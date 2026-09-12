@@ -32,11 +32,16 @@ pub fn stderr_text(raw: &str) -> String {
 const REDACTED: &str = "[REDACTED]";
 
 /// `authorization : bearer <token>`, however it was spaced and cased.
+///
+/// `basic` counts as well as `bearer`: it is the same header carrying the same credential, and a
+/// base64 user:password is no less a secret for being the older spelling.
 fn redact_bearer(raw: &str) -> String {
     rewrite(raw, |bytes, at| {
         let after_keyword = match_word(bytes, at, b"authorization")?;
         let after_colon = match_byte(bytes, skip_spaces(bytes, after_keyword), b':')?;
-        let after_scheme = match_word(bytes, skip_spaces(bytes, after_colon), b"bearer")?;
+        let scheme_start = skip_spaces(bytes, after_colon);
+        let after_scheme = match_word(bytes, scheme_start, b"bearer")
+            .or_else(|| match_word(bytes, scheme_start, b"basic"))?;
         let token_start = skip_spaces(bytes, after_scheme);
         if token_start == after_scheme {
             return None;
@@ -387,6 +392,20 @@ mod tests {
                 "expected U+{code:04X} to be stripped"
             );
         }
+    }
+
+    /// The same header carrying the same credential. A base64 `user:password` is no less a secret
+    /// for being the older spelling, and it reached a log while only `bearer` was matched.
+    #[test]
+    fn redacts_a_basic_credential_as_well_as_a_bearer_one() {
+        assert_eq!(
+            stderr_text("Authorization: Basic dXNlcjpodW50ZXIy"),
+            "Authorization: Basic [REDACTED]"
+        );
+        assert_eq!(
+            stderr_text("authorization:basic\tdXNlcjpodW50ZXIy"),
+            "authorization:basic [REDACTED]"
+        );
     }
 
     #[test]
