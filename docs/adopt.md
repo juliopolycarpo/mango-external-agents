@@ -52,7 +52,9 @@ let host = HostContext::builder()
 6. **A cancellation token, a clock and the caps**, all with defaults: `CancelToken` for shutdown,
    `Clock` for the instant an event is stamped with, and `Limits` for the turn channel's capacity
    (1,024 events), the line and buffer caps, the stderr tail, the request timeout and the kill
-   grace.
+   grace. Harnesses read them back through `host.limits()`; a host constructing `TokioLauncher`
+   passes the same kill grace to `TokioLauncher::with_kill_grace`, so one number governs teardown
+   wherever it is enforced.
 
 There is no credential field, and there never will be. The library reuses whatever the user
 already logged into with the vendor's own CLI.
@@ -105,6 +107,11 @@ assert_eq!(launcher.last_launch().unwrap().env.get("CONNECTOR_SECRET"), None);
 Implement `Harness` and `Session`, push every event through the `EventSink` a turn's stream comes
 from — it normalises and bounds on the way through, so a reducer cannot emit an unbounded event by
 accident — and leave the four optional methods to their defaults unless the vendor has them.
+
+A harness holds a `HostContext`, not a bag of durations, so take the bounds from it rather than
+from a constant: `ClientOptions::new("Codex app-server").with_limits(host.limits())`. A harness
+that threads its own timeout is a harness that ignores the host on the day the host asked for ten
+seconds.
 
 Then run the conformance suite:
 

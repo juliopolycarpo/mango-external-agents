@@ -25,7 +25,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::{Error, ErrorCode, Result, VendorError, jsonrpc_code_is_retryable};
-use crate::host::CancelToken;
+use crate::host::{CancelToken, Limits};
 use crate::link::{Link, LinkSender};
 
 /// One request's id, exactly as it arrived.
@@ -166,6 +166,34 @@ impl ClientOptions {
     #[must_use]
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Takes every bound this client has from the host's own.
+    ///
+    /// A harness holds a [`HostContext`](crate::HostContext), not a `Duration`, so without this
+    /// each one would have to remember to thread `host.limits().request_timeout` through by hand —
+    /// and the one that forgot would quietly wait two minutes on a host that asked for ten
+    /// seconds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::ClientOptions;
+    /// use mango_external_agents::Limits;
+    /// use std::time::Duration;
+    ///
+    /// let limits = Limits {
+    ///     request_timeout: Duration::from_secs(10),
+    ///     ..Limits::default()
+    /// };
+    /// let options = ClientOptions::new("Codex app-server").with_limits(&limits);
+    ///
+    /// assert_eq!(options.request_timeout, Duration::from_secs(10));
+    /// ```
+    #[must_use]
+    pub fn with_limits(mut self, limits: &Limits) -> Self {
+        self.request_timeout = limits.request_timeout;
         self
     }
 }
