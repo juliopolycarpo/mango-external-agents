@@ -283,6 +283,10 @@ impl Client {
 
         let closed = self.state.sender.lock().await.close().await;
         if let Some(pump) = self.pump.lock().await.take() {
+            // Taken down rather than waited out: the shutdown flag is only read between messages,
+            // so a pump parked inside a handler — which is where a host that stopped reading its
+            // turn stream parks it — would never reach the flag, and closing would never return.
+            pump.abort();
             let _ = pump.await;
         }
         closed
@@ -531,7 +535,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
 
     /// A handler that records what it was told and answers questions from a script.
     struct RecordingHandler {
@@ -847,5 +851,51 @@ mod tests {
             .await
             .expect("expected a dropped notification to be fine");
         assert!(link.sent().is_empty());
+    }
+
+    /// A host that stopped reading its turn stream. A bounded channel with no room left parks the
+    /// handler exactly like this, for as long as the host takes to read again.
+    struct StalledHandler {
+        entered: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for StalledHandler {
+        async fn on_notification(&self, _method: String, _params: Value) {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+
+        async fn on_request(
+            &self,
+            _method: String,
+            _params: Value,
+            id: RequestId,
+        ) -> ServerRequestOutcome {
+            ServerRequestOutcome::Answer(json!({ "echoed": id.key() }))
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_returns_while_the_handler_is_still_parked() {
+        let link = ScriptedLink::new();
+        let handler = Arc::new(StalledHandler {
+            entered: Notify::new(),
+        });
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server"),
+        );
+
+        link.push_line(r#"{"jsonrpc":"2.0","method":"item/started","params":{}}"#);
+        handler.entered.notified().await;
+
+        // The shutdown flag is read between messages only, so a pump parked in the handler never
+        // reaches it: waiting the pump out here would wait for a message that is not coming.
+        tokio::time::timeout(Duration::from_secs(5), client.close())
+            .await
+            .expect("expected close to return while the handler was parked")
+            .expect("expected a clean close");
     }
 }
