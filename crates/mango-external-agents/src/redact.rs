@@ -214,12 +214,17 @@ fn as_text(bytes: &[u8], from: usize, to: usize) -> String {
     String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default()).into_owned()
 }
 
-/// Keeps tab and newline, drops every other C0 control, DEL and the C1 block, and takes a CSI
-/// sequence out whole rather than leaving its parameters behind as text.
+/// Keeps tab and newline, drops every other C0 control, DEL, the C1 block and every bidirectional
+/// formatting character, and takes a CSI sequence out whole rather than leaving its parameters
+/// behind as text.
 ///
 /// A lone `\r` or an escape sequence in a vendor's diagnostic is a terminal-rendering problem the
 /// moment anyone tails a log. Dropping only the `ESC` would leave `[31m` sitting in the middle of
 /// a header, which reads as noise and hides a token from the rules that run after this.
+///
+/// The bidirectional set goes for the reason it goes everywhere else in this crate — see
+/// [`normalize::is_strippable`](crate::normalize) — and this tail is rendered in a host's
+/// diagnostics like any other vendor-written string, so the answer has to be the same one.
 fn strip_control_characters(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut characters = raw.chars().peekable();
@@ -236,12 +241,27 @@ fn strip_control_characters(raw: &str) -> String {
             }
             continue;
         }
-        let code = u32::from(character);
-        if code == 0x09 || code == 0x0a || (code > 0x1f && !(0x7f..=0x9f).contains(&code)) {
+        if character == '\t' || character == '\n' {
+            out.push(character);
+            continue;
+        }
+        if !is_unsafe_to_render(character) {
             out.push(character);
         }
     }
     out
+}
+
+/// Every code point a diagnostic must not carry across a boundary, tab and newline excepted.
+///
+/// One list rather than a second opinion: the ranges are the ones
+/// [`normalize`](crate::normalize) applies to every other vendor-written string.
+fn is_unsafe_to_render(character: char) -> bool {
+    let code = u32::from(character);
+    matches!(
+        code,
+        0x00..=0x1f | 0x7f..=0x9f | 0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+    )
 }
 
 #[cfg(test)]
@@ -352,6 +372,21 @@ mod tests {
     fn strips_control_characters_but_keeps_tabs_and_newlines() {
         let redacted = stderr_text("a\u{1b}[31mb\u{0}c\td\ne\u{9f}f");
         assert_eq!(redacted, "abc\td\nef");
+    }
+
+    /// The tail is vendor-written text rendered in a host's diagnostics, so it is bounded on the
+    /// same terms as every other vendor string. An override left in a log renders a filename, or
+    /// the command that produced it, in an order its code points do not have.
+    #[test]
+    fn strips_the_bidirectional_set_a_log_would_otherwise_render_backwards() {
+        for code in [0x061c, 0x200e, 0x200f, 0x202a, 0x202e, 0x2066, 0x2069] {
+            let character = char::from_u32(code).expect("expected a character");
+            assert_eq!(
+                stderr_text(&format!("error: cannot run {character}gpj.exe")),
+                "error: cannot run gpj.exe",
+                "expected U+{code:04X} to be stripped"
+            );
+        }
     }
 
     #[test]
