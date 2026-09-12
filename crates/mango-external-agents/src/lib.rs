@@ -1,5 +1,17 @@
 #![doc = include_str!("../README.md")]
 
+pub mod error;
+pub mod harness;
+pub mod session;
+pub mod transport;
+
+pub use error::{Error, ErrorCode, Result, VendorError};
+pub use harness::{
+    AcpProfileId, Capabilities, Capability, HarnessDescriptor, HarnessKind, VendorInfo,
+};
+pub use session::{CancelReason, CloseReason};
+pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};
+
 /// Semantic version of this crate, kept in lockstep with every workspace crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -27,6 +27,8 @@ launcher-tokio = []
 testing = []
 
 [dependencies]
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+thiserror = { version = "2.0.20", default-features = false, features = ["std"] }
 
 [package.metadata.docs.rs]
 all-features = true
