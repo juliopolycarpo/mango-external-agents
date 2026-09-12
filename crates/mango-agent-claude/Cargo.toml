@@ -1,0 +1,22 @@
+[package]
+name = "mango-agent-claude"
+version.workspace = true
+authors.workspace = true
+categories = ["development-tools", "asynchronous"]
+edition.workspace = true
+homepage.workspace = true
+keywords = ["mangostudio", "agents", "claude", "harness"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+description = "Claude Code harness for mango-external-agents: the stream-json dialect over stdio"
+
+[lints]
+workspace = true
+
+[dependencies]
+mango-external-agents.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

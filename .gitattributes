@@ -1,0 +1,18 @@
+# Normalize line endings to LF on commit; checkout as-is.
+*                          text=auto eol=lf
+*.rs                       text eol=lf
+*.toml                     text eol=lf
+*.yml                      text eol=lf
+*.yaml                     text eol=lf
+*.md                       text eol=lf
+*.json                     text eol=lf
+*.ndjson                   text eol=lf
+*.sh                       text eol=lf
+
+Cargo.lock                 text eol=lf linguist-generated=true
+
+# Captured vendor fixtures are data, not source: exact bytes matter.
+fixtures/**                -text linguist-generated=false
+
+docs/**                    linguist-documentation=true
+*.md                       linguist-documentation=true

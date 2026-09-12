@@ -1,0 +1,22 @@
+[package]
+name = "mango-agent-acp"
+version.workspace = true
+authors.workspace = true
+categories = ["development-tools", "asynchronous"]
+edition.workspace = true
+homepage.workspace = true
+keywords = ["mangostudio", "agents", "acp", "harness"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+description = "Generic Agent Client Protocol harness for mango-external-agents with per-agent profiles"
+
+[lints]
+workspace = true
+
+[dependencies]
+mango-external-agents.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

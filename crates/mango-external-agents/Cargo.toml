@@ -1,0 +1,32 @@
+[package]
+name = "mango-external-agents"
+version.workspace = true
+authors.workspace = true
+categories = ["development-tools", "asynchronous"]
+edition.workspace = true
+homepage.workspace = true
+keywords = ["mangostudio", "agents", "claude-code", "codex", "acp"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+description = "Drive local coding-agent CLIs from Rust behind one abstraction: transport kind x harness kind"
+
+[lints]
+workspace = true
+
+[features]
+default = ["stdio"]
+# Line-framed child processes spawned through the host's ProcessLauncher.
+stdio = []
+# A dialled WebSocket URL (tokio-tungstenite over ring).
+websocket = []
+# A default ProcessLauncher on tokio::process for hosts without their own spawner.
+launcher-tokio = []
+# FakeLauncher, FakeHarness, ScriptedLink and the harness conformance cases.
+testing = []
+
+[dependencies]
+
+[package.metadata.docs.rs]
+all-features = true

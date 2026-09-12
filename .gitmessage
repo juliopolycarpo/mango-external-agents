@@ -1,0 +1,26 @@
+# Format:
+# type(scope): short imperative summary
+#
+# Examples:
+# feat(core): bound the turn stream at 1024 events
+# fix(claude): treat a missing stream-json result as a vendor error
+# docs(compliance): quote the Codex app-server integration note
+#
+# Types:
+# feat, fix, refactor, perf, docs, test, chore, ci, build, deps, release
+#
+# Scopes:
+# core, claude, codex, acp, mea, fixtures, docs, ci, build, deps, release
+
+
+#
+# Rules:
+# - Write in English
+# - Use imperative mood
+# - Keep subject <= 72 chars
+# - No trailing period
+# - One concern per commit
+# - Cite the vendor doc a harness change follows
+#
+# What, why, validation (if applicable) and refs (if applicable)
+# -

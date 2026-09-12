@@ -1,0 +1,23 @@
+{
+  "$schema": "https://dprint.dev/schemas/v0.json",
+  "lineWidth": 100,
+  "indentWidth": 2,
+  "newLineKind": "lf",
+  "useTabs": false,
+  "markdown": {
+    "textWrap": "maintain",
+    "emphasisKind": "asterisks",
+    "strongKind": "asterisks",
+    "lineWidth": 100,
+    "associations": ["**/*.{md,mdc,mdx}"]
+  },
+  "toml": {},
+  "yaml": {},
+  "includes": ["**/*.{md,mdc,mdx,toml,yml,yaml}"],
+  "excludes": ["**/target", "**/CHANGELOG.md", "crates/mango-agent-codex/vendor", "fixtures"],
+  "plugins": [
+    "https://plugins.dprint.dev/markdown-0.22.1.wasm",
+    "https://plugins.dprint.dev/toml-0.7.0.wasm",
+    "https://plugins.dprint.dev/g-plane/pretty_yaml-v0.6.0.wasm"
+  ]
+}
