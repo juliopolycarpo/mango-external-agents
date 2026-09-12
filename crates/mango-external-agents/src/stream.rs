@@ -18,6 +18,12 @@ use std::sync::Arc;
 /// The channel is bounded (see [`Limits::turn_channel_capacity`](crate::Limits)): a host that
 /// stops reading applies backpressure all the way to the vendor process, which is the behaviour
 /// worth having when the alternative is buffering a runaway stream until the process dies.
+///
+/// The bound is a number of events, not a number of bytes, and each event was already bounded by
+/// the line cap it arrived under — so the honest ceiling before backpressure engages is the two
+/// multiplied together. A host that cares about the byte figure sets
+/// [`Limits::turn_channel_capacity`](crate::Limits) against its own line cap rather than reading
+/// the default as a memory guarantee.
 pub struct TurnStream {
     /// The host's own id for this turn, echoed on every event.
     pub turn_id: TurnId,

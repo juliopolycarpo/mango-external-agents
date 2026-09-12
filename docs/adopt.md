@@ -10,7 +10,7 @@ All of it through one `HostContext`, built once and shared by every session:
 
 ```rust,ignore
 let host = HostContext::builder()
-    .launcher(Arc::new(TokioLauncher::new()))   // or the host's own
+    .launcher(Arc::new(TokioLauncher::new().with_limits(&limits)))  // or the host's own
     .cwd(authorised_directory)                  // already authorised, never widened
     .environment(EnvSource::from_process())     // the source; the allowlist does the filtering
     .client_info("my-host", env!("CARGO_PKG_VERSION"))
@@ -52,8 +52,8 @@ let host = HostContext::builder()
 6. **A cancellation token, a clock and the caps**, all with defaults: `CancelToken` for shutdown,
    `Clock` for the instant an event is stamped with, and `Limits` for the turn channel's capacity
    (1,024 events), the line and buffer caps, the stderr tail, the request timeout and the kill
-   grace. Harnesses read them back through `host.limits()`; a host constructing `TokioLauncher`
-   passes the same kill grace to `TokioLauncher::with_kill_grace`, so one number governs teardown
+   grace. Harnesses read them back through `host.limits()`, and a host constructing `TokioLauncher`
+   hands it the same ones with `TokioLauncher::with_limits`, so one setting governs a bound
    wherever it is enforced.
 
 There is no credential field, and there never will be. The library reuses whatever the user

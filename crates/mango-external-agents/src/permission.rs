@@ -328,7 +328,12 @@ pub struct PermissionRequest {
     pub options: Vec<PermissionOption>,
     /// When this question stops being answerable.
     ///
-    /// Every approval expires: an unanswered one must not hold a turn open forever.
+    /// Carried so that a host rendering the prompt, and the harness that raised it, agree on one
+    /// deadline rather than inventing two. Nothing in the core compares it to a clock today: the
+    /// harness that owns the vendor connection is what times the question out and resolves it with
+    /// [`DecisionSource::Expired`]. Moving that timer into the core is the obvious next step —
+    /// three harnesses each writing their own is three chances to forget — and is deliberately
+    /// left until there is a harness to move it out of.
     pub expires_at: SystemTime,
     /// True when any field above was cut to fit its bound.
     #[serde(default)]
@@ -493,7 +498,7 @@ pub enum DecisionSource {
     User,
     /// The host's own policy chose.
     AutoReview,
-    /// Nobody chose in time.
+    /// Nobody chose in time, and the deadline on the request passed.
     Expired,
     /// The turn ended before anyone chose.
     Cancelled,

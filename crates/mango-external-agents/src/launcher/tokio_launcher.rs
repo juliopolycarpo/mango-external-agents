@@ -78,7 +78,7 @@ impl TokioLauncher {
 
     /// Takes every bound this launcher has from the host's own.
     ///
-    /// [`Limits`] carries a kill grace and a stderr tail, and this type carried its own copies of
+    /// [`Limits`](crate::Limits) carries a kill grace and a stderr tail, and this type carried its own copies of
     /// both. A host that set one and constructed the launcher with the other silently got the
     /// launcher's — the defaults agree, so nothing would have shown it up until the day a host
     /// changed one.

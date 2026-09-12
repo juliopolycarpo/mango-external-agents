@@ -4,9 +4,16 @@
 //! environment it is willing to pass on, who the host says it is, a clock, a cancellation token
 //! and the caps it wants the library to read vendors under.
 //!
-//! There is no credential field, and there never will be. A host cannot pass a vendor token in
-//! even if it wanted to, because the library has nowhere to put one: it reuses whatever the user
-//! already logged into with the vendor's own CLI, and reports that state without reading it.
+//! There is no credential field here, and there never will be: the library reuses whatever the
+//! user already logged into with the vendor's own CLI, reports that state without reading it, and
+//! offers no way to smuggle a host secret into a child through the environment.
+//!
+//! That is a guarantee about this type, not a claim that no credential exists anywhere. A host
+//! driving an endpoint that requires one passes it per dial on
+//! [`WsSpec::with_bearer`](crate::WsSpec::with_bearer), where it is sent as one header on one
+//! handshake and kept out of debug output and errors; and a harness that documents a vendor's own
+//! API-key variable in `vendor_environment_keys` lets that one through by name. Both are
+//! deliberate, both are narrow, and neither goes through the shared context.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
