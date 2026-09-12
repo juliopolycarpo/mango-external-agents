@@ -437,11 +437,10 @@ fn group_of(pid: u32) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX))
 }
 
-/// Windows has no polite step worth taking: `taskkill` without `/F` posts `WM_CLOSE`, which a
-/// console program does not handle, so asking and insisting are the same call.
-#[cfg(windows)]
-fn ask_tree_to_stop(_pid: u32) {}
-
+/// Ends a tree with the only step Windows has.
+///
+/// There is no polite call to make first: `taskkill` without `/F` posts `WM_CLOSE`, which a
+/// console program does not handle, so asking and insisting would be the same call.
 #[cfg(windows)]
 fn insist_tree_stops(pid: u32) {
     use std::os::windows::process::CommandExt as _;
