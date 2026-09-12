@@ -541,7 +541,13 @@ impl AccountLimits {
         }
     }
 
-    /// This snapshot with its vendor labels bounded.
+    /// This snapshot with its vendor labels bounded and its percentages made renderable.
+    ///
+    /// `used_percent` is a number a harness derives rather than one a vendor spells out, and the
+    /// derivation divides: a window the vendor reports with no denominator yields `NaN`, which is
+    /// not a percentage and is not even JSON — `serde_json` refuses to write it, so a host that
+    /// persists or forwards its events would lose the whole event over one field. Clamped rather
+    /// than refused, because a quota reading is not worth ending a turn for.
     #[must_use]
     pub fn normalized(self) -> Self {
         Self {
@@ -552,6 +558,7 @@ impl AccountLimits {
                     label: window
                         .label
                         .map(|label| normalize::bound_text(&label, TextLimit::Title).text),
+                    used_percent: renderable_percent(window.used_percent),
                     ..window
                 })
                 .collect(),
@@ -561,6 +568,17 @@ impl AccountLimits {
             observed_at: self.observed_at,
         }
     }
+}
+
+/// A percentage that can be written and rendered: finite, and inside the scale it names.
+///
+/// `NaN` reads as unknown here, which is what a window with no denominator is, and zero is how an
+/// unknown window renders in every quota display there is.
+fn renderable_percent(used_percent: f64) -> f64 {
+    if used_percent.is_nan() {
+        return 0.0;
+    }
+    used_percent.clamp(0.0, 100.0)
 }
 
 /// Bounds a catalog, dropping rows that cannot be offered.
@@ -803,6 +821,43 @@ mod tests {
             result.detail.map(|detail| detail.chars().count()),
             Some(4_096)
         );
+    }
+
+    /// `used_percent` is derived, and a derivation divides. A window with no denominator yields
+    /// `NaN`, which `serde_json` refuses to write — so a host that persists its events would lose
+    /// the whole event over one field rather than one unreadable percentage.
+    #[test]
+    fn a_percentage_that_could_not_be_written_is_bounded_rather_than_carried() {
+        use super::{AccountLimits, RateLimitWindow};
+        use std::time::SystemTime;
+
+        let limits = AccountLimits {
+            windows: vec![
+                RateLimitWindow {
+                    used_percent: f64::NAN,
+                    ..RateLimitWindow::default()
+                },
+                RateLimitWindow {
+                    used_percent: 412.5,
+                    ..RateLimitWindow::default()
+                },
+                RateLimitWindow {
+                    used_percent: -1.0,
+                    ..RateLimitWindow::default()
+                },
+            ],
+            plan_type: None,
+            observed_at: SystemTime::UNIX_EPOCH,
+        }
+        .normalized();
+
+        let percentages: Vec<f64> = limits
+            .windows
+            .iter()
+            .map(|window| window.used_percent)
+            .collect();
+        assert_eq!(percentages, vec![0.0, 100.0, 0.0]);
+        serde_json::to_string(&limits).expect("expected a snapshot that can be written");
     }
 
     #[test]
