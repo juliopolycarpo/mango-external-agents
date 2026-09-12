@@ -20,10 +20,13 @@
 /// assert_eq!(tail, "Authorization: Bearer [REDACTED] API_KEY=[REDACTED]");
 /// ```
 pub fn stderr_text(raw: &str) -> String {
-    let bearer = redact_bearer(raw);
+    // Stripped first rather than last. A CLI that colours its output writes `Authorization:` and
+    // ` Bearer sk-live-x` either side of an escape sequence, and a rule that reads the two as
+    // neighbours never sees the token at all if the sequence is still sitting between them.
+    let plain = strip_control_characters(raw);
+    let bearer = redact_bearer(&plain);
     let assignments = redact_assignments(&bearer);
-    let urls = redact_url_passwords(&assignments);
-    strip_control_characters(&urls)
+    redact_url_passwords(&assignments)
 }
 
 const REDACTED: &str = "[REDACTED]";
@@ -55,7 +58,11 @@ fn redact_assignments(raw: &str) -> String {
     rewrite(raw, |bytes, at| {
         let after_keyword = match_api_key(bytes, at)
             .or_else(|| KEYWORDS.iter().find_map(|word| match_word(bytes, at, word)))?;
-        let separator = skip_spaces(bytes, after_keyword);
+        // `AWS_SECRET_ACCESS_KEY=` is a keyword with the rest of a name after it. Requiring the
+        // separator to follow the keyword itself would redact only the spellings that happen to
+        // end on one, which is a minority of the names credentials actually have.
+        let name_end = take_while(bytes, after_keyword, is_name_byte);
+        let separator = skip_spaces(bytes, name_end);
         let after_separator =
             match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
         let value_start = skip_spaces(bytes, after_separator);
@@ -65,7 +72,7 @@ fn redact_assignments(raw: &str) -> String {
         }
         Some(Rewrite {
             end: value_end,
-            replacement: format!("{}={REDACTED}", as_text(bytes, at, after_keyword)),
+            replacement: format!("{}={REDACTED}", as_text(bytes, at, name_end)),
         })
     })
 }
@@ -86,9 +93,8 @@ fn redact_url_passwords(raw: &str) -> String {
                 b' ' | b'\t' | b'\n' | b'\r' | b':' | b'/' | b'?' | b'#'
             )
         });
-        if user_end == after_scheme {
-            return None;
-        }
+        // The user half is optional: `redis://:hunter2@db/main` is what a URL looks like when
+        // only a password was configured.
         let password_start = match_byte(bytes, user_end, b':')?;
         let password_end = take_while(bytes, password_start, |byte| {
             !matches!(
@@ -133,9 +139,13 @@ fn rewrite(raw: &str, rule: impl Fn(&[u8], usize) -> Option<Rewrite>) -> String 
 }
 
 /// The `\b` the patterns open with: a match may not start inside a word.
+///
+/// An underscore counts as a boundary here even though `\w` counts it as a word character. The
+/// spelling that matters is `OPENAI_API_KEY`, and treating `_` as part of the preceding word is
+/// what let every screaming-snake-case credential walk past the scanner untouched.
 fn starts_a_word(bytes: &[u8], at: usize) -> bool {
     match at.checked_sub(1).and_then(|before| bytes.get(before)) {
-        Some(byte) => !byte.is_ascii_alphanumeric() && *byte != b'_',
+        Some(byte) => !byte.is_ascii_alphanumeric(),
         None => true,
     }
 }
@@ -187,6 +197,11 @@ fn take_while(bytes: &[u8], at: usize, keep: impl Fn(u8) -> bool) -> usize {
     end
 }
 
+/// What the rest of a variable's name is made of, after the keyword that identified it.
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
 /// The `[^\s,;]+` every value in these patterns is.
 fn is_value_byte(byte: u8) -> bool {
     !matches!(
@@ -199,17 +214,34 @@ fn as_text(bytes: &[u8], from: usize, to: usize) -> String {
     String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default()).into_owned()
 }
 
-/// Keeps tab and newline, drops every other C0 control, DEL and the C1 block.
+/// Keeps tab and newline, drops every other C0 control, DEL and the C1 block, and takes a CSI
+/// sequence out whole rather than leaving its parameters behind as text.
 ///
 /// A lone `\r` or an escape sequence in a vendor's diagnostic is a terminal-rendering problem the
-/// moment anyone tails a log.
+/// moment anyone tails a log. Dropping only the `ESC` would leave `[31m` sitting in the middle of
+/// a header, which reads as noise and hides a token from the rules that run after this.
 fn strip_control_characters(raw: &str) -> String {
-    raw.chars()
-        .filter(|character| {
-            let code = u32::from(*character);
-            code == 0x09 || code == 0x0a || (code > 0x1f && !(0x7f..=0x9f).contains(&code))
-        })
-        .collect()
+    let mut out = String::with_capacity(raw.len());
+    let mut characters = raw.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' {
+            if characters.peek() == Some(&'[') {
+                characters.next();
+                // Parameter and intermediate bytes, up to and including the final byte.
+                for character in characters.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&character) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let code = u32::from(character);
+        if code == 0x09 || code == 0x0a || (code > 0x1f && !(0x7f..=0x9f).contains(&code)) {
+            out.push(character);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -256,7 +288,41 @@ mod tests {
     #[test]
     fn leaves_a_keyword_inside_a_longer_word_alone() {
         assert_eq!(stderr_text("mytoken=v"), "mytoken=v");
-        assert_eq!(stderr_text("my_token=v"), "my_token=v");
+        assert_eq!(
+            stderr_text("a_token_count_of=3"),
+            "a_token_count_of=[REDACTED]"
+        );
+    }
+
+    /// The spellings credentials actually have. Each of these walked past the scanner while an
+    /// underscore counted as a word character and the keyword had to touch the separator.
+    #[test]
+    fn redacts_a_credential_named_the_way_credentials_are_named() {
+        for (line, expected) in [
+            ("OPENAI_API_KEY=sk-proj-x", "OPENAI_API_KEY=[REDACTED]"),
+            ("ANTHROPIC_API_KEY=sk-ant-x", "ANTHROPIC_API_KEY=[REDACTED]"),
+            ("GITHUB_TOKEN=ghp_x", "GITHUB_TOKEN=[REDACTED]"),
+            (
+                "AWS_SECRET_ACCESS_KEY=wJalrX",
+                "AWS_SECRET_ACCESS_KEY=[REDACTED]",
+            ),
+            ("CLIENT_SECRET=shh", "CLIENT_SECRET=[REDACTED]"),
+            ("my_token=v", "my_token=[REDACTED]"),
+        ] {
+            assert_eq!(stderr_text(line), expected, "expected {expected:?}");
+        }
+    }
+
+    #[test]
+    fn a_colour_sequence_does_not_hide_the_token_that_follows_it() {
+        assert_eq!(
+            stderr_text("Authorization:\u{1b}[1m Bearer sk-live-x"),
+            "Authorization: Bearer [REDACTED]"
+        );
+        assert_eq!(
+            stderr_text("\u{1b}[31mAPI_KEY\u{1b}[0m=secret-value"),
+            "API_KEY=[REDACTED]"
+        );
     }
 
     #[test]
@@ -275,9 +341,17 @@ mod tests {
     }
 
     #[test]
+    fn a_url_whose_userinfo_is_only_a_password_is_redacted() {
+        assert_eq!(
+            stderr_text("redis://:hunter2@db/main"),
+            "redis://:[REDACTED]@db/main"
+        );
+    }
+
+    #[test]
     fn strips_control_characters_but_keeps_tabs_and_newlines() {
         let redacted = stderr_text("a\u{1b}[31mb\u{0}c\td\ne\u{9f}f");
-        assert_eq!(redacted, "a[31mbc\td\nef");
+        assert_eq!(redacted, "abc\td\nef");
     }
 
     #[test]
