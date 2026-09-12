@@ -32,6 +32,13 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Escalation asks before it insists: the caller closes stdin, then this sends the polite signal,
 /// waits out the grace, and only then insists. A vendor asked to stop writes its own state first,
 /// and a library that skipped straight to the unstoppable signal would lose that every time.
+///
+/// What decides both steps is the group, not the leader. A helper the vendor started can ignore
+/// the polite signal or outlive the process that spawned it, so a leader `wait` already reported
+/// is never on its own a reason to stop escalating — and an empty group is the one thing that is,
+/// because past that point the number names whatever the operating system hands it to next.
+/// Dropping the last handle to a child runs the same escalation rather than a signal of its own:
+/// a handshake that fails after the spawn is the path that leaves a workspace held.
 #[derive(Clone, Debug)]
 pub struct TokioLauncher {
     kill_grace: Duration,
@@ -290,23 +297,26 @@ impl TokioChild {
     fn exited(&self) -> Option<ExitStatus> {
         *self.exit.borrow()
     }
+}
 
-    /// Waits out the grace, and says whether the child went away inside it.
-    async fn exited_within(&self, grace: Duration) -> bool {
-        let mut exit = self.exit.clone();
-        tokio::time::timeout(grace, async {
-            loop {
-                if exit.borrow_and_update().is_some() {
-                    return;
-                }
-                if exit.changed().await.is_err() {
-                    return;
-                }
+/// Waits out the grace, and says whether the leader went away inside it.
+#[cfg(windows)]
+async fn leader_exits_within(
+    mut exit: watch::Receiver<Option<ExitStatus>>,
+    grace: Duration,
+) -> bool {
+    tokio::time::timeout(grace, async {
+        loop {
+            if exit.borrow_and_update().is_some() {
+                return;
             }
-        })
-        .await
-        .is_ok()
-    }
+            if exit.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok()
 }
 
 #[async_trait::async_trait]
@@ -332,34 +342,37 @@ impl ProcessControl for TokioChild {
     }
 
     async fn kill(&self, _reason: CancelReason) -> Result<()> {
-        if self.exited().is_some() {
-            return Ok(());
-        }
         let Some(pid) = self.pid else {
-            return Err(Error::Launch {
-                program: String::from("<unknown>"),
-                message: String::from("expected a process id to end, received none"),
-            });
+            // A child that never had a pid never started; one whose pid is already gone was
+            // reaped before any handle asked, and there is nothing left to signal.
+            return if self.exited().is_some() {
+                Ok(())
+            } else {
+                Err(Error::Launch {
+                    program: String::from("<unknown>"),
+                    message: String::from("expected a process id to end, received none"),
+                })
+            };
         };
         // Escalated once, even if several tasks ask: a second escalation would be signalling a
-        // pid the operating system may already have handed to somebody else. The second caller
-        // waits on the first caller's outcome rather than reporting a child that is still inside
-        // its grace as already gone — `Ok` from `kill` is what a host reads as "the workspace is
-        // free".
+        // group id the operating system may already have handed to somebody else. The second
+        // caller waits on the first caller's outcome rather than reporting a child that is still
+        // inside its grace as already gone — `Ok` from `kill` is what a host reads as "the
+        // workspace is free".
         if self.killed.swap(true, Ordering::AcqRel) {
-            return if self.exited_within(self.kill_grace * 2).await {
+            let waited = self.kill_grace * 2;
+            return if tree_ends_within(pid, self.exit.clone(), waited).await {
                 Ok(())
             } else {
                 Err(Error::Launch {
                     program: format!("process group {pid}"),
                     message: format!(
-                        "expected the escalation already running to end the tree, received a live process after {:?}",
-                        self.kill_grace * 2
+                        "expected the escalation already running to end the tree, received a live process after {waited:?}"
                     ),
                 })
             };
         }
-        end_process_tree(pid, self.kill_grace, self).await
+        end_process_tree(pid, self.kill_grace, self.exit.clone()).await
     }
 }
 
@@ -372,23 +385,33 @@ impl Drop for TokioChild {
     /// for the life of the host. Relying on the vendor noticing its stdin closed is relying on
     /// vendor behaviour this library refuses to assume anywhere else.
     fn drop(&mut self) {
-        if self.exited().is_some() || self.killed.load(Ordering::Acquire) {
+        // Claimed the same way `kill` claims it, so a drop racing a kill escalates once. The
+        // child having exited is deliberately not a reason to stop here: the leader is not the
+        // tree, and a helper it left behind is exactly what this is for.
+        if self.killed.swap(true, Ordering::AcqRel) {
             return;
         }
         let Some(pid) = self.pid else {
             return;
         };
         let grace = self.kill_grace;
+        let exit = self.exit.clone();
         match tokio::runtime::Handle::try_current() {
+            // The same escalation `kill` runs, rather than a sleep and a signal: it asks first,
+            // stops the moment nothing is left, and never signals a tree that is already gone.
             Ok(runtime) => {
                 runtime.spawn(async move {
-                    ask_tree_to_stop(pid);
-                    tokio::time::sleep(grace).await;
-                    insist_tree_stops(pid);
+                    let _ = end_process_tree(pid, grace, exit).await;
                 });
             }
-            // Nothing left to wait a grace on. One signal now beats an orphan.
-            Err(_) => insist_tree_stops(pid),
+            // Nothing left to wait a grace on, so there is nowhere to wait between asking and
+            // insisting. Still checked first: a tree that is already gone must not be signalled,
+            // because the number may name whatever the operating system handed it to next.
+            Err(_) => {
+                if !tree_is_gone(pid, &exit) {
+                    insist_tree_stops(pid);
+                }
+            }
         }
     }
 }
@@ -432,27 +455,111 @@ fn insist_tree_stops(pid: u32) {
         .spawn();
 }
 
+/// How often a tree is asked whether anything is left of it.
 #[cfg(unix)]
-async fn end_process_tree(pid: u32, grace: Duration, child: &TokioChild) -> Result<()> {
+const TREE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Whether the operating system still knows anything in this tree.
+///
+/// The group, not the leader. A helper the vendor started can block the polite signal or outlive
+/// the process that spawned it, and both present as a leader `wait` already reported while the
+/// workspace is still held — so the leader exiting is never on its own a reason to stop.
+///
+/// `ESRCH` is also what says the group id itself is free: the kernel keeps the number reserved
+/// while the group has a member, so an empty group is the one moment after which signalling it
+/// would reach whatever the operating system hands the number to next. Only `ESRCH` counts;
+/// `EPERM` is a group that exists and that this process may not touch, which is a failure to
+/// report rather than a tree that is gone.
+#[cfg(unix)]
+fn tree_is_gone(pid: u32, _exit: &watch::Receiver<Option<ExitStatus>>) -> bool {
+    matches!(
+        nix::sys::signal::killpg(group_of(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
+/// Whether the operating system still knows anything in this tree.
+///
+/// The leader's own exit, because Windows offers no cheap equivalent of a process group to ask.
+/// `taskkill /T` is what reaches the descendants; this is what says there is still something to
+/// run it against, and what stops a second run from naming a process id Windows has reissued.
+#[cfg(windows)]
+fn tree_is_gone(_pid: u32, exit: &watch::Receiver<Option<ExitStatus>>) -> bool {
+    exit.borrow().is_some()
+}
+
+/// Waits out the grace, and says whether the tree went away inside it.
+#[cfg(unix)]
+async fn tree_ends_within(
+    pid: u32,
+    exit: watch::Receiver<Option<ExitStatus>>,
+    grace: Duration,
+) -> bool {
+    tokio::time::timeout(grace, async {
+        while !tree_is_gone(pid, &exit) {
+            tokio::time::sleep(TREE_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Waits out the grace, and says whether the tree went away inside it.
+#[cfg(windows)]
+async fn tree_ends_within(
+    _pid: u32,
+    exit: watch::Receiver<Option<ExitStatus>>,
+    grace: Duration,
+) -> bool {
+    leader_exits_within(exit, grace).await
+}
+
+/// Asks a tree to stop, waits, and insists only on what is left.
+///
+/// Takes the reaper's view of the leader rather than the child itself, so the drop path — which no
+/// longer holds a handle — runs the same escalation as [`ProcessControl::kill`] instead of a sleep
+/// and a signal of its own.
+#[cfg(unix)]
+async fn end_process_tree(
+    pid: u32,
+    grace: Duration,
+    exit: watch::Receiver<Option<ExitStatus>>,
+) -> Result<()> {
+    if tree_is_gone(pid, &exit) {
+        return Ok(());
+    }
+
     ask_tree_to_stop(pid);
-    if child.exited_within(grace).await {
+    if tree_ends_within(pid, exit.clone(), grace).await {
         return Ok(());
     }
 
     insist_tree_stops(pid);
-    if child.exited_within(grace).await {
+    if tree_ends_within(pid, exit, grace).await {
         return Ok(());
     }
     Err(Error::Launch {
         program: format!("process group {pid}"),
-        message: format!("expected the tree to end within {grace:?}, received a live process"),
+        message: format!("expected the group to end within {grace:?}, received a live member"),
     })
 }
 
+/// Ends a tree with the one step Windows has.
+///
+/// A direct child handle does not imply ownership of descendants here, so the tree is ended
+/// through the system's own primitive rather than by killing what the library can see. There is no
+/// polite step to take first: `taskkill` without `/F` posts `WM_CLOSE`, which a console program
+/// does not handle.
 #[cfg(windows)]
-async fn end_process_tree(pid: u32, grace: Duration, child: &TokioChild) -> Result<()> {
-    // A direct child handle does not imply ownership of descendants here, so the tree is ended
-    // through the system's own primitive rather than by killing what the library can see.
+async fn end_process_tree(
+    pid: u32,
+    grace: Duration,
+    exit: watch::Receiver<Option<ExitStatus>>,
+) -> Result<()> {
+    if tree_is_gone(pid, &exit) {
+        return Ok(());
+    }
+
     let mut taskkill = Command::new("taskkill");
     taskkill
         .args(["/PID", &pid.to_string(), "/T", "/F"])
@@ -462,7 +569,7 @@ async fn end_process_tree(pid: u32, grace: Duration, child: &TokioChild) -> Resu
         .creation_flags(CREATE_NO_WINDOW);
 
     let ran = tokio::time::timeout(grace, taskkill.status()).await;
-    if child.exited_within(grace).await {
+    if tree_ends_within(pid, exit, grace).await {
         return Ok(());
     }
     Err(Error::Launch {
@@ -525,6 +632,31 @@ mod tests {
             "forever" => loop {
                 std::thread::sleep(Duration::from_secs(60));
             },
+            // Spawns a helper of its own and exits — the shape a vendor CLI leaves behind when it
+            // hands its work to a daemon. The helper inherits this stdout and this process group,
+            // so the pipe the test holds outlives the process the launcher can see.
+            #[cfg(unix)]
+            "leaves-a-helper" => {
+                let executable =
+                    std::env::current_exe().expect("expected the test binary's own path");
+                let _ = std::process::Command::new(executable)
+                    .args(["launcher_fixture_child", "--nocapture", "--test-threads=1"])
+                    .env(FIXTURE_MODE, "survives-sigterm")
+                    .stdin(std::process::Stdio::null())
+                    .spawn();
+            }
+            // Blocked rather than handled: installing a handler needs `unsafe`, which this crate
+            // forbids. A blocked `SIGTERM` stays pending forever while `SIGKILL` still lands,
+            // which is the only thing that reaches this helper.
+            #[cfg(unix)]
+            "survives-sigterm" => {
+                let mut blocked = nix::sys::signal::SigSet::empty();
+                blocked.add(nix::sys::signal::Signal::SIGTERM);
+                let _ = blocked.thread_block();
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
             _ => {}
         }
         // Before the harness prints its own trailer, so the child's output is only its own.
@@ -604,8 +736,6 @@ mod tests {
 
         // Bounded: a regression leaves the process running, and an unbounded wait would report
         // nothing at all.
-        // Bounded: a regression leaves the process running, and an unbounded wait would report
-        // nothing at all.
         tokio::time::timeout(Duration::from_secs(10), async {
             while alive(pid) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -613,6 +743,73 @@ mod tests {
         })
         .await
         .expect("expected the orphaned child to be ended");
+    }
+
+    /// The leader's own `wait` is not the tree's. A helper the vendor started can block `SIGTERM`
+    /// and outlive the process that spawned it, and the module contract says escalation reaches
+    /// everything the child started — so returning `Ok` because the leader was reaped left the
+    /// helper holding the workspace.
+    ///
+    /// Stdout is the probe rather than the helper's own pid: a helper whose parent exited is
+    /// reparented, and `kill(pid, 0)` still reports a zombie nobody has reaped as alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escalation_reaches_a_helper_that_outlived_the_child() {
+        let child = TokioLauncher::new()
+            .with_kill_grace(Duration::from_millis(300))
+            .spawn(fixture("leaves-a-helper"))
+            .await
+            .expect("expected a child");
+
+        // The leader gone and the helper running is the shape the escalation used to read as an
+        // empty tree, so the kill has to happen after it has settled rather than into a race.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("expected the tree to be ended");
+
+        let mut stdout = child.stdout;
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Ok(Some(_)) = stdout.next_chunk().await {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "expected the helper's end of the pipe to close, received an open pipe"
+        );
+    }
+
+    /// The drop path is the one a failed handshake takes, and it runs the same escalation as
+    /// `kill` rather than one of its own: a leader that exited is not a tree that is gone, so
+    /// stopping at the leader left the helper holding the workspace for the life of the host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_last_handle_reaches_a_helper_the_child_left_behind() {
+        let child = TokioLauncher::new()
+            .with_kill_grace(Duration::from_millis(300))
+            .spawn(fixture("leaves-a-helper"))
+            .await
+            .expect("expected a child");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Only the handles go: stdout stays, because the helper inherited the other end of it and
+        // the pipe is what says when the helper is gone.
+        let mut stdout = child.stdout;
+        drop(child.stdin);
+        drop(child.control);
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Ok(Some(_)) = stdout.next_chunk().await {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "expected the helper's end of the pipe to close, received an open pipe"
+        );
     }
 
     /// Whether the operating system still knows this process id.

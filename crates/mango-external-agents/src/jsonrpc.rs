@@ -429,7 +429,7 @@ impl Drop for Client {
     /// a map the last owner is dropping has nothing to fail.
     ///
     /// What is left is the end of the link. The pump and the answers in flight are taken down, and
-    /// the sender goes with the last [`ClientState`] they were holding — which on a child's stdin
+    /// the sender goes with the last handle to this client's state — which on a child's stdin
     /// is the end-of-input a print-mode vendor waits for.
     fn drop(&mut self) {
         self.state.closed.store(true, Ordering::Release);
