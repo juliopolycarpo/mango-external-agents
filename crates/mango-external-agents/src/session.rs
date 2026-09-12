@@ -1,6 +1,6 @@
 //! A live conversation with one vendor CLI, and the typed reasons it ends by.
 //!
-//! The library hands a host [`Session`](crate::Session) handles and reason enums; it keeps no
+//! The library hands a host [`Session`] handles and reason enums; it keeps no
 //! registry of live sessions, polls no consent and fans nothing out to a hub. Those are host
 //! policy, and a host builds whatever registry it needs on top of these handles.
 
