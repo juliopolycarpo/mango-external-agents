@@ -2,15 +2,22 @@
 
 pub mod env;
 pub mod error;
+pub mod event;
 pub mod harness;
 pub mod host;
+pub mod normalize;
 pub mod process;
 pub mod redact;
 pub mod session;
+pub mod stream;
 pub mod transport;
 
 pub use env::EnvSource;
 pub use error::{Error, ErrorCode, Result, VendorError};
+pub use event::{
+    AccountLimits, Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
+    AgentEvent, Command, EventKind, RateLimitWindow, SessionId, ThreadUsage, TurnId, Usage,
+};
 pub use harness::{
     AcpProfileId, Capabilities, Capability, HarnessDescriptor, HarnessKind, VendorInfo,
 };
@@ -22,6 +29,7 @@ pub use process::{
     ProcessControl, ProcessLauncher, StderrTail,
 };
 pub use session::{CancelReason, CloseReason};
+pub use stream::{EventSink, ReviewStream, TurnStream};
 pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};
 
 /// Semantic version of this crate, kept in lockstep with every workspace crate.
