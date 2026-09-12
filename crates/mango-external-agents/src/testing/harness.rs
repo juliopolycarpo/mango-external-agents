@@ -345,7 +345,12 @@ impl Session for FakeSession {
 
     async fn close(&self, _reason: CloseReason) -> Result<()> {
         self.closed.store(true, Ordering::Release);
-        if let Some(turn) = self.pending.lock().await.take() {
+        // Taken in a statement of its own: an `if let` scrutinee's guard lives through the body,
+        // so cancelling under it would hold `pending` across an `emit` that a host which stopped
+        // reading parks indefinitely — and the calls waiting on that lock are the ones a host uses
+        // to get out of it.
+        let pending = self.pending.lock().await.take();
+        if let Some(turn) = pending {
             // A close ends whatever was running, for the same reason.
             let _ = turn.sink.cancel(CancelReason::Shutdown).await;
         }
@@ -353,20 +358,26 @@ impl Session for FakeSession {
     }
 
     async fn steer(&self, steer: Steer) -> Result<SteerOutcome> {
-        let pending = self.pending.lock().await;
-        match pending.as_ref() {
-            Some(turn) => {
-                turn.sink
-                    .emit(EventKind::TextDelta {
-                        text: format!(" and {}", steer.input),
-                    })
-                    .await?;
-                Ok(SteerOutcome::Accepted)
-            }
-            None => Ok(SteerOutcome::Rejected {
+        // The sink is taken out from under the lock, never emitted into while holding it: a host
+        // that stopped reading parks `emit` on a full channel, and a steer parked there while
+        // still holding `pending` parks `cancel`, `close` and `respond` behind it — the three
+        // calls that exist to get out of exactly that state.
+        let sink = self
+            .pending
+            .lock()
+            .await
+            .as_ref()
+            .map(|turn| turn.sink.clone());
+        let Some(sink) = sink else {
+            return Ok(SteerOutcome::Rejected {
                 reason: crate::session::SteerRejection::TurnAlreadyCompleted,
-            }),
-        }
+            });
+        };
+        sink.emit(EventKind::TextDelta {
+            text: format!(" and {}", steer.input),
+        })
+        .await?;
+        Ok(SteerOutcome::Accepted)
     }
 }
 
@@ -451,5 +462,78 @@ mod tests {
             last = Some(event.kind);
         }
         assert_eq!(last, Some(EventKind::Completed));
+    }
+
+    /// The bound on the turn channel is the whole point of the bound: a host that stops reading
+    /// stops the vendor. What must not stop with it is the host's way back out — `cancel`,
+    /// `close` and `respond` all take `pending`, so a `steer` parked on the full channel while
+    /// still holding that lock takes the escape hatch down with it.
+    ///
+    /// Five is exactly what `start_turn` emits before it stops at its approval, so the channel is
+    /// full the moment it returns and nothing has read a single event.
+    #[tokio::test(start_paused = true)]
+    async fn a_steer_parked_on_a_full_turn_does_not_hold_the_lock_a_close_needs() {
+        use crate::host::Limits;
+        use crate::session::{CloseReason, Session, SteerOutcome, SteerRejection};
+        use std::time::Duration;
+
+        let host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd("/workspace")
+            .client_info("test-host", "0.0.0")
+            .limits(Limits {
+                turn_channel_capacity: 5,
+                ..Limits::default()
+            })
+            .build()
+            .expect("expected a context");
+        let session: Arc<dyn Session> = Arc::from(
+            FakeHarness::new()
+                .open_session(&host, OpenSession::new("chat-1"))
+                .await
+                .expect("expected a session"),
+        );
+        let _turn = session
+            .start_turn(TurnRequest::new("turn-1", "ship it"))
+            .await
+            .expect("expected a turn");
+
+        let steering = Arc::clone(&session);
+        tokio::spawn(async move { steering.steer(steer("and also run the linter")).await });
+        yield_twice().await;
+
+        let closing = Arc::clone(&session);
+        tokio::spawn(async move { closing.close(CloseReason::Shutdown).await });
+        yield_twice().await;
+
+        // Both are parked on the full channel by now. `close` took the pending turn before it
+        // parked, so this answers from an empty slot rather than waiting on a lock nobody holds.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            session.steer(steer("and the formatter")),
+        )
+        .await
+        .expect("expected a steer to answer while the turn channel is full, received one that never returned");
+
+        assert_eq!(
+            outcome.expect("expected the steer to be answered"),
+            SteerOutcome::Rejected {
+                reason: SteerRejection::TurnAlreadyCompleted,
+            }
+        );
+    }
+
+    fn steer(input: &str) -> crate::session::Steer {
+        crate::session::Steer {
+            turn_id: crate::event::TurnId::new("turn-1"),
+            native_turn_id: String::from("fake-turn-1"),
+            input: String::from(input),
+        }
+    }
+
+    /// Once to hand the spawned task the thread, once more to let it reach its park.
+    async fn yield_twice() {
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
     }
 }
