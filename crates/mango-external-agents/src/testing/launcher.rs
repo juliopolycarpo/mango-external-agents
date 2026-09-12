@@ -79,13 +79,20 @@ impl FakeProcess {
     }
 
     /// Writes these lines before anything the responder produces.
+    ///
+    /// Spliced in front of whatever was already queued rather than assigned over it: a greeting
+    /// chained onto a [`transcript`](Self::transcript) that replaced it would silently throw the
+    /// transcript away, which reads as a fixture that stopped replaying rather than as the mistake
+    /// it is.
     #[must_use]
     pub fn with_greeting<I, S>(mut self, lines: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.stdout = lines.into_iter().map(Into::into).collect();
+        let mut greeting: Vec<String> = lines.into_iter().map(Into::into).collect();
+        greeting.append(&mut self.stdout);
+        self.stdout = greeting;
         self
     }
 }
@@ -442,6 +449,32 @@ mod tests {
         assert!(!tail.contains("top-secret"), "received {tail:?}");
         assert!(!tail.contains("another-secret"), "received {tail:?}");
         assert!(!tail.contains("password@"), "received {tail:?}");
+    }
+
+    /// A greeting goes in front of what is already queued. Assigning over it instead threw the
+    /// transcript away without saying so, which reads as a fixture that stopped replaying.
+    #[tokio::test]
+    async fn a_greeting_goes_in_front_of_what_was_already_queued() {
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::transcript(["queued"]).with_greeting(["hello", "ready"]));
+        let child = launcher
+            .spawn(spec(&["codex", "app-server"]))
+            .await
+            .expect("expected a child");
+
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("expected a line or the end") {
+            seen.push(line);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                String::from("hello"),
+                String::from("ready"),
+                String::from("queued"),
+            ]
+        );
     }
 
     #[tokio::test]
