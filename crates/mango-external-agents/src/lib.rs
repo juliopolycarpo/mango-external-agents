@@ -7,6 +7,7 @@ pub mod event;
 pub mod harness;
 pub mod host;
 pub mod jsonrpc;
+pub mod launcher;
 pub mod link;
 pub mod normalize;
 pub mod permission;

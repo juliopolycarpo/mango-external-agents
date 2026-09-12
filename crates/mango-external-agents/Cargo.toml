@@ -22,7 +22,7 @@ stdio = []
 # A dialled WebSocket URL (tokio-tungstenite over ring).
 websocket = ["dep:futures-util", "dep:rustls", "dep:tokio-tungstenite", "tokio/net"]
 # A default ProcessLauncher on tokio::process for hosts without their own spawner.
-launcher-tokio = []
+launcher-tokio = ["dep:nix", "tokio/io-util", "tokio/process"]
 # FakeLauncher, FakeHarness, ScriptedLink and the harness conformance cases.
 testing = []
 
@@ -38,6 +38,11 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 # choice rather than whatever a transitive default would have picked.
 rustls = { version = "0.23.35", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"], optional = true }
+
+# Signals for the default launcher's escalation. `unsafe_code` is forbidden in this workspace, so
+# the process-group signal goes through a safe binding rather than a raw `libc::kill`.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["process", "signal"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "test-util"] }

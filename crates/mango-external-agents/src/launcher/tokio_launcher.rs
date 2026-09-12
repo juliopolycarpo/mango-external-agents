@@ -1,0 +1,651 @@
+//! A launcher on `tokio::process`.
+
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::sync::watch;
+
+use crate::error::{Error, Result};
+use crate::process::{
+    ByteSink, ByteSource, DEFAULT_STDERR_TAIL_BYTES, ExitStatus, LaunchSpec, ManagedProcess,
+    ProcessControl, ProcessLauncher, StderrTail,
+};
+use crate::session::CancelReason;
+
+/// How much of a child's output is read at once.
+const CHUNK_BYTES: usize = 16 * 1024;
+
+/// Windows `CREATE_NO_WINDOW`: an agent CLI is not something a user asked to see a console for.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The ordinary way to spawn a vendor CLI.
+///
+/// On Unix a child leads its own process group, so escalation reaches everything it started rather
+/// than only the process the library can see. On Windows the tree is ended through `taskkill /T`,
+/// because a direct child handle does not imply ownership of its descendants there.
+///
+/// Escalation asks before it insists: the caller closes stdin, then this sends the polite signal,
+/// waits out the grace, and only then insists. A vendor asked to stop writes its own state first,
+/// and a library that skipped straight to the unstoppable signal would lose that every time.
+#[derive(Clone, Debug)]
+pub struct TokioLauncher {
+    kill_grace: Duration,
+    stderr_tail_bytes: usize,
+}
+
+impl Default for TokioLauncher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TokioLauncher {
+    /// A launcher with the ordinary grace period.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::launcher::TokioLauncher;
+    /// use std::sync::Arc;
+    ///
+    /// let launcher: Arc<dyn mango_external_agents::ProcessLauncher> = Arc::new(TokioLauncher::new());
+    /// ```
+    pub fn new() -> Self {
+        Self {
+            kill_grace: Duration::from_secs(2),
+            stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
+        }
+    }
+
+    /// Gives a child this long to exit on its own at each step of the escalation.
+    #[must_use]
+    pub fn with_kill_grace(mut self, kill_grace: Duration) -> Self {
+        self.kill_grace = kill_grace;
+        self
+    }
+
+    /// Keeps this much of a child's stderr for diagnostics.
+    #[must_use]
+    pub fn with_stderr_tail_bytes(mut self, stderr_tail_bytes: usize) -> Self {
+        self.stderr_tail_bytes = stderr_tail_bytes;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for TokioLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        let Some(program) = spec.program() else {
+            return Err(Error::HostConfiguration {
+                expected: "an argv naming a program",
+                received: String::from("an empty argv"),
+            });
+        };
+
+        let mut command = Command::new(program);
+        command
+            .args(&spec.argv[1..])
+            .current_dir(&spec.cwd)
+            // The allowlist is the whole environment, not an addition to this process's.
+            .env_clear()
+            .envs(&spec.env)
+            .stdin(if spec.stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(windows)]
+        if spec.hide_window {
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = command.spawn().map_err(|error| Error::Launch {
+            program: program.to_owned(),
+            message: error.to_string(),
+        })?;
+
+        let pid = child.id();
+        let stdout = child.stdout.take().ok_or_else(|| Error::Launch {
+            program: program.to_owned(),
+            message: String::from("expected a readable stdout, received none"),
+        })?;
+        let stdin = child.stdin.take();
+        let stderr_pipe = child.stderr.take();
+
+        let stderr = StderrTail::with_capacity(self.stderr_tail_bytes);
+        if let Some(mut pipe) = stderr_pipe {
+            let tail = stderr.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; CHUNK_BYTES];
+                while let Ok(read) = pipe.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    tail.push(&buffer[..read]);
+                }
+            });
+        }
+
+        // The child is owned by one reaper task, so every waiter reads the same answer and nothing
+        // races to `wait` on it twice.
+        let (exited, exit) = watch::channel(None);
+        tokio::spawn(async move {
+            let status = child.wait().await.ok().map(|status| ExitStatus {
+                code: status.code(),
+                signal: signal_of(&status),
+            });
+            let _ = exited.send(Some(status.unwrap_or_default()));
+        });
+
+        Ok(ManagedProcess {
+            stdout: Box::new(PipeSource {
+                stdout,
+                buffer: vec![0_u8; CHUNK_BYTES],
+            }),
+            stdin: stdin
+                .map(|stdin| -> Box<dyn ByteSink> { Box::new(PipeSink { stdin: Some(stdin) }) }),
+            control: Arc::new(TokioChild {
+                pid,
+                exit,
+                stderr,
+                kill_grace: self.kill_grace,
+                killed: AtomicBool::new(false),
+            }),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(status)
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+struct PipeSource {
+    stdout: ChildStdout,
+    buffer: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl ByteSource for PipeSource {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        let read = self
+            .stdout
+            .read(&mut self.buffer)
+            .await
+            .map_err(|error| Error::Link {
+                peer: String::from("child stdout"),
+                message: error.to_string(),
+            })?;
+        if read == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.buffer[..read].to_vec()))
+    }
+}
+
+/// The write half of a child's stdin, held so that closing it really closes it.
+///
+/// `shutdown` is not enough: on a child's stdin it resolves without closing the descriptor, and
+/// the pipe only reaches the child as end-of-input when the handle is dropped. A print-mode vendor
+/// reads until end of input, so a close that did not close would be a process that never finishes
+/// and a turn that ends only at the host's hard timeout.
+struct PipeSink {
+    stdin: Option<ChildStdin>,
+}
+
+#[async_trait::async_trait]
+impl ByteSink for PipeSink {
+    async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(Error::Closed {
+                subject: "child stdin",
+            });
+        };
+        stdin.write_all(bytes).await.map_err(pipe_error)?;
+        stdin.flush().await.map_err(pipe_error)
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        // Idempotent: a close racing a normal finish must not fail the second caller.
+        let Some(mut stdin) = self.stdin.take() else {
+            return Ok(());
+        };
+        // A child that already exited closed this end for us; that is not a failure to report.
+        let _ = stdin.shutdown().await;
+        drop(stdin);
+        Ok(())
+    }
+}
+
+fn pipe_error(error: std::io::Error) -> Error {
+    Error::Link {
+        peer: String::from("child stdin"),
+        message: error.to_string(),
+    }
+}
+
+struct TokioChild {
+    pid: Option<u32>,
+    exit: watch::Receiver<Option<ExitStatus>>,
+    stderr: StderrTail,
+    kill_grace: Duration,
+    killed: AtomicBool,
+}
+
+impl TokioChild {
+    fn exited(&self) -> Option<ExitStatus> {
+        *self.exit.borrow()
+    }
+
+    /// Waits out the grace, and says whether the child went away inside it.
+    async fn exited_within(&self, grace: Duration) -> bool {
+        let mut exit = self.exit.clone();
+        tokio::time::timeout(grace, async {
+            loop {
+                if exit.borrow_and_update().is_some() {
+                    return;
+                }
+                if exit.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for TokioChild {
+    fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.stderr.read()
+    }
+
+    async fn wait(&self) -> Result<ExitStatus> {
+        let mut exit = self.exit.clone();
+        loop {
+            if let Some(status) = *exit.borrow_and_update() {
+                return Ok(status);
+            }
+            if exit.changed().await.is_err() {
+                return Ok(ExitStatus::default());
+            }
+        }
+    }
+
+    async fn kill(&self, _reason: CancelReason) -> Result<()> {
+        if self.exited().is_some() {
+            return Ok(());
+        }
+        let Some(pid) = self.pid else {
+            return Err(Error::Launch {
+                program: String::from("<unknown>"),
+                message: String::from("expected a process id to end, received none"),
+            });
+        };
+        // Once, even if several tasks ask: a second escalation would be signalling a pid the
+        // operating system may already have handed to somebody else.
+        if self.killed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        end_process_tree(pid, self.kill_grace, self).await
+    }
+}
+
+#[cfg(unix)]
+async fn end_process_tree(pid: u32, grace: Duration, child: &TokioChild) -> Result<()> {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    let group = Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX));
+
+    // The polite ask goes to the whole group as a unit, so every member runs its own shutdown.
+    let _ = killpg(group, Signal::SIGTERM);
+    if child.exited_within(grace).await {
+        return Ok(());
+    }
+
+    let _ = killpg(group, Signal::SIGKILL);
+    if child.exited_within(grace).await {
+        return Ok(());
+    }
+    Err(Error::Launch {
+        program: format!("process group {pid}"),
+        message: format!("expected the tree to end within {grace:?}, received a live process"),
+    })
+}
+
+#[cfg(windows)]
+async fn end_process_tree(pid: u32, grace: Duration, child: &TokioChild) -> Result<()> {
+    // A direct child handle does not imply ownership of descendants here, so the tree is ended
+    // through the system's own primitive rather than by killing what the library can see.
+    let mut taskkill = Command::new("taskkill");
+    taskkill
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+
+    let ran = tokio::time::timeout(grace, taskkill.status()).await;
+    if child.exited_within(grace).await {
+        return Ok(());
+    }
+    Err(Error::Launch {
+        program: format!("process tree {pid}"),
+        message: match ran {
+            Ok(Ok(status)) => format!(
+                "expected taskkill to end the tree, received exit status {status} and a live process"
+            ),
+            Ok(Err(error)) => format!("expected taskkill to run, received {error}"),
+            Err(_) => format!("expected taskkill to answer within {grace:?}, received nothing"),
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokioLauncher;
+    use crate::process::{LaunchSpec, LineLimits, LineStream, ProcessLauncher};
+    use crate::session::CancelReason;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    /// Selects what the re-executed test binary does when it stands in for a vendor CLI.
+    const FIXTURE_MODE: &str = "MEA_LAUNCHER_FIXTURE";
+
+    /// The child half of every test below.
+    ///
+    /// Re-executing this binary is what makes the launcher testable on all three operating systems
+    /// without shipping a fixture program or assuming a shell: the test binary is the one
+    /// executable that is certainly present and certainly runnable.
+    #[test]
+    fn launcher_fixture_child() {
+        let Ok(mode) = std::env::var(FIXTURE_MODE) else {
+            return;
+        };
+        match mode.as_str() {
+            "lines" => println!("MEA-FIXTURE first line\nMEA-FIXTURE second"),
+            "environment" => {
+                for (key, value) in std::env::vars() {
+                    println!("MEA-FIXTURE {key}={value}");
+                }
+            }
+            "stderr" => eprint!(
+                "Authorization: Bearer top-secret API_KEY=another-secret redis://app:password@db/main"
+            ),
+            "echo" => {
+                use std::io::Write as _;
+                let mut line = String::new();
+                while std::io::stdin()
+                    .read_line(&mut line)
+                    .is_ok_and(|read| read > 0)
+                {
+                    print!("MEA-FIXTURE echo:{line}");
+                    // A piped stdout is block-buffered, so an answer nobody flushed is an answer
+                    // that never arrives — which is exactly how a real vendor CLI hangs a turn.
+                    std::io::stdout().flush().ok();
+                    line.clear();
+                }
+            }
+            "forever" => loop {
+                std::thread::sleep(Duration::from_secs(60));
+            },
+            _ => {}
+        }
+        // Before the harness prints its own trailer, so the child's output is only its own.
+        std::process::exit(0);
+    }
+
+    fn fixture(mode: &str) -> LaunchSpec {
+        let executable = std::env::current_exe().expect("expected the test binary's own path");
+        LaunchSpec {
+            argv: vec![
+                executable.to_string_lossy().into_owned(),
+                // A substring filter rather than `--exact`, which would have to spell out the
+                // module path and would silently match nothing after a rename.
+                String::from("launcher_fixture_child"),
+                String::from("--nocapture"),
+                String::from("--test-threads=1"),
+            ],
+            cwd: std::env::temp_dir(),
+            env: BTreeMap::from([
+                (String::from(FIXTURE_MODE), mode.to_owned()),
+                (
+                    String::from("PATH"),
+                    std::env::var("PATH").unwrap_or_default(),
+                ),
+            ]),
+            stdin: true,
+            hide_window: true,
+        }
+    }
+
+    /// Every line the fixture itself wrote, without the test harness's own chatter.
+    async fn fixture_lines(mode: &str) -> Vec<String> {
+        let child = TokioLauncher::new()
+            .spawn(fixture(mode))
+            .await
+            .expect("expected a child");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        let mut written = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("expected a line or the end") {
+            if let Some((_, rest)) = line.split_once("MEA-FIXTURE ") {
+                written.push(rest.to_owned());
+            }
+        }
+        written
+    }
+
+    #[tokio::test]
+    async fn reads_a_childs_output_line_by_line() {
+        assert_eq!(
+            fixture_lines("lines").await,
+            vec![String::from("first line"), String::from("second")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_receives_the_allowlist_and_nothing_else() {
+        // SAFETY-adjacent: this is the host's own process environment, which the launcher is
+        // required to ignore. Setting it here is what proves it is ignored.
+        let mut spec = fixture("environment");
+        spec.env.insert(
+            String::from("CONNECTOR_SECRET"),
+            String::from("never-forward-this"),
+        );
+        let child = TokioLauncher::new()
+            .spawn(spec)
+            .await
+            .expect("expected a child");
+
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        let mut environment = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("expected a line or the end") {
+            if let Some((_, rest)) = line.split_once("MEA-FIXTURE ") {
+                environment.push(rest.to_owned());
+            }
+        }
+
+        // What the spec carried reaches the child; what it did not carry does not.
+        assert!(
+            environment
+                .iter()
+                .any(|entry| entry.starts_with("MEA_LAUNCHER_FIXTURE=")),
+            "expected the spec's own keys, received {environment:?}"
+        );
+        assert!(
+            !environment
+                .iter()
+                .any(|entry| entry.contains("CARGO_PKG_NAME")),
+            "expected this process's environment to be cleared, received {environment:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_to_a_childs_stdin_and_reads_its_answer() {
+        let mut child = TokioLauncher::new()
+            .spawn(fixture("echo"))
+            .await
+            .expect("expected a child");
+        let mut stdin = child.stdin.take().expect("expected a stdin");
+
+        stdin
+            .write_all(b"ping\n")
+            .await
+            .expect("expected the write to land");
+
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        let mut seen = Vec::new();
+        let answered = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(line) = lines.next_line().await.expect("expected a line or the end") {
+                if let Some((_, rest)) = line.split_once("MEA-FIXTURE ") {
+                    return rest.to_owned();
+                }
+                seen.push(line);
+            }
+            String::new()
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected an answer, received {seen:?}"));
+        assert_eq!(answered, "echo:ping", "received {seen:?}");
+
+        // Closing stdin is the polite end: the child's read returns nothing and it exits. Bounded,
+        // because a close that did not really close would otherwise hang this test rather than
+        // fail it — which is how the defect it guards against first showed up.
+        stdin.close().await.expect("expected the close to land");
+        let status = tokio::time::timeout(Duration::from_secs(20), child.control.wait())
+            .await
+            .expect("expected closing stdin to end the child")
+            .expect("expected an exit status");
+        assert!(status.success(), "received {status:?}");
+    }
+
+    #[tokio::test]
+    async fn closing_a_childs_input_twice_is_harmless() {
+        let mut child = TokioLauncher::new()
+            .spawn(fixture("echo"))
+            .await
+            .expect("expected a child");
+        let mut stdin = child.stdin.take().expect("expected a stdin");
+
+        stdin.close().await.expect("expected the close to land");
+        stdin
+            .close()
+            .await
+            .expect("expected a second close to be harmless");
+        assert!(
+            stdin.write_all(b"late\n").await.is_err(),
+            "expected a write after close to be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_a_redacted_stderr_tail() {
+        let child = TokioLauncher::new()
+            .spawn(fixture("stderr"))
+            .await
+            .expect("expected a child");
+        child.control.wait().await.expect("expected an exit");
+
+        let tail = child.control.stderr_tail();
+        assert!(tail.contains("[REDACTED]"), "received {tail:?}");
+        assert!(!tail.contains("top-secret"), "received {tail:?}");
+        assert!(!tail.contains("another-secret"), "received {tail:?}");
+        assert!(!tail.contains("password@"), "received {tail:?}");
+    }
+
+    #[tokio::test]
+    async fn ends_a_child_that_would_never_exit_on_its_own() {
+        let child = TokioLauncher::new()
+            .with_kill_grace(Duration::from_millis(500))
+            .spawn(fixture("forever"))
+            .await
+            .expect("expected a child");
+
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("expected the child to be ended");
+        let status = tokio::time::timeout(Duration::from_secs(10), child.control.wait())
+            .await
+            .expect("expected the child to have exited")
+            .expect("expected an exit status");
+        assert!(
+            !status.success(),
+            "expected a killed child not to report success, received {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn killing_twice_is_harmless() {
+        let child = TokioLauncher::new()
+            .with_kill_grace(Duration::from_millis(500))
+            .spawn(fixture("forever"))
+            .await
+            .expect("expected a child");
+
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("expected the child to be ended");
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("expected a second kill to be harmless");
+    }
+
+    #[tokio::test]
+    async fn a_program_that_does_not_exist_is_a_typed_launch_failure() {
+        let mut spec = fixture("lines");
+        spec.argv[0] = String::from("mea-no-such-program");
+
+        let error = TokioLauncher::new()
+            .spawn(spec)
+            .await
+            .err()
+            .expect("expected a refusal, received a child");
+        assert!(
+            matches!(error, crate::Error::Launch { .. }),
+            "expected a launch failure, received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_argv_is_refused_before_anything_is_spawned() {
+        let mut spec = fixture("lines");
+        spec.argv.clear();
+
+        let error = TokioLauncher::new()
+            .spawn(spec)
+            .await
+            .err()
+            .expect("expected a refusal, received a child");
+        assert!(
+            matches!(error, crate::Error::HostConfiguration { .. }),
+            "expected a configuration refusal, received {error:?}"
+        );
+    }
+}
