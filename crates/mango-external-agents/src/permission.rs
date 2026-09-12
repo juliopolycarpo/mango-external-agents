@@ -808,6 +808,25 @@ mod tests {
         );
     }
 
+    /// The flag a host renders as a warning on the choice that deletes something. It survives
+    /// normalising, because a bounded label on an unmarked option is a prompt that lost the one
+    /// thing it was trying to say.
+    #[test]
+    fn a_destructive_choice_stays_marked_through_normalising() {
+        let marked = PermissionOption::new("wipe", PermissionOptionKind::AllowOnce).destructive();
+        assert!(marked.destructive);
+        assert!(!PermissionOption::new("ok", PermissionOptionKind::AllowOnce).destructive);
+
+        let normalised = request(vec![marked])
+            .normalized()
+            .expect("expected a bounded request");
+        assert!(
+            normalised.options[0].destructive,
+            "received {:?}",
+            normalised.options[0]
+        );
+    }
+
     #[tokio::test]
     async fn no_broker_means_the_request_reaches_the_host() {
         assert_eq!(broker_response(None, &request(four_options())).await, None);

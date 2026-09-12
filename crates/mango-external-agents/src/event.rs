@@ -823,6 +823,21 @@ mod tests {
         );
     }
 
+    /// A quota the harness could not read is unknown, never zero, which is why the snapshot
+    /// carries the instant it was read even when it carries no windows.
+    #[test]
+    fn an_unknown_quota_is_a_snapshot_with_no_windows_rather_than_an_empty_one() {
+        use super::AccountLimits;
+        use std::time::{Duration, SystemTime};
+
+        let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let limits = AccountLimits::unknown(observed_at);
+
+        assert!(limits.windows.is_empty());
+        assert_eq!(limits.plan_type, None);
+        assert_eq!(limits.observed_at, observed_at);
+    }
+
     /// `used_percent` is derived, and a derivation divides. A window with no denominator yields
     /// `NaN`, which `serde_json` refuses to write — so a host that persists its events would lose
     /// the whole event over one field rather than one unreadable percentage.

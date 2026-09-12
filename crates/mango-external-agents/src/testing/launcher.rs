@@ -477,6 +477,30 @@ mod tests {
         );
     }
 
+    /// A vendor that failed exited non-zero, and a fake that could not say so would make every
+    /// failure path untestable.
+    #[tokio::test]
+    async fn a_child_reports_the_exit_status_it_was_given() {
+        let launcher = FakeLauncher::new();
+        launcher.push(
+            FakeProcess::transcript(Vec::<String>::new()).with_exit(crate::ExitStatus {
+                code: Some(2),
+                signal: None,
+            }),
+        );
+        let child = launcher
+            .spawn(spec(&["claude"]))
+            .await
+            .expect("expected a child");
+
+        let status = child.control.wait().await.expect("expected an exit status");
+        assert_eq!(status.code, Some(2));
+        assert!(
+            !status.success(),
+            "expected a failing status, received {status:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_launch_nobody_queued_is_refused_rather_than_silently_empty() {
         let error = FakeLauncher::new()

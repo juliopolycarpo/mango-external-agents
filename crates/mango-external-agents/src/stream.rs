@@ -334,6 +334,28 @@ mod tests {
         assert!(sink.is_closed());
     }
 
+    /// A failure is a terminal on its own: unlike a cancellation it is not followed by a
+    /// completion, so a host reading `is_terminal` still sees its turn end exactly once.
+    #[tokio::test]
+    async fn a_failed_turn_ends_on_the_error_itself() {
+        use crate::error::{ErrorCode, VendorError};
+
+        let (sink, mut events) = sink(4);
+        sink.fail(VendorError::new(
+            ErrorCode::from_static("fake-stream-broken"),
+            "the vendor exited mid-turn",
+        ))
+        .await
+        .expect("expected the failure to be sent");
+
+        let event = events.recv().await.expect("expected an error event");
+        assert!(event.is_terminal(), "received {:?}", event.kind);
+        let EventKind::Error { error } = event.kind else {
+            panic!("expected an error event");
+        };
+        assert_eq!(error.message, "the vendor exited mid-turn");
+    }
+
     #[tokio::test]
     async fn a_cancelled_turn_still_completes() {
         let (sink, events) = sink(4);
