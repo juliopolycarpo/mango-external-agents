@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 
 use crate::env::EnvSource;
 use crate::error::{Error, Result};
+use crate::permission::PermissionBroker;
 use crate::process::{DEFAULT_STDERR_TAIL_BYTES, LineLimits, ProcessLauncher};
 use crate::transport::ExecutablePath;
 
@@ -177,6 +178,7 @@ pub struct HostContext {
     client_info: ClientInfo,
     clock: Arc<dyn Clock>,
     cancel: CancelToken,
+    broker: Option<Arc<dyn PermissionBroker>>,
     limits: Limits,
 }
 
@@ -228,6 +230,14 @@ impl HostContext {
         &self.cancel
     }
 
+    /// The host's approval policy, when it has one.
+    ///
+    /// `None` means every approval reaches the host as an event, which is the default: nothing in
+    /// the library grants a permission on its own.
+    pub fn broker(&self) -> Option<&Arc<dyn PermissionBroker>> {
+        self.broker.as_ref()
+    }
+
     /// The caps the library reads vendors under.
     pub fn limits(&self) -> &Limits {
         &self.limits
@@ -264,6 +274,7 @@ pub struct HostContextBuilder {
     client_info: Option<ClientInfo>,
     clock: Option<Arc<dyn Clock>>,
     cancel: Option<CancelToken>,
+    broker: Option<Arc<dyn PermissionBroker>>,
     limits: Option<Limits>,
 }
 
@@ -317,6 +328,15 @@ impl HostContextBuilder {
         self
     }
 
+    /// A policy that answers approvals without asking a person.
+    ///
+    /// Optional, and its absence is the safe default: every approval reaches the host.
+    #[must_use]
+    pub fn broker(mut self, broker: Arc<dyn PermissionBroker>) -> Self {
+        self.broker = Some(broker);
+        self
+    }
+
     /// Caps other than the defaults.
     #[must_use]
     pub fn limits(mut self, limits: Limits) -> Self {
@@ -354,6 +374,7 @@ impl HostContextBuilder {
             client_info,
             clock: self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
             cancel: self.cancel.unwrap_or_default(),
+            broker: self.broker,
             limits: self.limits.unwrap_or_default(),
         })
     }

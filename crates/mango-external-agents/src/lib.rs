@@ -6,6 +6,7 @@ pub mod event;
 pub mod harness;
 pub mod host;
 pub mod normalize;
+pub mod permission;
 pub mod process;
 pub mod redact;
 pub mod session;
@@ -23,6 +24,11 @@ pub use harness::{
 };
 pub use host::{
     CancelToken, ClientInfo, Clock, HostContext, HostContextBuilder, Limits, SystemClock,
+};
+pub use permission::{
+    ApprovalDecision, ApprovalRouting, BrokerDecision, ConfigurationVerdict, DecisionSource,
+    PermissionBroker, PermissionLevel, PermissionMatrix, PermissionOption, PermissionOptionKind,
+    PermissionRequest, PermissionResponse, SupportedConfiguration, UnsupportedReason,
 };
 pub use process::{
     ByteSink, ByteSource, ExitStatus, LaunchSpec, LineLimits, LineStream, ManagedProcess,

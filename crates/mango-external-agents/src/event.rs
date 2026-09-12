@@ -16,6 +16,7 @@ use std::time::SystemTime;
 
 use crate::error::{Result, VendorError};
 use crate::normalize::{self, COMMAND_CATALOG_MAX_ITEMS, TextLimit};
+use crate::permission::{ApprovalDecision, PermissionRequest};
 use crate::session::CancelReason;
 
 /// The host's own id for a session.
@@ -158,6 +159,22 @@ pub enum EventKind {
         /// How it ended.
         result: ActivityResult,
     },
+    /// The vendor is asking whether it may do something, and the turn is waiting.
+    ///
+    /// Answered through [`Session::respond`](crate::Session::respond). Nothing in the library
+    /// answers one on the vendor's behalf; a host with a policy implements a
+    /// [`PermissionBroker`](crate::PermissionBroker) and the answer is still the host's.
+    ApprovalRequested {
+        /// What is being asked, and the choices the vendor offered.
+        request: PermissionRequest,
+    },
+    /// An approval was answered, however it was reached.
+    ApprovalResolved {
+        /// Which question.
+        request_id: String,
+        /// What was decided.
+        decision: ApprovalDecision,
+    },
     /// Tokens this turn used, as the vendor reported them.
     Usage {
         /// What it reported.
@@ -229,6 +246,19 @@ impl EventKind {
             Self::ActivityCompleted { call_id, result } => Self::ActivityCompleted {
                 call_id: normalize::opaque_id(&call_id, "activity call id")?,
                 result: result.normalized(),
+            },
+            Self::ApprovalRequested { request } => Self::ApprovalRequested {
+                request: request.normalized()?,
+            },
+            Self::ApprovalResolved {
+                request_id,
+                decision,
+            } => Self::ApprovalResolved {
+                request_id: normalize::opaque_id(&request_id, "approval request id")?,
+                decision: ApprovalDecision {
+                    option_id: normalize::opaque_id(&decision.option_id, "approval option id")?,
+                    source: decision.source,
+                },
             },
             Self::AccountLimits { limits } => Self::AccountLimits {
                 limits: limits.normalized(),
