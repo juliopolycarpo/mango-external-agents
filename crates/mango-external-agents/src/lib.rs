@@ -18,6 +18,7 @@ pub mod stream;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod transport;
+pub mod transports;
 
 pub use discovery::{AuthMode, AuthState, Discovery, GateVerdict, Model, ReasoningEffort};
 pub use env::EnvSource;

@@ -1,0 +1,265 @@
+//! A child process's pipes, framed by lines.
+//!
+//! The library owns the framing and the caps; the host owns the spawn. What comes back is a
+//! [`Link`] that knows nothing about processes, plus the control handle for the child underneath
+//! it — separate because ending a process is a different decision from ending a conversation.
+
+use std::sync::Arc;
+
+use crate::error::{Error, Result};
+use crate::host::HostContext;
+use crate::link::{Link, LinkReceiver, LinkSender};
+use crate::process::{ByteSink, LineStream, ProcessControl};
+use crate::transport::StdioSpec;
+
+/// A spawned child, as a link and the handle that ends it.
+pub struct StdioTransport {
+    /// Messages in and out, one line each.
+    pub link: Link,
+    /// The child underneath, for waiting on it and ending it.
+    pub control: Arc<dyn ProcessControl>,
+}
+
+impl std::fmt::Debug for StdioTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StdioTransport")
+            .field("pid", &self.control.pid())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Spawns `spec` through the host's launcher and frames its stdout by lines.
+///
+/// The working directory and the environment come from the host: the directory it authorised, and
+/// the positive allowlist built from its [`EnvSource`](crate::EnvSource) plus the harness's own
+/// documented keys. A harness cannot widen either, which is the point of passing only an argv.
+///
+/// # Errors
+///
+/// [`Error::HostConfiguration`] when the argv is empty, and whatever the host's launcher reported
+/// otherwise.
+pub async fn open(
+    host: &HostContext,
+    spec: &StdioSpec,
+    vendor_environment_keys: &[&str],
+) -> Result<StdioTransport> {
+    let Some(program) = spec.program() else {
+        return Err(Error::HostConfiguration {
+            expected: "an argv naming a program",
+            received: String::from("an empty argv"),
+        });
+    };
+
+    // The host resolved the executable if it could; the harness only knows the program's name.
+    let mut argv = spec.argv.clone();
+    argv[0] = host.executable().or(program.to_owned());
+
+    let mut child = host
+        .launcher()
+        .spawn(crate::process::LaunchSpec {
+            argv,
+            cwd: host.cwd().to_path_buf(),
+            env: host.child_environment(vendor_environment_keys),
+            stdin: true,
+            hide_window: true,
+        })
+        .await?;
+
+    let stdin = child.stdin.take().ok_or_else(|| Error::Launch {
+        program: program.to_owned(),
+        message: String::from("expected a writable stdin, received none"),
+    })?;
+
+    Ok(StdioTransport {
+        link: Link::new(
+            Box::new(LineSink { stdin }),
+            Box::new(LineSource {
+                lines: LineStream::new(child.stdout, host.limits().line),
+            }),
+        ),
+        control: child.control,
+    })
+}
+
+/// Writes one message per line.
+struct LineSink {
+    stdin: Box<dyn ByteSink>,
+}
+
+#[async_trait::async_trait]
+impl LinkSender for LineSink {
+    async fn send(&mut self, message: String) -> Result<()> {
+        // One write rather than two: a second write could interleave with another task's message
+        // and split a frame across two lines.
+        self.stdin
+            .write_all(format!("{message}\n").as_bytes())
+            .await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        self.stdin.close().await
+    }
+}
+
+/// Reads one message per line.
+struct LineSource {
+    lines: LineStream,
+}
+
+#[async_trait::async_trait]
+impl LinkReceiver for LineSource {
+    async fn recv(&mut self) -> Result<Option<String>> {
+        self.lines.next_line().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open;
+    use crate::env::EnvSource;
+    use crate::error::Error;
+    use crate::host::HostContext;
+    use crate::testing::{FakeLauncher, FakeProcess};
+    use crate::transport::{ExecutablePath, StdioSpec};
+    use std::sync::Arc;
+
+    fn host(launcher: Arc<FakeLauncher>) -> HostContext {
+        HostContext::builder()
+            .launcher(launcher)
+            .cwd("/workspace")
+            .client_info("test-host", "0.0.0")
+            .environment(EnvSource::from_pairs([
+                ("PATH", "/bin"),
+                ("CONNECTOR_SECRET", "never-forward-this"),
+                ("VENDOR_CONFIG", "/home/ada/.vendor"),
+            ]))
+            .build()
+            .expect("expected a context")
+    }
+
+    #[tokio::test]
+    async fn spawns_with_the_hosts_directory_and_only_the_allowlisted_environment() {
+        let launcher = Arc::new(FakeLauncher::scripted("{}\n"));
+        let host = host(Arc::clone(&launcher));
+
+        open(
+            &host,
+            &StdioSpec::new(["codex", "app-server"]),
+            &["VENDOR_CONFIG"],
+        )
+        .await
+        .expect("expected a transport");
+
+        let launch = launcher.last_launch().expect("expected one launch");
+        assert_eq!(launch.argv, vec!["codex", "app-server"]);
+        assert_eq!(launch.cwd.to_string_lossy(), "/workspace");
+        assert_eq!(launch.env.get("PATH").map(String::as_str), Some("/bin"));
+        assert_eq!(
+            launch.env.get("VENDOR_CONFIG").map(String::as_str),
+            Some("/home/ada/.vendor")
+        );
+        assert_eq!(launch.env.get("CONNECTOR_SECRET"), None);
+        assert!(launch.stdin, "expected a writable stdin");
+        assert!(launch.hide_window, "expected no console window");
+    }
+
+    #[tokio::test]
+    async fn an_executable_the_host_resolved_replaces_the_bare_program_name() {
+        let launcher = Arc::new(FakeLauncher::scripted(""));
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd("/workspace")
+            .client_info("test-host", "0.0.0")
+            .executable(ExecutablePath::resolved("/opt/codex/bin/codex"))
+            .build()
+            .expect("expected a context");
+
+        open(&host, &StdioSpec::new(["codex", "app-server"]), &[])
+            .await
+            .expect("expected a transport");
+
+        let launch = launcher.last_launch().expect("expected one launch");
+        assert_eq!(launch.argv[0], "/opt/codex/bin/codex");
+        assert_eq!(launch.argv[1], "app-server");
+    }
+
+    #[tokio::test]
+    async fn one_message_is_one_line_in_each_direction() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::responding(|line| vec![format!("echo:{line}")]));
+        let host = host(Arc::clone(&launcher));
+
+        let transport = open(&host, &StdioSpec::new(["codex"]), &[])
+            .await
+            .expect("expected a transport");
+        let (mut sender, mut receiver) = transport.link.split();
+
+        sender
+            .send(String::from(r#"{"method":"ping"}"#))
+            .await
+            .expect("expected the send to land");
+        assert_eq!(
+            receiver.recv().await.expect("expected a message"),
+            Some(String::from(r#"echo:{"method":"ping"}"#))
+        );
+        assert_eq!(
+            launcher.written(),
+            vec![String::from(r#"{"method":"ping"}"#)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_that_exits_ends_the_link_rather_than_hanging() {
+        let launcher = Arc::new(FakeLauncher::scripted("one\ntwo\n"));
+        let host = host(Arc::clone(&launcher));
+
+        let transport = open(&host, &StdioSpec::new(["claude"]), &[])
+            .await
+            .expect("expected a transport");
+        let (_, mut receiver) = transport.link.split();
+
+        assert_eq!(
+            receiver.recv().await.expect("expected a message"),
+            Some(String::from("one"))
+        );
+        assert_eq!(
+            receiver.recv().await.expect("expected a message"),
+            Some(String::from("two"))
+        );
+        assert_eq!(receiver.recv().await.expect("expected the end"), None);
+    }
+
+    #[tokio::test]
+    async fn closing_the_sender_closes_the_childs_input() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let host = host(Arc::clone(&launcher));
+
+        let transport = open(&host, &StdioSpec::new(["claude"]), &[])
+            .await
+            .expect("expected a transport");
+        let (mut sender, mut receiver) = transport.link.split();
+
+        sender.close().await.expect("expected the close to land");
+        assert_eq!(receiver.recv().await.expect("expected the end"), None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_argv_is_refused_before_anything_is_spawned() {
+        let launcher = Arc::new(FakeLauncher::new());
+        let host = host(Arc::clone(&launcher));
+
+        let error = open(&host, &StdioSpec::new(Vec::<String>::new()), &[])
+            .await
+            .expect_err("expected a refusal, received a transport");
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "expected a configuration refusal, received {error:?}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected nothing to be spawned"
+        );
+    }
+}

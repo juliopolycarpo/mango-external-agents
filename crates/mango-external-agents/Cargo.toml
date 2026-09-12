@@ -20,7 +20,7 @@ default = ["stdio"]
 # Line-framed child processes spawned through the host's ProcessLauncher.
 stdio = []
 # A dialled WebSocket URL (tokio-tungstenite over ring).
-websocket = []
+websocket = ["dep:futures-util", "dep:rustls", "dep:tokio-tungstenite", "tokio/net"]
 # A default ProcessLauncher on tokio::process for hosts without their own spawner.
 launcher-tokio = []
 # FakeLauncher, FakeHarness, ScriptedLink and the harness conformance cases.
@@ -33,8 +33,14 @@ serde_json = { version = "1.0.151", default-features = false, features = ["std"]
 thiserror = { version = "2.0.20", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"], optional = true }
+# TLS is `ring` everywhere: named here with no default features, so the provider is this crate's
+# choice rather than whatever a transitive default would have picked.
+rustls = { version = "0.23.35", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"], optional = true }
+
 [dev-dependencies]
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true
