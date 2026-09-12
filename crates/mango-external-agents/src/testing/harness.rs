@@ -303,20 +303,15 @@ impl Session for FakeSession {
         });
 
         // A host policy answers first when it has one; otherwise the question reaches the host.
-        match broker_response(self.host.broker(), &request_for_approval).await {
-            Some(response) => {
-                sink.emit(EventKind::ApprovalRequested {
-                    request: request_for_approval,
-                })
-                .await?;
-                self.finish(&response.option_id, response.source).await?;
-            }
-            None => {
-                sink.emit(EventKind::ApprovalRequested {
-                    request: request_for_approval,
-                })
-                .await?;
-            }
+        // The event is emitted either way — a turn whose approval a policy answered still shows
+        // the host what was asked — so only the answer is conditional.
+        let answer = broker_response(self.host.broker(), &request_for_approval).await;
+        sink.emit(EventKind::ApprovalRequested {
+            request: request_for_approval,
+        })
+        .await?;
+        if let Some(response) = answer {
+            self.finish(&response.option_id, response.source).await?;
         }
 
         Ok(TurnStream {
