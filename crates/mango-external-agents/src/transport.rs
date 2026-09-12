@@ -144,13 +144,34 @@ impl WsSpec {
 }
 
 /// Which carrier the official Agent Client Protocol client rides.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AcpSpec {
     /// A child process's pipes, spawned through the host's launcher.
     ChildPipes(StdioSpec),
     /// An HTTP endpoint the host configured.
+    ///
+    /// A URL, and a URL is a place a credential hides: `https://svc:password@agent.internal` is
+    /// what a host configures when the endpoint is behind basic auth. It is redacted in
+    /// [`Debug`] for the same reason [`WsSpec`]'s is.
     Http(String),
+}
+
+impl fmt::Debug for AcpSpec {
+    /// Hand-written, because the HTTP arm holds a URL that may carry a password.
+    ///
+    /// A derived `Debug` prints the userinfo in the clear, and `TransportSpec` derives its own
+    /// from this one — so a `tracing::debug!(?spec)`, or the `received {spec:?}` idiom the crate's
+    /// own assertions use, would put it in a log.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChildPipes(spec) => formatter.debug_tuple("ChildPipes").field(spec).finish(),
+            Self::Http(url) => formatter
+                .debug_tuple("Http")
+                .field(&crate::redact::stderr_text(url))
+                .finish(),
+        }
+    }
 }
 
 /// Where a harness executable was found, when the host resolved one.
@@ -240,6 +261,30 @@ mod tests {
         assert_eq!(
             WsSpec::new("wss://localhost").with_bearer("t").bearer,
             Some(String::from("t"))
+        );
+    }
+
+    /// The ACP HTTP arm is a URL like the WebSocket one, so it leaks the same password through the
+    /// same `{spec:?}` idiom unless it is redacted the same way.
+    #[test]
+    fn an_acp_endpoints_password_never_reaches_a_debug_line() {
+        let spec = AcpSpec::Http(String::from("https://svc:s3cr3t@agent.internal/acp"));
+        let rendered = format!("{spec:?}");
+
+        assert!(
+            !rendered.contains("s3cr3t"),
+            "expected no url password, received {rendered}"
+        );
+        assert!(
+            rendered.contains("agent.internal"),
+            "expected the endpoint to stay legible, received {rendered}"
+        );
+
+        // `TransportSpec` derives its own `Debug` from this one, so the same must hold there.
+        let wrapped = format!("{:?}", TransportSpec::Acp(spec));
+        assert!(
+            !wrapped.contains("s3cr3t"),
+            "expected no url password through the wrapper, received {wrapped}"
         );
     }
 
