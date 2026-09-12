@@ -75,6 +75,45 @@ impl TokioLauncher {
         self.stderr_tail_bytes = stderr_tail_bytes;
         self
     }
+
+    /// Takes every bound this launcher has from the host's own.
+    ///
+    /// [`Limits`] carries a kill grace and a stderr tail, and this type carried its own copies of
+    /// both. A host that set one and constructed the launcher with the other silently got the
+    /// launcher's — the defaults agree, so nothing would have shown it up until the day a host
+    /// changed one.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::Limits;
+    /// use mango_external_agents::launcher::TokioLauncher;
+    /// use std::time::Duration;
+    ///
+    /// let limits = Limits {
+    ///     kill_grace: Duration::from_secs(10),
+    ///     ..Limits::default()
+    /// };
+    /// let launcher = TokioLauncher::new().with_limits(&limits);
+    ///
+    /// assert_eq!(launcher.kill_grace(), Duration::from_secs(10));
+    /// ```
+    #[must_use]
+    pub fn with_limits(mut self, limits: &crate::host::Limits) -> Self {
+        self.kill_grace = limits.kill_grace;
+        self.stderr_tail_bytes = limits.stderr_tail_bytes;
+        self
+    }
+
+    /// How long a child gets at each step of the escalation.
+    pub fn kill_grace(&self) -> Duration {
+        self.kill_grace
+    }
+
+    /// How much of a child's stderr is kept.
+    pub fn stderr_tail_bytes(&self) -> usize {
+        self.stderr_tail_bytes
+    }
 }
 
 #[async_trait::async_trait]
@@ -302,29 +341,105 @@ impl ProcessControl for TokioChild {
                 message: String::from("expected a process id to end, received none"),
             });
         };
-        // Once, even if several tasks ask: a second escalation would be signalling a pid the
-        // operating system may already have handed to somebody else.
+        // Escalated once, even if several tasks ask: a second escalation would be signalling a
+        // pid the operating system may already have handed to somebody else. The second caller
+        // waits on the first caller's outcome rather than reporting a child that is still inside
+        // its grace as already gone — `Ok` from `kill` is what a host reads as "the workspace is
+        // free".
         if self.killed.swap(true, Ordering::AcqRel) {
-            return Ok(());
+            return if self.exited_within(self.kill_grace * 2).await {
+                Ok(())
+            } else {
+                Err(Error::Launch {
+                    program: format!("process group {pid}"),
+                    message: format!(
+                        "expected the escalation already running to end the tree, received a live process after {:?}",
+                        self.kill_grace * 2
+                    ),
+                })
+            };
         }
         end_process_tree(pid, self.kill_grace, self).await
     }
 }
 
+impl Drop for TokioChild {
+    /// A child whose last handle went away was never asked to stop.
+    ///
+    /// The reaper task owns the `Child` and parks in `wait`, so nothing else would ever end it: a
+    /// handshake that failed after the spawn — the transport is built, `initialize` times out, the
+    /// harness returns `Err` — would leave a persistent app-server holding the user's workspace
+    /// for the life of the host. Relying on the vendor noticing its stdin closed is relying on
+    /// vendor behaviour this library refuses to assume anywhere else.
+    fn drop(&mut self) {
+        if self.exited().is_some() || self.killed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(pid) = self.pid else {
+            return;
+        };
+        let grace = self.kill_grace;
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    ask_tree_to_stop(pid);
+                    tokio::time::sleep(grace).await;
+                    insist_tree_stops(pid);
+                });
+            }
+            // Nothing left to wait a grace on. One signal now beats an orphan.
+            Err(_) => insist_tree_stops(pid),
+        }
+    }
+}
+
+/// Asks a whole tree to stop, as a unit, so every member runs its own shutdown.
+#[cfg(unix)]
+fn ask_tree_to_stop(pid: u32) {
+    use nix::sys::signal::{Signal, killpg};
+
+    let _ = killpg(group_of(pid), Signal::SIGTERM);
+}
+
+/// Ends a tree with the signal it cannot decline.
+#[cfg(unix)]
+fn insist_tree_stops(pid: u32) {
+    use nix::sys::signal::{Signal, killpg};
+
+    let _ = killpg(group_of(pid), Signal::SIGKILL);
+}
+
+#[cfg(unix)]
+fn group_of(pid: u32) -> nix::unistd::Pid {
+    nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX))
+}
+
+/// Windows has no polite step worth taking: `taskkill` without `/F` posts `WM_CLOSE`, which a
+/// console program does not handle, so asking and insisting are the same call.
+#[cfg(windows)]
+fn ask_tree_to_stop(_pid: u32) {}
+
+#[cfg(windows)]
+fn insist_tree_stops(pid: u32) {
+    use std::os::windows::process::CommandExt as _;
+
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
 #[cfg(unix)]
 async fn end_process_tree(pid: u32, grace: Duration, child: &TokioChild) -> Result<()> {
-    use nix::sys::signal::{Signal, killpg};
-    use nix::unistd::Pid;
-
-    let group = Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX));
-
-    // The polite ask goes to the whole group as a unit, so every member runs its own shutdown.
-    let _ = killpg(group, Signal::SIGTERM);
+    ask_tree_to_stop(pid);
     if child.exited_within(grace).await {
         return Ok(());
     }
 
-    let _ = killpg(group, Signal::SIGKILL);
+    insist_tree_stops(pid);
     if child.exited_within(grace).await {
         return Ok(());
     }
@@ -446,6 +561,64 @@ mod tests {
         let mut environment = crate::env::allowlist(source, &[]);
         environment.insert(String::from(FIXTURE_MODE), mode.to_owned());
         environment
+    }
+
+    /// A launcher built from the host's bounds uses them, rather than keeping its own copies.
+    #[test]
+    fn a_launcher_takes_its_bounds_from_the_host() {
+        let limits = crate::Limits {
+            kill_grace: Duration::from_secs(10),
+            stderr_tail_bytes: 4_096,
+            ..crate::Limits::default()
+        };
+        let launcher = TokioLauncher::new().with_limits(&limits);
+
+        assert_eq!(launcher.kill_grace(), Duration::from_secs(10));
+        assert_eq!(launcher.stderr_tail_bytes(), 4_096);
+    }
+
+    /// A handshake that fails after the spawn drops every handle to the child. The reaper owns it
+    /// and parks in `wait`, so without a teardown here a persistent vendor process would hold the
+    /// user's workspace for the life of the host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_last_handle_ends_the_child_rather_than_orphaning_it() {
+        let child = TokioLauncher::new()
+            .with_kill_grace(Duration::from_millis(50))
+            .spawn(fixture("forever"))
+            .await
+            .expect("expected a child");
+        let pid = child.control.pid().expect("expected a process id");
+
+        // Settled first, deliberately. Dropping the moment after the spawn closes the stdout pipe
+        // under a child that has not written yet, and the `SIGPIPE` that follows ends it for a
+        // reason that has nothing to do with this teardown — which is a test that passes without
+        // the code it is testing.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            alive(pid),
+            "expected a child still running before the handles are dropped"
+        );
+
+        drop(child);
+
+        // Bounded: a regression leaves the process running, and an unbounded wait would report
+        // nothing at all.
+        // Bounded: a regression leaves the process running, and an unbounded wait would report
+        // nothing at all.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while alive(pid) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("expected the orphaned child to be ended");
+    }
+
+    /// Whether the operating system still knows this process id.
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
     }
 
     /// Every line the fixture itself wrote, without the test harness's own chatter.
