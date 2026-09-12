@@ -53,15 +53,17 @@ impl Discovery {
     /// This discovery with every vendor-supplied value bounded.
     ///
     /// [`Harness::discover`](crate::Harness::discover) applies this, so a host never sees a probe's
-    /// raw output. Ids are refused rather than cut, on the same terms as everywhere else: a
-    /// shortened id names a different model, and the model it names would be echoed straight back
+    /// raw output. Ids and paths are refused rather than cut, on the same terms as everywhere else:
+    /// a shortened id names a different model, and the model it names would be echoed straight back
     /// to the vendor as the one that was chosen.
     #[must_use]
     pub fn normalized(self) -> Self {
         Self {
+            executable: self.executable.and_then(bounded_executable),
             version: self
                 .version
                 .map(|version| normalize::bound_text(&version, TextLimit::AccountLabel).text),
+            gate: self.gate.normalized(),
             auth: self.auth.normalized(),
             models: self
                 .models
@@ -72,6 +74,18 @@ impl Discovery {
             ..self
         }
     }
+}
+
+/// A probe's executable path, kept only when it survives bounding exactly as it was written.
+///
+/// Dropped rather than repaired, and the one place in this module where that matters most: this
+/// path is what a host hands back as [`OpenSession::with_executable`](crate::OpenSession), which
+/// becomes `argv[0]`. A truncated path names a different file, and a path whose non-UTF-8 bytes
+/// were replaced names a different file too — `ExecutablePath::or` renders it with
+/// `to_string_lossy` on the way to the launcher. A discovery without an executable is one the host
+/// resolves by program name, which is what it did before any probe ran.
+fn bounded_executable(executable: PathBuf) -> Option<PathBuf> {
+    normalize::vendor_path(executable.to_str()?).map(PathBuf::from)
 }
 
 /// Whether the installed build can be driven.
@@ -94,6 +108,23 @@ pub enum GateVerdict {
     /// Deliberately not a refusal: a CLI that changed the shape of `--version` is not a CLI that
     /// stopped working, and a host may still choose to try.
     Unknown,
+}
+
+impl GateVerdict {
+    /// This verdict with every vendor-written label bounded.
+    ///
+    /// Only `found` is the vendor's: `minimum` is the floor this harness declares, so it is not a
+    /// value a probe can grow.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::VersionTooOld { found, minimum } => Self::VersionTooOld {
+                found: normalize::bound_text(&found, TextLimit::AccountLabel).text,
+                minimum,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Whether somebody is signed in.
@@ -365,6 +396,66 @@ mod tests {
             panic!("expected a logged-out state, received {:?}", discovery.auth);
         };
         assert_eq!(login_hint.chars().count(), 256);
+    }
+
+    /// The one probe-written field that round-trips into a spawn: `Discovery::executable` becomes
+    /// `OpenSession::with_executable`, which becomes `argv[0]`. A path that cannot be kept as the
+    /// vendor wrote it is dropped, never repaired, so the host resolves by name instead of running
+    /// something else.
+    #[test]
+    fn an_executable_path_that_cannot_be_kept_verbatim_is_dropped_rather_than_repaired() {
+        let cases = [
+            ("/usr/local/bin/\u{202e}claude", "a bidirectional override"),
+            ("/opt/\u{0}/claude", "a control character"),
+            ("", "an empty path"),
+        ];
+        for (path, what) in cases {
+            let discovery = Discovery {
+                executable: Some(path.into()),
+                ..usable()
+            }
+            .normalized();
+            assert_eq!(
+                discovery.executable, None,
+                "expected {what} to drop the executable, received {:?}",
+                discovery.executable
+            );
+        }
+
+        let long = Discovery {
+            executable: Some(format!("/{}", "p".repeat(4_096)).into()),
+            ..usable()
+        }
+        .normalized();
+        assert_eq!(long.executable, None, "expected an oversized path to drop");
+
+        let kept = Discovery { ..usable() }.normalized();
+        assert_eq!(
+            kept.executable,
+            Some(std::path::PathBuf::from("/usr/local/bin/claude")),
+            "expected an ordinary path to survive untouched"
+        );
+    }
+
+    #[test]
+    fn the_version_a_gate_refused_is_bounded_like_any_other_vendor_label() {
+        let discovery = Discovery {
+            gate: GateVerdict::VersionTooOld {
+                found: "9".repeat(5_000),
+                minimum: String::from("2.0.0"),
+            },
+            ..usable()
+        }
+        .normalized();
+
+        let GateVerdict::VersionTooOld { found, minimum } = discovery.gate else {
+            panic!("expected a refused version, received {:?}", discovery.gate);
+        };
+        assert_eq!(found.chars().count(), 128);
+        assert_eq!(
+            minimum, "2.0.0",
+            "expected the harness's own floor untouched"
+        );
     }
 
     #[test]
