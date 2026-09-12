@@ -131,7 +131,7 @@ mod tests {
             PermissionMatrix::build(|_, _| ConfigurationVerdict::supported())
         }
 
-        async fn discover(&self, _host: &HostContext) -> Result<Discovery> {
+        async fn probe(&self, _host: &HostContext) -> Result<Discovery> {
             Ok(Discovery::not_installed())
         }
 

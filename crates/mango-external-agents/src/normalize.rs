@@ -79,6 +79,15 @@ impl TextLimit {
 /// without silently dropping a real catalog.
 pub const COMMAND_CATALOG_MAX_ITEMS: usize = 256;
 
+/// How many models one discovery may carry.
+///
+/// Sized the same way as the command catalog: a vendor enumerating a dozen is ordinary, and a
+/// vendor enumerating thousands has started enumerating something else.
+pub const MODEL_CATALOG_MAX_ITEMS: usize = 256;
+
+/// How many reasoning choices one model may offer.
+pub const REASONING_EFFORT_MAX_ITEMS: usize = 32;
+
 /// How many choices one approval may carry.
 ///
 /// A harness meeting a larger set refuses that one request rather than emitting it: an

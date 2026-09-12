@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use crate::harness::Capabilities;
-use crate::normalize::{self, TextLimit};
+use crate::normalize::{self, MODEL_CATALOG_MAX_ITEMS, REASONING_EFFORT_MAX_ITEMS, TextLimit};
 
 /// How the installed CLI was found, and what it can do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,14 +50,25 @@ impl Discovery {
             && !matches!(self.auth, AuthState::LoggedOut { .. })
     }
 
-    /// This discovery with every vendor-supplied label bounded.
+    /// This discovery with every vendor-supplied value bounded.
+    ///
+    /// [`Harness::discover`](crate::Harness::discover) applies this, so a host never sees a probe's
+    /// raw output. Ids are refused rather than cut, on the same terms as everywhere else: a
+    /// shortened id names a different model, and the model it names would be echoed straight back
+    /// to the vendor as the one that was chosen.
     #[must_use]
     pub fn normalized(self) -> Self {
         Self {
             version: self
                 .version
                 .map(|version| normalize::bound_text(&version, TextLimit::AccountLabel).text),
-            models: self.models.into_iter().map(Model::normalized).collect(),
+            auth: self.auth.normalized(),
+            models: self
+                .models
+                .into_iter()
+                .filter_map(Model::normalized)
+                .take(MODEL_CATALOG_MAX_ITEMS)
+                .collect(),
             ..self
         }
     }
@@ -108,6 +119,25 @@ pub enum AuthState {
     Unknown,
 }
 
+impl AuthState {
+    /// This state with every vendor-supplied label bounded.
+    ///
+    /// The login hint is text a host displays to a person, so it is bounded like any other label
+    /// the vendor wrote.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::LoggedIn { mode } => Self::LoggedIn {
+                mode: mode.normalized(),
+            },
+            Self::LoggedOut { login_hint } => Self::LoggedOut {
+                login_hint: normalize::bound_text(&login_hint, TextLimit::Title).text,
+            },
+            other => other,
+        }
+    }
+}
+
 /// How an account is signed in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -118,6 +148,19 @@ pub enum AuthMode {
     ApiKey,
     /// Something else the vendor named.
     Other(String),
+}
+
+impl AuthMode {
+    /// This mode with a vendor-supplied label bounded.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Other(label) => {
+                Self::Other(normalize::bound_text(&label, TextLimit::AccountLabel).text)
+            }
+            other => other,
+        }
+    }
 }
 
 /// A model as the vendor advertised it.
@@ -152,10 +195,18 @@ impl Model {
         }
     }
 
-    /// This model with every label bounded.
+    /// This model with every label bounded, or nothing when its id cannot survive bounding.
+    ///
+    /// A model whose id is dropped is a model a host cannot choose, which is the safe outcome: an
+    /// id that was cut short, or that carried a bidi override into a picker, would be sent back to
+    /// the vendor as a choice nobody made.
     #[must_use]
-    pub fn normalized(self) -> Self {
-        Self {
+    pub fn normalized(self) -> Option<Self> {
+        let default_reasoning_effort = self
+            .default_reasoning_effort
+            .and_then(|id| normalize::opaque_id(&id, "reasoning effort id").ok());
+        Some(Self {
+            id: normalize::opaque_id(&self.id, "model id").ok()?,
             display_name: self
                 .display_name
                 .map(|name| normalize::bound_text(&name, TextLimit::Title).text),
@@ -165,10 +216,12 @@ impl Model {
             reasoning_efforts: self
                 .reasoning_efforts
                 .into_iter()
-                .map(ReasoningEffort::normalized)
+                .filter_map(ReasoningEffort::normalized)
+                .take(REASONING_EFFORT_MAX_ITEMS)
                 .collect(),
+            default_reasoning_effort,
             ..self
-        }
+        })
     }
 }
 
@@ -187,18 +240,18 @@ pub struct ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// This choice with every label bounded.
+    /// This choice with every label bounded, or nothing when its id cannot survive bounding.
     #[must_use]
-    pub fn normalized(self) -> Self {
-        Self {
+    pub fn normalized(self) -> Option<Self> {
+        Some(Self {
+            id: normalize::opaque_id(&self.id, "reasoning effort id").ok()?,
             display_name: self
                 .display_name
                 .map(|name| normalize::bound_text(&name, TextLimit::Title).text),
             description: self
                 .description
                 .map(|text| normalize::bound_text(&text, TextLimit::Detail).text),
-            ..self
-        }
+        })
     }
 }
 
@@ -261,6 +314,59 @@ mod tests {
         assert!(!old.is_usable());
     }
 
+    /// The attack `normalize::is_strippable` exists to stop, arriving through the one vendor
+    /// surface that was not normalised: a model id lands in a host's picker and is echoed straight
+    /// back to the vendor as the choice.
+    #[test]
+    fn a_model_whose_id_cannot_be_bounded_is_dropped_rather_than_offered() {
+        let discovery = Discovery {
+            models: vec![
+                Model::new("gpt\u{202e}5-mini"),
+                Model::new("i".repeat(200)),
+                Model::new("opus"),
+            ],
+            ..usable()
+        }
+        .normalized();
+
+        assert_eq!(
+            discovery
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opus"],
+            "expected only the id that survived bounding"
+        );
+    }
+
+    #[test]
+    fn a_catalogue_the_vendor_never_stops_enumerating_is_capped() {
+        let discovery = Discovery {
+            models: (0..5_000).map(|n| Model::new(format!("m-{n}"))).collect(),
+            ..usable()
+        }
+        .normalized();
+
+        assert_eq!(discovery.models.len(), 256);
+    }
+
+    #[test]
+    fn a_login_hint_is_bounded_like_any_other_label() {
+        let discovery = Discovery {
+            auth: AuthState::LoggedOut {
+                login_hint: "h".repeat(4_000),
+            },
+            ..usable()
+        }
+        .normalized();
+
+        let AuthState::LoggedOut { login_hint } = discovery.auth else {
+            panic!("expected a logged-out state, received {:?}", discovery.auth);
+        };
+        assert_eq!(login_hint.chars().count(), 256);
+    }
+
     #[test]
     fn normalising_bounds_every_vendor_label() {
         let discovery = Discovery {
@@ -285,6 +391,7 @@ mod tests {
         );
         let model = &discovery.models[0];
         assert_eq!(model.id, "opus");
+        assert_eq!(model.reasoning_efforts[0].id, "high");
         assert_eq!(
             model.display_name.as_ref().map(|name| name.chars().count()),
             Some(256)

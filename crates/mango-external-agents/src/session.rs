@@ -540,12 +540,26 @@ pub trait Session: Send + Sync {
         Err(Error::not_supported(Capability::NativeReview))
     }
 
-    /// Lists the vendor's own sessions.
+    /// Lists the vendor's own sessions, bounded before a host sees them.
+    ///
+    /// What a host calls. Like [`Harness::discover`](crate::Harness::discover), it is the half
+    /// that applies [`SessionPage::normalized`], so a title or a workspace path a vendor wrote
+    /// cannot reach a host's list unbounded.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] unless the harness implements
+    /// [`list_native_sessions`](Self::list_native_sessions).
+    async fn list_sessions(&self, query: SessionQuery) -> Result<SessionPage> {
+        Ok(self.list_native_sessions(query).await?.normalized())
+    }
+
+    /// The page as the vendor returned it. Implemented by a harness that supports listing.
     ///
     /// # Errors
     ///
     /// [`Error::NotSupported`] unless the harness implements it.
-    async fn list_sessions(&self, _query: SessionQuery) -> Result<SessionPage> {
+    async fn list_native_sessions(&self, _query: SessionQuery) -> Result<SessionPage> {
         Err(Error::not_supported(Capability::SessionListing))
     }
 

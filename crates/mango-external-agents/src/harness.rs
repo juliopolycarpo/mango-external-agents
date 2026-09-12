@@ -345,6 +345,21 @@ pub trait Harness: Send + Sync {
     /// Which (level, routing) pairs this harness can run, and why not for the rest.
     fn permission_matrix(&self) -> crate::permission::PermissionMatrix;
 
+    /// What a probe found, bounded before a host sees it.
+    ///
+    /// This is the method a host calls, and it is provided rather than implemented: it applies
+    /// [`Discovery::normalized`](crate::Discovery::normalized) to whatever
+    /// [`probe`](Self::probe) returned. Bounding a harness has to remember is bounding one harness
+    /// will forget, and what it forgot is a vendor-supplied model id on its way into a picker and
+    /// back out as the choice.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the probe hit.
+    async fn discover(&self, host: &crate::HostContext) -> crate::Result<crate::Discovery> {
+        Ok(self.probe(host).await?.normalized())
+    }
+
     /// Probes the machine.
     ///
     /// Never cached here: how fresh an answer has to be is the host's decision, and a harness that
@@ -354,7 +369,7 @@ pub trait Harness: Send + Sync {
     ///
     /// Whatever the probe hit. A CLI that is simply absent is
     /// [`Discovery::not_installed`](crate::Discovery::not_installed) rather than an error.
-    async fn discover(&self, host: &crate::HostContext) -> crate::Result<crate::Discovery>;
+    async fn probe(&self, host: &crate::HostContext) -> crate::Result<crate::Discovery>;
 
     /// Opens a session.
     ///
@@ -373,10 +388,93 @@ pub trait Harness: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpProfileId, Capabilities, Capability, HarnessDescriptor, HarnessKind, VendorInfo,
+        AcpProfileId, Capabilities, Capability, Harness, HarnessDescriptor, HarnessKind, VendorInfo,
     };
     use crate::Error;
     use crate::transport::TransportKind;
+
+    /// A harness that reports what a vendor said and bounds none of it, which is what a harness
+    /// author writes when the bounding is somebody else's job to remember.
+    struct UnboundedProbe {
+        descriptor: HarnessDescriptor,
+    }
+
+    impl UnboundedProbe {
+        fn new() -> Self {
+            Self {
+                descriptor: HarnessDescriptor {
+                    kind: HarnessKind::Claude,
+                    vendor: VendorInfo {
+                        company: "Example",
+                        terms_url: "https://example.com/terms",
+                        privacy_url: "https://example.com/privacy",
+                        skills_are_slash_commands: false,
+                    },
+                    capabilities: Capabilities::none(),
+                    transports: &[TransportKind::Stdio],
+                    vendor_environment_keys: &[],
+                },
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for UnboundedProbe {
+        fn descriptor(&self) -> &HarnessDescriptor {
+            &self.descriptor
+        }
+
+        fn permission_matrix(&self) -> crate::permission::PermissionMatrix {
+            crate::permission::PermissionMatrix::none(
+                crate::permission::UnsupportedReason::NotOfferedByVendor,
+            )
+        }
+
+        async fn probe(&self, _host: &crate::HostContext) -> crate::Result<crate::Discovery> {
+            Ok(crate::Discovery {
+                models: vec![
+                    crate::Model::new("gpt\u{202e}5-mini"),
+                    crate::Model::new("opus"),
+                ],
+                ..crate::Discovery::not_installed()
+            })
+        }
+
+        async fn open_session(
+            &self,
+            _host: &crate::HostContext,
+            _request: crate::session::OpenSession,
+        ) -> crate::Result<Box<dyn crate::session::Session>> {
+            Err(Error::Closed { subject: "session" })
+        }
+    }
+
+    /// The bounding is the trait's, not the harness author's: `discover` is what a host calls, and
+    /// it applies it to whatever `probe` returned.
+    #[tokio::test]
+    async fn discovering_bounds_what_the_probe_did_not() {
+        let host = crate::HostContext::builder()
+            .launcher(std::sync::Arc::new(crate::testing::FakeLauncher::new()))
+            .cwd(std::env::temp_dir())
+            .client_info("test", "0.0.0")
+            .build()
+            .expect("expected a host");
+
+        let discovery = UnboundedProbe::new()
+            .discover(&host)
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opus"],
+            "expected the unbounded id to be dropped by the trait, not by the harness"
+        );
+    }
 
     const VENDOR: VendorInfo = VendorInfo {
         company: "Anthropic",
