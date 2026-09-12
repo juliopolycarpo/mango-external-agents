@@ -587,17 +587,30 @@ fn renderable_percent(used_percent: f64) -> f64 {
 /// it into a composer for the vendor to expand, so a shortened name is a command the CLI does not
 /// have. A name with whitespace in it is dropped for the same reason — a completion that splits on
 /// the first space would offer half a command and turn the rest into an argument.
+///
+/// A leading `/` is taken off rather than dropping the row. Every surface the library drives sends
+/// the name bare and leaves the sigil to whoever renders it — Claude Code's `slash_commands` is
+/// `["clear", "compact", …]`, ACP's `AvailableCommand.name` is `create_plan`, and the ACP client
+/// that inserts one does `format!("/{name}")` — so a name that arrives spelled `/review` is
+/// off-contract, and inserting it produces `//review`, a command no CLI has. Taking the slash off
+/// recovers the command; dropping the row would lose it.
+///
+/// Only the *leading* slash: Claude Code namespaces a path-scoped skill as `apps/web:deploy`, and
+/// a rule that took every slash out would offer `appsweb:deploy` instead.
 fn normalize_commands(commands: Vec<Command>) -> Vec<Command> {
     let mut kept: Vec<Command> = Vec::new();
     for command in commands {
         if kept.len() >= COMMAND_CATALOG_MAX_ITEMS {
             break;
         }
-        let name = normalize::bound_text(&command.name, TextLimit::CommandName);
-        if name.truncated
-            || name.text.is_empty()
-            || name.text.chars().any(char::is_whitespace)
-            || kept.iter().any(|seen| seen.name == name.text)
+        let bounded = normalize::bound_text(&command.name, TextLimit::CommandName);
+        // Bounded first, so a name whose slash sits behind a stripped invisible character is the
+        // same name as one that wore it openly.
+        let name = bounded.text.trim_start_matches('/');
+        if bounded.truncated
+            || name.is_empty()
+            || name.chars().any(char::is_whitespace)
+            || kept.iter().any(|seen| seen.name == name)
         {
             continue;
         }
@@ -608,7 +621,7 @@ fn normalize_commands(commands: Vec<Command>) -> Vec<Command> {
             })
             .filter(|description| !description.is_empty());
         kept.push(Command {
-            name: name.text,
+            name: name.to_owned(),
             description,
         });
     }
@@ -674,6 +687,63 @@ mod tests {
 
         assert_eq!(kept.len(), 1, "expected one command, received {kept:?}");
         assert_eq!(kept[0].name, "review");
+    }
+
+    /// Every surface the library drives sends the name bare and leaves the sigil to whoever
+    /// renders it, so a name that arrives wearing one is off-contract — and a palette that inserts
+    /// `/{name}` turns it into `//review`, which no CLI answers to. The command is recovered
+    /// rather than dropped: the vendor has the command, it only spelled the announcement wrong.
+    #[test]
+    fn takes_off_a_leading_slash_a_vendor_should_not_have_sent() {
+        let kept = normalized_commands(commands(&[
+            ("/review", Some("Reviews the diff")),
+            ("//compact", None),
+        ]));
+
+        assert_eq!(kept.len(), 2, "expected two commands, received {kept:?}");
+        assert_eq!(kept[0].name, "review");
+        assert_eq!(kept[0].description.as_deref(), Some("Reviews the diff"));
+        assert_eq!(kept[1].name, "compact");
+    }
+
+    /// Only the leading one. Claude Code namespaces a path-scoped skill as `apps/web:deploy`, so a
+    /// rule that took every slash out would offer `appsweb:deploy` — a command that does not exist
+    /// — while fixing a spelling nobody sent.
+    #[test]
+    fn keeps_a_slash_that_is_part_of_a_namespaced_name() {
+        let kept = normalized_commands(commands(&[
+            ("apps/web:deploy", None),
+            ("my-plugin:custom-command", None),
+        ]));
+
+        assert_eq!(kept.len(), 2, "received {kept:?}");
+        assert_eq!(kept[0].name, "apps/web:deploy");
+        assert_eq!(kept[1].name, "my-plugin:custom-command");
+    }
+
+    /// A name that was nothing but its sigil names no command, so it goes the way of an empty one.
+    #[test]
+    fn drops_a_name_that_was_only_a_slash() {
+        let kept = normalized_commands(commands(&[("/", None), ("///", None), ("review", None)]));
+
+        assert_eq!(kept.len(), 1, "received {kept:?}");
+        assert_eq!(kept[0].name, "review");
+    }
+
+    /// Taking the slash off can make two announcements the same name. They were always the same
+    /// command: invocation is `/` + name, so both reach the vendor as `/review` and there is no
+    /// way to type the other. The existing dedup keeps the first, which is the one whose
+    /// description a palette shows.
+    #[test]
+    fn a_slashed_name_and_its_bare_twin_are_one_command() {
+        let kept = normalized_commands(commands(&[
+            ("review", Some("the bare one")),
+            ("/review", Some("the slashed one")),
+        ]));
+
+        assert_eq!(kept.len(), 1, "received {kept:?}");
+        assert_eq!(kept[0].name, "review");
+        assert_eq!(kept[0].description.as_deref(), Some("the bare one"));
     }
 
     #[test]
