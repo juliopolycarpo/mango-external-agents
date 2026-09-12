@@ -271,6 +271,7 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
                 break;
             }
         }
+        drain_queued(&mut turn, &mut events);
     })
     .await;
 
@@ -361,6 +362,7 @@ async fn check_cancelled_turn(session: &dyn Session, options: &Options, report: 
                 break;
             }
         }
+        drain_queued(&mut turn, &mut events);
     })
     .await;
 
@@ -467,6 +469,17 @@ fn refuses_as_unsupported<T>(outcome: &crate::error::Result<T>, capability: Capa
         outcome,
         Err(Error::NotSupported { capability: found }) if *found == capability
     )
+}
+
+/// Whatever is already sitting behind the terminal, without waiting for more.
+///
+/// Breaking at the terminal and stopping there is what made "nothing follows the terminal" a check
+/// that cannot fail: the loop never looks. An event already queued behind it is a turn that ended
+/// twice, or that kept talking afterwards, and it is exactly what a host would see.
+fn drain_queued(turn: &mut crate::stream::TurnStream, events: &mut Vec<AgentEvent>) {
+    while let Ok(event) = turn.events.try_recv() {
+        events.push(event);
+    }
 }
 
 fn terminal_outcome(events: &[AgentEvent]) -> Outcome {
