@@ -154,12 +154,28 @@ impl StderrTail {
     }
 
     /// Appends what the child just wrote, dropping the oldest bytes past the cap.
+    ///
+    /// What is dropped is rounded up to a whole line. Cutting the buffer at whatever byte the cap
+    /// landed on leaves the tail beginning mid-word, and a tail that begins mid-word is a tail
+    /// [`read`](Self::read) cannot redact: the scanner needs the name in front of the `=` to know
+    /// the value after it is a secret. Losing a partial first line costs a diagnostic nobody could
+    /// read anyway.
     pub fn push(&self, chunk: &[u8]) {
         let mut buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
         buffer.extend_from_slice(chunk);
-        if buffer.len() > self.max_bytes {
-            let overflow = buffer.len() - self.max_bytes;
-            buffer.drain(..overflow);
+        if buffer.len() <= self.max_bytes {
+            return;
+        }
+        let overflow = buffer.len() - self.max_bytes;
+        buffer.drain(..overflow);
+        match buffer.iter().position(|byte| matches!(byte, b'\n' | b'\r')) {
+            Some(boundary) => {
+                buffer.drain(..=boundary);
+            }
+            // Nothing retained starts a line, so the whole window is the middle of one — a single
+            // line longer than the cap. The middle of a line is exactly what cannot be redacted,
+            // and a diagnostic is not worth a token.
+            None => buffer.clear(),
         }
     }
 
@@ -475,18 +491,50 @@ mod tests {
         );
     }
 
+    /// A tail cut at an arbitrary byte starts mid-name, and a scanner that cannot see the name
+    /// cannot redact the value. The cut lands on a line boundary so that never happens, and when
+    /// there is no boundary to land on there is nothing safe to keep.
+    #[test]
+    fn a_tail_cut_by_the_cap_never_starts_mid_line() {
+        // 62 bytes into a 35-byte tail: the cut lands eight bytes into the second line, right
+        // after `API_KEY=`, leaving the value with nothing in front of it to identify it.
+        let tail = StderrTail::with_capacity(35);
+        tail.push(b"dropped by the cap\n");
+        tail.push(b"API_KEY=another-secret\n");
+        tail.push(b"ordinary diagnostic\n");
+
+        let read = tail.read();
+        assert!(
+            !read.contains("another-secret"),
+            "expected no orphaned secret, received {read:?}"
+        );
+        assert_eq!(read, "ordinary diagnostic\n");
+    }
+
+    #[test]
+    fn a_single_line_longer_than_the_cap_leaves_nothing_rather_than_a_fragment() {
+        let tail = StderrTail::with_capacity(16);
+        tail.push(b"OPENAI_API_KEY=sk-proj-0123456789abcdef");
+
+        assert_eq!(
+            tail.read(),
+            "",
+            "expected no fragment of an unredactable line"
+        );
+    }
+
     #[test]
     fn a_stderr_tail_keeps_the_last_bytes_and_redacts_them() {
         let tail = StderrTail::with_capacity(32);
-        tail.push(b"dropped by the cap ");
-        tail.push(b"API_KEY=another-secret");
+        tail.push(b"dropped by the cap\n");
+        tail.push(b"API_KEY=another-secret\n");
 
         let read = tail.read();
         assert!(
             !read.contains("another-secret"),
             "expected no secret, received {read:?}"
         );
-        assert!(read.contains("[REDACTED]"), "received {read:?}");
+        assert_eq!(read, "API_KEY=[REDACTED]\n");
         assert!(
             read.len() <= 32,
             "expected at most 32 bytes, received {}",
