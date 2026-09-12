@@ -11,18 +11,25 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::error::{CapacityError, ProtocolError};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Bytes, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 use crate::error::{Error, Result};
 use crate::link::{Link, LinkReceiver, LinkSender};
+use crate::process::LineLimits;
 use crate::transport::WsSpec;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Dials `spec` and returns the link.
+/// Dials `spec` and returns the link, bounded by the host's own caps.
+///
+/// `limits` is the host's — `host.limits().line` — rather than the socket library's. Left to
+/// itself, tungstenite accepts a 64 MiB message and a 16 MiB frame, so a host that capped a stdio
+/// line at 1 MiB would have been given sixty-four times that allowance the moment the same vendor
+/// was reached over a socket.
 ///
 /// The bearer token, when the host passed one, is sent as an `Authorization` header on the
 /// handshake and nowhere else. The library never reads, stores or derives one: a vendor login is
@@ -32,7 +39,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 ///
 /// [`Error::Link`] when the URL is unusable, the bearer is not a valid header value, or the
 /// handshake failed.
-pub async fn dial(spec: &WsSpec) -> Result<Link> {
+pub async fn dial(spec: &WsSpec, limits: LineLimits) -> Result<Link> {
     let mut request = spec
         .url
         .as_str()
@@ -49,24 +56,34 @@ pub async fn dial(spec: &WsSpec) -> Result<Link> {
         request.headers_mut().insert("Authorization", value);
     }
 
-    let (socket, _) = connect_async(request)
+    // Both caps, not just the message one: a peer that never finishes a frame would otherwise
+    // buffer 16 MiB before anything noticed.
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(limits.max_line_bytes))
+        .max_frame_size(Some(limits.max_line_bytes));
+    let (socket, _) = connect_async_with_config(request, Some(config), false)
         .await
         .map_err(|error| link_error(spec, error))?;
-    Ok(from_socket(socket, spec.url.clone()))
+    Ok(from_socket(socket, spec.url.clone(), limits))
 }
 
 /// The link for an already-dialled socket.
 ///
 /// Exposed for a host that dials on its own terms — through a proxy, or onto a listener it opened
-/// itself — and for the tests here.
-pub fn from_socket(socket: Socket, peer: String) -> Link {
+/// itself — and for the tests here. The cap is applied to every assembled message here as well as
+/// to the socket, because a host that dialled for itself configured the socket for itself.
+pub fn from_socket(socket: Socket, peer: String, limits: LineLimits) -> Link {
     let (sink, stream) = socket.split();
     Link::new(
         Box::new(SocketSender {
             sink,
             peer: peer.clone(),
         }),
-        Box::new(SocketReceiver { stream, peer }),
+        Box::new(SocketReceiver {
+            stream,
+            peer,
+            max_bytes: limits.max_line_bytes,
+        }),
     )
 }
 
@@ -105,6 +122,22 @@ impl LinkSender for SocketSender {
 struct SocketReceiver {
     stream: SplitStream<Socket>,
     peer: String,
+    max_bytes: usize,
+}
+
+impl SocketReceiver {
+    /// What [`LinkReceiver::recv`] promises: more than the library will assemble is refused by
+    /// name rather than returned.
+    fn bounded(&self, message: String) -> Result<Option<String>> {
+        if message.len() > self.max_bytes {
+            return Err(Error::LimitExceeded {
+                subject: "one websocket message",
+                limit: self.max_bytes,
+                received: message.len(),
+            });
+        }
+        Ok(Some(message))
+    }
 }
 
 #[async_trait::async_trait]
@@ -121,6 +154,15 @@ impl LinkReceiver for SocketReceiver {
                 // was waiting on an answer is failed by the layer above with a message that says
                 // the peer exited.
                 Err(error) if is_disconnect(&error) => return Ok(None),
+                // The socket caught the cap before the message was assembled. Reported the same
+                // way the check below reports it, so a host sees one shape whichever layer noticed.
+                Err(WsError::Capacity(CapacityError::MessageTooLong { size, max_size })) => {
+                    return Err(Error::LimitExceeded {
+                        subject: "one websocket message",
+                        limit: max_size,
+                        received: size,
+                    });
+                }
                 Err(error) => {
                     return Err(Error::Link {
                         peer: self.peer.clone(),
@@ -129,10 +171,10 @@ impl LinkReceiver for SocketReceiver {
                 }
             };
             match message {
-                Message::Text(text) => return Ok(Some(text.to_string())),
+                Message::Text(text) => return self.bounded(text.to_string()),
                 // A dialect that frames its JSON as binary is still sending text; a stray byte is
                 // replaced rather than ending a turn that is otherwise going fine.
-                Message::Binary(bytes) => return Ok(Some(decode(&bytes))),
+                Message::Binary(bytes) => return self.bounded(decode(&bytes)),
                 Message::Close(_) => return Ok(None),
                 // Keepalives are the library's business, not the harness's.
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
@@ -168,6 +210,7 @@ fn is_disconnect(error: &WsError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{dial, from_socket};
+    use crate::process::LineLimits;
     use crate::transport::WsSpec;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
@@ -212,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn dials_and_round_trips_a_message() {
         let url = echo_server().await;
-        let link = dial(&WsSpec::new(url))
+        let link = dial(&WsSpec::new(url), LineLimits::default())
             .await
             .expect("expected the dial to land");
         let (mut sender, mut receiver) = link.split();
@@ -230,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_socket_ends_the_link_rather_than_failing() {
         let url = echo_server().await;
-        let link = dial(&WsSpec::new(url))
+        let link = dial(&WsSpec::new(url), LineLimits::default())
             .await
             .expect("expected the dial to land");
         let (mut sender, mut receiver) = link.split();
@@ -254,9 +297,12 @@ mod tests {
             }
         });
 
-        let link = dial(&WsSpec::new(format!("ws://127.0.0.1:{port}")))
-            .await
-            .expect("expected the dial to land");
+        let link = dial(
+            &WsSpec::new(format!("ws://127.0.0.1:{port}")),
+            LineLimits::default(),
+        )
+        .await
+        .expect("expected the dial to land");
         let (_, mut receiver) = link.split();
 
         assert_eq!(receiver.recv().await.expect("expected the end"), None);
@@ -265,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn a_dial_to_nowhere_names_the_endpoint_rather_than_panicking() {
         // Port 1 is reserved and nothing is listening on it.
-        let error = dial(&WsSpec::new("ws://127.0.0.1:1"))
+        let error = dial(&WsSpec::new("ws://127.0.0.1:1"), LineLimits::default())
             .await
             .expect_err("expected a refusal, received a link");
         assert!(
@@ -276,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unusable_url_is_refused_before_anything_is_dialled() {
-        let error = dial(&WsSpec::new("not a url"))
+        let error = dial(&WsSpec::new("not a url"), LineLimits::default())
             .await
             .expect_err("expected a refusal, received a link");
         assert!(
@@ -287,9 +333,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_bearer_that_cannot_be_a_header_is_refused_without_echoing_it() {
-        let error = dial(&WsSpec::new("ws://127.0.0.1:1").with_bearer("bad\nvalue"))
-            .await
-            .expect_err("expected a refusal, received a link");
+        let error = dial(
+            &WsSpec::new("ws://127.0.0.1:1").with_bearer("bad\nvalue"),
+            LineLimits::default(),
+        )
+        .await
+        .expect_err("expected a refusal, received a link");
         assert!(
             !error.to_string().contains("bad"),
             "expected the credential not to be echoed, received {error}"
@@ -300,7 +349,7 @@ mod tests {
     async fn keepalives_never_reach_the_harness_above() {
         // The server pings on connect; the receiver must skip it and answer with the text frame.
         let url = echo_server().await;
-        let link = dial(&WsSpec::new(url))
+        let link = dial(&WsSpec::new(url), LineLimits::default())
             .await
             .expect("expected the dial to land");
         let (mut sender, mut receiver) = link.split();
@@ -315,13 +364,52 @@ mod tests {
         );
     }
 
+    /// The cap a host set for a stdio line is the cap a socket gets. Without it the socket
+    /// library's own 64 MiB allowance applies, and `recv` could never return the refusal its own
+    /// documentation promises.
+    #[tokio::test]
+    async fn a_message_past_the_hosts_cap_is_refused_by_name() {
+        let url = echo_server().await;
+        let link = dial(
+            &WsSpec::new(url),
+            LineLimits {
+                max_line_bytes: 64,
+                max_buffered_bytes: 128,
+            },
+        )
+        .await
+        .expect("expected the dial to land");
+        let (mut sender, mut receiver) = link.split();
+
+        sender
+            .send("x".repeat(100))
+            .await
+            .expect("expected the send to land");
+
+        let error = receiver
+            .recv()
+            .await
+            .expect_err("expected a refusal, received a message");
+        assert!(
+            matches!(
+                error,
+                crate::Error::LimitExceeded {
+                    subject: "one websocket message",
+                    limit: 64,
+                    received: 105,
+                }
+            ),
+            "expected the cap to be named, received {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_link_can_be_built_from_a_socket_a_host_dialled_itself() {
         let url = echo_server().await;
         let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
             .await
             .expect("expected the dial to land");
-        let (mut sender, mut receiver) = from_socket(socket, url).split();
+        let (mut sender, mut receiver) = from_socket(socket, url, LineLimits::default()).split();
 
         sender
             .send(String::from("hi"))
