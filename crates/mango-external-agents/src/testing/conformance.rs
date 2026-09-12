@@ -247,6 +247,7 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
 
     let mut events = Vec::new();
     let mut answered = None;
+    let mut refused = false;
     let collected = tokio::time::timeout(options.turn_timeout, async {
         while let Some(event) = turn.recv().await {
             let terminal = event.is_terminal();
@@ -254,14 +255,15 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
                 && answered.is_none()
             {
                 answered = Some(request.clone());
-                let response = request.allow().or_else(|_| request.deny()).or_else(|_| {
-                    request.respond(
-                        &request.options[0].id,
-                        crate::permission::DecisionSource::User,
-                    )
-                });
-                if let Ok(response) = response {
+                // Refused, never granted. This runs against a live `Harness` and the host's real
+                // launcher: nothing in the signature says the launcher has to be a fake, so
+                // someone will point the suite at an installed CLI in a real workspace. A refusal
+                // proves the round-trip just as well as a grant, and "approvals are brokered,
+                // never auto-answered" is not a rule the conformance suite gets to be the
+                // exception to. A vendor that offers no refusal is recorded as skipped below.
+                if let Ok(response) = request.deny() {
                     let _ = session.respond(response).await;
+                    refused = true;
                 }
             }
             events.push(event);
@@ -291,9 +293,17 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
     );
     report.record(
         "an approval can be answered",
-        match answered {
-            Some(_) => Outcome::Passed,
-            None => Outcome::Skipped(String::from(
+        match (&answered, refused) {
+            (Some(_), true) => Outcome::Passed,
+            (Some(request), false) => Outcome::Skipped(format!(
+                "this vendor offered no way to refuse: received {:?}",
+                request
+                    .options
+                    .iter()
+                    .map(|option| option.kind)
+                    .collect::<Vec<_>>()
+            )),
+            (None, _) => Outcome::Skipped(String::from(
                 "this harness asked for no approval on this turn",
             )),
         },
