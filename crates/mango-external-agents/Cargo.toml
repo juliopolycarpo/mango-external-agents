@@ -27,8 +27,13 @@ launcher-tokio = []
 testing = []
 
 [dependencies]
+async-trait = "0.1.92"
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 thiserror = { version = "2.0.20", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true

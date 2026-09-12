@@ -1,13 +1,25 @@
 #![doc = include_str!("../README.md")]
 
+pub mod env;
 pub mod error;
 pub mod harness;
+pub mod host;
+pub mod process;
+pub mod redact;
 pub mod session;
 pub mod transport;
 
+pub use env::EnvSource;
 pub use error::{Error, ErrorCode, Result, VendorError};
 pub use harness::{
     AcpProfileId, Capabilities, Capability, HarnessDescriptor, HarnessKind, VendorInfo,
+};
+pub use host::{
+    CancelToken, ClientInfo, Clock, HostContext, HostContextBuilder, Limits, SystemClock,
+};
+pub use process::{
+    ByteSink, ByteSource, ExitStatus, LaunchSpec, LineLimits, LineStream, ManagedProcess,
+    ProcessControl, ProcessLauncher, StderrTail,
 };
 pub use session::{CancelReason, CloseReason};
 pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};
