@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::discovery::{AuthMode, AuthState, Discovery, GateVerdict, Model};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result, VendorError};
 use crate::event::{Activity, ActivityKind, ActivityResult, ActivityStatus, EventKind, Usage};
 use crate::harness::{Capabilities, Harness, HarnessDescriptor, HarnessKind, VendorInfo};
 use crate::host::HostContext;
@@ -39,6 +39,7 @@ const VENDOR: VendorInfo = VendorInfo {
 pub struct FakeHarness {
     descriptor: Arc<HarnessDescriptor>,
     asks_for_approval: bool,
+    rejects_answers: bool,
 }
 
 impl Default for FakeHarness {
@@ -77,6 +78,7 @@ impl FakeHarness {
                 vendor_environment_keys: &["FAKE_AGENT_CONFIG_DIR"],
             }),
             asks_for_approval: true,
+            rejects_answers: false,
         }
     }
 
@@ -84,6 +86,16 @@ impl FakeHarness {
     #[must_use]
     pub fn without_approvals(mut self) -> Self {
         self.asks_for_approval = false;
+        self
+    }
+
+    /// The same harness whose session will not take the answer to its own question.
+    ///
+    /// A vendor that asks for an approval and then refuses the response is a broken round-trip,
+    /// not an approval that was answered. This is what proves the conformance suite says so.
+    #[must_use]
+    pub fn rejecting_answers(mut self) -> Self {
+        self.rejects_answers = true;
         self
     }
 }
@@ -135,6 +147,7 @@ impl Harness for FakeHarness {
             },
             host: host.clone(),
             asks_for_approval: self.asks_for_approval,
+            rejects_answers: self.rejects_answers,
             pending: Mutex::new(None),
             turns: AtomicU64::new(0),
             closed: AtomicBool::new(false),
@@ -147,6 +160,7 @@ struct FakeSession {
     info: SessionInfo,
     host: HostContext,
     asks_for_approval: bool,
+    rejects_answers: bool,
     pending: Mutex<Option<PendingTurn>>,
     turns: AtomicU64,
     closed: AtomicBool,
@@ -313,6 +327,12 @@ impl Session for FakeSession {
     }
 
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
+        if self.rejects_answers {
+            return Err(Error::Vendor(VendorError::new(
+                ErrorCode::from_static("fake-answer-rejected"),
+                "this harness would not take the answer",
+            )));
+        }
         self.finish(&response.option_id, response.source).await
     }
 

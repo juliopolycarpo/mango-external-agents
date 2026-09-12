@@ -248,7 +248,7 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
 
     let mut events = Vec::new();
     let mut answered = None;
-    let mut refused = false;
+    let mut refusal = None;
     let collected = tokio::time::timeout(options.turn_timeout, async {
         while let Some(event) = turn.recv().await {
             let terminal = event.is_terminal();
@@ -263,8 +263,7 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
                 // never auto-answered" is not a rule the conformance suite gets to be the
                 // exception to. A vendor that offers no refusal is recorded as skipped below.
                 if let Ok(response) = request.deny() {
-                    let _ = session.respond(response).await;
-                    refused = true;
+                    refusal = Some(session.respond(response).await);
                 }
             }
             events.push(event);
@@ -274,6 +273,14 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
         }
     })
     .await;
+
+    // Recorded before the turn's own outcome, because it is known either way: a harness that
+    // refused the answer is exactly the harness whose turn then never terminates, and reporting
+    // only the timeout would hide the reason for it.
+    report.record(
+        "an approval can be answered",
+        approval_outcome(answered.as_ref(), refusal),
+    );
 
     if collected.is_err() {
         report.record(
@@ -292,23 +299,36 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
         "every event names its session and turn",
         stamping_outcome(&events, "conformance-turn-1", session),
     );
-    report.record(
-        "an approval can be answered",
-        match (&answered, refused) {
-            (Some(_), true) => Outcome::Passed,
-            (Some(request), false) => Outcome::Skipped(format!(
-                "this vendor offered no way to refuse: received {:?}",
-                request
-                    .options
-                    .iter()
-                    .map(|option| option.kind)
-                    .collect::<Vec<_>>()
-            )),
-            (None, _) => Outcome::Skipped(String::from(
-                "this harness asked for no approval on this turn",
-            )),
-        },
-    );
+}
+
+/// Whether the approval round-trip held, given the question asked and what answering it returned.
+///
+/// `None` for the refusal means no answer was ever sent — the vendor asked nothing, or offered no
+/// option this suite is willing to pick. Neither is a pass, and neither is a failure of the
+/// harness.
+fn approval_outcome(
+    asked: Option<&crate::permission::PermissionRequest>,
+    refusal: Option<crate::error::Result<()>>,
+) -> Outcome {
+    let Some(request) = asked else {
+        return Outcome::Skipped(String::from(
+            "this harness asked for no approval on this turn",
+        ));
+    };
+    match refusal {
+        Some(Ok(())) => Outcome::Passed,
+        Some(Err(error)) => Outcome::Failed(format!(
+            "expected the refusal to be accepted, received {error}"
+        )),
+        None => Outcome::Skipped(format!(
+            "this vendor offered no way to refuse: received {:?}",
+            request
+                .options
+                .iter()
+                .map(|option| option.kind)
+                .collect::<Vec<_>>()
+        )),
+    }
 }
 
 async fn check_cancelled_turn(session: &dyn Session, options: &Options, report: &mut Report) {
@@ -529,6 +549,36 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "an approval can be answered"),
             "expected the approval check to be skipped, received {skipped:?}"
+        );
+    }
+
+    /// A vendor that asks and then will not take the answer has not answered anything. The check
+    /// is about the round-trip, so ignoring what `respond` returned made it a check on `deny()`
+    /// building an option.
+    #[tokio::test]
+    async fn an_answer_the_harness_would_not_take_fails_the_approval_check() {
+        let options = Options {
+            // The rejected answer leaves the fake's turn unfinished, so this bounds the wait
+            // rather than sitting out the default half-minute.
+            turn_timeout: std::time::Duration::from_millis(200),
+            ..Options::default()
+        };
+        let report = run(&FakeHarness::new().rejecting_answers(), &host(), options).await;
+
+        let failure = report
+            .failures()
+            .into_iter()
+            .find(|check| check.name == "an approval can be answered")
+            .map(|check| check.outcome.clone());
+        let Some(Outcome::Failed(message)) = failure else {
+            panic!(
+                "expected the approval check to fail, received {:?}",
+                report.checks
+            );
+        };
+        assert!(
+            message.contains("would not take the answer"),
+            "expected the harness's own refusal in the message, received {message:?}"
         );
     }
 
