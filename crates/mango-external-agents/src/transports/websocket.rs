@@ -20,6 +20,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 use crate::error::{Error, Result};
 use crate::link::{Link, LinkReceiver, LinkSender};
 use crate::process::LineLimits;
+use crate::redact;
 use crate::transport::WsSpec;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -49,7 +50,7 @@ pub async fn dial(spec: &WsSpec, limits: LineLimits) -> Result<Link> {
     if let Some(bearer) = &spec.bearer {
         let value =
             HeaderValue::from_str(&format!("Bearer {bearer}")).map_err(|_| Error::Link {
-                peer: spec.url.clone(),
+                peer: peer_label(&spec.url),
                 // Never the value: a malformed credential is still a credential.
                 message: String::from("expected a bearer token usable as a header value"),
             })?;
@@ -73,6 +74,7 @@ pub async fn dial(spec: &WsSpec, limits: LineLimits) -> Result<Link> {
 /// itself — and for the tests here. The cap is applied to every assembled message here as well as
 /// to the socket, because a host that dialled for itself configured the socket for itself.
 pub fn from_socket(socket: Socket, peer: String, limits: LineLimits) -> Link {
+    let peer = peer_label(&peer);
     let (sink, stream) = socket.split();
     Link::new(
         Box::new(SocketSender {
@@ -89,9 +91,17 @@ pub fn from_socket(socket: Socket, peer: String, limits: LineLimits) -> Link {
 
 fn link_error(spec: &WsSpec, error: impl std::fmt::Display) -> Error {
     Error::Link {
-        peer: spec.url.clone(),
+        peer: peer_label(&spec.url),
         message: error.to_string(),
     }
+}
+
+/// The endpoint as it may be repeated in every error a host logs.
+///
+/// A URL configured as `wss://svc:s3cr3t@agent.internal/ws` otherwise carries its password into
+/// the `Display` of each link failure, and the password is the half nobody needs to diagnose one.
+fn peer_label(url: &str) -> String {
+    redact::stderr_text(url)
 }
 
 struct SocketSender {
@@ -342,6 +352,53 @@ mod tests {
         assert!(
             !error.to_string().contains("bad"),
             "expected the credential not to be echoed, received {error}"
+        );
+    }
+
+    #[test]
+    fn a_bearer_never_reaches_a_debug_line() {
+        let spec = WsSpec::new("wss://svc:s3cr3t@agent.internal/ws").with_bearer("sk-live-42");
+        let rendered = format!("{spec:?}");
+
+        assert!(
+            !rendered.contains("sk-live-42"),
+            "expected no bearer, received {rendered}"
+        );
+        assert!(
+            !rendered.contains("s3cr3t"),
+            "expected no url password, received {rendered}"
+        );
+        assert!(
+            rendered.contains("agent.internal"),
+            "expected the endpoint to stay legible, received {rendered}"
+        );
+
+        // `TransportSpec` derives its own `Debug` from this one, so the same must hold there.
+        let wrapped = format!("{:?}", crate::TransportSpec::WebSocket(spec));
+        assert!(
+            !wrapped.contains("sk-live-42") && !wrapped.contains("s3cr3t"),
+            "expected no credential through the wrapper, received {wrapped}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_url_password_never_reaches_a_link_error() {
+        // Port 1 is reserved and nothing is listening on it, so the dial fails and the error is
+        // the one a host would log.
+        let error = dial(
+            &WsSpec::new("ws://svc:s3cr3t@127.0.0.1:1"),
+            LineLimits::default(),
+        )
+        .await
+        .expect_err("expected a refusal, received a link");
+
+        assert!(
+            !error.to_string().contains("s3cr3t"),
+            "expected no url password, received {error}"
+        );
+        assert!(
+            error.to_string().contains("127.0.0.1:1"),
+            "expected the endpoint to be named, received {error}"
         );
     }
 

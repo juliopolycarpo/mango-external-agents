@@ -96,7 +96,7 @@ impl StdioSpec {
 }
 
 /// A WebSocket endpoint to dial.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WsSpec {
     /// The `ws://` or `wss://` URL the host configured.
     pub url: String,
@@ -106,6 +106,22 @@ pub struct WsSpec {
     /// dial, and it is sent as an `Authorization` header and nowhere else. A vendor login is not
     /// a source for it — the library does not handle logins.
     pub bearer: Option<String>,
+}
+
+impl fmt::Debug for WsSpec {
+    /// Hand-written, because this is the one spec that holds a credential.
+    ///
+    /// A derived `Debug` prints the bearer in the clear, and `TransportSpec` derives its own from
+    /// this one — so a `tracing::debug!(?spec)`, or the `received {spec:?}` idiom the crate's own
+    /// assertions use, would put the token in a log. The URL goes through the same redaction a
+    /// stderr tail does, for the `wss://user:password@host` form.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WsSpec")
+            .field("url", &crate::redact::stderr_text(&self.url))
+            .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl WsSpec {
