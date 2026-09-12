@@ -205,44 +205,50 @@ impl Capabilities {
     /// assert_eq!(probed.beyond(&ceiling), vec!["nativeReview"]);
     /// ```
     pub fn beyond(&self, ceiling: &Self) -> Vec<&'static str> {
-        let pairs: [(&'static str, bool, bool); 13] = [
+        // Destructured rather than read field by field, and without a `..` rest: a capability
+        // added to the struct and forgotten here is a compile error instead of a flag that
+        // silently escapes the only check standing between a probe and a claim it cannot honour.
+        let Self {
+            structured_streaming,
+            reasoning_stream,
+            interactive_approvals,
+            resume,
+            model_catalog,
+            images,
+            usage_reporting,
+            cancellation,
+            steering,
+            session_listing,
+            native_review,
+            account_usage,
+            mcp_passthrough,
+        } = *self;
+        let pairs = [
             (
                 "structuredStreaming",
-                self.structured_streaming,
+                structured_streaming,
                 ceiling.structured_streaming,
             ),
             (
                 "reasoningStream",
-                self.reasoning_stream,
+                reasoning_stream,
                 ceiling.reasoning_stream,
             ),
             (
                 "interactiveApprovals",
-                self.interactive_approvals,
+                interactive_approvals,
                 ceiling.interactive_approvals,
             ),
-            ("resume", self.resume, ceiling.resume),
-            ("modelCatalog", self.model_catalog, ceiling.model_catalog),
-            ("images", self.images, ceiling.images),
-            (
-                "usageReporting",
-                self.usage_reporting,
-                ceiling.usage_reporting,
-            ),
-            ("cancellation", self.cancellation, ceiling.cancellation),
-            ("steering", self.steering, ceiling.steering),
-            (
-                "sessionListing",
-                self.session_listing,
-                ceiling.session_listing,
-            ),
-            ("nativeReview", self.native_review, ceiling.native_review),
-            ("accountUsage", self.account_usage, ceiling.account_usage),
-            (
-                "mcpPassthrough",
-                self.mcp_passthrough,
-                ceiling.mcp_passthrough,
-            ),
+            ("resume", resume, ceiling.resume),
+            ("modelCatalog", model_catalog, ceiling.model_catalog),
+            ("images", images, ceiling.images),
+            ("usageReporting", usage_reporting, ceiling.usage_reporting),
+            ("cancellation", cancellation, ceiling.cancellation),
+            ("steering", steering, ceiling.steering),
+            ("sessionListing", session_listing, ceiling.session_listing),
+            ("nativeReview", native_review, ceiling.native_review),
+            ("accountUsage", account_usage, ceiling.account_usage),
+            ("mcpPassthrough", mcp_passthrough, ceiling.mcp_passthrough),
         ];
         pairs
             .into_iter()
