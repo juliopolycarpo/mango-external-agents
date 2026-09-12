@@ -428,16 +428,24 @@ mod tests {
                 String::from("--test-threads=1"),
             ],
             cwd: std::env::temp_dir(),
-            env: BTreeMap::from([
-                (String::from(FIXTURE_MODE), mode.to_owned()),
-                (
-                    String::from("PATH"),
-                    std::env::var("PATH").unwrap_or_default(),
-                ),
-            ]),
+            // Built the way a harness builds it rather than from a hand-picked pair: on Windows a
+            // child needs `SystemRoot` and friends to start at all, and going through the library's
+            // own allowlist is what proves that list alone is enough to run a program.
+            env: fixture_environment(mode),
             stdin: true,
             hide_window: true,
         }
+    }
+
+    /// The allowlist, plus the one key that tells the re-executed binary which child to be.
+    fn fixture_environment(mode: &str) -> BTreeMap<String, String> {
+        environment_from(&crate::env::EnvSource::from_process(), mode)
+    }
+
+    fn environment_from(source: &crate::env::EnvSource, mode: &str) -> BTreeMap<String, String> {
+        let mut environment = crate::env::allowlist(source, &[]);
+        environment.insert(String::from(FIXTURE_MODE), mode.to_owned());
+        environment
     }
 
     /// Every line the fixture itself wrote, without the test harness's own chatter.
@@ -466,13 +474,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_child_receives_the_allowlist_and_nothing_else() {
-        // SAFETY-adjacent: this is the host's own process environment, which the launcher is
-        // required to ignore. Setting it here is what proves it is ignored.
-        let mut spec = fixture("environment");
-        spec.env.insert(
+        // A host whose own environment carries a secret next to the keys a child legitimately
+        // needs. The allowlist is what separates them, and this is the only test that proves the
+        // separation survives an actual process creation.
+        let source = crate::env::EnvSource::from_pairs(std::env::vars().chain([(
             String::from("CONNECTOR_SECRET"),
             String::from("never-forward-this"),
-        );
+        )]));
+        let mut spec = fixture("environment");
+        spec.env = environment_from(&source, "environment");
         let child = TokioLauncher::new()
             .spawn(spec)
             .await
@@ -486,12 +496,18 @@ mod tests {
             }
         }
 
-        // What the spec carried reaches the child; what it did not carry does not.
+        // What the spec carried reaches the child; what the allowlist dropped does not.
         assert!(
             environment
                 .iter()
                 .any(|entry| entry.starts_with("MEA_LAUNCHER_FIXTURE=")),
             "expected the spec's own keys, received {environment:?}"
+        );
+        assert!(
+            !environment
+                .iter()
+                .any(|entry| entry.contains("CONNECTOR_SECRET")),
+            "expected the host's secret to stay behind, received {environment:?}"
         );
         assert!(
             !environment
