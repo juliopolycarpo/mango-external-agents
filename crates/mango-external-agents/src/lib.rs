@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod discovery;
 pub mod env;
 pub mod error;
 pub mod event;
@@ -9,10 +10,12 @@ pub mod normalize;
 pub mod permission;
 pub mod process;
 pub mod redact;
+pub mod registry;
 pub mod session;
 pub mod stream;
 pub mod transport;
 
+pub use discovery::{AuthMode, AuthState, Discovery, GateVerdict, Model, ReasoningEffort};
 pub use env::EnvSource;
 pub use error::{Error, ErrorCode, Result, VendorError};
 pub use event::{
@@ -20,7 +23,7 @@ pub use event::{
     AgentEvent, Command, EventKind, RateLimitWindow, SessionId, ThreadUsage, TurnId, Usage,
 };
 pub use harness::{
-    AcpProfileId, Capabilities, Capability, HarnessDescriptor, HarnessKind, VendorInfo,
+    AcpProfileId, Capabilities, Capability, Harness, HarnessDescriptor, HarnessKind, VendorInfo,
 };
 pub use host::{
     CancelToken, ClientInfo, Clock, HostContext, HostContextBuilder, Limits, SystemClock,
@@ -34,7 +37,13 @@ pub use process::{
     ByteSink, ByteSource, ExitStatus, LaunchSpec, LineLimits, LineStream, ManagedProcess,
     ProcessControl, ProcessLauncher, StderrTail,
 };
-pub use session::{CancelReason, CloseReason};
+pub use registry::HarnessRegistry;
+pub use session::{
+    AccountUsage, Attachment, AttachmentKind, CancelReason, CloseReason, Configuration,
+    NativeSession, OpenSession, Resume, ResumeMode, ReviewRequest, ReviewTarget, Session,
+    SessionIds, SessionInfo, SessionPage, SessionQuery, Steer, SteerOutcome, SteerRejection,
+    TurnRequest,
+};
 pub use stream::{EventSink, ReviewStream, TurnStream};
 pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};
 

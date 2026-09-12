@@ -330,6 +330,44 @@ impl HarnessDescriptor {
     }
 }
 
+/// One vendor dialect, as a host drives it.
+///
+/// Stateless and shareable: a harness holds no session, caches no discovery and spawns nothing of
+/// its own. Everything it needs arrives in the [`HostContext`](crate::HostContext) it is handed,
+/// which is what lets one harness serve every session a host opens.
+#[async_trait::async_trait]
+pub trait Harness: Send + Sync {
+    /// What is true about this harness before anything is spawned.
+    fn descriptor(&self) -> &HarnessDescriptor;
+
+    /// Which (level, routing) pairs this harness can run, and why not for the rest.
+    fn permission_matrix(&self) -> crate::permission::PermissionMatrix;
+
+    /// Probes the machine.
+    ///
+    /// Never cached here: how fresh an answer has to be is the host's decision, and a harness that
+    /// memoised would be making it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the probe hit. A CLI that is simply absent is
+    /// [`Discovery::not_installed`](crate::Discovery::not_installed) rather than an error.
+    async fn discover(&self, host: &crate::HostContext) -> crate::Result<crate::Discovery>;
+
+    /// Opens a session.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AuthRequired`](crate::Error::AuthRequired) when nobody is signed in,
+    /// [`Error::VersionGate`](crate::Error::VersionGate) when the build is too old, and whatever
+    /// the vendor or the link reported otherwise.
+    async fn open_session(
+        &self,
+        host: &crate::HostContext,
+        request: crate::session::OpenSession,
+    ) -> crate::Result<Box<dyn crate::session::Session>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
