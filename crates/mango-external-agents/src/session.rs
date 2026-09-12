@@ -404,6 +404,29 @@ pub struct SessionQuery {
     pub workspace_path: Option<PathBuf>,
 }
 
+impl SessionQuery {
+    /// This query with its page size brought inside [`SESSION_PAGE_LIMIT`].
+    ///
+    /// Applied by [`Session::list_sessions`] before the harness sees it, so the cap is something
+    /// the vendor is asked for rather than something the library applies to the answer. A page cut
+    /// down afterwards is a page whose tail has no cursor pointing at it — the vendor's cursor
+    /// resumes after the last row it *sent*, not after the last row a host was shown.
+    ///
+    /// An absent limit becomes the cap for the same reason: "as many as you like" is the request
+    /// that produces the page there is no way to finish reading.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self {
+            limit: Some(
+                self.limit
+                    .unwrap_or(SESSION_PAGE_LIMIT)
+                    .min(SESSION_PAGE_LIMIT),
+            ),
+            ..self
+        }
+    }
+}
+
 /// One conversation the vendor already owns, as a row in a picker.
 ///
 /// A pointer, not an import: nothing here carries transcript content. Adopting a session records
@@ -434,6 +457,16 @@ pub struct SessionPage {
     pub sessions: Vec<NativeSession>,
     /// Where the next page starts, when there is one.
     pub next_cursor: Option<String>,
+    /// True when the page held more usable rows than [`SESSION_PAGE_LIMIT`] and the rest were cut.
+    ///
+    /// Worth carrying because [`next_cursor`](Self::next_cursor) cannot stand in for it: the
+    /// cursor is the vendor's own and resumes after the last row the vendor sent, so paging on it
+    /// skips whatever the cap removed. A host that sees this set knows the gap is there and that
+    /// no cursor will close it.
+    ///
+    /// A vendor given a bounded [`SessionQuery`] never trips this. Seeing it set means the vendor
+    /// returned more than it was asked for.
+    pub truncated: bool,
 }
 
 impl SessionPage {
@@ -443,29 +476,32 @@ impl SessionPage {
     /// different conversation, and adopting one would be worse than not offering it. A path is
     /// sanitised but never shortened, for the same reason — a shortened path names nothing — so an
     /// unbounded one drops its row too.
+    ///
+    /// Cutting the page to [`SESSION_PAGE_LIMIT`] sets [`truncated`](Self::truncated), which those
+    /// per-row drops do not: a row refused as unusable is a row nothing could have shown, while a
+    /// row past the cap is one the vendor sent, the host will never see, and the cursor will skip.
     #[must_use]
     pub fn normalized(self) -> Self {
-        let sessions = self
-            .sessions
-            .into_iter()
-            .filter_map(|session| {
-                let native_session_id =
-                    normalize::opaque_id(&session.native_session_id, "native session id").ok()?;
-                let workspace_path = match session.workspace_path {
-                    Some(path) => Some(normalize::vendor_path(&path)?),
-                    None => None,
-                };
-                Some(NativeSession {
-                    native_session_id,
-                    title: bounded_label(session.title),
-                    preview: bounded_label(session.preview),
-                    workspace_path,
-                    updated_at: session.updated_at,
-                })
+        let mut usable = self.sessions.into_iter().filter_map(|session| {
+            let native_session_id =
+                normalize::opaque_id(&session.native_session_id, "native session id").ok()?;
+            let workspace_path = match session.workspace_path {
+                Some(path) => Some(normalize::vendor_path(&path)?),
+                None => None,
+            };
+            Some(NativeSession {
+                native_session_id,
+                title: bounded_label(session.title),
+                preview: bounded_label(session.preview),
+                workspace_path,
+                updated_at: session.updated_at,
             })
-            .take(SESSION_PAGE_LIMIT)
-            .collect();
+        });
+        // Taken lazily, then asked whether a usable row survived the cap, so a vendor that ignored
+        // its limit is noticed without the whole overrun being built first.
+        let sessions: Vec<NativeSession> = usable.by_ref().take(SESSION_PAGE_LIMIT).collect();
         Self {
+            truncated: usable.next().is_some(),
             sessions,
             next_cursor: self.next_cursor,
         }
@@ -568,7 +604,10 @@ pub trait Session: Send + Sync {
     /// [`Error::NotSupported`] unless the harness implements
     /// [`list_native_sessions`](Self::list_native_sessions).
     async fn list_sessions(&self, query: SessionQuery) -> Result<SessionPage> {
-        Ok(self.list_native_sessions(query).await?.normalized())
+        Ok(self
+            .list_native_sessions(query.normalized())
+            .await?
+            .normalized())
     }
 
     /// The page as the vendor returned it. Implemented by a harness that supports listing.
@@ -593,8 +632,8 @@ pub trait Session: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReason, CloseReason, Configuration, NativeSession, OpenSession, ResumeMode,
-        SessionPage, TurnRequest,
+        CancelReason, CloseReason, Configuration, NativeSession, OpenSession, ResumeMode, Session,
+        SessionIds, SessionInfo, SessionPage, TurnRequest,
     };
     use crate::permission::{ApprovalRouting, PermissionLevel};
 
@@ -663,6 +702,7 @@ mod tests {
         let page = SessionPage {
             sessions: vec![row(&"i".repeat(129)), row("thread_1"), row("  ")],
             next_cursor: Some(String::from("next")),
+            truncated: false,
         }
         .normalized();
 
@@ -685,6 +725,7 @@ mod tests {
                 },
             ],
             next_cursor: None,
+            truncated: false,
         }
         .normalized();
 
@@ -701,6 +742,7 @@ mod tests {
                 ..row("thread_1")
             }],
             next_cursor: None,
+            truncated: false,
         }
         .normalized();
 
@@ -714,16 +756,165 @@ mod tests {
         assert_eq!(page.sessions[0].preview, None);
     }
 
+    /// The cap and the cursor describe different points in the same page: the cap stops at row 50,
+    /// the vendor's cursor resumes after row 80. Paging on it steps over rows 51-80, so a page
+    /// that was cut has to say it was — nothing else in the page can be read to mean it.
     #[test]
-    fn a_listing_is_cut_to_one_page() {
+    fn a_listing_cut_to_one_page_says_so_because_the_cursor_will_skip_the_rest() {
         let page = SessionPage {
             sessions: (0..80)
                 .map(|index| row(&format!("thread_{index}")))
                 .collect(),
-            next_cursor: None,
+            next_cursor: Some(String::from("after-thread-79")),
+            truncated: false,
         }
         .normalized();
 
         assert_eq!(page.sessions.len(), 50);
+        assert!(
+            page.truncated,
+            "expected a page of 80 cut to 50 to report the cut, received {:?}",
+            page.truncated
+        );
+        // The cursor is the vendor's and is carried as it was: dropping it would lose rows 81 and
+        // beyond on top of the ones the cap already took.
+        assert_eq!(page.next_cursor, Some(String::from("after-thread-79")));
+    }
+
+    /// The flag means "the cap fired", not "something was dropped". A row refused as unusable is a
+    /// row nothing could have shown, and reporting it here would make the flag unreadable on the
+    /// one page a host can actually act on.
+    #[test]
+    fn a_page_inside_the_cap_is_not_truncated_by_a_row_it_refused() {
+        let page = SessionPage {
+            sessions: vec![row(&"i".repeat(129)), row("thread_1")],
+            next_cursor: None,
+            truncated: false,
+        }
+        .normalized();
+
+        assert_eq!(page.sessions.len(), 1);
+        assert!(!page.truncated, "received {:?}", page.truncated);
+    }
+
+    /// A page of exactly the cap is whole, not cut. The boundary is worth pinning: the check asks
+    /// whether a row survived *past* the cap, and an off-by-one here would mark every full page.
+    #[test]
+    fn a_page_of_exactly_the_cap_is_not_reported_as_cut() {
+        let page = SessionPage {
+            sessions: (0..super::SESSION_PAGE_LIMIT)
+                .map(|index| row(&format!("thread_{index}")))
+                .collect(),
+            next_cursor: None,
+            truncated: false,
+        }
+        .normalized();
+
+        assert_eq!(page.sessions.len(), super::SESSION_PAGE_LIMIT);
+        assert!(!page.truncated, "received {:?}", page.truncated);
+    }
+
+    /// The cap has to be something the vendor is *asked* for. Applied only to the answer, it cuts
+    /// a page whose tail no cursor points at; applied to the query, a well-behaved vendor never
+    /// sends the overrun in the first place.
+    #[tokio::test]
+    async fn a_listing_query_reaches_the_harness_already_bounded() {
+        use super::{SESSION_PAGE_LIMIT, SessionQuery};
+
+        let session = RecordingListing::default();
+        session
+            .list_sessions(SessionQuery {
+                limit: Some(500),
+                ..SessionQuery::default()
+            })
+            .await
+            .expect("expected a page");
+        assert_eq!(session.last_limit().await, Some(SESSION_PAGE_LIMIT));
+
+        // Absent means "as many as you like", which is the request that produces the unfinishable
+        // page, so it is spelled out rather than left to the vendor's default.
+        session
+            .list_sessions(SessionQuery::default())
+            .await
+            .expect("expected a page");
+        assert_eq!(session.last_limit().await, Some(SESSION_PAGE_LIMIT));
+
+        // A host that asked for less still gets less.
+        session
+            .list_sessions(SessionQuery {
+                limit: Some(5),
+                ..SessionQuery::default()
+            })
+            .await
+            .expect("expected a page");
+        assert_eq!(session.last_limit().await, Some(5));
+    }
+
+    /// A session that answers listings with nothing and remembers what it was asked for.
+    struct RecordingListing {
+        info: SessionInfo,
+        last_query: tokio::sync::Mutex<Option<super::SessionQuery>>,
+    }
+
+    impl Default for RecordingListing {
+        fn default() -> Self {
+            Self {
+                info: SessionInfo {
+                    ids: SessionIds {
+                        session_id: crate::event::SessionId::new("chat-1"),
+                        native_session_id: String::from("native-1"),
+                    },
+                    resumed: false,
+                    fallback_reason: None,
+                    effective_configuration: Configuration::default(),
+                    capabilities: crate::harness::Capabilities::none(),
+                },
+                last_query: tokio::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl RecordingListing {
+        async fn last_limit(&self) -> Option<usize> {
+            self.last_query
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|query| query.limit)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::Session for RecordingListing {
+        fn info(&self) -> &SessionInfo {
+            &self.info
+        }
+
+        async fn start_turn(&self, _request: TurnRequest) -> crate::Result<crate::TurnStream> {
+            Err(crate::Error::Closed { subject: "session" })
+        }
+
+        async fn respond(
+            &self,
+            _response: crate::permission::PermissionResponse,
+        ) -> crate::Result<()> {
+            Err(crate::Error::Closed { subject: "session" })
+        }
+
+        async fn cancel(&self, _reason: CancelReason) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _reason: CloseReason) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn list_native_sessions(
+            &self,
+            query: super::SessionQuery,
+        ) -> crate::Result<SessionPage> {
+            *self.last_query.lock().await = Some(query);
+            Ok(SessionPage::default())
+        }
     }
 }
