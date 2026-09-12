@@ -1,6 +1,6 @@
 //! `mea`: the unpublished smoke and capture CLI for mango-external-agents.
 //!
-//! Subcommands (`discover`, `turn`, `capture`, `doctor`) land in plan 006. Today it prints the
+//! Subcommands (`discover`, `turn`, `capture`, `doctor`) land with the harness crates. Today it prints the
 //! harness kinds linked into the binary, which proves the workspace wiring end to end.
 
 /// Every harness kind the binary links, in registry order.

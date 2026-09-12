@@ -1,6 +1,6 @@
 # OpenAI Codex harness (`mango-agent-codex`)
 
-Stub; plan 004 fills this in. The page will state:
+Stub; the Codex harness fills this in when it lands. The page will state:
 
 - the vendor executable, the minimum version gate and how the version is read;
 - the exact documented surface driven (`codex app-server` JSON-RPC over lines, with the vendored protocol types), with a link to the vendor document each flag and

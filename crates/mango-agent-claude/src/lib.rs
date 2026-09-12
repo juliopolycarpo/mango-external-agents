@@ -1,7 +1,7 @@
 //! Claude Code harness for `mango-external-agents`.
 //!
-//! Drives Claude Code (`claude -p --output-format stream-json`) through its documented programmatic surface only. The behaviour lands in later
-//! plans; this crate currently declares its harness kind.
+//! Drives Claude Code (`claude -p --output-format stream-json`) through its documented programmatic surface only. The behaviour lands with the harness itself;
+//! this crate currently declares its harness kind.
 
 /// The harness kind this crate implements, as the core registry names it.
 pub const HARNESS_KIND: &str = "claude";

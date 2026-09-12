@@ -1,6 +1,6 @@
 # Claude Code harness (`mango-agent-claude`)
 
-Stub; plan 003 fills this in. The page will state:
+Stub; the Claude Code harness fills this in when it lands. The page will state:
 
 - the vendor executable, the minimum version gate and how the version is read;
 - the exact documented surface driven (`claude -p --output-format stream-json --input-format stream-json`), with a link to the vendor document each flag and

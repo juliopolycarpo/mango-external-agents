@@ -1,6 +1,6 @@
 # Agent Client Protocol harness (`mango-agent-acp`)
 
-Stub; plan 005 fills this in. The page will state:
+Stub; the ACP harness fills this in when it lands. The page will state:
 
 - the vendor executable, the minimum version gate and how the version is read;
 - the exact documented surface driven (ACP v1 over the official `agent-client-protocol` crate, one profile per agent), with a link to the vendor document each flag and

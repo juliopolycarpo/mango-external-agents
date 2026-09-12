@@ -2,7 +2,7 @@
 
 What each vendor's public documents say about driving their CLI from another program, and what
 this library does and does not do in response. Quotes are filled in per harness as each lands
-(plans 003–005); until then a section states the posture and the source it will quote.
+(Claude, Codex, ACP); until then a section states the posture and the source it will quote.
 
 Facts were read on 2026-09-12; re-verify against the vendor's current page before relying on them.
 
@@ -37,7 +37,7 @@ touches its token. Whether that counts as ordinary use of Claude Code is inferre
 enforcement pattern (token extraction was targeted, subprocess use was not), not from a written
 exception. Discovery reports the auth state so a host can show its own disclosure.
 
-**Quotes:** to be filled in plan 003 with the operative sentences and their URLs.
+**Quotes:** to be filled by the Claude Code harness with the operative sentences and their URLs.
 
 ## OpenAI Codex (`mango-agent-codex`)
 
@@ -47,7 +47,7 @@ exception. Discovery reports the auth state so a host can show its own disclosur
 **Posture:** OpenAI has publicly welcomed third-party harnesses on subscriptions (press coverage,
 2026-02); the doc cites it as reported, not as a licence term.
 
-**Quotes:** to be filled in plan 004 with the app-server documentation and the coverage cited.
+**Quotes:** to be filled by the Codex harness with the app-server documentation and the coverage cited.
 
 ## Agent Client Protocol agents (`mango-agent-acp`)
 
@@ -59,6 +59,6 @@ agent's own documentation for its ACP mode.
 - **Cursor** (`agent acp`): documented; no third-party-harness statement found either way. The
   doc says "not found", not "permitted".
 - **OpenCode**, **Gemini CLI**, **Copilot CLI**, **Goose**, the `codex-acp` and `claude-code-acp`
-  shims: to be filled in plan 005, each with its documentation link.
+  shims: to be filled by the ACP harness, each with its documentation link.
 
-**Quotes:** to be filled in plan 005.
+**Quotes:** to be filled by the ACP harness.
