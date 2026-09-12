@@ -162,7 +162,12 @@ impl FakeLauncher {
 
     /// The most recent launch.
     pub fn last_launch(&self) -> Option<LaunchSpec> {
-        self.launches().pop()
+        self.state
+            .launches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last()
+            .cloned()
     }
 
     /// Every line the library wrote to a child's stdin, across all of them.

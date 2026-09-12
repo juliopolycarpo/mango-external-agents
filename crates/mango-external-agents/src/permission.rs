@@ -420,6 +420,7 @@ impl PermissionRequest {
         let detail = self
             .detail
             .map(|detail| normalize::bound_text(&detail, TextLimit::Detail));
+        let detail_truncated = detail.as_ref().is_some_and(|detail| detail.truncated);
         let mut options = Vec::with_capacity(self.options.len());
         let mut options_truncated = false;
         for option in self.options {
@@ -439,13 +440,10 @@ impl PermissionRequest {
             id: normalize::opaque_id(&self.id, "approval request id")?,
             kind: self.kind,
             title: title.text,
-            detail: detail.as_ref().map(|detail| detail.text.clone()),
+            detail: detail.map(|detail| detail.text),
             options,
             expires_at: self.expires_at,
-            truncated: self.truncated
-                || title.truncated
-                || detail.is_some_and(|detail| detail.truncated)
-                || options_truncated,
+            truncated: self.truncated || title.truncated || detail_truncated || options_truncated,
         })
     }
 
