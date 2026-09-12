@@ -157,7 +157,12 @@ pub enum AcpSpec {
 ///
 /// The host owns resolution: it knows the toolchain, the version manager and the sandbox the
 /// child will run under. The library never searches `PATH` on its own initiative.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Carried on [`OpenSession`](crate::OpenSession) rather than on the host, because a path is
+/// resolved for one harness: a host that resolved Claude and then opened a Codex session through
+/// the same context would otherwise have spawned the Claude binary with Codex's arguments.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct ExecutablePath(Option<PathBuf>);
 
 impl ExecutablePath {

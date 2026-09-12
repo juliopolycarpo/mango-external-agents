@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::host::HostContext;
 use crate::link::{Link, LinkReceiver, LinkSender};
 use crate::process::{ByteSink, LineStream, ProcessControl};
-use crate::transport::StdioSpec;
+use crate::transport::{ExecutablePath, StdioSpec};
 
 /// A spawned child, as a link and the handle that ends it.
 pub struct StdioTransport {
@@ -42,6 +42,7 @@ impl std::fmt::Debug for StdioTransport {
 pub async fn open(
     host: &HostContext,
     spec: &StdioSpec,
+    executable: &ExecutablePath,
     vendor_environment_keys: &[&str],
 ) -> Result<StdioTransport> {
     let Some(program) = spec.program() else {
@@ -52,8 +53,9 @@ pub async fn open(
     };
 
     // The host resolved the executable if it could; the harness only knows the program's name.
+    // It comes from the request rather than the context because it was resolved for this harness.
     let mut argv = spec.argv.clone();
-    argv[0] = host.executable().or(program.to_owned());
+    argv[0] = executable.or(program.to_owned());
 
     let mut child = host
         .launcher()
@@ -146,6 +148,7 @@ mod tests {
         open(
             &host,
             &StdioSpec::new(["codex", "app-server"]),
+            &ExecutablePath::default(),
             &["VENDOR_CONFIG"],
         )
         .await
@@ -171,17 +174,61 @@ mod tests {
             .launcher(launcher.clone())
             .cwd("/workspace")
             .client_info("test-host", "0.0.0")
-            .executable(ExecutablePath::resolved("/opt/codex/bin/codex"))
             .build()
             .expect("expected a context");
 
-        open(&host, &StdioSpec::new(["codex", "app-server"]), &[])
-            .await
-            .expect("expected a transport");
+        open(
+            &host,
+            &StdioSpec::new(["codex", "app-server"]),
+            &ExecutablePath::resolved("/opt/codex/bin/codex"),
+            &[],
+        )
+        .await
+        .expect("expected a transport");
 
         let launch = launcher.last_launch().expect("expected one launch");
         assert_eq!(launch.argv[0], "/opt/codex/bin/codex");
         assert_eq!(launch.argv[1], "app-server");
+    }
+
+    /// One `HostContext` is built once and serves every harness, so a path resolved for one must
+    /// not reach another. Spawning the Claude binary with Codex's arguments fails as a Codex bug.
+    #[tokio::test]
+    async fn a_path_resolved_for_one_harness_never_reaches_another() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript::<[&str; 0], &str>([]));
+        launcher.push(FakeProcess::transcript::<[&str; 0], &str>([]));
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd("/workspace")
+            .client_info("test-host", "0.0.0")
+            .build()
+            .expect("expected a context");
+
+        open(
+            &host,
+            &StdioSpec::new(["claude", "-p"]),
+            &ExecutablePath::resolved("/opt/claude/bin/claude"),
+            &[],
+        )
+        .await
+        .expect("expected a transport");
+        assert_eq!(
+            launcher.last_launch().expect("expected a launch").argv[0],
+            "/opt/claude/bin/claude"
+        );
+
+        open(
+            &host,
+            &StdioSpec::new(["codex", "app-server"]),
+            &ExecutablePath::resolved("/opt/codex/bin/codex"),
+            &[],
+        )
+        .await
+        .expect("expected a transport");
+        let second = launcher.last_launch().expect("expected a second launch");
+        assert_eq!(second.argv[0], "/opt/codex/bin/codex");
+        assert_eq!(second.argv[1], "app-server");
     }
 
     #[tokio::test]
@@ -190,9 +237,14 @@ mod tests {
         launcher.push(FakeProcess::responding(|line| vec![format!("echo:{line}")]));
         let host = host(Arc::clone(&launcher));
 
-        let transport = open(&host, &StdioSpec::new(["codex"]), &[])
-            .await
-            .expect("expected a transport");
+        let transport = open(
+            &host,
+            &StdioSpec::new(["codex"]),
+            &ExecutablePath::default(),
+            &[],
+        )
+        .await
+        .expect("expected a transport");
         let (mut sender, mut receiver) = transport.link.split();
 
         sender
@@ -214,9 +266,14 @@ mod tests {
         let launcher = Arc::new(FakeLauncher::scripted("one\ntwo\n"));
         let host = host(Arc::clone(&launcher));
 
-        let transport = open(&host, &StdioSpec::new(["claude"]), &[])
-            .await
-            .expect("expected a transport");
+        let transport = open(
+            &host,
+            &StdioSpec::new(["claude"]),
+            &ExecutablePath::default(),
+            &[],
+        )
+        .await
+        .expect("expected a transport");
         let (_, mut receiver) = transport.link.split();
 
         assert_eq!(
@@ -236,9 +293,14 @@ mod tests {
         launcher.push(FakeProcess::responding(|_| Vec::new()));
         let host = host(Arc::clone(&launcher));
 
-        let transport = open(&host, &StdioSpec::new(["claude"]), &[])
-            .await
-            .expect("expected a transport");
+        let transport = open(
+            &host,
+            &StdioSpec::new(["claude"]),
+            &ExecutablePath::default(),
+            &[],
+        )
+        .await
+        .expect("expected a transport");
         let (mut sender, mut receiver) = transport.link.split();
 
         sender.close().await.expect("expected the close to land");
@@ -250,9 +312,14 @@ mod tests {
         let launcher = Arc::new(FakeLauncher::new());
         let host = host(Arc::clone(&launcher));
 
-        let error = open(&host, &StdioSpec::new(Vec::<String>::new()), &[])
-            .await
-            .expect_err("expected a refusal, received a transport");
+        let error = open(
+            &host,
+            &StdioSpec::new(Vec::<String>::new()),
+            &ExecutablePath::default(),
+            &[],
+        )
+        .await
+        .expect_err("expected a refusal, received a transport");
         assert!(
             matches!(error, Error::HostConfiguration { .. }),
             "expected a configuration refusal, received {error:?}"

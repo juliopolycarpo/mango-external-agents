@@ -161,6 +161,13 @@ pub struct OpenSession {
     /// A vendor conversation to continue, when the host is continuing one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
+    /// Where this harness's executable is, when the host resolved it.
+    ///
+    /// Per request, because a resolved path belongs to one harness. It is usually
+    /// [`Discovery::executable`](crate::Discovery::executable) from the probe of the same harness
+    /// this session is being opened on.
+    #[serde(default)]
+    pub executable: crate::transport::ExecutablePath,
 }
 
 impl OpenSession {
@@ -180,7 +187,17 @@ impl OpenSession {
             session_id: SessionId::new(session_id),
             configuration: Configuration::default(),
             resume: None,
+            executable: crate::transport::ExecutablePath::default(),
         }
+    }
+
+    /// Spawns this executable rather than leaving the launcher to resolve the program name.
+    ///
+    /// The path the host resolved for *this* harness — `Discovery::executable`, usually.
+    #[must_use]
+    pub fn with_executable(mut self, executable: crate::transport::ExecutablePath) -> Self {
+        self.executable = executable;
+        self
     }
 
     /// Runs under this configuration instead of the restrictive default.

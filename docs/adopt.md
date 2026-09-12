@@ -61,10 +61,13 @@ already logged into with the vendor's own CLI.
 
 ## What the host reads
 
-- `Harness::discover` → `Discovery { executable, version, gate, auth, capabilities, models }`. The
-  harness never caches; the host decides freshness. `AuthState` is `LoggedIn { mode }`,
-  `LoggedOut { login_hint }` or `Unknown` — filled only from a surface that does not involve
-  reading a credential, and `Unknown` when the only way to know would be to read one.
+- `Harness::discover` → `Discovery { executable, version, gate, auth, capabilities, models }`,
+  bounded by the trait before the host sees it. The harness never caches; the host decides
+  freshness. `AuthState` is `LoggedIn { mode }`, `LoggedOut { login_hint }` or `Unknown` — filled
+  only from a surface that does not involve reading a credential, and `Unknown` when the only way
+  to know would be to read one. The `executable` it found is what the host passes back on
+  `OpenSession::with_executable`: a resolved path belongs to one harness, so it rides on the
+  request rather than on the context every harness shares.
 - `Harness::open_session` → a `Box<dyn Session>`. `SessionInfo` carries both ids, whether the
   vendor resumed, the configuration it actually accepted and what this build can do.
 - `Session::start_turn` → a `TurnStream`: a bounded channel of `AgentEvent`. A host that stops

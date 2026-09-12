@@ -19,7 +19,6 @@ use crate::env::EnvSource;
 use crate::error::{Error, Result};
 use crate::permission::PermissionBroker;
 use crate::process::{DEFAULT_STDERR_TAIL_BYTES, LineLimits, ProcessLauncher};
-use crate::transport::ExecutablePath;
 
 /// Who the host says it is, for vendors that ask.
 ///
@@ -174,7 +173,6 @@ pub struct HostContext {
     launcher: Arc<dyn ProcessLauncher>,
     cwd: PathBuf,
     environment: EnvSource,
-    executable: ExecutablePath,
     client_info: ClientInfo,
     clock: Arc<dyn Clock>,
     cancel: CancelToken,
@@ -187,7 +185,6 @@ impl std::fmt::Debug for HostContext {
         formatter
             .debug_struct("HostContext")
             .field("cwd", &self.cwd)
-            .field("executable", &self.executable)
             .field("client_info", &self.client_info)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
@@ -213,11 +210,6 @@ impl HostContext {
     /// The environment the host is willing to pass on, before the allowlist.
     pub fn environment(&self) -> &EnvSource {
         &self.environment
-    }
-
-    /// The executable the host resolved for this harness, if it resolved one.
-    pub fn executable(&self) -> &ExecutablePath {
-        &self.executable
     }
 
     /// Who the host says it is.
@@ -270,7 +262,6 @@ pub struct HostContextBuilder {
     launcher: Option<Arc<dyn ProcessLauncher>>,
     cwd: Option<PathBuf>,
     environment: Option<EnvSource>,
-    executable: ExecutablePath,
     client_info: Option<ClientInfo>,
     clock: Option<Arc<dyn Clock>>,
     cancel: Option<CancelToken>,
@@ -297,13 +288,6 @@ impl HostContextBuilder {
     #[must_use]
     pub fn environment(mut self, environment: EnvSource) -> Self {
         self.environment = Some(environment);
-        self
-    }
-
-    /// The executable the host resolved, when it resolved one.
-    #[must_use]
-    pub fn executable(mut self, executable: ExecutablePath) -> Self {
-        self.executable = executable;
         self
     }
 
@@ -370,7 +354,6 @@ impl HostContextBuilder {
             launcher,
             cwd,
             environment: self.environment.unwrap_or_default(),
-            executable: self.executable,
             client_info,
             clock: self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
             cancel: self.cancel.unwrap_or_default(),
