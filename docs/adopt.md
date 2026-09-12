@@ -1,7 +1,7 @@
 # Adopting the library in a host
 
 How a host (an IDE, a runtime, a CLI) embeds mango-external-agents. The types named here land with
-the core crate in plan 002; this page fixes the shape so the crate can be written against it.
+the core crate; this page fixes the shape so the crate can be written against it.
 
 ## What the host provides
 
@@ -35,7 +35,7 @@ the core crate in plan 002; this page fixes the shape so the crate can be writte
 
 Keep the mapping in one module in the host. It is small and it is where product vocabulary
 (disclosure text, presets, translated reasons) lives. mangostudio's runtime is the worked example
-and will be linked here once plan 006 documents it.
+and will be linked here once its integration is documented.
 
 ## Testing a host
 

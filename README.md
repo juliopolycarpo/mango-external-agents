@@ -40,7 +40,7 @@ Versions are lockstep: one tag releases the four crates.
 
 The host implements `ProcessLauncher` (or takes `TokioLauncher` from the `launcher-tokio`
 feature), authorises a working directory, and reads events. Against the `testing` fakes it looks
-like this; the types land with the core crate in plan 002.
+like this; the types land with the core crate.
 
 ```rust,ignore
 use mango_external_agents::testing::FakeLauncher;

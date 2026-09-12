@@ -1,7 +1,7 @@
 //! Agent Client Protocol harness for `mango-external-agents`.
 //!
-//! Drives any Agent Client Protocol agent over the official `agent-client-protocol` crate through its documented programmatic surface only. The behaviour lands in later
-//! plans; this crate currently declares its harness kind.
+//! Drives any Agent Client Protocol agent over the official `agent-client-protocol` crate through its documented programmatic surface only. The behaviour lands with the harness itself;
+//! this crate currently declares its harness kind.
 
 /// The harness kind this crate implements, as the core registry names it.
 pub const HARNESS_KIND: &str = "acp";
