@@ -14,6 +14,7 @@ use std::path::PathBuf;
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum TransportKind {
     /// A child the host's launcher spawned; the library owns line framing.
     Stdio,
@@ -35,6 +36,7 @@ impl fmt::Display for TransportKind {
 
 /// What one transport kind needs in order to be opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransportSpec {
     /// Spawn this argv through the host's launcher and frame its stdout by lines.
     Stdio(StdioSpec),
@@ -143,6 +145,7 @@ impl WsSpec {
 
 /// Which carrier the official Agent Client Protocol client rides.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AcpSpec {
     /// A child process's pipes, spawned through the host's launcher.
     ChildPipes(StdioSpec),

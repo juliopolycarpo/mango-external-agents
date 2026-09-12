@@ -24,6 +24,7 @@ use crate::stream::{ReviewStream, TurnStream};
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CancelReason {
     /// Somebody asked for it: a stop button, an API call.
     Requested,
@@ -55,6 +56,7 @@ impl fmt::Display for CancelReason {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CloseReason {
     /// Somebody asked for it.
     Requested,
@@ -129,6 +131,7 @@ impl Default for Configuration {
 /// Whether a session that cannot be resumed should start fresh or fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ResumeMode {
     /// Fail if the vendor cannot resume this conversation.
     Strict,
@@ -221,6 +224,7 @@ pub const TURN_MAX_ATTACHMENTS: usize = 4;
 /// What one attachment is, for a vendor that takes them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum AttachmentKind {
     /// An image.
     Image,
@@ -333,6 +337,7 @@ pub enum SteerOutcome {
 /// harness is called at all, because neither is a fact about the vendor's turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SteerRejection {
     /// The turn ended before the steer reached it — a race a person can legitimately hit.
     TurnAlreadyCompleted,
@@ -347,6 +352,7 @@ pub enum SteerRejection {
 /// more member.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum ReviewTarget {
     /// Staged, unstaged and untracked work, as the vendor defines it. The library does not narrow
     /// the definition.

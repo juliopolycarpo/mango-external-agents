@@ -70,6 +70,7 @@ impl ApprovalRouting {
 /// received a key would be rendering a string this crate had chosen for it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum UnsupportedReason {
     /// The vendor has no equivalent of this pair.
     NotOfferedByVendor,
@@ -239,6 +240,7 @@ impl PermissionMatrix {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum PermissionOptionKind {
     /// Allow this one thing.
     AllowOnce,
@@ -485,6 +487,7 @@ impl PermissionRequest {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum DecisionSource {
     /// A person chose.
     User,

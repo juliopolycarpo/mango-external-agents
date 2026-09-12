@@ -16,6 +16,7 @@ use std::fmt;
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum HarnessKind {
     /// Claude Code, through its documented headless stream-json mode.
     Claude,
@@ -264,6 +265,7 @@ impl Capabilities {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum Capability {
     /// [`Session::steer`](crate::Session::steer).
     Steering,

@@ -102,6 +102,7 @@ impl AgentEvent {
 /// What happened, in the vocabulary every harness normalises onto.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EventKind {
     /// The vendor opened or resumed its own session.
     SessionStarted {
@@ -301,6 +302,7 @@ pub struct Command {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ActivityKind {
     /// A shell command.
     Command,
@@ -409,6 +411,7 @@ impl ActivityUpdate {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ActivityStatus {
     /// It finished.
     Completed,

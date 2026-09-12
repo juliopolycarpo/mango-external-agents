@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 
 /// Every bounded field, and how many code points it may keep.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum TextLimit {
     /// The vendor's own tool name, rendered as an activity's label.
     ActivityName,

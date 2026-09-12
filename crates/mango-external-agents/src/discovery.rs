@@ -65,6 +65,7 @@ impl Discovery {
 
 /// Whether the installed build can be driven.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GateVerdict {
     /// It can.
     Usable,
@@ -89,6 +90,7 @@ pub enum GateVerdict {
 /// Reported, never established. The library has no login method anywhere, opens no browser and
 /// reads no token: this is what a non-secret vendor surface said, or `Unknown`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthState {
     /// Somebody is signed in.
     LoggedIn {
@@ -108,6 +110,7 @@ pub enum AuthState {
 
 /// How an account is signed in.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthMode {
     /// A consumer subscription.
     Subscription,
