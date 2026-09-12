@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::discovery::{AuthMode, AuthState, Discovery, GateVerdict, Model};
-use crate::error::{Error, ErrorCode, Result, VendorError};
+use crate::error::{Error, Result};
 use crate::event::{Activity, ActivityKind, ActivityResult, ActivityStatus, EventKind, Usage};
 use crate::harness::{Capabilities, Harness, HarnessDescriptor, HarnessKind, VendorInfo};
 use crate::host::HostContext;
@@ -16,8 +16,8 @@ use crate::permission::{
     PermissionOptionKind, PermissionRequest, PermissionResponse, broker_response,
 };
 use crate::session::{
-    AccountUsage, CancelReason, CloseReason, OpenSession, Session, SessionIds, SessionInfo, Steer,
-    SteerOutcome, TurnRequest,
+    CancelReason, CloseReason, OpenSession, Session, SessionIds, SessionInfo, Steer, SteerOutcome,
+    TurnRequest,
 };
 use crate::stream::{EventSink, TurnStream};
 use crate::transport::TransportKind;
@@ -347,13 +347,6 @@ impl Session for FakeSession {
                 reason: crate::session::SteerRejection::TurnAlreadyCompleted,
             }),
         }
-    }
-
-    async fn refresh_account_usage(&self) -> Result<AccountUsage> {
-        Err(Error::Vendor(VendorError::new(
-            ErrorCode::from_static("fake-no-account-surface"),
-            "this harness has no account surface",
-        )))
     }
 }
 

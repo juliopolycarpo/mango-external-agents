@@ -130,6 +130,6 @@ report.assert_passed();
 
 It checks what a host is entitled to assume: a turn ends exactly once and nothing follows its
 terminal, every event names its own session and turn, an approval can be answered, a cancelled turn
-still completes, closing twice is not an error, an undeclared capability refuses as unsupported,
-and a probe never claims more than the descriptor's ceiling. A check that cannot run on your
-fixture is reported as skipped rather than passed.
+still completes, closing twice is not an error, every capability the descriptor did not declare
+refuses as unsupported, and a probe never claims more than the descriptor's ceiling. A check that
+cannot run on your fixture is reported as skipped rather than passed.

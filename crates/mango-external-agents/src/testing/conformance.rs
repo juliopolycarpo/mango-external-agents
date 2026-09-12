@@ -4,8 +4,8 @@
 //! replays a captured fixture. What is checked here is what a host is entitled to assume — not
 //! what any one vendor happens to do — so the checks are about shape and ordering: a turn ends
 //! exactly once, every event names its turn, an approval can be answered, a cancelled turn still
-//! completes, closing twice is not an error, and an undeclared capability refuses rather than
-//! misbehaves.
+//! completes, closing twice is not an error, and every capability a harness did not declare
+//! refuses as [`Error::NotSupported`] rather than misbehaving.
 
 use std::time::Duration;
 
@@ -14,7 +14,8 @@ use crate::event::{AgentEvent, EventKind};
 use crate::harness::{Capability, Harness};
 use crate::host::HostContext;
 use crate::session::{
-    CancelReason, CloseReason, OpenSession, Session, SessionQuery, Steer, TurnRequest,
+    CancelReason, CloseReason, OpenSession, ReviewRequest, ReviewTarget, Session, SessionQuery,
+    Steer, TurnRequest,
 };
 
 /// How one check went.
@@ -394,6 +395,30 @@ async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
         if !refuses_as_unsupported(&outcome, Capability::SessionListing) {
             failures.push(String::from(
                 "expected session listing to refuse as unsupported, received something else",
+            ));
+        }
+    }
+
+    if !capabilities.has(Capability::NativeReview) {
+        let outcome = session
+            .start_review(ReviewRequest {
+                turn_id: crate::event::TurnId::new("conformance-review-1"),
+                target: ReviewTarget::UncommittedChanges,
+            })
+            .await
+            .map(|_| ());
+        if !refuses_as_unsupported(&outcome, Capability::NativeReview) {
+            failures.push(String::from(
+                "expected a native review to refuse as unsupported, received something else",
+            ));
+        }
+    }
+
+    if !capabilities.has(Capability::AccountUsage) {
+        let outcome = session.refresh_account_usage().await;
+        if !refuses_as_unsupported(&outcome, Capability::AccountUsage) {
+            failures.push(String::from(
+                "expected account usage to refuse as unsupported, received something else",
             ));
         }
     }
