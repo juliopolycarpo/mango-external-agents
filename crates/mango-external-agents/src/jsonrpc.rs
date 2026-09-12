@@ -504,31 +504,33 @@ impl ClientState {
             .abort_all();
     }
 
-    /// Claims a slot for one of the peer's questions, reaping the answers already given.
-    fn claim_in_flight_slot(&self) -> bool {
-        let mut in_flight = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        while in_flight.try_join_next().is_some() {}
-        in_flight.len() < self.options.max_in_flight_requests
-    }
-
-    /// Answers one of the peer's questions on a task this client owns.
+    /// Answers one of the peer's questions on a task this client owns, if there is room.
+    ///
+    /// The count and the spawn happen under one lock rather than two. Only the pump dispatches
+    /// today, so a gap between checking and spawning would hold — until the day anything else
+    /// answers a question, and then the bound this exists to enforce is off by however many
+    /// dispatchers raced through it.
     fn spawn_answer(
         state: &Arc<Self>,
         handler: &Arc<dyn PeerHandler>,
         method: String,
         params: Value,
         raw_id: Value,
-    ) {
-        let owned = Arc::clone(state);
-        let handler = Arc::clone(handler);
-        state
+    ) -> bool {
+        let mut in_flight = state
             .in_flight
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .spawn(async move { answer(&owned, &handler, method, params, raw_id).await });
+            .unwrap_or_else(PoisonError::into_inner);
+        // The answers already given are reaped first, so the count is what is still being decided
+        // rather than everything that was ever asked.
+        while in_flight.try_join_next().is_some() {}
+        if in_flight.len() >= state.options.max_in_flight_requests {
+            return false;
+        }
+        let owned = Arc::clone(state);
+        let handler = Arc::clone(handler);
+        in_flight.spawn(async move { answer(&owned, &handler, method, params, raw_id).await });
+        true
     }
 
     async fn write(&self, frame: String) -> Result<()> {
@@ -621,9 +623,7 @@ async fn dispatch(state: &Arc<ClientState>, handler: &Arc<dyn PeerHandler>, mess
             // arriving meanwhile, which is what a turn renders while the person decides. Counted,
             // because a peer that asks faster than anyone answers must not be able to spawn
             // without bound.
-            if state.claim_in_flight_slot() {
-                ClientState::spawn_answer(state, handler, method, params, id);
-            } else {
+            if !ClientState::spawn_answer(state, handler, method, params, id.clone()) {
                 let refusal = JsonRpcError {
                     code: -32000,
                     message: format!(
