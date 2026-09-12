@@ -112,6 +112,19 @@ struct ScriptedSender {
 #[async_trait::async_trait]
 impl LinkSender for ScriptedSender {
     async fn send(&mut self, message: String) -> Result<()> {
+        // A closed link refuses, as a child whose stdin was dropped would. Recording the write
+        // instead would make this fake the one place a post-close send succeeds, so a peer that
+        // writes after closing would pass here and hang against the real thing.
+        if *self
+            .state
+            .ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return Err(Error::Closed {
+                subject: "scripted link",
+            });
+        }
         if let Some(failure) = self
             .state
             .send_failure
@@ -218,6 +231,36 @@ mod tests {
                 .expect("expected a message"),
             Some(String::from("late"))
         );
+    }
+
+    /// A fake that kept accepting writes after `close` would be the one link on which a
+    /// post-close send succeeds, so a peer that writes into a link it already ended would pass
+    /// every test here and hang against a real child.
+    #[tokio::test]
+    async fn a_send_after_the_link_was_closed_is_refused_rather_than_recorded() {
+        let link = ScriptedLink::new();
+        let (mut sender, _) = link.clone().into_link().split();
+
+        sender
+            .send(String::from("one"))
+            .await
+            .expect("expected the send to land");
+        sender.close().await.expect("expected a clean close");
+
+        let error = sender
+            .send(String::from("two"))
+            .await
+            .expect_err("expected a refusal, received a send");
+        assert!(
+            matches!(
+                error,
+                crate::error::Error::Closed {
+                    subject: "scripted link"
+                }
+            ),
+            "received {error:?}"
+        );
+        assert_eq!(link.sent(), vec![String::from("one")]);
     }
 
     #[tokio::test]

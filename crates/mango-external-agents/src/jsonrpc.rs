@@ -322,6 +322,9 @@ impl Client {
     ///
     /// [`Error::Link`] when closing the link itself failed.
     pub async fn close(&self) -> Result<()> {
+        // Stored before the drain rather than inside it, and that order is the contract `call`
+        // reads: a caller that finds the map open has, by that fact, arrived before this store,
+        // and the drain below cannot run until that caller's entry is in the map.
         self.state.closed.store(true, Ordering::Release);
         self.state.shutdown.cancel();
         self.state.fail_pending(self.state.closed_error()).await;
@@ -365,12 +368,28 @@ impl Client {
             .next_id
             .fetch_add(1, Ordering::Relaxed)
             .to_string();
-        let (answer, waiting) = oneshot::channel();
-        self.state.pending.lock().await.insert(id.clone(), answer);
-
+        // Built before the map is touched: a frame this refuses would otherwise leave a waiter
+        // behind for a caller that is returning the failure here.
         let frame = self
             .state
             .frame(Some(Value::String(id.clone())), method, params)?;
+
+        let (answer, waiting) = oneshot::channel();
+        {
+            let mut pending = self.state.pending.lock().await;
+            // Read again, holding the map, because the check above is not the same instant as this
+            // insert. `close` stores the flag and then drains under this lock; a call checks under
+            // this lock and then inserts. If the read here says open, the store had not landed, and
+            // the drain that follows it needs the lock this call holds until the entry is in — so
+            // it sees the entry. If it says closed, the call returns. Nothing else can happen, and
+            // in particular no entry can land after the drain that was supposed to fail it, which
+            // is a caller waiting out its whole `request_timeout` for a link that is already gone.
+            if self.state.closed.load(Ordering::Acquire) {
+                return Err(Error::Closed { subject: "link" });
+            }
+            pending.insert(id.clone(), answer);
+        }
+
         if let Err(error) = self.state.write(frame).await {
             // The entry goes before the error leaves: nothing is waiting on this call — the
             // failure is returning here — so an orphan left behind would be failed later by a
@@ -401,6 +420,17 @@ impl Client {
 }
 
 impl Drop for Client {
+    /// Best effort, and nothing is left waiting by the time it runs.
+    ///
+    /// [`Client::close`] is the supported shutdown: it fails every call still waiting, lets the
+    /// answers in flight write their refusals, and closes the link. This runs when nobody called
+    /// it, and there is deliberately no drain here — a caller inside [`Client::request`] holds a
+    /// borrow of this client for the life of its future, so no pending call can outlive this, and
+    /// a map the last owner is dropping has nothing to fail.
+    ///
+    /// What is left is the end of the link. The pump and the answers in flight are taken down, and
+    /// the sender goes with the last [`ClientState`] they were holding — which on a child's stdin
+    /// is the end-of-input a print-mode vendor waits for.
     fn drop(&mut self) {
         self.state.closed.store(true, Ordering::Release);
         self.state.shutdown.cancel();
@@ -715,6 +745,81 @@ mod tests {
             handler,
             ClientOptions::new("Codex app-server").with_request_timeout(Duration::from_secs(5)),
         )
+    }
+
+    /// A frame that cannot be built must not leave a waiter behind: the map is what `close` and a
+    /// dying pump drain, so an orphan is failed later against a caller that gave up here.
+    #[tokio::test]
+    async fn params_that_cannot_be_written_leave_no_waiter_behind() {
+        struct Unwritable;
+
+        impl serde::Serialize for Unwritable {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("these params cannot be written"))
+            }
+        }
+
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        let refused = client.request::<_, Value>("thread/start", Unwritable).await;
+        assert!(
+            matches!(refused, Err(Error::Protocol { .. })),
+            "expected the params to be refused, received {refused:?}"
+        );
+
+        let waiting = client.state.pending.lock().await.len();
+        assert_eq!(
+            waiting, 0,
+            "expected nothing left waiting, received {waiting}"
+        );
+        assert!(link.sent().is_empty(), "received {:?}", link.sent());
+    }
+
+    /// The window this closes is a preemption between `call` reading the closed flag and inserting
+    /// its waiter, which no test can schedule. Holding the map reproduces the same ordering
+    /// deterministically: the caller is past its check and not yet inserted when a close lands its
+    /// flag and queues behind it. Without the check under the lock the caller inserts anyway and
+    /// is failed by the drain that follows — an answer that names the peer for a refusal this side
+    /// made, and on the real timeline no drain follows at all and the caller waits out its whole
+    /// `request_timeout`.
+    #[tokio::test]
+    async fn a_call_that_reaches_the_map_behind_a_close_is_refused_by_this_side() {
+        let link = ScriptedLink::new();
+        let client = Arc::new(client(link.clone(), RecordingHandler::arc(None)));
+
+        let held = client.state.pending.lock().await;
+
+        let calling = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("thread/start", json!({})).await })
+        };
+        tokio::task::yield_now().await;
+
+        let closing = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.close().await })
+        };
+        tokio::task::yield_now().await;
+
+        assert!(
+            client.is_closed(),
+            "expected the close to have landed its flag while the caller waits for the map"
+        );
+        drop(held);
+
+        let refused = calling.await.expect("expected the caller to finish");
+        assert!(
+            matches!(refused, Err(Error::Closed { subject: "link" })),
+            "expected this side to refuse the call, received {refused:?}"
+        );
+        closing
+            .await
+            .expect("expected the close to finish")
+            .expect("expected a clean close");
     }
 
     #[tokio::test]
