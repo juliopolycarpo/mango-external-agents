@@ -55,11 +55,14 @@ impl ConfigFile {
             });
         }
 
+        // Every refusal that does not touch the disk runs before the directory below is created,
+        // so a host misconfiguration never leaves an unguessable, owner-only directory behind for
+        // nobody to clean up.
+        let document = document_for(servers)?;
+
         let directory = scratch
             .join(PARENT_DIRECTORY)
             .join(uuid::Uuid::new_v4().to_string());
-        create_private_directory(&directory).await?;
-
         let path = directory.join(FILE_NAME);
         // `--mcp-config` takes one argument, and an argument is a string. A path that is not UTF-8
         // would have to be rendered lossily, and a lossy path names a different file.
@@ -69,7 +72,8 @@ impl ConfigFile {
                 received: path.to_string_lossy().into_owned(),
             });
         };
-        let document = document_for(servers)?;
+
+        create_private_directory(&directory).await?;
         tokio::fs::write(&path, document.to_string())
             .await
             .map_err(|error| launch_failure("write an MCP configuration", &path, &error))?;
@@ -122,17 +126,14 @@ fn document_for(servers: &[McpServer]) -> Result<Value> {
         // unusable transport for: a turn that runs without the tools somebody configured, reported
         // as though it had been set up. Which of the two the host meant is not this harness's guess
         // to make.
-        if let Some(collision) = configured.insert(server.name.clone(), entry) {
+        if configured.insert(server.name.clone(), entry).is_some() {
             let count = servers
                 .iter()
                 .filter(|other| other.name == server.name)
                 .count();
             return Err(Error::HostConfiguration {
                 expected: "one MCP server per name, because the vendor lists them in a map",
-                received: format!(
-                    "{count} servers named {:?}; the first maps to {collision}",
-                    server.name
-                ),
+                received: format!("{count} servers named {:?}", server.name),
             });
         }
     }
@@ -214,7 +215,7 @@ fn launch_failure(what: &str, path: &Path, error: &std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigFile, document_for};
+    use super::{ConfigFile, PARENT_DIRECTORY, document_for};
     use mango_external_agents::{McpServer, McpTransport};
     use serde_json::json;
 
@@ -252,6 +253,12 @@ mod tests {
         assert!(
             message.contains("docs") && message.contains('2'),
             "expected the colliding name and how many asked for it, received {message}"
+        );
+        // `servers()`'s first `docs` entry carries `DOCS_TOKEN=s3cret`. Naming the collision is
+        // enough to diagnose it; the credential the first entry mapped to is not.
+        assert!(
+            !message.contains("s3cret"),
+            "expected the collision's mapped value to stay out of the message, received {message}"
         );
     }
 
@@ -312,6 +319,34 @@ mod tests {
                 mango_external_agents::Error::HostConfiguration { .. }
             ),
             "received {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn refuses_colliding_names_without_leaving_a_directory_behind() {
+        let scratch = tempdir();
+        let mut colliding = servers();
+        colliding.push(McpServer::stdio("docs", "other-docs-mcp"));
+
+        let error = ConfigFile::write(&colliding, &scratch)
+            .await
+            .map(|file| file.is_some())
+            .expect_err("expected the collision to be refused");
+        assert!(
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration { .. }
+            ),
+            "received {error:?}"
+        );
+
+        let left_behind = std::fs::read_dir(scratch.join(PARENT_DIRECTORY))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            left_behind, 0,
+            "expected a refusal that never wrote a file to leave no directory behind, received {left_behind} entries"
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }
