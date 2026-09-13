@@ -104,7 +104,7 @@ fn from_command(params: &CommandExecutionApprovalParams, now: SystemTime) -> Pen
     }
 
     build(
-        &params.item_id,
+        params.approval_id.as_deref().unwrap_or(&params.item_id),
         ActivityKind::Command,
         title,
         detail,
@@ -139,7 +139,7 @@ fn base_decisions() -> Vec<ApprovalDecisionValue> {
 }
 
 fn build(
-    item_id: &str,
+    id: &str,
     kind: ActivityKind,
     title: String,
     detail: Option<String>,
@@ -153,10 +153,17 @@ fn build(
         .collect();
     PendingApproval {
         request: PermissionRequest {
-            // The item the approval gates, which is also the activity a host already has on
-            // screen. Using the JSON-RPC request id instead would name the question rather than
-            // the thing being asked about, and a host could not line the two up.
-            id: item_id.to_owned(),
+            // The question, as the vendor names it: its own callback id where it has one, and the
+            // item it gates otherwise. Not the JSON-RPC request id, which names the frame rather
+            // than the thing being asked about — a host that stored one could not line it up with
+            // anything it had already been told.
+            //
+            // The distinction matters where one command raises two questions. Upstream says
+            // several callbacks can share a parent item, so keying by the item would have the
+            // second question overwrite the first: the first host to answer would be answering
+            // for both, and the waiter it displaced would sit out the deadline and decline a
+            // question somebody had already allowed.
+            id: id.to_owned(),
             kind,
             title,
             detail,
@@ -205,6 +212,24 @@ fn option_for(decision: &ApprovalDecisionValue) -> PermissionOption {
 
 #[cfg(test)]
 mod tests {
+    /// One command-execution approval as the server writes it, with or without a callback id.
+    fn command_approval(item_id: &str, approval_id: Option<&str>) -> super::PendingApproval {
+        let request = crate::protocol::approvals::ServerRequest::parse(
+            crate::protocol::approvals::method::COMMAND_EXECUTION_APPROVAL,
+            serde_json::json!({
+                "threadId": "t",
+                "turnId": "u",
+                "itemId": item_id,
+                "approvalId": approval_id,
+                "kind": "shell",
+                "startedAtMs": 1_u64,
+                "command": "rm -rf /tmp/mango",
+            }),
+        );
+        super::to_request(&request, std::time::SystemTime::UNIX_EPOCH)
+            .expect("expected a question a person can be asked")
+    }
+
     use super::{APPROVAL_TIMEOUT, to_request};
     use crate::protocol::approvals::{ApprovalDecisionValue, ServerRequest, method};
     use mango_external_agents::event::ActivityKind;
@@ -236,6 +261,28 @@ mod tests {
 
     /// A question names the item it gates, not the JSON-RPC call that carried it: the host already
     /// has that item on screen as an activity.
+    /// Upstream declares a callback id precisely because several can share a parent item. Keying
+    /// by the item would let the second question overwrite the first, so the first answer would
+    /// settle both and the displaced waiter would sit out the deadline — declining something
+    /// somebody had already allowed.
+    #[test]
+    fn two_questions_about_one_command_stay_two_questions() {
+        let one = command_approval("exec-1", Some("callback-a"));
+        let two = command_approval("exec-1", Some("callback-b"));
+        assert_ne!(
+            one.request.id, two.request.id,
+            "expected two callbacks on one item to be told apart, received {} twice",
+            one.request.id
+        );
+    }
+
+    /// And where the vendor raises no callback of its own, the item is the question.
+    #[test]
+    fn a_command_with_no_callback_of_its_own_is_named_by_the_item_it_gates() {
+        let asked = command_approval("exec-1", None);
+        assert_eq!(asked.request.id, "exec-1");
+    }
+
     #[test]
     fn a_command_approval_is_a_question_about_the_activity_a_host_already_shows() {
         let pending = to_request(&command_request(json!({})), now()).expect("expected a question");

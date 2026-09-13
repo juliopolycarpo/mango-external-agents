@@ -151,6 +151,13 @@ pub struct CommandExecutionApprovalParams {
     /// The command-execution item this gates.
     #[serde(default)]
     pub item_id: String,
+    /// The callback this question answers, when one item raises more than one.
+    ///
+    /// Upstream declares it as an opaque id distinguishing callbacks that share a parent item, so
+    /// two questions about one command stay two questions. Absent on the ordinary shell approval,
+    /// where the item is the question.
+    #[serde(default)]
+    pub approval_id: Option<String>,
     /// The command itself.
     #[serde(default)]
     pub command: Option<String>,
@@ -291,6 +298,10 @@ mod tests {
         };
         assert_eq!(params.thread_id, "01a09999-7858");
         assert_eq!(params.item_id, "exec-ee0f9baa");
+        assert_eq!(
+            params.approval_id, None,
+            "expected the ordinary shell approval to carry no callback of its own"
+        );
         assert!(params.command.is_some());
         assert!(
             params.proposed_execpolicy_amendment.is_some(),
