@@ -240,6 +240,41 @@ mod opening_a_session {
         }
     }
 
+    /// At face value is not the same as unvetted.
+    ///
+    /// The reference goes on the command line as `--resume <value>`, and an argv array stops shell
+    /// injection but not argument injection: a stored handle beginning with `-` is read by the
+    /// CLI's parser as a flag of its own. Refused at `open_session`, so no turn is ever spawned
+    /// with it.
+    #[tokio::test]
+    async fn refuses_a_resume_reference_that_could_become_another_flag() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let host = host(Arc::clone(&launcher));
+        for injected in [
+            "--dangerously-skip-permissions",
+            "-p",
+            "22222222-3333-4444-5555-666666666666 --print",
+        ] {
+            let error = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").resuming(injected, ResumeMode::Strict),
+                )
+                .await
+                .map(drop)
+                .expect_err("expected the reference to be refused");
+            assert!(
+                matches!(error, Error::HostConfiguration { .. }),
+                "expected a host-configuration refusal for {injected:?}, received {error:?}"
+            );
+        }
+        assert!(
+            launcher.turn_argvs().is_empty(),
+            "expected no turn to be spawned, received {:?}",
+            launcher.turn_argvs()
+        );
+    }
+
     #[tokio::test]
     async fn refuses_a_signed_out_cli_before_a_turn_is_spawned() {
         let launcher = Arc::new(FakeClaudeCli::new().with_auth(SIGNED_OUT));
@@ -404,6 +439,52 @@ mod a_turn {
             value_after(&argvs[1], "--resume"),
             Some("b01414e7-4b4b-43a2-9109-a33e21664340"),
             "expected the second turn to resume the conversation the run reported"
+        );
+    }
+
+    /// The echoed handle is a vendor-chosen value that a later argv carries.
+    ///
+    /// `system/init` is followed because it names the conversation that now exists — but following
+    /// it verbatim puts whatever the run printed into the next turn's `--resume <value>`, where a
+    /// leading `-` is read as a flag rather than as the option's value. The minted id stays in
+    /// force instead, and the turn still resumes rather than trying to mint the same id twice.
+    #[tokio::test]
+    async fn does_not_follow_an_echoed_session_handle_that_could_become_another_flag() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::replaying(
+                    r#"{"type":"system","subtype":"init","session_id":"--dangerously-skip-permissions"}
+{"type":"result","is_error":false}"#,
+                ))
+                .with_turn(Run::replaying(r#"{"type":"result","is_error":false}"#)),
+        );
+        let session = open(&launcher).await;
+
+        let mut first = session
+            .start_turn(TurnRequest::new("turn-1", "start"))
+            .await
+            .expect("expected a turn");
+        drain(&mut first).await;
+        let mut second = session
+            .start_turn(TurnRequest::new("turn-2", "carry on"))
+            .await
+            .expect("expected a second turn");
+        drain(&mut second).await;
+
+        let argvs = launcher.turn_argvs();
+        let minted = value_after(&argvs[0], "--session-id").expect("expected a minted id");
+        assert_eq!(
+            value_after(&argvs[1], "--resume"),
+            Some(minted),
+            "expected the minted handle to stay in force, received {:?}",
+            argvs[1]
+        );
+        assert!(
+            argvs[1]
+                .iter()
+                .all(|argument| !argument.contains("skip-permissions")),
+            "received {:?}",
+            argvs[1]
         );
     }
 

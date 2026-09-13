@@ -21,7 +21,7 @@ use crate::permissions::{self, ModeAvailability};
 use crate::pinned::{self, MINIMUM_VERSION, VENDOR, VENDOR_ENVIRONMENT_KEYS};
 use crate::probe;
 use crate::session::ClaudeSession;
-use crate::{models, version};
+use crate::{argv, models, version};
 
 /// What this harness could support given a new enough CLI.
 ///
@@ -277,17 +277,29 @@ impl Harness for ClaudeHarness {
                 ),
             });
         }
-        // The library has no scratch directory of its own to be given, so the file goes where the
-        // platform puts temporary files, in a directory of its own that only its owner can read.
-        let mcp_config = ConfigFile::write(&request.mcp_servers, &std::env::temp_dir()).await?;
-
         let resumed = request.resume.is_some();
         let native_session_id = match &request.resume {
+            // Vetted rather than taken on trust, and before anything touches the disk. The
+            // reference goes on the command line as `--resume <value>`, and a stored one
+            // beginning with `-` would be read by the CLI's parser as a flag rather than as the
+            // option's value — the same argument-injection seam `models::safe_model` closes for
+            // `--model`. Refused rather than dropped: a resume this harness silently ignored
+            // would start a new conversation under the name of the one the host meant to continue.
+            Some(resume) if !argv::is_vendor_session_id(&resume.native_session_id) => {
+                return Err(Error::HostConfiguration {
+                    expected: "a resume reference shaped like the UUID Claude Code mints",
+                    received: format!("{:?}", resume.native_session_id),
+                });
+            }
             Some(resume) => resume.native_session_id.clone(),
             // `--session-id` takes a UUID and nothing else, so the handle is minted here rather
             // than derived from the host's own session id, which has no shape requirement.
             None => uuid::Uuid::new_v4().to_string(),
         };
+
+        // The library has no scratch directory of its own to be given, so the file goes where the
+        // platform puts temporary files, in a directory of its own that only its owner can read.
+        let mcp_config = ConfigFile::write(&request.mcp_servers, &std::env::temp_dir()).await?;
 
         let info = SessionInfo {
             ids: SessionIds {

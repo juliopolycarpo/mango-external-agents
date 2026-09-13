@@ -98,9 +98,11 @@ pub struct ClaudeSession {
 impl ClaudeSession {
     /// Adopts a session id without starting anything.
     ///
-    /// A resume reference is taken at face value. Verifying one would cost a process launch per
-    /// open, and a wrong guess is recoverable: a session Claude has forgotten fails at the first
-    /// turn with the vendor's own message rather than at a probe nobody asked for. That is why
+    /// A resume reference is checked for shape and then taken on trust — see
+    /// [`is_vendor_session_id`](crate::argv::is_vendor_session_id) for why the shape is checked at
+    /// all. Verifying that the conversation still *exists* would cost a process launch per open,
+    /// and a wrong guess is recoverable: a session Claude has forgotten fails at the first turn
+    /// with the vendor's own message rather than at a probe nobody asked for. That is why
     /// [`ResumeMode`](mango_external_agents::ResumeMode) makes no difference here, and why
     /// [`SessionInfo::fallback_reason`] is always `None` — nothing was verified, so nothing fell
     /// back.
@@ -539,8 +541,17 @@ fn apply_init(shared: &Shared, init: RunInit) {
         return;
     };
     let mut state = shared.lock();
-    state.native_session_id = session_id;
+    // The conversation exists either way — that is what the record proves, and it is what makes
+    // the next turn a `--resume`.
     state.established = true;
+    // Which handle it is followed under is a different question. This is the one value in this
+    // file a vendor process chooses and a later argv carries, so it is vetted like the resume
+    // reference a host supplies: a handle beginning with `-` would be read by the CLI's parser as
+    // a flag rather than as `--resume`'s value. An unrecognisable echo leaves the minted id in
+    // force, which is the id this run was asked to write and the better of the two guesses.
+    if crate::argv::is_vendor_session_id(&session_id) {
+        state.native_session_id = session_id;
+    }
 }
 
 /// One user message, as `--input-format stream-json` takes it.

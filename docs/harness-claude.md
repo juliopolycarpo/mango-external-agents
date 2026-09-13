@@ -88,12 +88,25 @@ id, and each turn spawns, streams and reaps its own child.
   a host holds a resumable handle before any tokens are spent. The first turn passes
   `--session-id`; every later one passes `--resume`, using whatever handle the run's own
   `system/init` reported.
-- **Resume is adopted, never verified.** Verifying would cost a process launch per open, and a
-  wrong guess is recoverable: a session the vendor has forgotten fails at the first turn with the
-  vendor's own message. `ResumeMode::Fallback` therefore behaves exactly like `Strict`, and
-  `SessionInfo::fallback_reason` is always `None` — nothing was verified, so nothing fell back.
-  Implementing a real fallback means retrying a failed first turn under a fresh id, and that waits
-  for a stable signal to key off (today the only one is vendor prose).
+- **Resume is vetted for shape, never verified for existence.** Verifying that a conversation is
+  still there would cost a process launch per open, and a wrong guess is recoverable: a session the
+  vendor has forgotten fails at the first turn with the vendor's own message. `ResumeMode::Fallback`
+  therefore behaves exactly like `Strict`, and `SessionInfo::fallback_reason` is always `None` —
+  nothing was verified, so nothing fell back. Implementing a real fallback means retrying a failed
+  first turn under a fresh id, and that waits for a stable signal to key off (today the only one is
+  vendor prose).
+
+  The *shape* is checked, and that is a different question. A resume reference goes on the command
+  line as `--resume <value>`, and an argv array stops shell injection but not **argument**
+  injection: a stored handle beginning with `-` is read by the CLI's parser as a flag of its own,
+  which is how a forgotten reference could put `--dangerously-skip-permissions` on a turn. The
+  vendor documents the handle as a UUID (`--session-id` "must be a valid UUID") and echoes it back
+  verbatim, so there is a published shape to check rather than a guess to accommodate. A reference
+  that is not one is refused at `open_session` with `Error::HostConfiguration`, and an `init`
+  record that echoes back a handle of some other shape is not followed — the minted id stays in
+  force. Same rule, same reason, as `models::safe_model` for `--model`.
+
+  <https://code.claude.com/docs/en/cli-reference.md>
 - **A second `start_turn` ends the first.** A host that starts one has decided the first is over.
 - **Steering is not supported.** `--input-format stream-json` accepts a second message, but it runs
   as its own turn with its own `result` — a queued follow-up, not same-turn steering.

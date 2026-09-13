@@ -122,9 +122,48 @@ impl TurnArgv<'_> {
     }
 }
 
+/// Whether a vendor session handle is one this harness may put on a command line.
+///
+/// The same argument the [`safe_model`](crate::models::safe_model) guard makes, for the other
+/// caller-owned value that reaches argv. Two sources feed `--session-id` and `--resume` and
+/// neither is this harness's own: a host's
+/// [`Resume::native_session_id`](mango_external_agents::Resume), and the id a run echoes back in
+/// `system/init`, which the session follows because that is the conversation that now exists. An
+/// argv array stops *shell* injection, not **argument** injection — a value beginning with `-` is
+/// read by the CLI's parser as a new flag rather than as the option's value, which is how a
+/// stored resume reference could put `--dangerously-skip-permissions` on the command line.
+///
+/// A UUID is the whole shape, rather than the looser "could not become a flag" rule
+/// [`safe_model`](crate::models::safe_model) settles for: the vendor documents `--session-id` as
+/// taking one and echoes it back verbatim, so there is a published shape to check against instead
+/// of a guess to accommodate.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_claude::argv::is_vendor_session_id;
+///
+/// assert!(is_vendor_session_id("b01414e7-4b4b-43a2-9109-a33e21664340"));
+/// assert!(!is_vendor_session_id("--dangerously-skip-permissions"));
+/// ```
+pub fn is_vendor_session_id(id: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+    let mut groups = id.split('-');
+    for width in GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TurnArgv;
+    use super::{TurnArgv, is_vendor_session_id};
     use crate::permissions::CliMode;
 
     const SESSION: &str = "11111111-2222-3333-4444-555555555555";
@@ -372,5 +411,40 @@ mod tests {
             value_after(&argv, "--mcp-config"),
             Some("/tmp/mea/servers.json")
         );
+    }
+
+    #[test]
+    fn never_lets_a_session_handle_become_another_flag() {
+        for injected in [
+            "--dangerously-skip-permissions",
+            "-p",
+            "",
+            " b01414e7-4b4b-43a2-9109-a33e21664340",
+            "b01414e7-4b4b-43a2-9109-a33e21664340 --print",
+            "b01414e7-4b4b-43a2-9109-a33e21664340\nsecond",
+            "b01414e7-4b4b-43a2-9109-a33e2166434",
+            "b01414e7-4b4b-43a2-9109-a33e21664340-extra",
+            "b01414e7_4b4b_43a2_9109_a33e21664340",
+            "zz1414e7-4b4b-43a2-9109-a33e21664340",
+        ] {
+            assert!(
+                !is_vendor_session_id(injected),
+                "expected {injected:?} to be refused rather than passed on"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_the_handle_shape_the_vendor_actually_mints() {
+        for accepted in [
+            SESSION,
+            "b01414e7-4b4b-43a2-9109-a33e21664340",
+            "B01414E7-4B4B-43A2-9109-A33E21664340",
+        ] {
+            assert!(
+                is_vendor_session_id(accepted),
+                "expected {accepted:?} to be usable"
+            );
+        }
     }
 }
