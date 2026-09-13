@@ -903,7 +903,14 @@ impl Session for CodexSession {
                 request.turn_id,
                 method::REVIEW_START,
                 params,
-                |response| (response.turn, Some(response.review_thread_id)),
+                // Only when the server named one. `reviewThreadId` deserialises to an empty
+                // string when it is absent, and wrapping that in `Some` would hand the fallback
+                // below a value it could never replace — leaving a host told to subscribe to a
+                // thread with no name.
+                |response| {
+                    let named = Some(response.review_thread_id).filter(|id| !id.is_empty());
+                    (response.turn, named)
+                },
                 false,
             )
             .await?;

@@ -715,6 +715,49 @@ async fn a_steer_for_a_turn_that_is_not_running_is_refused_before_it_is_sent() {
     );
 }
 
+/// And when the server names no review thread at all, the fallback has to be reachable.
+///
+/// `reviewThreadId` deserialises to an empty string when it is absent, so wrapping it
+/// unconditionally made the fallback dead code and handed the host a thread with no name. A host
+/// doing what the core tells it to — refuse a thread it is not subscribed to — would have dropped
+/// a review it should have shown.
+#[tokio::test]
+async fn a_review_the_server_named_no_thread_for_runs_on_the_one_this_session_holds() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("review").as_process_intercepting(|frame| {
+        if frame.get("method").and_then(serde_json::Value::as_str) != Some("review/start") {
+            return None;
+        }
+        // The recording carries a review thread; no recording carries its absence.
+        Some(vec![
+            serde_json::json!({
+                "id": frame.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "result": {"turn": {"id": "review-turn-1"}},
+            })
+            .to_string(),
+        ])
+    }));
+    let (host, _launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+
+    let review = session
+        .start_review(mango_external_agents::ReviewRequest {
+            turn_id: mango_external_agents::TurnId::new("review-1"),
+            target: mango_external_agents::ReviewTarget::UncommittedChanges,
+        })
+        .await
+        .expect("expected a review");
+
+    assert_eq!(
+        review.review_thread_id,
+        session.ids().native_session_id,
+        "expected a review the server named no thread for to fall back to this session's own"
+    );
+}
+
 /// The recorded review. An inline review runs on the session's own thread, which is what leaving
 /// `delivery` absent asks for — a detached one would stream on a thread the reducer drops.
 #[tokio::test]

@@ -138,9 +138,10 @@ impl Transcript {
         }));
         FakeProcess::responding(move |line| {
             if let Ok(frame) = serde_json::from_str::<Value>(line)
-                && let Some(answers) = intercept(&frame) {
-                    return answers;
-                }
+                && let Some(answers) = intercept(&frame)
+            {
+                return answers;
+            }
             script
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
