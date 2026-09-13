@@ -618,6 +618,36 @@ mod subagent_handling {
         assert_eq!(shape(&events), vec!["activity_started"]);
     }
 
+    /// A subagent's own tool calls are the subagent's, exactly as its text is.
+    ///
+    /// Promoting one puts a second agent's `Read` beside the `Task` that spawned it, as though the
+    /// assistant had run it — and the `tool_result` that would close it arrives under the same
+    /// parent, so the activity spins for the rest of the turn and then closes as cancelled.
+    #[test]
+    fn never_promotes_a_subagents_own_tool_call_into_the_main_transcript() {
+        let nested_call = r#"{"type":"assistant","parent_tool_use_id":"toolu_task","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_nested","name":"Read","input":{"file_path":"/work/note.txt"}}]}}"#;
+        let nested_result = r#"{"type":"user","parent_tool_use_id":"toolu_task","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_nested","content":"1\tmango"}]}}"#;
+        let events = reduce_lines(&[
+            OPEN_TASK,
+            nested_call,
+            nested_result,
+            r#"{"type":"result","is_error":false}"#,
+        ]);
+        assert_eq!(
+            shape(&events),
+            vec!["activity_started", "activity_completed", "completed"],
+            "expected only the Task's own pair, received {events:?}"
+        );
+        let started = events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityStarted { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(started, vec!["toolu_task"]);
+    }
+
     #[test]
     fn ignores_nested_text_for_a_call_that_has_already_closed() {
         let nested = nested_text("late");

@@ -445,12 +445,18 @@ impl TurnReducer {
         let parent = record.parent_tool_use_id();
         let mut events = Vec::new();
         for block in record.content_blocks() {
-            if block.kind() == Some("tool_use") {
-                events.extend(self.start_activity(&block));
-                continue;
-            }
+            // Every arm below the parent check belongs to a subagent, which is why the main
+            // conversation's two are taken first: a `tool_use` a subagent made would otherwise
+            // open an activity beside the `Task` that spawned it, as though the assistant had run
+            // the call itself — and its `tool_result` arrives under the same parent, so nothing
+            // would ever close it. A subagent's work is reported through the parent activity; see
+            // this module's own header.
             let Some(parent) = parent else {
-                events.extend(self.undelivered_event_for(&block));
+                if block.kind() == Some("tool_use") {
+                    events.extend(self.start_activity(&block));
+                } else {
+                    events.extend(self.undelivered_event_for(&block));
+                }
                 continue;
             };
             // Only under a call that is still open. A completed activity has been removed from the
