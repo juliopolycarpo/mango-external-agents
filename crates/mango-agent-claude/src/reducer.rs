@@ -471,13 +471,14 @@ impl TurnReducer {
             };
             // Accumulated, not replaced: an update overwrites downstream, so emitting each block
             // on its own would leave only the last one — a subagent that reported three findings
-            // would render as having found the third.
+            // would render as having found the third. Borrowed rather than cloned: the buffer runs
+            // to twice a detail's bound, and `detail_for` allocates the copy that is kept anyway.
             let merged = self.append_nested(parent, text);
             events.push(EventKind::ActivityUpdated {
                 call_id: parent.to_owned(),
                 update: ActivityUpdate {
                     title: None,
-                    detail: detail_for(&merged),
+                    detail: detail_for(merged),
                     truncated: false,
                 },
             });
@@ -618,7 +619,11 @@ impl TurnReducer {
     }
 
     /// Bounded concatenation of a subagent's forwarded blocks.
-    fn append_nested(&mut self, parent: &str, text: &str) -> String {
+    ///
+    /// Hands back the accumulated buffer itself. A copy would be made per forwarded block, of a
+    /// string that is allowed to grow to twice a detail's bound, only for the caller to bound and
+    /// copy it again on the way into the event.
+    fn append_nested(&mut self, parent: &str, text: &str) -> &str {
         let entry = self.nested_text.entry(parent.to_owned()).or_default();
         if !entry.is_empty() {
             entry.push('\n');
@@ -627,7 +632,7 @@ impl TurnReducer {
         if let Some((boundary, _)) = entry.char_indices().nth(DETAIL_ACCUMULATION_MAX_CHARS) {
             entry.truncate(boundary);
         }
-        entry.clone()
+        entry
     }
 }
 
