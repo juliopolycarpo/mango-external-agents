@@ -601,6 +601,120 @@ mod a_turn {
         );
     }
 
+    /// `cancel` while a turn's process is still being spawned.
+    ///
+    /// The slot `start_turn` reserves before awaiting the spawn has no control to kill yet, so a
+    /// `cancel` landing in that window used to record no reason and report success, then have the
+    /// turn plant a live child anyway once the spawn finished. No stream was ever handed out to
+    /// this call, so there is nothing for a `Cancelled` event to reach — this refuses the turn
+    /// with `Error::Cancelled` instead of handing one out.
+    #[tokio::test]
+    async fn refuses_a_turn_that_a_cancel_stopped_while_its_process_was_starting() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let gate = launcher.gate_turn_spawns();
+        let session = shared(&launcher).await;
+
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hello"))
+                    .await
+                    .map(drop)
+            }
+        });
+
+        gate.wait_for_spawn().await;
+        session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect("expected the cancel to succeed");
+        gate.release();
+
+        let outcome = starting.await.expect("expected the task to finish");
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::Cancelled {
+                    reason: CancelReason::Requested
+                })
+            ),
+            "expected the turn to be refused by the cancel that landed while it was starting, received {outcome:?}"
+        );
+        assert!(
+            launcher.all_children_ended(),
+            "expected the child spawned into the window to be reaped, not left running"
+        );
+    }
+
+    /// Two `start_turn`s racing the same spawn window.
+    ///
+    /// Both used to read `active` as `None` before the spawn, both to spawn their own child, and
+    /// the later assignment to overwrite the first `ActiveTurn` without ending it: two children
+    /// ran and only the second could ever be reached by a later `cancel`. Reserving the slot
+    /// before the spawn awaits means the second call finds the first's reservation rather than an
+    /// empty one, and supersedes it exactly the way a sequential second call already does.
+    #[tokio::test]
+    async fn a_second_start_turn_racing_the_first_spawn_supersedes_it_rather_than_losing_it() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::stalling::<[String; 0], String>([]))
+                .with_turn(Run::stalling::<[String; 0], String>([])),
+        );
+        let gate = launcher.gate_turn_spawns();
+        let session = shared(&launcher).await;
+
+        let first = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hello"))
+                    .await
+            }
+        });
+        gate.wait_for_spawn().await;
+
+        let second = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-2", "hello again"))
+                    .await
+            }
+        });
+        gate.wait_for_spawn().await;
+
+        gate.release();
+        gate.release();
+
+        let first_outcome = first.await.expect("expected the first task to finish");
+        let second_outcome = second.await.expect("expected the second task to finish");
+
+        assert!(
+            matches!(
+                first_outcome,
+                Err(Error::Cancelled {
+                    reason: CancelReason::Requested
+                })
+            ),
+            "expected the first turn to be refused as superseded, received {first_outcome:?}"
+        );
+        assert!(
+            second_outcome.is_ok(),
+            "expected the second turn to be handed a stream, received {second_outcome:?}"
+        );
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the close to succeed");
+        assert!(
+            launcher.all_children_ended(),
+            "expected both children to be reaped rather than leaving the superseded one running"
+        );
+    }
+
     #[tokio::test]
     async fn refuses_a_turn_carrying_attachments_rather_than_dropping_them() {
         let launcher = Arc::new(FakeClaudeCli::new());

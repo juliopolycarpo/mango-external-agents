@@ -44,9 +44,13 @@ use crate::reducer::{RunInit, TurnReducer};
 type TurnEnd = OnceLock<CancelReason>;
 
 /// The turn a session is running right now.
+///
+/// `control` is `None` from the moment a turn claims the slot until `stdio::open` returns it a
+/// child: the reservation exists so a stop landing in that window has a place to record its
+/// reason, even though there is nothing yet to kill.
 struct ActiveTurn {
     end: Arc<TurnEnd>,
-    control: Arc<dyn mango_external_agents::ProcessControl>,
+    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
 }
 
 /// Everything about a session that changes after it is opened.
@@ -133,20 +137,36 @@ impl ClaudeSession {
     /// `Session` method that held this lock across an await would deadlock the moment the turn
     /// channel filled, which is exactly when a host is least able to do anything about it.
     async fn stop_active_turn(&self, reason: CancelReason) {
-        let active = self.shared.lock().active.take();
-        end_turn(active, reason).await;
+        let control = take_turn(&mut self.shared.lock(), reason);
+        end_turn(control, reason).await;
     }
 }
 
-/// Records why a turn stopped and ends its child. The pump writes the events.
-async fn end_turn(active: Option<ActiveTurn>, reason: CancelReason) {
-    let Some(active) = active else {
-        return;
-    };
+/// Takes whatever turn is active and records why it stopped, under the same guard that takes it.
+///
+/// A turn's slot is reserved before its child is spawned, so a stop can land while `control` is
+/// still `None` — nothing to kill yet, but the reason must not be lost. Recording it here, under
+/// the lock that empties the slot, is what makes that reason visible to the spawn once it returns;
+/// only the actual kill happens after the guard is released.
+fn take_turn(
+    state: &mut SessionState,
+    reason: CancelReason,
+) -> Option<Arc<dyn mango_external_agents::ProcessControl>> {
+    let active = state.active.take()?;
     if active.end.set(reason).is_err() {
-        return;
+        return None;
     }
-    let _ = active.control.kill(reason).await;
+    active.control
+}
+
+/// Ends a child taken by [`take_turn`], if it had one yet. The pump writes the events.
+async fn end_turn(
+    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+    reason: CancelReason,
+) {
+    if let Some(control) = control {
+        let _ = control.kill(reason).await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -174,13 +194,22 @@ impl mango_external_agents::Session for ClaudeSession {
         let mode = self.shared.resolve_mode(configuration)?;
 
         // A host that starts a second turn has decided the first is over. Taken before anything is
-        // spawned so the two cannot both hold a child.
+        // spawned so the two cannot both hold a child, and the slot this turn claims is reserved
+        // in the same statement: a `cancel`, a `close`, or a third `start_turn` landing before
+        // `stdio::open` returns below then has this reservation, rather than an empty slot, to
+        // record its reason against.
+        let end = Arc::new(TurnEnd::default());
         let previous = {
             let mut state = self.shared.lock();
             if state.closed {
                 return Err(Error::Closed { subject: "session" });
             }
-            state.active.take()
+            let previous = take_turn(&mut state, CancelReason::Requested);
+            state.active = Some(ActiveTurn {
+                end: Arc::clone(&end),
+                control: None,
+            });
+            previous
         };
         end_turn(previous, CancelReason::Requested).await;
 
@@ -216,13 +245,22 @@ impl mango_external_agents::Session for ClaudeSession {
         }
         .build();
 
-        let transport = stdio::open(
+        let transport = match stdio::open(
             &self.shared.host,
             &StdioSpec::new(argv),
             &self.shared.executable,
             VENDOR_ENVIRONMENT_KEYS,
         )
-        .await?;
+        .await
+        {
+            Ok(transport) => transport,
+            // No child ever launched, so there is nothing to reap here — only the reservation
+            // this call made above, and only if a stop has not already taken it.
+            Err(error) => {
+                clear_active(&self.shared, &end);
+                return Err(error);
+            }
+        };
 
         let limits = *self.shared.host.limits();
         let (sink, events) = EventSink::new(
@@ -231,30 +269,37 @@ impl mango_external_agents::Session for ClaudeSession {
             Arc::clone(self.shared.host.clock()),
             limits.turn_channel_capacity,
         );
-        let end = Arc::new(TurnEnd::default());
         let control = Arc::clone(&transport.control);
-        // Re-checked under the same guard that assigns the turn, because `stdio::open` is awaited
-        // above and the session can end while it is in flight. A `close` that landed in that window
-        // took an `active` that was still `None`: it recorded nothing, killed nothing, and removed
-        // the `--mcp-config` file this child was launched with. Planting the turn anyway would put
-        // a live process on a session that already answers every other caller `Closed`, with nobody
-        // holding a handle to stop it.
-        let already_closed = {
+        // Re-checked under the same guard that installs the control, because `stdio::open` is
+        // awaited above and a stop can have landed while this reservation had no control to kill:
+        // a `close` marks `closed` and takes it, a `cancel` or a racing `start_turn` takes it and
+        // records the reason but kills nothing, because there was nothing here to kill yet. Either
+        // way no stream has been handed out, so there is nothing for the stop to reach — this reaps
+        // the child that just started and refuses instead of planting a live process nobody holds
+        // a handle to.
+        let stopped = {
             let mut state = self.shared.lock();
-            let closed = state.closed;
-            if !closed {
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
+            {
                 state.active = Some(ActiveTurn {
                     end: Arc::clone(&end),
-                    control: Arc::clone(&control),
+                    control: Some(Arc::clone(&control)),
                 });
+                None
+            } else {
+                end.get().copied()
             }
-            closed
         };
-        if already_closed {
-            // Reaped rather than cancelled: no turn was ever handed out, so there is no stream for
-            // a `Cancelled` to reach and nothing to report it to.
-            let _ = control.kill(CancelReason::Shutdown).await;
-            return Err(Error::Closed { subject: "session" });
+        if let Some(reason) = stopped {
+            let _ = control.kill(reason).await;
+            return Err(if self.shared.lock().closed {
+                Error::Closed { subject: "session" }
+            } else {
+                Error::Cancelled { reason }
+            });
         }
 
         tokio::spawn(pump(
@@ -301,12 +346,13 @@ impl mango_external_agents::Session for ClaudeSession {
     async fn close(&self, reason: CloseReason) -> Result<()> {
         // Idempotent: a close racing a cancel, or two closes from different tasks, must not fail
         // the second caller. Both takes happen under the guard; nothing slow happens under it.
-        let (active, mcp_config) = {
+        let (control, mcp_config) = {
             let mut state = self.shared.lock();
             state.closed = true;
-            (state.active.take(), state.mcp_config.take())
+            let control = take_turn(&mut state, CancelReason::from(reason));
+            (control, state.mcp_config.take())
         };
-        end_turn(active, CancelReason::from(reason)).await;
+        end_turn(control, CancelReason::from(reason)).await;
         // The configuration file leaves with the session that wrote it — but only once the child
         // launched with `--mcp-config` pointing at it is dead. `Drop` unlinks the directory, and
         // unlinking it first would leave a child that is still starting reading a configuration
