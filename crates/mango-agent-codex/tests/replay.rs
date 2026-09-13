@@ -86,6 +86,142 @@ impl PermissionBroker for SlowBroker {
     }
 }
 
+/// An app-server that withholds its first `turn/start` answer until another call arrives.
+///
+/// The real peer can notify that a turn ended before answering the call that started it. Holding
+/// that answer lets the tests put another host turn in the slot and then deliver the old success
+/// or error, which is the ordering the session has to survive.
+struct DelayedFirstStartServer {
+    answer: DelayedStartAnswer,
+    complete_before_answer: bool,
+    thread_id: String,
+    first_request_id: std::sync::Mutex<Option<serde_json::Value>>,
+    starts: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum DelayedStartAnswer {
+    Success,
+    Error,
+}
+
+impl DelayedFirstStartServer {
+    fn respond(&self, frame: &serde_json::Value) -> Option<Vec<String>> {
+        let method = frame.get("method").and_then(serde_json::Value::as_str)?;
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            "turn/start" => {
+                let start = self
+                    .starts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if start == 0 {
+                    *self
+                        .first_request_id
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+                    return Some(if self.complete_before_answer {
+                        vec![
+                            serde_json::json!({
+                                "method": "turn/completed",
+                                "params": {
+                                    "threadId": self.thread_id,
+                                    "turn": {"id": "vendor-turn-1", "status": "completed"},
+                                },
+                            })
+                            .to_string(),
+                        ]
+                    } else {
+                        Vec::new()
+                    });
+                }
+                Some(vec![
+                    serde_json::json!({
+                        "id": id,
+                        "result": {"turn": {"id": format!("vendor-turn-{}", start + 1)}},
+                    })
+                    .to_string(),
+                ])
+            }
+            "account/rateLimits/read" => {
+                let first_id = self
+                    .first_request_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("expected the held turn/start request");
+                let delayed = match self.answer {
+                    DelayedStartAnswer::Success => serde_json::json!({
+                        "id": first_id,
+                        "result": {"turn": {"id": "vendor-turn-1"}},
+                    }),
+                    DelayedStartAnswer::Error => serde_json::json!({
+                        "id": first_id,
+                        "error": {"code": -32602, "message": "delayed start refusal"},
+                    }),
+                };
+                Some(vec![
+                    delayed.to_string(),
+                    serde_json::json!({"id": id, "result": {"rateLimits": null}}).to_string(),
+                ])
+            }
+            "turn/interrupt" => Some(vec![
+                serde_json::json!({"id": id, "result": {}}).to_string(),
+                serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": self.thread_id,
+                        "turn": {
+                            "id": frame.pointer("/params/turnId").cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                            "status": "interrupted",
+                        },
+                    },
+                })
+                .to_string(),
+            ]),
+            _ => None,
+        }
+    }
+}
+
+async fn open_with_delayed_first_start(
+    answer: DelayedStartAnswer,
+    complete_before_answer: bool,
+) -> (Arc<dyn Session>, Arc<FakeLauncher>) {
+    let transcript = Transcript::load("turn");
+    let server = Arc::new(DelayedFirstStartServer {
+        answer,
+        complete_before_answer,
+        thread_id: transcript
+            .thread_id()
+            .expect("expected the recording to name its thread"),
+        first_request_id: std::sync::Mutex::new(None),
+        starts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| server.respond(frame)));
+    let (host, launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    (Arc::from(session), launcher)
+}
+
+async fn wait_for_turn_start(launcher: &FakeLauncher) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"turn/start\""))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the held turn/start to reach the fake server");
+}
+
 /// A host whose launcher replays these fixtures, one child per named scenario.
 fn host_replaying(scenarios: &[&str]) -> (HostContext, Arc<FakeLauncher>) {
     host_with(scenarios, None)
@@ -370,6 +506,198 @@ async fn a_second_turn_started_while_one_is_running_is_refused_rather_than_steer
         launcher.written().len(),
         before,
         "expected nothing to be written to the vendor"
+    );
+}
+
+/// A cancel cannot name a turn until `turn/start` answers. The unnamed vendor turn still occupies
+/// the app-server, so another start in that interval would be treated as a steer of it.
+#[tokio::test]
+async fn a_cancelled_start_holds_the_slot_until_its_vendor_handle_arrives() {
+    let (session, launcher) =
+        open_with_delayed_first_start(DelayedStartAnswer::Success, false).await;
+    let first_session = Arc::clone(&session);
+    let first = tokio::spawn(async move {
+        first_session
+            .start_turn(TurnRequest::new("turn-reused", "one"))
+            .await
+    });
+    wait_for_turn_start(&launcher).await;
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the pending start to be cancelled");
+    let error = session
+        .start_turn(TurnRequest::new("turn-reused", "two"))
+        .await
+        .expect_err("expected the unnamed vendor turn to keep the slot occupied");
+    assert!(
+        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+                 if vendor.code.as_str() == "codex-turn-already-running"),
+        "expected a running-turn refusal, received {error:?}"
+    );
+    assert_eq!(
+        launcher
+            .written()
+            .iter()
+            .filter(|line| line.contains("\"turn/start\""))
+            .count(),
+        1,
+        "expected no second turn/start to reach the occupied app-server"
+    );
+
+    session
+        .refresh_account_usage()
+        .await
+        .expect("expected the trigger call to release the held answer");
+    let mut first = first
+        .await
+        .expect("expected the first start task to finish")
+        .expect("expected the delayed vendor handle");
+    assert!(
+        launcher.written().iter().any(|line| {
+            line.contains("\"turn/interrupt\"") && line.contains("\"vendor-turn-1\"")
+        }),
+        "expected the delayed handle to be interrupted once it arrived"
+    );
+    let events = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut events = Vec::new();
+        while let Some(event) = first.recv().await {
+            events.push(event.kind);
+        }
+        events
+    })
+    .await
+    .expect("expected the interrupted turn stream to close");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, EventKind::Completed | EventKind::Error { .. }))
+            .count(),
+        1,
+        "expected exactly one terminal, received {events:#?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(EventKind::Completed | EventKind::Error { .. })
+        ),
+        "expected nothing after the terminal, received {events:#?}"
+    );
+}
+
+/// A completion can clear a slot before the corresponding `turn/start` answer arrives. A delayed
+/// success belongs to that finished start, even when the host reuses its own turn id meanwhile.
+#[tokio::test]
+async fn a_delayed_start_success_cannot_replace_the_live_turns_vendor_handle() {
+    let (session, launcher) =
+        open_with_delayed_first_start(DelayedStartAnswer::Success, true).await;
+    let first_session = Arc::clone(&session);
+    let first = tokio::spawn(async move {
+        first_session
+            .start_turn(TurnRequest::new("turn-reused", "one"))
+            .await
+    });
+    wait_for_turn_start(&launcher).await;
+
+    let mut second = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match session
+                .start_turn(TurnRequest::new("turn-reused", "two"))
+                .await
+            {
+                Ok(turn) => break turn,
+                Err(mango_external_agents::Error::Vendor(vendor))
+                    if vendor.code.as_str() == "codex-turn-already-running" =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("expected the replacement turn, received {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("expected the completion notification to free the first slot");
+    assert_eq!(second.native_turn_id, "vendor-turn-2");
+
+    session
+        .refresh_account_usage()
+        .await
+        .expect("expected the trigger call to release the held answer");
+    first
+        .await
+        .expect("expected the delayed start task to finish")
+        .expect("expected the delayed start success");
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the replacement turn to be cancelled");
+    assert!(
+        launcher.written().iter().any(|line| {
+            line.contains("\"turn/interrupt\"") && line.contains("\"vendor-turn-2\"")
+        }),
+        "expected cancel to name the replacement handle, received {:?}",
+        launcher.written()
+    );
+    let _ = drain(&mut second).await;
+}
+
+/// The same stale ownership on the error path used to `take()` the replacement out of the slot.
+#[tokio::test]
+async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_host_id() {
+    let (session, launcher) = open_with_delayed_first_start(DelayedStartAnswer::Error, true).await;
+    let first_session = Arc::clone(&session);
+    let first = tokio::spawn(async move {
+        first_session
+            .start_turn(TurnRequest::new("turn-reused", "one"))
+            .await
+    });
+    wait_for_turn_start(&launcher).await;
+
+    let _second = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match session
+                .start_turn(TurnRequest::new("turn-reused", "two"))
+                .await
+            {
+                Ok(turn) => break turn,
+                Err(mango_external_agents::Error::Vendor(vendor))
+                    if vendor.code.as_str() == "codex-turn-already-running" =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("expected the replacement turn, received {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("expected the completion notification to free the first slot");
+
+    session
+        .refresh_account_usage()
+        .await
+        .expect("expected the trigger call to release the held error");
+    first
+        .await
+        .expect("expected the delayed start task to finish")
+        .expect_err("expected the held start refusal");
+    let error = session
+        .start_turn(TurnRequest::new("turn-reused", "three"))
+        .await
+        .expect_err("expected the live replacement to keep the slot");
+    assert!(
+        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+                 if vendor.code.as_str() == "codex-turn-already-running"),
+        "expected a running-turn refusal, received {error:?}"
+    );
+    assert_eq!(
+        launcher
+            .written()
+            .iter()
+            .filter(|line| line.contains("\"turn/start\""))
+            .count(),
+        2,
+        "expected no third turn/start to reach the occupied app-server"
     );
 }
 

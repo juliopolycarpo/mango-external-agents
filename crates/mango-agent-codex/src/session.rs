@@ -97,16 +97,6 @@ pub(crate) struct Shared {
     thread_id: std::sync::OnceLock<String>,
     turn: Mutex<Option<ActiveTurn>>,
     pending: Mutex<HashMap<String, PendingEntry>>,
-    /// Turns given up before the server had even named them.
-    ///
-    /// A slot emptied by `turn/completed` holds a turn that is over. A slot emptied by a cancel
-    /// that arrived before the `turn/start` answer did holds one the vendor is still running, with
-    /// nobody on this side holding an id to stop it by — the id is still in flight. Recorded here
-    /// so the call that is parked on that answer can stop the turn when it finally lands.
-    ///
-    /// Self-clearing: only a turn whose handle has not arrived is recorded, and the call waiting
-    /// for that handle takes its own entry back whether or not anybody abandoned it.
-    abandoned: Mutex<HashSet<TurnId>>,
     /// Questions the server stopped waiting on before this side had registered them.
     ///
     /// A `serverRequest/resolved` is read off the same pipe as the request it resolves, and the
@@ -117,16 +107,6 @@ pub(crate) struct Shared {
     /// Emptied with the questions themselves, because that is their lifetime: a turn that ends
     /// settles everything it was waiting on.
     resolved_early: Mutex<HashSet<String>>,
-    /// Vendor turns this session gave up and then stopped by name.
-    ///
-    /// An interrupt is answered with a `turn/completed`, and by the time it arrives the slot the
-    /// orphan once held belongs to whatever turn is running now. Ending that one would close a
-    /// stream its host is reading and leave the turn it was reading about running unattended —
-    /// the same orphan, one turn along. So the orphan's own ending is recognised and dropped.
-    ///
-    /// One entry per orphan, removed by the completion it is waiting for. A server that never
-    /// sends one leaves a string behind, which is the cost of not guessing when to forget.
-    interrupted: Mutex<HashSet<String>>,
 }
 
 impl Shared {
@@ -138,9 +118,7 @@ impl Shared {
             thread_id: std::sync::OnceLock::new(),
             turn: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
-            abandoned: Mutex::new(HashSet::new()),
             resolved_early: Mutex::new(HashSet::new()),
-            interrupted: Mutex::new(HashSet::new()),
         }
     }
 
@@ -157,9 +135,16 @@ impl Shared {
 
 /// The turn currently running, and the sink its events go to.
 struct ActiveTurn {
+    /// The particular `begin` call that installed this slot.
+    ///
+    /// A host turn id may be reused, so ownership is shared only by one start attempt. A delayed
+    /// answer must not mutate a later attempt that happens to carry the same id.
+    owner: Arc<()>,
     sink: EventSink,
     turn_id: TurnId,
     native_turn_id: String,
+    /// A cancel arrived before the server supplied the id its interrupt needs.
+    cancel_before_start: bool,
     /// Why this turn is being stopped, when somebody here asked for it.
     ///
     /// The server reports only that a turn was interrupted. Who asked, and why, is this side's
@@ -266,17 +251,11 @@ impl Shared {
     /// cannot happen. A single `Completed` cannot half-land: either it arrives or the stream
     /// closes, and both are endings a host can read. Nothing is lost by dropping the reason,
     /// because the reason is the argument the host passed to `cancel` or `close` itself.
-    /// Returns the vendor's own handle for the turn it ended, when the server had already named
-    /// one. The caller is then the only thing that can stop it.
-    async fn abandon(&self) -> Option<String> {
-        let active = self.turn.lock().await.take()?;
-        // No handle yet, so this side has no id to interrupt the vendor's turn by. Whoever is
-        // parked on that answer stops it instead.
-        if active.native_turn_id.is_empty() {
-            self.abandoned.lock().await.insert(active.turn_id.clone());
-        }
+    async fn abandon(&self) {
+        let Some(active) = self.turn.lock().await.take() else {
+            return;
+        };
         let _ = tokio::time::timeout(TERMINAL_GRACE, active.sink.complete()).await;
-        Some(active.native_turn_id).filter(|id| !id.is_empty())
     }
 
     /// Settles every question the server is still waiting on.
@@ -315,20 +294,6 @@ impl PeerHandler for CodexHandler {
         if let Notification::ServerRequestResolved(resolved) = &notification {
             self.release_resolved(&RequestId::new(resolved.request_id.clone()).key())
                 .await;
-        }
-
-        // The ending of a turn this session already gave up and stopped. The slot it once held
-        // belongs to whatever turn is running now, and ending that one would close a stream its
-        // host is reading — and leave the turn that host was reading about running unattended.
-        if let Notification::TurnCompleted(completed) = &notification
-            && self
-                .shared
-                .interrupted
-                .lock()
-                .await
-                .remove(&completed.turn.id)
-        {
-            return;
         }
 
         let outcome = reducer::reduce(
@@ -589,6 +554,7 @@ impl CodexSession {
             Arc::clone(self.shared.host.clock()),
             self.shared.host.limits().turn_channel_capacity,
         );
+        let owner = Arc::new(());
 
         {
             let mut turn = self.shared.turn.lock().await;
@@ -607,9 +573,11 @@ impl CodexSession {
             // Installed before the call, because notifications for this turn can arrive before its
             // own response does.
             *turn = Some(ActiveTurn {
+                owner: Arc::clone(&owner),
                 sink: sink.clone(),
                 turn_id: turn_id.clone(),
                 native_turn_id: String::new(),
+                cancel_before_start: false,
                 cancel_reason: None,
             });
         }
@@ -629,27 +597,33 @@ impl CodexSession {
             Err(error) => {
                 // The turn never started, so the stream it would have written to is closed here
                 // rather than left for a `turn/completed` that will never come. Nothing to
-                // interrupt either — and the entry a cancel may have left is dropped, because the
-                // only call that could ever have used it is this one.
-                self.shared.turn.lock().await.take();
-                self.shared.abandoned.lock().await.remove(&turn_id);
+                // interrupt either. The slot may already belong to a later start if the server
+                // announced this turn's completion before returning this error.
+                let mut turn = self.shared.turn.lock().await;
+                if turn
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(&active.owner, &owner))
+                {
+                    turn.take();
+                }
                 return Err(error);
             }
         };
 
-        if let Some(active) = self.shared.turn.lock().await.as_mut() {
-            active.native_turn_id.clone_from(&handle.id);
-        }
+        let cancel_before_start = {
+            let mut turn = self.shared.turn.lock().await;
+            match turn.as_mut() {
+                Some(active) if Arc::ptr_eq(&active.owner, &owner) => {
+                    active.native_turn_id.clone_from(&handle.id);
+                    active.cancel_before_start
+                }
+                _ => false,
+            }
+        };
 
-        // Somebody ended this turn while its own handle was still on the wire — a cancel with no
-        // id to name, or a close. The vendor's turn is running regardless of what this side did
-        // with the slot, and this is the first moment anything here can name it.
-        if self.shared.abandoned.lock().await.remove(&turn_id) {
-            self.shared
-                .interrupted
-                .lock()
-                .await
-                .insert(handle.id.clone());
+        // A cancel that beat this answer could not name the turn. It kept the slot occupied so no
+        // later `turn/start` could become a steer; now this call has the id needed to stop it.
+        if cancel_before_start {
             self.interrupt(handle.id.clone()).await;
         }
 
@@ -737,16 +711,16 @@ impl Session for CodexSession {
             .clone()
             .unwrap_or_else(|| self.info.effective_configuration.clone());
 
-        // A level is a sandbox and an approval policy together, and `turn/start` takes only the
-        // policy. Sending half of one would produce a configuration nobody chose, in whichever
-        // direction it went: a turn narrowed to read-only would keep the thread's full-access
-        // sandbox and lose its prompts along with it, and a turn widened from read-only would ask
-        // for permissions its sandbox will not grant. Refused rather than half-applied — a host
-        // that wants a different level opens a session at that level.
+        // A level is a sandbox and an approval policy together, while this harness models only the
+        // policy as a per-turn override. Sending half of one would produce a configuration nobody
+        // chose, in whichever direction it went: a turn narrowed to read-only would keep the
+        // thread's full-access sandbox and lose its prompts along with it, and a turn widened from
+        // read-only would ask for permissions its sandbox will not grant. Refused rather than
+        // half-applied — a host that wants a different level opens a session at that level.
         if configuration.level != self.info.effective_configuration.level {
             return Err(Error::Protocol {
                 expected: format!(
-                    "a turn at this session's own permission level, {:?}; the app-server takes a \
+                    "a turn at this session's own permission level, {:?}; this harness applies a \
                      sandbox on the thread and only an approval policy on a turn",
                     self.info.effective_configuration.level
                 ),
@@ -824,13 +798,18 @@ impl Session for CodexSession {
     }
 
     async fn cancel(&self, reason: CancelReason) -> Result<()> {
-        let Some((thread_id, turn_id)) = ({
+        let Some((thread_id, turn_id, pending_start)) = ({
             let mut turn = self.shared.turn.lock().await;
             turn.as_mut().map(|active| {
                 active.cancel_reason = Some(reason);
+                let pending_start = active.native_turn_id.is_empty();
+                if pending_start {
+                    active.cancel_before_start = true;
+                }
                 (
                     self.shared.thread_id().to_owned(),
                     active.native_turn_id.clone(),
+                    pending_start,
                 )
             })
         }) else {
@@ -844,17 +823,11 @@ impl Session for CodexSession {
         // being stopped.
         self.shared.release_pending(DecisionSource::Cancelled).await;
 
-        if turn_id.is_empty() {
+        if pending_start {
             // The turn's own handle had not come back when the slot was read, so there was nothing
-            // to name in an interrupt. The stream is ended here rather than left waiting on a
-            // `turn/completed` for a turn the server may not have started.
-            //
-            // It may have come back since — settling the questions above is not instant — in which
-            // case `abandon` hands it over and there is something to name after all.
-            if let Some(named) = self.shared.abandon().await {
-                self.shared.interrupted.lock().await.insert(named.clone());
-                self.interrupt(named).await;
-            }
+            // to name in an interrupt. Keep the slot occupied until `begin` receives the handle
+            // and interrupts it, or the start fails. The stream has not reached the caller yet;
+            // the vendor's completion supplies its one terminal after the interrupt.
             return Ok(());
         }
 
@@ -877,7 +850,7 @@ impl Session for CodexSession {
         // host holding a stream that will never terminate is worse than one told why it stopped.
         // Nothing is interrupted here: the child is about to be killed, which stops every turn on
         // it more thoroughly than a call could.
-        let _ = self.shared.abandon().await;
+        self.shared.abandon().await;
 
         let closed = self.client.close().await;
         let killed = self.control.kill(CancelReason::from(reason)).await;
@@ -1043,9 +1016,7 @@ mod tests {
     use mango_external_agents::stream::EventSink;
     use mango_external_agents::testing::FakeLauncher;
 
-    use super::{ActiveTurn, CodexHandler, Shared, base64, data_url};
-    use crate::protocol::notifications::method::TURN_COMPLETED;
-    use mango_external_agents::jsonrpc::PeerHandler;
+    use super::{ActiveTurn, Shared, base64, data_url};
 
     /// A host with a launcher that spawns nothing, for the state these tests drive directly.
     fn shared() -> Arc<Shared> {
@@ -1074,9 +1045,11 @@ mod tests {
             8,
         );
         *shared.turn.lock().await = Some(ActiveTurn {
+            owner: Arc::new(()),
             sink,
             turn_id: turn_id.clone(),
             native_turn_id: native_turn_id.to_owned(),
+            cancel_before_start: false,
             cancel_reason: None,
         });
         (
@@ -1107,96 +1080,6 @@ mod tests {
         assert!(
             shared.turn.lock().await.is_some(),
             "expected the vendor's turn to still hold the slot"
-        );
-    }
-
-    /// A turn given up before its own handle arrived leaves nothing on this side to stop it by.
-    /// The call still parked on that answer is the only thing that will ever know the id.
-    #[tokio::test]
-    async fn a_turn_abandoned_before_the_server_named_it_is_left_for_its_own_answer_to_stop() {
-        let shared = shared();
-        let (turn_id, _stream) = running(&shared, "").await;
-
-        shared.abandon().await;
-
-        assert!(
-            shared.abandoned.lock().await.contains(&turn_id),
-            "expected the turn to be recorded for the answer still in flight"
-        );
-    }
-
-    /// The other half: a turn whose handle already arrived was cancelled by name, or belongs to a
-    /// session that is killing the process. Recording it would send an interrupt nobody asked for.
-    #[tokio::test]
-    async fn a_turn_the_server_already_named_is_not_left_for_anybody_to_stop() {
-        let shared = shared();
-        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
-
-        shared.abandon().await;
-
-        assert!(
-            shared.abandoned.lock().await.is_empty(),
-            "expected nothing to be recorded for a turn this side can name"
-        );
-    }
-
-    /// The answer can land while the questions a cancel settles are still being settled. Whoever
-    /// gave the turn up is then the only thing holding an id to stop it by, so it is handed back
-    /// rather than dropped.
-    #[tokio::test]
-    async fn a_turn_the_server_named_while_it_was_being_given_up_is_handed_to_its_canceller() {
-        let shared = shared();
-        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
-
-        let named = shared.abandon().await;
-
-        assert_eq!(named.as_deref(), Some("vendor-turn-1"));
-    }
-
-    /// And a turn the server never named has nothing to hand over.
-    #[tokio::test]
-    async fn a_turn_the_server_never_named_is_handed_over_as_nothing() {
-        let shared = shared();
-        let (_turn_id, _stream) = running(&shared, "").await;
-
-        assert_eq!(shared.abandon().await, None);
-    }
-
-    /// An interrupt is answered with a `turn/completed`, and by then the slot the orphan held
-    /// belongs to whatever turn is running now. Ending that one would close a stream its host is
-    /// reading and leave the turn it was reading about running unattended — the same orphan again.
-    #[tokio::test]
-    async fn an_orphans_ending_does_not_end_the_turn_that_replaced_it() {
-        let shared = shared();
-        shared
-            .interrupted
-            .lock()
-            .await
-            .insert(String::from("vendor-turn-1"));
-        let (_turn_id, mut stream) = running(&shared, "vendor-turn-2").await;
-        let handler = CodexHandler {
-            shared: Arc::clone(&shared),
-        };
-
-        handler
-            .on_notification(
-                String::from(TURN_COMPLETED),
-                serde_json::json!({"threadId": shared.thread_id(),
-                                   "turn": {"id": "vendor-turn-1", "status": "interrupted"}}),
-            )
-            .await;
-
-        assert!(
-            shared.turn.lock().await.is_some(),
-            "expected the running turn to keep its slot"
-        );
-        assert!(
-            stream.events.try_recv().is_err(),
-            "expected nothing on the running turn's stream"
-        );
-        assert!(
-            !shared.interrupted.lock().await.contains("vendor-turn-1"),
-            "expected the orphan to be forgotten once its ending arrived"
         );
     }
 
