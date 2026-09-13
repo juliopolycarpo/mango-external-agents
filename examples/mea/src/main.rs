@@ -1,18 +1,23 @@
 //! `mea`: the unpublished smoke and capture CLI for mango-external-agents.
 //!
-//! Two subcommands so far, both against a real installed vendor CLI:
+//! Three subcommands against a real installed vendor CLI:
 //!
 //! ```text
-//! mea discover [--harness claude]
-//! mea turn     [--harness claude] [--level read-only|default|full-access] <prompt>
+//! mea discover [--harness claude|codex]
+//! mea turn     [--harness claude|codex] [--level read-only|default|full-access] <prompt>
+//! mea capture codex [--out DIR] [--workspace DIR]
 //! ```
 //!
-//! `capture` and `doctor` land with the vendor-drift workflow. What is here is what proves a
+//! `doctor` lands with the vendor-drift workflow. What is here is what proves a
 //! harness against the binary a user actually has, which no fixture can: fixtures prove the
 //! dialect, and this proves the fixtures still describe the vendor.
 //!
 //! It is not published, and nothing in the library depends on it.
 
+mod capture;
+mod redact;
+
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -33,10 +38,13 @@ fn harness_kinds() -> [&'static str; 3] {
 
 /// The harnesses this binary can dispatch to.
 ///
-/// Only Claude so far; the other two register as their crates grow a `Harness`.
+/// Claude and Codex currently implement the shared `Harness` contract.
 fn registry() -> HarnessRegistry {
-    HarnessRegistry::new(vec![mango_agent_claude::harness()])
-        .expect("expected one harness per kind")
+    HarnessRegistry::new(vec![
+        mango_agent_claude::harness(),
+        Arc::new(mango_agent_codex::CodexHarness::new()),
+    ])
+    .expect("expected one harness per kind")
 }
 
 /// A context with the default launcher, this process's environment and this directory.
@@ -71,11 +79,13 @@ async fn run(arguments: &[String]) -> Result<(), String> {
         print_banner();
         return Ok(());
     };
-    let parsed = Options::parse(rest)?;
     match command.as_str() {
-        "discover" => discover(&parsed).await,
-        "turn" => turn(&parsed).await,
-        other => Err(format!("expected `discover` or `turn`, received {other:?}")),
+        "discover" => discover(&Options::parse(rest)?).await,
+        "turn" => turn(&Options::parse(rest)?).await,
+        "capture" => capture(rest).await,
+        other => Err(format!(
+            "expected `discover`, `turn` or `capture`, received {other:?}"
+        )),
     }
 }
 
@@ -88,8 +98,11 @@ fn print_banner() {
     for kind in harness_kinds() {
         println!("harness: {kind}");
     }
-    println!("usage: mea discover [--harness claude]");
-    println!("       mea turn [--harness claude] [--level read-only|default|full-access] <prompt>");
+    println!("usage: mea discover [--harness claude|codex]");
+    println!(
+        "       mea turn [--harness claude|codex] [--level read-only|default|full-access] <prompt>"
+    );
+    println!("       mea capture codex [--out DIR] [--workspace DIR]");
 }
 
 /// What a subcommand was asked for.
@@ -113,7 +126,12 @@ impl Options {
                         .ok_or("expected a harness kind after --harness")?;
                     kind = match named.as_str() {
                         "claude" => HarnessKind::Claude,
-                        other => return Err(format!("expected `claude`, received {other:?}")),
+                        "codex" => HarnessKind::Codex,
+                        other => {
+                            return Err(format!(
+                                "expected `claude` or `codex`, received {other:?}"
+                            ));
+                        }
                     };
                 }
                 "--level" => {
@@ -219,6 +237,31 @@ async fn turn(options: &Options) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+async fn capture(arguments: &[String]) -> Result<(), String> {
+    let harness = arguments.first().map(String::as_str).unwrap_or("codex");
+    if harness != "codex" {
+        return Err(format!(
+            "expected a harness this command can capture (`codex`), received {harness:?}"
+        ));
+    }
+    let out = flag(arguments, "--out").map_or_else(capture::default_out_dir, PathBuf::from);
+    let workspace = flag(arguments, "--workspace")
+        .map_or_else(|| std::env::temp_dir().join("mea-capture"), PathBuf::from);
+    std::fs::create_dir_all(&workspace)
+        .map_err(|error| format!("expected a writable capture workspace, received {error}"))?;
+    capture::codex(&out, &workspace)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn flag(arguments: &[String], name: &str) -> Option<String> {
+    arguments
+        .iter()
+        .position(|argument| argument == name)
+        .and_then(|at| arguments.get(at + 1))
+        .cloned()
+}
+
 /// A session id nobody has to be able to reproduce.
 ///
 /// `mea` is not a host that retries, so the only requirement is that two runs do not collide.
@@ -231,7 +274,7 @@ fn uuid_like() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, harness_kinds, registry};
+    use super::{Options, flag, harness_kinds, registry};
     use mango_external_agents::{HarnessKind, PermissionLevel};
 
     #[test]
@@ -248,8 +291,9 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_dispatches_to_the_claude_harness() {
+    fn the_registry_dispatches_to_each_implemented_harness() {
         assert!(registry().get(&HarnessKind::Claude).is_some());
+        assert!(registry().get(&HarnessKind::Codex).is_some());
     }
 
     #[test]
@@ -274,10 +318,38 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_codex_harness_a_caller_asked_for() {
+        let options = Options::parse(&[
+            String::from("--harness"),
+            String::from("codex"),
+            String::from("ship"),
+        ])
+        .expect("expected the arguments to parse");
+        assert_eq!(options.kind, HarnessKind::Codex);
+        assert_eq!(options.prompt, "ship");
+    }
+
+    #[test]
+    fn a_capture_flag_reads_the_argument_after_it() {
+        let arguments: Vec<String> = ["codex", "--out", "fixtures/codex"]
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        assert_eq!(flag(&arguments, "--out").as_deref(), Some("fixtures/codex"));
+        assert_eq!(flag(&arguments, "--workspace"), None);
+    }
+
+    #[test]
+    fn a_capture_flag_with_no_value_reads_as_absent() {
+        let arguments = vec![String::from("--out")];
+        assert_eq!(flag(&arguments, "--out"), None);
+    }
+
+    #[test]
     fn refuses_a_value_it_does_not_recognise_rather_than_guessing() {
         for arguments in [
             vec![String::from("--level"), String::from("yolo")],
-            vec![String::from("--harness"), String::from("codex")],
+            vec![String::from("--harness"), String::from("acp")],
             vec![String::from("--level")],
         ] {
             assert!(

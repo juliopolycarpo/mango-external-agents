@@ -25,4 +25,4 @@ mango-agent-codex.workspace = true
 mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio"] }
 
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
