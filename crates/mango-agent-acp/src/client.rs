@@ -171,9 +171,21 @@ impl SessionState {
         self.lock_reducer().finish()
     }
 
-    /// Every question still waiting, taken out so the caller can answer them outside the lock.
-    pub(crate) fn take_pending(&self) -> Vec<(String, Responder<RequestPermissionResponse>)> {
-        self.lock_pending().drain().collect()
+    /// Withdraws every question still waiting.
+    ///
+    /// Called wherever a turn ends, not only on `close`, because a question cannot outlive the turn it
+    /// belongs to: its answer would be emitted into a sink that is already finished, and the agent
+    /// would be told "allow" about a turn it stopped running. Dropping the responders instead would
+    /// say nothing at all — the SDK's drop guard only answers batch requests — so each is answered
+    /// `Cancelled`, which is ACP's own outcome for a question that was withdrawn rather than refused.
+    ///
+    /// Taken out from under the lock in one statement, so nothing is held while the answers go out.
+    pub(crate) fn withdraw_pending(&self) {
+        let pending: Vec<Responder<RequestPermissionResponse>> =
+            self.lock_pending().drain().map(|(_, held)| held).collect();
+        for responder in pending {
+            let _ = responder.respond(permission::cancelled());
+        }
     }
 
     /// Answers one question the host decided.

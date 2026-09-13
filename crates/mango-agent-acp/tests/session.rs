@@ -504,6 +504,90 @@ async fn session_listing_follows_what_the_agent_advertised() {
     assert_eq!(page.sessions[0].title.as_deref(), Some("Yesterday"));
 }
 
+/// A question cannot outlive the turn it belongs to. Answering one afterwards would emit into a
+/// finished sink and tell the agent "allow" about a turn it has stopped running, so the turn's own end
+/// withdraws every question still parked — not just `close`.
+#[tokio::test]
+async fn a_question_still_parked_when_the_turn_ends_is_withdrawn_by_the_turn() {
+    // The fake answers its prompt without waiting, so the turn ends with the question still open —
+    // which is what a misbehaving agent does, and what a cancel produces on a well-behaved one.
+    let agent = FakeAcpAgent::new().with_updates(vec![serde_json::json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "text", "text": "working" }
+    })]);
+    let (session, launcher) = open(agent.asking_without_waiting(), permissive()).await;
+
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "delete the build"))
+        .await
+        .expect("expected a turn");
+
+    let events = drain(&mut turn).await;
+    let question = events
+        .iter()
+        .find_map(|kind| match kind {
+            EventKind::ApprovalRequested { request } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("expected the question to reach the host");
+
+    // Awaited rather than read once: the answer reaches the agent through the transport actor, so
+    // reading immediately would report an empty list for a write that simply had not flushed — which
+    // would make this pass for the wrong reason in both directions.
+    let withdrawal = answers_reaching_the_agent(&launcher, 1).await;
+    assert!(
+        withdrawal[0].contains("cancelled"),
+        "expected the turn's end to withdraw the question, received {withdrawal:?}"
+    );
+
+    // Answering now must not reach the agent: the turn it belonged to is over. It is accepted rather
+    // than refused, for the same reason a second `close` is.
+    session
+        .respond(question.deny().expect("expected a refusing option"))
+        .await
+        .expect("expected the late answer to be accepted");
+
+    // Given every chance to arrive, and it must not.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    let answers = outcome_lines(&launcher);
+    assert_eq!(
+        answers.len(),
+        1,
+        "expected the late answer never to reach the agent, received {answers:?}"
+    );
+}
+
+/// Every answer to a `session/request_permission` that actually reached the agent.
+fn outcome_lines(launcher: &FakeLauncher) -> Vec<String> {
+    launcher
+        .written()
+        .into_iter()
+        .filter(|line| line.contains("\"outcome\""))
+        .collect()
+}
+
+/// Waits until `count` answers have reached the agent, or fails rather than reading a stale empty list.
+async fn answers_reaching_the_agent(launcher: &FakeLauncher, count: usize) -> Vec<String> {
+    let waited = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let answers = outcome_lines(launcher);
+            if answers.len() >= count {
+                return answers;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    waited.unwrap_or_else(|_| {
+        panic!(
+            "expected {count} answer(s) to reach the agent, received {:?}",
+            outcome_lines(launcher)
+        )
+    })
+}
+
 /// An agent that accepts the pipe and never answers would otherwise hold `open_session` open for the
 /// life of the process, which looks to a host like a hung machine rather than a misbehaving agent.
 /// `Limits::request_timeout` is the number the host already set for exactly this.

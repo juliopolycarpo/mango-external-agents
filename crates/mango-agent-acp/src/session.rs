@@ -28,7 +28,7 @@ use crate::client::{
     self, Answered, ConnectionHandle, SessionState, TurnHandle, link_failure, with_stderr,
 };
 use crate::profile::AcpProfile;
-use crate::{content, permission, reducer};
+use crate::{content, reducer};
 
 /// How long a `session/close` is given before the transport is torn down anyway.
 ///
@@ -240,6 +240,9 @@ impl Session for AcpSession {
                 // Already ended: a cancel or a close got here first.
                 return;
             };
+            // A question cannot outlive the turn it belongs to: answering one afterwards would emit
+            // into a finished sink and tell the agent "allow" about a turn it has stopped running.
+            state.withdraw_pending();
             for kind in state.finish_reducing() {
                 if turn.sink.emit(kind).await.is_err() {
                     return;
@@ -322,11 +325,8 @@ impl Session for AcpSession {
         }
 
         // Every question the agent is still waiting on is withdrawn first, while the transport is
-        // still up. Dropping a `Responder` sends nothing on a non-batch request, so an agent whose
-        // question went unanswered would wait for a client that has gone.
-        for (_, responder) in self.state.take_pending() {
-            let _ = responder.respond(permission::cancelled());
-        }
+        // still up: an unanswered one would leave the agent waiting for a client that has gone.
+        self.state.withdraw_pending();
 
         if self.agent_capabilities.session_capabilities.close.is_some() {
             let _ = tokio::time::timeout(

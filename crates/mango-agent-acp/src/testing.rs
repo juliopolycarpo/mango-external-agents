@@ -24,6 +24,12 @@ pub enum Approval {
     /// Ask once per turn, offering only choices that allow — so a client with nothing to refuse with
     /// has to put the question to a person.
     OnlyAllows,
+    /// Ask once per turn and end the turn anyway, without waiting for the answer.
+    ///
+    /// What a misbehaving agent does, and what a well-behaved one looks like from the client's side
+    /// when a cancel lands between the question and the answer. It is the only way to reach a state
+    /// where a question outlives the turn it belongs to.
+    WithoutWaiting,
 }
 
 /// A scripted ACP agent, as a [`FakeProcess`] the core's `FakeLauncher` can hand out.
@@ -113,6 +119,12 @@ impl FakeAcpAgent {
     pub fn with_protocol_version(mut self, version: u16) -> Self {
         self.protocol_version = version;
         self
+    }
+
+    /// Asks once per turn and ends the turn anyway, without waiting for the answer.
+    #[must_use]
+    pub fn asking_without_waiting(self) -> Self {
+        self.asking_for_approval(Approval::WithoutWaiting)
     }
 
     /// Advertises `session/list`.
@@ -289,6 +301,23 @@ impl FakeAcpAgent {
             return lines;
         }
 
+        if self.approval == Approval::WithoutWaiting {
+            let request_id = pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .next_request_id();
+            lines.push(request(
+                request_id,
+                "session/request_permission",
+                self.permission_params(),
+            ));
+            lines.push(result(
+                id,
+                serde_json::json!({ "stopReason": self.stop_reason }),
+            ));
+            return lines;
+        }
+
         // The turn is held open: its response goes out when the client answers, which is what proves
         // the round trip rather than a request nobody replies to.
         let request_id = pending
@@ -298,13 +327,17 @@ impl FakeAcpAgent {
         lines.push(request(
             request_id,
             "session/request_permission",
-            serde_json::json!({
-                "sessionId": "sess_fake",
-                "toolCall": { "toolCallId": "call_1", "kind": "execute", "title": "Run `rm -rf build`" },
-                "options": self.options(),
-            }),
+            self.permission_params(),
         ));
         lines
+    }
+
+    fn permission_params(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": "sess_fake",
+            "toolCall": { "toolCallId": "call_1", "kind": "execute", "title": "Run `rm -rf build`" },
+            "options": self.options(),
+        })
     }
 
     fn options(&self) -> serde_json::Value {
@@ -360,9 +393,15 @@ struct PendingTurn {
 impl PendingTurn {
     fn open(&mut self, prompt_id: serde_json::Value) -> i64 {
         self.prompt_id = Some(prompt_id);
+        self.next_request_id()
+    }
+
+    /// The next id for a request this fake sends.
+    ///
+    /// Numbered above anything the client sends, so the two id spaces never collide in a transcript
+    /// somebody is reading.
+    fn next_request_id(&mut self) -> i64 {
         self.next_request_id += 1;
-        // Numbered above anything the client sends, so the two id spaces never collide in a
-        // transcript somebody is reading.
         9_000 + self.next_request_id
     }
 
