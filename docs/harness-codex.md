@@ -265,7 +265,8 @@ a subset on purpose, and every addition would otherwise be a red build.
 
 ## Fixtures
 
-Select Codex explicitly when using the shared smoke CLI; its default harness is Claude:
+Bare `mea discover` probes every linked harness. Select Codex explicitly for its detailed report;
+`mea turn` defaults to Claude when `--harness` is absent:
 
 ```sh
 cargo run -p mea -- discover --harness codex
