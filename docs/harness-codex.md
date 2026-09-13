@@ -85,6 +85,12 @@ Attachments: image attachments travel as `UserInput::image` with a `data:` URL, 
 real `turn/start`. Other attachment kinds are dropped — `UserInput` has no general-purpose file arm,
 and smuggling one in as text would send something different from what the host attached.
 
+Cancelling before `turn/start` answers records the request and keeps the vendor's turn slot
+occupied. The returned handle is interrupted as soon as it arrives; another start is refused
+until the vendor completes or the start fails. Late start responses only update their own
+start attempt, even if a host reuses a `TurnId`. This follows the vendor's requirement to name
+the active turn in `turn/interrupt` and `turn/steer`.
+
 ## The permission matrix
 
 All six (level, routing) pairs are supported. A level is two vendor settings that move together,
@@ -175,10 +181,16 @@ refused as `Error::UnsupportedTransport` before anything is spawned.
 
 ## MCP
 
-`Capabilities::mcp_passthrough` is `false`. MCP servers are configured in the user's own
-`~/.codex/config.toml` or with `codex mcp`; there is no app-server call that takes a server
-definition from a client. Servers the user configured still run, and their calls are rendered as
-`ActivityKind::Mcp` — what a host cannot do is pass one through.
+`Capabilities::mcp_passthrough` is `false`. The harness does not implement host-supplied MCP
+configuration. A nonempty `OpenSession::mcp_servers` is refused as `Error::HostConfiguration`
+before any process is launched, including on resume. Configure servers in the user's own
+`~/.codex/config.toml` or with `codex mcp`. Calls to those servers still render as
+`ActivityKind::Mcp`.
+
+The pinned schema includes a `config` map on both `thread/start` and `thread/resume`. Mapping
+the core's MCP configuration through that override is a follow-up. It needs validation of server
+names and transports, schema coverage, and a real captured start/resume before the capability can
+be advertised. See the [app-server documentation][readme] for configuration overrides.
 
 ## Environment
 
@@ -221,8 +233,16 @@ a subset on purpose, and every addition would otherwise be a red build.
 
 ## Fixtures
 
-`fixtures/codex/` holds four conversations recorded by `mea capture codex` against a real
-`codex app-server`: `handshake`, `turn`, `approval` and `interrupt`. They are never hand-edited —
+Select Codex explicitly when using the shared smoke CLI; its default harness is Claude:
+
+```sh
+cargo run -p mea -- discover --harness codex
+cargo run -p mea -- turn --harness codex "summarise this repository"
+cargo run -p mea -- capture codex
+```
+
+`fixtures/codex/` holds five conversations recorded by `mea capture codex` against a real
+`codex app-server`: `handshake`, `turn`, `approval`, `interrupt` and `review`. They are never hand-edited —
 the redaction happens in the capture (`examples/mea/src/redact.rs`), which replaces the members
 that identify a person or a machine and rewrites the capture's own two directories.
 
@@ -235,30 +255,22 @@ this tool letting an agent out of its sandbox, checked into the repository.
 - No MCP passthrough (see above).
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
-- A turn cannot change its session's `PermissionLevel`. A level is a sandbox *and* an approval
-  policy, `thread/start` takes the sandbox and `turn/start` takes only the policy, and sending half
-  of a level is a configuration nobody chose — a turn narrowed to read-only would keep the thread's
-  sandbox and lose its prompts with it. `Session::start_turn` refuses a level that differs from the
-  session's, and a host that wants a different one opens a session at it. `TurnStartParams`
-  declares a `sandboxPolicy`, so the full per-turn change is reachable once its shape is pinned
-  and driven against a real server; the per-turn `routing`, `model` and `effort` all apply today.
+- A turn cannot change its session's `PermissionLevel`. A level requires both a sandbox and an
+  approval policy; this harness currently sends only the policy on `turn/start`. The vendor's
+  `TurnStartParams` also declares `sandboxPolicy`, but the harness does not model it yet.
+  `Session::start_turn` refuses a level that differs from the session's. Supporting changes needs
+  schema coverage and verification against a real server. Per-turn `routing`, `model` and `effort`
+  apply today.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
 - `SteerRejection::TurnNotSteerable` is never produced. The app-server's refusal for a turn that
   refuses steering — a review, a compaction — has not been observed, so a steer it declines for any
   reason other than "no active turn" surfaces as the vendor error rather than as that reason.
-- A turn cancelled in the window between `turn/start` being written and its answer arriving is
-  stopped by name as soon as the answer lands, and that orphan's own `turn/completed` is dropped so
-  it cannot end whatever turn has started since. What is not filtered is the orphan's deltas: a
-  notification it emits between the interrupt going out and the server acting on it carries no turn
-  id the reducer reads, so it renders under the running turn. Cosmetic, and the window is one round
-  trip; routing every conversation frame by `turnId` as well as `threadId` is the fix, and wants
-  the reducer to hold the running turn's handle.
-- A session closed or cancelled while its host has stopped reading ends that turn with a bare
+- A session closed while its host has stopped reading ends that turn with a bare
   `Completed` under a 200 ms grace, rather than with the cancellation marker a turn that ends
   normally carries. One event is what fits: a bounded sink offers no way to put two events on or
   neither, and a grace that elapsed between a marker and its terminal would leave the host the one
   shape the core's contract rules out. The reason is not lost with the marker — it is the argument
-  the host passed to `close` or `cancel` in the first place.
+  the host passed to `close` in the first place.
 
 Compliance posture: see [compliance.md](compliance.md).
 
