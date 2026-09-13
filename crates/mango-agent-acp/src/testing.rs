@@ -1,0 +1,394 @@
+//! A fake ACP agent, for proving the harness without an agent installed.
+//!
+//! [`FakeAcpAgent`] answers the v1 wire from a script rather than from a model: it handles
+//! `initialize`, `session/new`, `session/load`, `session/list`, `session/set_mode`, `session/cancel`
+//! and `session/prompt`, and a prompt streams whatever updates it was built with. Everything it
+//! writes is JSON it composes itself, so a rename in the schema crate shows up as a test that stops
+//! matching rather than as a test that compiles against a wire nobody speaks.
+//!
+//! It is **not** a fixture. Captured contracts belong under `fixtures/` and are produced by
+//! `mea capture` against a real agent; this is a named fake, which is what the repository's own rule
+//! asks for in place of inline stubs.
+
+use std::sync::{Arc, Mutex, PoisonError};
+
+use mango_external_agents::testing::FakeProcess;
+
+/// What the fake does when a turn asks for permission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Approval {
+    /// Never ask.
+    Never,
+    /// Ask once per turn, and wait for the client's answer before finishing.
+    Once,
+    /// Ask once per turn, offering only choices that allow — so a client with nothing to refuse with
+    /// has to put the question to a person.
+    OnlyAllows,
+}
+
+/// A scripted ACP agent, as a [`FakeProcess`] the core's `FakeLauncher` can hand out.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_acp::testing::FakeAcpAgent;
+/// use mango_external_agents::testing::FakeLauncher;
+///
+/// let launcher = FakeLauncher::new();
+/// launcher.push(FakeAcpAgent::new().process());
+/// ```
+#[derive(Clone, Debug)]
+pub struct FakeAcpAgent {
+    protocol_version: u16,
+    load_session: bool,
+    supports_listing: bool,
+    supports_close: bool,
+    modes: Vec<String>,
+    approval: Approval,
+    /// `session/new` answers with this error code instead of a session.
+    new_session_error: Option<(i32, String)>,
+    updates: Vec<serde_json::Value>,
+    stop_reason: String,
+    version_output: String,
+}
+
+impl Default for FakeAcpAgent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeAcpAgent {
+    /// An agent that opens a session and answers one turn with text, an activity and a completion.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            protocol_version: 1,
+            load_session: true,
+            supports_listing: false,
+            supports_close: false,
+            modes: Vec::new(),
+            approval: Approval::Never,
+            new_session_error: None,
+            updates: vec![
+                serde_json::json!({
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{ "name": "review", "description": "Review the diff" }]
+                }),
+                serde_json::json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "thinking" }
+                }),
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "hello" }
+                }),
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_1",
+                    "title": "Run `cargo test`",
+                    "kind": "execute",
+                    "status": "completed"
+                }),
+                serde_json::json!({
+                    "sessionUpdate": "usage_update",
+                    "used": 1200,
+                    "size": 200_000
+                }),
+            ],
+            stop_reason: String::from("end_turn"),
+            version_output: String::from("fake-acp 1.2.3"),
+        }
+    }
+
+    /// Asks for one approval per turn.
+    #[must_use]
+    pub fn asking_for_approval(mut self, approval: Approval) -> Self {
+        self.approval = approval;
+        self
+    }
+
+    /// Answers `initialize` with this protocol version.
+    #[must_use]
+    pub fn with_protocol_version(mut self, version: u16) -> Self {
+        self.protocol_version = version;
+        self
+    }
+
+    /// Advertises `session/list`.
+    #[must_use]
+    pub fn listing_sessions(mut self) -> Self {
+        self.supports_listing = true;
+        self
+    }
+
+    /// Advertises `session/close`.
+    #[must_use]
+    pub fn closing_sessions(mut self) -> Self {
+        self.supports_close = true;
+        self
+    }
+
+    /// Advertises these mode ids on `session/new`.
+    #[must_use]
+    pub fn with_modes<I, S>(mut self, modes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.modes = modes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Does not advertise `session/load`.
+    #[must_use]
+    pub fn without_load_session(mut self) -> Self {
+        self.load_session = false;
+        self
+    }
+
+    /// Answers `session/new` with this JSON-RPC error.
+    #[must_use]
+    pub fn refusing_new_session(mut self, code: i32, message: impl Into<String>) -> Self {
+        self.new_session_error = Some((code, message.into()));
+        self
+    }
+
+    /// Streams these `session/update` payloads for a turn instead of the default script.
+    #[must_use]
+    pub fn with_updates(mut self, updates: Vec<serde_json::Value>) -> Self {
+        self.updates = updates;
+        self
+    }
+
+    /// Ends its turns with this stop reason.
+    #[must_use]
+    pub fn with_stop_reason(mut self, stop_reason: impl Into<String>) -> Self {
+        self.stop_reason = stop_reason.into();
+        self
+    }
+
+    /// Prints this for a version probe.
+    #[must_use]
+    pub fn printing_version(mut self, output: impl Into<String>) -> Self {
+        self.version_output = output.into();
+        self
+    }
+
+    /// A child that prints this agent's version output and exits, for a probe.
+    #[must_use]
+    pub fn version_process(&self) -> FakeProcess {
+        FakeProcess::transcript([self.version_output.clone()])
+    }
+
+    /// A child that speaks the v1 wire for as long as it is driven.
+    #[must_use]
+    pub fn process(&self) -> FakeProcess {
+        let agent = self.clone();
+        let pending = Arc::new(Mutex::new(PendingTurn::default()));
+        FakeProcess::responding(move |line| agent.answer(line, &pending))
+    }
+
+    fn answer(&self, line: &str, pending: &Arc<Mutex<PendingTurn>>) -> Vec<String> {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Vec::new();
+        };
+        let method = message.get("method").and_then(serde_json::Value::as_str);
+        let id = message.get("id").cloned();
+
+        match (method, id) {
+            (Some("initialize"), Some(id)) => vec![result(id, self.initialize_result())],
+            (Some("session/new"), Some(id)) => vec![self.session_result(id)],
+            (Some("session/load"), Some(id)) => match self.load_session {
+                true => vec![result(
+                    id,
+                    serde_json::json!({ "modes": self.mode_state() }),
+                )],
+                false => vec![error(id, -32601, "method not found")],
+            },
+            (Some("session/list"), Some(id)) => vec![result(
+                id,
+                serde_json::json!({
+                    "sessions": [{ "sessionId": "sess_old", "cwd": "/repo", "title": "Yesterday" }]
+                }),
+            )],
+            (Some("session/set_mode" | "session/close"), Some(id)) => {
+                vec![result(id, serde_json::json!({}))]
+            }
+            (Some("session/prompt"), Some(id)) => self.prompt(id, pending),
+            (Some("session/cancel"), None) => self.cancelled(pending),
+            // An unanswered request would hang the client, and an unknown one is the agent's own
+            // "method not found" rather than silence.
+            (Some(_), Some(id)) => vec![error(id, -32601, "method not found")],
+            // A response to our own `session/request_permission`.
+            (None, Some(_)) => self.answered(pending),
+            _ => Vec::new(),
+        }
+    }
+
+    fn initialize_result(&self) -> serde_json::Value {
+        let mut session_capabilities = serde_json::Map::new();
+        if self.supports_listing {
+            session_capabilities.insert(String::from("list"), serde_json::json!({}));
+        }
+        if self.supports_close {
+            session_capabilities.insert(String::from("close"), serde_json::json!({}));
+        }
+        serde_json::json!({
+            "protocolVersion": self.protocol_version,
+            "agentInfo": { "name": "fake-acp", "version": "1.2.3" },
+            "agentCapabilities": {
+                "loadSession": self.load_session,
+                "promptCapabilities": { "image": true, "embeddedContext": true },
+                "sessionCapabilities": session_capabilities,
+            },
+            "authMethods": [],
+        })
+    }
+
+    fn session_result(&self, id: serde_json::Value) -> String {
+        match &self.new_session_error {
+            Some((code, message)) => error(id, *code, message),
+            None => result(
+                id,
+                serde_json::json!({ "sessionId": "sess_fake", "modes": self.mode_state() }),
+            ),
+        }
+    }
+
+    fn mode_state(&self) -> Option<serde_json::Value> {
+        let first = self.modes.first()?;
+        Some(serde_json::json!({
+            "currentModeId": first,
+            "availableModes": self
+                .modes
+                .iter()
+                .map(|mode| serde_json::json!({ "id": mode, "name": mode }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// The updates for one turn, then either a permission request or the turn's end.
+    fn prompt(&self, id: serde_json::Value, pending: &Arc<Mutex<PendingTurn>>) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .updates
+            .iter()
+            .map(|update| {
+                notification(
+                    "session/update",
+                    serde_json::json!({ "sessionId": "sess_fake", "update": update }),
+                )
+            })
+            .collect();
+
+        if self.approval == Approval::Never {
+            lines.push(result(
+                id,
+                serde_json::json!({ "stopReason": self.stop_reason }),
+            ));
+            return lines;
+        }
+
+        // The turn is held open: its response goes out when the client answers, which is what proves
+        // the round trip rather than a request nobody replies to.
+        let request_id = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .open(id);
+        lines.push(request(
+            request_id,
+            "session/request_permission",
+            serde_json::json!({
+                "sessionId": "sess_fake",
+                "toolCall": { "toolCallId": "call_1", "kind": "execute", "title": "Run `rm -rf build`" },
+                "options": self.options(),
+            }),
+        ));
+        lines
+    }
+
+    fn options(&self) -> serde_json::Value {
+        match self.approval {
+            Approval::OnlyAllows => serde_json::json!([
+                { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                { "optionId": "allow-all", "name": "Always", "kind": "allow_always" },
+            ]),
+            _ => serde_json::json!([
+                { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                { "optionId": "reject", "name": "Reject", "kind": "reject_once" },
+            ]),
+        }
+    }
+
+    fn answered(&self, pending: &Arc<Mutex<PendingTurn>>) -> Vec<String> {
+        let turn = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .close();
+        let Some(turn) = turn else {
+            return Vec::new();
+        };
+        vec![result(
+            turn,
+            serde_json::json!({ "stopReason": self.stop_reason }),
+        )]
+    }
+
+    /// A cancelled turn answers `stop_reason: cancelled`, which is what ACP says it does.
+    fn cancelled(&self, pending: &Arc<Mutex<PendingTurn>>) -> Vec<String> {
+        let turn = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .close();
+        let Some(turn) = turn else {
+            return Vec::new();
+        };
+        vec![result(
+            turn,
+            serde_json::json!({ "stopReason": "cancelled" }),
+        )]
+    }
+}
+
+/// The one `session/prompt` this fake keeps open while it waits on a permission answer.
+#[derive(Debug, Default)]
+struct PendingTurn {
+    prompt_id: Option<serde_json::Value>,
+    next_request_id: i64,
+}
+
+impl PendingTurn {
+    fn open(&mut self, prompt_id: serde_json::Value) -> i64 {
+        self.prompt_id = Some(prompt_id);
+        self.next_request_id += 1;
+        // Numbered above anything the client sends, so the two id spaces never collide in a
+        // transcript somebody is reading.
+        9_000 + self.next_request_id
+    }
+
+    fn close(&mut self) -> Option<serde_json::Value> {
+        self.prompt_id.take()
+    }
+}
+
+fn result(id: serde_json::Value, result: serde_json::Value) -> String {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
+}
+
+fn error(id: serde_json::Value, code: i32, message: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message }
+    })
+    .to_string()
+}
+
+fn notification(method: &str, params: serde_json::Value) -> String {
+    serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string()
+}
+
+fn request(id: i64, method: &str, params: serde_json::Value) -> String {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        .to_string()
+}
