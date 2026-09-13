@@ -15,8 +15,29 @@ description = "Generic Agent Client Protocol harness for mango-external-agents w
 [lints]
 workspace = true
 
+[features]
+default = []
+# The named fake ACP agent this crate's own tests replay, for a host writing tests of its own.
+testing = ["mango-external-agents/testing"]
+
 [dependencies]
+# ACP v1 only: `unstable_protocol_v2` and the other draft features stay off, so the wire this
+# crate speaks is the one agentclientprotocol.com documents as stable.
+agent-client-protocol = { version = "2.1.0", default-features = false }
+async-trait = "0.1.92"
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+# `Sink`/`Stream` adapters between the core's `ManagedProcess` halves and the official crate's
+# `Lines` transport. No executor: the host owns the runtime.
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
 mango-external-agents.workspace = true
+# The fake agent composes the v1 wire as JSON rather than as Rust values, so a schema reshape shows
+# up as a test that stops matching rather than one that compiles against a wire nobody speaks.
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+mango-external-agents = { workspace = true, features = ["testing"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true
