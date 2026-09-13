@@ -153,6 +153,7 @@ about third-party harnesses found either way — "not found" is the finding, not
 | Agent              | Owner                         | ACP mode documented at                             |
 | ------------------ | ----------------------------- | -------------------------------------------------- |
 | Cursor CLI         | Anysphere                     | [cursor.com/docs/cli/acp][cursor-acp]              |
+| Grok Build         | SpaceXAI                      | [Grok Headless & Scripting][grok-acp]              |
 | OpenCode           | Anomaly Innovations           | [opencode.ai/docs/acp][opencode-acp]               |
 | Gemini CLI         | Google                        | [gemini-cli/docs/cli/acp-mode.md][gemini-acp]      |
 | GitHub Copilot CLI | GitHub                        | [ACP server reference][copilot-acp]                |
@@ -161,6 +162,7 @@ about third-party harnesses found either way — "not found" is the finding, not
 | `claude-agent-acp` | Claude Code, via the adapter  | [agentclientprotocol/claude-agent-acp][claude-acp] |
 
 [cursor-acp]: https://cursor.com/docs/cli/acp
+[grok-acp]: https://docs.x.ai/build/cli/headless-scripting
 [opencode-acp]: https://opencode.ai/docs/acp/
 [gemini-acp]: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md
 [copilot-acp]: https://docs.github.com/copilot/reference/copilot-cli-reference/acp-server
@@ -168,7 +170,13 @@ about third-party harnesses found either way — "not found" is the finding, not
 [codex-acp]: https://github.com/agentclientprotocol/codex-acp
 [claude-acp]: https://github.com/agentclientprotocol/claude-agent-acp
 
-Four of them need a note beyond the link:
+Some profiles need a note beyond the link:
+
+- **Grok's example includes ACP `authenticate`.** This harness never sends it and never forwards
+  `XAI_API_KEY`. It only supports the installed CLI when `initialize` and `session/new` can reuse
+  the user's existing local login. The profile disables background updates with the documented
+  `--no-auto-update` flag. A smoke turn passed against Grok 1.0.30 on 2026-09-13 without
+  `authenticate`; that is an observation of this build, not a documented promise about other builds.
 
 - **Goose has no corporate terms of service.** It is Apache-2.0 and brings the user's own model
   credentials, and Block publishes no page covering it — only product-specific terms for unrelated
@@ -183,7 +191,7 @@ Four of them need a note beyond the link:
 - **`claude-agent-acp` drives the user's own `claude`**, so the Claude Code section above applies
   unchanged. The package moved twice and the older `@zed-industries/claude-code-acp` is orphaned.
 
-Every profile except `cursor` is `verified: false`: the entry is documented but nobody has driven the
+Every profile except `cursor` and `grok` is `verified: false`: the entry is documented but nobody has driven the
 agent. A host can say so in its own interface.
 
 **Quotes:** none of these vendors publishes an operative sentence about third-party harnesses for its

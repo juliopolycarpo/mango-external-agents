@@ -324,6 +324,7 @@ pub const ACP_PROTOCOL_DOCS: &str = "https://agentclientprotocol.com/protocol/ov
 pub fn builtin_profiles() -> Vec<Arc<AcpProfile>> {
     vec![
         Arc::new(cursor()),
+        Arc::new(grok()),
         Arc::new(opencode()),
         Arc::new(gemini()),
         Arc::new(copilot()),
@@ -357,9 +358,9 @@ fn profile(
 
 /// Cursor's CLI in ACP mode.
 ///
-/// The binary is `agent`. `cursor-agent` is a legacy alias some installs still ship, and a host
-/// whose machine has only that one resolves it and passes the path on
-/// [`OpenSession::executable`](mango_external_agents::OpenSession).
+/// Cursor's installer supplies `cursor-agent` alongside `agent`. Use the distinct alias because
+/// Grok also installs `agent`; that shared name depends on installation order.
+/// Source: <https://cursor.com/install>.
 fn cursor() -> AcpProfile {
     profile(
         "cursor",
@@ -370,13 +371,35 @@ fn cursor() -> AcpProfile {
             privacy_url: "https://cursor.com/privacy",
             skills_are_slash_commands: true,
         },
-        &["agent", "acp"],
+        &["cursor-agent", "acp"],
         "https://cursor.com/docs/cli/acp",
     )
-    .with_login_hint("agent login")
-    // Checked against `agent` 2026.08.25 on 2026-09-13 by `tests/smoke.rs`: a session opened, a turn
-    // ran and closed. Its `session/new` advertised no modes, which is why `modes` stays unknown here
-    // and `FullAccess` stays refused.
+    .with_login_hint("cursor-agent login")
+    // Checked against `cursor-agent` 2026.09.10-fd3934a on 2026-09-13 by `tests/smoke.rs`:
+    // a session opened, answered pong and closed. No permission-mode mapping is claimed.
+    .verified()
+}
+
+/// Grok Build's documented ACP v1 command, with background updates disabled.
+///
+/// The distinct `grok` executable avoids the `agent` alias shared with Cursor. The harness uses
+/// the installed CLI's existing login and never sends ACP `authenticate` or forwards an API key.
+fn grok() -> AcpProfile {
+    profile(
+        "grok",
+        "Grok Build",
+        VendorInfo {
+            company: "SpaceXAI",
+            terms_url: "https://x.ai/legal/terms-of-service",
+            privacy_url: "https://x.ai/legal/privacy-policy",
+            skills_are_slash_commands: true,
+        },
+        &["grok", "--no-auto-update", "agent", "stdio"],
+        "https://docs.x.ai/build/cli/headless-scripting",
+    )
+    .with_login_hint("grok login")
+    // `tests/smoke.rs` passed against Grok 1.0.30 on 2026-09-13 with the existing local login,
+    // without an ACP `authenticate` request. No permission-mode mapping is claimed.
     .verified()
 }
 
@@ -570,7 +593,7 @@ mod tests {
             .collect();
         assert_eq!(
             claimed,
-            vec![String::from("cursor")],
+            vec![String::from("cursor"), String::from("grok")],
             "expected only the profiles run against their own agent, received {claimed:?}"
         );
     }

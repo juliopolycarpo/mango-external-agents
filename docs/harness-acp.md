@@ -181,8 +181,12 @@ printing a plausible command would send a person to a prompt that does not exist
 
 The probe runs the profile's version argv through the host's launcher and reads what the agent printed.
 It does **not** search `PATH` (the library never does; a host that resolved a path passes it on
-`OpenSession::with_executable`) and it does **not** run `initialize`, because a handshake is a session
+`AcpHarness::with_executable`) and it does **not** run `initialize`, because a handshake is a session
 and discovering an agent should not open one.
+
+The harness uses that path for both discovery and sessions and returns it in `Discovery::executable`.
+`OpenSession::with_executable` can override it for one session. This lets a host support custom
+install locations without editing the profile or changing a user's `PATH`.
 
 - A launcher that could not start the program is `GateVerdict::NotInstalled`.
 - Output with no dotted number is `GateVerdict::Unknown`. An agent that changed the shape of
@@ -204,7 +208,8 @@ file and shell tools and uses them, which is what the activity events describe.
 
 | Profile                        | ACP argv                             | Login                 | Verified            |
 | ------------------------------ | ------------------------------------ | --------------------- | ------------------- |
-| [`cursor`][p-cursor]           | `agent acp`                          | `agent login`         | **yes**, 2026-09-13 |
+| [`cursor`][p-cursor]           | `cursor-agent acp`                   | `cursor-agent login`  | **yes**, 2026-09-13 |
+| [`grok`][p-grok]               | `grok --no-auto-update agent stdio`  | `grok login`          | **yes**, 2026-09-13 |
 | [`opencode`][p-opencode]       | `opencode acp`                       | `opencode auth login` | no                  |
 | [`gemini`][p-gemini]           | `gemini --acp`                       | none; inside `gemini` | no                  |
 | [`copilot`][p-copilot]         | `copilot --acp`                      | `copilot login`       | no                  |
@@ -214,6 +219,7 @@ file and shell tools and uses them, which is what the activity events describe.
 | `custom`                       | the host's own argv                  | the host's own        | no                  |
 
 [p-cursor]: https://cursor.com/docs/cli/acp
+[p-grok]: https://docs.x.ai/build/cli/headless-scripting
 [p-opencode]: https://opencode.ai/docs/acp/
 [p-gemini]: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md
 [p-copilot]: https://docs.github.com/copilot/reference/copilot-cli-reference/acp-server
@@ -221,16 +227,33 @@ file and shell tools and uses them, which is what the activity events describe.
 [p-codex]: https://github.com/agentclientprotocol/codex-acp
 [p-claude]: https://github.com/agentclientprotocol/claude-agent-acp
 
-`cursor` was driven against `agent` 2026.08.25 on 2026-09-13.
+`tests/smoke.rs` passed on 2026-09-13 against `cursor-agent` 2026.09.10-fd3934a and Grok 1.0.30.
+Each opened a session, returned `pong` and closed. Neither run sent ACP `authenticate`.
 
 `verified` says a profile was driven against the agent itself by `tests/smoke.rs`. Everything else is a
 documented entry that nobody has run; a host can say so in its own interface, and nothing here pretends
 otherwise.
 
-Three corrections worth recording, because the obvious spellings are stale:
+### Executable names and installation order
 
-- Cursor's binary is **`agent`**. `cursor-agent` is a legacy alias some installs still ship; a host
-  whose machine has only that one resolves it and passes the path on `OpenSession::executable`.
+Cursor's [installer](https://cursor.com/install) creates both `agent` and `cursor-agent` as aliases
+of the same executable. Grok also installs an `agent` command, so the Cursor profile uses
+`cursor-agent` for discovery, sessions and its login hint. It never falls back to `agent`: a version
+number from that command cannot establish which vendor owns it.
+
+The Grok command is `grok --no-auto-update agent stdio`, using the ACP invocation and update control
+documented in [Headless & Scripting][p-grok]. Using the distinct executable names allows
+both installations to coexist regardless of which installer last claimed `agent`. Hosts with a
+custom installation can supply their own resolved executable path.
+
+Grok's documented example calls `authenticate` before `session/new`. This library never sends that
+request. The profile can only use a build that accepts an existing local login without it; an
+authentication refusal stays `AuthRequired` with `grok login` as text for the host to display.
+Reuse of an existing local login was verified against Grok 1.0.30. Its documentation does not
+promise that the explicit authentication step can always be omitted.
+
+Two other spellings worth recording:
+
 - Gemini's flag is **`--acp`**; `--experimental-acp` is its deprecated predecessor.
 - The Claude Code adapter moved twice and is now `@agentclientprotocol/claude-agent-acp` with the
   binary **`claude-agent-acp`**. The older `claude-code-acp` spelling launches an orphaned package.
@@ -304,7 +327,8 @@ never going to work.
 ## Smoke test
 
 ```bash
-cargo run -p mea -- discover                      # installed | missing | gated, per profile
+cargo run -p mea -- discover                      # all linked harnesses and ACP profiles
+cargo run -p mea -- discover --harness acp:grok   # one profile in detail
 MEA_ACP_PROFILE=cursor cargo test -p mango-agent-acp --all-features \
     --test smoke -- --ignored --nocapture         # one real turn
 ```

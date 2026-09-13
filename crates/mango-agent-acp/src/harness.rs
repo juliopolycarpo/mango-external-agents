@@ -4,7 +4,7 @@
 //!
 //! It runs the profile's version argv through the host's launcher and reads what the agent printed.
 //! It does not search `PATH` — the core is explicit that the library never does, and a host that
-//! resolved a path passes it on [`OpenSession::with_executable`] — and it does not run `initialize`,
+//! resolved a path passes it on [`AcpHarness::with_executable`] — and it does not run `initialize`,
 //! because a handshake is a session, and discovering an agent should not open one.
 //!
 //! [`AuthState`] is therefore always [`AuthState::Unknown`]. ACP's `initialize` reports which
@@ -31,8 +31,8 @@ use mango_external_agents::session::{
 };
 use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
-    AcpSpec, AuthState, Capabilities, Discovery, Error, GateVerdict, Harness, HarnessDescriptor,
-    HarnessKind, HostContext, LaunchSpec, LineStream, Result, StdioSpec,
+    AcpSpec, AuthState, Capabilities, Discovery, Error, ExecutablePath, GateVerdict, Harness,
+    HarnessDescriptor, HarnessKind, HostContext, LaunchSpec, LineStream, Result, StdioSpec,
 };
 
 use crate::client::{self, SessionState};
@@ -96,6 +96,7 @@ fn ceiling() -> Capabilities {
 pub struct AcpHarness {
     profile: Arc<AcpProfile>,
     descriptor: HarnessDescriptor,
+    executable: ExecutablePath,
 }
 
 impl AcpHarness {
@@ -111,7 +112,26 @@ impl AcpHarness {
         Self {
             profile,
             descriptor,
+            executable: ExecutablePath::default(),
         }
+    }
+
+    /// Uses a host-resolved executable for discovery and sessions, unless a session overrides it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::AcpHarness;
+    /// use mango_external_agents::ExecutablePath;
+    ///
+    /// let harness = AcpHarness::builtin("cursor").expect("built-in profile")
+    ///     .with_executable(ExecutablePath::resolved("/opt/cursor/cursor-agent"));
+    /// assert_eq!(harness.profile().id.as_str(), "cursor");
+    /// ```
+    #[must_use]
+    pub fn with_executable(mut self, executable: ExecutablePath) -> Self {
+        self.executable = executable;
+        self
     }
 
     /// A harness for one of the profiles this crate ships, by id.
@@ -171,7 +191,7 @@ impl Harness for AcpHarness {
     }
 
     async fn probe(&self, host: &HostContext) -> Result<Discovery> {
-        let argv = self.profile.version_argv.clone();
+        let argv = self.profile.resolved_version_argv(&self.executable);
         if argv.is_empty() {
             return Ok(Discovery::not_installed());
         }
@@ -185,7 +205,7 @@ impl Harness for AcpHarness {
 
         let version = version::parse(&printed);
         Ok(Discovery {
-            executable: None,
+            executable: self.executable.get().cloned(),
             version: version.clone(),
             gate: gate(version.as_deref(), self.profile.minimum_version.as_deref()),
             // ACP has no signed-in surface; see this module's own documentation.
@@ -203,6 +223,12 @@ impl Harness for AcpHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
+        if !request.mcp_servers.is_empty() {
+            return Err(Error::HostConfiguration {
+                expected: "no host-supplied MCP servers: ACP passthrough is not implemented",
+                received: format!("{} host-supplied MCP server(s)", request.mcp_servers.len()),
+            });
+        }
         refuse_model_selection(&request.configuration)?;
         let matrix = self.permission_matrix();
         if request.configuration.level.is_some_and(|level| {
@@ -223,18 +249,15 @@ impl Harness for AcpHarness {
                     "{:?}/{:?} on {}",
                     request.configuration.level, request.configuration.routing, self.profile.id
                 ),
-        if !request.mcp_servers.is_empty() {
-            return Err(Error::HostConfiguration {
-                expected: "no host-supplied MCP servers: ACP passthrough is not implemented",
-                received: format!("{} host-supplied MCP server(s)", request.mcp_servers.len()),
-            });
-        }
             });
         }
 
-        let spec = AcpSpec::ChildPipes(StdioSpec::new(
-            self.profile.resolved_argv(&request.executable),
-        ));
+        let executable = if request.executable.get().is_some() {
+            &request.executable
+        } else {
+            &self.executable
+        };
+        let spec = AcpSpec::ChildPipes(StdioSpec::new(self.profile.resolved_argv(executable)));
         let launched =
             transport::connect(host, &spec, self.descriptor.vendor_environment_keys).await?;
 
