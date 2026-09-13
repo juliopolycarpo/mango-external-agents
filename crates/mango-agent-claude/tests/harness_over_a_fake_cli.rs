@@ -728,6 +728,46 @@ mod mcp_passthrough {
         );
     }
 
+    /// The file outlives the child that was launched pointing at it.
+    ///
+    /// `--mcp-config` is a path the vendor reads at startup, so a close that unlinks it before the
+    /// kill lands leaves a starting child reading a configuration that is no longer there — a turn
+    /// running without the servers somebody set up rather than a turn that stopped. The unlink also
+    /// has to happen off the session lock, which every other method needs while it runs.
+    #[tokio::test]
+    async fn keeps_the_file_until_the_turn_it_configured_has_been_killed() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::stalling::<[String; 0], String>([])),
+        );
+        let session = open_with_servers(&launcher).await;
+        session
+            .start_turn(TurnRequest::new("turn-1", "start something long"))
+            .await
+            .expect("expected a turn");
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let path = std::path::PathBuf::from(
+            value_after(&argv, "--mcp-config").expect("expected the flag"),
+        );
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected a clean close");
+
+        assert_eq!(
+            launcher.mcp_config_at_kill(),
+            vec![true],
+            "expected the config file to still exist when the child was killed"
+        );
+        assert!(
+            !path.exists(),
+            "expected the close to still remove {}",
+            path.display()
+        );
+    }
+
     #[tokio::test]
     async fn refuses_a_build_that_cannot_load_them_rather_than_dropping_them() {
         // The 2.1.260 excerpt declares no `--mcp-config`.

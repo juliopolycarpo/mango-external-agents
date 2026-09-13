@@ -322,16 +322,20 @@ impl mango_external_agents::Session for ClaudeSession {
 
     async fn close(&self, reason: CloseReason) -> Result<()> {
         // Idempotent: a close racing a cancel, or two closes from different tasks, must not fail
-        // the second caller. The take happens under the guard; the kill happens after it is gone.
-        // The configuration file leaves with the session that wrote it: taken here, dropped at
-        // the end of this statement, and removed from disk by that drop.
-        let active = {
+        // the second caller. Both takes happen under the guard; nothing slow happens under it.
+        let (active, mcp_config) = {
             let mut state = self.shared.lock();
             state.closed = true;
-            drop(state.mcp_config.take());
-            state.active.take()
+            (state.active.take(), state.mcp_config.take())
         };
         end_turn(active, CancelReason::from(reason)).await;
+        // The configuration file leaves with the session that wrote it — but only once the child
+        // launched with `--mcp-config` pointing at it is dead. `Drop` unlinks the directory, and
+        // unlinking it first would leave a child that is still starting reading a configuration
+        // that is no longer there: a turn running without the servers somebody set up, rather than
+        // a turn that stopped. Off the lock as well, because a stalled unlink under that guard
+        // blocks every other method on this session.
+        drop(mcp_config);
         Ok(())
     }
 }

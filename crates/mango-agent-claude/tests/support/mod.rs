@@ -16,6 +16,7 @@
 //! in CI.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mango_external_agents::testing::FrozenClock;
@@ -130,6 +131,8 @@ pub struct FakeClaudeCli {
     stderr: Mutex<Vec<u8>>,
     /// Held closed while a test wants a turn's spawn to still be in flight.
     spawn_gate: Mutex<Option<SpawnGate>>,
+    /// Whether each killed child's `--mcp-config` file was still on disk when it was killed.
+    config_at_kill: Arc<Mutex<Vec<bool>>>,
 }
 
 impl Default for FakeClaudeCli {
@@ -151,6 +154,7 @@ impl FakeClaudeCli {
             children: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
             spawn_gate: Mutex::new(None),
+            config_at_kill: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -222,6 +226,15 @@ impl FakeClaudeCli {
         gate
     }
 
+    /// For each child that was killed, whether its `--mcp-config` file still existed then.
+    ///
+    /// A child is launched with `--mcp-config <path>` and reads it at startup, so unlinking that
+    /// file before the kill lands is a child that can observe a missing configuration. Recorded at
+    /// the moment of the kill because the ordering is the whole claim.
+    pub fn mcp_config_at_kill(&self) -> Vec<bool> {
+        lock(&self.config_at_kill).clone()
+    }
+
     /// Whether every child this launcher handed out has ended.
     pub fn all_children_ended(&self) -> bool {
         lock(&self.children).iter().all(|child| child.is_finished())
@@ -249,6 +262,11 @@ impl FakeClaudeCli {
     }
 }
 
+fn value_after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+    let at = argv.iter().position(|argument| argument == flag)?;
+    argv.get(at + 1).map(String::as_str)
+}
+
 fn is_probe(argv: &[String]) -> bool {
     argv.iter()
         .any(|argument| argument == "--version" || argument == "--help")
@@ -274,6 +292,7 @@ impl ProcessLauncher for FakeClaudeCli {
             gate.arrived.notify_one();
             gate.release.notified().await;
         }
+        let mcp_config = value_after(&spec.argv, "--mcp-config").map(PathBuf::from);
         lock(&self.launches).push(spec);
 
         let stderr = StderrTail::default();
@@ -296,6 +315,8 @@ impl ProcessLauncher for FakeClaudeCli {
             stderr,
             written: Arc::clone(&self.written),
             changed: Notify::new(),
+            mcp_config,
+            config_at_kill: Arc::clone(&self.config_at_kill),
         });
         lock(&self.children).push(Arc::clone(&child));
 
@@ -319,6 +340,8 @@ struct Child {
     stderr: StderrTail,
     written: Arc<Mutex<Vec<String>>>,
     changed: Notify,
+    mcp_config: Option<PathBuf>,
+    config_at_kill: Arc<Mutex<Vec<bool>>>,
 }
 
 impl Child {
@@ -355,6 +378,9 @@ impl ProcessControl for Child {
 
     /// 128 + SIGTERM, which is what the vendor documents for a `claude -p` run stopped that way.
     async fn kill(&self, _reason: CancelReason) -> Result<()> {
+        if let Some(path) = &self.mcp_config {
+            lock(&self.config_at_kill).push(path.exists());
+        }
         self.end(ExitStatus {
             code: Some(143),
             signal: None,
