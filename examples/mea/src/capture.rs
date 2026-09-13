@@ -58,6 +58,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "interrupt",
         purpose: "a turn stopped by turn/interrupt",
     },
+    Scenario {
+        name: "review",
+        purpose: "the vendor's own review, run inline on the session's thread",
+    },
 ];
 
 /// Records every Codex scenario into `out_dir`.
@@ -151,6 +155,7 @@ impl Recorder {
             "turn" => self.turn().await,
             "approval" => self.approval().await,
             "interrupt" => self.interrupt().await,
+            "review" => self.review().await,
             other => Err(Error::HostConfiguration {
                 expected: "a scenario this command knows",
                 received: other.to_owned(),
@@ -249,6 +254,18 @@ impl Recorder {
         self.send(json!({"id": 11, "method": "turn/interrupt",
                          "params": {"threadId": thread, "turnId": turn}}))
             .await?;
+        self.read_until(is_turn_completed).await.map(|_| ())
+    }
+
+    async fn review(&mut self) -> Result<()> {
+        let thread = self.start_thread("read-only", "never").await?;
+        // Without `delivery`, which the server reads as inline: a detached review runs on a thread
+        // the session is not subscribed to, and this transcript would describe events the harness
+        // is right to drop.
+        self.send(json!({"id": 10, "method": "review/start", "params": {
+            "threadId": thread, "target": {"type": "uncommittedChanges"}
+        }}))
+        .await?;
         self.read_until(is_turn_completed).await.map(|_| ())
     }
 

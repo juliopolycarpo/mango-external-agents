@@ -527,6 +527,51 @@ async fn a_steer_for_a_turn_that_is_not_running_is_refused_before_it_is_sent() {
     );
 }
 
+/// The recorded review. An inline review runs on the session's own thread, which is what leaving
+/// `delivery` absent asks for — a detached one would stream on a thread the reducer drops.
+#[tokio::test]
+async fn a_recorded_review_runs_on_the_thread_this_session_is_subscribed_to() {
+    let (session, launcher) = open("review").await;
+
+    let mut review = session
+        .start_review(mango_external_agents::ReviewRequest {
+            turn_id: mango_external_agents::TurnId::new("review-1"),
+            target: mango_external_agents::ReviewTarget::UncommittedChanges,
+        })
+        .await
+        .expect("expected a review");
+
+    assert_eq!(
+        review.review_thread_id,
+        session.ids().native_session_id,
+        "expected an inline review on this session's own thread"
+    );
+
+    let started = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("review/start"))
+        .expect("expected the vendor to be asked");
+    let frame: serde_json::Value = serde_json::from_str(&started).expect("expected a JSON frame");
+    assert_eq!(frame["params"]["target"]["type"], "uncommittedChanges");
+    assert!(
+        frame["params"].get("delivery").is_none(),
+        "expected no delivery member, which the server reads as inline; received {frame}"
+    );
+
+    let events = drain(&mut review.turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the review to end like any other turn, received {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|kind| matches!(kind, EventKind::SessionStarted { .. })),
+        "expected a review not to announce the vendor session, received {events:#?}"
+    );
+}
+
 /// The recorded `thread/list`, through the core's own bounding.
 #[tokio::test]
 async fn listing_the_vendors_own_sessions_asks_for_a_bounded_page() {
