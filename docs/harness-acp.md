@@ -137,6 +137,10 @@ A level a profile cannot reach is refused at `open_session` and again at `start_
 downgraded: silently running a read-only request under "ask every time" would grant more freedom than
 anybody chose.
 
+An omitted permission axis leaves the vendor's configuration untouched. After a host makes an
+explicit selection, later turns inherit it until another accepted override replaces it.
+`Session::configuration()` reports that current selection. A rejected turn cannot change it.
+
 A per-turn level is compared to the session's **by mode**, and any pair whose mode differs from the one
 the session was opened under is refused in both directions. Narrowing looks harmless and is not: a turn
 asking for `ReadOnly` on a session the agent runs in its own full-access mode would register a
@@ -146,6 +150,10 @@ standing refusal to answer.
 Cancelling withdraws every question the agent is waiting on, with ACP's own `Cancelled` outcome — the
 specification requires it, and an agent whose permission await is not itself cancellation-aware never
 returns from its tool call otherwise, so the turn would end with no terminal at all.
+Permission requests arriving after cancellation receive that same outcome, even when no permission
+level was selected. They cannot become new pending questions or reach the broker.
+Cancellation and completion cleanup remain attached to their turn. A close that wins before the
+prompt is queued prevents that prompt from being sent.
 
 ACP's four option kinds map one-to-one onto the core's, so a host policy can answer without reading a
 label in a language it does not know. The option set itself is passed through with the agent's own
@@ -300,7 +308,7 @@ never going to work.
   honest reading of a closed channel: the host abandoned the *events*, not the work, and the core has
   no signal that distinguishes the two. Sending the agent's own cancel there needs a drop hook on
   `TurnStream`, and `Session::cancel` is the call that does it today.
-- **No captured fixtures.** `fixtures/` is produced by `mea capture`, which does not exist yet. Tests
+- **No captured ACP fixtures.** `mea capture` currently captures Codex only. ACP tests
   drive `testing::FakeAcpAgent`, a named fake that composes the v1 wire as JSON, and `tests/smoke.rs`
   drives a real agent on demand.
 

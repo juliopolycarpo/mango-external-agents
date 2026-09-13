@@ -124,21 +124,21 @@ impl AcpSession {
     /// mode for it — nothing would have set a mode, nothing would have refused a request, and the
     /// turn would have run as `Default` while the host believed it had granted more.
     fn effective(&self, request: &TurnRequest) -> Result<Configuration> {
-        let configuration = request
-            .configuration
-            .clone()
-            .unwrap_or_else(|| self.info.effective_configuration.clone());
+        let configuration = match &request.configuration {
+            Some(overrides) => self.state.configuration().with_overrides(overrides),
+            None => self.state.configuration(),
+        };
         refuse_model_selection(&configuration)?;
-        if !crate::profile::matrix(&self.profile.modes)
-            .supports(configuration.level, configuration.routing)
-        {
-            return Err(Error::HostConfiguration {
-                expected: "a (level, routing) pair this profile supports",
-                received: format!(
-                    "{:?}/{:?} on {}",
-                    configuration.level, configuration.routing, self.profile.id
-                ),
-            });
+        if let Some(level) = configuration.level {
+            let routing = configuration
+                .routing
+                .unwrap_or(mango_external_agents::ApprovalRouting::User);
+            if !crate::profile::matrix(&self.profile.modes).supports(level, routing) {
+                return Err(Error::HostConfiguration {
+                    expected: "a (level, routing) pair this profile supports",
+                    received: format!("{level:?}/{routing:?} on {}", self.profile.id),
+                });
+            }
         }
         // Compared by *mode*, not by level. A level the profile reaches through a mode would need a
         // `session/set_mode` mid-session, and this harness does not change a session's mode under a
@@ -147,15 +147,19 @@ impl AcpSession {
         // `ReadOnly` on a session the agent runs in its own full-access mode would register a
         // read-only handle while the agent, still in that mode, raises no permission request at all
         // for the standing refusal to answer. Nothing would hold the level the host asked for.
+        // ACP modes are selected once, while the session opens. The live inherited configuration
+        // may later gain mode-free overrides, but it must not become the baseline used to infer a
+        // mode this running agent never received.
         let session_level = self.info.effective_configuration.level;
-        let wanted_mode = self.profile.modes.for_level(configuration.level);
-        if configuration.level != session_level
-            && wanted_mode != self.profile.modes.for_level(session_level)
-        {
+        let wanted_mode = configuration
+            .level
+            .and_then(|level| self.profile.modes.for_level(level));
+        let session_mode = session_level.and_then(|level| self.profile.modes.for_level(level));
+        if configuration.level != session_level && wanted_mode != session_mode {
             return Err(Error::Protocol {
                 expected: format!(
                     "a turn whose level runs under the session's own mode {:?}: ACP modes are set when the session opens",
-                    self.profile.modes.for_level(session_level)
+                    session_mode
                 ),
                 received: format!(
                     "{:?}, which wants mode {wanted_mode:?}",
@@ -195,11 +199,14 @@ impl Session for AcpSession {
         &self.info
     }
 
+    async fn configuration(&self) -> Configuration {
+        self.state.configuration()
+    }
+
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed { subject: "session" });
         }
-        let configuration = self.effective(&request)?;
         let prompt = content::prompt(
             &request.input,
             &request.attachments,
@@ -212,7 +219,19 @@ impl Session for AcpSession {
             Arc::clone(self.host.clock()),
             self.host.limits().turn_channel_capacity,
         );
-        let handle = self.state.begin_turn(sink.clone(), configuration.level)?;
+        // A configuration update and the single ACP prompt slot are one transaction. A second
+        // caller must not merge from an old snapshot while this one accepts its settings, then win
+        // the slot later and restore the stale snapshot over the newer restriction.
+        let handle = {
+            let _starting = self.state.lock_turn_start();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::Closed { subject: "session" });
+            }
+            let configuration = self.effective(&request)?;
+            let handle = self.state.begin_turn(sink.clone(), configuration.level)?;
+            self.state.accept_configuration(configuration);
+            handle
+        };
 
         // Emitted before the prompt is sent, so the first event a host reads names the conversation
         // the rest of the turn belongs to.
@@ -227,10 +246,36 @@ impl Session for AcpSession {
             return Err(error);
         }
 
-        let sent = self
-            .connection
-            .connection()
-            .send_request(PromptRequest::new(self.native_session_id.clone(), prompt));
+        // `SessionStarted` is emitted first, which can give `cancel` a window before ACP has a
+        // prompt to cancel. Re-enter the start guard while sending the wire request; if cancellation
+        // already won that window, queue a second notification after the prompt so the agent applies
+        // it to this turn rather than treating the earlier notification as a no-op.
+        let (sent, retry_cancel_error) = {
+            let _starting = self.state.lock_turn_start();
+            if !self
+                .state
+                .can_submit_prompt(self.closed.load(Ordering::Acquire), &handle)
+            {
+                return Err(Error::Closed { subject: "session" });
+            }
+            let sent = self
+                .connection
+                .connection()
+                .send_request(PromptRequest::new(self.native_session_id.clone(), prompt));
+            let retry_cancel_error = match self.state.is_cancelling() {
+                true => self
+                    .connection
+                    .connection()
+                    .send_notification(CancelNotification::new(self.native_session_id.clone()))
+                    .err()
+                    .map(|error| Error::Link {
+                        peer: format!("ACP agent {}", self.profile.id),
+                        message: with_stderr(&error.message, self.connection.control().as_ref()),
+                    }),
+                false => None,
+            };
+            (sent, retry_cancel_error)
+        };
         let native_turn_id = sent.id().to_string();
 
         let state = Arc::clone(&self.state);
@@ -244,27 +289,22 @@ impl Session for AcpSession {
             // Matched, not taken: a `close` may have ended this turn already, and a *later* turn may
             // have started since, so an unconditional take would terminate a conversation that is not
             // this prompt's.
-            let Some(turn) = state.end_turn_matching(&handle) else {
+            let Some((turn, cancel_reason, closing)) = state.end_turn_matching(&handle) else {
                 return;
             };
-            // A question cannot outlive the turn it belongs to: answering one afterwards would emit
-            // into a finished sink and tell the agent "allow" about a turn it has stopped running.
-            state.withdraw_pending();
             // Claimed before the closing events go out, so a `close` racing this one cannot emit a
             // second terminal into the same stream.
             if !turn.finish() {
                 return;
             }
-            for kind in state.finish_reducing() {
+            for kind in closing {
                 if turn.sink.emit(kind).await.is_err() {
                     return;
                 }
             }
             match outcome {
                 Ok(response) if reducer::was_cancelled(response.stop_reason) => {
-                    let reason = state
-                        .take_cancel_reason()
-                        .unwrap_or(CancelReason::Requested);
+                    let reason = cancel_reason.unwrap_or(CancelReason::Requested);
                     let _ = turn.sink.cancel(reason).await;
                 }
                 Ok(_) => {
@@ -283,6 +323,10 @@ impl Session for AcpSession {
                 }
             }
         });
+
+        if let Some(error) = retry_cancel_error {
+            return Err(error);
+        }
 
         Ok(TurnStream {
             turn_id: request.turn_id,
@@ -313,22 +357,23 @@ impl Session for AcpSession {
     }
 
     async fn cancel(&self, reason: CancelReason) -> Result<()> {
-        if self.state.turn().is_none() {
-            return Ok(());
-        }
         // Recorded before the notification goes out: the agent answers the prompt with
         // `stop_reason: cancelled`, and the task that ends the turn has to report *this* reason
         // rather than flattening a shutdown or a withdrawn consent into "requested".
-        self.state.record_cancel_reason(reason);
         // Required, not merely tidy. ACP v1 states that a client sending `session/cancel` **MUST**
         // answer every pending `session/request_permission` with the `Cancelled` outcome — twice, on
         // `RequestPermissionOutcome::Cancelled` and on `AgentRequest::RequestPermissionRequest`. An
         // agent whose permission await is not itself cancellation-aware never returns from its tool
         // call otherwise, so `session/prompt` never answers, the turn emits no terminal at all, and
         // the turn slot stays occupied for the life of the session.
-        self.state.withdraw_pending();
+        let _starting = self.state.lock_turn_start();
+        if !self.state.begin_cancellation(reason) {
+            return Ok(());
+        }
         // A notification, so there is no answer to wait for and no deadline to apply: `session/cancel`
-        // is queued to the transport and the agent reports the outcome on the prompt response.
+        // is queued to the transport and the agent reports the outcome on the prompt response. The
+        // start guard holds new prompts back until this notification is queued, so it cannot cancel
+        // a later ACP prompt on the same session.
         self.connection
             .connection()
             .send_notification(CancelNotification::new(self.native_session_id.clone()))
@@ -339,9 +384,17 @@ impl Session for AcpSession {
     }
 
     async fn close(&self, reason: CloseReason) -> Result<()> {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
+        // Share the same guard as cancellation and host answers before publishing the closed state.
+        // Once this starts, a request that wins neither side of the lock is withdrawn rather than
+        // selected while the session tears down.
+        let ending = {
+            let _starting = self.state.lock_turn_start();
+            self.state.begin_cancellation(reason.into());
+            if self.closed.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            self.state.end_turn()
+        };
 
         // Every question the agent is still waiting on is withdrawn first, while the transport is
         // still up: an unanswered one would leave the agent waiting for a client that has gone.
@@ -358,7 +411,6 @@ impl Session for AcpSession {
         // so cancelling under it would hold the turn lock across an `emit` that a host which stopped
         // reading parks indefinitely — and the calls waiting on that lock are the ones a host uses
         // to get out of it.
-        let ending = self.state.end_turn();
         let terminal = ending
             .as_ref()
             .is_some_and(super::client::TurnHandle::finish);
@@ -489,7 +541,7 @@ mod tests {
     #[test]
     fn a_configuration_that_only_chooses_a_level_and_a_routing_is_accepted() {
         refuse_model_selection(&Configuration {
-            level: PermissionLevel::Default,
+            level: Some(PermissionLevel::Default),
             ..Configuration::default()
         })
         .expect("expected acceptance, received a refusal");

@@ -6,16 +6,16 @@
 //! tests cannot reach — that a turn ends exactly once, that an approval round trip lands, that a
 //! cancel carries its reason, and that closing twice is not an error.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime};
 
 use mango_agent_acp::testing::{Approval, FakeAcpAgent};
 use mango_agent_acp::{AcpHarness, AcpProfile, SessionModeIds};
 use mango_external_agents::testing::{FakeLauncher, FakeProcess, RecordingBroker};
 use mango_external_agents::{
-    ApprovalRouting, BrokerDecision, CancelReason, CloseReason, Configuration, DecisionSource,
-    Error, EventKind, Harness, HostContext, Limits, OpenSession, PermissionLevel, Session,
-    TurnRequest, TurnStream, VendorInfo,
+    ApprovalRouting, BrokerDecision, CancelReason, Clock, CloseReason, Configuration,
+    DecisionSource, Error, EventKind, Harness, HostContext, Limits, OpenSession, PermissionLevel,
+    Session, TurnRequest, TurnStream, VendorInfo,
 };
 
 const VENDOR: VendorInfo = VendorInfo {
@@ -38,6 +38,58 @@ fn host(launcher: &FakeLauncher) -> HostContext {
         .expect("expected a host")
 }
 
+fn host_with_clock(launcher: &FakeLauncher, clock: Arc<dyn Clock>) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .clock(clock)
+        .client_info("mea-tests", "0.1.0")
+        .build()
+        .expect("expected a host")
+}
+
+/// A named clock that blocks the first event stamp until a test releases it.
+#[derive(Debug, Default)]
+struct SessionStartedClock {
+    state: Mutex<SessionStartedClockState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SessionStartedClockState {
+    blocked: bool,
+    released: bool,
+}
+
+impl SessionStartedClock {
+    fn wait_until_blocked(&self) {
+        let mut state = self.state.lock().expect("expected the clock state");
+        while !state.blocked {
+            state = self.changed.wait(state).expect("expected the clock state");
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("expected the clock state");
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+impl Clock for SessionStartedClock {
+    fn now(&self) -> SystemTime {
+        let mut state = self.state.lock().expect("expected the clock state");
+        if !state.released {
+            state.blocked = true;
+            self.changed.notify_all();
+            while !state.released {
+                state = self.changed.wait(state).expect("expected the clock state");
+            }
+        }
+        SystemTime::UNIX_EPOCH
+    }
+}
+
 /// A host whose broker answers every approval, so nothing waits for a person.
 fn host_with_broker(
     launcher: &FakeLauncher,
@@ -56,7 +108,7 @@ fn host_with_broker(
 
 fn permissive() -> Configuration {
     Configuration {
-        level: PermissionLevel::Default,
+        level: Some(PermissionLevel::Default),
         ..Configuration::default()
     }
 }
@@ -258,12 +310,15 @@ async fn a_broker_answers_without_the_question_waiting_for_a_person() {
 async fn a_read_only_session_refuses_every_request_without_asking_anyone() {
     let (session, _launcher) = open(
         FakeAcpAgent::new().asking_for_approval(Approval::Once),
-        Configuration::default(),
+        Configuration {
+            level: Some(PermissionLevel::ReadOnly),
+            ..Configuration::default()
+        },
     )
     .await;
     assert_eq!(
         session.info().effective_configuration.level,
-        PermissionLevel::ReadOnly
+        Some(PermissionLevel::ReadOnly)
     );
 
     let mut turn = session
@@ -290,8 +345,117 @@ async fn a_read_only_session_refuses_every_request_without_asking_anyone() {
     );
 }
 
+/// The agent's question is still visible for audit, but a host response cannot replace the standing
+/// read-only refusal while the harness owns that decision.
+#[tokio::test]
+async fn a_host_cannot_override_a_standing_read_only_refusal() {
+    let (session, _launcher) = open(
+        FakeAcpAgent::new().asking_for_approval(Approval::Once),
+        Configuration {
+            level: Some(PermissionLevel::ReadOnly),
+            ..Configuration::default()
+        },
+    )
+    .await;
+
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "delete the build"))
+        .await
+        .expect("expected a turn");
+    let request = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = turn.recv().await {
+            if let EventKind::ApprovalRequested { request } = event.kind {
+                return request;
+            }
+        }
+        panic!("expected the approval request before the turn ended");
+    })
+    .await
+    .expect("expected the approval request rather than a hang");
+
+    session
+        .respond(request.allow().expect("expected an allowing option"))
+        .await
+        .expect("expected the losing host answer to be harmless");
+
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::ApprovalResolved { decision, .. }
+                if decision.option_id == "reject" && decision.source == DecisionSource::AutoReview
+        )),
+        "expected the standing refusal to reach the agent, received {events:?}"
+    );
+}
+
 fn decision_option(decision: &mango_external_agents::ApprovalDecision) -> &str {
     &decision.option_id
+}
+
+fn has_automatic_refusal(events: &[EventKind]) -> bool {
+    events.iter().any(|kind| {
+        matches!(
+            kind,
+            EventKind::ApprovalResolved { decision, .. }
+                if decision.option_id == "reject" && decision.source == DecisionSource::AutoReview
+        )
+    })
+}
+
+/// A turn changes only the axes it names. In particular, the read-only standing refusal must remain
+/// in force when a later request chooses routing but omits the level, and when the next request
+/// chooses neither.
+#[tokio::test]
+async fn turn_overrides_stick_and_omitted_axes_preserve_the_last_accepted_restriction() {
+    let (session, _launcher) = open(
+        FakeAcpAgent::new().asking_for_approval(Approval::Once),
+        Configuration::default(),
+    )
+    .await;
+
+    let mut first = session
+        .start_turn(
+            TurnRequest::new("turn-1", "delete the build").with_configuration(Configuration {
+                level: Some(PermissionLevel::ReadOnly),
+                ..Configuration::default()
+            }),
+        )
+        .await
+        .expect("expected the explicit restriction to be accepted");
+    assert!(has_automatic_refusal(&drain(&mut first).await));
+    assert_eq!(
+        session.configuration().await,
+        Configuration {
+            level: Some(PermissionLevel::ReadOnly),
+            ..Configuration::default()
+        }
+    );
+
+    let mut second = session
+        .start_turn(
+            TurnRequest::new("turn-2", "delete the build").with_configuration(Configuration {
+                routing: Some(ApprovalRouting::AutoReview),
+                ..Configuration::default()
+            }),
+        )
+        .await
+        .expect("expected the routing-only override to inherit the restriction");
+    assert!(has_automatic_refusal(&drain(&mut second).await));
+
+    let mut third = session
+        .start_turn(TurnRequest::new("turn-3", "delete the build"))
+        .await
+        .expect("expected omitted settings to inherit the accepted restriction");
+    assert!(has_automatic_refusal(&drain(&mut third).await));
+    assert_eq!(
+        session.configuration().await,
+        Configuration {
+            level: Some(PermissionLevel::ReadOnly),
+            routing: Some(ApprovalRouting::AutoReview),
+            ..Configuration::default()
+        }
+    );
 }
 
 /// An agent that offers nothing to refuse with leaves nothing for a standing refusal to pick, so the
@@ -300,7 +464,10 @@ fn decision_option(decision: &mango_external_agents::ApprovalDecision) -> &str {
 async fn a_read_only_session_still_asks_when_the_agent_offered_no_way_to_refuse() {
     let (session, _launcher) = open(
         FakeAcpAgent::new().asking_for_approval(Approval::OnlyAllows),
-        Configuration::default(),
+        Configuration {
+            level: Some(PermissionLevel::ReadOnly),
+            ..Configuration::default()
+        },
     )
     .await;
 
@@ -382,6 +549,48 @@ async fn a_cancelled_turn_reports_the_reason_the_host_gave_and_still_completes()
     );
 }
 
+/// Cancellation can reach the agent before its permission request reaches this client. That late
+/// request still has to receive ACP's `Cancelled` outcome, otherwise an agent waiting inside the
+/// tool call cannot finish the prompt it was cancelling.
+#[tokio::test]
+async fn cancellation_withdraws_a_permission_that_arrives_after_cancel() {
+    let (session, launcher) = open(
+        FakeAcpAgent::new().asking_for_approval(Approval::Once),
+        Configuration::default(),
+    )
+    .await;
+
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "take your time"))
+        .await
+        .expect("expected a turn");
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the immediate cancel to land");
+
+    let withdrawal = answers_reaching_the_agent(&launcher, 1).await;
+    assert!(
+        withdrawal.iter().any(|answer| answer.contains("cancelled")),
+        "expected the late permission request to be withdrawn, received {withdrawal:?}"
+    );
+
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::Cancelled {
+                reason: CancelReason::Requested
+            }
+        )),
+        "expected the cancelled turn marker, received {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the marker to be followed by completion, received {events:?}"
+    );
+}
+
 /// ACP v1 runs one `session/prompt` at a time: the response *is* the turn's end, so two prompts would
 /// race for one stream of updates with nothing on the wire to tell them apart.
 #[tokio::test]
@@ -427,6 +636,51 @@ async fn closing_twice_is_not_an_error_and_a_turn_after_it_is_refused() {
     assert!(
         matches!(error, Error::Closed { subject: "session" }),
         "received {error:?}"
+    );
+}
+
+/// `SessionStarted` is emitted after the turn handle is installed. If close wins while that event is
+/// stalled, releasing the event must not let the starter submit a detached `session/prompt`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_close_between_handle_installation_and_prompt_write_refuses_the_detached_turn() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().process());
+    let clock = Arc::new(SessionStartedClock::default());
+    let host = host_with_clock(&launcher, Arc::clone(&clock) as Arc<dyn Clock>);
+    let opened = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+
+    let starting = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.start_turn(TurnRequest::new("turn-1", "one")).await })
+    };
+    clock.wait_until_blocked();
+
+    session
+        .close(CloseReason::ConsentRevoked)
+        .await
+        .expect("expected the close to land while the start event was stalled");
+    clock.release();
+
+    let error = refusal(
+        starting
+            .await
+            .expect("expected the start task to return a result"),
+    );
+    assert!(
+        matches!(error, Error::Closed { subject: "session" }),
+        "received {error:?}"
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"session/prompt\"")),
+        "a closed session must not submit a detached prompt, received {:?}",
+        launcher.written()
     );
 }
 
@@ -526,7 +780,7 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
         .open_session(
             &host(&launcher),
             OpenSession::new("chat-1").with_configuration(Configuration {
-                level: PermissionLevel::FullAccess,
+                level: Some(PermissionLevel::FullAccess),
                 ..Configuration::default()
             }),
         )
@@ -537,7 +791,7 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
         session
             .start_turn(
                 TurnRequest::new("turn-1", "just read").with_configuration(Configuration {
-                    level: PermissionLevel::ReadOnly,
+                    level: Some(PermissionLevel::ReadOnly),
                     ..Configuration::default()
                 }),
             )
@@ -675,12 +929,18 @@ async fn a_read_only_session_never_lets_a_broker_allow_even_when_it_cannot_refus
     let (host, broker) = host_with_broker(&launcher, BrokerDecision::Allow);
 
     let session = AcpHarness::new(profile())
-        .open_session(&host, OpenSession::new("chat-1"))
+        .open_session(
+            &host,
+            OpenSession::new("chat-1").with_configuration(Configuration {
+                level: Some(PermissionLevel::ReadOnly),
+                ..Configuration::default()
+            }),
+        )
         .await
         .expect("expected a session");
     assert_eq!(
         session.info().effective_configuration.level,
-        PermissionLevel::ReadOnly
+        Some(PermissionLevel::ReadOnly)
     );
 
     let mut turn = session
@@ -806,6 +1066,44 @@ async fn a_dropped_turn_stream_does_not_free_the_slot_while_the_prompt_is_in_fli
         matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
         "received {error:?}"
     );
+}
+
+/// A rejected concurrent turn has not run, so its overrides cannot become the defaults a later turn
+/// inherits. The configuration is committed only after ACP's one-prompt slot accepts the turn.
+#[tokio::test]
+async fn a_rejected_concurrent_turn_does_not_change_the_inherited_configuration() {
+    let (session, _launcher) =
+        open(FakeAcpAgent::new().never_finishing_turns(), permissive()).await;
+
+    let _first = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected the first prompt to occupy ACP's only slot");
+
+    let error = refusal(
+        session
+            .start_turn(
+                TurnRequest::new("turn-2", "two").with_configuration(Configuration {
+                    level: Some(PermissionLevel::ReadOnly),
+                    ..Configuration::default()
+                }),
+            )
+            .await,
+    );
+    assert!(
+        matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        "received {error:?}"
+    );
+    assert_eq!(
+        session.configuration().await,
+        permissive(),
+        "a rejected turn must not replace the last accepted settings"
+    );
+
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected the session to close");
 }
 
 /// A question cannot outlive the turn it belongs to. Answering one afterwards would emit into a
@@ -939,7 +1237,7 @@ async fn a_turn_asking_for_a_level_this_profile_cannot_reach_is_refused() {
         session
             .start_turn(
                 TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
-                    level: PermissionLevel::FullAccess,
+                    level: Some(PermissionLevel::FullAccess),
                     ..Configuration::default()
                 }),
             )
@@ -1065,7 +1363,13 @@ async fn a_mode_the_agent_never_advertised_is_refused_and_ends_the_child() {
     );
     let error = refusal(
         AcpHarness::new(insists)
-            .open_session(&recording_host(&launcher), OpenSession::new("chat-1"))
+            .open_session(
+                &recording_host(&launcher),
+                OpenSession::new("chat-1").with_configuration(Configuration {
+                    level: Some(PermissionLevel::ReadOnly),
+                    ..Configuration::default()
+                }),
+            )
             .await,
     );
 
@@ -1170,8 +1474,8 @@ async fn a_level_this_profile_cannot_reach_is_refused_rather_than_downgraded() {
             .open_session(
                 &host(&launcher),
                 OpenSession::new("chat-1").with_configuration(Configuration {
-                    level: PermissionLevel::FullAccess,
-                    routing: ApprovalRouting::User,
+                    level: Some(PermissionLevel::FullAccess),
+                    routing: Some(ApprovalRouting::User),
                     ..Configuration::default()
                 }),
             )

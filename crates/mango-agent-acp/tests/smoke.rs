@@ -66,7 +66,7 @@ async fn one_real_turn_against_an_installed_agent() {
             OpenSession::new("smoke-1").with_configuration(Configuration {
                 // Not `ReadOnly`: a read-only session refuses every request the agent raises, and a
                 // smoke test that refused its own agent's tools would prove less than it looks.
-                level: PermissionLevel::Default,
+                level: Some(PermissionLevel::Default),
                 ..Configuration::default()
             }),
         )

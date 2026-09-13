@@ -206,7 +206,15 @@ impl Harness for AcpHarness {
     ) -> Result<Box<dyn Session>> {
         refuse_model_selection(&request.configuration)?;
         let matrix = self.permission_matrix();
-        if !matrix.supports(request.configuration.level, request.configuration.routing) {
+        if request.configuration.level.is_some_and(|level| {
+            !matrix.supports(
+                level,
+                request
+                    .configuration
+                    .routing
+                    .unwrap_or(mango_external_agents::ApprovalRouting::User),
+            )
+        }) {
             // Refused, never downgraded. Silently running a read-only request under "ask every time"
             // would grant more freedom than anybody chose, which is the one direction a permission
             // mistake must not go.
@@ -225,7 +233,11 @@ impl Harness for AcpHarness {
         let launched =
             transport::connect(host, &spec, self.descriptor.vendor_environment_keys).await?;
 
-        let state = Arc::new(SessionState::new(request.session_id.clone(), host));
+        let state = Arc::new(SessionState::new(
+            request.session_id.clone(),
+            host,
+            request.configuration.clone(),
+        ));
         let connection = Arc::new(
             client::drive(
                 launched,
@@ -481,7 +493,10 @@ impl AcpHarness {
         configuration: &Configuration,
         modes: Option<&SessionModeState>,
     ) -> Result<Option<String>> {
-        let Some(wanted) = self.profile.modes.for_level(configuration.level) else {
+        let Some(wanted) = configuration
+            .level
+            .and_then(|level| self.profile.modes.for_level(level))
+        else {
             return Ok(None);
         };
         let advertised = modes.is_some_and(|state| {
