@@ -1,11 +1,13 @@
 //! A launcher that spawns nothing and replays what a vendor would have said.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
+use crate::host::CancelToken;
 use crate::process::{
     ByteSink, ByteSource, ExitStatus, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
     StderrTail,
@@ -26,6 +28,7 @@ pub struct FakeProcess {
     stderr: Vec<u8>,
     exit: ExitStatus,
     responder: Option<Responder>,
+    end_stdout_when: Option<CancelToken>,
 }
 
 impl std::fmt::Debug for FakeProcess {
@@ -62,6 +65,27 @@ impl FakeProcess {
             responder: Some(Arc::new(responder)),
             ..Self::default()
         }
+    }
+
+    /// Closes the child's stdout when `signal` is cancelled, while leaving the child alive.
+    ///
+    /// This models a peer whose output pipe disappears before its process has exited, so callers
+    /// can verify that their connection-failure path owns process cleanup.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::CancelToken;
+    /// use mango_external_agents::testing::FakeProcess;
+    ///
+    /// let close_stdout = CancelToken::new();
+    /// let process = FakeProcess::responding(|_| Vec::new()).ending_stdout_when(close_stdout);
+    /// let _ = process;
+    /// ```
+    #[must_use]
+    pub fn ending_stdout_when(mut self, signal: CancelToken) -> Self {
+        self.end_stdout_when = Some(signal);
+        self
     }
 
     /// Writes this to stderr before exiting.
@@ -123,6 +147,8 @@ struct LauncherState {
     launches: Mutex<Vec<LaunchSpec>>,
     /// Shared with every child, so `written` is one list across all of them.
     written: Arc<Mutex<Vec<String>>>,
+    /// Children that have not exited or been killed yet.
+    live_children: Arc<AtomicUsize>,
 }
 
 impl FakeLauncher {
@@ -178,6 +204,15 @@ impl FakeLauncher {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// The fake children that are still alive.
+    ///
+    /// Tests use this to prove a harness reaped a peer after a broken output pipe, rather than
+    /// merely dropping the stream handle that exposed the failure.
+    /// For example, assert `launcher.live_children() == 0` after session shutdown.
+    pub fn live_children(&self) -> usize {
+        self.state.live_children.load(Ordering::Acquire)
+    }
 }
 
 #[async_trait::async_trait]
@@ -205,13 +240,19 @@ impl ProcessLauncher for FakeLauncher {
 
         let stderr = StderrTail::default();
         stderr.push(&process.stderr);
+        let ended = process.responder.is_none();
+        if !ended {
+            self.state.live_children.fetch_add(1, Ordering::AcqRel);
+        }
         let child = Arc::new(ChildState {
             stdout: Mutex::new(process.stdout.into_iter().collect()),
-            ended: Mutex::new(process.responder.is_none()),
+            ended: Mutex::new(ended),
             responder: process.responder,
+            end_stdout_when: process.end_stdout_when,
             exit: process.exit,
             stderr,
             written: Arc::clone(&self.state.written),
+            live_children: Arc::clone(&self.state.live_children),
             changed: Notify::new(),
         });
 
@@ -234,15 +275,23 @@ struct ChildState {
     stdout: Mutex<VecDeque<String>>,
     ended: Mutex<bool>,
     responder: Option<Responder>,
+    end_stdout_when: Option<CancelToken>,
     exit: ExitStatus,
     stderr: StderrTail,
     written: Arc<Mutex<Vec<String>>>,
+    live_children: Arc<AtomicUsize>,
     changed: Notify,
 }
 
 impl ChildState {
     fn end(&self) {
-        *self.ended.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        let mut ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        if *ended {
+            return;
+        }
+        *ended = true;
+        self.live_children.fetch_sub(1, Ordering::AcqRel);
+        drop(ended);
         self.changed.notify_waiters();
     }
 
@@ -299,7 +348,14 @@ impl ByteSource for FakeStdout {
             if self.state.is_ended() {
                 return Ok(None);
             }
-            changed.await;
+            if let Some(signal) = &self.state.end_stdout_when {
+                tokio::select! {
+                    () = signal.cancelled() => return Ok(None),
+                    () = changed => {}
+                }
+            } else {
+                changed.await;
+            }
         }
     }
 }
@@ -345,7 +401,9 @@ impl ByteSink for FakeStdin {
 mod tests {
     use super::{FakeLauncher, FakeProcess};
     use crate::error::Error;
+    use crate::host::CancelToken;
     use crate::process::{LaunchSpec, LineLimits, LineStream, ProcessLauncher};
+    use crate::session::CancelReason;
     use std::collections::BTreeMap;
 
     fn spec(argv: &[&str]) -> LaunchSpec {
@@ -437,6 +495,44 @@ mod tests {
 
         let mut lines = LineStream::new(child.stdout, LineLimits::default());
         assert_eq!(lines.next_line().await.expect("expected the end"), None);
+    }
+
+    #[tokio::test]
+    async fn closing_stdout_by_signal_keeps_the_child_alive_until_it_is_killed() {
+        let launcher = FakeLauncher::new();
+        let close_stdout = CancelToken::new();
+        launcher
+            .push(FakeProcess::responding(|_| Vec::new()).ending_stdout_when(close_stdout.clone()));
+        let child = launcher
+            .spawn(spec(&["codex", "app-server"]))
+            .await
+            .expect("expected a child");
+        let control = child.control.clone();
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+
+        close_stdout.cancel();
+        assert_eq!(lines.next_line().await.expect("expected stdout EOF"), None);
+        assert_eq!(
+            launcher.live_children(),
+            1,
+            "expected the child to remain alive"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), control.wait())
+                .await
+                .is_err(),
+            "expected stdout EOF not to imply that the child exited"
+        );
+
+        control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("expected fake child cleanup");
+        assert_eq!(
+            launcher.live_children(),
+            0,
+            "expected the child to be reaped"
+        );
     }
 
     #[tokio::test]

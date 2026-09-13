@@ -30,7 +30,8 @@
 use std::collections::BTreeSet;
 
 use mango_external_agents::{
-    ApprovalRouting, ConfigurationVerdict, PermissionLevel, PermissionMatrix, UnsupportedReason,
+    ApprovalRouting, Configuration, ConfigurationVerdict, Error, PermissionLevel, PermissionMatrix,
+    Result, UnsupportedReason,
 };
 use serde_json::Value;
 
@@ -183,6 +184,36 @@ pub fn permission_mode(
     })
 }
 
+/// Resolves Claude's inseparable permission-mode pair when the host supplied both axes.
+///
+/// Unlike Codex, Claude exposes one `--permission-mode` flag rather than independent sandbox and
+/// reviewer settings. It therefore rejects a partial pair instead of silently selecting a mode
+/// for the omitted axis, while an omitted pair leaves all permission flags out of argv.
+pub(crate) fn configuration_mode(
+    configuration: &Configuration,
+    availability: &ModeAvailability,
+) -> Result<Option<CliMode>> {
+    let (Some(level), Some(routing)) = (configuration.level, configuration.routing) else {
+        if configuration.level.is_none() && configuration.routing.is_none() {
+            return Ok(None);
+        }
+        return Err(Error::HostConfiguration {
+            expected: "both permission level and approval routing for Claude's one permission-mode flag, or neither",
+            received: format!(
+                "level {:?} with routing {:?}",
+                configuration.level, configuration.routing
+            ),
+        });
+    };
+    permission_mode(level, routing, availability)
+        .filter(|mode| availability.accepts(*mode))
+        .map(Some)
+        .ok_or_else(|| Error::HostConfiguration {
+            expected: "a permission level and routing this Claude build and account can run",
+            received: format!("{level:?} with {routing:?}"),
+        })
+}
+
 /// The whole two-by-three matrix, minus whatever this account and this machine forbid.
 pub fn matrix(availability: &ModeAvailability) -> PermissionMatrix {
     PermissionMatrix::build(|level, routing| {
@@ -245,11 +276,13 @@ pub fn auto_mode_disabled(managed_settings: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliMode, ModeAvailability, auto_mode_disabled, matrix, permission_mode};
+    use super::{
+        CliMode, ModeAvailability, auto_mode_disabled, configuration_mode, matrix, permission_mode,
+    };
     use crate::auth::AccountKind;
     use mango_external_agents::{
-        ApprovalRouting, PermissionLevel, PermissionMatrix, SupportedConfiguration,
-        UnsupportedReason,
+        ApprovalRouting, Configuration, Error, PermissionLevel, PermissionMatrix,
+        SupportedConfiguration, UnsupportedReason,
     };
     use serde_json::json;
 
@@ -289,6 +322,37 @@ mod tests {
                 &availability
             ),
             Some(CliMode::BypassPermissions)
+        );
+    }
+
+    #[test]
+    fn only_claude_rejects_a_partial_permission_pair_because_its_flag_is_inseparable() {
+        let availability = subscription();
+        assert_eq!(
+            configuration_mode(&Configuration::default(), &availability)
+                .expect("expected omitted permissions to be accepted"),
+            None
+        );
+        let explicit = Configuration {
+            level: Some(PermissionLevel::Default),
+            routing: Some(ApprovalRouting::User),
+            ..Configuration::default()
+        };
+        assert_eq!(
+            configuration_mode(&explicit, &availability)
+                .expect("expected the complete pair to resolve"),
+            Some(CliMode::Manual)
+        );
+        let partial = Configuration {
+            level: Some(PermissionLevel::Default),
+            ..Configuration::default()
+        };
+        let error = configuration_mode(&partial, &availability)
+            .expect_err("expected Claude to reject its partial mode pair");
+        assert!(
+            matches!(error, Error::HostConfiguration { expected, .. }
+                if expected.contains("Claude's one permission-mode flag")),
+            "expected the Claude-specific refusal, received {error:?}"
         );
     }
 

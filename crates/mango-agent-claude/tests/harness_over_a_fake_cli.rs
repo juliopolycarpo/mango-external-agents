@@ -367,8 +367,8 @@ mod opening_a_session {
                 .with_auth(r#"{"loggedIn":true,"authMethod":"apiKey","apiProvider":"firstParty"}"#),
         );
         let request = OpenSession::new("chat-1").with_configuration(Configuration {
-            level: PermissionLevel::Default,
-            routing: ApprovalRouting::AutoReview,
+            level: Some(PermissionLevel::Default),
+            routing: Some(ApprovalRouting::AutoReview),
             ..Configuration::default()
         });
         let error = ClaudeHarness::new()
@@ -406,6 +406,75 @@ mod opening_a_session {
 
 mod a_turn {
     use super::*;
+
+    /// An omitted pair must remain absent from argv, while a later accepted pair is repeated on
+    /// turns that omit their own configuration.
+    #[tokio::test]
+    async fn omitted_permissions_use_vendor_defaults_then_inherit_an_explicit_turn_choice() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::replaying(r#"{"type":"result","is_error":false}"#))
+                .with_turn(Run::replaying(r#"{"type":"result","is_error":false}"#))
+                .with_turn(Run::replaying(r#"{"type":"result","is_error":false}"#))
+                .with_turn(Run::replaying(r#"{"type":"result","is_error":false}"#)),
+        );
+        let session = open(&launcher).await;
+
+        let mut vendor_default = session
+            .start_turn(TurnRequest::new("turn-1", "keep vendor defaults"))
+            .await
+            .expect("expected the default turn to start");
+        drain(&mut vendor_default).await;
+
+        let explicit = Configuration {
+            level: Some(PermissionLevel::Default),
+            routing: Some(ApprovalRouting::User),
+            ..Configuration::default()
+        };
+        let mut configured = session
+            .start_turn(
+                TurnRequest::new("turn-2", "set explicit defaults")
+                    .with_configuration(explicit.clone()),
+            )
+            .await
+            .expect("expected the explicit turn to start");
+        drain(&mut configured).await;
+
+        let mut inherited = session
+            .start_turn(TurnRequest::new("turn-3", "inherit explicit defaults"))
+            .await
+            .expect("expected the inherited turn to start");
+        drain(&mut inherited).await;
+
+        // A model-only override is the regression: replacing the configuration wholesale cleared
+        // the accepted permission pair, so this invocation omitted `--permission-mode`.
+        let mut model_only = session
+            .start_turn(
+                TurnRequest::new("turn-4", "keep permissions while changing model")
+                    .with_configuration(Configuration {
+                        model: Some(String::from("sonnet")),
+                        ..Configuration::default()
+                    }),
+            )
+            .await
+            .expect("expected the model-only turn to start");
+        drain(&mut model_only).await;
+
+        let argvs = launcher.turn_argvs();
+        assert_eq!(value_after(&argvs[0], "--permission-mode"), None);
+        assert_eq!(value_after(&argvs[0], "--permission-prompts"), None);
+        assert_eq!(value_after(&argvs[1], "--permission-mode"), Some("manual"));
+        assert_eq!(value_after(&argvs[2], "--permission-mode"), Some("manual"));
+        assert_eq!(value_after(&argvs[3], "--permission-mode"), Some("manual"));
+        assert_eq!(value_after(&argvs[3], "--model"), Some("sonnet"));
+        assert_eq!(
+            session.configuration().await,
+            Configuration {
+                model: Some(String::from("sonnet")),
+                ..explicit
+            }
+        );
+    }
 
     #[tokio::test]
     async fn streams_the_recorded_turn_and_closes_with_completed() {

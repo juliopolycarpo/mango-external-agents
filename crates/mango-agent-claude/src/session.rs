@@ -71,6 +71,8 @@ struct SessionState {
     /// which is what removes it from disk. A session that is dropped without being closed removes
     /// it too, when this state goes.
     mcp_config: Option<ConfigFile>,
+    /// The settings a turn without an override inherits.
+    configuration: Configuration,
     closed: bool,
 }
 
@@ -119,6 +121,7 @@ impl ClaudeSession {
             established: info.resumed,
             active: None,
             mcp_config,
+            configuration: info.effective_configuration.clone(),
             closed: false,
         };
         Self {
@@ -191,6 +194,10 @@ impl mango_external_agents::Session for ClaudeSession {
         }
     }
 
+    async fn configuration(&self) -> Configuration {
+        self.shared.lock().configuration.clone()
+    }
+
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
         if !request.attachments.is_empty() {
             // Claude Code's stream-json input takes content blocks, but nothing here encodes one
@@ -203,11 +210,16 @@ impl mango_external_agents::Session for ClaudeSession {
             });
         }
 
-        let configuration = request
-            .configuration
-            .as_ref()
-            .unwrap_or(&self.shared.info.effective_configuration);
-        let mode = self.shared.resolve_mode(configuration)?;
+        let requested_configuration = request.configuration.clone();
+        let configuration = {
+            let current = self.shared.lock().configuration.clone();
+            requested_configuration
+                .as_ref()
+                .map_or(current.clone(), |overrides| {
+                    current.with_overrides(overrides)
+                })
+        };
+        let mode = self.shared.resolve_mode(&configuration)?;
 
         // A host that starts a second turn has decided the first is over. Taken before anything is
         // spawned so the two cannot both hold a child, and the slot this turn claims is reserved
@@ -300,6 +312,12 @@ impl mango_external_agents::Session for ClaudeSession {
                 .as_ref()
                 .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
             {
+                if requested_configuration.is_some() {
+                    // `stdio::open` is the successful start boundary for the batch CLI: there is
+                    // no app-server response to acknowledge later. A following unconfigured turn
+                    // therefore repeats the flags the accepted process was launched with.
+                    state.configuration = configuration.clone();
+                }
                 state.active = Some(ActiveTurn {
                     end: Arc::clone(&end),
                     control: Some(Arc::clone(&control)),
@@ -387,17 +405,8 @@ impl Shared {
     /// stored configuration outlives a discovery: passing `--permission-mode auto` to a CLI whose
     /// managed settings reject it produces a startup failure indistinguishable from every other
     /// startup failure.
-    fn resolve_mode(&self, configuration: &Configuration) -> Result<permissions::CliMode> {
-        permissions::permission_mode(
-            configuration.level,
-            configuration.routing,
-            &self.availability,
-        )
-        .filter(|mode| self.availability.accepts(*mode))
-        .ok_or_else(|| Error::HostConfiguration {
-            expected: "a permission level and routing this account and build can run",
-            received: format!("{:?} with {:?}", configuration.level, configuration.routing),
-        })
+    fn resolve_mode(&self, configuration: &Configuration) -> Result<Option<permissions::CliMode>> {
+        permissions::configuration_mode(configuration, &self.availability)
     }
 }
 

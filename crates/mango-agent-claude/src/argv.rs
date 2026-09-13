@@ -17,8 +17,10 @@ pub struct TurnArgv<'a> {
     /// The program name. The host's launcher resolves it, or
     /// [`ExecutablePath`](mango_external_agents::ExecutablePath) replaces it at spawn time.
     pub program: &'a str,
-    /// The mode this turn's (level, routing) pair resolved to.
-    pub mode: CliMode,
+    /// The mode this turn's explicit (level, routing) pair resolved to.
+    ///
+    /// `None` leaves Claude's own configured permission defaults untouched.
+    pub mode: Option<CliMode>,
     /// The vendor session handle this turn belongs to.
     pub native_session_id: &'a str,
     /// Whether a previous run already created that conversation on disk.
@@ -46,7 +48,7 @@ impl TurnArgv<'_> {
     ///
     /// let argv = TurnArgv {
     ///     program: "claude",
-    ///     mode: CliMode::Plan,
+    ///     mode: Some(CliMode::Plan),
     ///     native_session_id: "11111111-2222-3333-4444-555555555555",
     ///     established: false,
     ///     model: None,
@@ -77,20 +79,21 @@ impl TurnArgv<'_> {
             // Subagent output, tagged with the tool call that spawned it. Needs 2.1.211, which is
             // why that is the pinned minimum rather than 2.1.200.
             "--forward-subagent-text",
-            "--permission-mode",
-            self.mode.as_arg(),
         ]
         .map(String::from)
         .into();
 
-        // Stated rather than left to the default. The vendor documents `none` as "nobody: anything
+        // Stated rather than left to the default when the host chose a mode. The vendor documents `none` as "nobody: anything
         // that would prompt is denied automatically; the permission mode still decides everything
         // else", and this harness genuinely is that host — it reports no answerable approval, so a
         // prompt has nowhere to go. Leaving it implicit means a build whose `host` default later
         // *waits* for an answer would park every approval-needing turn until the idle timeout, and
         // the first report would be "Claude hangs". Never `host`: that value promises an answering
         // host this harness does not have.
-        if self.declares_permission_prompts {
+        if let Some(mode) = self.mode {
+            argv.extend(["--permission-mode", mode.as_arg()].map(String::from));
+        }
+        if self.mode.is_some() && self.declares_permission_prompts {
             argv.extend(["--permission-prompts", "none"].map(String::from));
         }
 
@@ -171,7 +174,7 @@ mod tests {
     fn base() -> TurnArgv<'static> {
         TurnArgv {
             program: "claude",
-            mode: CliMode::Manual,
+            mode: Some(CliMode::Manual),
             native_session_id: SESSION,
             established: false,
             model: None,
@@ -241,13 +244,29 @@ mod tests {
     }
 
     #[test]
+    fn leaves_permission_flags_out_when_the_host_omitted_both_axes() {
+        let argv = TurnArgv {
+            mode: None,
+            declares_permission_prompts: true,
+            ..base()
+        }
+        .build();
+        assert_eq!(value_after(&argv, "--permission-mode"), None);
+        assert_eq!(value_after(&argv, "--permission-prompts"), None);
+    }
+
+    #[test]
     fn uses_plan_for_read_only_and_bypass_permissions_for_full_access() {
         for (mode, expected) in [
             (CliMode::Plan, "plan"),
             (CliMode::BypassPermissions, "bypassPermissions"),
             (CliMode::Auto, "auto"),
         ] {
-            let argv = TurnArgv { mode, ..base() }.build();
+            let argv = TurnArgv {
+                mode: Some(mode),
+                ..base()
+            }
+            .build();
             assert_eq!(value_after(&argv, "--permission-mode"), Some(expected));
         }
     }
@@ -262,7 +281,11 @@ mod tests {
             CliMode::DontAsk,
             CliMode::BypassPermissions,
         ] {
-            let argv = TurnArgv { mode, ..base() }.build();
+            let argv = TurnArgv {
+                mode: Some(mode),
+                ..base()
+            }
+            .build();
             assert!(
                 argv.iter()
                     .all(|argument| !argument.contains("skip-permissions")),

@@ -52,7 +52,7 @@ claude --print
        --input-format stream-json --output-format stream-json
        --verbose --include-partial-messages
        --forward-subagent-text
-       --permission-mode <mode>
+       [--permission-mode <mode>]
        [--permission-prompts none]
        (--session-id <uuid> | --resume <uuid>)
        [--model <id>] [--effort <level>] [--mcp-config <path>]
@@ -64,7 +64,12 @@ claude --print
   the stream arrives in whole messages and nothing renders until each block is complete.
 - **The prompt is never in argv.** It is written as one `{"type":"user",…}` message on stdin, which
   is then closed. argv is world-readable in `ps` on every platform this runs on.
-- **`--permission-prompts none`** is passed only on a build that declares it (2.1.259+). It is
+- **Omitted permissions preserve the user's CLI profile.** No permission mode or prompt override
+  is passed until the host selects permissions. Claude's single mode flag requires both axes on
+  the first selection; subsequent partial updates inherit the other axis. Accepted settings persist
+  in `Session::configuration()` and are repeated on later batch invocations.
+- **`--permission-prompts none`** accompanies an explicit permission mode only on a build that
+  declares it (2.1.259+). It is
   pinning, not a fix: the vendor's current default is `host`, and this harness is not an answering
   host, so a build whose default later *waits* would park every approval-needing turn until the
   idle timeout. `host` is never passed.

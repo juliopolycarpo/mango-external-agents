@@ -11,7 +11,7 @@ use std::sync::Arc;
 use mango_external_agents::{
     AuthState, Capabilities, Configuration, Discovery, Error, ExecutablePath, GateVerdict, Harness,
     HarnessDescriptor, HarnessKind, HostContext, OpenSession, PermissionMatrix, Result, Session,
-    SessionIds, SessionInfo, TransportKind, UnsupportedReason,
+    SessionIds, SessionInfo, TransportKind,
 };
 
 use crate::auth::{self, Authentication};
@@ -376,21 +376,7 @@ const fn probed_capabilities() -> Capabilities {
 
 /// Refuses a pair this account and this build cannot run, before anything is spawned.
 fn require_supported(configuration: &Configuration, availability: &ModeAvailability) -> Result<()> {
-    let matrix = permissions::matrix(availability);
-    let cell = matrix.cell(configuration.level, configuration.routing);
-    if cell.is_some_and(|cell| cell.supported) {
-        return Ok(());
-    }
-    let reason = cell
-        .and_then(|cell| cell.unsupported_reason.clone())
-        .unwrap_or(UnsupportedReason::NotOfferedByVendor);
-    Err(Error::HostConfiguration {
-        expected: "a permission level and routing this account and build can run",
-        received: format!(
-            "{:?} with {:?}, refused as {reason:?}",
-            configuration.level, configuration.routing
-        ),
-    })
+    permissions::configuration_mode(configuration, availability).map(drop)
 }
 
 /// `disableAutoMode` from the administrator-managed settings document.
@@ -484,8 +470,8 @@ mod tests {
     fn a_configuration_no_probe_vetted_is_refused_before_anything_is_spawned() {
         let availability = crate::permissions::ModeAvailability::default();
         let auto_review = Configuration {
-            level: PermissionLevel::Default,
-            routing: ApprovalRouting::AutoReview,
+            level: Some(PermissionLevel::Default),
+            routing: Some(ApprovalRouting::AutoReview),
             ..Configuration::default()
         };
         let error = require_supported(&auto_review, &availability)
@@ -496,6 +482,6 @@ mod tests {
         );
 
         require_supported(&Configuration::default(), &availability)
-            .expect("expected the restrictive default to be runnable");
+            .expect("expected an omitted vendor-default configuration to need no probe verdict");
     }
 }

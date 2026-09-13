@@ -16,8 +16,8 @@ use crate::permission::{
     PermissionOptionKind, PermissionRequest, PermissionResponse, broker_response,
 };
 use crate::session::{
-    CancelReason, CloseReason, OpenSession, Session, SessionIds, SessionInfo, Steer, SteerOutcome,
-    TurnRequest,
+    CancelReason, CloseReason, Configuration, OpenSession, Session, SessionIds, SessionInfo, Steer,
+    SteerOutcome, TurnRequest,
 };
 use crate::stream::{EventSink, TurnStream};
 use crate::transport::TransportKind;
@@ -142,13 +142,14 @@ impl Harness for FakeHarness {
                 },
                 resumed,
                 fallback_reason: None,
-                effective_configuration: request.configuration,
+                effective_configuration: request.configuration.clone(),
                 capabilities: self.descriptor.capabilities,
             },
             host: host.clone(),
             asks_for_approval: self.asks_for_approval,
             rejects_answers: self.rejects_answers,
             pending: Mutex::new(None),
+            configuration: Mutex::new(request.configuration),
             turns: AtomicU64::new(0),
             closed: AtomicBool::new(false),
         }))
@@ -162,6 +163,7 @@ struct FakeSession {
     asks_for_approval: bool,
     rejects_answers: bool,
     pending: Mutex<Option<PendingTurn>>,
+    configuration: Mutex<Configuration>,
     turns: AtomicU64,
     closed: AtomicBool,
 }
@@ -246,9 +248,17 @@ impl Session for FakeSession {
         &self.info
     }
 
+    async fn configuration(&self) -> Configuration {
+        self.configuration.lock().await.clone()
+    }
+
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed { subject: "session" });
+        }
+        if let Some(overrides) = &request.configuration {
+            let mut configuration = self.configuration.lock().await;
+            *configuration = configuration.with_overrides(overrides);
         }
         let turn = self.turns.fetch_add(1, Ordering::Relaxed) + 1;
         let (sink, events) = EventSink::new(
@@ -382,7 +392,8 @@ mod tests {
     use crate::event::EventKind;
     use crate::harness::Harness;
     use crate::host::HostContext;
-    use crate::session::{OpenSession, TurnRequest};
+    use crate::permission::{ApprovalRouting, PermissionLevel};
+    use crate::session::{Configuration, OpenSession, TurnRequest};
     use crate::testing::FakeLauncher;
     use std::sync::Arc;
 
@@ -457,6 +468,54 @@ mod tests {
             last = Some(event.kind);
         }
         assert_eq!(last, Some(EventKind::Completed));
+    }
+
+    #[tokio::test]
+    async fn accepted_explicit_settings_become_the_next_turns_inherited_configuration() {
+        let harness = FakeHarness::new().without_approvals();
+        let host = host();
+        let session = harness
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let explicit = Configuration {
+            level: Some(PermissionLevel::Default),
+            routing: Some(ApprovalRouting::User),
+            ..Configuration::default()
+        };
+
+        session
+            .start_turn(
+                TurnRequest::new("turn-1", "set defaults").with_configuration(explicit.clone()),
+            )
+            .await
+            .expect("expected the explicit turn to start");
+        assert_eq!(session.configuration().await, explicit);
+
+        session
+            .start_turn(TurnRequest::new("turn-2", "inherit defaults"))
+            .await
+            .expect("expected the inherited turn to start");
+        assert_eq!(session.configuration().await, explicit);
+
+        session
+            .start_turn(
+                TurnRequest::new("turn-3", "change only the model").with_configuration(
+                    Configuration {
+                        model: Some(String::from("fast")),
+                        ..Configuration::default()
+                    },
+                ),
+            )
+            .await
+            .expect("expected the model-only turn to start");
+        assert_eq!(
+            session.configuration().await,
+            Configuration {
+                model: Some(String::from("fast")),
+                ..explicit
+            }
+        );
     }
 
     /// The bound on the turn channel is the whole point of the bound: a host that stops reading

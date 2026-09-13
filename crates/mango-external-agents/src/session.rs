@@ -97,7 +97,11 @@ pub struct SessionIds {
     pub native_session_id: String,
 }
 
-/// Settings that can change between turns without opening a new session.
+/// Settings a host may explicitly override without opening a new session.
+///
+/// An omitted permission axis reports no known library override; it never means read-only. Some
+/// vendor profiles are more granular than this shared pair, so the library does not guess a
+/// generic equivalent for captured native defaults.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Configuration {
@@ -107,23 +111,61 @@ pub struct Configuration {
     /// The vendor's own reasoning-effort id, when the host chose one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// What the agent may do.
-    pub level: PermissionLevel,
-    /// Who answers its prompts.
-    pub routing: ApprovalRouting,
+    /// What the agent may do, when the host explicitly chooses a permission level.
+    ///
+    /// Omitted preserves the last accepted host selection, or the vendor's configured default
+    /// before any selection; it is not a request for this library's restrictive profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<PermissionLevel>,
+    /// Who answers its prompts, when the host explicitly chooses a routing policy.
+    ///
+    /// Omitted preserves the last accepted host selection, or the vendor's configured default
+    /// before any selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<ApprovalRouting>,
 }
 
 impl Default for Configuration {
-    /// The narrow end of both axes.
+    /// Leaves every vendor-controlled setting unspecified.
     ///
-    /// A default that granted more than the most restrictive pair would be a library deciding
-    /// something only a person can.
+    /// The harness must not silently narrow or widen a person's existing vendor configuration.
+    /// An explicit host choice is represented by `Some` on the axis it controls.
     fn default() -> Self {
         Self {
             model: None,
             effort: None,
-            level: PermissionLevel::RESTRICTIVE,
-            routing: ApprovalRouting::RESTRICTIVE,
+            level: None,
+            routing: None,
+        }
+    }
+}
+
+impl Configuration {
+    /// Applies the fields a later request explicitly supplied, preserving every omission.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Configuration, PermissionLevel};
+    ///
+    /// let current = Configuration {
+    ///     level: Some(PermissionLevel::ReadOnly),
+    ///     ..Configuration::default()
+    /// };
+    /// let next = current.with_overrides(&Configuration {
+    ///     model: Some(String::from("fast")),
+    ///     ..Configuration::default()
+    /// });
+    /// assert_eq!(next.level, Some(PermissionLevel::ReadOnly));
+    /// assert_eq!(next.model.as_deref(), Some("fast"));
+    /// ```
+    #[must_use]
+    pub fn with_overrides(&self, overrides: &Self) -> Self {
+        Self {
+            model: overrides.model.clone().or_else(|| self.model.clone()),
+            effort: overrides.effort.clone().or_else(|| self.effort.clone()),
+            level: overrides.level.or(self.level),
+            routing: overrides.routing.or(self.routing),
         }
     }
 }
@@ -310,15 +352,15 @@ pub struct OpenSession {
 }
 
 impl OpenSession {
-    /// A new session under the most restrictive configuration.
+    /// A new session that leaves vendor-controlled settings at their configured defaults.
     ///
     /// # Example
     ///
     /// ```
-    /// use mango_external_agents::{OpenSession, PermissionLevel};
+    /// use mango_external_agents::OpenSession;
     ///
     /// let request = OpenSession::new("chat-42");
-    /// assert_eq!(request.configuration.level, PermissionLevel::ReadOnly);
+    /// assert_eq!(request.configuration.level, None);
     /// assert!(request.resume.is_none());
     /// ```
     pub fn new(session_id: impl Into<String>) -> Self {
@@ -340,7 +382,7 @@ impl OpenSession {
         self
     }
 
-    /// Runs under this configuration instead of the restrictive default.
+    /// Runs under this explicit configuration instead of leaving settings to the vendor.
     #[must_use]
     pub fn with_configuration(mut self, configuration: Configuration) -> Self {
         self.configuration = configuration;
@@ -377,10 +419,8 @@ impl OpenSession {
 
 /// What opening produced.
 ///
-/// A snapshot of the answer `open_session` gave, not a live view. One field can go out of date:
-/// a vendor is free to rename its own handle mid-session, and the handle that is in force is
-/// [`Session::ids`], which a harness overrides when its vendor does that. Everything else here is
-/// settled at open and does not move.
+/// A snapshot of the answer `open_session` gave, not a live view. Read [`Session::ids`] for
+/// the current vendor handle and [`Session::configuration`] for the defaults later turns inherit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionInfo {
     /// The two ids, as opening reported them.
@@ -392,7 +432,10 @@ pub struct SessionInfo {
     pub resumed: bool,
     /// Why a requested resume did not happen, when one was asked for and did not.
     pub fallback_reason: Option<String>,
-    /// What the vendor actually accepted, which may not be what was asked for.
+    /// The known settings at opening, including omissions that leave vendor defaults in force.
+    ///
+    /// `None` on a permission axis is unreported or inherited vendor policy, not a restrictive
+    /// setting. Use [`Session::configuration`] after explicit turn settings have been accepted.
     pub effective_configuration: Configuration,
     /// What this session can do, as this build of the CLI reports it.
     pub capabilities: Capabilities,
@@ -447,7 +490,7 @@ pub struct TurnRequest {
     pub input: String,
     /// Files travelling with it.
     pub attachments: Vec<Attachment>,
-    /// A configuration for this turn alone, when it differs from the session's.
+    /// Explicit settings for this turn, when they differ from the session's inherited settings.
     pub configuration: Option<Configuration>,
 }
 
@@ -482,7 +525,8 @@ impl TurnRequest {
         self
     }
 
-    /// Runs this turn under a configuration of its own.
+    /// Runs this turn under an explicit configuration and makes accepted settings the defaults for
+    /// later turns that omit one.
     #[must_use]
     pub fn with_configuration(mut self, configuration: Configuration) -> Self {
         self.configuration = Some(configuration);
@@ -529,9 +573,7 @@ pub enum SteerRejection {
 
 /// What a vendor-native review is pointed at.
 ///
-/// A one-member enum deliberately: vendors also model base branches, commits and custom targets,
-/// and modelling this as a bare flag would make adding them a breaking reshape rather than one
-/// more member.
+/// Harnesses may reject targets their vendor does not support.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -539,6 +581,23 @@ pub enum ReviewTarget {
     /// Staged, unstaged and untracked work, as the vendor defines it. The library does not narrow
     /// the definition.
     UncommittedChanges,
+    /// Changes relative to a branch or revision.
+    BaseBranch {
+        /// The base branch or revision.
+        branch: String,
+    },
+    /// One commit.
+    Commit {
+        /// The commit hash or revision.
+        sha: String,
+        /// Optional display title for the review.
+        title: Option<String>,
+    },
+    /// A review directed by host-supplied instructions.
+    Custom {
+        /// What the reviewer should inspect.
+        instructions: String,
+    },
 }
 
 /// Start a vendor-native review on an open session.
@@ -700,6 +759,24 @@ pub struct AccountUsage {
 pub trait Session: Send + Sync {
     /// What opening this session produced.
     fn info(&self) -> &SessionInfo;
+
+    /// The known overrides the next turn inherits when it supplies no override.
+    ///
+    /// Harnesses whose vendor persists turn overrides return their last accepted settings. `None`
+    /// means that axis still has no library override; it is not a claim that the vendor is
+    /// read-only. The default is the opening snapshot.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(session: &dyn mango_external_agents::Session) {
+    /// let configuration = session.configuration().await;
+    /// println!("next turn permission: {:?}", configuration.level);
+    /// # }
+    /// ```
+    async fn configuration(&self) -> Configuration {
+        self.info().effective_configuration.clone()
+    }
 
     /// The two ids this session answers to, as they stand now.
     ///
@@ -892,11 +969,55 @@ mod tests {
     }
 
     #[test]
-    fn the_default_configuration_is_the_narrow_end_of_both_axes() {
+    fn the_default_configuration_leaves_permission_axes_unspecified() {
         let configuration = Configuration::default();
-        assert_eq!(configuration.level, PermissionLevel::ReadOnly);
-        assert_eq!(configuration.routing, ApprovalRouting::User);
+        assert_eq!(configuration.level, None);
+        assert_eq!(configuration.routing, None);
         assert_eq!(configuration.model, None);
+    }
+
+    #[test]
+    fn omitted_permissions_are_not_serialized_as_library_defaults() {
+        let encoded = serde_json::to_value(Configuration::default())
+            .expect("expected a serializable configuration");
+        assert!(encoded.get("level").is_none(), "received {encoded}");
+        assert!(encoded.get("routing").is_none(), "received {encoded}");
+    }
+
+    #[test]
+    fn explicit_permissions_are_serialized_without_losing_their_choice() {
+        let configuration = Configuration {
+            level: Some(PermissionLevel::Default),
+            routing: Some(ApprovalRouting::User),
+            ..Configuration::default()
+        };
+        let encoded =
+            serde_json::to_value(&configuration).expect("expected a serializable configuration");
+        assert_eq!(encoded["level"], "default");
+        assert_eq!(encoded["routing"], "user");
+        assert_eq!(
+            serde_json::from_value::<Configuration>(encoded)
+                .expect("expected the explicit configuration to deserialize"),
+            configuration
+        );
+    }
+
+    #[test]
+    fn an_omitted_field_in_a_later_configuration_keeps_the_accepted_setting() {
+        let current = Configuration {
+            model: Some(String::from("deliberate")),
+            effort: Some(String::from("high")),
+            level: Some(PermissionLevel::Default),
+            routing: Some(ApprovalRouting::User),
+        };
+        let merged = current.with_overrides(&Configuration {
+            model: Some(String::from("fast")),
+            ..Configuration::default()
+        });
+        assert_eq!(merged.model.as_deref(), Some("fast"));
+        assert_eq!(merged.effort.as_deref(), Some("high"));
+        assert_eq!(merged.level, Some(PermissionLevel::Default));
+        assert_eq!(merged.routing, Some(ApprovalRouting::User));
     }
 
     #[test]
@@ -1249,5 +1370,37 @@ mod tests {
             super::Session::ids(&session),
             super::Session::info(&session).ids
         );
+    }
+
+    #[tokio::test]
+    async fn configuration_defaults_to_the_opening_snapshot() {
+        let session = RecordingListing::default();
+        assert_eq!(
+            session.configuration().await,
+            session.info().effective_configuration
+        );
+    }
+
+    #[test]
+    fn review_targets_preserve_host_values_through_serialization() {
+        for target in [
+            super::ReviewTarget::UncommittedChanges,
+            super::ReviewTarget::BaseBranch {
+                branch: String::from("main"),
+            },
+            super::ReviewTarget::Commit {
+                sha: String::from("abc123"),
+                title: Some(String::from("Fix parser")),
+            },
+            super::ReviewTarget::Custom {
+                instructions: String::from("Review error handling"),
+            },
+        ] {
+            let json = serde_json::to_value(&target).expect("serializable review target");
+            assert_eq!(
+                serde_json::from_value::<super::ReviewTarget>(json).expect("review target"),
+                target
+            );
+        }
     }
 }
