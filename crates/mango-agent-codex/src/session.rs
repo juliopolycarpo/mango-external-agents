@@ -69,6 +69,9 @@ pub struct CodexSession {
     /// so the first turn carries the announcement and the rest do not. Repeating it would tell a
     /// host the conversation had just started, or just been resumed, on a turn where neither
     /// happened.
+    ///
+    /// Set only once a turn has actually started. A turn the server refuses never reaches its
+    /// host, and the announcement it was carrying goes with it.
     announced_session: AtomicBool,
 }
 
@@ -720,7 +723,10 @@ impl Session for CodexSession {
             configuration.level,
             configuration.routing,
         );
-        let announce_session = !self.announced_session.swap(true, Ordering::Relaxed);
+        // Read, not taken. The announcement rides the turn's own stream, so a turn the server
+        // refuses takes the announcement down with it — and a flag set in advance would mean the
+        // host never hears which vendor session it is talking to, or whether it was resumed.
+        let announce_session = !self.announced_session.load(Ordering::Acquire);
 
         let params = TurnStartParams {
             thread_id: self.shared.thread_id().to_owned(),
@@ -740,6 +746,7 @@ impl Session for CodexSession {
                 announce_session,
             )
             .await?;
+        self.announced_session.store(true, Ordering::Release);
         Ok(stream)
     }
 

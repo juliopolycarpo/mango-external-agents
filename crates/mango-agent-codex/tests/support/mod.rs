@@ -117,10 +117,30 @@ impl Transcript {
     /// does not contain gets nothing, which shows up as a call that times out rather than as an
     /// answer to a different question.
     pub fn as_process(&self) -> FakeProcess {
+        self.as_process_intercepting(|_| None)
+    }
+
+    /// The same replay, with some calls answered by `intercept` instead of by the recording.
+    ///
+    /// For the answers no recording holds: a turn the server refuses, a response missing a member
+    /// the harness has to cope without. Writing those into a fixture would put words in the
+    /// app-server's mouth, which is exactly what capturing fixtures exists to avoid — so they live
+    /// in the test that needs them, next to the assertion that says why.
+    ///
+    /// `intercept` sees the frame the library wrote and returns the lines to answer it with, or
+    /// `None` to leave the call to the recording.
+    pub fn as_process_intercepting(
+        &self,
+        intercept: impl Fn(&Value) -> Option<Vec<String>> + Send + Sync + 'static,
+    ) -> FakeProcess {
         let script = Arc::new(Mutex::new(Replay {
             remaining: self.steps.iter().cloned().collect(),
         }));
         FakeProcess::responding(move |line| {
+            if let Ok(frame) = serde_json::from_str::<Value>(line)
+                && let Some(answers) = intercept(&frame) {
+                    return answers;
+                }
             script
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

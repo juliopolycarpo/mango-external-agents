@@ -837,6 +837,55 @@ async fn the_configuration_a_host_chose_reaches_the_thread_as_three_settings() {
     assert_eq!(frame["params"]["cwd"], "/workspace");
 }
 
+/// The announcement rides the first turn's stream, so a first turn the server refuses takes it
+/// with it. The next turn to actually start is the one that carries it.
+#[tokio::test]
+async fn a_first_turn_the_server_refused_does_not_take_the_session_announcement_with_it() {
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&refused);
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        Transcript::load("turn").as_process_intercepting(move |frame| {
+            if frame.get("method").and_then(serde_json::Value::as_str) != Some("turn/start")
+                || seen.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return None;
+            }
+            // No recording holds a refused turn, and inventing one as a fixture would put words in
+            // the app-server's mouth. This is the transport's own shape, not the vendor's dialect.
+            Some(vec![
+                serde_json::json!({
+                    "id": frame.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                    "error": {"code": -32602, "message": "no such model"},
+                })
+                .to_string(),
+            ])
+        }),
+    );
+    let (host, _launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+
+    session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect_err("expected the server's refusal to reach the caller");
+
+    let mut second = session
+        .start_turn(TurnRequest::new("turn-2", "two"))
+        .await
+        .expect("expected the next turn to run");
+    let events = drain(&mut second).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventKind::SessionStarted { .. })),
+        "expected the first turn that actually started to announce the session, received {events:#?}"
+    );
+}
+
 /// A level is a sandbox and an approval policy together, and `turn/start` takes only the policy.
 ///
 /// Both directions are wrong, and the narrowing one is the dangerous one: a turn asked to run
