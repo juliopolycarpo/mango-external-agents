@@ -837,6 +837,79 @@ async fn the_configuration_a_host_chose_reaches_the_thread_as_three_settings() {
     assert_eq!(frame["params"]["cwd"], "/workspace");
 }
 
+/// A level is a sandbox and an approval policy together, and `turn/start` takes only the policy.
+///
+/// Both directions are wrong, and the narrowing one is the dangerous one: a turn asked to run
+/// read-only on a full-access session would have kept the sandbox and lost the prompts, so a host
+/// trying to fence off a risky turn would have handed it the most permissive cell there is.
+#[tokio::test]
+async fn a_turn_cannot_be_given_a_permission_level_only_half_of_which_would_apply() {
+    let (host, launcher) = host_replaying(&["turn"]);
+    let request = OpenSession::new("chat-1").with_configuration(Configuration {
+        level: PermissionLevel::FullAccess,
+        routing: ApprovalRouting::User,
+        ..Configuration::default()
+    });
+    let session = CodexHarness::new()
+        .open_session(&host, request)
+        .await
+        .expect("expected a session");
+
+    let before = launcher.written().len();
+    let error = session
+        .start_turn(
+            TurnRequest::new("turn-1", "read the tree").with_configuration(Configuration {
+                level: PermissionLevel::ReadOnly,
+                routing: ApprovalRouting::User,
+                ..Configuration::default()
+            }),
+        )
+        .await
+        .expect_err("expected a refusal, received a turn at a level only half of which applies");
+
+    assert!(
+        matches!(&error, mango_external_agents::Error::Protocol { received, .. }
+                 if received.contains("ReadOnly")),
+        "expected the refusal to name the level it was given, received {error:?}"
+    );
+    assert_eq!(
+        launcher.written().len(),
+        before,
+        "expected no turn/start to reach the vendor"
+    );
+}
+
+/// The same session's own level is not a change, and still runs.
+#[tokio::test]
+async fn a_turn_that_repeats_the_sessions_own_level_is_the_turn_it_always_was() {
+    let (host, _launcher) = host_replaying(&["turn"]);
+    let request = OpenSession::new("chat-1").with_configuration(Configuration {
+        level: PermissionLevel::Default,
+        routing: ApprovalRouting::User,
+        ..Configuration::default()
+    });
+    let session = CodexHarness::new()
+        .open_session(&host, request)
+        .await
+        .expect("expected a session");
+
+    let mut turn = session
+        .start_turn(
+            TurnRequest::new("turn-1", "create mango.txt").with_configuration(Configuration {
+                level: PermissionLevel::Default,
+                routing: ApprovalRouting::AutoReview,
+                ..Configuration::default()
+            }),
+        )
+        .await
+        .expect("expected the turn to run");
+    let events = drain(&mut turn).await;
+    assert!(
+        !events.is_empty(),
+        "expected the recorded turn to produce events"
+    );
+}
+
 /// A CLI that is not there is a discovery, not an error: `Discovery::not_installed` is what a host
 /// renders as "install it", and a failure would be what it renders as "something broke".
 #[tokio::test]

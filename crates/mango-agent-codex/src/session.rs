@@ -699,6 +699,23 @@ impl Session for CodexSession {
             .configuration
             .clone()
             .unwrap_or_else(|| self.info.effective_configuration.clone());
+
+        // A level is a sandbox and an approval policy together, and `turn/start` takes only the
+        // policy. Sending half of one would produce a configuration nobody chose, in whichever
+        // direction it went: a turn narrowed to read-only would keep the thread's full-access
+        // sandbox and lose its prompts along with it, and a turn widened from read-only would ask
+        // for permissions its sandbox will not grant. Refused rather than half-applied — a host
+        // that wants a different level opens a session at that level.
+        if configuration.level != self.info.effective_configuration.level {
+            return Err(Error::Protocol {
+                expected: format!(
+                    "a turn at this session's own permission level, {:?}; the app-server takes a \
+                     sandbox on the thread and only an approval policy on a turn",
+                    self.info.effective_configuration.level
+                ),
+                received: format!("{:?}", configuration.level),
+            });
+        }
         let vendor = crate::permissions::VendorConfiguration::for_pair(
             configuration.level,
             configuration.routing,

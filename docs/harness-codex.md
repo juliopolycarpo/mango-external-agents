@@ -235,6 +235,13 @@ this tool letting an agent out of its sandbox, checked into the repository.
 - No MCP passthrough (see above).
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
+- A turn cannot change its session's `PermissionLevel`. A level is a sandbox *and* an approval
+  policy, `thread/start` takes the sandbox and `turn/start` takes only the policy, and sending half
+  of a level is a configuration nobody chose — a turn narrowed to read-only would keep the thread's
+  sandbox and lose its prompts with it. `Session::start_turn` refuses a level that differs from the
+  session's, and a host that wants a different one opens a session at it. `TurnStartParams`
+  declares a `sandboxPolicy`, so the full per-turn change is reachable once its shape is pinned
+  and driven against a real server; the per-turn `routing`, `model` and `effort` all apply today.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
 - `SteerRejection::TurnNotSteerable` is never produced. The app-server's refusal for a turn that
   refuses steering — a review, a compaction — has not been observed, so a steer it declines for any
