@@ -72,7 +72,10 @@ Every request except `session/prompt` is bounded by `Limits::request_timeout` an
 
 One `session/prompt` in flight per session. The response *is* the turn's end, so two prompts would race
 for one stream of updates with nothing on the wire to tell them apart; a second is refused with
-`Error::Protocol` rather than queued.
+`Error::Protocol` rather than queued. The slot belongs to the prompt: a host that drops its
+`TurnStream` closes the sink but does not finish the prompt, so the slot stays taken until the agent
+answers or the session closes — and each turn carries a generation, so a prompt that answers late can
+only ever end its own turn.
 
 `TurnStream::native_turn_id` is the prompt request's own JSON-RPC id — ACP has no turn id of its own.
 
@@ -117,11 +120,15 @@ Two axes, six cells, answered per profile by `profile::matrix`. Routing never va
 approval is the host's own arrangement (a `PermissionBroker`, or the `ApprovalRequested` event) and the
 agent cannot tell the difference. Level does, and the three cases are **not** symmetric:
 
-- **`Default` — supported.** What plain ACP already is: the agent asks, somebody answers.
+- **`Default` — supported.** What plain ACP already is: the agent asks, and the host answers — through
+  its `PermissionBroker` if it installed one, otherwise through the `ApprovalRequested` event.
 - **`ReadOnly` — supported.** Refusing every request the agent raises grants nothing, and it is the
   host's own standing instruction rather than a decision the library made. The question is still
   emitted, so a host sees what was asked, then resolved with `DecisionSource::AutoReview`. An agent that
-  offered no way to refuse leaves nothing to pick, so that question reaches a person instead.
+  offered no way to refuse leaves nothing to pick, so that question reaches a person instead — and the
+  broker is **not** consulted in that case, nor in any other under this level. A policy answering
+  `Allow` would become an allowing option id on the wire, which is the one outcome this level exists to
+  make impossible.
 - **`FullAccess` — `NotOfferedByVendor`**, unless the profile knows the agent's own mode id for it.
   Reaching it by answering would mean the library *allowing* on the agent's behalf, which is the one
   thing nothing here may do.
@@ -129,6 +136,16 @@ agent cannot tell the difference. Level does, and the three cases are **not** sy
 A level a profile cannot reach is refused at `open_session` and again at `start_turn`, never
 downgraded: silently running a read-only request under "ask every time" would grant more freedom than
 anybody chose.
+
+A per-turn level is compared to the session's **by mode**, and any pair whose mode differs from the one
+the session was opened under is refused in both directions. Narrowing looks harmless and is not: a turn
+asking for `ReadOnly` on a session the agent runs in its own full-access mode would register a
+read-only turn while the agent, still in that mode, raises no permission request at all for the
+standing refusal to answer.
+
+Cancelling withdraws every question the agent is waiting on, with ACP's own `Cancelled` outcome — the
+specification requires it, and an agent whose permission await is not itself cancellation-aware never
+returns from its tool call otherwise, so the turn would end with no terminal at all.
 
 ACP's four option kinds map one-to-one onto the core's, so a host policy can answer without reading a
 label in a language it does not know. The option set itself is passed through with the agent's own
@@ -239,16 +256,16 @@ invariant too.
 
 ## Sessions
 
-| Method                  | Behaviour                                                                                                                                    |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `start_turn`            | `session/prompt`; one in flight                                                                                                              |
-| `respond`               | answers one parked `session/request_permission`; an answer to an already-settled question is accepted and sends nothing further              |
-| `cancel`                | `session/cancel`, recording the host's reason first                                                                                          |
-| `close`                 | idempotent: withdraws every pending question, ends the turn under a bounded wait, sends `session/close` when advertised, then ends the child |
-| `steer`                 | `Error::NotSupported`                                                                                                                        |
-| `list_sessions`         | `session/list` when `sessionCapabilities.list`, else `Error::NotSupported`                                                                   |
-| `start_review`          | `Error::NotSupported`                                                                                                                        |
-| `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                                 |
+| Method                  | Behaviour                                                                                                                       |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `start_turn`            | `session/prompt`; one in flight                                                                                                 |
+| `respond`               | answers one parked `session/request_permission`; an answer to an already-settled question is accepted and sends nothing further |
+| `cancel`                | withdraws every pending question, then `session/cancel`, recording the host's reason first                                      |
+| `close`                 | idempotent: withdraws every pending question, sends `session/close` when advertised, ends the turn, then ends the child         |
+| `steer`                 | `Error::NotSupported`                                                                                                           |
+| `list_sessions`         | `session/list` when `sessionCapabilities.list`, else `Error::NotSupported`                                                      |
+| `start_review`          | `Error::NotSupported`                                                                                                           |
+| `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                    |
 
 A resume against an agent that does not advertise `loadSession` is `Error::Protocol` under
 `ResumeMode::Strict`, and a fresh conversation with `SessionInfo::fallback_reason` set otherwise.
