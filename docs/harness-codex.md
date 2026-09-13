@@ -239,11 +239,12 @@ this tool letting an agent out of its sandbox, checked into the repository.
 - `SteerRejection::TurnNotSteerable` is never produced. The app-server's refusal for a turn that
   refuses steering — a review, a compaction — has not been observed, so a steer it declines for any
   reason other than "no active turn" surfaces as the vendor error rather than as that reason.
-- A session that is closed while its host has stopped reading its turn offers the turn's terminal
-  under a 200 ms grace and then drops the stream. `EventSink::cancel` is two events, so a grace
-  that elapses between them shows that host a cancellation marker with no terminal after it. Only
-  a host that has stopped reading can reach it, and closing it properly needs a non-blocking
-  `try_emit` in the core — a bounded sink offers no way to put two events on or neither.
+- A session closed or cancelled while its host has stopped reading ends that turn with a bare
+  `Completed` under a 200 ms grace, rather than with the cancellation marker a turn that ends
+  normally carries. One event is what fits: a bounded sink offers no way to put two events on or
+  neither, and a grace that elapsed between a marker and its terminal would leave the host the one
+  shape the core's contract rules out. The reason is not lost with the marker — it is the argument
+  the host passed to `close` or `cancel` in the first place.
 
 Compliance posture: see [compliance.md](compliance.md).
 

@@ -11,7 +11,8 @@ use std::sync::Arc;
 use mango_agent_codex::CodexHarness;
 use mango_external_agents::event::EventKind;
 use mango_external_agents::permission::{
-    BrokerDecision, DecisionSource, PermissionBroker, PermissionRequest,
+    BrokerDecision, DecisionSource, PermissionBroker, PermissionOptionKind, PermissionRequest,
+    PermissionResponse,
 };
 use mango_external_agents::testing::{FakeLauncher, FakeProcess};
 use mango_external_agents::{
@@ -340,6 +341,53 @@ async fn a_second_turn_started_while_one_is_running_is_refused_rather_than_steer
         launcher.written().len(),
         before,
         "expected nothing to be written to the vendor"
+    );
+}
+
+/// The same refusal, for a host that walked away rather than one that is waiting.
+///
+/// Dropping a `TurnStream` stops the host reading; it does not stop the vendor. The turn is still
+/// running inside `codex app-server`, so the slot has to stay claimed — a free one would let the
+/// next `turn/start` out, and the app-server reads that as a steer of the turn nobody is watching.
+#[tokio::test]
+async fn a_turn_whose_host_stopped_reading_still_holds_the_slot_against_a_steer() {
+    let (session, launcher) = open("approval").await;
+    let mut first = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+    let asked = await_approval(&mut first).await;
+
+    drop(first);
+    // One event onto the closed stream, which is what a host that left looks like from here.
+    session
+        .respond(PermissionResponse {
+            request_id: asked.id.clone(),
+            option_id: asked
+                .options
+                .iter()
+                .find(|option| option.kind == PermissionOptionKind::RejectOnce)
+                .map(|option| option.id.clone())
+                .expect("expected a refusal among the recorded options"),
+            source: DecisionSource::User,
+        })
+        .await
+        .expect("expected the refusal to reach the server");
+
+    let before = launcher.written().len();
+    let error = session
+        .start_turn(TurnRequest::new("turn-2", "two"))
+        .await
+        .expect_err("expected a refusal, received a second turn on a live one");
+    assert!(
+        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+                 if vendor.code.as_str() == "codex-turn-already-running"),
+        "expected the turn-already-running refusal, received {error:?}"
+    );
+    assert_eq!(
+        launcher.written().len(),
+        before,
+        "expected no turn/start to reach the vendor"
     );
 }
 

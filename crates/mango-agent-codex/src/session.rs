@@ -6,7 +6,7 @@
 //! whatever the server is still waiting on. A question nobody answers is a vendor process blocked
 //! for the rest of its life.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -94,6 +94,16 @@ pub(crate) struct Shared {
     thread_id: std::sync::OnceLock<String>,
     turn: Mutex<Option<ActiveTurn>>,
     pending: Mutex<HashMap<String, PendingEntry>>,
+    /// Turns given up before the server had even named them.
+    ///
+    /// A slot emptied by `turn/completed` holds a turn that is over. A slot emptied by a cancel
+    /// that arrived before the `turn/start` answer did holds one the vendor is still running, with
+    /// nobody on this side holding an id to stop it by — the id is still in flight. Recorded here
+    /// so the call that is parked on that answer can stop the turn when it finally lands.
+    ///
+    /// Self-clearing: only a turn whose handle has not arrived is recorded, and the call waiting
+    /// for that handle takes its own entry back whether or not anybody abandoned it.
+    abandoned: Mutex<HashSet<TurnId>>,
 }
 
 impl Shared {
@@ -105,6 +115,7 @@ impl Shared {
             thread_id: std::sync::OnceLock::new(),
             turn: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            abandoned: Mutex::new(HashSet::new()),
         }
     }
 
@@ -160,29 +171,25 @@ impl Shared {
     /// `cancel`, `close`, the next `start_turn` — on a host that is never coming back. A close
     /// that cannot return is worse than a turn that cannot be fed.
     ///
-    /// A turn whose host has dropped the stream is finished here rather than fed: the sink
-    /// refuses, and there is nobody left to tell.
+    /// A turn whose host has dropped the stream stays installed, and the event is dropped
+    /// instead. A closed sink refuses immediately and without parking, so there is nothing to save
+    /// by forgetting the turn — and forgetting it would open the trap the running-turn guard
+    /// exists to close: the vendor's turn runs on whether or not anybody is listening, and a free
+    /// slot would let the next `turn/start` out to be read as a steer of it. `turn/completed`
+    /// ends this turn, as it ends every other.
+    ///
+    /// A refusal is also not always a host that left. The core refuses an event it cannot bound —
+    /// a vendor id past the length limit — and losing the turn over one unrenderable event would
+    /// close a host's stream with no terminal at all.
     async fn emit(&self, kind: EventKind) {
-        let running = {
+        let sink = {
             let turn = self.turn.lock().await;
-            turn.as_ref()
-                .map(|active| (active.sink.clone(), active.turn_id.clone()))
+            turn.as_ref().map(|active| active.sink.clone())
         };
-        let Some((sink, turn_id)) = running else {
+        let Some(sink) = sink else {
             return;
         };
-        if sink.emit(kind).await.is_err() {
-            // Cleared only if it is still the same turn. While this was parked, a `finish` may
-            // have ended it and a later `start_turn` installed another, and dropping that one
-            // would strand a stream a host is reading right now.
-            let mut turn = self.turn.lock().await;
-            if turn
-                .as_ref()
-                .is_some_and(|active| active.turn_id == turn_id)
-            {
-                *turn = None;
-            }
-        }
+        let _ = sink.emit(kind).await;
     }
 
     /// Ends the running turn, if there is one.
@@ -225,20 +232,25 @@ impl Shared {
     /// process, waiting for a reader that has already walked away.
     ///
     /// So the terminal is offered under a grace, and the sink is dropped either way. A host that
-    /// is merely behind gets its `Cancelled` and `Completed`; a host that has stopped reading gets
-    /// the end of its stream, which is the same ending by a different route.
+    /// is merely behind gets its `Completed`; a host that has stopped reading gets the end of its
+    /// stream, which is the same ending by a different route.
     ///
-    /// One edge this leaves open: `EventSink::cancel` is two events, and a grace that elapses
-    /// between them shows the host a cancellation marker with no terminal after it. Only a host
-    /// that has stopped reading can reach it — a reader that is merely behind drains both — and
-    /// nothing here can close it, because a bounded sink offers no way to put two events on or
-    /// neither. A non-blocking `EventSink::try_emit` in the core would; it is the follow-up this
-    /// harness found and could not fix from the outside.
-    async fn abandon(&self, reason: CancelReason) {
+    /// One event, deliberately, where a turn that ends normally sends two. `EventSink::cancel`
+    /// writes a cancellation marker and then a terminal, and a grace that elapsed between them
+    /// would leave a host a marker with nothing after it — the one shape the core's contract says
+    /// cannot happen. A single `Completed` cannot half-land: either it arrives or the stream
+    /// closes, and both are endings a host can read. Nothing is lost by dropping the reason,
+    /// because the reason is the argument the host passed to `cancel` or `close` itself.
+    async fn abandon(&self) {
         let Some(active) = self.turn.lock().await.take() else {
             return;
         };
-        let _ = tokio::time::timeout(TERMINAL_GRACE, active.sink.cancel(reason)).await;
+        // Its handle has not arrived, so this side has no id to interrupt the vendor's turn by.
+        // Whoever is parked on that answer stops it instead.
+        if active.native_turn_id.is_empty() {
+            self.abandoned.lock().await.insert(active.turn_id.clone());
+        }
+        let _ = tokio::time::timeout(TERMINAL_GRACE, active.sink.complete()).await;
     }
 
     /// Settles every question the server is still waiting on.
@@ -555,6 +567,13 @@ impl CodexSession {
             active.native_turn_id.clone_from(&handle.id);
         }
 
+        // Somebody ended this turn while its own handle was still on the wire — a cancel with no
+        // id to name, or a close. The vendor's turn is running regardless of what this side did
+        // with the slot, and this is the first moment anything here can name it.
+        if self.shared.abandoned.lock().await.remove(&turn_id) {
+            self.interrupt(handle.id.clone()).await;
+        }
+
         Ok((
             TurnStream {
                 turn_id,
@@ -563,6 +582,23 @@ impl CodexSession {
             },
             extra,
         ))
+    }
+
+    /// Stops one vendor turn, best effort.
+    ///
+    /// Used where nothing can be done about a failure: the turn is already out of this session's
+    /// hands, and the alternative to a call that might not land is no call at all.
+    async fn interrupt(&self, turn_id: String) {
+        let _: Result<Value> = self
+            .client
+            .request(
+                method::TURN_INTERRUPT,
+                TurnInterruptParams {
+                    thread_id: self.shared.thread_id().to_owned(),
+                    turn_id,
+                },
+            )
+            .await;
     }
 
     fn input_for(request: &TurnRequest) -> Vec<UserInput> {
@@ -712,7 +748,7 @@ impl Session for CodexSession {
             // The turn's own handle has not come back yet, so there is nothing to name in an
             // interrupt. The stream is ended here rather than left waiting on a `turn/completed`
             // for a turn the server may not have started.
-            self.shared.abandon(reason).await;
+            self.shared.abandon().await;
             return Ok(());
         }
 
@@ -733,7 +769,7 @@ impl Session for CodexSession {
         self.shared.release_pending(DecisionSource::Cancelled).await;
         // The turn ends here rather than on a notification: the connection is about to go, and a
         // host holding a stream that will never terminate is worse than one told why it stopped.
-        self.shared.abandon(CancelReason::from(reason)).await;
+        self.shared.abandon().await;
 
         let closed = self.client.close().await;
         let killed = self.control.kill(CancelReason::from(reason)).await;
@@ -875,7 +911,129 @@ fn is_no_active_turn(error: &VendorError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64, data_url};
+    use std::sync::Arc;
+
+    use mango_external_agents::HostContext;
+    use mango_external_agents::event::{EventKind, TurnId};
+    use mango_external_agents::stream::EventSink;
+    use mango_external_agents::testing::FakeLauncher;
+
+    use super::{ActiveTurn, Shared, base64, data_url};
+
+    /// A host with a launcher that spawns nothing, for the state these tests drive directly.
+    fn shared() -> Arc<Shared> {
+        let host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd("/workspace")
+            .client_info("mango-test", "0.0.1")
+            .build()
+            .expect("expected a host");
+        Arc::new(Shared::new(
+            host,
+            mango_external_agents::SessionId::new("chat-1"),
+        ))
+    }
+
+    /// Installs a turn the way `begin` does, and hands back the stream a host would hold.
+    async fn running(
+        shared: &Shared,
+        native_turn_id: &str,
+    ) -> (TurnId, mango_external_agents::stream::TurnStream) {
+        let turn_id = TurnId::new("turn-1");
+        let (sink, events) = EventSink::new(
+            mango_external_agents::SessionId::new("chat-1"),
+            turn_id.clone(),
+            Arc::clone(shared.host.clock()),
+            8,
+        );
+        *shared.turn.lock().await = Some(ActiveTurn {
+            sink,
+            turn_id: turn_id.clone(),
+            native_turn_id: native_turn_id.to_owned(),
+            cancel_reason: None,
+        });
+        (
+            turn_id.clone(),
+            mango_external_agents::stream::TurnStream {
+                turn_id,
+                native_turn_id: native_turn_id.to_owned(),
+                events,
+            },
+        )
+    }
+
+    /// The trap the running-turn guard exists to close. A host that drops its stream stops
+    /// reading; it does not stop the vendor, whose turn runs on. Giving up the slot here would let
+    /// the next `turn/start` out, and the app-server reads that as a steer of the live turn.
+    #[tokio::test]
+    async fn an_event_no_host_will_read_does_not_give_up_the_running_turn() {
+        let shared = shared();
+        let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
+        drop(stream);
+
+        shared
+            .emit(EventKind::TextDelta {
+                text: String::from("nobody is reading this"),
+            })
+            .await;
+
+        assert!(
+            shared.turn.lock().await.is_some(),
+            "expected the vendor's turn to still hold the slot"
+        );
+    }
+
+    /// A turn given up before its own handle arrived leaves nothing on this side to stop it by.
+    /// The call still parked on that answer is the only thing that will ever know the id.
+    #[tokio::test]
+    async fn a_turn_abandoned_before_the_server_named_it_is_left_for_its_own_answer_to_stop() {
+        let shared = shared();
+        let (turn_id, _stream) = running(&shared, "").await;
+
+        shared.abandon().await;
+
+        assert!(
+            shared.abandoned.lock().await.contains(&turn_id),
+            "expected the turn to be recorded for the answer still in flight"
+        );
+    }
+
+    /// The other half: a turn whose handle already arrived was cancelled by name, or belongs to a
+    /// session that is killing the process. Recording it would send an interrupt nobody asked for.
+    #[tokio::test]
+    async fn a_turn_the_server_already_named_is_not_left_for_anybody_to_stop() {
+        let shared = shared();
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+
+        shared.abandon().await;
+
+        assert!(
+            shared.abandoned.lock().await.is_empty(),
+            "expected nothing to be recorded for a turn this side can name"
+        );
+    }
+
+    /// The grace exists so a closing session cannot park on a host that stopped reading, and one
+    /// event is what fits through it: a marker with no terminal behind it is the one shape the
+    /// core's contract rules out.
+    #[tokio::test]
+    async fn an_abandoned_turn_ends_with_a_terminal_and_nothing_before_it() {
+        let shared = shared();
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+
+        shared.abandon().await;
+
+        let event = stream.recv().await.expect("expected an ending");
+        assert!(
+            event.is_terminal(),
+            "expected the first event to be the terminal, received {:?}",
+            event.kind
+        );
+        assert!(
+            stream.recv().await.is_none(),
+            "expected the stream to end after its terminal"
+        );
+    }
 
     /// Verified against a real `turn/start`: the app-server accepts an image as a `data:` URL and
     /// the turn completes. The encoding is the part that has to be exactly right.
