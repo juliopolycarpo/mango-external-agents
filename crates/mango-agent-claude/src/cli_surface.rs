@@ -203,6 +203,8 @@ mod tests {
     use crate::version;
 
     const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
+    /// `claude --help` in full, from the build installed when this harness was written.
+    const HELP_2_1_270: &str = include_str!("../../../fixtures/claude/help/2.1.270.txt");
     const HELP_2_1_260: &str = include_str!("../../../fixtures/claude/help/2.1.260.txt");
 
     #[test]
@@ -219,6 +221,37 @@ mod tests {
                 "expected {label} to offer every required flag"
             );
         }
+    }
+
+    /// The drift check: the whole surface of a real build, not an excerpt.
+    ///
+    /// An excerpt can only prove the parser reads what somebody trimmed for it. This one fails the
+    /// day the vendor renames or removes something every turn depends on, which is the earliest a
+    /// maintainer could hear about it.
+    #[test]
+    fn the_whole_surface_of_the_installed_build_parses() {
+        let surface = CliSurface::parse(HELP_2_1_270);
+        assert!(surface.is_usable());
+        assert_eq!(surface.missing_required_flags(), Vec::<&str>::new());
+        assert!(
+            surface.declares_permission_prompts(),
+            "expected 2.1.270 to declare --permission-prompts"
+        );
+        assert!(
+            surface.declares_mcp_config(),
+            "expected 2.1.270 to declare --mcp-config"
+        );
+        assert_eq!(
+            surface.model_aliases(),
+            Some(["fable", "opus", "sonnet"].map(String::from).as_slice())
+        );
+        assert!(
+            surface
+                .accepted_modes()
+                .is_some_and(|modes| modes.contains("plan") && modes.contains("manual")),
+            "received {:?}",
+            surface.accepted_modes()
+        );
     }
 
     #[test]

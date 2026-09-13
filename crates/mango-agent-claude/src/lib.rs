@@ -6,6 +6,7 @@ pub mod cli_surface;
 pub mod commands;
 pub mod harness;
 pub mod help;
+pub mod mcp;
 pub mod models;
 pub mod permissions;
 pub mod pinned;

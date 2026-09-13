@@ -27,6 +27,7 @@ use serde_json::json;
 
 use crate::argv::TurnArgv;
 use crate::cli_surface::CliSurface;
+use crate::mcp::ConfigFile;
 use crate::permissions::{self, ModeAvailability};
 use crate::pinned::{SIGTERM_EXIT_CODE, STREAM_IDLE_TIMEOUT, VENDOR_ENVIRONMENT_KEYS};
 use crate::probe::PROGRAM;
@@ -81,6 +82,12 @@ struct SessionState {
     established: bool,
     /// The turn now running, when one is.
     active: Option<ActiveTurn>,
+    /// The `--mcp-config` file every turn loads, when the host configured servers.
+    ///
+    /// Held here rather than on [`Shared`] so that closing the session takes it out and drops it,
+    /// which is what removes it from disk. A session that is dropped without being closed removes
+    /// it too, when this state goes.
+    mcp_config: Option<ConfigFile>,
     closed: bool,
 }
 
@@ -120,11 +127,13 @@ impl ClaudeSession {
         info: SessionInfo,
         availability: ModeAvailability,
         surface: Option<CliSurface>,
+        mcp_config: Option<ConfigFile>,
     ) -> Self {
         let state = SessionState {
             native_session_id: info.ids.native_session_id.clone(),
             established: info.resumed,
             active: None,
+            mcp_config,
             closed: false,
         };
         Self {
@@ -196,9 +205,16 @@ impl mango_external_agents::Session for ClaudeSession {
         };
         end_turn(previous, CancelReason::Requested).await;
 
-        let (native_session_id, established) = {
+        let (native_session_id, established, mcp_config) = {
             let state = self.shared.lock();
-            (state.native_session_id.clone(), state.established)
+            (
+                state.native_session_id.clone(),
+                state.established,
+                state
+                    .mcp_config
+                    .as_ref()
+                    .map(|file| file.argument().to_owned()),
+            )
         };
         let argv = TurnArgv {
             program: PROGRAM,
@@ -217,7 +233,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 .surface
                 .as_ref()
                 .is_some_and(CliSurface::declares_permission_prompts),
-            mcp_config: None,
+            mcp_config: mcp_config.as_deref(),
         }
         .build();
 
@@ -290,9 +306,12 @@ impl mango_external_agents::Session for ClaudeSession {
     async fn close(&self, reason: CloseReason) -> Result<()> {
         // Idempotent: a close racing a cancel, or two closes from different tasks, must not fail
         // the second caller. The take happens under the guard; the kill happens after it is gone.
+        // The configuration file leaves with the session that wrote it: taken here, dropped at
+        // the end of this statement, and removed from disk by that drop.
         let active = {
             let mut state = self.shared.lock();
             state.closed = true;
+            drop(state.mcp_config.take());
             state.active.take()
         };
         end_turn(active, CancelReason::from(reason)).await;

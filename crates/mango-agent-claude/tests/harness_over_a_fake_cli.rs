@@ -15,6 +15,8 @@ use support::{FakeClaudeCli, Run, SIGNED_OUT, host};
 
 const READ_TURN: &str = include_str!("../../../fixtures/claude/transcripts/read-turn.jsonl");
 const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
+/// The whole surface of a real build, which is where `--mcp-config` is actually declared.
+const HELP_2_1_270: &str = include_str!("../../../fixtures/claude/help/2.1.270.txt");
 
 /// Everything a turn produced, up to and including its terminal event.
 async fn drain(turn: &mut TurnStream) -> Vec<EventKind> {
@@ -554,6 +556,129 @@ mod a_turn {
             matches!(error, Error::Vendor(ref vendor) if vendor.code.as_str() == "claude-approvals-unsupported"),
             "received {error:?}"
         );
+    }
+}
+
+mod mcp_passthrough {
+    use super::*;
+    use mango_external_agents::{McpServer, McpTransport};
+
+    fn servers() -> Vec<McpServer> {
+        vec![McpServer {
+            name: String::from("docs"),
+            transport: McpTransport::Stdio {
+                command: String::from("docs-mcp"),
+                args: vec![String::from("--stdio")],
+                env: [(String::from("DOCS_TOKEN"), String::from("s3cret"))]
+                    .into_iter()
+                    .collect(),
+            },
+        }]
+    }
+
+    async fn open_with_servers(launcher: &Arc<FakeClaudeCli>) -> Box<dyn Session> {
+        ClaudeHarness::new()
+            .open_session(
+                &host(Arc::clone(launcher)),
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .expect("expected a session")
+    }
+
+    #[tokio::test]
+    async fn loads_the_hosts_servers_from_a_file_rather_than_from_the_command_line() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let session = open_with_servers(&launcher).await;
+        session
+            .start_turn(TurnRequest::new("turn-1", "hello"))
+            .await
+            .expect("expected a turn");
+
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let path = value_after(&argv, "--mcp-config").expect("expected the flag");
+        assert!(
+            argv.iter().all(|argument| !argument.contains("s3cret")),
+            "expected no credential on a command line anyone can read, received {argv:?}"
+        );
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("expected the file"))
+                .expect("expected valid JSON");
+        assert_eq!(written["mcpServers"]["docs"]["command"], "docs-mcp");
+        assert_eq!(written["mcpServers"]["docs"]["env"]["DOCS_TOKEN"], "s3cret");
+    }
+
+    #[tokio::test]
+    async fn the_file_leaves_with_the_session_that_wrote_it() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let session = open_with_servers(&launcher).await;
+        session
+            .start_turn(TurnRequest::new("turn-1", "hello"))
+            .await
+            .expect("expected a turn");
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let path = std::path::PathBuf::from(
+            value_after(&argv, "--mcp-config").expect("expected the flag"),
+        );
+        assert!(path.exists());
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected a clean close");
+        assert!(
+            !path.exists(),
+            "expected closing to remove {}",
+            path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_build_that_cannot_load_them_rather_than_dropping_them() {
+        // The 2.1.260 excerpt declares no `--mcp-config`.
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host(Arc::clone(&launcher)),
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected a refusal rather than a session without the servers");
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_servers_writes_no_file_and_passes_no_flag() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let session = open(&launcher).await;
+        session
+            .start_turn(TurnRequest::new("turn-1", "hello"))
+            .await
+            .expect("expected a turn");
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        assert_eq!(value_after(&argv, "--mcp-config"), None);
+    }
+
+    #[tokio::test]
+    async fn reports_the_capability_only_on_a_build_that_declares_the_flag() {
+        let declaring = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let discovery = ClaudeHarness::new()
+            .discover(&host(declaring))
+            .await
+            .expect("expected a discovery");
+        assert!(discovery.capabilities.mcp_passthrough);
+
+        let silent = Arc::new(FakeClaudeCli::new());
+        let discovery = ClaudeHarness::new()
+            .discover(&host(silent))
+            .await
+            .expect("expected a discovery");
+        assert!(!discovery.capabilities.mcp_passthrough);
     }
 }
 

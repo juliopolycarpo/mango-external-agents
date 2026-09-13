@@ -16,6 +16,7 @@ use mango_external_agents::{
 
 use crate::auth::{self, Authentication};
 use crate::cli_surface::CliSurface;
+use crate::mcp::ConfigFile;
 use crate::permissions::{self, ModeAvailability};
 use crate::pinned::{self, MINIMUM_VERSION, VENDOR, VENDOR_ENVIRONMENT_KEYS};
 use crate::probe;
@@ -258,6 +259,26 @@ impl Harness for ClaudeHarness {
         let configuration = request.configuration.clone();
         require_supported(&configuration, &survey.availability)?;
 
+        // Refused rather than dropped. A session that quietly ignored the servers a host
+        // configured would run every turn without the tools somebody set up, and report success.
+        if !request.mcp_servers.is_empty()
+            && !survey
+                .surface
+                .as_ref()
+                .is_some_and(CliSurface::declares_mcp_config)
+        {
+            return Err(Error::HostConfiguration {
+                expected: "a build that declares --mcp-config, for a session that configures MCP servers",
+                received: format!(
+                    "{} servers on a build that does not",
+                    request.mcp_servers.len()
+                ),
+            });
+        }
+        // The library has no scratch directory of its own to be given, so the file goes where the
+        // platform puts temporary files, in a directory of its own that only its owner can read.
+        let mcp_config = ConfigFile::write(&request.mcp_servers, &std::env::temp_dir()).await?;
+
         let resumed = request.resume.is_some();
         let native_session_id = match &request.resume {
             Some(resume) => resume.native_session_id.clone(),
@@ -290,6 +311,7 @@ impl Harness for ClaudeHarness {
             info,
             survey.availability,
             survey.surface,
+            mcp_config,
         )))
     }
 }
