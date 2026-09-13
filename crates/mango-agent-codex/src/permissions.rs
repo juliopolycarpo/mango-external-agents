@@ -10,7 +10,32 @@ use mango_external_agents::permission::{
     ApprovalRouting, ConfigurationVerdict, PermissionLevel, PermissionMatrix,
 };
 
-use crate::protocol::requests::{ApprovalsReviewer, AskForApproval, SandboxMode};
+use crate::protocol::requests::{ApprovalsReviewer, AskForApproval, SandboxMode, SandboxPolicy};
+
+/// Only the permission settings explicitly selected by the host.
+pub(crate) struct PermissionOverrides {
+    pub(crate) sandbox: Option<SandboxMode>,
+    pub(crate) approval_policy: Option<AskForApproval>,
+    pub(crate) approvals_reviewer: Option<ApprovalsReviewer>,
+}
+
+/// Leaves omitted axes to the user's CLI settings. For example, a default configuration emits
+/// no permission overrides.
+pub(crate) fn overrides(
+    configuration: &mango_external_agents::Configuration,
+) -> PermissionOverrides {
+    let level = configuration
+        .level
+        .map(|level| VendorConfiguration::for_pair(level, ApprovalRouting::User));
+    PermissionOverrides {
+        sandbox: level.map(|configuration| configuration.sandbox),
+        approval_policy: level.map(|configuration| configuration.approval_policy),
+        approvals_reviewer: configuration.routing.map(|routing| match routing {
+            ApprovalRouting::User => ApprovalsReviewer::User,
+            ApprovalRouting::AutoReview => ApprovalsReviewer::AutoReview,
+        }),
+    }
+}
 
 /// The three settings one (level, routing) pair becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +49,33 @@ pub struct VendorConfiguration {
 }
 
 impl VendorConfiguration {
+    /// Builds the structured turn policy for the host's authorised directory.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_codex::permissions::VendorConfiguration;
+    /// use mango_external_agents::{ApprovalRouting, PermissionLevel};
+    /// let config = VendorConfiguration::for_pair(PermissionLevel::ReadOnly, ApprovalRouting::User);
+    /// let policy = config.sandbox_policy("/workspace");
+    /// assert_eq!(serde_json::to_value(policy).unwrap()["type"], "readOnly");
+    /// ```
+    #[must_use]
+    pub fn sandbox_policy(&self, cwd: &str) -> SandboxPolicy {
+        match self.sandbox {
+            SandboxMode::ReadOnly => SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            SandboxMode::WorkspaceWrite => SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![cwd.to_owned()],
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
+            SandboxMode::DangerFullAccess => SandboxPolicy::DangerFullAccess,
+        }
+    }
+
     /// The settings this pair runs under.
     ///
     /// # Example
@@ -97,6 +149,61 @@ mod tests {
     use super::{VendorConfiguration, matrix};
     use crate::protocol::requests::{ApprovalsReviewer, AskForApproval, SandboxMode};
     use mango_external_agents::permission::{ApprovalRouting, PermissionLevel};
+
+    #[test]
+    fn omitted_permission_axes_are_not_filled_in() {
+        let omitted = super::overrides(&mango_external_agents::Configuration::default());
+        assert_eq!(omitted.sandbox, None);
+        assert_eq!(omitted.approval_policy, None);
+        assert_eq!(omitted.approvals_reviewer, None);
+        let explicit = super::overrides(&mango_external_agents::Configuration {
+            level: Some(PermissionLevel::FullAccess),
+            routing: Some(ApprovalRouting::AutoReview),
+            ..mango_external_agents::Configuration::default()
+        });
+        assert_eq!(explicit.sandbox, Some(SandboxMode::DangerFullAccess));
+        assert_eq!(explicit.approval_policy, Some(AskForApproval::Never));
+        assert_eq!(
+            explicit.approvals_reviewer,
+            Some(ApprovalsReviewer::AutoReview)
+        );
+        let routing = super::overrides(&mango_external_agents::Configuration {
+            routing: Some(ApprovalRouting::AutoReview),
+            ..mango_external_agents::Configuration::default()
+        });
+        assert_eq!(routing.sandbox, None);
+        assert_eq!(routing.approval_policy, None);
+        assert_eq!(
+            routing.approvals_reviewer,
+            Some(ApprovalsReviewer::AutoReview)
+        );
+    }
+
+    #[test]
+    fn structured_sandbox_policies_bound_writes_and_network() {
+        let cases = [
+            (
+                PermissionLevel::ReadOnly,
+                serde_json::json!({"type": "readOnly", "networkAccess": false}),
+            ),
+            (
+                PermissionLevel::Default,
+                serde_json::json!({"type": "workspaceWrite", "writableRoots": ["/workspace"], "networkAccess": false, "excludeTmpdirEnvVar": true, "excludeSlashTmp": true}),
+            ),
+            (
+                PermissionLevel::FullAccess,
+                serde_json::json!({"type": "dangerFullAccess"}),
+            ),
+        ];
+        for (level, expected) in cases {
+            let config = VendorConfiguration::for_pair(level, ApprovalRouting::User);
+            assert_eq!(
+                serde_json::to_value(config.sandbox_policy("/workspace"))
+                    .expect("serializable policy"),
+                expected
+            );
+        }
+    }
 
     /// The sandbox and the policy move together. A pair that set one and not the other would
     /// produce a configuration nobody chose.

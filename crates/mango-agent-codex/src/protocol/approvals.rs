@@ -131,6 +131,17 @@ impl ServerRequest {
             Self::Refused { .. } => None,
         }
     }
+
+    /// Which native turn the question belongs to, when the server named one.
+    /// For example, compare `request.turn_id()` with the active turn before offering approval.
+    #[must_use]
+    pub fn turn_id(&self) -> Option<&str> {
+        match self {
+            Self::CommandExecution(params) => Some(params.turn_id.as_str()),
+            Self::FileChange(params) => Some(params.turn_id.as_str()),
+            Self::Refused { .. } => None,
+        }
+    }
 }
 
 /// May the agent run this command?
@@ -293,6 +304,7 @@ mod tests {
             }),
         );
 
+        assert_eq!(request.turn_id(), Some("01a09999-78a8"));
         let ServerRequest::CommandExecution(params) = request else {
             panic!("expected a command approval");
         };

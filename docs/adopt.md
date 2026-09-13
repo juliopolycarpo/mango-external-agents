@@ -70,6 +70,9 @@ already logged into with the vendor's own CLI.
   request rather than on the context every harness shares.
 - `Harness::open_session` → a `Box<dyn Session>`. `SessionInfo` carries both ids, whether the
   vendor resumed, the configuration it actually accepted and what this build can do.
+- `Session::configuration()` → the defaults a later turn inherits. `SessionInfo` is the opening
+  snapshot; vendors such as Codex persist successful turn overrides. Read the shared accessor
+  when displaying current settings or constructing the next request.
 - `Session::start_turn` → a `TurnStream`: a bounded channel of `AgentEvent`. A host that stops
   reading slows the vendor instead of growing the library's memory.
 - `AgentEvent { session_id, turn_id, at, kind }`. The `kind` is one of seventeen: session started,
@@ -79,6 +82,17 @@ already logged into with the vendor's own CLI.
 
 Cancellation is a marker, not a terminal: it is emitted immediately before `Completed` and never
 instead of it, so a host that does not recognise it still sees its turn end.
+
+Start with `Configuration::default()` to leave permissions under the user's vendor profile.
+Select a level explicitly with `level: Some(PermissionLevel::Default)` and select approval routing
+with `routing: Some(ApprovalRouting::User)`. Successful explicit settings become session defaults;
+later omitted fields retain them. Hosts need not resend settings on every turn. An absent value
+from `Session::configuration()` means no reported selection, not read-only access.
+
+For native review, pass a `ReviewRequest` to `Session::start_review`. `ReviewTarget` covers
+uncommitted changes, a base branch, a commit, and custom instructions. The returned `ReviewStream`
+contains an ordinary `TurnStream`, so the same event relay handles both. A harness that cannot
+review returns `Error::NotSupported`; the host needs no vendor protocol code.
 
 ## Mapping events to your own product
 

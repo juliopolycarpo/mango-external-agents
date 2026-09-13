@@ -35,6 +35,13 @@ pub enum Outcome {
         /// The failure, when it failed.
         failure: Option<VendorError>,
     },
+    /// The terminal frame was malformed and could not name a conversation. The session must stop
+    /// accepting work after failing its active stream because it cannot safely correlate later
+    /// frames on this connection.
+    Poison {
+        /// The protocol failure to put on the active stream.
+        failure: VendorError,
+    },
     /// Nothing a host needs to know about.
     Ignore,
 }
@@ -65,6 +72,19 @@ pub fn reduce(notification: &Notification, thread_id: &str, now: std::time::Syst
         return Outcome::Ignore;
     }
 
+    if notification.is_malformed_terminal() {
+        let failure = malformed_terminal_failure();
+        return if notification.thread_id().is_some() {
+            Outcome::Finish {
+                events: Vec::new(),
+                cancelled: None,
+                failure: Some(failure),
+            }
+        } else {
+            Outcome::Poison { failure }
+        };
+    }
+
     match notification {
         Notification::AgentMessageDelta(delta) if !delta.delta.is_empty() => {
             Outcome::one(EventKind::TextDelta {
@@ -93,8 +113,35 @@ pub fn reduce(notification: &Notification, thread_id: &str, now: std::time::Syst
         | Notification::Error(_)
         | Notification::AgentMessageDelta(_)
         | Notification::ReasoningDelta(_)
+        | Notification::Malformed { .. }
         | Notification::Other { .. } => Outcome::Ignore,
     }
+}
+
+/// Reduces an announcement after checking it against the current turn's native id.
+///
+/// The start response is the authoritative id. `turn/started` deliberately bypasses this check,
+/// because native reviews announce a different id in that early notification than they use for
+/// their items and completion.
+#[must_use]
+pub fn reduce_for_active_turn(
+    notification: &Notification,
+    thread_id: &str,
+    active_native_turn_id: Option<&str>,
+    now: std::time::SystemTime,
+) -> Outcome {
+    let Some(active_native_turn_id) = active_native_turn_id else {
+        return Outcome::Ignore;
+    };
+    if !active_native_turn_id.is_empty()
+        && notification.requires_native_turn_match()
+        && notification
+            .turn_id()
+            .is_some_and(|turn_id| turn_id != active_native_turn_id)
+    {
+        return Outcome::Ignore;
+    }
+    reduce(notification, thread_id, now)
 }
 
 fn item_started(item: &ThreadItem) -> Outcome {
@@ -162,6 +209,17 @@ fn to_usage(breakdown: &TokenUsageBreakdown) -> Usage {
 
 /// The code every Codex turn failure is reported under.
 pub const TURN_FAILED: ErrorCode = ErrorCode::from_static("codex-turn-failed");
+
+/// The app-server named a terminal notification but did not provide the shape this harness needs.
+pub const PROTOCOL_ERROR: ErrorCode = ErrorCode::from_static("codex-protocol-error");
+
+fn malformed_terminal_failure() -> VendorError {
+    VendorError::new(
+        PROTOCOL_ERROR,
+        "expected turn/completed params with a string threadId and turn.id, received malformed params",
+    )
+    .with_vendor_code("malformed-turn-completed", false)
+}
 
 fn finish(status: Option<TurnStatus>, turn: &crate::protocol::requests::TurnHandle) -> Outcome {
     match status {
@@ -437,6 +495,21 @@ mod tests {
                 failure: None
             }
         );
+    }
+
+    /// A terminal the server cannot route is unsafe to ignore because no later completion can be
+    /// tied back to this connection's active stream.
+    #[test]
+    fn an_unroutable_malformed_terminal_poisons_the_connection() {
+        let outcome = reduce(
+            &notification(method::TURN_COMPLETED, json!({"unexpected": true})),
+            THREAD,
+            now(),
+        );
+        let Outcome::Poison { failure } = outcome else {
+            panic!("expected malformed terminal to poison the connection, received {outcome:?}");
+        };
+        assert_eq!(failure.code.as_str(), "codex-protocol-error");
     }
 
     /// The one frame whose unknown spelling must not cost the turn. A strict enum would fail the

@@ -21,7 +21,7 @@ use mango_external_agents::transports::stdio;
 use mango_external_agents::{ClientInfo as HostClientInfo, HostContext};
 
 use crate::discovery::{self, LOGIN_HINT, PROGRAM};
-use crate::permissions::VendorConfiguration;
+use crate::permissions::PermissionOverrides;
 use crate::protocol::requests::{
     AccountReadResponse, ClientInfo, InitializeParams, InitializeResponse, ModelListParams,
     ModelListResponse, ThreadResumeParams, ThreadStartParams, ThreadStartResponse, empty_params,
@@ -283,7 +283,7 @@ async fn open_thread(
     }
 
     let configuration = &request.configuration;
-    let vendor = VendorConfiguration::for_pair(configuration.level, configuration.routing);
+    let vendor = crate::permissions::overrides(configuration);
     let cwd = host.cwd().to_string_lossy().into_owned();
 
     let (response, resumed, fallback_reason) = match &request.resume {
@@ -292,9 +292,9 @@ async fn open_thread(
                 thread_id: resume.native_session_id.clone(),
                 cwd: cwd.clone(),
                 model: configuration.model.clone(),
-                approval_policy: Some(vendor.approval_policy),
-                sandbox: Some(vendor.sandbox),
-                approvals_reviewer: Some(vendor.approvals_reviewer),
+                approval_policy: vendor.approval_policy,
+                sandbox: vendor.sandbox,
+                approvals_reviewer: vendor.approvals_reviewer,
                 // Metadata only. The vendor keeps the transcript it wrote, and this library never
                 // replays one into anybody's context.
                 exclude_turns: true,
@@ -354,7 +354,7 @@ async fn start_thread(
     client: &Client,
     cwd: &str,
     configuration: &Configuration,
-    vendor: VendorConfiguration,
+    vendor: PermissionOverrides,
 ) -> Result<ThreadStartResponse> {
     client
         .request(
@@ -362,9 +362,9 @@ async fn start_thread(
             ThreadStartParams {
                 cwd: cwd.to_owned(),
                 model: configuration.model.clone(),
-                approval_policy: Some(vendor.approval_policy),
-                sandbox: Some(vendor.sandbox),
-                approvals_reviewer: Some(vendor.approvals_reviewer),
+                approval_policy: vendor.approval_policy,
+                sandbox: vendor.sandbox,
+                approvals_reviewer: vendor.approvals_reviewer,
             },
         )
         .await

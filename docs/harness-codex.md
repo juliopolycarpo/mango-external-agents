@@ -3,7 +3,7 @@
 Drives the `codex` CLI a user already installed, through `codex app-server` — the interface OpenAI
 documents for rich clients and uses for its own VS Code extension.
 
-Facts on this page were read on 2026-09-13 against `codex-cli 0.153.4`. Re-verify against the
+Facts on this page were read on 2026-09-13 against `codex-cli 0.154.0`. Re-verify against the
 vendor's current documentation before relying on them.
 
 ## The executable and the version gate
@@ -13,7 +13,7 @@ vendor's current documentation before relying on them.
 | Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name    |
 | Arguments         | `app-server`, and nothing else                                               |
 | Version read from | `codex --version` for a probe; the handshake's own `userAgent` for a session |
-| Minimum version   | `0.153.4` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`              |
+| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`              |
 
 The floor is the pinned build rather than something older. The app-server's item families and its
 `thread/`–`turn/` method names changed shape inside the 0.15x series, so a lower floor would be a
@@ -26,7 +26,8 @@ the shape of its version output has not stopped working, and the host may still 
 
 ## The documented surface this harness drives
 
-Every method below is from [`codex-rs/app-server/README.md`][readme] at `rust-v0.153.4`. JSON-RPC
+Every method below follows the [official app-server documentation][app-server] and the
+[`codex-rs/app-server/README.md`][readme] at `rust-v0.154.0`. JSON-RPC
 2.0 over newline-delimited JSON, **without** the `"jsonrpc"` member — the README's own words:
 "bidirectional communication using JSON-RPC 2.0 messages (with the `"jsonrpc":"2.0"` header omitted
 on the wire)".
@@ -57,9 +58,10 @@ Everything else is dropped by name.
 not one — it carries `willRetry`, and the turn's own completion still follows. Ending a turn there
 would end the host's turn twice.
 
-**Every conversation-scoped notification is filtered by thread id.** A subagent's thread rides the
-same connection, and replaying its events under this session's turn would attribute another
-conversation's work to this one.
+**Conversation events and approvals retain thread and native-turn ownership.** Delayed events
+cannot finish a replacement turn. Reviews explicitly account for the early `turn/started` id
+differing from the review response. Child-thread events remain excluded until the shared API
+can represent parent-child activity and approval ownership.
 
 ## Sessions, turns and steering
 
@@ -81,9 +83,14 @@ own refusal (`-32600 "no active turn to steer"`) maps to `SteerRejection::TurnAl
 on a thread this session is not subscribed to, and its events would arrive under an id the reducer
 drops. `ReviewStream::review_thread_id` reports whatever the server named.
 
+Hosts use the shared `ReviewTarget` enum for uncommitted changes, a base branch, a commit with an
+optional title, or custom instructions. Each target uses the same bounded stream, cancellation,
+and completion handling as an ordinary turn. Hosts do not construct Codex requests themselves.
+
 Attachments: image attachments travel as `UserInput::image` with a `data:` URL, verified against a
-real `turn/start`. Other attachment kinds are dropped — `UserInput` has no general-purpose file arm,
-and smuggling one in as text would send something different from what the host attached.
+real `turn/start`. PNG, JPEG, GIF and WebP are accepted, up to four attachments and 2 MiB each.
+Unsupported kinds, media types and oversized inputs are rejected before encoding or writing a
+request; `UserInput` has no general-purpose file arm.
 
 Cancelling before `turn/start` answers records the request and keeps the vendor's turn slot
 occupied. The returned handle is interrupted as soon as it arrives; another start is refused
@@ -91,9 +98,22 @@ until the vendor completes or the start fails. Late start responses only update 
 start attempt, even if a host reuses a `TurnId`. This follows the vendor's requirement to name
 the active turn in `turn/interrupt` and `turn/steer`.
 
+Ambiguous start failures retain the slot until completion or shutdown. Malformed terminal frames
+fail their addressed turn; an unrouteable terminal closes the session. Connection loss and host
+shutdown terminate active streams, release approvals and reap the process. RPC responses settle
+independently of the bounded notification queue; queue overflow closes the connection instead of
+growing memory or silently dropping lifecycle events.
+
+Native reviews reject steering with `TurnNotSteerable`. Closing offers the cancellation marker
+and completion atomically within a bounded grace period. A one-event channel can carry only the
+completion; a stalled consumer never receives a cancellation marker without its terminal.
+
 ## The permission matrix
 
-All six (level, routing) pairs are supported. A level is two vendor settings that move together,
+All six explicit (level, routing) pairs are supported. Omitted permission fields leave the user's
+Codex profile in control: the harness sends no sandbox, approval policy or reviewer override for
+an axis the host has never selected. `Configuration::default()` does not impose read-only mode.
+A selected level is two vendor settings that move together,
 because setting one without the other produces a configuration nobody chose:
 
 | `PermissionLevel` | `sandbox`            | `approvalPolicy` |
@@ -112,6 +132,18 @@ change the machine, so an escalation prompt's only honest answer is no.
 
 `auto_review` was accepted by a real app-server on a consumer subscription, so refusing the cell
 here would be this harness narrowing what the vendor offers rather than reporting it.
+
+Per-turn permission changes send `approvalPolicy` and the structured `sandboxPolicy` together.
+Read-only disables network access; workspace-write authorises only the host's workspace and
+excludes temporary directories. Full access is sent only from a host-selected configuration.
+These fields use the pinned CLI's schema, which does not yet declare the newer `ReadOnlyAccess`
+fields shown in the current online documentation.
+
+Codex persists successful turn overrides. `Session::configuration()` reports the settings a later
+turn inherits; omitted fields retain the last host selection, or the user's Codex defaults if
+there has been no selection. `SessionInfo::effective_configuration` remains the opening snapshot.
+Native reviews inherit the same current settings. Hosts use the shared `Session` trait and need
+no Codex-specific permission state machine.
 
 ## Approvals
 
@@ -219,8 +251,8 @@ workspace refuses and a dependency surface no MSRV lane could hold.
 
 What is vendored instead is OpenAI's own description of the wire.
 `codex app-server generate-json-schema` is a documented subcommand; `scripts/vendor-codex.sh` runs
-it against the pinned build and reduces the 622-definition, 583 KB bundle to the field names and
-enum values of the types this harness speaks — 12 KB in `vendor/schema.json`. The tests in
+it against the pinned build and reduces the bundle to field names, enum values and JSON-RPC
+method discriminators in `vendor/schema.json`. The tests in
 `src/protocol/schema.rs` assert every name this crate writes or reads against it, so a field
 renamed upstream fails a test here rather than a turn on a user's machine.
 
@@ -241,10 +273,13 @@ cargo run -p mea -- turn --harness codex "summarise this repository"
 cargo run -p mea -- capture codex
 ```
 
-`fixtures/codex/` holds five conversations recorded by `mea capture codex` against a real
-`codex app-server`: `handshake`, `turn`, `approval`, `interrupt` and `review`. They are never hand-edited —
-the redaction happens in the capture (`examples/mea/src/redact.rs`), which replaces the members
-that identify a person or a machine and rewrites the capture's own two directories.
+`fixtures/codex/` holds conversations recorded by `mea capture codex` against a real
+`codex app-server`: `handshake`, `turn`, `approval`, `interrupt`, `review`, three additional review
+targets, `permission-transitions` and `user-defaults`. They are never hand-edited —
+the redaction happens in the capture (`examples/mea/src/redact.rs`). Incoming frames retain the
+wire shape, enum values and opaque identifiers that replay needs, while every other vendor string
+becomes `[REDACTED]`. Fixtures are protocol evidence, not a record of a model answer, command,
+tool result, review or reasoning.
 
 The approval fixture records a **refusal**. A fixture that captured a grant would be a recording of
 this tool letting an agent out of its sandbox, checked into the repository.
@@ -255,23 +290,11 @@ this tool letting an agent out of its sandbox, checked into the repository.
 - No MCP passthrough (see above).
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
-- A turn cannot change its session's `PermissionLevel`. A level requires both a sandbox and an
-  approval policy; this harness currently sends only the policy on `turn/start`. The vendor's
-  `TurnStartParams` also declares `sandboxPolicy`, but the harness does not model it yet.
-  `Session::start_turn` refuses a level that differs from the session's. Supporting changes needs
-  schema coverage and verification against a real server. Per-turn `routing`, `model` and `effort`
-  apply today.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
-- `SteerRejection::TurnNotSteerable` is never produced. The app-server's refusal for a turn that
-  refuses steering — a review, a compaction — has not been observed, so a steer it declines for any
-  reason other than "no active turn" surfaces as the vendor error rather than as that reason.
-- A session closed while its host has stopped reading ends that turn with a bare
-  `Completed` under a 200 ms grace, rather than with the cancellation marker a turn that ends
-  normally carries. One event is what fits: a bounded sink offers no way to put two events on or
-  neither, and a grace that elapsed between a marker and its terminal would leave the host the one
-  shape the core's contract rules out. The reason is not lost with the marker — it is the argument
-  the host passed to `close` in the first place.
+- Vendor steering refusals other than the observed "no active turn" response retain the vendor
+  error; native reviews are rejected locally as `TurnNotSteerable`.
 
 Compliance posture: see [compliance.md](compliance.md).
 
-[readme]: https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/app-server/README.md
+[readme]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md
+[app-server]: https://learn.chatgpt.com/docs/app-server

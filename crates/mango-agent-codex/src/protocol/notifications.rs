@@ -64,6 +64,18 @@ pub enum Notification {
     ServerRequestResolved(ServerRequestResolved),
     /// A failure that does not end the turn.
     Error(ErrorNotification),
+    /// A notification family this harness recognises, whose parameters did not decode.
+    ///
+    /// The routing values are recovered independently of the typed payload. A malformed terminal
+    /// still has to end the active stream when the server gave enough information to identify it.
+    Malformed {
+        /// The method the server used.
+        method: String,
+        /// The conversation, when the raw params named one as a string.
+        thread_id: Option<String>,
+        /// The native turn, when the raw params named one as a string.
+        turn_id: Option<String>,
+    },
     /// A family this harness does not act on.
     ///
     /// Kept as its method name rather than dropped at the parse, so a reducer test can assert that
@@ -76,10 +88,6 @@ pub enum Notification {
 
 impl Notification {
     /// Reads one announcement, or `Other` when it is a family this harness does not act on.
-    ///
-    /// A family this harness *does* act on whose params will not deserialise is `Other` as well:
-    /// a malformed frame is one event lost, and ending a live turn over it would be worse than
-    /// the loss.
     #[must_use]
     pub fn parse(method: &str, params: Value) -> Self {
         fn read<T: serde::de::DeserializeOwned>(
@@ -87,9 +95,16 @@ impl Notification {
             method: &str,
             wrap: impl FnOnce(T) -> Notification,
         ) -> Notification {
-            serde_json::from_value(params).map_or_else(
-                |_| Notification::Other {
+            serde_json::from_value(params.clone()).map_or_else(
+                |_| Notification::Malformed {
                     method: method.to_owned(),
+                    thread_id: routing_string(&params, "threadId"),
+                    turn_id: routing_string(&params, "turnId").or_else(|| {
+                        params
+                            .pointer("/turn/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    }),
                 },
                 wrap,
             )
@@ -136,9 +151,66 @@ impl Notification {
             Self::ServerRequestResolved(resolved) => Some(resolved.thread_id.as_str()),
             Self::Error(error) => Some(error.thread_id.as_str()),
             // Account quota is the account's, not a conversation's.
+            Self::Malformed { thread_id, .. } => thread_id.as_deref(),
             Self::RateLimits(_) | Self::Other { .. } => None,
         }
     }
+
+    /// The native turn this belongs to, when this notification family names one.
+    /// For example, use `notification.turn_id()` to reject a delayed completion for another turn.
+    #[must_use]
+    pub fn turn_id(&self) -> Option<&str> {
+        match self {
+            Self::TurnStarted(notification) | Self::TurnCompleted(notification) => {
+                Some(notification.turn.id.as_str())
+            }
+            Self::ItemStarted(notification) | Self::ItemCompleted(notification) => {
+                Some(notification.turn_id.as_str())
+            }
+            Self::AgentMessageDelta(delta) => Some(delta.turn_id.as_str()),
+            Self::ReasoningDelta(delta) => Some(delta.turn_id.as_str()),
+            Self::ThreadTokenUsage(usage) => Some(usage.turn_id.as_str()),
+            Self::Error(error) => Some(error.turn_id.as_str()),
+            Self::Malformed { turn_id, .. } => turn_id.as_deref(),
+            Self::ThreadStarted(_)
+            | Self::RateLimits(_)
+            | Self::ServerRequestResolved(_)
+            | Self::Other { .. } => None,
+        }
+    }
+
+    /// Whether this notification must match the active native turn before it can render or end.
+    ///
+    /// `turn/started` is excluded. Native review captures show that its id can differ from the
+    /// `review/start` response and from every later item and completion for the same review.
+    /// For example, gate an id comparison on `notification.requires_native_turn_match()`.
+    #[must_use]
+    pub fn requires_native_turn_match(&self) -> bool {
+        matches!(
+            self,
+            Self::TurnCompleted(_)
+                | Self::ItemStarted(_)
+                | Self::ItemCompleted(_)
+                | Self::AgentMessageDelta(_)
+                | Self::ReasoningDelta(_)
+                | Self::ThreadTokenUsage(_)
+                | Self::Error(_)
+        ) || self.is_malformed_terminal()
+    }
+
+    /// Whether malformed terminal parameters can strand an active stream.
+    /// For example, `notification.is_malformed_terminal()` selects the fail-closed path.
+    #[must_use]
+    pub fn is_malformed_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Malformed { method, .. } if method == method::TURN_COMPLETED
+        )
+    }
+}
+
+fn routing_string(params: &Value, key: &str) -> Option<String> {
+    params.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
 /// A conversation opened.
@@ -344,14 +416,19 @@ mod tests {
         assert_eq!(notification.thread_id(), None);
     }
 
-    /// A malformed frame in a family this harness *does* act on costs one event, never the turn.
+    /// A malformed terminal keeps the routing values needed to end its addressed stream.
     #[test]
-    fn a_family_that_matters_with_params_that_do_not_parse_is_ignored_rather_than_fatal() {
-        let notification = Notification::parse(method::TURN_COMPLETED, json!({"threadId": 7}));
+    fn a_malformed_terminal_keeps_its_method_and_any_routing_values() {
+        let notification = Notification::parse(
+            method::TURN_COMPLETED,
+            json!({"threadId": "thread-1", "turn": {"id": "turn-1", "status": 7}}),
+        );
         assert_eq!(
             notification,
-            Notification::Other {
-                method: String::from(method::TURN_COMPLETED)
+            Notification::Malformed {
+                method: String::from(method::TURN_COMPLETED),
+                thread_id: Some(String::from("thread-1")),
+                turn_id: Some(String::from("turn-1")),
             }
         );
     }

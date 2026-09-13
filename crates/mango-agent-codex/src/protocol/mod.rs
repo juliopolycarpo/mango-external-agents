@@ -43,9 +43,8 @@ pub use requests::{
 
 /// The methods this harness calls, exactly as the app-server spells them.
 ///
-/// Named rather than written inline so the drift check in `schema` has one list to compare
-/// against the pinned bundle, and so a typo is a missing constant rather than a `-32601` at run
-/// time.
+/// Named rather than written inline so the drift check in `schema` can compare each method to the
+/// pinned bundle, and so a typo is a missing constant rather than a `-32601` at run time.
 pub mod method {
     /// The one call that must precede every other on a connection.
     pub const INITIALIZE: &str = "initialize";
@@ -75,33 +74,3 @@ pub mod method {
 
 /// The peer as a person would name it, in errors and log lines.
 pub const PEER_NAME: &str = "Codex app-server";
-
-#[cfg(test)]
-mod tests {
-    use super::method;
-
-    /// Every method this harness calls sits under a namespace the app-server README documents.
-    #[test]
-    fn every_method_is_namespaced_the_way_the_app_server_spells_it() {
-        let methods = [
-            method::INITIALIZE,
-            method::INITIALIZED,
-            method::THREAD_START,
-            method::THREAD_RESUME,
-            method::THREAD_LIST,
-            method::TURN_START,
-            method::TURN_STEER,
-            method::TURN_INTERRUPT,
-            method::REVIEW_START,
-            method::MODEL_LIST,
-            method::ACCOUNT_READ,
-            method::ACCOUNT_RATE_LIMITS_READ,
-        ];
-        for name in methods {
-            assert!(
-                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '/'),
-                "expected an app-server method name, received {name:?}"
-            );
-        }
-    }
-}

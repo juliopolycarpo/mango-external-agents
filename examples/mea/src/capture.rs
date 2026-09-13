@@ -18,7 +18,7 @@ use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::link::{LinkReceiver, LinkSender};
 use mango_external_agents::transport::{ExecutablePath, StdioSpec};
 use mango_external_agents::transports::stdio;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::redact;
 
@@ -61,6 +61,26 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "review",
         purpose: "the vendor's own review, run inline on the session's thread",
+    },
+    Scenario {
+        name: "review-base-branch",
+        purpose: "an inline review against the current branch",
+    },
+    Scenario {
+        name: "review-commit",
+        purpose: "an inline review of HEAD",
+    },
+    Scenario {
+        name: "review-custom",
+        purpose: "an inline review with host-provided instructions",
+    },
+    Scenario {
+        name: "permission-transitions",
+        purpose: "explicit policies followed by a turn that inherits full access",
+    },
+    Scenario {
+        name: "user-defaults",
+        purpose: "a thread and turn that leave the user's Codex permission defaults untouched",
     },
 ];
 
@@ -157,7 +177,11 @@ impl Recorder {
             "turn" => self.turn().await,
             "approval" => self.approval().await,
             "interrupt" => self.interrupt().await,
-            "review" => self.review().await,
+            "review" | "review-base-branch" | "review-commit" | "review-custom" => {
+                self.review(scenario.name).await
+            }
+            "permission-transitions" => self.permission_transitions().await,
+            "user-defaults" => self.user_defaults().await,
             other => Err(Error::HostConfiguration {
                 expected: "a scenario this command knows",
                 received: other.to_owned(),
@@ -259,22 +283,76 @@ impl Recorder {
         self.read_until(is_turn_completed).await.map(|_| ())
     }
 
-    async fn review(&mut self) -> Result<()> {
+    async fn review(&mut self, scenario: &str) -> Result<()> {
         let thread = self.start_thread("read-only", "never").await?;
         // Without `delivery`, which the server reads as inline: a detached review runs on a thread
         // the session is not subscribed to, and this transcript would describe events the harness
         // is right to drop.
         self.send(json!({"id": 10, "method": "review/start", "params": {
-            "threadId": thread, "target": {"type": "uncommittedChanges"}
+            "threadId": thread, "target": review_target(scenario)
         }}))
         .await?;
         self.read_until(is_turn_completed).await.map(|_| ())
     }
 
+    async fn permission_transitions(&mut self) -> Result<()> {
+        let thread = self.start_thread("read-only", "never").await?;
+        for (index, level) in [
+            mango_external_agents::PermissionLevel::ReadOnly,
+            mango_external_agents::PermissionLevel::Default,
+            mango_external_agents::PermissionLevel::FullAccess,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let configuration = mango_agent_codex::permissions::VendorConfiguration::for_pair(
+                level,
+                mango_external_agents::ApprovalRouting::User,
+            );
+            self.send(json!({"id": 10 + index, "method": "turn/start", "params": {
+                "threadId": thread,
+                "input": [{"type": "text", "text": "Reply with the single word mango. Do not use tools.", "text_elements": []}],
+                "approvalPolicy": configuration.approval_policy,
+                "sandboxPolicy": configuration.sandbox_policy(&self.cwd),
+                "approvalsReviewer": configuration.approvals_reviewer
+            }})).await?;
+            self.read_until(is_turn_completed).await?;
+        }
+
+        // Codex keeps a thread's explicit selection. Omitting every permission member on the next
+        // turn records that inheritance rather than accidentally forcing a host default again.
+        self.send(json!({"id": 13, "method": "turn/start", "params":
+            unconfigured_turn_params(&thread)
+        }))
+        .await?;
+        self.read_until(is_turn_completed).await?;
+        Ok(())
+    }
+
+    async fn user_defaults(&mut self) -> Result<()> {
+        // An omitted initial policy asks Codex to use the user's own configured defaults. This is
+        // deliberately distinct from a read-only policy, which would overwrite that choice.
+        let thread = self.start_thread_with(None, None).await?;
+        self.send(json!({"id": 10, "method": "turn/start", "params":
+            unconfigured_turn_params(&thread)
+        }))
+        .await?;
+        self.read_until(is_turn_completed).await.map(|_| ())
+    }
+
     async fn start_thread(&mut self, sandbox: &str, approval_policy: &str) -> Result<String> {
-        self.send(json!({"id": 5, "method": "thread/start", "params": {
-            "cwd": self.cwd, "sandbox": sandbox, "approvalPolicy": approval_policy
-        }}))
+        self.start_thread_with(Some(sandbox), Some(approval_policy))
+            .await
+    }
+
+    async fn start_thread_with(
+        &mut self,
+        sandbox: Option<&str>,
+        approval_policy: Option<&str>,
+    ) -> Result<String> {
+        self.send(json!({"id": 5, "method": "thread/start", "params":
+            thread_start_params(&self.cwd, sandbox, approval_policy)
+        }))
         .await?;
         let started = self
             .read_until(|frame| frame.get("id") == Some(&json!(5)))
@@ -290,8 +368,10 @@ impl Recorder {
 
     async fn send(&mut self, frame: Value) -> Result<()> {
         let line = frame.to_string();
-        self.lines
-            .push(format!("{SENT}{}", redact::frame(frame, self.paths())));
+        self.lines.push(format!(
+            "{SENT}{}",
+            redact::outgoing_frame(frame, self.paths())
+        ));
         self.sender.send(line).await
     }
 
@@ -324,7 +404,7 @@ impl Recorder {
             };
             self.lines.push(format!(
                 "{RECEIVED}{}",
-                redact::frame(frame.clone(), self.paths())
+                redact::incoming_frame(frame.clone(), self.paths())
             ));
             if matches(&frame) {
                 return Ok(frame);
@@ -358,8 +438,95 @@ fn is_turn_completed(frame: &Value) -> bool {
     frame.get("method") == Some(&json!("turn/completed"))
 }
 
+/// Builds `thread/start` members without imposing a permission choice when one is absent.
+fn thread_start_params(cwd: &str, sandbox: Option<&str>, approval_policy: Option<&str>) -> Value {
+    let mut params = Map::from_iter([(String::from("cwd"), json!(cwd))]);
+    if let Some(sandbox) = sandbox {
+        params.insert(String::from("sandbox"), json!(sandbox));
+    }
+    if let Some(approval_policy) = approval_policy {
+        params.insert(String::from("approvalPolicy"), json!(approval_policy));
+    }
+    Value::Object(params)
+}
+
+/// Builds a no-tools turn that deliberately leaves Codex permission members absent.
+fn unconfigured_turn_params(thread: &str) -> Value {
+    json!({
+        "threadId": thread,
+        "input": [{
+            "type": "text",
+            "text": "Reply with the single word mango. Do not use tools.",
+            "text_elements": []
+        }]
+    })
+}
+
+fn review_target(scenario: &str) -> Value {
+    match scenario {
+        "review-base-branch" => json!({"type": "baseBranch", "branch": "HEAD"}),
+        "review-commit" => json!({"type": "commit", "sha": "HEAD", "title": "Current commit"}),
+        "review-custom" => {
+            json!({"type": "custom", "instructions": "Review the current changes for correctness. Do not modify files."})
+        }
+        _ => json!({"type": "uncommittedChanges"}),
+    }
+}
+
 /// Where fixtures live, relative to the repository root.
 #[must_use]
 pub fn default_out_dir() -> PathBuf {
     PathBuf::from("fixtures/codex")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{review_target, thread_start_params, unconfigured_turn_params};
+    use serde_json::json;
+
+    #[test]
+    fn review_scenarios_use_the_documented_targets() {
+        assert_eq!(
+            review_target("review"),
+            json!({"type": "uncommittedChanges"})
+        );
+        assert_eq!(
+            review_target("review-base-branch"),
+            json!({"type": "baseBranch", "branch": "HEAD"})
+        );
+        assert_eq!(
+            review_target("review-commit"),
+            json!({"type": "commit", "sha": "HEAD", "title": "Current commit"})
+        );
+        assert_eq!(review_target("review-custom")["type"], "custom");
+        assert!(
+            review_target("review-custom")["instructions"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+    }
+
+    #[test]
+    fn user_default_thread_start_omits_permission_members() {
+        let params = thread_start_params("/workspace", None, None);
+
+        assert_eq!(params["cwd"], "/workspace");
+        assert!(params.get("sandbox").is_none());
+        assert!(params.get("approvalPolicy").is_none());
+    }
+
+    #[test]
+    fn unconfigured_turn_omits_every_permission_member() {
+        let params = unconfigured_turn_params("thread-1");
+
+        assert_eq!(params["threadId"], "thread-1");
+        for member in [
+            "approvalPolicy",
+            "sandbox",
+            "sandboxPolicy",
+            "approvalsReviewer",
+        ] {
+            assert!(params.get(member).is_none(), "{member} must be absent");
+        }
+    }
 }

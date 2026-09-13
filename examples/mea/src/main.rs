@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::{
-    AuthState, EnvSource, ExecutablePath, HarnessKind, HarnessRegistry, HostContext, OpenSession,
-    PermissionLevel, TurnRequest,
+    ApprovalRouting, AuthState, EnvSource, ExecutablePath, HarnessKind, HarnessRegistry,
+    HostContext, OpenSession, PermissionLevel, TurnRequest,
 };
 
 /// Every harness kind the binary links, in registry order.
@@ -109,14 +109,14 @@ fn print_banner() {
 /// What a subcommand was asked for.
 struct Options {
     kind: HarnessKind,
-    level: PermissionLevel,
+    level: Option<PermissionLevel>,
     prompt: String,
 }
 
 impl Options {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let mut kind = HarnessKind::Claude;
-        let mut level = PermissionLevel::ReadOnly;
+        let mut level = None;
         let mut words: Vec<&str> = Vec::new();
         let mut rest = arguments.iter();
         while let Some(argument) = rest.next() {
@@ -138,9 +138,9 @@ impl Options {
                 "--level" => {
                     let named = rest.next().ok_or("expected a level after --level")?;
                     level = match named.as_str() {
-                        "read-only" => PermissionLevel::ReadOnly,
-                        "default" => PermissionLevel::Default,
-                        "full-access" => PermissionLevel::FullAccess,
+                        "read-only" => Some(PermissionLevel::ReadOnly),
+                        "default" => Some(PermissionLevel::Default),
+                        "full-access" => Some(PermissionLevel::FullAccess),
                         other => {
                             return Err(format!(
                                 "expected `read-only`, `default` or `full-access`, received {other:?}"
@@ -213,7 +213,12 @@ async fn turn(options: &Options) -> Result<(), String> {
     }
 
     let mut request = OpenSession::new(format!("mea-{}", uuid_like()));
-    request.configuration.level = options.level;
+    if let Some(level) = options.level {
+        request.configuration.level = Some(level);
+        // The CLI only exposes the level axis. Its explicit form keeps the historic interactive
+        // routing; omission of `--level` leaves both axes to the vendor.
+        request.configuration.routing = Some(ApprovalRouting::User);
+    }
     if let Some(executable) = &discovery.executable {
         request = request.with_executable(ExecutablePath::resolved(executable.clone()));
     }
@@ -292,11 +297,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_claude_at_the_narrow_end_of_the_permission_axis() {
+    fn defaults_to_claude_without_overriding_the_vendors_permission_axis() {
         let options = Options::parse(&[String::from("say"), String::from("hello")])
             .expect("expected the arguments to parse");
         assert_eq!(options.kind, HarnessKind::Claude);
-        assert_eq!(options.level, PermissionLevel::ReadOnly);
+        assert_eq!(options.level, None);
         assert_eq!(options.prompt, "say hello");
     }
 
@@ -308,7 +313,7 @@ mod tests {
             String::from("ship"),
         ])
         .expect("expected the arguments to parse");
-        assert_eq!(options.level, PermissionLevel::FullAccess);
+        assert_eq!(options.level, Some(PermissionLevel::FullAccess));
         assert_eq!(options.prompt, "ship");
     }
 

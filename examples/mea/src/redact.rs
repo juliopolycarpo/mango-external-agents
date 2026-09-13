@@ -2,12 +2,13 @@
 //!
 //! A captured transcript is a real conversation with a real account on a real machine, and the
 //! rule that fixtures are never hand-edited means the scrubbing has to happen here rather than in
-//! a text editor afterwards. Two kinds of thing go: values a vendor writes that identify a person
-//! or an installation, and paths that carry a home directory.
+//! a text editor afterwards. Vendor-generated text is private by default. The fixture keeps wire
+//! structure, enum values and opaque identifiers, then replaces every other string the server
+//! sends.
 //!
-//! This is deliberately a denylist of field names rather than a pattern search. A pattern that
-//! looked for anything email-shaped would also rewrite the body of a turn, and a fixture whose
-//! content was silently altered is worse than no fixture.
+//! This allows the fakes to replay a real protocol conversation without preserving a model answer,
+//! command, tool result, review, reasoning or a path spelling such as `~`, `$HOME` or
+//! `$env:USERPROFILE`.
 
 use serde_json::{Map, Value};
 
@@ -41,6 +42,51 @@ const REDACTED_MEMBERS: &[&str] = &[
 /// redact everywhere — it would take the model tier list and the host's own `clientInfo.name` with
 /// it — so the family it appears in is part of the rule.
 const REDACTED_IN_FAMILY: &[(&str, &[&str])] = &[("mcpServer/", &["name"])];
+
+/// String members that carry protocol structure rather than user-controlled content.
+///
+/// Incoming fixtures preserve only these strings. An omitted key falls into the private-text
+/// default, so a new app-server field cannot leak a model answer or a command result before this
+/// list is reviewed.
+const STRUCTURAL_STRING_MEMBERS: &[&str] = &[
+    "approvalId",
+    "approvalPolicy",
+    "approvalsReviewer",
+    "backwardsCursor",
+    "cliVersion",
+    "cwd",
+    "decision",
+    "defaultReasoningEffort",
+    "environmentId",
+    "expectedTurnId",
+    "historyMode",
+    "id",
+    "itemId",
+    "itemsView",
+    "kind",
+    "limitId",
+    "method",
+    "model",
+    "modelProvider",
+    "nextCursor",
+    "parentThreadId",
+    "phase",
+    "planType",
+    "platformFamily",
+    "platformOs",
+    "processId",
+    "reasoningEffort",
+    "requestId",
+    "resetType",
+    "reviewThreadId",
+    "sandbox",
+    "sessionId",
+    "source",
+    "status",
+    "threadId",
+    "turnId",
+    "type",
+];
 
 /// What a redacted value is replaced with.
 pub const PLACEHOLDER: &str = "[REDACTED]";
@@ -82,13 +128,26 @@ pub struct Paths<'a> {
     pub user: &'a str,
 }
 
-/// One frame, with everything identifying taken out of it.
+/// A client frame, with known identifying values removed and capture paths rewritten.
 ///
-/// The named members lose their values outright; every other string has the capture's own two
-/// directories and its account name rewritten, so a replayed fixture describes a workspace rather
-/// than somebody's disk.
+/// Scripted input is part of the capture scenario, so it stays readable. The app-server's response
+/// takes the stricter path in [`incoming_frame`].
 #[must_use]
-pub fn frame(value: Value, paths: Paths<'_>) -> Value {
+pub fn outgoing_frame(value: Value, paths: Paths<'_>) -> Value {
+    scrub(value, paths, false)
+}
+
+/// A server frame with protocol structure retained and all free-form text replaced.
+///
+/// This deliberately does not try to recognise paths or secrets. An answer can repeat a private
+/// file without naming it, so every incoming string outside [`STRUCTURAL_STRING_MEMBERS`] becomes
+/// [`PLACEHOLDER`].
+#[must_use]
+pub fn incoming_frame(value: Value, paths: Paths<'_>) -> Value {
+    scrub(value, paths, true)
+}
+
+fn scrub(value: Value, paths: Paths<'_>, redact_free_form_text: bool) -> Value {
     // Read once, at the top, because a member's family is a fact about the frame rather than about
     // the object it happens to sit in.
     let family: Vec<&str> = value
@@ -102,30 +161,33 @@ pub fn frame(value: Value, paths: Paths<'_>) -> Value {
                 .collect()
         })
         .unwrap_or_default();
-    scrub(value, paths, &family)
-}
-
-fn scrub(value: Value, paths: Paths<'_>, family: &[&str]) -> Value {
     match value {
         Value::Object(members) => Value::Object(
             members
                 .into_iter()
                 .map(|(key, value)| {
-                    let named =
-                        REDACTED_MEMBERS.contains(&key.as_str()) || family.contains(&key.as_str());
+                    let named = REDACTED_MEMBERS.contains(&key.as_str())
+                        || family.contains(&key.as_str())
+                        || (redact_free_form_text
+                            && value.is_string()
+                            && !STRUCTURAL_STRING_MEMBERS.contains(&key.as_str()));
                     if named && !value.is_null() {
                         return (key, Value::String(String::from(PLACEHOLDER)));
                     }
-                    (key, scrub(value, paths, family))
+                    if let Value::String(text) = value {
+                        return (key, Value::String(rewrite_paths(&text, paths)));
+                    }
+                    (key, scrub(value, paths, redact_free_form_text))
                 })
                 .collect::<Map<String, Value>>(),
         ),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| scrub(item, paths, family))
+                .map(|item| scrub(item, paths, redact_free_form_text))
                 .collect(),
         ),
+        Value::String(_) if redact_free_form_text => Value::String(String::from(PLACEHOLDER)),
         Value::String(text) => Value::String(rewrite_paths(&text, paths)),
         other => other,
     }
@@ -152,13 +214,13 @@ fn rewrite_paths(text: &str, paths: Paths<'_>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIXTURE_CWD, FIXTURE_HOME, FIXTURE_USER, PLACEHOLDER, Paths, frame};
+    use super::{FIXTURE_CWD, FIXTURE_HOME, PLACEHOLDER, Paths, incoming_frame, outgoing_frame};
     use serde_json::json;
 
     /// The real `account/read` answer, which is where an address would otherwise land in the repo.
     #[test]
     fn an_account_answer_keeps_its_shape_and_loses_the_person() {
-        let redacted = frame(
+        let redacted = incoming_frame(
             json!({"id": 1, "result": {"account": {"type": "chatgpt",
                                                    "email": "someone@example.com",
                                                    "planType": "plus"},
@@ -176,7 +238,7 @@ mod tests {
     /// with it, on any host that puts a username in the URL, the person.
     #[test]
     fn a_thread_keeps_its_shape_and_loses_the_account_and_the_remote() {
-        let redacted = frame(
+        let redacted = incoming_frame(
             json!({"result": {"thread": {
                 "id": "01a09999-7858",
                 "accountId": "22c05f8e-5615-4da1-985f-f70d9f88b751",
@@ -195,17 +257,14 @@ mod tests {
             thread["id"], "01a09999-7858",
             "expected the thread a replay addresses to survive"
         );
-        assert_eq!(
-            thread["gitInfo"]["branch"], "main",
-            "expected what the vendor reported about the tree to survive"
-        );
+        assert_eq!(thread["gitInfo"]["branch"], PLACEHOLDER);
     }
 
     /// Which servers a person has configured is a fact about their installation. The vendor
     /// spells it `name` in this one family, and `name` everywhere else is ordinary.
     #[test]
     fn the_servers_a_person_configured_lose_their_names_and_nothing_else_does() {
-        let redacted = frame(
+        let redacted = incoming_frame(
             json!({"method": "mcpServer/startupStatus/updated",
                    "params": {"name": "exa", "status": "starting"}}),
             Paths::default(),
@@ -213,7 +272,7 @@ mod tests {
         assert_eq!(redacted["params"]["name"], PLACEHOLDER);
         assert_eq!(redacted["params"]["status"], "starting");
 
-        let kept = frame(
+        let kept = outgoing_frame(
             json!({"id": 0, "method": "initialize",
                    "params": {"clientInfo": {"name": "mea"}}}),
             Paths::default(),
@@ -229,7 +288,7 @@ mod tests {
     /// itself, which is the thing the fixture exists to record.
     #[test]
     fn the_account_a_capture_ran_as_is_rewritten_out_of_what_a_command_printed() {
-        let redacted = frame(
+        let redacted = incoming_frame(
             json!({"params": {"item": {
                 "aggregatedOutput": "drwxr-xr-x 2 ada ada 40 Sep 13 05:41 .\n",
             }}}),
@@ -240,17 +299,65 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            redacted["params"]["item"]["aggregatedOutput"],
-            format!("drwxr-xr-x 2 {FIXTURE_USER} {FIXTURE_USER} 40 Sep 13 05:41 .\n")
+        assert_eq!(redacted["params"]["item"]["aggregatedOutput"], PLACEHOLDER);
+    }
+
+    /// Shell aliases cannot evade the rule because the server's command text is free-form by
+    /// default, and an answer that echoes private content needs no path to be redacted.
+    #[test]
+    fn an_incoming_command_and_pathless_echo_lose_their_text() {
+        let private = incoming_frame(
+            json!({"params": {"item": {
+                "command": "cat ~/.codex/memory.md; cat $HOME/private; cat $env:USERPROFILE/private",
+                "aggregatedOutput": "private instructions without a path",
+                "review": "the private instructions are private instructions",
+                "text": "private instructions without a path",
+                "delta": "private instructions without a path",
+                "reasoning": "private instructions without a path",
+            }}}),
+            Paths {
+                cwd: "/tmp/capture",
+                home: "/home/ada",
+                user: "ada",
+            },
         );
+        assert_eq!(private["params"]["item"]["command"], PLACEHOLDER);
+        assert_eq!(private["params"]["item"]["aggregatedOutput"], PLACEHOLDER);
+        assert_eq!(private["params"]["item"]["review"], PLACEHOLDER);
+        assert_eq!(private["params"]["item"]["text"], PLACEHOLDER);
+        assert_eq!(private["params"]["item"]["delta"], PLACEHOLDER);
+        assert_eq!(private["params"]["item"]["reasoning"], PLACEHOLDER);
+    }
+
+    #[test]
+    fn incoming_structure_survives_while_unknown_strings_do_not() {
+        let redacted = incoming_frame(
+            json!({"method": "turn/completed", "params": {
+                "threadId": "thread-1", "turn": {
+                    "id": "turn-1", "status": "completed", "type": "turn",
+                    "text": "private answer", "output": "private tool output"
+                }
+            }}),
+            Paths {
+                cwd: "/tmp/capture",
+                home: "/home/ada",
+                user: "ada",
+            },
+        );
+        assert_eq!(redacted["method"], "turn/completed");
+        assert_eq!(redacted["params"]["threadId"], "thread-1");
+        assert_eq!(redacted["params"]["turn"]["id"], "turn-1");
+        assert_eq!(redacted["params"]["turn"]["status"], "completed");
+        assert_eq!(redacted["params"]["turn"]["type"], "turn");
+        assert_eq!(redacted["params"]["turn"]["text"], PLACEHOLDER);
+        assert_eq!(redacted["params"]["turn"]["output"], PLACEHOLDER);
     }
 
     /// A login short enough to be a substring of ordinary words is left alone: a transcript
     /// corrupted by its own scrubbing is worse than one naming an account.
     #[test]
     fn a_login_too_short_to_rewrite_safely_is_left_where_it_is() {
-        let redacted = frame(
+        let redacted = incoming_frame(
             json!({"params": {"item": {"aggregatedOutput": "an ad for adobe, owned by ad\n"}}}),
             Paths {
                 cwd: "",
@@ -259,17 +366,14 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            redacted["params"]["item"]["aggregatedOutput"],
-            "an ad for adobe, owned by ad\n"
-        );
+        assert_eq!(redacted["params"]["item"]["aggregatedOutput"], PLACEHOLDER);
     }
 
     /// A home directory reaches a fixture through several members at once, so the capture's own
     /// working directory is rewritten wherever it appears rather than only where it was expected.
     #[test]
     fn the_directory_the_capture_ran_in_becomes_a_workspace_everywhere_it_appears() {
-        let redacted = frame(
+        let redacted = outgoing_frame(
             json!({"params": {"cwd": "/home/ada/code/thing",
                               "item": {"command": "ls /home/ada/code/thing/src"}}}),
             Paths {
@@ -291,13 +395,13 @@ mod tests {
     #[test]
     fn text_that_merely_looks_identifying_is_left_exactly_as_it_was() {
         let text = "write to someone@example.com about the release";
-        let redacted = frame(json!({"params": {"delta": text}}), Paths::default());
-        assert_eq!(redacted["params"]["delta"], text);
+        let redacted = incoming_frame(json!({"params": {"delta": text}}), Paths::default());
+        assert_eq!(redacted["params"]["delta"], PLACEHOLDER);
     }
 
     #[test]
     fn a_member_the_vendor_left_null_stays_null_rather_than_becoming_a_placeholder() {
-        let redacted = frame(json!({"params": {"serverName": null}}), Paths::default());
+        let redacted = incoming_frame(json!({"params": {"serverName": null}}), Paths::default());
         assert!(
             redacted["params"]["serverName"].is_null(),
             "expected an absent value to stay absent, received {redacted}"
@@ -308,7 +412,7 @@ mod tests {
     /// first would leave a `/home/user/...` the workspace rule no longer recognises.
     #[test]
     fn a_workspace_inside_a_home_directory_is_rewritten_as_a_workspace() {
-        let redacted = frame(
+        let redacted = outgoing_frame(
             json!({"cwd": "/home/ada/code/thing", "other": "/home/ada/.codex/AGENTS.md"}),
             Paths {
                 cwd: "/home/ada/code/thing",
@@ -325,7 +429,7 @@ mod tests {
 
     #[test]
     fn identifying_members_are_found_however_deep_they_sit() {
-        let redacted = frame(
+        let redacted = incoming_frame(
             json!({"a": {"b": [{"installationId": "d91a5f34", "keep": 1}]}}),
             Paths::default(),
         );

@@ -82,7 +82,7 @@ whose terms apply. No logos, no wordmarks, nothing implying an official or endor
 
 **Surface used:** `codex app-server`, the interface OpenAI documents for rich clients and ships its
 own VS Code extension on. JSON-RPC over newline-delimited JSON. `clientInfo.name` is always the
-host's name, passed through `HostContext`. Read on 2026-09-13 against `codex-cli 0.153.4`;
+host's name, passed through `HostContext`. Read on 2026-09-13 against `codex-cli 0.154.0`;
 `docs/harness-codex.md` lists every method driven and the document each follows.
 
 **Posture:** OpenAI has publicly welcomed third-party harnesses on subscriptions (press coverage,
@@ -92,8 +92,8 @@ and asks that such clients identify themselves through `clientInfo`. This harnes
 own installed `codex` under the user's own login and never touches its token.
 
 **Quotes**, from
-[`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/app-server/README.md)
-at `rust-v0.153.4`:
+[`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md)
+at `rust-v0.154.0`:
 
 - "`codex app-server` is the interface Codex uses to power rich interfaces such as the Codex VS
   Code extension."

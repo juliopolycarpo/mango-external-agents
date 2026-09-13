@@ -92,6 +92,34 @@ pub enum SandboxMode {
     DangerFullAccess,
 }
 
+/// The complete sandbox policy sent alongside a turn's approval policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SandboxPolicy {
+    /// Read-only filesystem access with an explicit network policy.
+    ReadOnly {
+        /// Whether network access is allowed.
+        network_access: bool,
+    },
+    /// Writes confined to the host's authorised workspace.
+    WorkspaceWrite {
+        /// Directories the host authorised for writes.
+        writable_roots: Vec<String>,
+        /// Whether network access is allowed without approval.
+        network_access: bool,
+        /// Exclude the process's temporary directory from writable roots.
+        exclude_tmpdir_env_var: bool,
+        /// Exclude the system temporary directory from writable roots.
+        exclude_slash_tmp: bool,
+    },
+    /// No vendor sandbox, only when the host explicitly chose full access.
+    DangerFullAccess,
+}
+
 /// Who answers the agent's approval prompts, as the app-server spells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -247,6 +275,9 @@ pub struct TurnStartParams {
     /// How much the agent has to ask, when this turn overrides the session's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<AskForApproval>,
+    /// What the turn may touch, paired with its approval policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_policy: Option<SandboxPolicy>,
     /// Who answers, when this turn overrides the session's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
@@ -358,6 +389,24 @@ pub struct TurnInterruptParams {
 pub enum ReviewTarget {
     /// Staged, unstaged and untracked work, as the vendor defines it.
     UncommittedChanges,
+    /// Changes relative to a base branch.
+    BaseBranch {
+        /// The branch or revision to compare against.
+        branch: String,
+    },
+    /// One commit.
+    Commit {
+        /// The commit hash or revision.
+        sha: String,
+        /// Optional display title.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Host-supplied review instructions.
+    Custom {
+        /// What the reviewer should inspect.
+        instructions: String,
+    },
 }
 
 /// Starting the vendor's own review.
@@ -599,6 +648,7 @@ mod tests {
             model: None,
             effort: Some(String::from("high")),
             approval_policy: None,
+            sandbox_policy: None,
             approvals_reviewer: None,
         };
         let frame = serde_json::to_value(&params).expect("expected a frame");

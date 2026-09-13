@@ -10,8 +10,9 @@
 #
 # So: `codex app-server generate-json-schema` (a documented app-server subcommand) is run against
 # the pinned build, and the inventory of every type this harness speaks — each definition's field
-# names and enum values — is written to vendor/schema.json. A rename upstream shows up as a diff
-# here rather than as a -32602 on a user's machine.
+# names and enum values, plus the JSON-RPC method discriminators — is written to
+# vendor/schema.json. A rename upstream shows up as a diff here rather than as a -32602 on a
+# user's machine.
 #
 # Usage: scripts/vendor-codex.sh <version>     # e.g. 0.153.4, matching `codex --version`
 set -euo pipefail
