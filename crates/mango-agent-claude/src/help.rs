@@ -233,7 +233,10 @@ fn is_identifier(value: &str, extra: &[char]) -> bool {
         .next()
         .is_some_and(|first| first.is_ascii_lowercase())
         && characters.all(|next| {
-            next.is_ascii_lowercase() || next.is_ascii_digit() || next == '-' || extra.contains(&next)
+            next.is_ascii_lowercase()
+                || next.is_ascii_digit()
+                || next == '-'
+                || extra.contains(&next)
         })
 }
 

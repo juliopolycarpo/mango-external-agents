@@ -75,7 +75,10 @@ impl ConfigFile {
             .map_err(|error| launch_failure("write an MCP configuration", &path, &error))?;
         restrict_to_owner(&path, 0o600).await?;
 
-        Ok(Some(Self { directory, argument }))
+        Ok(Some(Self {
+            directory,
+            argument,
+        }))
     }
 
     /// The path `--mcp-config` is given.

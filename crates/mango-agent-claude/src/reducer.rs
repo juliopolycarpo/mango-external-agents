@@ -299,7 +299,9 @@ impl TurnReducer {
 
         let index = event.index();
         match kind {
-            Some("content_block_start") => self.reduce_block_start(event.content_block_type(), index),
+            Some("content_block_start") => {
+                self.reduce_block_start(event.content_block_type(), index)
+            }
             Some("content_block_stop") => {
                 let Some(index) = index else {
                     return Vec::new();
@@ -325,7 +327,11 @@ impl TurnReducer {
     /// reasoning phase produces on an account whose `thinking_delta` text is withheld.
     /// `redacted_thinking` qualifies and then some: its text is encrypted, so no renderable delta
     /// can ever follow and the announcement is the whole of what that phase will show.
-    fn reduce_block_start(&mut self, block_type: Option<&str>, index: Option<u64>) -> Vec<EventKind> {
+    fn reduce_block_start(
+        &mut self,
+        block_type: Option<&str>,
+        index: Option<u64>,
+    ) -> Vec<EventKind> {
         if let (Some(index), Some(channel)) = (index, opening_channel(block_type)) {
             self.delivered_by_block.insert(
                 index,

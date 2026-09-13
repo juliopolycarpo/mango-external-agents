@@ -39,8 +39,7 @@ pub const SIGNED_IN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiPro
 pub const SIGNED_OUT: &str = r#"{"loggedIn":false}"#;
 
 /// A captured `read a file` turn, replayed byte for byte across every test that needs one.
-pub const READ_TURN: &str =
-    include_str!("../../../../fixtures/claude/transcripts/read-turn.jsonl");
+pub const READ_TURN: &str = include_str!("../../../../fixtures/claude/transcripts/read-turn.jsonl");
 
 /// An excerpt from before `--effort` and `--permission-prompts` existed, which is what proves an
 /// older build keeps working with those features off.

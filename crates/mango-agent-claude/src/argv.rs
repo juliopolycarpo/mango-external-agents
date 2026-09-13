@@ -353,9 +353,7 @@ mod tests {
         ];
         for &flag in crate::cli_surface::REQUIRED_FLAGS {
             assert!(
-                turns
-                    .iter()
-                    .any(|argv| argv.contains(&String::from(flag))),
+                turns.iter().any(|argv| argv.contains(&String::from(flag))),
                 "expected {flag:?}, declared required by cli_surface::REQUIRED_FLAGS, to appear \
                  on some turn"
             );

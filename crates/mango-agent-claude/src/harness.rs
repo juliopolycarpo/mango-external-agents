@@ -117,7 +117,9 @@ impl ClaudeHarness {
             async {
                 probe::output(host, executable, &["auth", "status"])
                     .await
-                    .map_or_else(Authentication::unknown, |stdout| auth::parse_status(&stdout))
+                    .map_or_else(Authentication::unknown, |stdout| {
+                        auth::parse_status(&stdout)
+                    })
             },
             read_auto_mode_policy(host)
         );
