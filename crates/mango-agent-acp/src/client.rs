@@ -343,6 +343,13 @@ async fn on_request_permission(
         // No turn: nobody is reading, and an unanswered request would hold the agent forever.
         return responder.respond(permission::cancelled());
     };
+    if turn.is_finished() {
+        // The turn's terminal has gone out — a `close` is in progress, and its `session/close`
+        // handshake is the window this arrives in. Withdrawn rather than parked or decided: nothing
+        // may grant a permission while the session is being torn down, and a responder parked now
+        // would be left waiting when the transport goes.
+        return responder.respond(permission::cancelled());
+    }
 
     let question =
         permission::request_from(&request, id.clone(), state.now() + state.approval_timeout);

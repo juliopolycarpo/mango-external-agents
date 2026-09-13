@@ -86,10 +86,28 @@ impl Reducer {
 
     /// The events that close out a turn, before its terminal.
     ///
-    /// A turn that ended while the agent was still reasoning still owes the host the other half of
-    /// the pair.
+    /// Two debts a turn can end owing. A turn that stopped mid-thought owes the other half of the
+    /// reasoning pair; and a turn that opened the plan activity owes its completion, because ACP never
+    /// sends one — the plan is session state that is replaced wholesale, so nothing on the wire marks
+    /// it done. Without this, every turn that wrote a plan leaves a host rendering an activity that
+    /// runs forever.
+    ///
+    /// The plan completes as [`ActivityStatus::Completed`] whatever its entries say. The activity is
+    /// the *display* of the plan, and the turn ending is what ends it; reporting `Failed` because some
+    /// entry was still pending would claim the agent failed at something it merely did not finish.
     pub fn finish(&mut self) -> Vec<EventKind> {
-        self.close_reasoning()
+        let mut events = self.close_reasoning();
+        if std::mem::take(&mut self.plan_started) {
+            events.push(EventKind::ActivityCompleted {
+                call_id: String::from(PLAN_CALL_ID),
+                result: ActivityResult {
+                    status: ActivityStatus::Completed,
+                    detail: None,
+                    truncated: false,
+                },
+            });
+        }
+        events
     }
 
     fn close_reasoning(&mut self) -> Vec<EventKind> {
@@ -557,9 +575,15 @@ mod tests {
                 call_id: revised,
                 update,
             },
+            // ACP never marks a plan done — it replaces it — so the turn's end is what completes the
+            // activity. Without it a host renders a plan that runs forever.
+            EventKind::ActivityCompleted {
+                call_id: completed,
+                result,
+            },
         ] = events.as_slice()
         else {
-            panic!("expected a start then an update, received {events:?}");
+            panic!("expected a start, an update and a completion, received {events:?}");
         };
         assert_eq!(call_id, PLAN_CALL_ID);
         assert_eq!(revised, PLAN_CALL_ID);
@@ -568,6 +592,8 @@ mod tests {
         assert_eq!(activity.detail.as_deref(), Some("read the code"));
         assert_eq!(update.title.as_deref(), Some("Plan: 1/2 done"));
         assert_eq!(update.detail.as_deref(), Some("write the test"));
+        assert_eq!(completed, PLAN_CALL_ID);
+        assert_eq!(result.status, ActivityStatus::Completed);
     }
 
     /// The name reaches the host bare. Invocation is `/` plus the name, so the sigil belongs to

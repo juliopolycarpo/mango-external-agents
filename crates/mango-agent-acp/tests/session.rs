@@ -607,6 +607,56 @@ async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() 
     );
 }
 
+/// `close` awaits `session/close` for up to its grace period, and a turn still live across that wait is
+/// a window in which the agent can ask for permission. Nothing may grant one while the session is being
+/// torn down — least of all under `ConsentRevoked`, where the machine's owner has just withdrawn the
+/// permission to run the agent at all.
+#[tokio::test]
+async fn a_question_raised_during_the_close_handshake_is_withdrawn_rather_than_granted() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .closing_sessions()
+            // Asks on `session/close`, which is exactly the window `close` awaits in.
+            .asking_when_closing()
+            // And never answers its prompt, so the turn is still live when `close` runs. Draining to a
+            // terminal first would end the turn and take the handler down its no-turn path, which is
+            // how the first draft of this test passed with the fix reverted.
+            .never_finishing_turns()
+            .process(),
+    );
+    // A policy that would allow, to prove the level is not what saves this.
+    let (host, broker) = host_with_broker(&launcher, BrokerDecision::Allow);
+
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host,
+            OpenSession::new("chat-1").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let _turn = session
+        .start_turn(TurnRequest::new("turn-1", "do the thing"))
+        .await
+        .expect("expected a turn");
+
+    session
+        .close(CloseReason::ConsentRevoked)
+        .await
+        .expect("expected the close to land");
+
+    let answers = outcome_lines(&launcher);
+    assert!(
+        answers.iter().all(|line| line.contains("cancelled")),
+        "expected every answer during teardown to be a withdrawal, received {answers:?}"
+    );
+    assert!(
+        broker.requests().is_empty(),
+        "expected no policy decision during teardown, received {:?}",
+        broker.requests()
+    );
+}
+
 /// The level decides whether the broker is asked at all, and this is why. Under `ReadOnly` the library
 /// must never reach `broker_response`: a policy answering `Allow` there becomes an allowing option id
 /// on the wire, so the one level that exists to grant nothing would grant.

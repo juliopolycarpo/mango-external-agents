@@ -345,6 +345,23 @@ impl Session for AcpSession {
 
         // Every question the agent is still waiting on is withdrawn first, while the transport is
         // still up: an unanswered one would leave the agent waiting for a client that has gone.
+        //
+        // Ordering is load-bearing. The turn is ended and marked finished *first*, before the
+        // `session/close` handshake, because that handshake awaits the agent for up to `CLOSE_GRACE`
+        // — and a turn still live across it is a window in which the agent can raise a fresh
+        // `session/request_permission` that this library would park, or worse hand to a broker that
+        // answers `Allow`. Granting a permission while the session is being torn down is backwards in
+        // general and absurd under `CloseReason::ConsentRevoked`, where the machine's owner has just
+        // withdrawn the permission to run the agent at all.
+        //
+        // Taken out in a statement of its own: an `if let` scrutinee's guard lives through the body,
+        // so cancelling under it would hold the turn lock across an `emit` that a host which stopped
+        // reading parks indefinitely — and the calls waiting on that lock are the ones a host uses
+        // to get out of it.
+        let ending = self.state.end_turn();
+        let terminal = ending
+            .as_ref()
+            .is_some_and(super::client::TurnHandle::finish);
         self.state.withdraw_pending();
 
         if self.agent_capabilities.session_capabilities.close.is_some() {
@@ -356,15 +373,14 @@ impl Session for AcpSession {
                 ),
             )
             .await;
+            // Anything the agent asked during the handshake. `on_request_permission` answers such a
+            // question itself once the turn is finished, so this is the belt to that braces: nothing
+            // may be left parked when the transport goes.
+            self.state.withdraw_pending();
         }
 
-        // Taken out in a statement of its own: an `if let` scrutinee's guard lives through the body,
-        // so cancelling under it would hold the turn lock across an `emit` that a host which stopped
-        // reading parks indefinitely — and the calls waiting on that lock are the ones a host uses
-        // to get out of it.
-        let turn = self.state.end_turn();
-        if let Some(turn) = turn
-            && turn.finish()
+        if let Some(turn) = ending
+            && terminal
         {
             // Spawned rather than awaited under a timeout. `close` must not hang on a host that
             // stopped reading its own stream — but a timeout that *dropped* this future would send

@@ -294,8 +294,12 @@ never going to work.
   needs an additive core change.
 - **No model selection.** ACP v1 has no surface for one, so a `Configuration` naming a model or a
   reasoning effort is refused rather than silently ignored, and `model_catalog` is never reported.
-- **A host that drops a `TurnStream` mid-turn** ends the turn on our side but does not send
-  `session/cancel`; the agent runs until `close`. Sending one there is the obvious follow-up.
+- **A host that drops a `TurnStream` mid-turn stops reading, and nothing else.** No `session/cancel` is
+  sent, so the agent finishes its turn at its own pace and the turn slot stays taken until it answers
+  or the session closes — which means a further `start_turn` is refused in the meantime. That is the
+  honest reading of a closed channel: the host abandoned the *events*, not the work, and the core has
+  no signal that distinguishes the two. Sending the agent's own cancel there needs a drop hook on
+  `TurnStream`, and `Session::cancel` is the call that does it today.
 - **No captured fixtures.** `fixtures/` is produced by `mea capture`, which does not exist yet. Tests
   drive `testing::FakeAcpAgent`, a named fake that composes the v1 wire as JSON, and `tests/smoke.rs`
   drives a real agent on demand.

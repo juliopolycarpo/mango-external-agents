@@ -55,6 +55,8 @@ pub struct FakeAcpAgent {
     new_session_error: Option<(i32, String)>,
     /// Streams a turn's updates and never answers its `session/prompt`.
     never_finishes: bool,
+    /// Raises a permission request when the client sends `session/close`.
+    asks_when_closing: bool,
     updates: Vec<serde_json::Value>,
     stop_reason: String,
     version_output: String,
@@ -79,6 +81,7 @@ impl FakeAcpAgent {
             approval: Approval::Never,
             new_session_error: None,
             never_finishes: false,
+            asks_when_closing: false,
             updates: vec![
                 serde_json::json!({
                     "sessionUpdate": "available_commands_update",
@@ -145,6 +148,16 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn listing_sessions(mut self) -> Self {
         self.supports_listing = true;
+        self
+    }
+
+    /// Raises one `session/request_permission` when the client sends `session/close`.
+    ///
+    /// The window a `close` awaits in, and the only way to reach it: nothing may grant a permission
+    /// while the session is being torn down.
+    #[must_use]
+    pub fn asking_when_closing(mut self) -> Self {
+        self.asks_when_closing = true;
         self
     }
 
@@ -238,8 +251,22 @@ impl FakeAcpAgent {
                     "sessions": [{ "sessionId": "sess_old", "cwd": "/repo", "title": "Yesterday" }]
                 }),
             )],
-            (Some("session/set_mode" | "session/close"), Some(id)) => {
-                vec![result(id, serde_json::json!({}))]
+            (Some("session/set_mode"), Some(id)) => vec![result(id, serde_json::json!({}))],
+            (Some("session/close"), Some(id)) => {
+                let mut lines = Vec::new();
+                if self.asks_when_closing {
+                    let request_id = pending
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .next_request_id();
+                    lines.push(request(
+                        request_id,
+                        "session/request_permission",
+                        self.permission_params(),
+                    ));
+                }
+                lines.push(result(id, serde_json::json!({})));
+                lines
             }
             (Some("session/prompt"), Some(id)) => self.prompt(id, pending),
             (Some("session/cancel"), None) => self.cancelled(pending),
