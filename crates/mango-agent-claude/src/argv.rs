@@ -334,6 +334,35 @@ mod tests {
     }
 
     #[test]
+    fn every_flag_the_cli_surface_calls_required_actually_appears_on_some_turn() {
+        // `--resume` and `--session-id` are mutually exclusive, and `--model` is passed only when
+        // a model was chosen (REQUIRED_FLAGS's own documented exception) — so no single build()
+        // carries every required flag; a flag counts if any of these plausible turns passes it.
+        let turns = [
+            base().build(),
+            TurnArgv {
+                established: true,
+                ..base()
+            }
+            .build(),
+            TurnArgv {
+                model: Some("opus"),
+                ..base()
+            }
+            .build(),
+        ];
+        for &flag in crate::cli_surface::REQUIRED_FLAGS {
+            assert!(
+                turns
+                    .iter()
+                    .any(|argv| argv.contains(&String::from(flag))),
+                "expected {flag:?}, declared required by cli_surface::REQUIRED_FLAGS, to appear \
+                 on some turn"
+            );
+        }
+    }
+
+    #[test]
     fn loads_the_hosts_mcp_servers_only_when_there_are_some() {
         assert_eq!(value_after(&base().build(), "--mcp-config"), None);
         let argv = TurnArgv {
