@@ -16,7 +16,15 @@ description = "OpenAI Codex harness for mango-external-agents: the app-server JS
 workspace = true
 
 [dependencies]
-mango-external-agents.workspace = true
+async-trait = "0.1.92"
+mango-external-agents = { workspace = true, features = ["stdio"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+mango-external-agents = { workspace = true, features = ["stdio", "testing"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true
