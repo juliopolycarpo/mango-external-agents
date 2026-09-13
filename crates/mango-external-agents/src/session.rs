@@ -209,7 +209,7 @@ impl McpServer {
 /// **own** MCP server, which the vendor spawns or dials on the host's behalf, and they never widen
 /// what the vendor's own child inherits. A host that puts a token here has decided to give its own
 /// server a credential; it cannot use this seam to add anything to the vendor CLI's environment.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum McpTransport {
@@ -232,6 +232,54 @@ pub enum McpTransport {
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         headers: std::collections::BTreeMap<String, String>,
     },
+}
+
+impl fmt::Debug for McpTransport {
+    /// Hand-written, for the same reason [`WsSpec`](crate::WsSpec) is: this is where a host's own
+    /// credential lives.
+    ///
+    /// `env` and `headers` are declared credential carriers by this type's own documentation, and
+    /// every type above this one derives `Debug` from it — so a `tracing::debug!(?request)` of an
+    /// open that configured MCP, or the crate's `received {value:?}` assertion idiom, would print
+    /// the token in the clear. Values go, names stay: a host debugging a server it misconfigured
+    /// still has to see which variable and which header. The URL and the command line go through
+    /// the same redaction a stderr tail does, for the `https://user:password@host` form and for an
+    /// argument written as an assignment.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdio { command, args, env } => formatter
+                .debug_struct("Stdio")
+                .field("command", &crate::redact::stderr_text(command))
+                .field("args", &redacted_arguments(args))
+                .field("env", &redacted_values(env))
+                .finish(),
+            Self::Http { url, headers } => formatter
+                .debug_struct("Http")
+                .field("url", &crate::redact::stderr_text(url))
+                .field("headers", &redacted_values(headers))
+                .finish(),
+            // No wildcard arm: `#[non_exhaustive]` does not apply inside the defining crate, so a
+            // new variant breaks this match rather than silently falling into a `{ .. }` that
+            // prints nothing. Deciding what a new field is worth printing is part of adding it.
+        }
+    }
+}
+
+/// Every name, no values.
+fn redacted_values(
+    map: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<&str, &str> {
+    map.keys()
+        .map(|name| (name.as_str(), "[REDACTED]"))
+        .collect()
+}
+
+/// Each argument through the stderr redaction, which catches the `--api-key=…` shape.
+fn redacted_arguments(arguments: &[String]) -> Vec<String> {
+    arguments
+        .iter()
+        .map(|argument| crate::redact::stderr_text(argument))
+        .collect()
 }
 
 /// What a host asks for when it opens a session.
@@ -741,10 +789,70 @@ pub trait Session: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReason, CloseReason, Configuration, NativeSession, OpenSession, ResumeMode, Session,
-        SessionIds, SessionInfo, SessionPage, TurnRequest,
+        CancelReason, CloseReason, Configuration, McpServer, McpTransport, NativeSession,
+        OpenSession, ResumeMode, Session, SessionIds, SessionInfo, SessionPage, TurnRequest,
     };
     use crate::permission::{ApprovalRouting, PermissionLevel};
+
+    /// `env` and `headers` are the one place a host puts its own credential on this surface.
+    ///
+    /// A derived `Debug` prints both maps in the clear, and every type above this one derives from
+    /// it — so a `tracing::debug!(?request)` of an open that configured MCP, or the crate's own
+    /// `received {value:?}` assertion idiom, would put the token in a log. This is the same
+    /// reasoning `WsSpec` is hand-written for.
+    #[test]
+    fn never_prints_a_credential_a_host_put_on_an_mcp_server() {
+        let stdio = McpServer {
+            name: String::from("docs"),
+            transport: McpTransport::Stdio {
+                command: String::from("docs-mcp"),
+                args: vec![String::from("--api-key=sk-live-args")],
+                env: [(String::from("API_KEY"), String::from("sk-live-env"))]
+                    .into_iter()
+                    .collect(),
+            },
+        };
+        let http = McpServer {
+            name: String::from("search"),
+            transport: McpTransport::Http {
+                url: String::from("https://user:sk-live-url@search.example/mcp"),
+                headers: [(
+                    String::from("Authorization"),
+                    String::from("Bearer sk-live-header"),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        };
+        let request = OpenSession::new("chat-1").with_mcp_servers(vec![stdio, http]);
+        let printed = format!("{request:?}");
+
+        for secret in [
+            "sk-live-env",
+            "sk-live-header",
+            "sk-live-url",
+            "sk-live-args",
+        ] {
+            assert!(
+                !printed.contains(secret),
+                "expected {secret:?} to be redacted, received {printed}"
+            );
+        }
+        // Redacted, not erased: a host debugging a misconfigured server still needs to see which
+        // server, which variable and which header.
+        for kept in [
+            "docs",
+            "docs-mcp",
+            "API_KEY",
+            "Authorization",
+            "search.example",
+        ] {
+            assert!(
+                printed.contains(kept),
+                "expected {kept:?} to survive redaction, received {printed}"
+            );
+        }
+    }
 
     #[test]
     fn closing_carries_its_reason_into_the_turn_it_cancels() {
