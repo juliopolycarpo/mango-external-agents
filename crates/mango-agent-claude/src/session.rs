@@ -191,9 +191,9 @@ impl mango_external_agents::Session for ClaudeSession {
 
         let configuration = request
             .configuration
-            .clone()
-            .unwrap_or_else(|| self.shared.info.effective_configuration.clone());
-        let mode = self.shared.resolve_mode(&configuration)?;
+            .as_ref()
+            .unwrap_or(&self.shared.info.effective_configuration);
+        let mode = self.shared.resolve_mode(configuration)?;
 
         // A host that starts a second turn has decided the first is over. Taken before anything is
         // spawned so the two cannot both hold a child.
