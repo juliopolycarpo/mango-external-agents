@@ -161,12 +161,31 @@ impl Survey {
         self.banner.is_some()
     }
 
+    /// The one line of `--version` output a host should be shown.
+    ///
+    /// `probe::output` hands back every line the CLI printed joined together, because a build can
+    /// arrive behind a wrapper script that prints its own preamble first and
+    /// [`version::parse`](crate::version::parse) scans all of it for the token that is a version.
+    /// What a host renders is a single line, so only one travels: the line the version was read
+    /// from when there is one, and otherwise the first line that said anything. A `version` field
+    /// carrying a whole multi-line stdout is not a version, and neither is a
+    /// [`GateVerdict`](mango_external_agents::GateVerdict) that quotes one back at the person
+    /// holding the binary.
+    fn reported(&self) -> Option<String> {
+        let banner = self.banner.as_deref()?;
+        let lines = || banner.lines().map(str::trim).filter(|line| !line.is_empty());
+        lines()
+            .find(|line| self.version.is_some() && version::parse(line) == self.version)
+            .or_else(|| lines().next())
+            .map(str::to_owned)
+    }
+
     /// The version as a host should read it: what the CLI reported, bounded by the core.
     fn found(&self) -> String {
         self.version
             .as_ref()
             .map(semver::Version::to_string)
-            .or_else(|| self.banner.clone())
+            .or_else(|| self.reported())
             .unwrap_or_else(|| String::from("an unreadable version"))
     }
 
@@ -213,7 +232,7 @@ impl Harness for ClaudeHarness {
         if survey.refusal.is_some() {
             return Ok(Discovery {
                 executable,
-                version: survey.banner.clone(),
+                version: survey.reported(),
                 gate: GateVerdict::VersionTooOld {
                     found: survey.found(),
                     minimum: String::from(MINIMUM_VERSION),
@@ -227,7 +246,7 @@ impl Harness for ClaudeHarness {
         let models = models::catalog(survey.surface.as_ref());
         Ok(Discovery {
             executable,
-            version: survey.banner.clone(),
+            version: survey.reported(),
             // The surface said every flag a turn passes is there. A version this harness could not
             // read is not a reason to refuse a binary that answered every other question.
             gate: GateVerdict::Usable,

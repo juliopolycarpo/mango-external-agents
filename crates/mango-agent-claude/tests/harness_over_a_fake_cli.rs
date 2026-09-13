@@ -77,6 +77,55 @@ mod discovery {
         );
     }
 
+    /// A wrapper script's preamble is not the version, and neither is the whole of stdout.
+    ///
+    /// `--version` reaches the harness as every line joined together, because the token that is a
+    /// version can arrive behind a preamble. What a host renders is one line, so one line is what
+    /// `Discovery::version` carries.
+    #[tokio::test]
+    async fn reports_one_line_of_a_version_banner_a_wrapper_script_padded() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_version(
+            "npm notice a new version of npm is available\n\n2.1.270 (Claude Code)\n",
+        ));
+        let discovery = ClaudeHarness::new()
+            .discover(&host(Arc::clone(&launcher)))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.version.as_deref(),
+            Some("2.1.270 (Claude Code)"),
+            "expected the line the version was read from, received {:?}",
+            discovery.version
+        );
+    }
+
+    /// The same rule where there is no version to key off: one line, not the whole banner.
+    #[tokio::test]
+    async fn refuses_an_unreadable_build_without_quoting_its_whole_stdout_back() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version("claude: this build is a repackage\nno version here\n")
+                .with_help("--print\n"),
+        );
+        let discovery = ClaudeHarness::new()
+            .discover(&host(Arc::clone(&launcher)))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.version.as_deref(),
+            Some("claude: this build is a repackage")
+        );
+        let GateVerdict::VersionTooOld { found, .. } = &discovery.gate else {
+            panic!("expected a refusal, received {:?}", discovery.gate);
+        };
+        assert!(
+            !found.contains('\n'),
+            "expected one line in the refusal, received {found:?}"
+        );
+    }
+
     #[tokio::test]
     async fn keeps_a_build_older_than_the_pin_when_every_flag_it_passes_is_there() {
         let launcher = Arc::new(
