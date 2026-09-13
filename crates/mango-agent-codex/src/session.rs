@@ -227,6 +227,13 @@ impl Shared {
     /// So the terminal is offered under a grace, and the sink is dropped either way. A host that
     /// is merely behind gets its `Cancelled` and `Completed`; a host that has stopped reading gets
     /// the end of its stream, which is the same ending by a different route.
+    ///
+    /// One edge this leaves open: `EventSink::cancel` is two events, and a grace that elapses
+    /// between them shows the host a cancellation marker with no terminal after it. Only a host
+    /// that has stopped reading can reach it — a reader that is merely behind drains both — and
+    /// nothing here can close it, because a bounded sink offers no way to put two events on or
+    /// neither. A non-blocking `EventSink::try_emit` in the core would; it is the follow-up this
+    /// harness found and could not fix from the outside.
     async fn abandon(&self, reason: CancelReason) {
         let Some(active) = self.turn.lock().await.take() else {
             return;

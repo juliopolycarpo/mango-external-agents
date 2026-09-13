@@ -236,6 +236,11 @@ this tool letting an agent out of its sandbox, checked into the repository.
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
+- A session that is closed while its host has stopped reading its turn offers the turn's terminal
+  under a 200 ms grace and then drops the stream. `EventSink::cancel` is two events, so a grace
+  that elapses between them shows that host a cancellation marker with no terminal after it. Only
+  a host that has stopped reading can reach it, and closing it properly needs a non-blocking
+  `try_emit` in the core — a bounded sink offers no way to put two events on or neither.
 
 Compliance posture: see [compliance.md](compliance.md).
 
