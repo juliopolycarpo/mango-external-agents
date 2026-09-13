@@ -183,11 +183,19 @@ fn entry_for(transport: &McpTransport) -> Option<Value> {
 ///
 /// `create_dir_all` for the parent, which several sessions share, and a plain `create_dir` for the
 /// leaf: a leaf that already exists is a name somebody else chose, and the name is a fresh UUID.
+///
+/// The shared parent is restricted too, and that is not tidiness. The platform's temporary
+/// directory is world-writable on every Unix, so on a multi-user host the parent is a name another
+/// account can create first — and whoever owns the parent can rename the leaf out from under a
+/// session and leave a directory of their own in its place, which is a `--mcp-config` an attacker
+/// wrote and a server the vendor would then spawn. A `chmod` of a directory this user does not own
+/// fails with `EPERM`, so that case refuses the session instead of running it.
 async fn create_private_directory(directory: &Path) -> Result<()> {
     if let Some(parent) = directory.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|error| launch_failure("create a scratch directory", parent, &error))?;
+        restrict_to_owner(parent, 0o700).await?;
     }
     tokio::fs::create_dir(directory)
         .await
@@ -445,6 +453,37 @@ mod tests {
             left_behind, 0,
             "expected a failed write to take its own directory with it, received {left_behind} entries"
         );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The shared parent is the one name in a world-writable temporary directory an attacker can
+    /// create first, and whoever owns it can swap the leaf a session is about to be launched with.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_shared_parent_is_owner_only_too() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempdir();
+        let parent = scratch.join(PARENT_DIRECTORY);
+        std::fs::create_dir_all(&parent).expect("expected the parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+            .expect("expected a world-writable parent");
+
+        let file = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected a file")
+            .expect("expected servers to produce one");
+
+        let mode = std::fs::metadata(&parent)
+            .expect("expected metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "expected the shared parent to be taken off group and other"
+        );
+        drop(file);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
