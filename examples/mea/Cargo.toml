@@ -20,4 +20,9 @@ path = "src/main.rs"
 mango-agent-acp.workspace = true
 mango-agent-claude.workspace = true
 mango-agent-codex.workspace = true
-mango-external-agents.workspace = true
+# `mea` is the host here, so it takes the default launcher rather than writing one: it has no
+# sandbox policy of its own to express.
+mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio"] }
+
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread"] }

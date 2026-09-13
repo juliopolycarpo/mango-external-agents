@@ -304,6 +304,8 @@ dependencies = [
  "mango-agent-claude",
  "mango-agent-codex",
  "mango-external-agents",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

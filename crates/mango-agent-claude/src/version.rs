@@ -13,7 +13,8 @@ use semver::Version;
 
 /// The oldest build this harness drives, parsed.
 ///
-/// Built rather than parsed from [`MINIMUM_VERSION`] so there is no panic path in a library; a test
+/// Built rather than parsed from [`MINIMUM_VERSION`](crate::pinned::MINIMUM_VERSION), so there is
+/// no panic path in a library; a test
 /// asserts the two agree.
 pub fn minimum() -> Version {
     Version::new(2, 1, 211)

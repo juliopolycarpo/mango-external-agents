@@ -78,7 +78,7 @@ impl CliSurface {
     /// Three vocabularies, three shapes the vendor happens to print them in, and none of the
     /// shape-reading here: `(choices: …)` for the permission modes, a bare list for the effort
     /// levels, a first `(e.g. …)` group for the model aliases. Which flag carries which vocabulary
-    /// is this harness's knowledge; how each shape is read is [`help`](crate::help)'s.
+    /// is this harness's knowledge; how each shape is read is [`crate::help`]'s.
     pub fn parse(help_text: &str) -> Self {
         let options = help::declared_options(help_text);
         let flags = options

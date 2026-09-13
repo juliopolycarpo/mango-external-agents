@@ -11,7 +11,7 @@
 //!   and echoed back — so a host holds a resumable handle before any tokens are spent.
 //! - **The prompt travels on stdin.** `--input-format stream-json` is the documented programmatic
 //!   input, and it keeps the prompt out of argv.
-//! - **A turn ends exactly once.** Who ends it is a single transition recorded on [`TurnEnd`], and
+//! - **A turn ends exactly once.** Who ends it is one transition, recorded once, and
 //!   only the pump task emits. A cancel records the reason and kills the child; the pump sees the
 //!   stream end and writes the terminal pair. Two tasks racing to emit a terminal is the one defect
 //!   a host cannot work around.
