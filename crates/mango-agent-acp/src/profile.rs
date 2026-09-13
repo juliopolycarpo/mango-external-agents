@@ -374,6 +374,10 @@ fn cursor() -> AcpProfile {
         "https://cursor.com/docs/cli/acp",
     )
     .with_login_hint("agent login")
+    // Checked against `agent` 2026.08.25 on 2026-09-13 by `tests/smoke.rs`: a session opened, a turn
+    // ran and closed. Its `session/new` advertised no modes, which is why `modes` stays unknown here
+    // and `FullAccess` stays refused.
+    .verified()
 }
 
 /// OpenCode in ACP mode.
@@ -556,19 +560,20 @@ mod tests {
         assert_eq!(ids.len(), count, "expected distinct ids, received {ids:?}");
     }
 
-    /// Nothing in this crate has been run against a released agent yet, and a profile that claimed
-    /// otherwise would put a capture in a host's interface that does not exist. When the first
-    /// capture lands, this test is what has to be updated alongside it.
+    /// A profile claims `verified` only after `tests/smoke.rs` has been run against the agent itself.
+    /// Anything else would put a check in a host's interface that nobody performed, so this test is
+    /// the list — and it is what has to be updated when the next profile is driven for real.
     #[test]
-    fn no_builtin_profile_claims_to_be_verified_yet() {
+    fn only_profiles_checked_against_a_real_agent_claim_to_be_verified() {
         let claimed: Vec<String> = builtin_profiles()
             .iter()
             .filter(|profile| profile.verified)
             .map(|profile| profile.id.to_string())
             .collect();
-        assert!(
-            claimed.is_empty(),
-            "expected every builtin to be unverified until captured, received {claimed:?}"
+        assert_eq!(
+            claimed,
+            vec![String::from("cursor")],
+            "expected only the profiles run against their own agent, received {claimed:?}"
         );
     }
 

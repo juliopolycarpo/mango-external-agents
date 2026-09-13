@@ -3,8 +3,8 @@
 //! Three subcommands against a real installed vendor CLI:
 //!
 //! ```text
-//! mea discover [--harness claude|codex]
-//! mea turn     [--harness claude|codex] [--level read-only|default|full-access] <prompt>
+//! mea discover [--harness claude|codex|acp:<profile>]
+//! mea turn     [--harness claude|codex|acp:<profile>] [--level read-only|default|full-access] <prompt>
 //! mea capture codex [--out DIR] [--workspace DIR]
 //! ```
 //!
@@ -39,13 +39,14 @@ fn harness_kinds() -> [&'static str; 3] {
 
 /// The harnesses this binary can dispatch to.
 ///
-/// Claude and Codex currently implement the shared `Harness` contract.
+/// Claude, Codex and every built-in ACP profile implement the shared `Harness` contract.
 fn registry() -> HarnessRegistry {
-    HarnessRegistry::new(vec![
+    let mut harnesses = vec![
         mango_agent_claude::harness(),
         Arc::new(mango_agent_codex::CodexHarness::new()),
-    ])
-    .expect("expected one harness per kind")
+    ];
+    harnesses.extend(mango_agent_acp::AcpHarness::builtins());
+    HarnessRegistry::new(harnesses).expect("expected one harness per kind")
 }
 
 /// A context with the default launcher, this process's environment and this directory.
@@ -99,23 +100,50 @@ fn print_banner() {
     for kind in harness_kinds() {
         println!("harness: {kind}");
     }
-    println!("usage: mea discover [--harness claude|codex]");
+    println!("usage: mea discover [--harness claude|codex|acp:<profile>]");
     println!(
-        "       mea turn [--harness claude|codex] [--level read-only|default|full-access] <prompt>"
+        "       mea turn [--harness claude|codex|acp:<profile>] [--level read-only|default|full-access] <prompt>"
     );
     println!("       mea capture codex [--out DIR] [--workspace DIR]");
+    println!("ACP profiles: {}", acp_profile_ids().join(", "));
+}
+
+fn acp_profile_ids() -> Vec<String> {
+    mango_agent_acp::builtin_profiles()
+        .into_iter()
+        .map(|profile| profile.id.to_string())
+        .collect()
+}
+
+/// One profile's state in the three words the smoke test asks for.
+fn describe(discovery: &mango_external_agents::Discovery) -> String {
+    use mango_external_agents::GateVerdict;
+    match &discovery.gate {
+        GateVerdict::NotInstalled => String::from("missing"),
+        GateVerdict::VersionTooOld { found, minimum } => {
+            format!("gated      {found} is older than {minimum}")
+        }
+        GateVerdict::Usable => match &discovery.version {
+            Some(version) => format!("installed  {version}"),
+            None => String::from("installed"),
+        },
+        GateVerdict::Unknown | _ => match &discovery.version {
+            Some(version) => format!("unknown    started, reported {version}"),
+            None => String::from("unknown    started, printed no version"),
+        },
+    }
 }
 
 /// What a subcommand was asked for.
 struct Options {
-    kind: HarnessKind,
+    kind: Option<HarnessKind>,
     level: Option<PermissionLevel>,
     prompt: String,
 }
 
 impl Options {
     fn parse(arguments: &[String]) -> Result<Self, String> {
-        let mut kind = HarnessKind::Claude;
+        let mut kind = None;
         let mut level = None;
         let mut words: Vec<&str> = Vec::new();
         let mut rest = arguments.iter();
@@ -125,15 +153,23 @@ impl Options {
                     let named = rest
                         .next()
                         .ok_or("expected a harness kind after --harness")?;
-                    kind = match named.as_str() {
+                    kind = Some(match named.as_str() {
                         "claude" => HarnessKind::Claude,
                         "codex" => HarnessKind::Codex,
+                        named if let Some(profile) = named.strip_prefix("acp:") => {
+                            if mango_agent_acp::builtin_profile(profile).is_none() {
+                                return Err(format!(
+                                    "expected a built-in ACP profile after `acp:`, received {profile:?}"
+                                ));
+                            }
+                            HarnessKind::Acp(mango_external_agents::AcpProfileId::new(profile))
+                        }
                         other => {
                             return Err(format!(
-                                "expected `claude` or `codex`, received {other:?}"
+                                "expected `claude`, `codex` or `acp:<profile>`, received {other:?}"
                             ));
                         }
-                    };
+                    });
                 }
                 "--level" => {
                     let named = rest.next().ok_or("expected a level after --level")?;
@@ -161,11 +197,24 @@ impl Options {
 
 async fn discover(options: &Options) -> Result<(), String> {
     let host = host()?;
+    let Some(kind) = &options.kind else {
+        for harness in mango_agent_acp::AcpHarness::builtins() {
+            let HarnessKind::Acp(profile) = &harness.descriptor().kind else {
+                continue;
+            };
+            let line = match harness.discover(&host).await {
+                Ok(discovery) => describe(&discovery),
+                Err(error) => format!("error      {error}"),
+            };
+            println!("{:<24} {line}", format!("acp:{profile}"));
+        }
+        return Ok(());
+    };
     let registry = registry();
-    let harness = registry.require(&options.kind).map_err(|e| e.to_string())?;
+    let harness = registry.require(kind).map_err(|e| e.to_string())?;
     let discovery = harness.discover(&host).await.map_err(|e| e.to_string())?;
 
-    println!("harness:      {}", options.kind);
+    println!("harness:      {kind}");
     println!("installed:    {:?}", discovery.version);
     println!("gate:         {:?}", discovery.gate);
     println!("auth:         {:?}", discovery.auth);
@@ -205,7 +254,8 @@ async fn turn(options: &Options) -> Result<(), String> {
     }
     let host = host()?;
     let registry = registry();
-    let harness = registry.require(&options.kind).map_err(|e| e.to_string())?;
+    let kind = options.kind.clone().unwrap_or(HarnessKind::Claude);
+    let harness = registry.require(&kind).map_err(|e| e.to_string())?;
 
     let discovery = harness.discover(&host).await.map_err(|e| e.to_string())?;
     if let AuthState::LoggedOut { login_hint } = &discovery.auth {
@@ -274,8 +324,8 @@ fn uuid_like() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, flag, harness_kinds, registry};
-    use mango_external_agents::{HarnessKind, PermissionLevel};
+    use super::{Options, acp_profile_ids, describe, flag, harness_kinds, registry};
+    use mango_external_agents::{AcpProfileId, Discovery, GateVerdict, HarnessKind, PermissionLevel};
 
     #[test]
     fn harness_kinds_are_distinct() {
@@ -294,13 +344,21 @@ mod tests {
     fn the_registry_dispatches_to_each_implemented_harness() {
         assert!(registry().get(&HarnessKind::Claude).is_some());
         assert!(registry().get(&HarnessKind::Codex).is_some());
+        for profile in acp_profile_ids() {
+            assert!(
+                registry()
+                    .get(&HarnessKind::Acp(AcpProfileId::new(profile.clone())))
+                    .is_some(),
+                "expected the {profile:?} ACP profile to be registered"
+            );
+        }
     }
 
     #[test]
-    fn defaults_to_claude_without_overriding_the_vendors_permission_axis() {
+    fn leaves_the_harness_unspecified_for_acp_discover_all() {
         let options = Options::parse(&[String::from("say"), String::from("hello")])
             .expect("expected the arguments to parse");
-        assert_eq!(options.kind, HarnessKind::Claude);
+        assert_eq!(options.kind, None);
         assert_eq!(options.level, None);
         assert_eq!(options.prompt, "say hello");
     }
@@ -325,7 +383,22 @@ mod tests {
             String::from("ship"),
         ])
         .expect("expected the arguments to parse");
-        assert_eq!(options.kind, HarnessKind::Codex);
+        assert_eq!(options.kind, Some(HarnessKind::Codex));
+        assert_eq!(options.prompt, "ship");
+    }
+
+    #[test]
+    fn reads_a_built_in_acp_harness() {
+        let options = Options::parse(&[
+            String::from("--harness"),
+            String::from("acp:cursor"),
+            String::from("ship"),
+        ])
+        .expect("expected the arguments to parse");
+        assert_eq!(
+            options.kind,
+            Some(HarnessKind::Acp(AcpProfileId::new("cursor")))
+        );
         assert_eq!(options.prompt, "ship");
     }
 
@@ -350,6 +423,7 @@ mod tests {
         for arguments in [
             vec![String::from("--level"), String::from("yolo")],
             vec![String::from("--harness"), String::from("acp")],
+            vec![String::from("--harness"), String::from("acp:unknown")],
             vec![String::from("--level")],
         ] {
             assert!(
@@ -357,5 +431,38 @@ mod tests {
                 "expected {arguments:?} to be refused"
             );
         }
+    }
+
+    /// The three words the smoke test reads, plus the honest fourth: an agent that started and
+    /// printed something unrecognisable is neither installed-and-fine nor gated.
+    #[test]
+    fn every_gate_verdict_reads_as_one_word_a_person_can_scan() {
+        assert_eq!(describe(&Discovery::not_installed()), "missing");
+
+        let usable = Discovery {
+            gate: GateVerdict::Usable,
+            version: Some(String::from("1.2.3")),
+            ..Discovery::not_installed()
+        };
+        assert_eq!(describe(&usable), "installed  1.2.3");
+
+        let gated = Discovery {
+            gate: GateVerdict::VersionTooOld {
+                found: String::from("0.9.0"),
+                minimum: String::from("1.0.0"),
+            },
+            ..Discovery::not_installed()
+        };
+        assert!(
+            describe(&gated).starts_with("gated"),
+            "{}",
+            describe(&gated)
+        );
+
+        let unknown = Discovery {
+            gate: GateVerdict::Unknown,
+            ..Discovery::not_installed()
+        };
+        assert!(describe(&unknown).starts_with("unknown"));
     }
 }

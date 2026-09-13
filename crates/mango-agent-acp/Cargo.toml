@@ -44,7 +44,7 @@ tokio = { version = "1.53.1", default-features = false, features = ["macros", "r
 
 [dev-dependencies]
 async-trait = "0.1.92"
-mango-external-agents = { workspace = true, features = ["testing"] }
+mango-external-agents = { features = ["launcher-tokio", "testing"], path = "../mango-external-agents" }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [package.metadata.docs.rs]
