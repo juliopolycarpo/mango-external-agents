@@ -181,6 +181,27 @@ mod tests {
     use crate::pinned::LOGIN_COMMAND;
     use mango_external_agents::{AuthMode, AuthState};
 
+    /// Every key the committed contract capture declares, as the vendor spells them.
+    const CONTRACT: &str = include_str!("../../../fixtures/claude/contract/auth-status.json");
+
+    /// The captured contract still carries the three fields this parser reads.
+    ///
+    /// The capture is a shape document rather than a sample, so nothing replays it — which leaves
+    /// it able to disagree with the code beside it in silence. Reading it here is what turns a
+    /// vendor that renamed `loggedIn` into a failing test instead of an account that quietly reads
+    /// as unknown.
+    #[test]
+    fn the_captured_contract_still_names_every_field_this_parser_reads() {
+        let contract: serde_json::Value =
+            serde_json::from_str(CONTRACT).expect("expected the captured contract to be JSON");
+        for field in ["loggedIn", "apiProvider", "authMethod"] {
+            assert!(
+                contract.get(field).is_some(),
+                "expected the captured `auth status` to carry {field:?}, received {contract}"
+            );
+        }
+    }
+
     /// The shape of the committed contract capture, with the placeholder values filled in.
     const SIGNED_IN: &str = r#"{
         "analyticsDisabled": false,

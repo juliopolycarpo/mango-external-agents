@@ -359,4 +359,54 @@ mod tests {
             "expected an unreadable version and an unreadable surface to refuse"
         );
     }
+
+    /// The captured contract, read by something rather than only committed.
+    ///
+    /// `fixtures/claude/contract/cli-surface.json` is the whole option and mode vocabulary of the
+    /// build this harness was written against, and until it is read by a test it is a document
+    /// that can drift out of agreement with the code beside it without anybody hearing. Read as a
+    /// floor, not as an equality: the vendor adds options constantly, and every `REQUIRED_FLAGS`
+    /// entry and every [`CliMode`](crate::permissions::CliMode) spelling has to still be one the
+    /// captured build offers.
+    #[test]
+    fn the_captured_contract_still_names_everything_this_harness_passes() {
+        use crate::permissions::CliMode;
+
+        const CONTRACT: &str = include_str!("../../../fixtures/claude/contract/cli-surface.json");
+
+        let contract: serde_json::Value =
+            serde_json::from_str(CONTRACT).expect("expected the captured contract to be JSON");
+        let listed = |key: &str| -> Vec<String> {
+            contract[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("expected {key} to be an array"))
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        };
+
+        let flags = listed("flags");
+        for required in super::REQUIRED_FLAGS {
+            assert!(
+                flags.iter().any(|flag| flag == required),
+                "expected the captured surface to declare {required:?}, received {flags:?}"
+            );
+        }
+
+        let modes = listed("permissionModes");
+        for mode in [
+            CliMode::Manual,
+            CliMode::AcceptEdits,
+            CliMode::Plan,
+            CliMode::Auto,
+            CliMode::DontAsk,
+            CliMode::BypassPermissions,
+        ] {
+            assert!(
+                modes.iter().any(|listed| listed == mode.as_arg()),
+                "expected the captured surface to offer {:?}, received {modes:?}",
+                mode.as_arg()
+            );
+        }
+    }
 }
