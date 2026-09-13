@@ -80,13 +80,44 @@ whose terms apply. No logos, no wordmarks, nothing implying an official or endor
 
 ## OpenAI Codex (`mango-agent-codex`)
 
-**Surface used:** `codex app-server`, the supported integration protocol (JSON-RPC over lines).
-`clientInfo.name` is always the host's name, passed through `HostContext`.
+**Surface used:** `codex app-server`, the interface OpenAI documents for rich clients and ships its
+own VS Code extension on. JSON-RPC over newline-delimited JSON. `clientInfo.name` is always the
+host's name, passed through `HostContext`. Read on 2026-09-13 against `codex-cli 0.153.4`;
+`docs/harness-codex.md` lists every method driven and the document each follows.
 
 **Posture:** OpenAI has publicly welcomed third-party harnesses on subscriptions (press coverage,
-2026-02); the doc cites it as reported, not as a licence term.
+2026-02); this is cited as reported, not as a licence term. What the vendor *does* document is the
+interface: the app-server README describes the protocol as the way to build a rich client on Codex,
+and asks that such clients identify themselves through `clientInfo`. This harness runs the user's
+own installed `codex` under the user's own login and never touches its token.
 
-**Quotes:** to be filled by the Codex harness with the app-server documentation and the coverage cited.
+**Quotes**, from
+[`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/app-server/README.md)
+at `rust-v0.153.4`:
+
+- "`codex app-server` is the interface Codex uses to power rich interfaces such as the Codex VS
+  Code extension."
+- "Applications building on top of `codex app-server` should identify themselves via the
+  `clientInfo` parameter." — followed by: "`clientInfo.name` is used to identify the client for the
+  OpenAI Compliance Logs Platform." The host's own name is therefore passed through unchanged; the
+  library never substitutes its own.
+- "Websocket transport is currently experimental and unsupported. Do not rely on it for production
+  workloads." — which is why the harness declares `stdio` only.
+
+**What this harness reads about an account:** `account/read`, and only the account *kind* plus, for
+a ChatGPT sign-in, the plan name. The email that call also returns is not modelled; a test asserts
+nothing of it survives into a value the harness holds. `~/.codex/auth.json` is never opened. The
+server's `account/chatgptAuthTokens/refresh` request — which asks a client to hand over a refreshed
+credential — is refused with a JSON-RPC error, unread.
+
+**Protocol types:** hand-written against OpenAI's own published schema rather than vendored from
+its source tree. `crates/mango-agent-codex/vendor/` holds the schema inventory
+`codex app-server generate-json-schema` produced at the pinned tag, under the Apache-2.0 notice in
+`vendor/NOTICE`; no OpenAI source code is copied into this repository.
+`docs/harness-codex.md` records the measurement behind that decision.
+
+**Branding:** nominative use only. "Codex" names the CLI being launched; no logos, no wordmarks,
+and nothing implying an official or endorsed integration.
 
 ## Agent Client Protocol agents (`mango-agent-acp`)
 
