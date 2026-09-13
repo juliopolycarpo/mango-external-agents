@@ -53,6 +53,8 @@ pub struct FakeAcpAgent {
     approval: Approval,
     /// `session/new` answers with this error code instead of a session.
     new_session_error: Option<(i32, String)>,
+    /// Streams a turn's updates and never answers its `session/prompt`.
+    never_finishes: bool,
     updates: Vec<serde_json::Value>,
     stop_reason: String,
     version_output: String,
@@ -76,6 +78,7 @@ impl FakeAcpAgent {
             modes: Vec::new(),
             approval: Approval::Never,
             new_session_error: None,
+            never_finishes: false,
             updates: vec![
                 serde_json::json!({
                     "sessionUpdate": "available_commands_update",
@@ -118,6 +121,17 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn with_protocol_version(mut self, version: u16) -> Self {
         self.protocol_version = version;
+        self
+    }
+
+    /// Streams a turn's updates and never answers its `session/prompt`.
+    ///
+    /// The only way to hold a prompt in flight with nothing else outstanding, which is what a host
+    /// dropping its `TurnStream` mid-turn has to be tested against: the turn slot belongs to the
+    /// prompt, and a closed sink must not release it.
+    #[must_use]
+    pub fn never_finishing_turns(mut self) -> Self {
+        self.never_finishes = true;
         self
     }
 
@@ -233,7 +247,7 @@ impl FakeAcpAgent {
             // "method not found" rather than silence.
             (Some(_), Some(id)) => vec![error(id, -32601, "method not found")],
             // A response to our own `session/request_permission`.
-            (None, Some(_)) => self.answered(pending),
+            (None, Some(_)) => self.answered(&message, pending),
             _ => Vec::new(),
         }
     }
@@ -292,6 +306,10 @@ impl FakeAcpAgent {
                 )
             })
             .collect();
+
+        if self.never_finishes {
+            return lines;
+        }
 
         if self.approval == Approval::Never {
             lines.push(result(
@@ -353,7 +371,17 @@ impl FakeAcpAgent {
         }
     }
 
-    fn answered(&self, pending: &Arc<Mutex<PendingTurn>>) -> Vec<String> {
+    /// The client answered this fake's `session/request_permission`, so its turn can finish.
+    ///
+    /// A `cancelled` outcome ends the turn as cancelled, which is what a real agent does: ACP requires
+    /// a client sending `session/cancel` to withdraw every pending question that way, so treating a
+    /// withdrawal as an ordinary answer would have this fake report `end_turn` for a turn somebody
+    /// stopped — and a harness that got the reason wrong would look correct against it.
+    fn answered(
+        &self,
+        message: &serde_json::Value,
+        pending: &Arc<Mutex<PendingTurn>>,
+    ) -> Vec<String> {
         let turn = pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -361,18 +389,32 @@ impl FakeAcpAgent {
         let Some(turn) = turn else {
             return Vec::new();
         };
+        // `/result/outcome/outcome`, not `/result/outcome`: `RequestPermissionResponse` carries the
+        // outcome as a field and the enum is internally tagged `outcome`, so the tag sits one level in.
+        let withdrawn = message
+            .pointer("/result/outcome/outcome")
+            .and_then(serde_json::Value::as_str)
+            == Some("cancelled");
+        let stop_reason = match withdrawn {
+            true => "cancelled",
+            false => self.stop_reason.as_str(),
+        };
         vec![result(
             turn,
-            serde_json::json!({ "stopReason": self.stop_reason }),
+            serde_json::json!({ "stopReason": stop_reason }),
         )]
     }
 
     /// A cancelled turn answers `stop_reason: cancelled`, which is what ACP says it does.
+    ///
+    /// But only once nothing is outstanding. While a `session/request_permission` is unanswered this
+    /// fake is, like a real agent, still inside the tool call that raised it — so the prompt response
+    /// waits for the client to withdraw the question, which ACP requires it to do.
     fn cancelled(&self, pending: &Arc<Mutex<PendingTurn>>) -> Vec<String> {
         let turn = pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .close();
+            .close_unless_asking();
         let Some(turn) = turn else {
             return Vec::new();
         };
@@ -387,12 +429,20 @@ impl FakeAcpAgent {
 #[derive(Debug, Default)]
 struct PendingTurn {
     prompt_id: Option<serde_json::Value>,
+    /// Whether a `session/request_permission` is outstanding.
+    ///
+    /// Load-bearing for `session/cancel`. A real agent awaits the permission answer *inside* its tool
+    /// call, so it cannot answer `session/prompt` until that await returns — which is exactly why ACP
+    /// requires a cancelling client to withdraw the question. A fake that answered the prompt on
+    /// `session/cancel` regardless would let a harness that never withdrew look correct.
+    question_open: bool,
     next_request_id: i64,
 }
 
 impl PendingTurn {
     fn open(&mut self, prompt_id: serde_json::Value) -> i64 {
         self.prompt_id = Some(prompt_id);
+        self.question_open = true;
         self.next_request_id()
     }
 
@@ -405,7 +455,17 @@ impl PendingTurn {
         9_000 + self.next_request_id
     }
 
+    /// Ends the turn, whatever else is outstanding.
     fn close(&mut self) -> Option<serde_json::Value> {
+        self.question_open = false;
+        self.prompt_id.take()
+    }
+
+    /// Ends the turn only if no question is outstanding, as a real agent's tool call would.
+    fn close_unless_asking(&mut self) -> Option<serde_json::Value> {
+        if self.question_open {
+            return None;
+        }
         self.prompt_id.take()
     }
 }

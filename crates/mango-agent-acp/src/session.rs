@@ -24,9 +24,7 @@ use mango_external_agents::{
     Capability, Error, EventSink, HostContext, PermissionResponse, Result, TurnStream,
 };
 
-use crate::client::{
-    self, Answered, ConnectionHandle, SessionState, TurnHandle, link_failure, with_stderr,
-};
+use crate::client::{self, Answered, ConnectionHandle, SessionState, link_failure, with_stderr};
 use crate::profile::AcpProfile;
 use crate::{content, reducer};
 
@@ -142,17 +140,27 @@ impl AcpSession {
                 ),
             });
         }
-        if configuration.level != self.info.effective_configuration.level
-            && self.profile.modes.for_level(configuration.level).is_some()
+        // Compared by *mode*, not by level. A level the profile reaches through a mode would need a
+        // `session/set_mode` mid-session, and this harness does not change a session's mode under a
+        // running conversation — so any pair whose mode differs from the one the session was opened
+        // with is refused, in both directions. Narrowing looks harmless and is not: a turn asking for
+        // `ReadOnly` on a session the agent runs in its own full-access mode would register a
+        // read-only handle while the agent, still in that mode, raises no permission request at all
+        // for the standing refusal to answer. Nothing would hold the level the host asked for.
+        let session_level = self.info.effective_configuration.level;
+        let wanted_mode = self.profile.modes.for_level(configuration.level);
+        if configuration.level != session_level
+            && wanted_mode != self.profile.modes.for_level(session_level)
         {
-            // A level the profile reaches through a mode would need a `session/set_mode` mid-session,
-            // and this harness does not change a session's mode under a running conversation:
-            // the level a host chose at `open_session` is the level the agent was configured with.
             return Err(Error::Protocol {
-                expected: String::from(
-                    "a turn configuration whose level matches the session's: ACP modes are set when the session opens",
+                expected: format!(
+                    "a turn whose level runs under the session's own mode {:?}: ACP modes are set when the session opens",
+                    self.profile.modes.for_level(session_level)
                 ),
-                received: format!("{:?}", configuration.level),
+                received: format!(
+                    "{:?}, which wants mode {wanted_mode:?}",
+                    configuration.level
+                ),
             });
         }
         Ok(configuration)
@@ -204,10 +212,7 @@ impl Session for AcpSession {
             Arc::clone(self.host.clock()),
             self.host.limits().turn_channel_capacity,
         );
-        self.state.begin_turn(TurnHandle {
-            sink: sink.clone(),
-            level: configuration.level,
-        })?;
+        let handle = self.state.begin_turn(sink.clone(), configuration.level)?;
 
         // Emitted before the prompt is sent, so the first event a host reads names the conversation
         // the rest of the turn belongs to.
@@ -236,13 +241,20 @@ impl Session for AcpSession {
         // `block_task` is sound here for the same reason — this task is not the dispatch loop.
         tokio::spawn(async move {
             let outcome = sent.block_task().await;
-            let Some(turn) = state.end_turn() else {
-                // Already ended: a cancel or a close got here first.
+            // Matched, not taken: a `close` may have ended this turn already, and a *later* turn may
+            // have started since, so an unconditional take would terminate a conversation that is not
+            // this prompt's.
+            let Some(turn) = state.end_turn_matching(&handle) else {
                 return;
             };
             // A question cannot outlive the turn it belongs to: answering one afterwards would emit
             // into a finished sink and tell the agent "allow" about a turn it has stopped running.
             state.withdraw_pending();
+            // Claimed before the closing events go out, so a `close` racing this one cannot emit a
+            // second terminal into the same stream.
+            if !turn.finish() {
+                return;
+            }
             for kind in state.finish_reducing() {
                 if turn.sink.emit(kind).await.is_err() {
                     return;
@@ -308,6 +320,13 @@ impl Session for AcpSession {
         // `stop_reason: cancelled`, and the task that ends the turn has to report *this* reason
         // rather than flattening a shutdown or a withdrawn consent into "requested".
         self.state.record_cancel_reason(reason);
+        // Required, not merely tidy. ACP v1 states that a client sending `session/cancel` **MUST**
+        // answer every pending `session/request_permission` with the `Cancelled` outcome — twice, on
+        // `RequestPermissionOutcome::Cancelled` and on `AgentRequest::RequestPermissionRequest`. An
+        // agent whose permission await is not itself cancellation-aware never returns from its tool
+        // call otherwise, so `session/prompt` never answers, the turn emits no terminal at all, and
+        // the turn slot stays occupied for the life of the session.
+        self.state.withdraw_pending();
         // A notification, so there is no answer to wait for and no deadline to apply: `session/cancel`
         // is queued to the transport and the agent reports the outcome on the prompt response.
         self.connection
@@ -344,12 +363,16 @@ impl Session for AcpSession {
         // reading parks indefinitely — and the calls waiting on that lock are the ones a host uses
         // to get out of it.
         let turn = self.state.end_turn();
-        if let Some(turn) = turn {
-            // Bounded, because the host is the one that may not be reading. A host that abandoned a
-            // turn's stream and then closed the session must not hang its own shutdown on its own
-            // backpressure; dropping the sink afterwards ends that stream instead of leaving it open
-            // forever. The wait is only ever reached when the channel is already full and unread.
-            let _ = tokio::time::timeout(CLOSE_GRACE, turn.sink.cancel(reason.into())).await;
+        if let Some(turn) = turn
+            && turn.finish()
+        {
+            // Spawned rather than awaited under a timeout. `close` must not hang on a host that
+            // stopped reading its own stream — but a timeout that *dropped* this future would send
+            // nothing at all: `mpsc::Sender::send` is cancel-safe, so abandoning it mid-send loses the
+            // value, and the host would get a stream that just ends with no `Cancelled` and no
+            // `Completed`. The core's conformance suite requires exactly one terminal. Spawned, the
+            // terminal lands the moment the host reads, or is dropped when the host drops the stream.
+            tokio::spawn(async move { turn.sink.cancel(reason.into()).await });
         }
 
         self.connection.shutdown(reason.into()).await;

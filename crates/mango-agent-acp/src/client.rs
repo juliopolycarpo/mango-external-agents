@@ -28,6 +28,7 @@
 //! are computed under the guard and emitted after it drops.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -68,6 +69,29 @@ pub(crate) struct TurnHandle {
     pub(crate) sink: EventSink,
     /// What the agent may do for this turn, which is what decides a standing refusal.
     pub(crate) level: PermissionLevel,
+    /// Which turn this is, so only its own owner can end it.
+    ///
+    /// Without it, `end_turn` takes whatever handle is present — and a `session/prompt` task that
+    /// answered late would end, and emit the terminal of, a turn that is not its own.
+    generation: u64,
+    /// Set by whoever emitted this turn's terminal.
+    ///
+    /// A handler holding a clone can be parked mid-frame while `close` emits the terminal on another
+    /// task; resuming afterwards would put the rest of that frame's events *after* the terminal,
+    /// which the core's conformance suite refuses. Checked before every emit.
+    finished: Arc<AtomicBool>,
+}
+
+impl TurnHandle {
+    /// Whether this turn's terminal has already gone out.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// Claims the right to emit this turn's terminal, once.
+    pub(crate) fn finish(&self) -> bool {
+        !self.finished.swap(true, Ordering::AcqRel)
+    }
 }
 
 /// Everything the dispatch loop's handlers and the session's own methods share.
@@ -78,6 +102,8 @@ pub(crate) struct SessionState {
     /// How long an approval stays answerable, carried on every request the host sees.
     approval_timeout: Duration,
     turn: Mutex<Option<TurnHandle>>,
+    /// Stamped onto each turn so a late `session/prompt` task can prove a handle is its own.
+    generations: AtomicU64,
     /// Why the running turn was cancelled, when somebody said.
     ///
     /// ACP answers a cancelled `session/prompt` with `stop_reason: cancelled` and no reason of its
@@ -110,6 +136,7 @@ impl SessionState {
             broker: host.broker().cloned(),
             approval_timeout: host.limits().request_timeout,
             turn: Mutex::new(None),
+            generations: AtomicU64::new(0),
             cancel_reason: Mutex::new(None),
             reducer: Mutex::new(Reducer::new()),
             pending: Mutex::new(HashMap::new()),
@@ -122,7 +149,8 @@ impl SessionState {
     /// second prompt would produce two turns racing for one stream of updates with no field on the
     /// wire to tell them apart. Refused rather than queued, because a host that thinks it queued a
     /// turn and a library that silently serialised them disagree about what has been sent.
-    pub(crate) fn begin_turn(&self, handle: TurnHandle) -> Result<()> {
+    /// Returns the turn's own handle, which its `session/prompt` task keeps in order to end it.
+    pub(crate) fn begin_turn(&self, sink: EventSink, level: PermissionLevel) -> Result<TurnHandle> {
         let mut turn = self.lock_turn();
         if turn.is_some() {
             return Err(Error::Protocol {
@@ -132,10 +160,20 @@ impl SessionState {
                 received: String::from("a turn that has not ended"),
             });
         }
-        *turn = Some(handle);
+        let handle = TurnHandle {
+            sink,
+            level,
+            generation: self.generations.fetch_add(1, Ordering::Relaxed),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
+        *turn = Some(handle.clone());
         *self.lock_reducer() = Reducer::new();
         *self.lock_cancel_reason() = None;
-        Ok(())
+        // A question belongs to a turn, and a turn that is starting has none. Anything still parked
+        // here outlived the turn it was asked under and would otherwise be answerable during this one.
+        drop(turn);
+        self.withdraw_pending();
+        Ok(handle)
     }
 
     /// Records why the running turn is being cancelled.
@@ -156,9 +194,24 @@ impl SessionState {
         self.lock_turn().clone()
     }
 
-    /// Ends the turn and hands back its sink, so the caller can emit outside the lock.
+    /// Ends whatever turn is running, whoever it belongs to.
+    ///
+    /// For `close`, which ends the session and therefore every turn in it.
     pub(crate) fn end_turn(&self) -> Option<TurnHandle> {
         self.lock_turn().take()
+    }
+
+    /// Ends this turn, and only this turn.
+    ///
+    /// What a `session/prompt` task calls. Its own turn may already have been ended by a `close`, and
+    /// a *later* turn may have started in the meantime — so an unconditional take would let a task
+    /// that answered late end, and emit the terminal of, a conversation that is not its own.
+    pub(crate) fn end_turn_matching(&self, handle: &TurnHandle) -> Option<TurnHandle> {
+        let mut turn = self.lock_turn();
+        if turn.as_ref()?.generation != handle.generation {
+            return None;
+        }
+        turn.take()
     }
 
     /// The events one frame produces, computed under the guard because the reducer is pure.
@@ -245,9 +298,11 @@ impl SessionState {
 
 /// One `session/update` notification, reduced and emitted.
 ///
-/// Returns `Ok(())` even when the host has gone: the dispatch loop's contract is that a handler
-/// error ends the whole connection, and a dropped turn stream is not a reason to tear down a session
-/// the host may still be using. The turn is ended instead, so the next frame is dropped cheaply.
+/// Never fails the handler, and — deliberately — never ends the turn. A host that dropped its
+/// `TurnStream` has closed the sink, not finished the `session/prompt` that is still in flight, so
+/// freeing the turn slot here would let a second prompt onto a wire that has no way to tell two turns
+/// apart, and would hand this turn's completion task a *later* turn's handle to terminate. The slot is
+/// the prompt's to release; a closed sink simply makes every later frame fail fast.
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
     // Cloned out from under its lock before the first emit: a handler parked on a full channel must
     // not be holding the lock that `cancel` and `close` need to unpark it.
@@ -255,8 +310,9 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
         return;
     };
     for kind in state.reduce(notification) {
-        if turn.sink.emit(kind).await.is_err() {
-            state.end_turn();
+        // Re-checked each time round: this handler can be parked on a full channel while `close`
+        // emits the terminal on another task, and resuming would put the rest of this frame after it.
+        if turn.is_finished() || turn.sink.emit(kind).await.is_err() {
             return;
         }
     }
@@ -301,12 +357,14 @@ async fn on_request_permission(
     // interface the host would otherwise render. The dispatch loop is held while the broker thinks,
     // which is correct: the agent is waiting on this question either way.
     //
-    // A `match` rather than `Option::or`, whose argument is evaluated either way: a read-only
-    // session that already refused must not also consult the broker, or a host reading its own
-    // policy's log would find a question the policy never decided.
-    let decided = match standing_refusal(turn.level, &question) {
-        Some(refusal) => Some(refusal),
-        None => broker_response(state.broker.as_ref(), &question).await,
+    // The level decides *whether* the broker is asked at all, and that is the whole point. A
+    // read-only session must never reach `broker_response`, because a policy answering `Allow` there
+    // becomes an allowing option id on the wire — so the one level that exists to grant nothing would
+    // grant. When a read-only session cannot refuse (the agent offered no refusing option) the answer
+    // is nobody's but a person's, which is what leaving `decided` empty arranges.
+    let decided = match turn.level {
+        PermissionLevel::ReadOnly => standing_refusal(&question),
+        _ => broker_response(state.broker.as_ref(), &question).await,
     };
 
     // An undecided question is parked *before* it is emitted. A host reading its own stream can
@@ -320,16 +378,17 @@ async fn on_request_permission(
         }
     };
 
-    if turn
-        .sink
-        .emit(EventKind::ApprovalRequested {
-            request: question.clone(),
-        })
-        .await
-        .is_err()
+    if turn.is_finished()
+        || turn
+            .sink
+            .emit(EventKind::ApprovalRequested {
+                request: question.clone(),
+            })
+            .await
+            .is_err()
     {
-        state.end_turn();
-        // Whichever side still holds the responder answers: a host answer can no longer arrive.
+        // The turn slot is left alone — it belongs to the `session/prompt` in flight. Whichever side
+        // still holds the responder answers, because a host answer can no longer arrive.
         let orphan = held.or_else(|| state.lock_pending().remove(&id));
         return match orphan {
             Some(responder) => responder.respond(permission::cancelled()),
@@ -353,18 +412,15 @@ async fn on_request_permission(
     Ok(())
 }
 
-/// The refusal a read-only session owes every question, when the agent offered one.
+/// The refusal a read-only session owes a question, when the agent offered a way to refuse.
 ///
-/// `None` when the level allows acting, and also when the agent offered no way to refuse — there is
-/// nothing to answer with, so the question goes to a person, which is the same thing
-/// [`broker_response`] does in that case.
+/// `None` when it did not: there is nothing to answer with, so the question goes to a person. The
+/// caller must **not** fall back to the broker in that case — a policy answering `Allow` would put an
+/// allowing option id on the wire, and read-only exists precisely so that cannot happen. See
+/// [`on_request_permission`].
 fn standing_refusal(
-    level: PermissionLevel,
     question: &mango_external_agents::PermissionRequest,
 ) -> Option<PermissionResponse> {
-    if level != PermissionLevel::ReadOnly {
-        return None;
-    }
     Some(
         question
             .deny()

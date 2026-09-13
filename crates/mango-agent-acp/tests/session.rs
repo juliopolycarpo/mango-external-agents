@@ -504,6 +504,260 @@ async fn session_listing_follows_what_the_agent_advertised() {
     assert_eq!(page.sessions[0].title.as_deref(), Some("Yesterday"));
 }
 
+/// Narrowing a turn below a mode-bearing session level looks harmless and is not. The agent stays in
+/// the mode `open_session` set, so it raises no permission request at all and the standing refusal has
+/// nothing to answer — the turn would run with full access while the harness reported `ReadOnly`.
+#[tokio::test]
+async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_modes(["bypassPermissions", "plan"])
+            .process(),
+    );
+    let moded = Arc::new(
+        AcpProfile::custom("fake", ["fake-acp", "acp"], VENDOR).with_modes(SessionModeIds {
+            full_access: Some("bypassPermissions"),
+            ..SessionModeIds::UNKNOWN
+        }),
+    );
+
+    let session = AcpHarness::new(moded)
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(Configuration {
+                level: PermissionLevel::FullAccess,
+                ..Configuration::default()
+            }),
+        )
+        .await
+        .expect("expected a session");
+
+    let error = refusal(
+        session
+            .start_turn(
+                TurnRequest::new("turn-1", "just read").with_configuration(Configuration {
+                    level: PermissionLevel::ReadOnly,
+                    ..Configuration::default()
+                }),
+            )
+            .await,
+    );
+    assert!(
+        matches!(&error, Error::Protocol { expected, .. } if expected.contains("bypassPermissions")),
+        "received {error:?}"
+    );
+}
+
+/// `close` must not drop a half-sent terminal. A timeout that abandoned the `emit` would send nothing —
+/// `mpsc::Sender::send` is cancel-safe — so a host that stopped reading and then closed would get a
+/// stream that just ends, with no `Cancelled` and no `Completed`, which the core's conformance rules
+/// refuse.
+#[tokio::test]
+async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            turn_channel_capacity: 1,
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host,
+            OpenSession::new("chat-1").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "fill the channel"))
+        .await
+        .expect("expected a turn");
+
+    // The channel holds one event and nobody has read it, so `close`'s terminal cannot be sent yet.
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected the close to return");
+
+    // Now read. The terminal has to arrive rather than having been dropped with the abandoned future.
+    let events = drain(&mut turn).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|kind| matches!(kind, EventKind::Completed | EventKind::Error { .. }))
+            .count(),
+        1,
+        "expected exactly one terminal, received {events:?}"
+    );
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::Cancelled {
+                reason: CancelReason::Shutdown
+            }
+        )),
+        "expected the close's own reason, received {events:?}"
+    );
+}
+
+/// The level decides whether the broker is asked at all, and this is why. Under `ReadOnly` the library
+/// must never reach `broker_response`: a policy answering `Allow` there becomes an allowing option id
+/// on the wire, so the one level that exists to grant nothing would grant.
+///
+/// Reachable only when the agent offers no way to refuse — otherwise the standing refusal answers
+/// first — which is why the earlier read-only tests missed it: one built its host without a broker, the
+/// other used an agent that offered a refusal.
+#[tokio::test]
+async fn a_read_only_session_never_lets_a_broker_allow_even_when_it_cannot_refuse() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .asking_for_approval(Approval::OnlyAllows)
+            .process(),
+    );
+    let (host, broker) = host_with_broker(&launcher, BrokerDecision::Allow);
+
+    let session = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    assert_eq!(
+        session.info().effective_configuration.level,
+        PermissionLevel::ReadOnly
+    );
+
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "delete the build"))
+        .await
+        .expect("expected a turn");
+
+    let asked = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = turn.recv().await {
+            if matches!(event.kind, EventKind::ApprovalRequested { .. }) {
+                return true;
+            }
+            if event.is_terminal() {
+                return false;
+            }
+        }
+        false
+    })
+    .await
+    .expect("expected an answer rather than a hang");
+
+    assert!(
+        asked,
+        "expected the question to reach the host when nothing could refuse it"
+    );
+    assert!(
+        broker.requests().is_empty(),
+        "expected a read-only session never to consult the broker, received {:?}",
+        broker.requests()
+    );
+    // And nothing was answered on the agent's behalf.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        outcome_lines(&launcher).is_empty(),
+        "expected no answer to reach the agent, received {:?}",
+        outcome_lines(&launcher)
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected the close to land");
+}
+
+/// ACP v1 states twice that a client sending `session/cancel` MUST answer every pending
+/// `session/request_permission` with the `Cancelled` outcome. An agent whose permission await is not
+/// itself cancellation-aware never returns from its tool call otherwise, so `session/prompt` never
+/// answers, the turn emits no terminal at all, and the turn slot stays occupied for the session's life.
+#[tokio::test]
+async fn cancelling_withdraws_every_question_the_agent_is_waiting_on() {
+    // Answers its prompt only once the question is settled, which is what a real agent does — so a
+    // harness that cancelled without withdrawing would hang here rather than fail an assertion.
+    let (session, launcher) = open(
+        FakeAcpAgent::new().asking_for_approval(Approval::Once),
+        permissive(),
+    )
+    .await;
+
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "take your time"))
+        .await
+        .expect("expected a turn");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = turn.recv().await {
+            if matches!(event.kind, EventKind::ApprovalRequested { .. }) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("expected the question to arrive");
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to land");
+
+    let withdrawal = answers_reaching_the_agent(&launcher, 1).await;
+    assert!(
+        withdrawal[0].contains("cancelled"),
+        "expected the cancel to withdraw the question, received {withdrawal:?}"
+    );
+
+    // And the turn still ends, which is what the withdrawal buys.
+    let events = drain(&mut turn).await;
+    assert!(
+        events
+            .iter()
+            .any(|kind| matches!(kind, EventKind::Completed | EventKind::Error { .. })),
+        "expected the turn to end, received {events:?}"
+    );
+
+    // The slot is free again, so the session is still usable.
+    session
+        .start_turn(TurnRequest::new("turn-2", "carry on"))
+        .await
+        .expect("expected the session to still take a turn");
+}
+
+/// A host that drops a `TurnStream` closes the sink; it does not finish the `session/prompt` that is
+/// still in flight. Freeing the turn slot on a failed emit would put a second prompt on a wire that
+/// cannot tell two turns apart, and would hand turn 1's completion task turn 2's handle to terminate.
+#[tokio::test]
+async fn a_dropped_turn_stream_does_not_free_the_slot_while_the_prompt_is_in_flight() {
+    let (session, _launcher) =
+        open(FakeAcpAgent::new().never_finishing_turns(), permissive()).await;
+
+    let turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected a turn");
+    // Dropped mid-turn: this agent never answers its prompt, so prompt 1 is genuinely in flight and
+    // the only thing that could free the slot is a handler reacting to the closed sink.
+    drop(turn);
+    // Let the agent's next frame hit the closed sink.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+
+    let error = refusal(session.start_turn(TurnRequest::new("turn-2", "two")).await);
+    assert!(
+        matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        "received {error:?}"
+    );
+}
+
 /// A question cannot outlive the turn it belongs to. Answering one afterwards would emit into a
 /// finished sink and tell the agent "allow" about a turn it has stopped running, so the turn's own end
 /// withdraws every question still parked — not just `close`.
