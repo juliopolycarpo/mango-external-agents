@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::error::{Error, ErrorCode, Result, VendorError, jsonrpc_code_is_retryable};
@@ -100,6 +100,33 @@ pub enum ServerRequestOutcome {
     Failure(JsonRpcError),
 }
 
+/// Why the peer's read side stopped without this client closing it first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerTermination {
+    /// The peer closed its output.
+    Exited,
+    /// Reading the peer failed.
+    LinkFailed(String),
+    /// Peer work filled the bounded handoff queue before the handler could consume it.
+    NotificationBackpressure {
+        /// The number of peer messages the client can retain while the handler is busy.
+        limit: usize,
+    },
+}
+
+impl std::fmt::Display for PeerTermination {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited => formatter.write_str("the peer exited"),
+            Self::LinkFailed(error) => write!(formatter, "the peer link failed: {error}"),
+            Self::NotificationBackpressure { limit } => write!(
+                formatter,
+                "the peer sent more messages than the client could retain while its handler was busy (limit {limit})"
+            ),
+        }
+    }
+}
+
 /// What the harness above does with what the peer said.
 #[async_trait::async_trait]
 pub trait PeerHandler: Send + Sync {
@@ -121,6 +148,12 @@ pub trait PeerHandler: Send + Sync {
         params: Value,
         id: RequestId,
     ) -> ServerRequestOutcome;
+
+    /// The peer's read side ended unexpectedly.
+    ///
+    /// A handler can release state that only a complete vendor turn would otherwise clear. This
+    /// callback is never made for [`Client::close`], whose caller already owns that shutdown.
+    async fn on_terminated(&self, _termination: PeerTermination) {}
 }
 
 /// How this client speaks.
@@ -143,6 +176,8 @@ pub struct ClientOptions {
     /// them, so a peer writing request frames as fast as the pipe allows would spawn one task per
     /// frame. Past this many, the next question is refused rather than spawned.
     pub max_in_flight_requests: usize,
+    /// How many peer messages that need the handler can wait while responses keep settling.
+    pub max_pending_notifications: usize,
 }
 
 impl Default for ClientOptions {
@@ -152,6 +187,7 @@ impl Default for ClientOptions {
             include_version_header: true,
             request_timeout: Duration::from_secs(120),
             max_in_flight_requests: 256,
+            max_pending_notifications: 256,
         }
     }
 }
@@ -176,6 +212,13 @@ impl ClientOptions {
     #[must_use]
     pub fn with_max_in_flight_requests(mut self, max_in_flight_requests: usize) -> Self {
         self.max_in_flight_requests = max_in_flight_requests;
+        self
+    }
+
+    /// Buffers at most this many peer messages while responses continue through the pump.
+    #[must_use]
+    pub fn with_max_pending_notifications(mut self, max_pending_notifications: usize) -> Self {
+        self.max_pending_notifications = max_pending_notifications;
         self
     }
 
@@ -233,6 +276,7 @@ struct ClientState {
     shutdown: CancelToken,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
+    notifications: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl Client {
@@ -242,6 +286,7 @@ impl Client {
     /// client is dropped.
     pub fn connect(link: Link, handler: Arc<dyn PeerHandler>, options: ClientOptions) -> Self {
         let (sender, receiver) = link.split();
+        let notification_capacity = options.max_pending_notifications.max(1);
         let state = Arc::new(ClientState {
             sender: Mutex::new(sender),
             pending: Mutex::new(HashMap::new()),
@@ -250,8 +295,18 @@ impl Client {
             closed: AtomicBool::new(false),
             shutdown: CancelToken::new(),
             in_flight: StdMutex::new(JoinSet::new()),
+            notifications: StdMutex::new(None),
         });
-        let pump = tokio::spawn(pump(Arc::clone(&state), receiver, handler));
+        let (notifications, notification_receiver) = mpsc::channel(notification_capacity);
+        *state
+            .notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tokio::spawn(peer_work_pump(
+            Arc::clone(&state),
+            notification_receiver,
+            Arc::clone(&handler),
+        )));
+        let pump = tokio::spawn(pump(Arc::clone(&state), receiver, handler, notifications));
         Self {
             state,
             pump: Mutex::new(Some(pump)),
@@ -328,6 +383,7 @@ impl Client {
         self.state.closed.store(true, Ordering::Release);
         self.state.shutdown.cancel();
         self.state.fail_pending(self.state.closed_error()).await;
+        self.state.stop_notifications().await;
         // The peer's own questions are answered on tasks of their own, and one waiting for a
         // person would otherwise outlive the client that spawned it — holding its share of the
         // state for the rest of the process, and replying into a link that is already gone. The
@@ -435,6 +491,7 @@ impl Drop for Client {
         self.state.closed.store(true, Ordering::Release);
         self.state.shutdown.cancel();
         self.state.abort_in_flight();
+        self.state.abort_notifications();
         if let Ok(mut pump) = self.pump.try_lock()
             && let Some(pump) = pump.take()
         {
@@ -504,6 +561,52 @@ impl ClientState {
             .abort_all();
     }
 
+    async fn stop_notifications(&self) {
+        let handle = self
+            .notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    /// Lets already queued peer work reach the handler before reporting that the peer vanished.
+    ///
+    /// A complete activity frame followed by EOF is still observable output. Dropping the sender
+    /// first gives the worker that finite tail; the grace keeps a host that stopped reading from
+    /// turning peer teardown into an unbounded wait.
+    async fn drain_notifications(&self) {
+        let handle = self
+            .notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(mut handle) = handle else {
+            return;
+        };
+        if tokio::time::timeout(IN_FLIGHT_DRAIN_GRACE, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    fn abort_notifications(&self) {
+        if let Some(handle) = self
+            .notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.abort();
+        }
+    }
+
     /// Answers one of the peer's questions on a task this client owns, if there is room.
     ///
     /// The count and the spawn happen under one lock rather than two. Only the pump dispatches
@@ -566,6 +669,7 @@ async fn pump(
     state: Arc<ClientState>,
     mut receiver: Box<dyn crate::link::LinkReceiver>,
     handler: Arc<dyn PeerHandler>,
+    notifications: mpsc::Sender<PeerWork>,
 ) {
     loop {
         let message = tokio::select! {
@@ -575,7 +679,30 @@ async fn pump(
         };
 
         match message {
-            Ok(Some(message)) => dispatch(&state, &handler, message).await,
+            Ok(Some(message)) => {
+                if !dispatch(&state, &notifications, message).await {
+                    state.closed.store(true, Ordering::Release);
+                    state
+                        .fail_pending(JsonRpcError {
+                            code: -32000,
+                            message: format!(
+                                "the {} notification queue reached its limit",
+                                state.options.peer_name
+                            ),
+                            data: None,
+                        })
+                        .await;
+                    state.stop_notifications().await;
+                    state.shutdown.cancel();
+                    state.drain_in_flight().await;
+                    handler
+                        .on_terminated(PeerTermination::NotificationBackpressure {
+                            limit: state.options.max_pending_notifications.max(1),
+                        })
+                        .await;
+                    break;
+                }
+            }
             Ok(None) => {
                 state.closed.store(true, Ordering::Release);
                 state
@@ -585,9 +712,17 @@ async fn pump(
                         data: None,
                     })
                     .await;
+                // Closing this sender lets the ordered worker deliver every frame it already
+                // owns, including an activity immediately before EOF, before it exits.
+                drop(notifications);
+                state.drain_notifications().await;
+                state.shutdown.cancel();
+                state.drain_in_flight().await;
+                handler.on_terminated(PeerTermination::Exited).await;
                 break;
             }
             Err(error) => {
+                let termination = PeerTermination::LinkFailed(error.to_string());
                 state.closed.store(true, Ordering::Release);
                 state
                     .fail_pending(JsonRpcError {
@@ -596,17 +731,26 @@ async fn pump(
                         data: None,
                     })
                     .await;
+                drop(notifications);
+                state.drain_notifications().await;
+                state.shutdown.cancel();
+                state.drain_in_flight().await;
+                handler.on_terminated(termination).await;
                 break;
             }
         }
     }
 }
 
-async fn dispatch(state: &Arc<ClientState>, handler: &Arc<dyn PeerHandler>, message: String) {
+async fn dispatch(
+    state: &Arc<ClientState>,
+    notifications: &mpsc::Sender<PeerWork>,
+    message: String,
+) -> bool {
     // Not every line on a peer's output is a frame. Dropping an unparseable one keeps a stray
     // diagnostic from killing a live turn.
     let Ok(Value::Object(frame)) = serde_json::from_str::<Value>(&message) else {
-        return;
+        return true;
     };
 
     let id = frame.get("id").cloned();
@@ -616,24 +760,23 @@ async fn dispatch(state: &Arc<ClientState>, handler: &Arc<dyn PeerHandler>, mess
         .map(str::to_owned);
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
 
+    if let (Some(method), None) = (&method, &id) {
+        return notifications
+            .try_send(PeerWork::Notification {
+                method: method.clone(),
+                params,
+            })
+            .is_ok();
+    }
+
     match (method, id) {
-        (Some(method), None) => handler.on_notification(method, params).await,
         (Some(method), Some(id)) => {
-            // On a task of its own: a question that waits for a person must not stop the events
-            // arriving meanwhile, which is what a turn renders while the person decides. Counted,
-            // because a peer that asks faster than anyone answers must not be able to spawn
-            // without bound.
-            if !ClientState::spawn_answer(state, handler, method, params, id.clone()) {
-                let refusal = JsonRpcError {
-                    code: -32000,
-                    message: format!(
-                        "expected at most {} questions in flight, received one more",
-                        state.options.max_in_flight_requests
-                    ),
-                    data: None,
-                };
-                write_reply(state, id, ServerRequestOutcome::Failure(refusal)).await;
-            }
+            // Requests share the ordered handoff with notifications. A request can still answer
+            // on its own task once it reaches the worker, but it must not overtake an earlier
+            // event whose handler has not run yet.
+            return notifications
+                .try_send(PeerWork::Request { method, params, id })
+                .is_ok();
         }
         (None, Some(id)) => {
             let outcome = match frame.get("error") {
@@ -649,6 +792,50 @@ async fn dispatch(state: &Arc<ClientState>, handler: &Arc<dyn PeerHandler>, mess
             state.settle(&RequestId::new(id).key(), outcome).await;
         }
         (None, None) => {}
+        (Some(_), None) => unreachable!("notifications returned before this match"),
+    }
+    true
+}
+
+enum PeerWork {
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Request {
+        method: String,
+        params: Value,
+        id: Value,
+    },
+}
+
+async fn peer_work_pump(
+    state: Arc<ClientState>,
+    mut notifications: mpsc::Receiver<PeerWork>,
+    handler: Arc<dyn PeerHandler>,
+) {
+    while let Some(work) = notifications.recv().await {
+        match work {
+            PeerWork::Notification { method, params } => {
+                handler.on_notification(method, params).await
+            }
+            PeerWork::Request { method, params, id } => {
+                // A question that waits for a person must not stop later events after it has
+                // reached the head of the queue. Count the task before starting it so a peer
+                // cannot use request frames to create unbounded work.
+                if !ClientState::spawn_answer(&state, &handler, method, params, id.clone()) {
+                    let refusal = JsonRpcError {
+                        code: -32000,
+                        message: format!(
+                            "expected at most {} questions in flight, received one more",
+                            state.options.max_in_flight_requests
+                        ),
+                        data: None,
+                    };
+                    write_reply(&state, id, ServerRequestOutcome::Failure(refusal)).await;
+                }
+            }
+        }
     }
 }
 
@@ -696,7 +883,8 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
 #[cfg(test)]
 mod tests {
     use super::{
-        Client, ClientOptions, JsonRpcError, PeerHandler, RequestId, ServerRequestOutcome,
+        Client, ClientOptions, JsonRpcError, PeerHandler, PeerTermination, RequestId,
+        ServerRequestOutcome,
     };
     use crate::error::Error;
     use crate::testing::ScriptedLink;
@@ -709,6 +897,7 @@ mod tests {
     /// A handler that records what it was told and answers questions from a script.
     struct RecordingHandler {
         notifications: Mutex<Vec<(String, Value)>>,
+        terminations: Mutex<Vec<PeerTermination>>,
         answer: Option<ServerRequestOutcome>,
     }
 
@@ -716,6 +905,7 @@ mod tests {
         fn arc(answer: Option<ServerRequestOutcome>) -> Arc<Self> {
             Arc::new(Self {
                 notifications: Mutex::new(Vec::new()),
+                terminations: Mutex::new(Vec::new()),
                 answer,
             })
         }
@@ -736,6 +926,10 @@ mod tests {
             self.answer
                 .clone()
                 .unwrap_or_else(|| ServerRequestOutcome::Answer(json!({ "echoed": id.key() })))
+        }
+
+        async fn on_terminated(&self, termination: PeerTermination) {
+            self.terminations.lock().await.push(termination);
         }
     }
 
@@ -982,6 +1176,31 @@ mod tests {
         assert!(client.is_closed());
     }
 
+    #[tokio::test]
+    async fn a_peer_exit_reaches_the_handler_when_no_call_is_waiting() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = client(link.clone(), Arc::clone(&handler));
+
+        link.end();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !handler.terminations.lock().await.is_empty() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the pump to report the exit");
+
+        assert_eq!(
+            *handler.terminations.lock().await,
+            vec![PeerTermination::Exited]
+        );
+        assert!(client.is_closed());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_call_that_is_never_answered_ends_at_its_deadline() {
         let link = ScriptedLink::new();
@@ -1168,6 +1387,61 @@ mod tests {
             .expect("expected a clean close");
     }
 
+    #[tokio::test]
+    async fn a_full_notification_queue_fails_closed_without_parking_the_response_pump() {
+        let link = ScriptedLink::new();
+        let handler = StalledHandler::arc();
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_max_pending_notifications(1),
+        );
+
+        // The worker owns the first notification and then parks in the handler. The second fits
+        // the handoff queue; the third must fail the connection instead of blocking the one task
+        // that still has to read responses.
+        link.push_line(r#"{"jsonrpc":"2.0","method":"item/started","params":{}}"#);
+        handler.entered.notified().await;
+        link.push_line(r#"{"jsonrpc":"2.0","method":"item/updated","params":{}}"#);
+        link.push_line(r#"{"jsonrpc":"2.0","method":"item/completed","params":{}}"#);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected bounded notification backpressure to close the client");
+    }
+
+    /// Peer requests are ordered behind earlier notifications, even though their answers run on
+    /// independent tasks once they reach the head of that queue.
+    #[tokio::test]
+    async fn a_peer_request_cannot_overtake_a_stalled_notification() {
+        let link = ScriptedLink::new();
+        let handler = StalledHandler::arc();
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_max_pending_notifications(2),
+        );
+
+        link.push_line(r#"{"jsonrpc":"2.0","method":"item/started","params":{}}"#);
+        handler.entered.notified().await;
+        link.push_line(
+            r#"{"jsonrpc":"2.0","id":"approval-1","method":"session/request_permission"}"#,
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), handler.asked.notified())
+                .await
+                .is_err(),
+            "expected the request to wait behind the stalled notification"
+        );
+
+        client.close().await.expect("expected a clean close");
+    }
+
     /// A question the peer asked is answered on a task of its own. Closing has to take that task
     /// with it, or an approval nobody answered outlives the session that raised it — holding its
     /// share of the client for the rest of the process.
@@ -1202,6 +1476,28 @@ mod tests {
             serde_json::from_str(&sent[0]).expect("expected the refusal to be a frame");
         assert_eq!(refusal["id"], json!("1"), "received {refusal}");
         assert_eq!(refusal["error"]["code"], json!(-32000));
+    }
+
+    #[tokio::test]
+    async fn peer_exit_releases_unanswered_questions_without_explicit_close() {
+        let link = ScriptedLink::new();
+        let handler = StalledHandler::arc();
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server"),
+        );
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","method":"session/request_permission"}"#);
+        handler.asked.notified().await;
+        link.end();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handler.released.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected peer EOF to release the unanswered handler without explicit close");
+        client.close().await.expect("expected idempotent close");
     }
 
     /// The line cap bounds how big one frame is, never how many arrive. Without a count, a peer

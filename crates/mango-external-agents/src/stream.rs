@@ -121,12 +121,7 @@ impl EventSink {
     /// [`Error::Closed`] when the host dropped the stream. Both end the reducer's loop: there is
     /// nobody to tell, and a turn nobody is reading is a turn to stop feeding.
     pub async fn emit(&self, kind: EventKind) -> Result<()> {
-        let event = AgentEvent {
-            session_id: self.session_id.clone(),
-            turn_id: self.turn_id.clone(),
-            at: self.clock.now(),
-            kind: kind.normalized()?,
-        };
+        let event = self.event(kind)?;
         self.sender.send(event).await.map_err(|_| Error::Closed {
             subject: "turn stream",
         })
@@ -143,7 +138,57 @@ impl EventSink {
     /// As [`EventSink::emit`].
     pub async fn cancel(&self, reason: CancelReason) -> Result<()> {
         self.emit(EventKind::Cancelled { reason }).await?;
-        self.emit(EventKind::Completed).await
+        self.complete().await
+    }
+
+    /// Offers a cancellation without leaving a lone marker if shutdown interrupts this future.
+    ///
+    /// Reserves both events together. A one-slot channel receives only `Completed` because it
+    /// cannot fit both events atomically. Ordinary turn cancellation uses [`Self::cancel`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(sink: &mango_external_agents::stream::EventSink) {
+    /// use mango_external_agents::CancelReason;
+    /// let _ = tokio::time::timeout(std::time::Duration::from_millis(200),
+    ///     sink.cancel_on_close(CancelReason::Shutdown)).await;
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::emit`].
+    pub async fn cancel_on_close(&self, reason: CancelReason) -> Result<()> {
+        let completed = self.event(EventKind::Completed)?;
+        // A channel with room for one cannot reserve the marker and its terminal together. A
+        // terminal alone is the only shape that cannot be cut in half by a shutdown timeout.
+        if self.sender.max_capacity() < 2 {
+            return self
+                .sender
+                .send(completed)
+                .await
+                .map_err(|_| Error::Closed {
+                    subject: "turn stream",
+                });
+        }
+        let cancelled = self.event(EventKind::Cancelled { reason })?;
+        let mut permits = self
+            .sender
+            .reserve_many(2)
+            .await
+            .map_err(|_| Error::Closed {
+                subject: "turn stream",
+            })?;
+        permits
+            .next()
+            .expect("expected a permit for the cancellation marker")
+            .send(cancelled);
+        permits
+            .next()
+            .expect("expected a permit for the cancellation terminal")
+            .send(completed);
+        Ok(())
     }
 
     /// Ends the turn with a failure.
@@ -162,6 +207,15 @@ impl EventSink {
     /// As [`EventSink::emit`].
     pub async fn complete(&self) -> Result<()> {
         self.emit(EventKind::Completed).await
+    }
+
+    fn event(&self, kind: EventKind) -> Result<AgentEvent> {
+        Ok(AgentEvent {
+            session_id: self.session_id.clone(),
+            turn_id: self.turn_id.clone(),
+            at: self.clock.now(),
+            kind: kind.normalized()?,
+        })
     }
 
     /// Whether the host has dropped the stream.
@@ -311,6 +365,79 @@ mod tests {
         })
         .await
         .expect("expected the event to be sent once a slot freed");
+    }
+
+    #[tokio::test]
+    async fn a_one_slot_stream_ends_cleanly_when_cancelled() {
+        let (sink, mut events) = sink(1);
+        let sending = tokio::spawn(async move { sink.cancel(CancelReason::Shutdown).await });
+        assert_eq!(
+            events.recv().await.map(|event| event.kind),
+            Some(crate::event::EventKind::Cancelled {
+                reason: CancelReason::Shutdown
+            })
+        );
+        assert_eq!(
+            events.recv().await.map(|event| event.kind),
+            Some(crate::event::EventKind::Completed)
+        );
+        sending
+            .await
+            .expect("sender task")
+            .expect("cancellation sent");
+        assert!(events.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_never_leaves_a_cancellation_marker_without_a_terminal() {
+        let (sink, mut events) = sink(2);
+        sink.emit(EventKind::TextDelta {
+            text: String::from("queued"),
+        })
+        .await
+        .expect("queued event");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                sink.cancel_on_close(CancelReason::Shutdown)
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            events.recv().await.expect("original event").kind,
+            EventKind::TextDelta { .. }
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "expected no partial cancellation marker"
+        );
+        sink.cancel_on_close(CancelReason::Shutdown)
+            .await
+            .expect("atomic cancellation");
+        assert!(matches!(
+            events.recv().await.expect("marker").kind,
+            EventKind::Cancelled {
+                reason: CancelReason::Shutdown
+            }
+        ));
+        assert_eq!(
+            events.recv().await.expect("terminal").kind,
+            EventKind::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn one_slot_close_falls_back_to_a_terminal() {
+        let (sink, mut events) = sink(1);
+        sink.cancel_on_close(CancelReason::Shutdown)
+            .await
+            .expect("close terminal");
+        assert_eq!(
+            events.recv().await.expect("terminal").kind,
+            EventKind::Completed
+        );
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
