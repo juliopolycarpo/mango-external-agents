@@ -375,10 +375,18 @@ impl OpenSession {
     }
 }
 
-/// What opening produced, as the session will answer for its whole life.
+/// What opening produced.
+///
+/// A snapshot of the answer `open_session` gave, not a live view. One field can go out of date:
+/// a vendor is free to rename its own handle mid-session, and the handle that is in force is
+/// [`Session::ids`], which a harness overrides when its vendor does that. Everything else here is
+/// settled at open and does not move.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionInfo {
-    /// The two ids.
+    /// The two ids, as opening reported them.
+    ///
+    /// Read [`Session::ids`] instead for the handle to resume with; this field keeps the one
+    /// opening minted even after a vendor has chosen another.
     pub ids: SessionIds,
     /// Whether the vendor continued a conversation rather than starting one.
     pub resumed: bool,
@@ -693,9 +701,16 @@ pub trait Session: Send + Sync {
     /// What opening this session produced.
     fn info(&self) -> &SessionInfo;
 
-    /// The two ids this session answers to.
-    fn ids(&self) -> &SessionIds {
-        &self.info().ids
+    /// The two ids this session answers to, as they stand now.
+    ///
+    /// Owned rather than borrowed, because this is the one answer a session is allowed to change
+    /// after it is open: a vendor may mint its own handle and report a different one once a run
+    /// has started, and the value a host persists to resume with has to be that one. The default
+    /// is the snapshot [`SessionInfo`] carries, which is right for every vendor that keeps the
+    /// handle it was given; a harness whose vendor does not overrides this and reads its own live
+    /// state.
+    fn ids(&self) -> SessionIds {
+        self.info().ids.clone()
     }
 
     /// Starts a turn and returns its bounded event stream.
@@ -1133,5 +1148,106 @@ mod tests {
             *self.last_query.lock().await = Some(query);
             Ok(SessionPage::default())
         }
+    }
+
+    /// A session whose vendor minted a handle of its own after the open had already answered.
+    ///
+    /// The shape Claude Code has: `--session-id` proposes one, and the run's own `system/init` is
+    /// free to report another, which is then the only handle a resume can use.
+    struct RenamedByTheVendor {
+        info: SessionInfo,
+        chosen: std::sync::Mutex<String>,
+    }
+
+    impl RenamedByTheVendor {
+        fn new(opened_with: &str, chosen: &str) -> Self {
+            Self {
+                info: SessionInfo {
+                    ids: SessionIds {
+                        session_id: crate::event::SessionId::new("chat-1"),
+                        native_session_id: String::from(opened_with),
+                    },
+                    resumed: false,
+                    fallback_reason: None,
+                    effective_configuration: Configuration::default(),
+                    capabilities: crate::harness::Capabilities::none(),
+                },
+                chosen: std::sync::Mutex::new(String::from(chosen)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::Session for RenamedByTheVendor {
+        fn info(&self) -> &SessionInfo {
+            &self.info
+        }
+
+        fn ids(&self) -> SessionIds {
+            SessionIds {
+                native_session_id: self
+                    .chosen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                ..self.info.ids.clone()
+            }
+        }
+
+        async fn start_turn(&self, _request: TurnRequest) -> crate::Result<crate::TurnStream> {
+            Err(crate::Error::Closed { subject: "session" })
+        }
+
+        async fn respond(
+            &self,
+            _response: crate::permission::PermissionResponse,
+        ) -> crate::Result<()> {
+            Err(crate::Error::Closed { subject: "session" })
+        }
+
+        async fn cancel(&self, _reason: CancelReason) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _reason: CloseReason) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The handle a host persists has to be the one a resume can actually use.
+    #[test]
+    fn reports_the_handle_the_vendor_chose_over_the_one_opening_minted() {
+        let session = RenamedByTheVendor::new("native-1", "native-2");
+        let ids = super::Session::ids(&session);
+        assert_eq!(
+            ids.native_session_id, "native-2",
+            "expected the vendor's own handle, received {:?}",
+            ids.native_session_id
+        );
+        assert_eq!(
+            ids.session_id.as_str(),
+            "chat-1",
+            "expected the host's own id to be untouched"
+        );
+    }
+
+    /// `info()` stays the snapshot of what opening answered, which is what documents the change.
+    #[test]
+    fn keeps_the_opening_snapshot_even_after_the_vendor_renamed_its_handle() {
+        let session = RenamedByTheVendor::new("native-1", "native-2");
+        assert_eq!(
+            super::Session::info(&session).ids.native_session_id,
+            "native-1"
+        );
+    }
+
+    /// Every vendor that keeps the handle it was given needs no override at all.
+    #[test]
+    fn defaults_to_the_opening_snapshot_for_a_vendor_that_keeps_its_handle() {
+        let session = RecordingListing::default();
+        assert_eq!(
+            super::Session::ids(&session),
+            super::Session::info(&session).ids
+        );
     }
 }
