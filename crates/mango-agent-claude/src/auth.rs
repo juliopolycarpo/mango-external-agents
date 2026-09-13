@@ -119,13 +119,16 @@ pub fn parse_status(stdout: &str) -> Authentication {
 }
 
 /// The first `{ … }` in the output, parsed.
+///
+/// Read as *one* value from the first `{` onwards rather than as everything up to the last `}`.
+/// The tolerance this function exists for cuts both ways: a build that printed a line after the
+/// payload — a deprecation notice, a shell wrapper's own epilogue — puts a stray `}` past the end
+/// of the object, and a slice that ran to it would hand `serde_json` trailing garbage and turn a
+/// signed-in account into "unknown", which is the failure this was written to avoid.
 fn embedded_object(stdout: &str) -> Option<serde_json::Map<String, Value>> {
     let start = stdout.find('{')?;
-    let end = stdout.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    match serde_json::from_str::<Value>(&stdout[start..=end]) {
+    let mut values = serde_json::Deserializer::from_str(&stdout[start..]).into_iter::<Value>();
+    match values.next()? {
         Ok(Value::Object(fields)) => Some(fields),
         _ => None,
     }
@@ -287,5 +290,27 @@ mod tests {
             "warning: a new version is available\n{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}\n",
         );
         assert_eq!(authentication.kind, Some(AccountKind::Subscription));
+    }
+
+    /// The other half of the same tolerance, and the half a last-brace scan gets wrong.
+    ///
+    /// A line printed *after* the payload puts a stray `}` past the object's own end, and reading
+    /// to the last one hands `serde_json` trailing text — which reports a signed-in account as
+    /// unknown, refuses every configuration that needs an account, and reads to the user as a
+    /// broken install.
+    #[test]
+    fn tolerates_a_build_that_printed_a_brace_after_the_object() {
+        for epilogue in [
+            "\nnote: settings merged from {project} and {user}",
+            "\n}",
+            "\ndone {}",
+        ] {
+            let stdout = format!("{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}{epilogue}");
+            assert_eq!(
+                parse_status(&stdout).kind,
+                Some(AccountKind::Subscription),
+                "expected {epilogue:?} after the payload to change nothing"
+            );
+        }
     }
 }
