@@ -150,6 +150,90 @@ pub struct Resume {
     pub mode: ResumeMode,
 }
 
+/// One MCP server a host configured, for a vendor that accepts them.
+///
+/// Passed through untouched: the library never inspects a server, never connects to one and never
+/// puts a vendor's MCP tools into a host's own tool registry. It maps this shape onto whatever the
+/// vendor's dialect spells it as and stops there.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    /// The name the vendor lists this server under.
+    pub name: String,
+    /// How the vendor reaches it.
+    pub transport: McpTransport,
+}
+
+impl McpServer {
+    /// A server the vendor starts as a child of its own.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::McpServer;
+    ///
+    /// let server = McpServer::stdio("docs", "docs-mcp");
+    /// assert!(server.is_usable());
+    /// ```
+    pub fn stdio(name: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: command.into(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+            },
+        }
+    }
+
+    /// Whether this server is complete enough to hand to a vendor.
+    ///
+    /// A name or a command the host left empty produces a configuration entry the vendor either
+    /// refuses or, worse, reads as something else. Refusing one is the harness's job; saying what
+    /// "usable" means is this type's.
+    pub fn is_usable(&self) -> bool {
+        if self.name.trim().is_empty() {
+            return false;
+        }
+        match &self.transport {
+            McpTransport::Stdio { command, .. } => !command.trim().is_empty(),
+            McpTransport::Http { url, .. } => !url.trim().is_empty(),
+        }
+    }
+}
+
+/// How a vendor reaches one MCP server.
+///
+/// The `env` and `headers` maps are the one place a host-supplied value reaches a vendor process,
+/// and they are deliberately not the environment allowlist's business: they configure the host's
+/// **own** MCP server, which the vendor spawns or dials on the host's behalf, and they never widen
+/// what the vendor's own child inherits. A host that puts a token here has decided to give its own
+/// server a credential; it cannot use this seam to add anything to the vendor CLI's environment.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum McpTransport {
+    /// A child the vendor spawns.
+    Stdio {
+        /// The executable.
+        command: String,
+        /// Its arguments.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        /// The environment that server — not the vendor's own child — receives.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        env: std::collections::BTreeMap<String, String>,
+    },
+    /// An endpoint the vendor dials.
+    Http {
+        /// Where it is.
+        url: String,
+        /// Headers the vendor sends with every request to it.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        headers: std::collections::BTreeMap<String, String>,
+    },
+}
+
 /// What a host asks for when it opens a session.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +252,13 @@ pub struct OpenSession {
     /// this session is being opened on.
     #[serde(default)]
     pub executable: crate::transport::ExecutablePath,
+    /// MCP servers the vendor should load for this session.
+    ///
+    /// Honoured only by a harness whose
+    /// [`Capabilities::mcp_passthrough`](crate::Capabilities) is set; the rest refuse rather than
+    /// accept a request they would silently drop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServer>,
 }
 
 impl OpenSession {
@@ -188,6 +279,7 @@ impl OpenSession {
             configuration: Configuration::default(),
             resume: None,
             executable: crate::transport::ExecutablePath::default(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -204,6 +296,23 @@ impl OpenSession {
     #[must_use]
     pub fn with_configuration(mut self, configuration: Configuration) -> Self {
         self.configuration = configuration;
+        self
+    }
+
+    /// Loads these MCP servers for the session.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{McpServer, OpenSession};
+    ///
+    /// let request = OpenSession::new("chat-42")
+    ///     .with_mcp_servers(vec![McpServer::stdio("docs", "docs-mcp")]);
+    /// assert_eq!(request.mcp_servers.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = mcp_servers;
         self
     }
 
