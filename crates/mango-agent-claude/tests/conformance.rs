@@ -12,9 +12,7 @@ use std::time::Duration;
 
 use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::testing::conformance::{self, Outcome};
-use support::{FakeClaudeCli, Run, host};
-
-const READ_TURN: &str = include_str!("../../../fixtures/claude/transcripts/read-turn.jsonl");
+use support::{FakeClaudeCli, READ_TURN, Run, host};
 
 /// A build that replays the captured turn, then holds a second turn open to be cancelled.
 fn scripted() -> Arc<FakeClaudeCli> {

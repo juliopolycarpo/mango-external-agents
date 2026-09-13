@@ -38,6 +38,17 @@ pub const SIGNED_IN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiPro
 /// A signed-out `auth status`.
 pub const SIGNED_OUT: &str = r#"{"loggedIn":false}"#;
 
+/// A captured `read a file` turn, replayed byte for byte across every test that needs one.
+pub const READ_TURN: &str =
+    include_str!("../../../../fixtures/claude/transcripts/read-turn.jsonl");
+
+/// An excerpt from before `--effort` and `--permission-prompts` existed, which is what proves an
+/// older build keeps working with those features off.
+pub const HELP_2_1_227: &str = include_str!("../../../../fixtures/claude/help/2.1.227.txt");
+
+/// The whole surface of a real build, which is where `--mcp-config` is actually declared.
+pub const HELP_2_1_270: &str = include_str!("../../../../fixtures/claude/help/2.1.270.txt");
+
 /// A turn's spawn, held open for as long as a test needs the window it makes.
 ///
 /// Both halves are `notify_one` rather than `notify_waiters`, so neither side has to arrive first:
@@ -262,7 +273,7 @@ impl FakeClaudeCli {
     }
 }
 
-fn value_after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+pub(crate) fn value_after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
     let at = argv.iter().position(|argument| argument == flag)?;
     argv.get(at + 1).map(String::as_str)
 }

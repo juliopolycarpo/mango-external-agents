@@ -11,17 +11,15 @@ use mango_external_agents::{
     EventKind, ExecutablePath, GateVerdict, Harness, Limits, LineLimits, OpenSession,
     PermissionLevel, PermissionResponse, ResumeMode, Session, TurnRequest, TurnStream,
 };
-use support::{FakeClaudeCli, Run, SIGNED_OUT, host, host_under};
+use support::{
+    FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, host, host_under,
+    value_after,
+};
 
 /// A session several tasks can hold, for the tests that race two of its methods.
 async fn shared(launcher: &Arc<FakeClaudeCli>) -> Arc<dyn Session> {
     Arc::from(open(launcher).await)
 }
-
-const READ_TURN: &str = include_str!("../../../fixtures/claude/transcripts/read-turn.jsonl");
-const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
-/// The whole surface of a real build, which is where `--mcp-config` is actually declared.
-const HELP_2_1_270: &str = include_str!("../../../fixtures/claude/help/2.1.270.txt");
 
 /// Everything a turn produced, up to and including its terminal event.
 async fn drain(turn: &mut TurnStream) -> Vec<EventKind> {
@@ -38,11 +36,6 @@ async fn drain(turn: &mut TurnStream) -> Vec<EventKind> {
     })
     .await;
     collected.expect("expected the turn to end rather than hang")
-}
-
-fn value_after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
-    let at = argv.iter().position(|argument| argument == flag)?;
-    argv.get(at + 1).map(String::as_str)
 }
 
 async fn open(launcher: &Arc<FakeClaudeCli>) -> Box<dyn Session> {

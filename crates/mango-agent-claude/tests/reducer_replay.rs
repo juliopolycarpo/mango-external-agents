@@ -5,13 +5,15 @@
 //! dialect on a machine where the vendor's CLI is not installed — which is every machine, in CI —
 //! and it is the only thing that can notice the vendor changing a shape.
 
+mod support;
+
 use mango_agent_claude::protocol::StreamRecord;
 use mango_agent_claude::reducer::{RunInit, TurnReducer};
 use mango_external_agents::{
     ActivityKind, ActivityStatus, Command, ErrorCode, EventKind, VendorError,
 };
+use support::READ_TURN;
 
-const READ_TURN: &str = include_str!("../../../fixtures/claude/transcripts/read-turn.jsonl");
 const DENIED_WRITE: &str =
     include_str!("../../../fixtures/claude/transcripts/denied-write-turn.jsonl");
 
