@@ -37,6 +37,28 @@ pub const SIGNED_IN: &str = r#"{"loggedIn":true,"authMethod":"claude.ai","apiPro
 /// A signed-out `auth status`.
 pub const SIGNED_OUT: &str = r#"{"loggedIn":false}"#;
 
+/// A turn's spawn, held open for as long as a test needs the window it makes.
+///
+/// Both halves are `notify_one` rather than `notify_waiters`, so neither side has to arrive first:
+/// a permit waits for whoever gets there second.
+#[derive(Clone)]
+pub struct SpawnGate {
+    arrived: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl SpawnGate {
+    /// Returns once a turn's spawn is in flight and waiting to be released.
+    pub async fn wait_for_spawn(&self) {
+        self.arrived.notified().await;
+    }
+
+    /// Lets the held spawn finish.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 /// What one fake child does once it is spawned.
 #[derive(Clone, Debug)]
 pub enum Run {
@@ -106,6 +128,8 @@ pub struct FakeClaudeCli {
     written: Arc<Mutex<Vec<String>>>,
     children: Mutex<Vec<Arc<Child>>>,
     stderr: Mutex<Vec<u8>>,
+    /// Held closed while a test wants a turn's spawn to still be in flight.
+    spawn_gate: Mutex<Option<SpawnGate>>,
 }
 
 impl Default for FakeClaudeCli {
@@ -126,6 +150,7 @@ impl FakeClaudeCli {
             written: Arc::new(Mutex::new(Vec::new())),
             children: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
+            spawn_gate: Mutex::new(None),
         }
     }
 
@@ -183,6 +208,20 @@ impl FakeClaudeCli {
         lock(&self.written).clone()
     }
 
+    /// Holds every turn spawn until the returned handle releases it.
+    ///
+    /// The window between "this session is still open" and "this turn is the active one" is only
+    /// reachable while a spawn is in flight, and a fake that returns instantly never opens it.
+    #[must_use]
+    pub fn gate_turn_spawns(&self) -> SpawnGate {
+        let gate = SpawnGate {
+            arrived: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *lock(&self.spawn_gate) = Some(gate.clone());
+        gate
+    }
+
     /// Whether every child this launcher handed out has ended.
     pub fn all_children_ended(&self) -> bool {
         lock(&self.children).iter().all(|child| child.is_finished())
@@ -228,6 +267,13 @@ fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl ProcessLauncher for FakeClaudeCli {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
         let (run, stderr_bytes) = self.run_for(&spec.argv);
+        let gate = (!is_probe(&spec.argv))
+            .then(|| lock(&self.spawn_gate).clone())
+            .flatten();
+        if let Some(gate) = gate {
+            gate.arrived.notify_one();
+            gate.release.notified().await;
+        }
         lock(&self.launches).push(spec);
 
         let stderr = StderrTail::default();

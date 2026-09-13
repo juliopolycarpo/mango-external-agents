@@ -13,6 +13,11 @@ use mango_external_agents::{
 };
 use support::{FakeClaudeCli, Run, SIGNED_OUT, host, host_under};
 
+/// A session several tasks can hold, for the tests that race two of its methods.
+async fn shared(launcher: &Arc<FakeClaudeCli>) -> Arc<dyn Session> {
+    Arc::from(open(launcher).await)
+}
+
 const READ_TURN: &str = include_str!("../../../fixtures/claude/transcripts/read-turn.jsonl");
 const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
 /// The whole surface of a real build, which is where `--mcp-config` is actually declared.
@@ -563,6 +568,48 @@ mod a_turn {
         assert!(
             launcher.all_children_ended(),
             "expected the child to be reaped even though it never exited on its own"
+        );
+    }
+
+    /// `close` while a turn's process is still being spawned.
+    ///
+    /// `start_turn` reads `closed` before it awaits the spawn and assigns the turn after, so a
+    /// `close` that lands in between takes an `active` that is still `None`: it records nothing,
+    /// kills nothing, and removes the MCP file the child about to start was launched with. The
+    /// turn then arrives on a session that has already answered every other caller `Closed`, and
+    /// runs with nobody holding a handle to stop it.
+    #[tokio::test]
+    async fn refuses_a_turn_whose_session_closed_while_its_process_was_starting() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let gate = launcher.gate_turn_spawns();
+        let session = shared(&launcher).await;
+
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hello"))
+                    .await
+                    .map(drop)
+            }
+        });
+
+        gate.wait_for_spawn().await;
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the close to succeed");
+        gate.release();
+
+        let outcome = starting.await.expect("expected the task to finish");
+        assert!(
+            matches!(outcome, Err(Error::Closed { .. })),
+            "expected the turn to be refused by the closed session, received {outcome:?}"
+        );
+        assert!(
+            launcher.all_children_ended(),
+            "expected the child spawned into the window to be reaped, not left running"
         );
     }
 

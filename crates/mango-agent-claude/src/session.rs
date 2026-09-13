@@ -255,12 +255,28 @@ impl mango_external_agents::Session for ClaudeSession {
         );
         let end = Arc::new(TurnEnd::default());
         let control = Arc::clone(&transport.control);
-        {
+        // Re-checked under the same guard that assigns the turn, because `stdio::open` is awaited
+        // above and the session can end while it is in flight. A `close` that landed in that window
+        // took an `active` that was still `None`: it recorded nothing, killed nothing, and removed
+        // the `--mcp-config` file this child was launched with. Planting the turn anyway would put
+        // a live process on a session that already answers every other caller `Closed`, with nobody
+        // holding a handle to stop it.
+        let already_closed = {
             let mut state = self.shared.lock();
-            state.active = Some(ActiveTurn {
-                end: Arc::clone(&end),
-                control: Arc::clone(&control),
-            });
+            let closed = state.closed;
+            if !closed {
+                state.active = Some(ActiveTurn {
+                    end: Arc::clone(&end),
+                    control: Arc::clone(&control),
+                });
+            }
+            closed
+        };
+        if already_closed {
+            // Reaped rather than cancelled: no turn was ever handed out, so there is no stream for
+            // a `Cancelled` to reach and nothing to report it to.
+            let _ = control.kill(CancelReason::Shutdown).await;
+            return Err(Error::Closed { subject: "session" });
         }
 
         tokio::spawn(pump(
