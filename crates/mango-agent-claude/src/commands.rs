@@ -24,7 +24,7 @@ const PRIVATE_PREFIX: &str = "__";
 /// The prefix the CLI namespaces an MCP server's own commands with.
 ///
 /// A protocol convention rather than a name, which is why it cannot collide with a builtin.
-const MCP_PREFIX: &str = "mcp__";
+pub(crate) const MCP_PREFIX: &str = "mcp__";
 
 /// The commands one run can expand, in the order the CLI announced them.
 ///

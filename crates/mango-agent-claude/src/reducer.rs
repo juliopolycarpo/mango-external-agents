@@ -106,9 +106,9 @@ pub struct TurnReducer {
     resumed: bool,
     session_started: bool,
     finished: bool,
-    /// Tool calls this run has opened, in the order it opened them, so a result can be matched to
-    /// a name and an unclosed call can be closed in a stable order.
-    open_activities: Vec<(String, String)>,
+    /// Tool calls this run has opened, in the order it opened them, so an unclosed call can be
+    /// closed in a stable order.
+    open_activities: Vec<String>,
     /// Forwarded subagent text per parent call, so updates accumulate rather than replace.
     nested_text: BTreeMap<String, String>,
     /// A held `system/permission_denied` reason, keyed by the call it refused, until the
@@ -190,8 +190,7 @@ impl TurnReducer {
         if self.finished {
             return Vec::new();
         }
-        self.finished = true;
-        let mut events = self.close_open_activities();
+        let mut events = self.end_run();
         events.push(EventKind::Error { error });
         events
     }
@@ -207,6 +206,12 @@ impl TurnReducer {
         if self.finished {
             return Vec::new();
         }
+        self.end_run()
+    }
+
+    /// Marks the run over and closes whatever it left open, for [`abort`](Self::abort),
+    /// [`cancel`](Self::cancel) and a terminal `result` record alike.
+    fn end_run(&mut self) -> Vec<EventKind> {
         self.finished = true;
         self.close_open_activities()
     }
@@ -304,34 +309,7 @@ impl TurnReducer {
 
         let index = event.index();
         match kind {
-            Some("content_block_start") => {
-                let block_type = event.content_block_type();
-                // Opened with nothing delivered yet. Recorded even so: a withheld reasoning phase
-                // streams only empty `thinking_delta`s, and this is what says those deltas were
-                // still this block's delivery channel. A block whose kind will never be renderable
-                // — `tool_use` chief among them — gets no entry, since one could never match
-                // anything in `undelivered_remainder`.
-                if let (Some(index), Some(channel)) = (index, opening_channel(block_type)) {
-                    self.delivered_by_block.insert(
-                        index,
-                        Delivered {
-                            channel,
-                            text: String::new(),
-                        },
-                    );
-                }
-                // Fires once per block, by protocol — the only signal a reasoning phase produces
-                // on an account whose `thinking_delta` text is withheld. `redacted_thinking`
-                // qualifies and then some: its text is encrypted, so no renderable delta can ever
-                // follow and the announcement is the whole of what that phase will show.
-                if !is_reasoning_block(block_type) {
-                    return Vec::new();
-                }
-                if let Some(index) = index {
-                    self.open_reasoning_blocks.insert(index);
-                }
-                vec![EventKind::ReasoningStarted]
-            }
+            Some("content_block_start") => self.reduce_block_start(event.content_block_type(), index),
             Some("content_block_stop") => {
                 let Some(index) = index else {
                     return Vec::new();
@@ -344,6 +322,36 @@ impl TurnReducer {
             Some("content_block_delta") => self.reduce_delta(&event, index),
             _ => Vec::new(),
         }
+    }
+
+    /// A block opening: records the channel it will stream on and, for a reasoning phase, opens it.
+    ///
+    /// Opened with nothing delivered yet. Recorded even so: a withheld reasoning phase streams only
+    /// empty `thinking_delta`s, and this is what says those deltas were still this block's delivery
+    /// channel. A block whose kind will never be renderable — `tool_use` chief among them — gets no
+    /// entry, since one could never match anything in `undelivered_remainder`.
+    ///
+    /// The reasoning-phase announcement fires once per block, by protocol — the only signal a
+    /// reasoning phase produces on an account whose `thinking_delta` text is withheld.
+    /// `redacted_thinking` qualifies and then some: its text is encrypted, so no renderable delta
+    /// can ever follow and the announcement is the whole of what that phase will show.
+    fn reduce_block_start(&mut self, block_type: Option<&str>, index: Option<u64>) -> Vec<EventKind> {
+        if let (Some(index), Some(channel)) = (index, opening_channel(block_type)) {
+            self.delivered_by_block.insert(
+                index,
+                Delivered {
+                    channel,
+                    text: String::new(),
+                },
+            );
+        }
+        if !is_reasoning_block(block_type) {
+            return Vec::new();
+        }
+        if let Some(index) = index {
+            self.open_reasoning_blocks.insert(index);
+        }
+        vec![EventKind::ReasoningStarted]
     }
 
     fn reduce_delta(
@@ -495,8 +503,7 @@ impl TurnReducer {
         if self.is_open(call_id) {
             return None;
         }
-        self.open_activities
-            .push((call_id.to_owned(), name.to_owned()));
+        self.open_activities.push(call_id.to_owned());
         Some(EventKind::ActivityStarted {
             call_id: call_id.to_owned(),
             activity: Activity {
@@ -557,8 +564,7 @@ impl TurnReducer {
     /// so nothing will ever report their outcome, and an activity left spinning in a reloaded
     /// transcript is a control that will never resolve.
     fn reduce_result(&mut self, record: &StreamRecord) -> Vec<EventKind> {
-        self.finished = true;
-        let mut events = self.close_open_activities();
+        let mut events = self.end_run();
         if let Some(usage) = record.result().usage() {
             events.push(EventKind::Usage { usage });
         }
@@ -578,7 +584,7 @@ impl TurnReducer {
         let open = std::mem::take(&mut self.open_activities);
         let denials = std::mem::take(&mut self.denied_activities);
         open.into_iter()
-            .map(|(call_id, _)| {
+            .map(|call_id| {
                 let detail = denials
                     .get(&call_id)
                     .map(String::as_str)
@@ -596,16 +602,12 @@ impl TurnReducer {
     }
 
     fn is_open(&self, call_id: &str) -> bool {
-        self.open_activities.iter().any(|(open, _)| open == call_id)
+        self.open_activities.iter().any(|open| open == call_id)
     }
 
     /// Removes an open call, answering whether it was one.
     fn close(&mut self, call_id: &str) -> bool {
-        let Some(position) = self
-            .open_activities
-            .iter()
-            .position(|(open, _)| open == call_id)
-        else {
+        let Some(position) = self.open_activities.iter().position(|open| open == call_id) else {
             return false;
         };
         self.open_activities.remove(position);
@@ -654,7 +656,7 @@ pub fn activity_kind(tool_name: &str) -> ActivityKind {
         // MCP tools are namespaced `mcp__<server>__<tool>` by the CLI, which is the one shape
         // worth recognising here: a protocol convention rather than a tool name, so it cannot
         // collide with a built-in.
-        _ if tool_name.starts_with("mcp__") => ActivityKind::Mcp,
+        _ if tool_name.starts_with(commands::MCP_PREFIX) => ActivityKind::Mcp,
         _ => ActivityKind::Other,
     }
 }
