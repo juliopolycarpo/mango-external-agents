@@ -10,7 +10,8 @@ mod support;
 use mango_agent_claude::protocol::StreamRecord;
 use mango_agent_claude::reducer::{RunInit, TurnReducer};
 use mango_external_agents::{
-    ActivityKind, ActivityStatus, Command, ErrorCode, EventKind, VendorError,
+    Activity, ActivityKind, ActivityResult, ActivityStatus, Command, ErrorCode, EventKind,
+    VendorError,
 };
 use support::READ_TURN;
 
@@ -92,6 +93,28 @@ fn commands_of(events: &[EventKind]) -> Vec<Command> {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// The first call this run opened, and what it opened it with.
+fn first_activity_started(events: &[EventKind]) -> (&str, &Activity) {
+    events
+        .iter()
+        .find_map(|event| match event {
+            EventKind::ActivityStarted { call_id, activity } => Some((call_id.as_str(), activity)),
+            _ => None,
+        })
+        .expect("expected an ActivityStarted event")
+}
+
+/// The first call this run closed, and what it closed it with.
+fn first_activity_completed(events: &[EventKind]) -> (&str, &ActivityResult) {
+    events
+        .iter()
+        .find_map(|event| match event {
+            EventKind::ActivityCompleted { call_id, result } => Some((call_id.as_str(), result)),
+            _ => None,
+        })
+        .expect("expected an ActivityCompleted event")
 }
 
 fn names(commands: &[Command]) -> Vec<&str> {
@@ -218,13 +241,7 @@ mod on_a_recorded_read_a_file_turn {
     #[test]
     fn labels_the_activity_with_claudes_own_tool_name_verbatim() {
         let events = replay(READ_TURN, false).events;
-        let EventKind::ActivityStarted { call_id, activity } = events
-            .iter()
-            .find(|event| matches!(event, EventKind::ActivityStarted { .. }))
-            .expect("expected the Read call")
-        else {
-            unreachable!("filtered above")
-        };
+        let (call_id, activity) = first_activity_started(&events);
         assert_eq!(call_id, "toolu_01LZJqPzShDSj9cPgL7PeD1v");
         assert_eq!(activity.name, "Read");
         assert_eq!(activity.kind, ActivityKind::Other);
@@ -234,13 +251,7 @@ mod on_a_recorded_read_a_file_turn {
     #[test]
     fn closes_the_activity_when_its_tool_result_arrives() {
         let events = replay(READ_TURN, false).events;
-        let EventKind::ActivityCompleted { call_id, result } = events
-            .iter()
-            .find(|event| matches!(event, EventKind::ActivityCompleted { .. }))
-            .expect("expected the Read call to close")
-        else {
-            unreachable!("filtered above")
-        };
+        let (call_id, result) = first_activity_completed(&events);
         assert_eq!(call_id, "toolu_01LZJqPzShDSj9cPgL7PeD1v");
         assert_eq!(result.status, ActivityStatus::Completed);
         assert_eq!(result.detail.as_deref(), Some("1\tmango\n2\t"));
@@ -338,24 +349,12 @@ mod on_a_recorded_denied_write {
     #[test]
     fn names_the_refused_tool_and_the_reason_in_the_activity_claude_reports() {
         let events = replay(DENIED_WRITE, false).events;
-        let EventKind::ActivityStarted { activity, .. } = events
-            .iter()
-            .find(|event| matches!(event, EventKind::ActivityStarted { .. }))
-            .expect("expected the Write call")
-        else {
-            unreachable!("filtered above")
-        };
+        let (_, activity) = first_activity_started(&events);
         assert_eq!(activity.name, "Write");
         assert_eq!(activity.kind, ActivityKind::FileChange);
         assert_eq!(activity.title, "/work/repo/denied.txt");
 
-        let EventKind::ActivityCompleted { result, .. } = events
-            .iter()
-            .find(|event| matches!(event, EventKind::ActivityCompleted { .. }))
-            .expect("expected the Write call to close")
-        else {
-            unreachable!("filtered above")
-        };
+        let (_, result) = first_activity_completed(&events);
         assert_eq!(result.status, ActivityStatus::Failed);
         assert_eq!(
             result.detail.as_deref(),
