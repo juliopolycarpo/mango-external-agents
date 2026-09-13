@@ -39,12 +39,15 @@ Versions are lockstep: one tag releases the four crates.
 ## A host in twenty lines
 
 The host implements `ProcessLauncher` (or takes `TokioLauncher` from the `launcher-tokio`
-feature), authorises a working directory, and reads events. Against the `testing` fakes it looks
-like this; the types land with the core crate.
+feature), authorises a working directory, and reads events. Replacing `FakeLauncher` with a real
+launcher and `ClaudeHarness` with the vendor's own is the only difference from a production host;
+the same example against `testing::FakeHarness` is a running doctest on the core crate.
 
 ```rust,ignore
 use mango_external_agents::testing::FakeLauncher;
-use mango_external_agents::{AgentEvent, HostContext, OpenSession, TurnRequest};
+use mango_external_agents::{
+    CloseReason, EventKind, Harness, HostContext, OpenSession, TurnRequest,
+};
 use std::sync::Arc;
 
 let launcher = FakeLauncher::scripted(include_str!("../fixtures/claude/transcripts/hello.ndjson"));
@@ -52,21 +55,24 @@ let host = HostContext::builder()
     .launcher(Arc::new(launcher))
     .cwd(std::env::current_dir()?)
     .client_info("my-host", env!("CARGO_PKG_VERSION"))
-    .build();
+    .build()?;
 
 let harness = mango_agent_claude::ClaudeHarness::default();
-let session = harness.open_session(&host, OpenSession::default()).await?;
-let mut turn = session.start_turn(TurnRequest::prompt("say hello")).await?;
-while let Some(event) = turn.events.recv().await {
-    match event {
-        AgentEvent::TextDelta { text, .. } => print!("{text}"),
-        AgentEvent::ApprovalRequested { request, .. } => session.respond(request.deny()).await?,
-        AgentEvent::Completed { .. } => break,
+let session = harness.open_session(&host, OpenSession::new("chat-1")).await?;
+let mut turn = session.start_turn(TurnRequest::new("turn-1", "say hello")).await?;
+while let Some(event) = turn.recv().await {
+    match event.kind {
+        EventKind::TextDelta { text } => print!("{text}"),
+        EventKind::ApprovalRequested { request } => session.respond(request.deny()?).await?,
+        EventKind::Completed => break,
         _ => {}
     }
 }
 session.close(CloseReason::Requested).await?;
 ```
+
+An event carries its session, its turn and the instant it was stamped alongside its `kind`, so a
+host can log or route one without matching on what happened first.
 
 ## Documentation
 
@@ -77,5 +83,7 @@ session.close(CloseReason::Requested).await?;
 
 ## Status
 
-Bootstrapped; the crates compile and declare their harness kinds. Behaviour lands crate by crate;
-`CHANGELOG.md` tracks it. Rust 1.96 or newer, edition 2024, MIT.
+The core crate is complete: traits, events, normalisation, the permission matrix, the host ports,
+the stdio and WebSocket transports, a JSON-RPC client and the `testing` fakes, including the
+conformance suite the three harness crates must pass. The harnesses themselves land next, crate by
+crate; `CHANGELOG.md` tracks it. Rust 1.96 or newer, edition 2024, MIT.

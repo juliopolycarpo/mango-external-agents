@@ -1,0 +1,1244 @@
+//! A JSON-RPC peer over a [`Link`], in both directions.
+//!
+//! "Both directions" is the requirement that shaped it. These vendors do not merely stream at a
+//! client — they *ask the client things* and block until they get an answer: Codex's approval
+//! requests, ACP's `session/request_permission`. A codec that only turned messages into events
+//! could never reply, which is why a harness is semantic rather than a reducer, and why
+//! correlating request ids is the library's job rather than each harness's.
+//!
+//! Vendor-neutral on purpose: two copies of one wire format would drift apart, and the drift would
+//! show up as a hung turn rather than as a failing test. What each vendor calls itself enters only
+//! through [`ClientOptions::peer_name`], which appears in messages a person may read.
+//!
+//! Framing, byte caps and process teardown all belong to the transport underneath; this speaks the
+//! protocol on top of them.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, PoisonError};
+use std::time::Duration;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
+use tokio::sync::{Mutex, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
+
+use crate::error::{Error, ErrorCode, Result, VendorError, jsonrpc_code_is_retryable};
+use crate::host::{CancelToken, Limits};
+use crate::link::{Link, LinkSender};
+
+/// One request's id, exactly as it arrived.
+///
+/// Kept as raw JSON rather than normalised to a string, and that is load-bearing rather than tidy:
+/// ids may be strings or numbers, and some agents number their requests from zero. Replying to
+/// request `0` with `"0"` is a different id, so the peer never matches the answer to the question
+/// and blocks forever — which presents as a turn that renders an approval, accepts a click, and
+/// then simply never finishes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestId(Value);
+
+impl RequestId {
+    /// Wraps an id as it arrived.
+    pub fn new(raw: Value) -> Self {
+        Self(raw)
+    }
+
+    /// The id as JSON, for echoing back.
+    pub fn as_json(&self) -> &Value {
+        &self.0
+    }
+
+    /// The id as a map key, where the JSON type no longer matters.
+    ///
+    /// Used on this side only: a string `"1"` and a number `1` name the same pending call, and a
+    /// peer that answers with the other spelling is answering the right question.
+    pub fn key(&self) -> String {
+        match &self.0 {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.key())
+    }
+}
+
+/// A JSON-RPC error body.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JsonRpcError {
+    /// The peer's code.
+    pub code: i64,
+    /// The peer's message.
+    pub message: String,
+    /// Whatever else the peer attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl JsonRpcError {
+    /// The failure this represents, with the peer's structure kept.
+    pub fn into_vendor_error(self, code: ErrorCode, request_id: Option<String>) -> VendorError {
+        let retryable = jsonrpc_code_is_retryable(self.code);
+        let mut error =
+            VendorError::new(code, self.message).with_vendor_code(self.code.to_string(), retryable);
+        error.request_id = request_id;
+        error
+    }
+}
+
+/// What a handler answers a peer's question with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerRequestOutcome {
+    /// An answer.
+    Answer(Value),
+    /// A refusal, in the protocol's own shape.
+    Failure(JsonRpcError),
+}
+
+/// What the harness above does with what the peer said.
+#[async_trait::async_trait]
+pub trait PeerHandler: Send + Sync {
+    /// The peer announced something.
+    ///
+    /// Dispatched in arrival order and awaited, so a handler that pushes into a full event sink
+    /// applies backpressure to the peer instead of letting events pile up here.
+    async fn on_notification(&self, method: String, params: Value);
+
+    /// The peer asked something and is waiting.
+    ///
+    /// Answered on a task of its own, so a question that waits for a person does not stop the
+    /// stream of events arriving meanwhile. A handler that cannot decide should refuse rather than
+    /// never return: an unanswered request blocks the vendor on a reply that never comes, which
+    /// presents as a hung turn rather than as the failure it is.
+    async fn on_request(
+        &self,
+        method: String,
+        params: Value,
+        id: RequestId,
+    ) -> ServerRequestOutcome;
+}
+
+/// How this client speaks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientOptions {
+    /// The peer as a person would name it, such as `Codex app-server`.
+    pub peer_name: String,
+    /// Whether to write the `"jsonrpc": "2.0"` member.
+    ///
+    /// Not every dialect this library drives writes it, and a peer that validates strictly will
+    /// refuse a frame carrying a member its own schema does not have.
+    pub include_version_header: bool,
+    /// How long a request waits before it is a failure.
+    pub request_timeout: Duration,
+    /// How many of the peer's own questions may be in flight at once.
+    ///
+    /// A question from the peer is answered on a task of its own, so a person deciding on an
+    /// approval does not stop the events a turn is rendering meanwhile. Nothing else bounds how
+    /// many of those tasks exist: the line cap bounds each frame's size, never the number of
+    /// them, so a peer writing request frames as fast as the pipe allows would spawn one task per
+    /// frame. Past this many, the next question is refused rather than spawned.
+    pub max_in_flight_requests: usize,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            peer_name: String::from("external agent"),
+            include_version_header: true,
+            request_timeout: Duration::from_secs(120),
+            max_in_flight_requests: 256,
+        }
+    }
+}
+
+impl ClientOptions {
+    /// Names the peer.
+    pub fn new(peer_name: impl Into<String>) -> Self {
+        Self {
+            peer_name: peer_name.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Omits the `"jsonrpc"` member, for a dialect that does not write one.
+    #[must_use]
+    pub fn without_version_header(mut self) -> Self {
+        self.include_version_header = false;
+        self
+    }
+
+    /// Answers at most this many of the peer's questions at once.
+    #[must_use]
+    pub fn with_max_in_flight_requests(mut self, max_in_flight_requests: usize) -> Self {
+        self.max_in_flight_requests = max_in_flight_requests;
+        self
+    }
+
+    /// Waits this long for an answer.
+    #[must_use]
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Takes every bound this client has from the host's own.
+    ///
+    /// A harness holds a [`HostContext`](crate::HostContext), not a `Duration`, so without this
+    /// each one would have to remember to thread `host.limits().request_timeout` through by hand —
+    /// and the one that forgot would quietly wait two minutes on a host that asked for ten
+    /// seconds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::ClientOptions;
+    /// use mango_external_agents::Limits;
+    /// use std::time::Duration;
+    ///
+    /// let limits = Limits {
+    ///     request_timeout: Duration::from_secs(10),
+    ///     ..Limits::default()
+    /// };
+    /// let options = ClientOptions::new("Codex app-server").with_limits(&limits);
+    ///
+    /// assert_eq!(options.request_timeout, Duration::from_secs(10));
+    /// ```
+    #[must_use]
+    pub fn with_limits(mut self, limits: &Limits) -> Self {
+        self.request_timeout = limits.request_timeout;
+        self
+    }
+}
+
+/// How long [`Client::close`] lets an answer already resolved write its frame.
+const IN_FLIGHT_DRAIN_GRACE: Duration = Duration::from_millis(200);
+
+/// A JSON-RPC client that also answers.
+pub struct Client {
+    state: Arc<ClientState>,
+    pump: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct ClientState {
+    sender: Mutex<Box<dyn LinkSender>>,
+    pending: Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, JsonRpcError>>>>,
+    options: ClientOptions,
+    next_id: AtomicU64,
+    closed: AtomicBool,
+    shutdown: CancelToken,
+    /// The peer's questions currently being answered, so they can be counted and taken down.
+    in_flight: StdMutex<JoinSet<()>>,
+}
+
+impl Client {
+    /// Starts speaking, pumping the link on a task of its own.
+    ///
+    /// The pump stops when the peer goes away, when [`Client::close`] is called, or when the
+    /// client is dropped.
+    pub fn connect(link: Link, handler: Arc<dyn PeerHandler>, options: ClientOptions) -> Self {
+        let (sender, receiver) = link.split();
+        let state = Arc::new(ClientState {
+            sender: Mutex::new(sender),
+            pending: Mutex::new(HashMap::new()),
+            options,
+            next_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            shutdown: CancelToken::new(),
+            in_flight: StdMutex::new(JoinSet::new()),
+        });
+        let pump = tokio::spawn(pump(Arc::clone(&state), receiver, handler));
+        Self {
+            state,
+            pump: Mutex::new(Some(pump)),
+        }
+    }
+
+    /// Calls a method and waits for its answer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Vendor`] when the peer answered with an error frame, [`Error::Timeout`] when it
+    /// did not answer in time, [`Error::Link`] when the link failed, and [`Error::Protocol`] when
+    /// the answer did not deserialise into `R`.
+    pub async fn request<P, R>(&self, method: &str, params: P) -> Result<R>
+    where
+        P: Serialize + Send,
+        R: DeserializeOwned,
+    {
+        self.request_with_timeout(method, params, self.state.options.request_timeout)
+            .await
+    }
+
+    /// Calls a method with a deadline of its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::request`].
+    pub async fn request_with_timeout<P, R>(
+        &self,
+        method: &str,
+        params: P,
+        timeout: Duration,
+    ) -> Result<R>
+    where
+        P: Serialize + Send,
+        R: DeserializeOwned,
+    {
+        let answer = self.call(method, params, timeout).await?;
+        serde_json::from_value(answer).map_err(|error| Error::Protocol {
+            expected: format!("a result {method} could answer with"),
+            received: error.to_string(),
+        })
+    }
+
+    /// Tells the peer something, expecting no answer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Link`] when the link failed. A notification to a closed client is dropped rather
+    /// than refused: there is nothing to correlate and nobody waiting.
+    pub async fn notify<P>(&self, method: &str, params: P) -> Result<()>
+    where
+        P: Serialize + Send,
+    {
+        if self.is_closed() {
+            return Ok(());
+        }
+        let frame = self.state.frame(None, method, params)?;
+        self.state.write(frame).await
+    }
+
+    /// Stops the pump, fails every call still waiting, and closes this side of the link.
+    ///
+    /// The process or socket underneath is the caller's to reap: this client did not open it.
+    /// Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Link`] when closing the link itself failed.
+    pub async fn close(&self) -> Result<()> {
+        // Stored before the drain rather than inside it, and that order is the contract `call`
+        // reads: a caller that finds the map open has, by that fact, arrived before this store,
+        // and the drain below cannot run until that caller's entry is in the map.
+        self.state.closed.store(true, Ordering::Release);
+        self.state.shutdown.cancel();
+        self.state.fail_pending(self.state.closed_error()).await;
+        // The peer's own questions are answered on tasks of their own, and one waiting for a
+        // person would otherwise outlive the client that spawned it — holding its share of the
+        // state for the rest of the process, and replying into a link that is already gone. The
+        // shutdown flag has already reached them, so this is the moment they need to write the
+        // refusal, and it happens before the link is closed under them.
+        self.state.drain_in_flight().await;
+
+        let closed = self.state.sender.lock().await.close().await;
+        if let Some(pump) = self.pump.lock().await.take() {
+            // Taken down rather than waited out: the shutdown flag is only read between messages,
+            // so a pump parked inside a handler — which is where a host that stopped reading its
+            // turn stream parks it — would never reach the flag, and closing would never return.
+            pump.abort();
+            let _ = pump.await;
+        }
+        closed
+    }
+
+    /// Whether this client has been closed or the peer has gone.
+    pub fn is_closed(&self) -> bool {
+        self.state.closed.load(Ordering::Acquire)
+    }
+
+    /// The peer as a person would name it.
+    pub fn peer_name(&self) -> &str {
+        &self.state.options.peer_name
+    }
+
+    async fn call<P>(&self, method: &str, params: P, timeout: Duration) -> Result<Value>
+    where
+        P: Serialize + Send,
+    {
+        if self.is_closed() {
+            return Err(Error::Closed { subject: "link" });
+        }
+        let id = self
+            .state
+            .next_id
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        // Built before the map is touched: a frame this refuses would otherwise leave a waiter
+        // behind for a caller that is returning the failure here.
+        let frame = self
+            .state
+            .frame(Some(Value::String(id.clone())), method, params)?;
+
+        let (answer, waiting) = oneshot::channel();
+        {
+            let mut pending = self.state.pending.lock().await;
+            // Read again, holding the map, because the check above is not the same instant as this
+            // insert. `close` stores the flag and then drains under this lock; a call checks under
+            // this lock and then inserts. If the read here says open, the store had not landed, and
+            // the drain that follows it needs the lock this call holds until the entry is in — so
+            // it sees the entry. If it says closed, the call returns. Nothing else can happen, and
+            // in particular no entry can land after the drain that was supposed to fail it, which
+            // is a caller waiting out its whole `request_timeout` for a link that is already gone.
+            if self.state.closed.load(Ordering::Acquire) {
+                return Err(Error::Closed { subject: "link" });
+            }
+            pending.insert(id.clone(), answer);
+        }
+
+        if let Err(error) = self.state.write(frame).await {
+            // The entry goes before the error leaves: nothing is waiting on this call — the
+            // failure is returning here — so an orphan left behind would be failed later by a
+            // close or a dying pump, against a caller that had already given up.
+            self.state.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+
+        match tokio::time::timeout(timeout, waiting).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(failure))) => Err(Error::Vendor(failure.into_vendor_error(
+                ErrorCode::new(format!("{}-call-failed", self.state.slug())),
+                Some(id),
+            ))),
+            Ok(Err(_)) => Err(Error::Link {
+                peer: self.state.options.peer_name.clone(),
+                message: format!("the peer went away before answering {method}"),
+            }),
+            Err(_) => {
+                self.state.pending.lock().await.remove(&id);
+                Err(Error::Timeout {
+                    operation: format!("{} {method}", self.state.options.peer_name),
+                    after: timeout,
+                })
+            }
+        }
+    }
+}
+
+impl Drop for Client {
+    /// Best effort, and nothing is left waiting by the time it runs.
+    ///
+    /// [`Client::close`] is the supported shutdown: it fails every call still waiting, lets the
+    /// answers in flight write their refusals, and closes the link. This runs when nobody called
+    /// it, and there is deliberately no drain here — a caller inside [`Client::request`] holds a
+    /// borrow of this client for the life of its future, so no pending call can outlive this, and
+    /// a map the last owner is dropping has nothing to fail.
+    ///
+    /// What is left is the end of the link. The pump and the answers in flight are taken down, and
+    /// the sender goes with the last handle to this client's state — which on a child's stdin
+    /// is the end-of-input a print-mode vendor waits for.
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+        self.state.shutdown.cancel();
+        self.state.abort_in_flight();
+        if let Ok(mut pump) = self.pump.try_lock()
+            && let Some(pump) = pump.take()
+        {
+            pump.abort();
+        }
+    }
+}
+
+impl ClientState {
+    fn frame<P: Serialize>(&self, id: Option<Value>, method: &str, params: P) -> Result<String> {
+        let mut frame = Map::new();
+        if self.options.include_version_header {
+            frame.insert(String::from("jsonrpc"), json!("2.0"));
+        }
+        if let Some(id) = id {
+            frame.insert(String::from("id"), id);
+        }
+        frame.insert(String::from("method"), json!(method));
+
+        let params = serde_json::to_value(params).map_err(|error| Error::Protocol {
+            expected: format!("serialisable params for {method}"),
+            received: error.to_string(),
+        })?;
+        // A dialect that validates strictly refuses a `params: null` it never declared, so an
+        // absent parameter is an absent member.
+        if !params.is_null() {
+            frame.insert(String::from("params"), params);
+        }
+        Ok(Value::Object(frame).to_string())
+    }
+
+    /// What a call still waiting is failed with once this side has stopped speaking.
+    fn closed_error(&self) -> JsonRpcError {
+        JsonRpcError {
+            code: -32000,
+            message: format!("the {} connection was closed", self.options.peer_name),
+            data: None,
+        }
+    }
+
+    /// Lets every answer still being composed write its refusal, then takes down what is left.
+    ///
+    /// Each one is already racing the shutdown flag, so this is a frame's worth of work rather
+    /// than a wait on whoever was being asked. The grace is a bound on a slow link, not on a slow
+    /// person.
+    async fn drain_in_flight(&self) {
+        let mut in_flight = std::mem::take(
+            &mut *self
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let drained = tokio::time::timeout(IN_FLIGHT_DRAIN_GRACE, async {
+            while in_flight.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            in_flight.abort_all();
+        }
+    }
+
+    /// Takes down every answer still being composed, for a caller that cannot wait.
+    fn abort_in_flight(&self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .abort_all();
+    }
+
+    /// Answers one of the peer's questions on a task this client owns, if there is room.
+    ///
+    /// The count and the spawn happen under one lock rather than two. Only the pump dispatches
+    /// today, so a gap between checking and spawning would hold — until the day anything else
+    /// answers a question, and then the bound this exists to enforce is off by however many
+    /// dispatchers raced through it.
+    fn spawn_answer(
+        state: &Arc<Self>,
+        handler: &Arc<dyn PeerHandler>,
+        method: String,
+        params: Value,
+        raw_id: Value,
+    ) -> bool {
+        let mut in_flight = state
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // The answers already given are reaped first, so the count is what is still being decided
+        // rather than everything that was ever asked.
+        while in_flight.try_join_next().is_some() {}
+        if in_flight.len() >= state.options.max_in_flight_requests {
+            return false;
+        }
+        let owned = Arc::clone(state);
+        let handler = Arc::clone(handler);
+        in_flight.spawn(async move { answer(&owned, &handler, method, params, raw_id).await });
+        true
+    }
+
+    async fn write(&self, frame: String) -> Result<()> {
+        self.sender.lock().await.send(frame).await
+    }
+
+    async fn fail_pending(&self, failure: JsonRpcError) {
+        let waiting: Vec<_> = self.pending.lock().await.drain().collect();
+        for (_, answer) in waiting {
+            let _ = answer.send(Err(failure.clone()));
+        }
+    }
+
+    async fn settle(&self, id: &str, outcome: std::result::Result<Value, JsonRpcError>) {
+        if let Some(answer) = self.pending.lock().await.remove(id) {
+            let _ = answer.send(outcome);
+        }
+    }
+
+    /// The peer's name as an error-code prefix.
+    fn slug(&self) -> String {
+        self.options
+            .peer_name
+            .to_lowercase()
+            .split_whitespace()
+            .next()
+            .unwrap_or("peer")
+            .to_owned()
+    }
+}
+
+async fn pump(
+    state: Arc<ClientState>,
+    mut receiver: Box<dyn crate::link::LinkReceiver>,
+    handler: Arc<dyn PeerHandler>,
+) {
+    loop {
+        let message = tokio::select! {
+            biased;
+            () = state.shutdown.cancelled() => break,
+            message = receiver.recv() => message,
+        };
+
+        match message {
+            Ok(Some(message)) => dispatch(&state, &handler, message).await,
+            Ok(None) => {
+                state.closed.store(true, Ordering::Release);
+                state
+                    .fail_pending(JsonRpcError {
+                        code: -32000,
+                        message: format!("the {} exited", state.options.peer_name),
+                        data: None,
+                    })
+                    .await;
+                break;
+            }
+            Err(error) => {
+                state.closed.store(true, Ordering::Release);
+                state
+                    .fail_pending(JsonRpcError {
+                        code: -32000,
+                        message: format!("the {} link failed: {error}", state.options.peer_name),
+                        data: None,
+                    })
+                    .await;
+                break;
+            }
+        }
+    }
+}
+
+async fn dispatch(state: &Arc<ClientState>, handler: &Arc<dyn PeerHandler>, message: String) {
+    // Not every line on a peer's output is a frame. Dropping an unparseable one keeps a stray
+    // diagnostic from killing a live turn.
+    let Ok(Value::Object(frame)) = serde_json::from_str::<Value>(&message) else {
+        return;
+    };
+
+    let id = frame.get("id").cloned();
+    let method = frame
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let params = frame.get("params").cloned().unwrap_or(Value::Null);
+
+    match (method, id) {
+        (Some(method), None) => handler.on_notification(method, params).await,
+        (Some(method), Some(id)) => {
+            // On a task of its own: a question that waits for a person must not stop the events
+            // arriving meanwhile, which is what a turn renders while the person decides. Counted,
+            // because a peer that asks faster than anyone answers must not be able to spawn
+            // without bound.
+            if !ClientState::spawn_answer(state, handler, method, params, id.clone()) {
+                let refusal = JsonRpcError {
+                    code: -32000,
+                    message: format!(
+                        "expected at most {} questions in flight, received one more",
+                        state.options.max_in_flight_requests
+                    ),
+                    data: None,
+                };
+                write_reply(state, id, ServerRequestOutcome::Failure(refusal)).await;
+            }
+        }
+        (None, Some(id)) => {
+            let outcome = match frame.get("error") {
+                Some(error) => Err(
+                    serde_json::from_value(error.clone()).unwrap_or(JsonRpcError {
+                        code: -32603,
+                        message: error.to_string(),
+                        data: None,
+                    }),
+                ),
+                None => Ok(frame.get("result").cloned().unwrap_or(Value::Null)),
+            };
+            state.settle(&RequestId::new(id).key(), outcome).await;
+        }
+        (None, None) => {}
+    }
+}
+
+async fn answer(
+    state: &Arc<ClientState>,
+    handler: &Arc<dyn PeerHandler>,
+    method: String,
+    params: Value,
+    raw_id: Value,
+) {
+    let id = RequestId::new(raw_id.clone());
+    // A question the peer is blocked on has to be answered even when this side is shutting down:
+    // leaving it unanswered leaves the vendor waiting, and leaving the task alive leaks it.
+    let outcome = tokio::select! {
+        outcome = handler.on_request(method, params, id) => outcome,
+        () = state.shutdown.cancelled() => ServerRequestOutcome::Failure(state.closed_error()),
+    };
+    write_reply(state, raw_id, outcome).await;
+}
+
+/// Writes one reply frame for a question the peer asked.
+async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerRequestOutcome) {
+    let mut frame = Map::new();
+    if state.options.include_version_header {
+        frame.insert(String::from("jsonrpc"), json!("2.0"));
+    }
+    // The id goes back exactly as it arrived: a peer that numbered its request will not match a
+    // stringified answer to it.
+    frame.insert(String::from("id"), raw_id);
+    match outcome {
+        ServerRequestOutcome::Answer(result) => {
+            frame.insert(String::from("result"), result);
+        }
+        ServerRequestOutcome::Failure(failure) => {
+            frame.insert(
+                String::from("error"),
+                serde_json::to_value(failure).unwrap_or(Value::Null),
+            );
+        }
+    }
+    // The peer may have died between its question and this reply; the pump reports that.
+    let _ = state.write(Value::Object(frame).to_string()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Client, ClientOptions, JsonRpcError, PeerHandler, RequestId, ServerRequestOutcome,
+    };
+    use crate::error::Error;
+    use crate::testing::ScriptedLink;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::{Mutex, Notify};
+
+    /// A handler that records what it was told and answers questions from a script.
+    struct RecordingHandler {
+        notifications: Mutex<Vec<(String, Value)>>,
+        answer: Option<ServerRequestOutcome>,
+    }
+
+    impl RecordingHandler {
+        fn arc(answer: Option<ServerRequestOutcome>) -> Arc<Self> {
+            Arc::new(Self {
+                notifications: Mutex::new(Vec::new()),
+                answer,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for RecordingHandler {
+        async fn on_notification(&self, method: String, params: Value) {
+            self.notifications.lock().await.push((method, params));
+        }
+
+        async fn on_request(
+            &self,
+            _method: String,
+            _params: Value,
+            id: RequestId,
+        ) -> ServerRequestOutcome {
+            self.answer
+                .clone()
+                .unwrap_or_else(|| ServerRequestOutcome::Answer(json!({ "echoed": id.key() })))
+        }
+    }
+
+    fn client(link: ScriptedLink, handler: Arc<RecordingHandler>) -> Client {
+        Client::connect(
+            link.into_link(),
+            handler,
+            ClientOptions::new("Codex app-server").with_request_timeout(Duration::from_secs(5)),
+        )
+    }
+
+    /// A frame that cannot be built must not leave a waiter behind: the map is what `close` and a
+    /// dying pump drain, so an orphan is failed later against a caller that gave up here.
+    #[tokio::test]
+    async fn params_that_cannot_be_written_leave_no_waiter_behind() {
+        struct Unwritable;
+
+        impl serde::Serialize for Unwritable {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("these params cannot be written"))
+            }
+        }
+
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        let refused = client.request::<_, Value>("thread/start", Unwritable).await;
+        assert!(
+            matches!(refused, Err(Error::Protocol { .. })),
+            "expected the params to be refused, received {refused:?}"
+        );
+
+        let waiting = client.state.pending.lock().await.len();
+        assert_eq!(
+            waiting, 0,
+            "expected nothing left waiting, received {waiting}"
+        );
+        assert!(link.sent().is_empty(), "received {:?}", link.sent());
+    }
+
+    /// The window this closes is a preemption between `call` reading the closed flag and inserting
+    /// its waiter, which no test can schedule. Holding the map reproduces the same ordering
+    /// deterministically: the caller is past its check and not yet inserted when a close lands its
+    /// flag and queues behind it. Without the check under the lock the caller inserts anyway and
+    /// is failed by the drain that follows — an answer that names the peer for a refusal this side
+    /// made, and on the real timeline no drain follows at all and the caller waits out its whole
+    /// `request_timeout`.
+    #[tokio::test]
+    async fn a_call_that_reaches_the_map_behind_a_close_is_refused_by_this_side() {
+        let link = ScriptedLink::new();
+        let client = Arc::new(client(link.clone(), RecordingHandler::arc(None)));
+
+        let held = client.state.pending.lock().await;
+
+        let calling = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("thread/start", json!({})).await })
+        };
+        tokio::task::yield_now().await;
+
+        let closing = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.close().await })
+        };
+        tokio::task::yield_now().await;
+
+        assert!(
+            client.is_closed(),
+            "expected the close to have landed its flag while the caller waits for the map"
+        );
+        drop(held);
+
+        let refused = calling.await.expect("expected the caller to finish");
+        assert!(
+            matches!(refused, Err(Error::Closed { subject: "link" })),
+            "expected this side to refuse the call, received {refused:?}"
+        );
+        closing
+            .await
+            .expect("expected the close to finish")
+            .expect("expected a clean close");
+    }
+
+    #[tokio::test]
+    async fn a_request_is_answered_by_the_response_that_names_it() {
+        let link = ScriptedLink::new();
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":{"threadId":"t-1"}}"#);
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        let answer: Value = client
+            .request("thread/start", json!({}))
+            .await
+            .expect("expected an answer");
+        assert_eq!(answer, json!({ "threadId": "t-1" }));
+
+        let sent = link.sent();
+        assert_eq!(sent.len(), 1, "received {sent:?}");
+        assert!(sent[0].contains(r#""method":"thread/start""#));
+        assert!(sent[0].contains(r#""jsonrpc":"2.0""#));
+    }
+
+    #[tokio::test]
+    async fn answers_arriving_out_of_order_still_reach_the_right_caller() {
+        let link = ScriptedLink::new();
+        let client = Arc::new(client(link.clone(), RecordingHandler::arc(None)));
+
+        let first = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("first", json!({})).await })
+        };
+        let second = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("second", json!({})).await })
+        };
+        link.wait_for_sent(2).await;
+
+        // The second question is answered first.
+        link.push_line(r#"{"jsonrpc":"2.0","id":"2","result":"second-answer"}"#);
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"first-answer"}"#);
+
+        assert_eq!(
+            second
+                .await
+                .expect("expected the task to finish")
+                .expect("expected an answer"),
+            json!("second-answer")
+        );
+        assert_eq!(
+            first
+                .await
+                .expect("expected the task to finish")
+                .expect("expected an answer"),
+            json!("first-answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_the_peer_numbered_is_echoed_as_a_number() {
+        // Some agents number their server-to-client requests from zero. Answering `0` with `"0"`
+        // is a different id: the peer never matches the reply and stays blocked, which reads as a
+        // turn that hangs after an approval is clicked.
+        let link = ScriptedLink::new();
+        link.push_line(r#"{"jsonrpc":"2.0","id":0,"method":"session/request_permission"}"#);
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        link.wait_for_sent(1).await;
+        let reply: Value =
+            serde_json::from_str(&link.sent()[0]).expect("expected the reply to be a frame");
+        assert_eq!(reply["id"], json!(0), "received {reply}");
+        assert_eq!(reply["result"], json!({ "echoed": "0" }));
+
+        client.close().await.expect("expected a clean close");
+    }
+
+    #[tokio::test]
+    async fn a_notification_reaches_the_handler_in_arrival_order() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = client(link.clone(), Arc::clone(&handler));
+
+        link.push_line(r#"{"jsonrpc":"2.0","method":"item/started","params":{"n":1}}"#);
+        link.push_line(r#"{"jsonrpc":"2.0","method":"item/completed","params":{"n":2}}"#);
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":null}"#);
+        client
+            .request::<_, Value>("ping", json!({}))
+            .await
+            .expect("expected an answer");
+
+        let seen = handler.notifications.lock().await;
+        assert_eq!(
+            seen.iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["item/started", "item/completed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_frame_keeps_the_peers_own_code_and_retryability() {
+        let link = ScriptedLink::new();
+        link.push_line(
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32601,"message":"no such method"}}"#,
+        );
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        let error = client
+            .request::<_, Value>("nope", json!({}))
+            .await
+            .expect_err("expected a failure, received an answer");
+        let Error::Vendor(vendor) = error else {
+            panic!("expected a vendor failure, received {error:?}");
+        };
+        assert_eq!(vendor.message, "no such method");
+        assert_eq!(vendor.vendor_code.as_deref(), Some("-32601"));
+        assert!(
+            !vendor.retryable,
+            "expected a reserved code to be non-retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_whose_write_never_lands_fails_without_orphaning_itself() {
+        let link = ScriptedLink::new();
+        link.fail_sends("EPIPE: the vendor process is gone");
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        let error = client
+            .request::<_, Value>("thread/start", json!({}))
+            .await
+            .expect_err("expected a failure, received an answer");
+        assert!(
+            error.to_string().contains("EPIPE"),
+            "expected the write failure, received {error}"
+        );
+
+        // Closing fails everything still pending. A call whose write failed is not pending — it
+        // already failed — so there is nothing here for a second failure to land on.
+        client.close().await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_exits_fails_every_call_still_waiting() {
+        let link = ScriptedLink::new();
+        let client = Arc::new(client(link.clone(), RecordingHandler::arc(None)));
+
+        let waiting = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("thread/start", json!({})).await })
+        };
+        link.wait_for_sent(1).await;
+        link.end();
+
+        let error = waiting
+            .await
+            .expect("expected the task to finish")
+            .expect_err("expected a failure, received an answer");
+        assert!(
+            error.to_string().contains("exited"),
+            "expected the peer's exit, received {error}"
+        );
+        assert!(client.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_is_never_answered_ends_at_its_deadline() {
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        let error = client
+            .request_with_timeout::<_, Value>("thread/start", json!({}), Duration::from_secs(30))
+            .await
+            .expect_err("expected a timeout, received an answer");
+        assert!(
+            matches!(error, Error::Timeout { .. }),
+            "expected a timeout, received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_line_is_dropped_rather_than_killing_the_turn() {
+        let link = ScriptedLink::new();
+        link.push_line("Warning: your terminal does not support colour");
+        link.push_line("[]");
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"still here"}"#);
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        assert_eq!(
+            client
+                .request::<_, Value>("ping", json!({}))
+                .await
+                .expect("expected an answer"),
+            json!("still here")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dialect_that_writes_no_version_header_does_not_get_one() {
+        let link = ScriptedLink::new();
+        let client = Client::connect(
+            link.clone().into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::new("Codex app-server").without_version_header(),
+        );
+
+        client
+            .notify("turn/interrupt", json!({ "turnId": "t-1" }))
+            .await
+            .expect("expected the notification to be sent");
+
+        let sent = link.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            !sent[0].contains("jsonrpc"),
+            "expected no version header, received {}",
+            sent[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_parameter_is_an_absent_member_rather_than_a_null() {
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+
+        client
+            .notify("account/rateLimits/read", ())
+            .await
+            .expect("expected the notification to be sent");
+
+        assert!(
+            !link.sent()[0].contains("params"),
+            "expected no params member, received {}",
+            link.sent()[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handler_can_refuse_a_question_rather_than_leaving_the_peer_blocked() {
+        let link = ScriptedLink::new();
+        link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"fs/write_text_file"}"#);
+        let client = client(
+            link.clone(),
+            RecordingHandler::arc(Some(ServerRequestOutcome::Failure(JsonRpcError {
+                code: -32601,
+                message: String::from("this host executes no vendor tool call"),
+                data: None,
+            }))),
+        );
+
+        link.wait_for_sent(1).await;
+        let reply: Value =
+            serde_json::from_str(&link.sent()[0]).expect("expected the reply to be a frame");
+        assert_eq!(reply["id"], json!(7));
+        assert_eq!(reply["error"]["code"], json!(-32601));
+
+        client.close().await.expect("expected a clean close");
+    }
+
+    #[tokio::test]
+    async fn a_closed_client_refuses_a_call_and_drops_a_notification() {
+        let link = ScriptedLink::new();
+        let client = client(link.clone(), RecordingHandler::arc(None));
+        client.close().await.expect("expected a clean close");
+
+        let error = client
+            .request::<_, Value>("thread/start", json!({}))
+            .await
+            .expect_err("expected a refusal, received an answer");
+        assert!(
+            matches!(error, Error::Closed { subject: "link" }),
+            "expected a closed link, received {error:?}"
+        );
+        client
+            .notify("ping", json!({}))
+            .await
+            .expect("expected a dropped notification to be fine");
+        assert!(link.sent().is_empty());
+    }
+
+    /// A host that stopped reading its turn stream. A bounded channel with no room left parks the
+    /// handler exactly like this, for as long as the host takes to read again.
+    ///
+    /// Its questions park too, which is what an approval waiting for a person looks like. The flag
+    /// records whether the future answering one was ever let go of.
+    struct StalledHandler {
+        entered: Notify,
+        asked: Notify,
+        released: Arc<AtomicBool>,
+    }
+
+    impl StalledHandler {
+        fn arc() -> Arc<Self> {
+            Arc::new(Self {
+                entered: Notify::new(),
+                asked: Notify::new(),
+                released: Arc::new(AtomicBool::new(false)),
+            })
+        }
+    }
+
+    /// Sets its flag when the future holding it is dropped or finishes.
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for StalledHandler {
+        async fn on_notification(&self, _method: String, _params: Value) {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+
+        async fn on_request(
+            &self,
+            _method: String,
+            _params: Value,
+            _id: RequestId,
+        ) -> ServerRequestOutcome {
+            let _release = ReleaseOnDrop(Arc::clone(&self.released));
+            self.asked.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("the handler never answers")
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_returns_while_the_handler_is_still_parked() {
+        let link = ScriptedLink::new();
+        let handler = StalledHandler::arc();
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server"),
+        );
+
+        link.push_line(r#"{"jsonrpc":"2.0","method":"item/started","params":{}}"#);
+        handler.entered.notified().await;
+
+        // The shutdown flag is read between messages only, so a pump parked in the handler never
+        // reaches it: waiting the pump out here would wait for a message that is not coming.
+        tokio::time::timeout(Duration::from_secs(5), client.close())
+            .await
+            .expect("expected close to return while the handler was parked")
+            .expect("expected a clean close");
+    }
+
+    /// A question the peer asked is answered on a task of its own. Closing has to take that task
+    /// with it, or an approval nobody answered outlives the session that raised it — holding its
+    /// share of the client for the rest of the process.
+    #[tokio::test]
+    async fn closing_takes_down_a_question_nobody_answered() {
+        let link = ScriptedLink::new();
+        let handler = StalledHandler::arc();
+        let released = Arc::clone(&handler.released);
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server"),
+        );
+
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","method":"session/request_permission"}"#);
+        handler.asked.notified().await;
+        assert!(
+            !released.load(Ordering::Acquire),
+            "expected the question to still be waiting"
+        );
+
+        client.close().await.expect("expected a clean close");
+        assert!(
+            released.load(Ordering::Acquire),
+            "expected the answer task to be let go of by the time the client closed"
+        );
+
+        // And the peer is told, rather than left waiting on a link that is already gone.
+        let sent = link.sent();
+        assert_eq!(sent.len(), 1, "received {sent:?}");
+        let refusal: Value =
+            serde_json::from_str(&sent[0]).expect("expected the refusal to be a frame");
+        assert_eq!(refusal["id"], json!("1"), "received {refusal}");
+        assert_eq!(refusal["error"]["code"], json!(-32000));
+    }
+
+    /// The line cap bounds how big one frame is, never how many arrive. Without a count, a peer
+    /// writing questions as fast as the pipe allows spawns one task per frame.
+    #[tokio::test]
+    async fn a_peer_asking_faster_than_anyone_answers_is_refused_rather_than_spawned() {
+        let link = ScriptedLink::new();
+        let handler = StalledHandler::arc();
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_max_in_flight_requests(1),
+        );
+
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","method":"session/request_permission"}"#);
+        handler.asked.notified().await;
+        link.push_line(r#"{"jsonrpc":"2.0","id":"2","method":"session/request_permission"}"#);
+        // Bounded: without the cap nothing is ever written, and a test that waits forever reports
+        // nothing at all.
+        tokio::time::timeout(Duration::from_secs(5), link.wait_for_sent(1))
+            .await
+            .expect("expected the question past the cap to be refused");
+
+        // The parked question wrote nothing; the one past the cap was refused by name.
+        let sent = link.sent();
+        assert_eq!(sent.len(), 1, "received {sent:?}");
+        let refusal: Value =
+            serde_json::from_str(&sent[0]).expect("expected the refusal to be a frame");
+        assert_eq!(refusal["id"], json!("2"), "received {refusal}");
+        assert_eq!(refusal["error"]["code"], json!(-32000));
+        assert!(
+            refusal["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("at most 1")),
+            "expected the cap to be named, received {refusal}"
+        );
+
+        client.close().await.expect("expected a clean close");
+    }
+}
