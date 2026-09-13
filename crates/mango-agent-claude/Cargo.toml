@@ -16,7 +16,22 @@ description = "Claude Code harness for mango-external-agents: the stream-json di
 workspace = true
 
 [dependencies]
-mango-external-agents.workspace = true
+# `stdio` because this dialect is a child process per turn and per probe; the
+# core's other transport kinds are not reachable from it.
+mango-external-agents = { workspace = true, features = ["stdio"] }
+
+async-trait = "0.1.92"
+semver = { version = "1.0.28", default-features = false, features = ["std"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["fs", "macros", "rt", "sync", "time"] }
+# `--session-id` takes a UUID and nothing else, so the harness mints one rather
+# than reusing the host's own session id, which has no shape requirement.
+uuid = { version = "1.19.1", default-features = false, features = ["std", "v4"] }
+
+[dev-dependencies]
+mango-external-agents = { workspace = true, features = ["stdio", "testing"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true
