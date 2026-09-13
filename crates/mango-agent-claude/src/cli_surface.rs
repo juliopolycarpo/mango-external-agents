@@ -1,0 +1,329 @@
+//! What `claude --help` says this build offers, and whether that is enough.
+//!
+//! Claude has no handshake. Codex answers `initialize` and an ACP agent negotiates a version, but
+//! a `claude --print` turn is a one-shot process whose first feedback about an argument it does
+//! not recognise is a non-zero exit after the user already pressed send. `--help` is the only place
+//! the CLI describes its own surface before anything is spawned in anger, so it is what this
+//! harness probes.
+//!
+//! This is deliberately a better gate than the version number. [`MINIMUM_VERSION`] records 2.1.211
+//! because that is where `--forward-subagent-text` arrived, but the version is a proxy for the flag
+//! and the flag is the thing that matters: a repackaged build, a vendor that backports, or a pin
+//! that went stale all make the number disagree with the binary. Reading the surface asks the
+//! question directly, so a below-pin install that has everything this harness passes keeps
+//! working, and an at-pin install that lost a flag is caught before a turn is attempted.
+//!
+//! Two different failures come out of here, and they are not interchangeable:
+//!
+//! - A **missing flag** is fatal for the whole harness. Every flag listed below is on every turn's
+//!   argv, so there is no configuration that avoids it.
+//! - A **missing permission mode** is fatal only for the configurations that need that mode, which
+//!   is why [`permissions`](crate::permissions) narrows the matrix with it instead of refusing the
+//!   harness.
+//!
+//! Unknown *extra* flags and modes are ignored on purpose. Claude gains options constantly;
+//! treating an unrecognised one as drift would break this harness on every vendor release.
+
+use std::collections::BTreeSet;
+
+use crate::help::{self, Option_};
+use crate::pinned::MINIMUM_VERSION;
+
+/// The option whose choice list is Claude's permission vocabulary.
+const PERMISSION_MODE_FLAG: &str = "--permission-mode";
+
+/// The two options whose vocabulary is stated in prose rather than as choices.
+const MODEL_FLAG: &str = "--model";
+const EFFORT_FLAG: &str = "--effort";
+
+/// Who answers a permission prompt. Declared from 2.1.259; absent before it.
+const PERMISSION_PROMPTS_FLAG: &str = "--permission-prompts";
+
+/// The MCP servers a turn passes through. Declared for as long as the CLI has had MCP.
+const MCP_CONFIG_FLAG: &str = "--mcp-config";
+
+/// Long flags every turn puts on the wire.
+///
+/// Every one of these is unconditional except `--model`, which is passed only when a model was
+/// chosen — it is still required here, because losing it silently removes model selection rather
+/// than failing where it can be seen.
+///
+/// Short aliases are not listed: `-p` and `--print` are the same option and this harness passes the
+/// long form, so matching the long form is matching what is actually sent.
+pub const REQUIRED_FLAGS: &[&str] = &[
+    "--print",
+    "--input-format",
+    "--output-format",
+    "--verbose",
+    "--include-partial-messages",
+    "--forward-subagent-text",
+    PERMISSION_MODE_FLAG,
+    "--resume",
+    "--session-id",
+    MODEL_FLAG,
+];
+
+/// The parsed surface, reduced to the things this harness reads off it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CliSurface {
+    flags: BTreeSet<String>,
+    permission_modes: BTreeSet<String>,
+    model_aliases: Option<Vec<String>>,
+    effort_levels: Option<Vec<String>>,
+}
+
+impl CliSurface {
+    /// Reads `claude --help` into the surface this harness depends on.
+    ///
+    /// Three vocabularies, three shapes the vendor happens to print them in, and none of the
+    /// shape-reading here: `(choices: …)` for the permission modes, a bare list for the effort
+    /// levels, a first `(e.g. …)` group for the model aliases. Which flag carries which vocabulary
+    /// is this harness's knowledge; how each shape is read is [`help`](crate::help)'s.
+    pub fn parse(help_text: &str) -> Self {
+        let options = help::declared_options(help_text);
+        let flags = options
+            .iter()
+            .flat_map(|option| option.flags.iter().cloned())
+            .collect();
+        let permission_modes = option_block(&options, PERMISSION_MODE_FLAG)
+            .and_then(help::choice_list)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        Self {
+            flags,
+            permission_modes,
+            model_aliases: option_block(&options, MODEL_FLAG).and_then(help::quoted_examples),
+            effort_levels: option_block(&options, EFFORT_FLAG).and_then(help::bare_choice_list),
+        }
+    }
+
+    /// Which required flags this build does not offer, in declaration order.
+    ///
+    /// Empty means every argument this harness passes exists — the answer that lets a below-pin
+    /// binary keep working.
+    pub fn missing_required_flags(&self) -> Vec<&'static str> {
+        REQUIRED_FLAGS
+            .iter()
+            .copied()
+            .filter(|flag| !self.flags.contains(*flag))
+            .collect()
+    }
+
+    /// Whether a parsed surface is worth trusting at all.
+    ///
+    /// A help text that yielded no permission modes and none of the required flags is far more
+    /// likely to be a probe that failed — a spawn that produced nothing, a CLI that printed to
+    /// stderr, a wrapper that swallowed the output — than a build with no options. Treating that as
+    /// "everything is missing" would make a flaky spawn look like vendor drift and refuse a working
+    /// install, so callers fall back to the version comparison instead.
+    pub fn is_usable(&self) -> bool {
+        !self.permission_modes.is_empty() || self.missing_required_flags().is_empty()
+    }
+
+    /// The modes this build declared, or nothing when it declared none.
+    ///
+    /// An empty choice list is **unproven**, not "this build accepts no mode", and the two have to
+    /// stay distinguishable: a build that offers every required flag and whose `(choices: …)` list
+    /// moved or wrapped differently parses as usable with no modes, and passing that empty set
+    /// through as authoritative would refuse every configuration on a binary that can run them all.
+    /// Narrowing belongs to a probe that saw the vocabulary, never to one that failed to read it.
+    pub fn accepted_modes(&self) -> Option<&BTreeSet<String>> {
+        (!self.permission_modes.is_empty()).then_some(&self.permission_modes)
+    }
+
+    /// The model aliases `--model`'s description advertises, or nothing when it advertises none.
+    pub fn model_aliases(&self) -> Option<&[String]> {
+        self.model_aliases.as_deref()
+    }
+
+    /// `--effort`'s levels, from the same prose, with the same absent-is-not-empty rule.
+    pub fn effort_levels(&self) -> Option<&[String]> {
+        self.effort_levels.as_deref()
+    }
+
+    /// Whether this build lets the caller say who answers permission prompts.
+    ///
+    /// `false` for an unreadable surface, which is the **opposite** default from
+    /// [`accepted_modes`](Self::accepted_modes), and deliberately so — the two answer different
+    /// questions. A probe that failed may not *narrow* what the matrix offers, so that one fails
+    /// open; it also may not *promise* an option exists, so this one fails closed. Passing an
+    /// undeclared flag is a startup failure on every turn, which is the one outcome worth being
+    /// pessimistic to avoid.
+    pub fn declares_permission_prompts(&self) -> bool {
+        self.flags.contains(PERMISSION_PROMPTS_FLAG)
+    }
+
+    /// Whether this build accepts MCP servers the host configured.
+    ///
+    /// Fails closed for the same reason [`declares_permission_prompts`](Self::declares_permission_prompts)
+    /// does: the flag goes on the argv only when the binary said it exists.
+    pub fn declares_mcp_config(&self) -> bool {
+        self.flags.contains(MCP_CONFIG_FLAG)
+    }
+
+    /// Why this build cannot be driven, or nothing when it can.
+    ///
+    /// The flag surface decides, and the version only steps in when the surface could not be read.
+    /// That ordering is the point: the pin exists because `--forward-subagent-text` landed in a
+    /// particular release, so asking whether the flag is *there* answers the real question, and a
+    /// below-pin build that has everything this harness passes stays usable instead of being
+    /// refused by arithmetic.
+    pub fn refusal(surface: Option<&Self>, version: Option<&semver::Version>) -> Option<String> {
+        let Some(surface) = surface else {
+            // No usable surface, so the pin is all that is left to go on.
+            if crate::version::is_supported(version) {
+                return None;
+            }
+            let found =
+                version.map_or_else(|| String::from("no version"), semver::Version::to_string);
+            return Some(format!(
+                "Claude Code {found} predates the {MINIMUM_VERSION} this harness drives, and its flag surface could not be read"
+            ));
+        };
+        let missing = surface.missing_required_flags();
+        if missing.is_empty() {
+            return None;
+        }
+        let found = version.map_or_else(|| String::from("this build"), semver::Version::to_string);
+        Some(format!(
+            "Claude Code {found} does not offer {}, which every turn passes; upgrade to {MINIMUM_VERSION} or later",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn option_block<'a>(options: &'a [Option_], flag: &str) -> Option<&'a str> {
+    help::option_for(options, flag).map(|option| option.block.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliSurface;
+    use crate::version;
+
+    const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
+    const HELP_2_1_260: &str = include_str!("../../../fixtures/claude/help/2.1.260.txt");
+
+    #[test]
+    fn every_flag_every_turn_passes_is_present_on_both_captured_builds() {
+        for (label, help) in [("2.1.227", HELP_2_1_227), ("2.1.260", HELP_2_1_260)] {
+            let surface = CliSurface::parse(help);
+            assert!(
+                surface.is_usable(),
+                "expected {label} to parse into a usable surface"
+            );
+            assert_eq!(
+                surface.missing_required_flags(),
+                Vec::<&str>::new(),
+                "expected {label} to offer every required flag"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_permission_vocabulary_the_vendor_wrapped_across_three_lines() {
+        let modes = CliSurface::parse(HELP_2_1_260)
+            .accepted_modes()
+            .expect("expected a mode vocabulary")
+            .clone();
+        for mode in [
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "manual",
+            "dontAsk",
+            "plan",
+        ] {
+            assert!(modes.contains(mode), "expected {mode:?} in {modes:?}");
+        }
+    }
+
+    #[test]
+    fn reports_a_build_that_states_no_aliases_as_absent_rather_than_empty() {
+        assert_eq!(
+            CliSurface::parse(HELP_2_1_227).model_aliases(),
+            None,
+            "expected the bare 2.1.227 --model line to advertise no catalog"
+        );
+        assert_eq!(
+            CliSurface::parse(HELP_2_1_260).model_aliases(),
+            Some(["fable", "opus", "sonnet"].map(String::from).as_slice())
+        );
+    }
+
+    #[test]
+    fn reports_a_build_without_the_effort_option_as_absent() {
+        assert_eq!(CliSurface::parse(HELP_2_1_227).effort_levels(), None);
+        assert_eq!(
+            CliSurface::parse(HELP_2_1_260).effort_levels(),
+            Some(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn only_a_build_that_declares_the_flag_is_told_who_answers_prompts() {
+        assert!(!CliSurface::parse(HELP_2_1_227).declares_permission_prompts());
+        assert!(CliSurface::parse(HELP_2_1_260).declares_permission_prompts());
+    }
+
+    #[test]
+    fn an_unreadable_surface_narrows_nothing_and_promises_nothing() {
+        let surface = CliSurface::parse("claude: command not found");
+        assert!(!surface.is_usable());
+        assert_eq!(
+            surface.accepted_modes(),
+            None,
+            "expected an unread vocabulary to narrow nothing"
+        );
+        assert!(
+            !surface.declares_permission_prompts(),
+            "expected an unread surface to promise no flag"
+        );
+    }
+
+    #[test]
+    fn keeps_a_build_older_than_the_pin_when_every_flag_it_passes_is_there() {
+        let surface = CliSurface::parse(HELP_2_1_227);
+        let below_pin = version::parse("2.1.150");
+        assert_eq!(
+            CliSurface::refusal(Some(&surface), below_pin.as_ref()),
+            None,
+            "expected the flag surface to decide, not the arithmetic"
+        );
+    }
+
+    #[test]
+    fn names_the_version_to_upgrade_to_when_a_flag_every_turn_passes_is_gone() {
+        let stripped = HELP_2_1_260.replace("--forward-subagent-text", "--forward-subagent-txt");
+        let surface = CliSurface::parse(&stripped);
+        let refusal = CliSurface::refusal(Some(&surface), version::parse("2.1.260").as_ref())
+            .expect("expected a refusal");
+        assert!(
+            refusal.contains("--forward-subagent-text") && refusal.contains("2.1.211"),
+            "expected the missing flag and the floor, received {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_pin_when_the_surface_could_not_be_read() {
+        assert_eq!(
+            CliSurface::refusal(None, version::parse("2.1.270").as_ref()),
+            None
+        );
+        let refusal = CliSurface::refusal(None, version::parse("2.1.200").as_ref())
+            .expect("expected a refusal");
+        assert!(
+            refusal.contains("2.1.200") && refusal.contains("2.1.211"),
+            "received {refusal:?}"
+        );
+        assert!(
+            CliSurface::refusal(None, None).is_some(),
+            "expected an unreadable version and an unreadable surface to refuse"
+        );
+    }
+}
