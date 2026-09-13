@@ -150,6 +150,138 @@ pub struct Resume {
     pub mode: ResumeMode,
 }
 
+/// One MCP server a host configured, for a vendor that accepts them.
+///
+/// Passed through untouched: the library never inspects a server, never connects to one and never
+/// puts a vendor's MCP tools into a host's own tool registry. It maps this shape onto whatever the
+/// vendor's dialect spells it as and stops there.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    /// The name the vendor lists this server under.
+    pub name: String,
+    /// How the vendor reaches it.
+    pub transport: McpTransport,
+}
+
+impl McpServer {
+    /// A server the vendor starts as a child of its own.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::McpServer;
+    ///
+    /// let server = McpServer::stdio("docs", "docs-mcp");
+    /// assert!(server.is_usable());
+    /// ```
+    pub fn stdio(name: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: command.into(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+            },
+        }
+    }
+
+    /// Whether this server is complete enough to hand to a vendor.
+    ///
+    /// A name or a command the host left empty produces a configuration entry the vendor either
+    /// refuses or, worse, reads as something else. Refusing one is the harness's job; saying what
+    /// "usable" means is this type's.
+    pub fn is_usable(&self) -> bool {
+        if self.name.trim().is_empty() {
+            return false;
+        }
+        match &self.transport {
+            McpTransport::Stdio { command, .. } => !command.trim().is_empty(),
+            McpTransport::Http { url, .. } => !url.trim().is_empty(),
+        }
+    }
+}
+
+/// How a vendor reaches one MCP server.
+///
+/// The `env` and `headers` maps are the one place a host-supplied value reaches a vendor process,
+/// and they are deliberately not the environment allowlist's business: they configure the host's
+/// **own** MCP server, which the vendor spawns or dials on the host's behalf, and they never widen
+/// what the vendor's own child inherits. A host that puts a token here has decided to give its own
+/// server a credential; it cannot use this seam to add anything to the vendor CLI's environment.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum McpTransport {
+    /// A child the vendor spawns.
+    Stdio {
+        /// The executable.
+        command: String,
+        /// Its arguments.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        /// The environment that server — not the vendor's own child — receives.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        env: std::collections::BTreeMap<String, String>,
+    },
+    /// An endpoint the vendor dials.
+    Http {
+        /// Where it is.
+        url: String,
+        /// Headers the vendor sends with every request to it.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        headers: std::collections::BTreeMap<String, String>,
+    },
+}
+
+impl fmt::Debug for McpTransport {
+    /// Hand-written, for the same reason [`WsSpec`](crate::WsSpec) is: this is where a host's own
+    /// credential lives.
+    ///
+    /// `env` and `headers` are declared credential carriers by this type's own documentation, and
+    /// every type above this one derives `Debug` from it — so a `tracing::debug!(?request)` of an
+    /// open that configured MCP, or the crate's `received {value:?}` assertion idiom, would print
+    /// the token in the clear. Values go, names stay: a host debugging a server it misconfigured
+    /// still has to see which variable and which header. The URL and the command line go through
+    /// the same redaction a stderr tail does, for the `https://user:password@host` form and for an
+    /// argument written as an assignment.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdio { command, args, env } => formatter
+                .debug_struct("Stdio")
+                .field("command", &crate::redact::stderr_text(command))
+                .field("args", &redacted_arguments(args))
+                .field("env", &redacted_values(env))
+                .finish(),
+            Self::Http { url, headers } => formatter
+                .debug_struct("Http")
+                .field("url", &crate::redact::stderr_text(url))
+                .field("headers", &redacted_values(headers))
+                .finish(),
+            // No wildcard arm: `#[non_exhaustive]` does not apply inside the defining crate, so a
+            // new variant breaks this match rather than silently falling into a `{ .. }` that
+            // prints nothing. Deciding what a new field is worth printing is part of adding it.
+        }
+    }
+}
+
+/// Every name, no values.
+fn redacted_values(
+    map: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<&str, &str> {
+    map.keys()
+        .map(|name| (name.as_str(), "[REDACTED]"))
+        .collect()
+}
+
+/// Each argument through the stderr redaction, which catches the `--api-key=…` shape.
+fn redacted_arguments(arguments: &[String]) -> Vec<String> {
+    arguments
+        .iter()
+        .map(|argument| crate::redact::stderr_text(argument))
+        .collect()
+}
+
 /// What a host asks for when it opens a session.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +300,13 @@ pub struct OpenSession {
     /// this session is being opened on.
     #[serde(default)]
     pub executable: crate::transport::ExecutablePath,
+    /// MCP servers the vendor should load for this session.
+    ///
+    /// Honoured only by a harness whose
+    /// [`Capabilities::mcp_passthrough`](crate::Capabilities) is set; the rest refuse rather than
+    /// accept a request they would silently drop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServer>,
 }
 
 impl OpenSession {
@@ -188,6 +327,7 @@ impl OpenSession {
             configuration: Configuration::default(),
             resume: None,
             executable: crate::transport::ExecutablePath::default(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -207,6 +347,23 @@ impl OpenSession {
         self
     }
 
+    /// Loads these MCP servers for the session.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{McpServer, OpenSession};
+    ///
+    /// let request = OpenSession::new("chat-42")
+    ///     .with_mcp_servers(vec![McpServer::stdio("docs", "docs-mcp")]);
+    /// assert_eq!(request.mcp_servers.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = mcp_servers;
+        self
+    }
+
     /// Continues the vendor conversation with this handle.
     #[must_use]
     pub fn resuming(mut self, native_session_id: impl Into<String>, mode: ResumeMode) -> Self {
@@ -218,10 +375,18 @@ impl OpenSession {
     }
 }
 
-/// What opening produced, as the session will answer for its whole life.
+/// What opening produced.
+///
+/// A snapshot of the answer `open_session` gave, not a live view. One field can go out of date:
+/// a vendor is free to rename its own handle mid-session, and the handle that is in force is
+/// [`Session::ids`], which a harness overrides when its vendor does that. Everything else here is
+/// settled at open and does not move.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionInfo {
-    /// The two ids.
+    /// The two ids, as opening reported them.
+    ///
+    /// Read [`Session::ids`] instead for the handle to resume with; this field keeps the one
+    /// opening minted even after a vendor has chosen another.
     pub ids: SessionIds,
     /// Whether the vendor continued a conversation rather than starting one.
     pub resumed: bool,
@@ -536,9 +701,16 @@ pub trait Session: Send + Sync {
     /// What opening this session produced.
     fn info(&self) -> &SessionInfo;
 
-    /// The two ids this session answers to.
-    fn ids(&self) -> &SessionIds {
-        &self.info().ids
+    /// The two ids this session answers to, as they stand now.
+    ///
+    /// Owned rather than borrowed, because this is the one answer a session is allowed to change
+    /// after it is open: a vendor may mint its own handle and report a different one once a run
+    /// has started, and the value a host persists to resume with has to be that one. The default
+    /// is the snapshot [`SessionInfo`] carries, which is right for every vendor that keeps the
+    /// handle it was given; a harness whose vendor does not overrides this and reads its own live
+    /// state.
+    fn ids(&self) -> SessionIds {
+        self.info().ids.clone()
     }
 
     /// Starts a turn and returns its bounded event stream.
@@ -632,10 +804,70 @@ pub trait Session: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReason, CloseReason, Configuration, NativeSession, OpenSession, ResumeMode, Session,
-        SessionIds, SessionInfo, SessionPage, TurnRequest,
+        CancelReason, CloseReason, Configuration, McpServer, McpTransport, NativeSession,
+        OpenSession, ResumeMode, Session, SessionIds, SessionInfo, SessionPage, TurnRequest,
     };
     use crate::permission::{ApprovalRouting, PermissionLevel};
+
+    /// `env` and `headers` are the one place a host puts its own credential on this surface.
+    ///
+    /// A derived `Debug` prints both maps in the clear, and every type above this one derives from
+    /// it — so a `tracing::debug!(?request)` of an open that configured MCP, or the crate's own
+    /// `received {value:?}` assertion idiom, would put the token in a log. This is the same
+    /// reasoning `WsSpec` is hand-written for.
+    #[test]
+    fn never_prints_a_credential_a_host_put_on_an_mcp_server() {
+        let stdio = McpServer {
+            name: String::from("docs"),
+            transport: McpTransport::Stdio {
+                command: String::from("docs-mcp"),
+                args: vec![String::from("--api-key=sk-live-args")],
+                env: [(String::from("API_KEY"), String::from("sk-live-env"))]
+                    .into_iter()
+                    .collect(),
+            },
+        };
+        let http = McpServer {
+            name: String::from("search"),
+            transport: McpTransport::Http {
+                url: String::from("https://user:sk-live-url@search.example/mcp"),
+                headers: [(
+                    String::from("Authorization"),
+                    String::from("Bearer sk-live-header"),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        };
+        let request = OpenSession::new("chat-1").with_mcp_servers(vec![stdio, http]);
+        let printed = format!("{request:?}");
+
+        for secret in [
+            "sk-live-env",
+            "sk-live-header",
+            "sk-live-url",
+            "sk-live-args",
+        ] {
+            assert!(
+                !printed.contains(secret),
+                "expected {secret:?} to be redacted, received {printed}"
+            );
+        }
+        // Redacted, not erased: a host debugging a misconfigured server still needs to see which
+        // server, which variable and which header.
+        for kept in [
+            "docs",
+            "docs-mcp",
+            "API_KEY",
+            "Authorization",
+            "search.example",
+        ] {
+            assert!(
+                printed.contains(kept),
+                "expected {kept:?} to survive redaction, received {printed}"
+            );
+        }
+    }
 
     #[test]
     fn closing_carries_its_reason_into_the_turn_it_cancels() {
@@ -916,5 +1148,106 @@ mod tests {
             *self.last_query.lock().await = Some(query);
             Ok(SessionPage::default())
         }
+    }
+
+    /// A session whose vendor minted a handle of its own after the open had already answered.
+    ///
+    /// The shape Claude Code has: `--session-id` proposes one, and the run's own `system/init` is
+    /// free to report another, which is then the only handle a resume can use.
+    struct RenamedByTheVendor {
+        info: SessionInfo,
+        chosen: std::sync::Mutex<String>,
+    }
+
+    impl RenamedByTheVendor {
+        fn new(opened_with: &str, chosen: &str) -> Self {
+            Self {
+                info: SessionInfo {
+                    ids: SessionIds {
+                        session_id: crate::event::SessionId::new("chat-1"),
+                        native_session_id: String::from(opened_with),
+                    },
+                    resumed: false,
+                    fallback_reason: None,
+                    effective_configuration: Configuration::default(),
+                    capabilities: crate::harness::Capabilities::none(),
+                },
+                chosen: std::sync::Mutex::new(String::from(chosen)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::Session for RenamedByTheVendor {
+        fn info(&self) -> &SessionInfo {
+            &self.info
+        }
+
+        fn ids(&self) -> SessionIds {
+            SessionIds {
+                native_session_id: self
+                    .chosen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                ..self.info.ids.clone()
+            }
+        }
+
+        async fn start_turn(&self, _request: TurnRequest) -> crate::Result<crate::TurnStream> {
+            Err(crate::Error::Closed { subject: "session" })
+        }
+
+        async fn respond(
+            &self,
+            _response: crate::permission::PermissionResponse,
+        ) -> crate::Result<()> {
+            Err(crate::Error::Closed { subject: "session" })
+        }
+
+        async fn cancel(&self, _reason: CancelReason) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _reason: CloseReason) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The handle a host persists has to be the one a resume can actually use.
+    #[test]
+    fn reports_the_handle_the_vendor_chose_over_the_one_opening_minted() {
+        let session = RenamedByTheVendor::new("native-1", "native-2");
+        let ids = super::Session::ids(&session);
+        assert_eq!(
+            ids.native_session_id, "native-2",
+            "expected the vendor's own handle, received {:?}",
+            ids.native_session_id
+        );
+        assert_eq!(
+            ids.session_id.as_str(),
+            "chat-1",
+            "expected the host's own id to be untouched"
+        );
+    }
+
+    /// `info()` stays the snapshot of what opening answered, which is what documents the change.
+    #[test]
+    fn keeps_the_opening_snapshot_even_after_the_vendor_renamed_its_handle() {
+        let session = RenamedByTheVendor::new("native-1", "native-2");
+        assert_eq!(
+            super::Session::info(&session).ids.native_session_id,
+            "native-1"
+        );
+    }
+
+    /// Every vendor that keeps the handle it was given needs no override at all.
+    #[test]
+    fn defaults_to_the_opening_snapshot_for_a_vendor_that_keeps_its_handle() {
+        let session = RecordingListing::default();
+        assert_eq!(
+            super::Session::ids(&session),
+            super::Session::info(&session).ids
+        );
     }
 }

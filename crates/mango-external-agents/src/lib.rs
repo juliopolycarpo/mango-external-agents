@@ -50,10 +50,10 @@ pub use process::{
 };
 pub use registry::HarnessRegistry;
 pub use session::{
-    AccountUsage, Attachment, AttachmentKind, CancelReason, CloseReason, Configuration,
-    NativeSession, OpenSession, Resume, ResumeMode, ReviewRequest, ReviewTarget, Session,
-    SessionIds, SessionInfo, SessionPage, SessionQuery, Steer, SteerOutcome, SteerRejection,
-    TurnRequest,
+    AccountUsage, Attachment, AttachmentKind, CancelReason, CloseReason, Configuration, McpServer,
+    McpTransport, NativeSession, OpenSession, Resume, ResumeMode, ReviewRequest, ReviewTarget,
+    Session, SessionIds, SessionInfo, SessionPage, SessionQuery, Steer, SteerOutcome,
+    SteerRejection, TurnRequest,
 };
 pub use stream::{EventSink, ReviewStream, TurnStream};
 pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};

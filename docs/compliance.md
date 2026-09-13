@@ -26,18 +26,57 @@ Facts were read on 2026-09-12; re-verify against the vendor's current page befor
 ## Claude Code (`mango-agent-claude`)
 
 **Surface used:** the documented headless mode,
-`claude -p --output-format stream-json --input-format stream-json …`, one process per turn with
-`--resume`.
+`claude --print --output-format stream-json --input-format stream-json …`, one process per turn
+with `--resume`. Discovery adds three documented read-only probes: `claude --version`,
+`claude --help` and `claude auth status`. Nothing else is read. See
+[harness-claude.md](harness-claude.md) for every flag and the document behind it.
 
-**Posture:** Anthropic's legal page states that OAuth login is for subscription purchasers using
-Claude Code and native Anthropic applications, that products built on Claude should use API keys,
-and that third parties may not route requests through Free/Pro/Max credentials on behalf of their
-users. The library runs the user's own installed `claude` under the user's own login and never
-touches its token. Whether that counts as ordinary use of Claude Code is inferred from Anthropic's
-enforcement pattern (token extraction was targeted, subprocess use was not), not from a written
-exception. Discovery reports the auth state so a host can show its own disclosure.
+**Quotes** (read 2026-09-13, from
+<https://code.claude.com/docs/en/legal-and-compliance>, "Authentication and credential use"):
 
-**Quotes:** to be filled by the Claude Code harness with the operative sentences and their URLs.
+> OAuth authentication is intended exclusively for purchasers of Claude Free, Pro, Max, Team, and
+> Enterprise subscription plans and is designed to support ordinary use of Claude Code and other
+> native Anthropic applications.
+
+> Developers building products or services that interact with Claude's capabilities, including
+> those using the Agent SDK, should use API key authentication through Claude Console or a
+> supported cloud provider.
+
+> Anthropic does not permit third-party developers to offer Claude.ai login or to route requests
+> through Free, Pro, or Max plan credentials on behalf of their users.
+
+> Anthropic reserves the right to take measures to enforce these restrictions and may do so
+> without prior notice.
+
+The contractual backstop is in the Consumer Terms themselves
+(<https://www.anthropic.com/legal/consumer-terms>), among the prohibited uses:
+
+> Except when you are accessing our Services via an Anthropic API Key or where we otherwise
+> explicitly permit it, to access the Services through automated or non-human means, whether
+> through a bot, script, or otherwise.
+
+**Posture:** the library runs the user's own installed `claude`, under whatever the user already
+logged into with the vendor's own CLI, and never reads, stores, copies or forwards its token. It
+offers no Claude.ai login of its own and routes no request anywhere — the vendor's binary talks to
+the vendor. Whether a host spawning that binary counts as "ordinary use of Claude Code" is
+**inferred from Anthropic's enforcement pattern** (the targeted conduct has been extracting OAuth
+tokens into another product, not running the CLI as a subprocess), not from a written exception,
+and this page says so rather than claiming a permission nobody granted. The third quote is the one
+a host should read closely: it bites on offering Claude.ai login and on routing requests through
+subscription credentials, neither of which this library does.
+
+Discovery reports `AuthState` — including whether the account is a subscription rather than an API
+key — so a host can show its own disclosure and make its own call. `mango-external-agents` makes
+none on a host's behalf.
+
+**The route not taken.** Anthropic's own Agent SDK reaches a permission-callback channel by passing
+`--permission-prompt-tool stdio`, a sentinel that appears in no `--help` and on no documentation
+page. This harness does not use it: driving an undocumented surface is the thing this repository's
+rules exist to prevent, and it would be a poor trade for a feature whose reliability history is
+public and unresolved. `interactive_approvals` is reported false instead.
+
+**Nominative use.** "Claude Code" and "Anthropic" name the tool being launched and the company
+whose terms apply. No logos, no wordmarks, nothing implying an official or endorsed integration.
 
 ## OpenAI Codex (`mango-agent-codex`)
 

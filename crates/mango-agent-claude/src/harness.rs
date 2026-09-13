@@ -1,0 +1,501 @@
+//! The Claude Code harness: what it can do, what this machine's build can do, and opening a
+//! session against it.
+//!
+//! Three probes answer "what is here": `claude --version`, `claude --help` and
+//! `claude auth status`. All three are documented, read-only and non-secret. Nothing else is read
+//! — no credential file, no `~/.claude` anything — except the administrator-managed settings
+//! document, which is policy rather than a secret and has to be known *before* a mode is chosen.
+
+use std::sync::Arc;
+
+use mango_external_agents::{
+    AuthState, Capabilities, Configuration, Discovery, Error, ExecutablePath, GateVerdict, Harness,
+    HarnessDescriptor, HarnessKind, HostContext, OpenSession, PermissionMatrix, Result, Session,
+    SessionIds, SessionInfo, TransportKind, UnsupportedReason,
+};
+
+use crate::auth::{self, Authentication};
+use crate::cli_surface::CliSurface;
+use crate::mcp::ConfigFile;
+use crate::permissions::{self, ModeAvailability};
+use crate::pinned::{self, MINIMUM_VERSION, VENDOR, VENDOR_ENVIRONMENT_KEYS};
+use crate::probe;
+use crate::session::ClaudeSession;
+use crate::{argv, models, version};
+
+/// What this harness could support given a new enough CLI.
+///
+/// The two probed flags are the ceiling too: nothing in [`probed_capabilities`] can exceed what a
+/// build could in principle advertise. Every other flag here is a measured verdict rather than an
+/// unimplemented stub; see `docs/harness-claude.md` for what was probed and when.
+const CEILING: Capabilities = Capabilities {
+    model_catalog: true,
+    mcp_passthrough: true,
+    ..probed_capabilities()
+};
+
+/// Claude Code, driven through its documented headless surface.
+///
+/// Stateless and shareable: it holds no session, caches no discovery and spawns nothing of its own.
+/// One instance serves every session a host opens.
+pub struct ClaudeHarness {
+    descriptor: HarnessDescriptor,
+    executable: ExecutablePath,
+}
+
+impl Default for ClaudeHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClaudeHarness {
+    /// A harness that lets the host's launcher resolve the program name.
+    ///
+    /// The library never searches `PATH` on its own initiative: the host knows the toolchain, the
+    /// version manager and the sandbox the child will run under.
+    pub fn new() -> Self {
+        Self {
+            descriptor: HarnessDescriptor {
+                kind: HarnessKind::Claude,
+                vendor: VENDOR,
+                capabilities: CEILING,
+                transports: &[TransportKind::Stdio],
+                vendor_environment_keys: VENDOR_ENVIRONMENT_KEYS,
+            },
+            executable: ExecutablePath::default(),
+        }
+    }
+
+    /// A harness that spawns this executable rather than the bare program name.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_claude::ClaudeHarness;
+    ///
+    /// let harness = ClaudeHarness::new().with_executable("/opt/claude/bin/claude");
+    /// ```
+    #[must_use]
+    pub fn with_executable(mut self, executable: impl Into<std::path::PathBuf>) -> Self {
+        self.executable = ExecutablePath::resolved(executable);
+        self
+    }
+
+    /// The executable this session should spawn: the host's per-request answer, or the harness's.
+    fn executable_for(&self, request: &OpenSession) -> ExecutablePath {
+        match request.executable.get() {
+            Some(path) => ExecutablePath::resolved(path.clone()),
+            None => self.executable.clone(),
+        }
+    }
+
+    /// Everything the three probes established, in one pass.
+    async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Survey {
+        let Some(banner) = probe::output(host, executable, &["--version"]).await else {
+            return Survey::default();
+        };
+        let version = version::parse(&banner);
+        let surface = probe::output(host, executable, &["--help"])
+            .await
+            .map(|help| CliSurface::parse(&help))
+            .filter(CliSurface::is_usable);
+
+        // A build that cannot be driven is not asked who is signed in: the answer would be true and
+        // useless, and it costs a third process launch to learn.
+        if let Some(refusal) = CliSurface::refusal(surface.as_ref(), version.as_ref()) {
+            return Survey {
+                banner: Some(banner),
+                version,
+                refusal: Some(refusal),
+                ..Survey::default()
+            };
+        }
+
+        // Neither read depends on the other's result: one is a process boot, the other a file read.
+        let (authentication, auto_mode_disabled_by_policy) = tokio::join!(
+            async {
+                probe::output(host, executable, &["auth", "status"])
+                    .await
+                    .map_or_else(Authentication::unknown, |stdout| {
+                        auth::parse_status(&stdout)
+                    })
+            },
+            read_auto_mode_policy(host)
+        );
+        let availability = ModeAvailability {
+            account_kind: authentication.kind,
+            auto_mode_disabled_by_policy,
+            accepted_modes: surface
+                .as_ref()
+                .and_then(CliSurface::accepted_modes)
+                .cloned(),
+        };
+
+        Survey {
+            banner: Some(banner),
+            version,
+            refusal: None,
+            authentication,
+            availability,
+            surface,
+        }
+    }
+}
+
+/// What the probes found, before it is shaped into a [`Discovery`] or a session.
+#[derive(Default)]
+struct Survey {
+    banner: Option<String>,
+    version: Option<semver::Version>,
+    /// Why this build cannot be driven, when it cannot.
+    refusal: Option<String>,
+    authentication: Authentication,
+    availability: ModeAvailability,
+    surface: Option<CliSurface>,
+}
+
+impl Survey {
+    /// Whether `--version` reported anything at all.
+    fn installed(&self) -> bool {
+        self.banner.is_some()
+    }
+
+    /// The one line of `--version` output a host should be shown.
+    ///
+    /// `probe::output` hands back every line the CLI printed joined together, because a build can
+    /// arrive behind a wrapper script that prints its own preamble first and
+    /// [`version::parse`](crate::version::parse) scans all of it for the token that is a version.
+    /// What a host renders is a single line, so only one travels: the line the version was read
+    /// from when there is one, and otherwise the first line that said anything. A `version` field
+    /// carrying a whole multi-line stdout is not a version, and neither is a
+    /// [`GateVerdict`](mango_external_agents::GateVerdict) that quotes one back at the person
+    /// holding the binary.
+    fn reported(&self) -> Option<String> {
+        let banner = self.banner.as_deref()?;
+        let lines = || {
+            banner
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+        };
+        lines()
+            .find(|line| self.version.is_some() && version::parse(line) == self.version)
+            .or_else(|| lines().next())
+            .map(str::to_owned)
+    }
+
+    /// The version as a host should read it: what the CLI reported, bounded by the core.
+    fn found(&self) -> String {
+        self.version
+            .as_ref()
+            .map(semver::Version::to_string)
+            .or_else(|| self.reported())
+            .unwrap_or_else(|| String::from("an unreadable version"))
+    }
+
+    /// Whether this build declares `--mcp-config` on its help surface.
+    fn declares_mcp_config(&self) -> bool {
+        self.surface
+            .as_ref()
+            .is_some_and(CliSurface::declares_mcp_config)
+    }
+
+    /// What this probed build can do, given whether it advertises a model catalog.
+    fn capabilities(&self, model_catalog: bool) -> Capabilities {
+        Capabilities {
+            model_catalog,
+            mcp_passthrough: self.declares_mcp_config(),
+            ..probed_capabilities()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Harness for ClaudeHarness {
+    fn descriptor(&self) -> &HarnessDescriptor {
+        &self.descriptor
+    }
+
+    /// The matrix before anything is probed, which can only describe the shape of the six cells.
+    ///
+    /// `auto` is refused here because it depends on the account and no account has been read: this
+    /// is the trait's declaration, and [`Discovery`] is where a probed answer lives. A host that
+    /// wants the real matrix opens a session, whose
+    /// [`SessionInfo::effective_configuration`] was vetted against a probe.
+    fn permission_matrix(&self) -> PermissionMatrix {
+        permissions::matrix(&ModeAvailability::default())
+    }
+
+    async fn probe(&self, host: &HostContext) -> Result<Discovery> {
+        let survey = self.survey(host, &self.executable).await;
+        if !survey.installed() {
+            return Ok(Discovery::not_installed());
+        }
+
+        let executable = self.executable.get().cloned();
+        if survey.refusal.is_some() {
+            return Ok(Discovery {
+                executable,
+                version: survey.reported(),
+                gate: GateVerdict::VersionTooOld {
+                    found: survey.found(),
+                    minimum: String::from(MINIMUM_VERSION),
+                },
+                auth: AuthState::Unknown,
+                capabilities: Capabilities::none(),
+                models: Vec::new(),
+            });
+        }
+
+        let models = models::catalog(survey.surface.as_ref());
+        Ok(Discovery {
+            executable,
+            version: survey.reported(),
+            // The surface said every flag a turn passes is there. A version this harness could not
+            // read is not a reason to refuse a binary that answered every other question.
+            gate: GateVerdict::Usable,
+            auth: survey.authentication.state.clone(),
+            capabilities: survey.capabilities(models.is_some()),
+            models: models.unwrap_or_default(),
+        })
+    }
+
+    async fn open_session(
+        &self,
+        host: &HostContext,
+        request: OpenSession,
+    ) -> Result<Box<dyn Session>> {
+        let executable = self.executable_for(&request);
+        let survey = self.survey(host, &executable).await;
+
+        if !survey.installed() {
+            return Err(Error::Launch {
+                program: String::from(probe::PROGRAM),
+                message: String::from("the Claude Code CLI did not report a version"),
+            });
+        }
+        if survey.refusal.is_some() {
+            return Err(Error::VersionGate {
+                found: survey.found(),
+                minimum: String::from(MINIMUM_VERSION),
+            });
+        }
+        if let AuthState::LoggedOut { login_hint } = &survey.authentication.state {
+            return Err(Error::AuthRequired {
+                login_hint: login_hint.clone(),
+            });
+        }
+
+        let configuration = request.configuration.clone();
+        require_supported(&configuration, &survey.availability)?;
+
+        // Refused rather than dropped. A session that quietly ignored the servers a host
+        // configured would run every turn without the tools somebody set up, and report success.
+        if !request.mcp_servers.is_empty() && !survey.declares_mcp_config() {
+            return Err(Error::HostConfiguration {
+                expected: "a build that declares --mcp-config, for a session that configures MCP servers",
+                received: format!(
+                    "{} servers on a build that does not",
+                    request.mcp_servers.len()
+                ),
+            });
+        }
+        let resumed = request.resume.is_some();
+        let native_session_id = match &request.resume {
+            // Vetted rather than taken on trust, and before anything touches the disk. The
+            // reference goes on the command line as `--resume <value>`, and a stored one
+            // beginning with `-` would be read by the CLI's parser as a flag rather than as the
+            // option's value — the same argument-injection seam `models::safe_model` closes for
+            // `--model`. Refused rather than dropped: a resume this harness silently ignored
+            // would start a new conversation under the name of the one the host meant to continue.
+            Some(resume) if !argv::is_vendor_session_id(&resume.native_session_id) => {
+                return Err(Error::HostConfiguration {
+                    expected: "a resume reference shaped like the UUID Claude Code mints",
+                    received: format!("{:?}", resume.native_session_id),
+                });
+            }
+            Some(resume) => resume.native_session_id.clone(),
+            // `--session-id` takes a UUID and nothing else, so the handle is minted here rather
+            // than derived from the host's own session id, which has no shape requirement.
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+
+        // The library has no scratch directory of its own to be given, so the file goes where the
+        // platform puts temporary files, in a directory of its own that only its owner can read.
+        let mcp_config = ConfigFile::write(&request.mcp_servers, &std::env::temp_dir()).await?;
+
+        let info = SessionInfo {
+            ids: SessionIds {
+                session_id: request.session_id,
+                native_session_id,
+            },
+            resumed,
+            fallback_reason: None,
+            effective_configuration: configuration,
+            capabilities: survey.capabilities(models::advertises_catalog(survey.surface.as_ref())),
+        };
+
+        Ok(Box::new(ClaudeSession::new(
+            host.clone(),
+            executable,
+            info,
+            survey.availability,
+            survey.surface,
+            mcp_config,
+        )))
+    }
+}
+
+/// What a build that passed the gate offers, before the two per-install flags are filled in.
+///
+/// Each `false` below is measured. `interactive_approvals`: the CLI has a real control channel and
+/// it is not reachable from a documented surface — see `docs/harness-claude.md`. `steering`:
+/// `--input-format stream-json` accepts a second message, but it runs as its own turn with its own
+/// result, which is a queued follow-up rather than same-turn steering. `session_listing`: the
+/// vendor's own transcripts live under a path documented as subject to change, and parsing them
+/// would be reading another company's private format. `images`, `native_review` and
+/// `account_usage`: no surface observed.
+const fn probed_capabilities() -> Capabilities {
+    Capabilities {
+        structured_streaming: true,
+        reasoning_stream: true,
+        resume: true,
+        cancellation: true,
+        usage_reporting: true,
+        model_catalog: false,
+        mcp_passthrough: false,
+        interactive_approvals: false,
+        images: false,
+        steering: false,
+        session_listing: false,
+        native_review: false,
+        account_usage: false,
+    }
+}
+
+/// Refuses a pair this account and this build cannot run, before anything is spawned.
+fn require_supported(configuration: &Configuration, availability: &ModeAvailability) -> Result<()> {
+    let matrix = permissions::matrix(availability);
+    let cell = matrix.cell(configuration.level, configuration.routing);
+    if cell.is_some_and(|cell| cell.supported) {
+        return Ok(());
+    }
+    let reason = cell
+        .and_then(|cell| cell.unsupported_reason.clone())
+        .unwrap_or(UnsupportedReason::NotOfferedByVendor);
+    Err(Error::HostConfiguration {
+        expected: "a permission level and routing this account and build can run",
+        received: format!(
+            "{:?} with {:?}, refused as {reason:?}",
+            configuration.level, configuration.routing
+        ),
+    })
+}
+
+/// `disableAutoMode` from the administrator-managed settings document.
+///
+/// Never inferred from a failed run: the CLI rejects `--permission-mode auto` *at startup* when
+/// policy forbids it, and a startup rejection is indistinguishable from any other startup failure.
+/// A missing file is the common case and an unreadable one is not a policy statement, so either way
+/// `auto` stays decided by the account.
+async fn read_auto_mode_policy(host: &HostContext) -> bool {
+    let path = pinned::managed_settings_path(std::env::consts::OS, host.environment());
+    let Ok(raw) = tokio::fs::read_to_string(&path).await else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .map(|settings| permissions::auto_mode_disabled(&settings))
+        .unwrap_or(false)
+}
+
+/// The registry entry a host adds to drive Claude Code.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_claude::harness;
+/// use mango_external_agents::{HarnessKind, HarnessRegistry};
+///
+/// let registry = HarnessRegistry::new(vec![harness()]).expect("expected a registry");
+/// assert!(registry.get(&HarnessKind::Claude).is_some());
+/// ```
+pub fn harness() -> Arc<dyn Harness> {
+    Arc::new(ClaudeHarness::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CEILING, ClaudeHarness, probed_capabilities, require_supported};
+    use mango_external_agents::{
+        ApprovalRouting, Capabilities, Configuration, Error, Harness, HarnessKind, PermissionLevel,
+        TransportKind,
+    };
+
+    #[test]
+    fn the_ceiling_covers_everything_a_probe_can_report() {
+        assert!(
+            probed_capabilities().within(&CEILING),
+            "expected the probed set inside the declared ceiling"
+        );
+        let richest = Capabilities {
+            model_catalog: true,
+            mcp_passthrough: true,
+            ..probed_capabilities()
+        };
+        assert!(
+            richest.within(&CEILING),
+            "received {:?}",
+            richest.beyond(&CEILING)
+        );
+    }
+
+    #[test]
+    fn declares_only_the_transport_this_dialect_rides() {
+        let harness = ClaudeHarness::new();
+        let descriptor = harness.descriptor();
+        assert_eq!(descriptor.kind, HarnessKind::Claude);
+        assert_eq!(descriptor.transports, &[TransportKind::Stdio]);
+
+        let error = descriptor
+            .require_transport(&TransportKind::Acp)
+            .expect_err("expected an undeclared transport to be refused");
+        assert!(
+            matches!(error, Error::UnsupportedTransport { .. }),
+            "received {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_declared_matrix_describes_all_six_cells_without_promising_auto() {
+        let matrix = ClaudeHarness::new().permission_matrix();
+        assert_eq!(matrix.cells().len(), 6);
+        assert!(
+            matrix.supports(PermissionLevel::Default, ApprovalRouting::User),
+            "expected the ordinary pair to be selectable before any probe"
+        );
+        assert!(
+            !matrix.supports(PermissionLevel::Default, ApprovalRouting::AutoReview),
+            "expected auto to fail closed until an account is read"
+        );
+    }
+
+    #[test]
+    fn a_configuration_no_probe_vetted_is_refused_before_anything_is_spawned() {
+        let availability = crate::permissions::ModeAvailability::default();
+        let auto_review = Configuration {
+            level: PermissionLevel::Default,
+            routing: ApprovalRouting::AutoReview,
+            ..Configuration::default()
+        };
+        let error = require_supported(&auto_review, &availability)
+            .expect_err("expected an unverified auto to be refused");
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "received {error:?}"
+        );
+
+        require_supported(&Configuration::default(), &availability)
+            .expect("expected the restrictive default to be runnable");
+    }
+}
