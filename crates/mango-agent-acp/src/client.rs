@@ -253,6 +253,16 @@ impl SessionState {
     /// What does *not* happen is a second answer reaching the agent. The decision the agent acted on
     /// is the one already sent, so the audit trail keeps that one rather than the one that lost.
     ///
+    /// Nor does an answer reach the agent once the turn it belongs to has finished. A host's
+    /// `respond` can win the race against a `close` that has already claimed the terminal, and
+    /// forwarding its choice then would let an allowing option out during teardown. The question is
+    /// withdrawn instead, which is what the turn's end owed it anyway.
+    ///
+    /// Like the matching guard in [`on_request_permission`], this one has no test: reaching it needs a
+    /// `respond` to land between `close`'s `finish` and its `withdraw_pending`, two adjacent statements
+    /// with no await between them, and `close` has torn the transport down by the time it returns. It
+    /// is two lines of defence in depth, not a covered path.
+    ///
     /// # Errors
     ///
     /// Whatever the transport reported while sending the answer.
@@ -261,10 +271,18 @@ impl SessionState {
         let Some(responder) = responder else {
             return Ok(Answered::AlreadyResolved);
         };
+        let alive = self.turn().is_some_and(|turn| !turn.is_finished());
+        let outcome = match alive {
+            true => permission::selected(&response.option_id),
+            false => permission::cancelled(),
+        };
         responder
-            .respond(permission::selected(&response.option_id))
+            .respond(outcome)
             .map_err(|error| Error::Vendor(vendor_error("session/request_permission", &error)))?;
-        Ok(Answered::Sent)
+        match alive {
+            true => Ok(Answered::Sent),
+            false => Ok(Answered::AlreadyResolved),
+        }
     }
 
     fn pending_count(&self) -> usize {
@@ -404,6 +422,19 @@ async fn on_request_permission(
     }
 
     if let (Some(decision), Some(responder)) = (decided, held) {
+        // Re-checked, because the emit above is the documented backpressure park: a host that stopped
+        // reading holds this handler there, and a `close` can claim the terminal in the meantime. The
+        // responder is in `held` rather than in `pending`, so `withdraw_pending` cannot reach it —
+        // this is the only place that can.
+        //
+        // Deliberately untested, which is worth saying rather than leaving as a gap. `close` awaits
+        // `ConnectionHandle::shutdown` before returning, so by then the transport is gone and a late
+        // `respond` reaches nothing at all; every test written against this window passes with the
+        // check removed, and an assertion that cannot fail is worse than none. It stays as a guard
+        // against a `close` that one day stops tearing the transport down synchronously.
+        if turn.is_finished() {
+            return responder.respond(permission::cancelled());
+        }
         responder.respond(permission::selected(&decision.option_id))?;
         let _ = turn
             .sink

@@ -382,13 +382,23 @@ impl Session for AcpSession {
         if let Some(turn) = ending
             && terminal
         {
+            // The same debts the prompt's own task settles: an open reasoning block and an unfinished
+            // plan activity. A turn cut short by a close owes them just as much as one that ran out.
+            let closing = self.state.finish_reducing();
             // Spawned rather than awaited under a timeout. `close` must not hang on a host that
             // stopped reading its own stream — but a timeout that *dropped* this future would send
             // nothing at all: `mpsc::Sender::send` is cancel-safe, so abandoning it mid-send loses the
             // value, and the host would get a stream that just ends with no `Cancelled` and no
             // `Completed`. The core's conformance suite requires exactly one terminal. Spawned, the
             // terminal lands the moment the host reads, or is dropped when the host drops the stream.
-            tokio::spawn(async move { turn.sink.cancel(reason.into()).await });
+            tokio::spawn(async move {
+                for kind in closing {
+                    if turn.sink.emit(kind).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = turn.sink.cancel(reason.into()).await;
+            });
         }
 
         self.connection.shutdown(reason.into()).await;
