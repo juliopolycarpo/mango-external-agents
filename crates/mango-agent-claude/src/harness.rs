@@ -173,7 +173,12 @@ impl Survey {
     /// holding the binary.
     fn reported(&self) -> Option<String> {
         let banner = self.banner.as_deref()?;
-        let lines = || banner.lines().map(str::trim).filter(|line| !line.is_empty());
+        let lines = || {
+            banner
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+        };
         lines()
             .find(|line| self.version.is_some() && version::parse(line) == self.version)
             .or_else(|| lines().next())

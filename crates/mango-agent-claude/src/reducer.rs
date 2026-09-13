@@ -37,12 +37,19 @@ use serde_json::Value;
 use crate::commands;
 use crate::protocol::{ContentBlock, PermissionDenied, StreamRecord};
 
-/// How much forwarded text one activity accumulates before it stops growing.
+/// How much text any detail carries on its way to the sink.
 ///
-/// Twice the bound the sink cuts a detail to, so a long-running subagent cannot grow an unbounded
-/// string in memory for a field that is bounded on the way out anyway. The head is kept rather
-/// than the tail, which is what the reader is following.
-const DETAIL_ACCUMULATION_MAX_CHARS: usize = 2 * TextLimit::Detail.max_code_points();
+/// Two call sites, one bound. It caps what a long-running subagent accumulates in memory, and it
+/// caps every detail `detail_for` builds. The head is kept rather than the tail, which is what the
+/// reader is following.
+///
+/// Deliberately **above** the sink's own `TextLimit::Detail` rather than equal to it. `EventSink`
+/// bounds a detail again on the way out and ORs `truncated` from whatever *it* had to cut, so a
+/// detail handed over already at the sink's bound is not cut there and the flag reads false — a
+/// host would render a truncated detail as complete. Cutting at twice the bound costs one
+/// allocation and keeps the cut visible to the one place that reports it; see
+/// `keeps_a_cut_visible_to_the_sink_that_reports_it`.
+const DETAIL_CARRY_MAX_CHARS: usize = 2 * TextLimit::Detail.max_code_points();
 
 /// The fields Claude's own built-ins use for "what is this call about", in the order that answers
 /// it best.
@@ -629,7 +636,7 @@ impl TurnReducer {
             entry.push('\n');
         }
         entry.push_str(text);
-        if let Some((boundary, _)) = entry.char_indices().nth(DETAIL_ACCUMULATION_MAX_CHARS) {
+        if let Some((boundary, _)) = entry.char_indices().nth(DETAIL_CARRY_MAX_CHARS) {
             entry.truncate(boundary);
         }
         entry
@@ -710,7 +717,7 @@ fn summarize_tool_input(input: Option<&Value>) -> String {
 
 /// A detail field, bounded, or nothing for text that says nothing.
 fn detail_for(detail: &str) -> Option<String> {
-    let bounded = head(detail, DETAIL_ACCUMULATION_MAX_CHARS);
+    let bounded = head(detail, DETAIL_CARRY_MAX_CHARS);
     (!bounded.is_empty()).then(|| bounded.to_owned())
 }
 
@@ -768,10 +775,39 @@ fn retryable_status(status: i64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TurnReducer, activity_kind, summarize_tool_input};
+    use super::{
+        DETAIL_CARRY_MAX_CHARS, TurnReducer, activity_kind, detail_for, summarize_tool_input,
+    };
     use crate::protocol::StreamRecord;
-    use mango_external_agents::{ActivityKind, EventKind};
+    use mango_external_agents::normalize::TextLimit;
+    use mango_external_agents::{ActivityKind, ActivityUpdate, EventKind};
     use serde_json::json;
+
+    /// The carry bound has to stay above the sink's, or a cut stops being reported.
+    ///
+    /// Lowering it to `TextLimit::Detail` looks like a saved allocation and is not: the sink then
+    /// has nothing left to cut, `truncated` reads false, and a host renders a detail that was cut
+    /// as one that was complete. This pins the invariant the constant's own doc argues for.
+    #[test]
+    fn keeps_a_cut_visible_to_the_sink_that_reports_it() {
+        assert!(
+            DETAIL_CARRY_MAX_CHARS > TextLimit::Detail.max_code_points(),
+            "expected room for the sink to make the cut it flags, received {DETAIL_CARRY_MAX_CHARS} against {}",
+            TextLimit::Detail.max_code_points()
+        );
+
+        let overlong = "m".repeat(DETAIL_CARRY_MAX_CHARS + 1);
+        let update = ActivityUpdate {
+            title: None,
+            detail: detail_for(&overlong),
+            truncated: false,
+        }
+        .normalized();
+        assert!(
+            update.truncated,
+            "expected the sink to report the cut it made, received {update:?}"
+        );
+    }
 
     fn reduce(reducer: &mut TurnReducer, line: &str) -> Vec<EventKind> {
         let record = StreamRecord::parse(line).expect("expected a parseable record");
