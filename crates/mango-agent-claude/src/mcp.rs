@@ -20,6 +20,18 @@ use std::path::{Path, PathBuf};
 use mango_external_agents::{Error, McpServer, McpTransport, Result};
 use serde_json::{Map, Value, json};
 
+trait FileWriter {
+    async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
+}
+
+struct TokioFileWriter;
+
+impl FileWriter for TokioFileWriter {
+    async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        tokio::fs::write(path, contents).await
+    }
+}
+
 /// The directory every session's configuration is written under.
 const PARENT_DIRECTORY: &str = "mango-external-agents";
 
@@ -45,6 +57,14 @@ impl ConfigFile {
     /// starting one that silently dropped a server the host asked for would run turns without the
     /// tools somebody configured.
     pub async fn write(servers: &[McpServer], scratch: &Path) -> Result<Option<Self>> {
+        Self::write_with(servers, scratch, &TokioFileWriter).await
+    }
+
+    async fn write_with(
+        servers: &[McpServer],
+        scratch: &Path,
+        writer: &impl FileWriter,
+    ) -> Result<Option<Self>> {
         if servers.is_empty() {
             return Ok(None);
         }
@@ -81,14 +101,16 @@ impl ConfigFile {
             directory,
             argument,
         };
-        file.populate(&document).await?;
+        file.populate(&document, writer).await?;
         Ok(Some(file))
     }
 
     /// Writes the document into the directory this value already owns.
-    async fn populate(&self, document: &Value) -> Result<()> {
+    async fn populate(&self, document: &Value, writer: &impl FileWriter) -> Result<()> {
         let path = self.path();
-        tokio::fs::write(path, document.to_string())
+        let contents = document.to_string();
+        writer
+            .write(path, contents.as_bytes())
             .await
             .map_err(|error| launch_failure("write an MCP configuration", path, &error))?;
         restrict_to_owner(path, 0o600).await
@@ -232,7 +254,9 @@ fn launch_failure(what: &str, path: &Path, error: &std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigFile, FILE_NAME, PARENT_DIRECTORY, document_for};
+    use std::path::Path;
+
+    use super::{ConfigFile, FileWriter, PARENT_DIRECTORY, document_for};
     use mango_external_agents::{McpServer, McpTransport};
     use serde_json::json;
 
@@ -410,43 +434,35 @@ mod tests {
     /// unguessable, owner-only directory that nothing will ever clean up, holding the file a host
     /// put its own server's credential in.
     ///
-    /// Forced through the one post-`mkdir` failure a test can arrange without a fake filesystem:
-    /// a scratch path long enough that the directory still fits inside `PATH_MAX` and the document
-    /// inside it does not, so `create_dir` succeeds and the write that follows fails with
-    /// `ENAMETOOLONG`.
-    #[cfg(unix)]
+    /// A named writer fails after the production path creates and takes ownership of the session
+    /// directory. This avoids relying on platform-specific path-length limits.
     #[tokio::test]
     async fn a_failure_after_the_directory_exists_still_leaves_nothing_behind() {
-        // `<scratch>/mango-external-agents/<uuid>` plus `/mcp-servers.json`: the first has to fit
-        // and the second must not.
-        const PATH_MAX: usize = 4096;
-        let overhead = 1 + PARENT_DIRECTORY.len() + 1 + uuid::Uuid::nil().to_string().len();
-        let longest_scratch = PATH_MAX - 1 - overhead;
-        let too_long_for_the_file = PATH_MAX - overhead - 1 - FILE_NAME.len();
+        struct FailingFileWriter;
+
+        impl FileWriter for FailingFileWriter {
+            async fn write(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected write refusal",
+                ))
+            }
+        }
 
         let scratch = tempdir();
-        let mut long = scratch.clone();
-        while long.as_os_str().len() + 1 + 200 <= longest_scratch {
-            long = long.join("p".repeat(200));
-        }
-        let remaining = longest_scratch - long.as_os_str().len() - 1;
-        long = long.join("p".repeat(remaining));
-        assert!(
-            long.as_os_str().len() > too_long_for_the_file,
-            "expected a scratch path whose directory fits and whose file does not"
-        );
-        std::fs::create_dir_all(&long).expect("expected the long scratch directory");
-
-        let error = ConfigFile::write(&servers(), &long)
+        let error = ConfigFile::write_with(&servers(), &scratch, &FailingFileWriter)
             .await
-            .map(|file| file.is_some())
             .expect_err("expected the write to be refused");
         assert!(
             matches!(error, mango_external_agents::Error::Launch { .. }),
             "received {error:?}"
         );
+        assert!(
+            error.to_string().contains("injected write refusal"),
+            "expected the injected post-directory failure, received {error}"
+        );
 
-        let left_behind = std::fs::read_dir(long.join(PARENT_DIRECTORY))
+        let left_behind = std::fs::read_dir(scratch.join(PARENT_DIRECTORY))
             .map(|entries| entries.count())
             .unwrap_or(0);
         assert_eq!(
