@@ -8,10 +8,10 @@ use std::time::Duration;
 use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::{
     ApprovalRouting, AuthMode, AuthState, CancelReason, CloseReason, Configuration, Error,
-    EventKind, ExecutablePath, GateVerdict, Harness, OpenSession, PermissionLevel,
-    PermissionResponse, ResumeMode, Session, TurnRequest, TurnStream,
+    EventKind, ExecutablePath, GateVerdict, Harness, Limits, LineLimits, OpenSession,
+    PermissionLevel, PermissionResponse, ResumeMode, Session, TurnRequest, TurnStream,
 };
-use support::{FakeClaudeCli, Run, SIGNED_OUT, host};
+use support::{FakeClaudeCli, Run, SIGNED_OUT, host, host_under};
 
 const READ_TURN: &str = include_str!("../../../fixtures/claude/transcripts/read-turn.jsonl");
 const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
@@ -516,6 +516,53 @@ mod a_turn {
         assert!(
             matches!(events.last(), Some(EventKind::Error { .. })),
             "received {events:?}"
+        );
+    }
+
+    /// The child is still running, and still writing, when the link gives up on it.
+    ///
+    /// Every other failing path here reaches a process that has already exited, so a terminal
+    /// arrives however long the turn is willing to wait for an exit status. This is the path where
+    /// it has not exited: one line past the cap breaks the link while the vendor works on. Waiting
+    /// on that exit without a bound is a turn that never ends, on exactly the failure a host most
+    /// needs to be told about.
+    #[tokio::test]
+    async fn ends_the_turn_when_a_line_breaks_the_link_and_the_process_runs_on() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling(["x".repeat(10_000)])));
+        let host = host_under(
+            Arc::clone(&launcher),
+            Limits {
+                line: LineLimits {
+                    max_line_bytes: 4_096,
+                    max_buffered_bytes: 8_192,
+                },
+                ..Limits::default()
+            },
+        );
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "say something enormous"))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!("expected an error, received {events:?}");
+        };
+        assert_eq!(error.code.as_str(), "claude-stream-broken");
+        assert!(
+            error.message.contains("8192") && error.message.contains("10001"),
+            "expected the cap and what passed it, received {:?}",
+            error.message
+        );
+        assert!(
+            launcher.all_children_ended(),
+            "expected the child to be reaped even though it never exited on its own"
         );
     }
 

@@ -123,6 +123,14 @@ Closing stdin is also what the vendor documents as cancelling a pending prompt, 
 closes it immediately after the prompt — so a run that would otherwise wait for an answer nobody
 can give does not wait.
 
+**A turn that fails does not wait on the process to agree.** When the stream ends without a
+`result`, the exit status is worth having: 143 is the one code the vendor documents, and naming it
+beats reporting an unexplained failure. But two of the three ways to reach that point — a link that
+broke mid-run, and the idle timeout — leave a child that is alive and has no reason to exit, so the
+wait is bounded by the host's own `Limits::kill_grace` and the turn ends either way. The child is
+killed after, not before: killing first would make every broken link exit 143 and read as an
+outside interruption.
+
 ## Permissions
 
 Claude is the vendor where the product's two axes are **not** independent: one

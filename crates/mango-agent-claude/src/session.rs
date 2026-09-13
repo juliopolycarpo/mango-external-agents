@@ -17,6 +17,7 @@
 //!   a host cannot work around.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use mango_external_agents::{
     CancelReason, CloseReason, Configuration, Error, ErrorCode, EventSink, ExecutablePath,
@@ -353,6 +354,9 @@ async fn pump(
     resumed: bool,
 ) {
     let mut reducer = TurnReducer::new(resumed);
+    // The host's own patience for a child that should be exiting; it owns the process, so it owns
+    // how long the turn waits on one that is not.
+    let exit_grace = shared.host.limits().kill_grace;
     let (mut sender, mut receiver) = link.split();
 
     // One message, then end of input. A second message would run as its own turn with its own
@@ -362,7 +366,7 @@ async fn pump(
     let written = sender.send(prompt_line(&input)).await;
     let closed = sender.close().await;
     if let Err(error) = written.and(closed) {
-        finish(&mut reducer, &sink, &end, &control, Some(error)).await;
+        finish(&mut reducer, &sink, &end, &control, Some(error), exit_grace).await;
         clear_active(&shared, &end);
         return;
     }
@@ -422,7 +426,7 @@ async fn pump(
         }
     }
 
-    finish(&mut reducer, &sink, &end, &control, failure).await;
+    finish(&mut reducer, &sink, &end, &control, failure, exit_grace).await;
     clear_active(&shared, &end);
 }
 
@@ -433,6 +437,7 @@ async fn finish(
     end: &TurnEnd,
     control: &Arc<dyn mango_external_agents::ProcessControl>,
     failure: Option<Error>,
+    exit_grace: Duration,
 ) {
     if reducer.finished() {
         // The vendor's own `result` already ended the turn. A cancel that arrived after it changes
@@ -443,7 +448,16 @@ async fn finish(
         }
         let _ = sink.cancel(reason).await;
     } else {
-        let exit = control.wait().await.ok();
+        // The exit status is worth a moment, because it is what names an exit the vendor documents
+        // — but only a moment. A link that broke while the child worked on, or an idle timeout,
+        // reaches here with a process that is alive and has no intention of exiting, and a turn
+        // that waits for that exit is a turn that never ends. The status is the better message;
+        // ending the turn is the one that has to happen. Killing first would be the other way
+        // round: every broken link would then exit 143 and read as an outside interruption.
+        let exit = tokio::time::timeout(exit_grace, control.wait())
+            .await
+            .ok()
+            .and_then(std::result::Result::ok);
         for event in reducer.abort(no_result_error(failure, exit, control.stderr_tail())) {
             let _ = sink.emit(event).await;
         }

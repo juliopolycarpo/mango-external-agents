@@ -362,8 +362,16 @@ impl ByteSink for FakeStdin {
     }
 }
 
-/// A host whose launcher is this fake, with a frozen clock and a small turn channel.
+/// A host whose launcher is this fake, with a frozen clock and the ordinary caps.
 pub fn host(launcher: Arc<FakeClaudeCli>) -> HostContext {
+    host_under(launcher, Limits::default())
+}
+
+/// The same host, reading a vendor under caps this narrow.
+///
+/// What a host sets here is its own policy, so a test that wants a cap reached says so rather than
+/// making a fake write a megabyte to reach the default one.
+pub fn host_under(launcher: Arc<FakeClaudeCli>, limits: Limits) -> HostContext {
     HostContext::builder()
         .launcher(launcher)
         .cwd(std::env::temp_dir())
@@ -374,7 +382,7 @@ pub fn host(launcher: Arc<FakeClaudeCli>) -> HostContext {
         ]))
         .client_info("mea-tests", "0.0.0")
         .clock(Arc::new(FrozenClock::default()))
-        .limits(Limits::default())
+        .limits(limits)
         .build()
         .expect("expected a host")
 }
