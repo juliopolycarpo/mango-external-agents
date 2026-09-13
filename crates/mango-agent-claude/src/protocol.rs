@@ -60,11 +60,6 @@ impl StreamRecord {
         text(&self.fields, "subtype")
     }
 
-    /// The vendor's own session handle for the run this record belongs to.
-    pub fn session_id(&self) -> Option<&str> {
-        non_empty(&self.fields, "session_id")
-    }
-
     /// Which tool call this record belongs to, or nothing for the main conversation.
     ///
     /// `null` is the documented value for the main conversation, so only a non-empty string means

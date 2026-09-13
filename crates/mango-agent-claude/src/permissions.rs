@@ -187,7 +187,7 @@ pub fn permission_mode(
 pub fn matrix(availability: &ModeAvailability) -> PermissionMatrix {
     PermissionMatrix::build(|level, routing| {
         let Some(mode) = permission_mode(level, routing, availability) else {
-            return refusal_for(level, routing, availability);
+            return refusal_for(level, availability);
         };
         let vendor_id = Some(String::from(mode.canonical()));
         if availability.accepts(mode) {
@@ -203,34 +203,15 @@ pub fn matrix(availability: &ModeAvailability) -> PermissionMatrix {
     })
 }
 
-/// The same matrix, wholly unavailable for one reason.
-///
-/// A machine that has Claude but cannot run it — a binary older than the pinned minimum, say —
-/// still has to describe the choices it is refusing. An empty list reads as "this harness has no
-/// configurations", which is a different and less useful statement than "here is why none of them
-/// can be selected".
-pub fn unsupported_matrix(reason: UnsupportedReason) -> PermissionMatrix {
-    PermissionMatrix::none(reason)
-}
-
 /// Why a pair with no mode behind it cannot be selected.
-fn refusal_for(
-    level: PermissionLevel,
-    routing: ApprovalRouting,
-    availability: &ModeAvailability,
-) -> ConfigurationVerdict {
-    if routing != ApprovalRouting::AutoReview {
-        // Unreachable: every `User` routing above resolves to a mode. Stated rather than panicked,
-        // because a new level added to the core must not be able to abort a host's discovery.
-        return ConfigurationVerdict::unsupported(UnsupportedReason::NotOfferedByVendor);
-    }
+///
+/// Called only for `AutoReview`: every `User` routing resolves to a mode in [`permission_mode`],
+/// so this only ever reasons about auto-review's own cell per level.
+fn refusal_for(level: PermissionLevel, availability: &ModeAvailability) -> ConfigurationVerdict {
     match level {
-        // Read-only is a whole session mode in Claude; nothing acts inside it, so nothing reviews.
-        PermissionLevel::ReadOnly => {
-            ConfigurationVerdict::unsupported(UnsupportedReason::NotOfferedByVendor)
-        }
-        // Nothing left to review once every action is permitted.
-        PermissionLevel::FullAccess => {
+        // Read-only is a whole session mode in Claude, so nothing acts inside it to review; full
+        // access has already permitted everything, so nothing is left to review either.
+        PermissionLevel::ReadOnly | PermissionLevel::FullAccess => {
             ConfigurationVerdict::unsupported(UnsupportedReason::NotOfferedByVendor)
         }
         PermissionLevel::Default => ConfigurationVerdict::Unsupported {
@@ -267,7 +248,8 @@ mod tests {
     use super::{CliMode, ModeAvailability, auto_mode_disabled, matrix, permission_mode};
     use crate::auth::AccountKind;
     use mango_external_agents::{
-        ApprovalRouting, PermissionLevel, SupportedConfiguration, UnsupportedReason,
+        ApprovalRouting, PermissionLevel, PermissionMatrix, SupportedConfiguration,
+        UnsupportedReason,
     };
     use serde_json::json;
 
@@ -477,7 +459,7 @@ mod tests {
 
     #[test]
     fn every_pair_is_described_even_when_none_can_be_selected() {
-        let refused = super::unsupported_matrix(UnsupportedReason::RequiresNewerVersion);
+        let refused = PermissionMatrix::none(UnsupportedReason::RequiresNewerVersion);
         assert_eq!(refused.cells().len(), 6);
         assert!(refused.cells().iter().all(|cell| !cell.supported));
     }

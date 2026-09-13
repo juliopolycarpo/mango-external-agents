@@ -63,10 +63,6 @@ const TITLE_FIELDS: [&str; 7] = [
 pub struct RunInit {
     /// The vendor's own session handle, which proves the conversation now exists on disk.
     pub session_id: Option<String>,
-    /// What this build announces it implements.
-    pub capabilities: Vec<String>,
-    /// The permission mode the run is operating under.
-    pub permission_mode: Option<String>,
     /// The model the run resolved to.
     pub model: Option<String>,
 }
@@ -238,13 +234,6 @@ impl TurnReducer {
         let init = record.init();
         let run = RunInit {
             session_id: init.session_id().map(str::to_owned),
-            capabilities: init
-                .capabilities()
-                .unwrap_or_default()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            permission_mode: init.permission_mode().map(str::to_owned),
             model: init.model().map(str::to_owned),
         };
 
