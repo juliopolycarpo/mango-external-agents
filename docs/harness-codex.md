@@ -246,6 +246,13 @@ this tool letting an agent out of its sandbox, checked into the repository.
 - `SteerRejection::TurnNotSteerable` is never produced. The app-server's refusal for a turn that
   refuses steering — a review, a compaction — has not been observed, so a steer it declines for any
   reason other than "no active turn" surfaces as the vendor error rather than as that reason.
+- A turn cancelled in the window between `turn/start` being written and its answer arriving is
+  stopped by name as soon as the answer lands, and that orphan's own `turn/completed` is dropped so
+  it cannot end whatever turn has started since. What is not filtered is the orphan's deltas: a
+  notification it emits between the interrupt going out and the server acting on it carries no turn
+  id the reducer reads, so it renders under the running turn. Cosmetic, and the window is one round
+  trip; routing every conversation frame by `turnId` as well as `threadId` is the fix, and wants
+  the reducer to hold the running turn's handle.
 - A session closed or cancelled while its host has stopped reading ends that turn with a bare
   `Completed` under a 200 ms grace, rather than with the cancellation marker a turn that ends
   normally carries. One event is what fits: a bounded sink offers no way to put two events on or

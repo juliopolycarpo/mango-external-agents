@@ -117,6 +117,16 @@ pub(crate) struct Shared {
     /// Emptied with the questions themselves, because that is their lifetime: a turn that ends
     /// settles everything it was waiting on.
     resolved_early: Mutex<HashSet<String>>,
+    /// Vendor turns this session gave up and then stopped by name.
+    ///
+    /// An interrupt is answered with a `turn/completed`, and by the time it arrives the slot the
+    /// orphan once held belongs to whatever turn is running now. Ending that one would close a
+    /// stream its host is reading and leave the turn it was reading about running unattended —
+    /// the same orphan, one turn along. So the orphan's own ending is recognised and dropped.
+    ///
+    /// One entry per orphan, removed by the completion it is waiting for. A server that never
+    /// sends one leaves a string behind, which is the cost of not guessing when to forget.
+    interrupted: Mutex<HashSet<String>>,
 }
 
 impl Shared {
@@ -130,6 +140,7 @@ impl Shared {
             pending: Mutex::new(HashMap::new()),
             abandoned: Mutex::new(HashSet::new()),
             resolved_early: Mutex::new(HashSet::new()),
+            interrupted: Mutex::new(HashSet::new()),
         }
     }
 
@@ -255,16 +266,17 @@ impl Shared {
     /// cannot happen. A single `Completed` cannot half-land: either it arrives or the stream
     /// closes, and both are endings a host can read. Nothing is lost by dropping the reason,
     /// because the reason is the argument the host passed to `cancel` or `close` itself.
-    async fn abandon(&self) {
-        let Some(active) = self.turn.lock().await.take() else {
-            return;
-        };
-        // Its handle has not arrived, so this side has no id to interrupt the vendor's turn by.
-        // Whoever is parked on that answer stops it instead.
+    /// Returns the vendor's own handle for the turn it ended, when the server had already named
+    /// one. The caller is then the only thing that can stop it.
+    async fn abandon(&self) -> Option<String> {
+        let active = self.turn.lock().await.take()?;
+        // No handle yet, so this side has no id to interrupt the vendor's turn by. Whoever is
+        // parked on that answer stops it instead.
         if active.native_turn_id.is_empty() {
             self.abandoned.lock().await.insert(active.turn_id.clone());
         }
         let _ = tokio::time::timeout(TERMINAL_GRACE, active.sink.complete()).await;
+        Some(active.native_turn_id).filter(|id| !id.is_empty())
     }
 
     /// Settles every question the server is still waiting on.
@@ -303,6 +315,20 @@ impl PeerHandler for CodexHandler {
         if let Notification::ServerRequestResolved(resolved) = &notification {
             self.release_resolved(&RequestId::new(resolved.request_id.clone()).key())
                 .await;
+        }
+
+        // The ending of a turn this session already gave up and stopped. The slot it once held
+        // belongs to whatever turn is running now, and ending that one would close a stream its
+        // host is reading — and leave the turn that host was reading about running unattended.
+        if let Notification::TurnCompleted(completed) = &notification
+            && self
+                .shared
+                .interrupted
+                .lock()
+                .await
+                .remove(&completed.turn.id)
+        {
+            return;
         }
 
         let outcome = reducer::reduce(
@@ -602,8 +628,11 @@ impl CodexSession {
             Ok(answer) => turn_of(answer),
             Err(error) => {
                 // The turn never started, so the stream it would have written to is closed here
-                // rather than left for a `turn/completed` that will never come.
+                // rather than left for a `turn/completed` that will never come. Nothing to
+                // interrupt either — and the entry a cancel may have left is dropped, because the
+                // only call that could ever have used it is this one.
                 self.shared.turn.lock().await.take();
+                self.shared.abandoned.lock().await.remove(&turn_id);
                 return Err(error);
             }
         };
@@ -616,6 +645,11 @@ impl CodexSession {
         // id to name, or a close. The vendor's turn is running regardless of what this side did
         // with the slot, and this is the first moment anything here can name it.
         if self.shared.abandoned.lock().await.remove(&turn_id) {
+            self.shared
+                .interrupted
+                .lock()
+                .await
+                .insert(handle.id.clone());
             self.interrupt(handle.id.clone()).await;
         }
 
@@ -811,10 +845,16 @@ impl Session for CodexSession {
         self.shared.release_pending(DecisionSource::Cancelled).await;
 
         if turn_id.is_empty() {
-            // The turn's own handle has not come back yet, so there is nothing to name in an
-            // interrupt. The stream is ended here rather than left waiting on a `turn/completed`
-            // for a turn the server may not have started.
-            self.shared.abandon().await;
+            // The turn's own handle had not come back when the slot was read, so there was nothing
+            // to name in an interrupt. The stream is ended here rather than left waiting on a
+            // `turn/completed` for a turn the server may not have started.
+            //
+            // It may have come back since — settling the questions above is not instant — in which
+            // case `abandon` hands it over and there is something to name after all.
+            if let Some(named) = self.shared.abandon().await {
+                self.shared.interrupted.lock().await.insert(named.clone());
+                self.interrupt(named).await;
+            }
             return Ok(());
         }
 
@@ -835,7 +875,9 @@ impl Session for CodexSession {
         self.shared.release_pending(DecisionSource::Cancelled).await;
         // The turn ends here rather than on a notification: the connection is about to go, and a
         // host holding a stream that will never terminate is worse than one told why it stopped.
-        self.shared.abandon().await;
+        // Nothing is interrupted here: the child is about to be killed, which stops every turn on
+        // it more thoroughly than a call could.
+        let _ = self.shared.abandon().await;
 
         let closed = self.client.close().await;
         let killed = self.control.kill(CancelReason::from(reason)).await;
@@ -1001,7 +1043,9 @@ mod tests {
     use mango_external_agents::stream::EventSink;
     use mango_external_agents::testing::FakeLauncher;
 
-    use super::{ActiveTurn, Shared, base64, data_url};
+    use super::{ActiveTurn, CodexHandler, Shared, base64, data_url};
+    use crate::protocol::notifications::method::TURN_COMPLETED;
+    use mango_external_agents::jsonrpc::PeerHandler;
 
     /// A host with a launcher that spawns nothing, for the state these tests drive directly.
     fn shared() -> Arc<Shared> {
@@ -1093,6 +1137,66 @@ mod tests {
         assert!(
             shared.abandoned.lock().await.is_empty(),
             "expected nothing to be recorded for a turn this side can name"
+        );
+    }
+
+    /// The answer can land while the questions a cancel settles are still being settled. Whoever
+    /// gave the turn up is then the only thing holding an id to stop it by, so it is handed back
+    /// rather than dropped.
+    #[tokio::test]
+    async fn a_turn_the_server_named_while_it_was_being_given_up_is_handed_to_its_canceller() {
+        let shared = shared();
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+
+        let named = shared.abandon().await;
+
+        assert_eq!(named.as_deref(), Some("vendor-turn-1"));
+    }
+
+    /// And a turn the server never named has nothing to hand over.
+    #[tokio::test]
+    async fn a_turn_the_server_never_named_is_handed_over_as_nothing() {
+        let shared = shared();
+        let (_turn_id, _stream) = running(&shared, "").await;
+
+        assert_eq!(shared.abandon().await, None);
+    }
+
+    /// An interrupt is answered with a `turn/completed`, and by then the slot the orphan held
+    /// belongs to whatever turn is running now. Ending that one would close a stream its host is
+    /// reading and leave the turn it was reading about running unattended — the same orphan again.
+    #[tokio::test]
+    async fn an_orphans_ending_does_not_end_the_turn_that_replaced_it() {
+        let shared = shared();
+        shared
+            .interrupted
+            .lock()
+            .await
+            .insert(String::from("vendor-turn-1"));
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-2").await;
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+
+        handler
+            .on_notification(
+                String::from(TURN_COMPLETED),
+                serde_json::json!({"threadId": shared.thread_id(),
+                                   "turn": {"id": "vendor-turn-1", "status": "interrupted"}}),
+            )
+            .await;
+
+        assert!(
+            shared.turn.lock().await.is_some(),
+            "expected the running turn to keep its slot"
+        );
+        assert!(
+            stream.events.try_recv().is_err(),
+            "expected nothing on the running turn's stream"
+        );
+        assert!(
+            !shared.interrupted.lock().await.contains("vendor-turn-1"),
+            "expected the orphan to be forgotten once its ending arrived"
         );
     }
 
