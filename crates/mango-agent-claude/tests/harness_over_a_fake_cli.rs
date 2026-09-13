@@ -134,12 +134,7 @@ mod discovery {
                 })
             }
         }
-        let context = mango_external_agents::HostContext::builder()
-            .launcher(Arc::new(NothingLauncher))
-            .cwd(std::env::temp_dir())
-            .client_info("mea-tests", "0.0.0")
-            .build()
-            .expect("expected a host");
+        let context = host_under(Arc::new(NothingLauncher), Limits::default());
 
         let discovery = ClaudeHarness::new()
             .discover(&context)
@@ -529,7 +524,7 @@ mod a_turn {
         let launcher =
             Arc::new(FakeClaudeCli::new().with_turn(Run::stalling(["x".repeat(10_000)])));
         let host = host_under(
-            Arc::clone(&launcher),
+            launcher.clone(),
             Limits {
                 line: LineLimits {
                     max_line_bytes: 4_096,

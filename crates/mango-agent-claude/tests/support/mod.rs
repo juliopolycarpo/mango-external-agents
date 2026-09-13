@@ -454,7 +454,10 @@ pub fn host(launcher: Arc<FakeClaudeCli>) -> HostContext {
 ///
 /// What a host sets here is its own policy, so a test that wants a cap reached says so rather than
 /// making a fake write a megabyte to reach the default one.
-pub fn host_under(launcher: Arc<FakeClaudeCli>, limits: Limits) -> HostContext {
+///
+/// Takes any launcher, not just [`FakeClaudeCli`]: a test that wants to prove what happens when the
+/// launcher itself cannot spawn builds its own and still gets this host's environment and clock.
+pub fn host_under(launcher: Arc<dyn ProcessLauncher>, limits: Limits) -> HostContext {
     HostContext::builder()
         .launcher(launcher)
         .cwd(std::env::temp_dir())
