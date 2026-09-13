@@ -157,9 +157,7 @@ fn account_kind(payload: &serde_json::Map<String, Value>) -> AccountKind {
 }
 
 fn lowercased(payload: &serde_json::Map<String, Value>, key: &str) -> String {
-    payload
-        .get(key)
-        .and_then(Value::as_str)
+    crate::protocol::text(payload, key)
         .unwrap_or_default()
         .to_lowercase()
 }

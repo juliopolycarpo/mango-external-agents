@@ -30,7 +30,8 @@ const FILE_NAME: &str = "mcp-servers.json";
 #[derive(Debug)]
 pub struct ConfigFile {
     directory: PathBuf,
-    path: PathBuf,
+    /// The file's path, as the string `--mcp-config` takes. UTF-8 was already proven when this was
+    /// written, so [`path`](Self::path) can hand it back as a [`Path`] without a second check.
     argument: String,
 }
 
@@ -74,16 +75,12 @@ impl ConfigFile {
             .map_err(|error| launch_failure("write an MCP configuration", &path, &error))?;
         restrict_to_owner(&path).await?;
 
-        Ok(Some(Self {
-            directory,
-            path,
-            argument,
-        }))
+        Ok(Some(Self { directory, argument }))
     }
 
     /// The path `--mcp-config` is given.
     pub fn path(&self) -> &Path {
-        &self.path
+        Path::new(&self.argument)
     }
 
     /// That path as the argument a turn's argv carries.

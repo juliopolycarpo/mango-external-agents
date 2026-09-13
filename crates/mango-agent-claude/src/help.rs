@@ -218,21 +218,22 @@ fn bare_identifiers(group: &str) -> Option<Vec<String>> {
 
 /// A single bare lowercase identifier: `[a-z][a-z0-9-]*`.
 fn is_bare_identifier(value: &str) -> bool {
-    let mut characters = value.chars();
-    characters
-        .next()
-        .is_some_and(|first| first.is_ascii_lowercase())
-        && characters.all(|next| next.is_ascii_lowercase() || next.is_ascii_digit() || next == '-')
+    is_identifier(value, &[])
 }
 
 /// An example value: `[a-z][a-z0-9.-]*`, which is what keeps a prose apostrophe from becoming one.
 fn is_example_identifier(value: &str) -> bool {
+    is_identifier(value, &['.'])
+}
+
+/// A lowercase identifier starting `[a-z]`, continuing `[a-z0-9-]` plus whatever `extra` allows.
+fn is_identifier(value: &str, extra: &[char]) -> bool {
     let mut characters = value.chars();
     characters
         .next()
         .is_some_and(|first| first.is_ascii_lowercase())
         && characters.all(|next| {
-            next.is_ascii_lowercase() || next.is_ascii_digit() || next == '-' || next == '.'
+            next.is_ascii_lowercase() || next.is_ascii_digit() || next == '-' || extra.contains(&next)
         })
 }
 
