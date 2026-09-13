@@ -111,6 +111,7 @@ async fn record(scenario: &Scenario, workspace: &Path) -> Result<String> {
         receiver,
         cwd: workspace.to_string_lossy().into_owned(),
         home: home_directory(),
+        user: account_name(),
         lines: vec![format!("# codex/{}: {}", scenario.name, scenario.purpose)],
     };
 
@@ -129,6 +130,7 @@ struct Recorder {
     receiver: Box<dyn LinkReceiver>,
     cwd: String,
     home: String,
+    user: String,
     lines: Vec<String>,
 }
 
@@ -297,6 +299,7 @@ impl Recorder {
         redact::Paths {
             cwd: &self.cwd,
             home: &self.home,
+            user: &self.user,
         }
     }
 
@@ -338,6 +341,16 @@ impl Recorder {
 fn home_directory() -> String {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default()
+}
+
+/// The account this capture runs as, for the same reason and from the same place.
+///
+/// A turn runs commands and the vendor reports what they printed, so the operator's login reaches
+/// a fixture through `ls -la` rather than through any member a denylist could name.
+fn account_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default()
 }
 
