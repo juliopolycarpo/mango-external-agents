@@ -104,6 +104,16 @@ pub(crate) struct Shared {
     /// Self-clearing: only a turn whose handle has not arrived is recorded, and the call waiting
     /// for that handle takes its own entry back whether or not anybody abandoned it.
     abandoned: Mutex<HashSet<TurnId>>,
+    /// Questions the server stopped waiting on before this side had registered them.
+    ///
+    /// A `serverRequest/resolved` is read off the same pipe as the request it resolves, and the
+    /// task composing the answer runs beside the pump rather than inside it — so the release can
+    /// win the race against the registration. Without this the waiter it was meant to free would
+    /// sit out the whole approval deadline before answering a question nobody is asking.
+    ///
+    /// Emptied with the questions themselves, because that is their lifetime: a turn that ends
+    /// settles everything it was waiting on.
+    resolved_early: Mutex<HashSet<String>>,
 }
 
 impl Shared {
@@ -116,6 +126,7 @@ impl Shared {
             turn: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             abandoned: Mutex::new(HashSet::new()),
+            resolved_early: Mutex::new(HashSet::new()),
         }
     }
 
@@ -258,6 +269,7 @@ impl Shared {
     /// Called when a turn is cancelled or a session closes. The waiting handler tasks answer with
     /// a refusal, which is what lets the server's own turn end instead of blocking forever.
     async fn release_pending(&self, source: DecisionSource) {
+        self.resolved_early.lock().await.clear();
         let waiting: Vec<PendingEntry> =
             self.pending.lock().await.drain().map(|(_, e)| e).collect();
         for entry in waiting {
@@ -374,13 +386,35 @@ impl CodexHandler {
     ) -> Option<ApprovalDecisionValue> {
         let request = pending.request.clone();
 
-        // The event first, so a host sees the question whether or not a policy answers it. A
-        // request the core refuses to bound is a request nothing could render, and refusing it
+        // A request the core refuses to bound is a request nothing could render, and refusing it
         // here is better than a prompt nobody sees behind a turn that waits.
         let bounded = match request.clone().normalized() {
             Ok(bounded) => bounded,
             Err(_) => return Some(pending.refusal()),
         };
+
+        // Registered before it is announced, and that order is the whole point. The host learns
+        // this question's id from the event, so a host that answers the moment it sees one would
+        // otherwise find nothing waiting: `respond` would refuse, the host would have spent its
+        // only handle on a protocol error, and the server would stay blocked until the deadline
+        // declined on its behalf.
+        let (answer, waiting) = oneshot::channel();
+        self.shared.pending.lock().await.insert(
+            request.id.clone(),
+            PendingEntry {
+                request_key: id.key(),
+                pending: pending.clone(),
+                answer,
+            },
+        );
+
+        // And the server may already have stopped waiting, in a race this side cannot see from
+        // the outside: the release is read off the same pipe and runs beside this task.
+        if self.shared.resolved_early.lock().await.remove(&id.key()) {
+            self.shared.pending.lock().await.remove(&request.id);
+            return None;
+        }
+
         self.shared
             .emit(EventKind::ApprovalRequested {
                 request: bounded.clone(),
@@ -388,27 +422,28 @@ impl CodexHandler {
             .await;
 
         if let Some(response) = broker_response(self.shared.host.broker(), &bounded).await {
-            // A policy answering with an id this question never offered is a policy that cannot be
-            // applied here. Refusing is the answer that grants nothing; sending the id on would
-            // have the server refuse a frame a person already thinks was answered.
-            let decision = pending
-                .decision_for(&response.option_id)
-                .unwrap_or_else(|| pending.refusal());
-            let option_id = decision.option_id().to_owned();
-            self.resolved(&request.id, &option_id, response.source)
-                .await;
-            return Some(decision);
+            // Only if nobody answered first. Taking the entry back is what says so — a policy that
+            // deliberated while a person chose does not get to overrule them.
+            if self
+                .shared
+                .pending
+                .lock()
+                .await
+                .remove(&request.id)
+                .is_some()
+            {
+                // A policy answering with an id this question never offered is a policy that
+                // cannot be applied here. Refusing is the answer that grants nothing; sending the
+                // id on would have the server refuse a frame a person already thinks was answered.
+                let decision = pending
+                    .decision_for(&response.option_id)
+                    .unwrap_or_else(|| pending.refusal());
+                let option_id = decision.option_id().to_owned();
+                self.resolved(&request.id, &option_id, response.source)
+                    .await;
+                return Some(decision);
+            }
         }
-
-        let (answer, waiting) = oneshot::channel();
-        self.shared.pending.lock().await.insert(
-            request.id.clone(),
-            PendingEntry {
-                request_key: id.key(),
-                pending,
-                answer,
-            },
-        );
 
         // Three ways this ends: somebody chooses, the deadline the request already carries passes,
         // or the host is going away. All three answer the server; none of them grants anything.
@@ -419,7 +454,7 @@ impl CodexHandler {
             () = tokio::time::sleep(approvals::APPROVAL_TIMEOUT) => None,
         };
 
-        let entry = self.shared.pending.lock().await.remove(&request.id);
+        self.shared.pending.lock().await.remove(&request.id);
         match settled {
             Some(Answer::Chosen {
                 decision,
@@ -435,9 +470,7 @@ impl CodexHandler {
                 None
             }
             None => {
-                let decision = entry.map_or(ApprovalDecisionValue::Decline, |entry| {
-                    entry.pending.refusal()
-                });
+                let decision = pending.refusal();
                 self.resolved(&request.id, decision.option_id(), DecisionSource::Expired)
                     .await;
                 Some(decision)
@@ -465,6 +498,15 @@ impl CodexHandler {
             .find(|(_, entry)| entry.request_key == request_key)
             .map(|(id, _)| id.clone())
         else {
+            // Nothing registered under it yet. Either this is somebody else's question, or the
+            // task that will register it has not reached the map — and it checks here for exactly
+            // this, rather than waiting out a deadline on a question already withdrawn.
+            drop(pending);
+            self.shared
+                .resolved_early
+                .lock()
+                .await
+                .insert(request_key.to_owned());
             return;
         };
         if let Some(entry) = pending.remove(&id) {

@@ -57,6 +57,35 @@ impl PermissionBroker for FixedBroker {
     }
 }
 
+/// A broker that has not made up its mind until the test says so.
+///
+/// A real policy that calls out to a service takes time to answer, and the host is reading events
+/// the whole while. Named rather than inlined so the test reads as "this host had a slow policy",
+/// which is the only thing about it that matters.
+struct SlowBroker {
+    release: tokio::sync::Semaphore,
+}
+
+impl SlowBroker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    fn make_up_its_mind(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[async_trait::async_trait]
+impl PermissionBroker for SlowBroker {
+    async fn decide(&self, _request: &PermissionRequest) -> BrokerDecision {
+        let _permit = self.release.acquire().await;
+        BrokerDecision::Ask
+    }
+}
+
 /// A host whose launcher replays these fixtures, one child per named scenario.
 fn host_replaying(scenarios: &[&str]) -> (HostContext, Arc<FakeLauncher>) {
     host_with(scenarios, None)
@@ -388,6 +417,52 @@ async fn a_turn_whose_host_stopped_reading_still_holds_the_slot_against_a_steer(
         launcher.written().len(),
         before,
         "expected no turn/start to reach the vendor"
+    );
+}
+
+/// A host answers the moment it sees the question, because the event is where it learns the id.
+///
+/// The question has to be answerable by then. Announcing it before registering it left a window —
+/// as wide as the host's policy takes to decide — in which `respond` found nothing waiting, so the
+/// host spent its one handle on a protocol error and the server stayed blocked until the deadline
+/// declined on its behalf.
+#[tokio::test]
+async fn a_question_is_answerable_the_instant_the_host_is_told_about_it() {
+    let broker = SlowBroker::new();
+    let (host, _launcher) = host_with(&["approval"], Some(broker.clone()));
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+
+    let asked = await_approval(&mut turn).await;
+    let answered = session
+        .respond(PermissionResponse {
+            request_id: asked.id.clone(),
+            option_id: asked
+                .options
+                .iter()
+                .find(|option| option.kind == PermissionOptionKind::RejectOnce)
+                .map(|option| option.id.clone())
+                .expect("expected a refusal among the recorded options"),
+            source: DecisionSource::User,
+        })
+        .await;
+    broker.make_up_its_mind();
+
+    answered.expect("expected the host's answer to reach a question it was just shown");
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ApprovalResolved { decision, .. }
+                if decision.source == DecisionSource::User
+        )),
+        "expected the person's answer to be the one that stood, received {events:#?}"
     );
 }
 
