@@ -614,13 +614,15 @@ impl TurnReducer {
 
     /// Bounded concatenation of a subagent's forwarded blocks.
     fn append_nested(&mut self, parent: &str, text: &str) -> String {
-        let merged = match self.nested_text.get(parent) {
-            Some(previous) => format!("{previous}\n{text}"),
-            None => text.to_owned(),
-        };
-        let bounded = head(&merged, DETAIL_ACCUMULATION_MAX_CHARS);
-        self.nested_text.insert(parent.to_owned(), bounded.clone());
-        bounded
+        let entry = self.nested_text.entry(parent.to_owned()).or_default();
+        if !entry.is_empty() {
+            entry.push('\n');
+        }
+        entry.push_str(text);
+        if let Some((boundary, _)) = entry.char_indices().nth(DETAIL_ACCUMULATION_MAX_CHARS) {
+            entry.truncate(boundary);
+        }
+        entry.clone()
     }
 }
 
@@ -699,12 +701,14 @@ fn summarize_tool_input(input: Option<&Value>) -> String {
 /// A detail field, bounded, or nothing for text that says nothing.
 fn detail_for(detail: &str) -> Option<String> {
     let bounded = head(detail, DETAIL_ACCUMULATION_MAX_CHARS);
-    (!bounded.is_empty()).then_some(bounded)
+    (!bounded.is_empty()).then(|| bounded.to_owned())
 }
 
 /// The first `max` characters, never cutting one in half.
-fn head(text: &str, max: usize) -> String {
-    text.chars().take(max).collect()
+fn head(text: &str, max: usize) -> &str {
+    text.char_indices()
+        .nth(max)
+        .map_or(text, |(boundary, _)| &text[..boundary])
 }
 
 /// Whether a `result` record is a failure, and what to call it.
