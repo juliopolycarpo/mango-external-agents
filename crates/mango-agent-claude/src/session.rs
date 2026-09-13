@@ -522,8 +522,16 @@ async fn finish(
             let _ = sink.emit(event).await;
         }
     }
-    // Background subagents can hold the process open after the result, so the turn does not wait on
-    // the exit — but nothing is allowed to outlive the turn that started it either.
+    // What can still be running here is a background *Bash* task the run started — a dev server, a
+    // watch build — which the vendor gives about five seconds after the result before terminating
+    // it. So the turn does not wait on the exit, and nothing is allowed to outlive the turn that
+    // started it either.
+    //
+    // Not a background subagent: those are waited for *before* the result, because their output is
+    // part of the final answer, under the ceiling `VENDOR_ENVIRONMENT_KEYS` forwards. This kill
+    // lands after the record that wait produced, so it pre-empts nothing.
+    //
+    // <https://code.claude.com/docs/en/headless.md>
     let _ = control.kill(CancelReason::Shutdown).await;
 }
 

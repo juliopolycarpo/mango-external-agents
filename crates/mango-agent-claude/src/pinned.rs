@@ -45,9 +45,17 @@ pub const LOGIN_COMMAND: &str = "claude auth login";
 /// Documented Claude variables a child is allowed to inherit.
 ///
 /// `CLAUDE_CONFIG_DIR` relocates the whole configuration home, so without it a user who moved it
-/// would appear signed out. `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` is the vendor's own ceiling on
-/// how long a finished turn waits for background subagents; an operator who lowered it means it,
-/// and dropping the variable would silently restore the ten-minute default.
+/// would appear signed out.
+///
+/// `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` is the vendor's own ceiling on how long a run waits for
+/// background subagents and workflows. The wait is *inside* the turn, not after it: headless.md
+/// exempts them from the five-second background-task grace "because their result is part of the
+/// final output, so `claude -p` waits for them to complete", capped at ten minutes by default
+/// since 2.1.182. So the ceiling gates the `result` record, which this harness's own kill lands
+/// after and cannot pre-empt — an operator who lowered it means it, and dropping the variable
+/// would silently restore the ten-minute default.
+///
+/// <https://code.claude.com/docs/en/headless.md>
 ///
 /// `ANTHROPIC_API_KEY` is deliberately **not** here. The library forwards no credential, and a
 /// harness that let one through by name would be doing exactly that under a documented-variable

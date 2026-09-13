@@ -114,6 +114,14 @@ id, and each turn spawns, streams and reaps its own child.
 - **A second `start_turn` ends the first.** A host that starts one has decided the first is over.
 - **Steering is not supported.** `--input-format stream-json` accepts a second message, but it runs
   as its own turn with its own `result` — a queued follow-up, not same-turn steering.
+- **The turn's own kill pre-empts no background subagent.** A run waits for background subagents and
+  workflows *before* it prints `result`, because their output is part of the final answer, capped by
+  `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (ten minutes by default since 2.1.182) — which is why that
+  variable is on the environment allowlist and why it is an operator's to lower. The kill lands
+  after the terminal event, so what it ends is a background *Bash* task the run left running, which
+  the vendor would otherwise terminate about five seconds later itself.
+
+  <https://code.claude.com/docs/en/headless.md>
 
 ## Cancellation, and what the vendor actually does
 
