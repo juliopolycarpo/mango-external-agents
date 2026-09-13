@@ -74,15 +74,24 @@ impl ConfigFile {
         };
 
         create_private_directory(&directory).await?;
-        tokio::fs::write(&path, document.to_string())
-            .await
-            .map_err(|error| launch_failure("write an MCP configuration", &path, &error))?;
-        restrict_to_owner(&path, 0o600).await?;
-
-        Ok(Some(Self {
+        // Owned from the moment the directory exists, so every failure below returns through this
+        // value's `Drop` instead of leaving an unguessable, owner-only directory — with the
+        // credential-carrying file inside it — behind for nobody to clean up.
+        let file = Self {
             directory,
             argument,
-        }))
+        };
+        file.populate(&document).await?;
+        Ok(Some(file))
+    }
+
+    /// Writes the document into the directory this value already owns.
+    async fn populate(&self, document: &Value) -> Result<()> {
+        let path = self.path();
+        tokio::fs::write(path, document.to_string())
+            .await
+            .map_err(|error| launch_failure("write an MCP configuration", path, &error))?;
+        restrict_to_owner(path, 0o600).await
     }
 
     /// The path `--mcp-config` is given.
@@ -215,7 +224,7 @@ fn launch_failure(what: &str, path: &Path, error: &std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigFile, PARENT_DIRECTORY, document_for};
+    use super::{ConfigFile, FILE_NAME, PARENT_DIRECTORY, document_for};
     use mango_external_agents::{McpServer, McpTransport};
     use serde_json::json;
 
@@ -382,6 +391,59 @@ mod tests {
             !path.exists(),
             "expected a dropped session to leave nothing behind at {}",
             path.display()
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The failure that only becomes reachable once the directory exists.
+    ///
+    /// Everything before `create_private_directory` refuses without touching the disk, so the only
+    /// way to leave one of these behind is a failure *after* it — and what is left is an
+    /// unguessable, owner-only directory that nothing will ever clean up, holding the file a host
+    /// put its own server's credential in.
+    ///
+    /// Forced through the one post-`mkdir` failure a test can arrange without a fake filesystem:
+    /// a scratch path long enough that the directory still fits inside `PATH_MAX` and the document
+    /// inside it does not, so `create_dir` succeeds and the write that follows fails with
+    /// `ENAMETOOLONG`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failure_after_the_directory_exists_still_leaves_nothing_behind() {
+        // `<scratch>/mango-external-agents/<uuid>` plus `/mcp-servers.json`: the first has to fit
+        // and the second must not.
+        const PATH_MAX: usize = 4096;
+        let overhead = 1 + PARENT_DIRECTORY.len() + 1 + uuid::Uuid::nil().to_string().len();
+        let longest_scratch = PATH_MAX - 1 - overhead;
+        let too_long_for_the_file = PATH_MAX - overhead - 1 - FILE_NAME.len();
+
+        let scratch = tempdir();
+        let mut long = scratch.clone();
+        while long.as_os_str().len() + 1 + 200 <= longest_scratch {
+            long = long.join("p".repeat(200));
+        }
+        let remaining = longest_scratch - long.as_os_str().len() - 1;
+        long = long.join("p".repeat(remaining));
+        assert!(
+            long.as_os_str().len() > too_long_for_the_file,
+            "expected a scratch path whose directory fits and whose file does not"
+        );
+        std::fs::create_dir_all(&long).expect("expected the long scratch directory");
+
+        let error = ConfigFile::write(&servers(), &long)
+            .await
+            .map(|file| file.is_some())
+            .expect_err("expected the write to be refused");
+        assert!(
+            matches!(error, mango_external_agents::Error::Launch { .. }),
+            "received {error:?}"
+        );
+
+        let left_behind = std::fs::read_dir(long.join(PARENT_DIRECTORY))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            left_behind, 0,
+            "expected a failed write to take its own directory with it, received {left_behind} entries"
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }
