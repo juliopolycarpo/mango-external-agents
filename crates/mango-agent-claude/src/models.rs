@@ -41,10 +41,10 @@ const MODEL_MAX_CHARS: usize = 128;
 /// assert!(catalog.iter().all(|model| !model.is_default));
 /// ```
 pub fn catalog(surface: Option<&CliSurface>) -> Option<Vec<Model>> {
-    let aliases = surface?.model_aliases()?;
-    if aliases.is_empty() {
+    if !advertises_catalog(surface) {
         return None;
     }
+    let aliases = surface?.model_aliases()?;
     let reasoning_efforts: Vec<ReasoningEffort> = surface
         .and_then(CliSurface::effort_levels)
         .unwrap_or_default()
@@ -69,6 +69,19 @@ pub fn catalog(surface: Option<&CliSurface>) -> Option<Vec<Model>> {
             })
             .collect(),
     )
+}
+
+/// Whether this build advertises a model catalog, without building it.
+///
+/// For a caller that only needs [`Capabilities::model_catalog`](mango_external_agents::Capabilities)
+/// and not the catalog itself: building the full `Vec<Model>` only to check `.is_some()` clones the
+/// alias list and its reasoning efforts for nothing.
+pub fn advertises_catalog(surface: Option<&CliSurface>) -> bool {
+    surface.is_some_and(|surface| {
+        surface
+            .model_aliases()
+            .is_some_and(|aliases| !aliases.is_empty())
+    })
 }
 
 /// Whether this build declared the effort level a configuration asked for.

@@ -25,22 +25,13 @@ use crate::{models, version};
 
 /// What this harness could support given a new enough CLI.
 ///
-/// Each flag that is *not* here is a measured verdict rather than an unimplemented stub; see
-/// `docs/harness-claude.md` for what was probed and when.
+/// The two probed flags are the ceiling too: nothing in [`probed_capabilities`] can exceed what a
+/// build could in principle advertise. Every other flag here is a measured verdict rather than an
+/// unimplemented stub; see `docs/harness-claude.md` for what was probed and when.
 const CEILING: Capabilities = Capabilities {
-    structured_streaming: true,
-    reasoning_stream: true,
-    resume: true,
-    cancellation: true,
-    usage_reporting: true,
     model_catalog: true,
     mcp_passthrough: true,
-    interactive_approvals: false,
-    images: false,
-    steering: false,
-    session_listing: false,
-    native_review: false,
-    account_usage: false,
+    ..probed_capabilities()
 };
 
 /// Claude Code, driven through its documented headless surface.
@@ -114,7 +105,6 @@ impl ClaudeHarness {
         // useless, and it costs a third process launch to learn.
         if let Some(refusal) = CliSurface::refusal(surface.as_ref(), version.as_ref()) {
             return Survey {
-                installed: true,
                 banner: Some(banner),
                 version,
                 refusal: Some(refusal),
@@ -141,7 +131,6 @@ impl ClaudeHarness {
         };
 
         Survey {
-            installed: true,
             banner: Some(banner),
             version,
             refusal: None,
@@ -155,7 +144,6 @@ impl ClaudeHarness {
 /// What the probes found, before it is shaped into a [`Discovery`] or a session.
 #[derive(Default)]
 struct Survey {
-    installed: bool,
     banner: Option<String>,
     version: Option<semver::Version>,
     /// Why this build cannot be driven, when it cannot.
@@ -166,6 +154,11 @@ struct Survey {
 }
 
 impl Survey {
+    /// Whether `--version` reported anything at all.
+    fn installed(&self) -> bool {
+        self.banner.is_some()
+    }
+
     /// The version as a host should read it: what the CLI reported, bounded by the core.
     fn found(&self) -> String {
         self.version
@@ -173,6 +166,22 @@ impl Survey {
             .map(semver::Version::to_string)
             .or_else(|| self.banner.clone())
             .unwrap_or_else(|| String::from("an unreadable version"))
+    }
+
+    /// Whether this build declares `--mcp-config` on its help surface.
+    fn declares_mcp_config(&self) -> bool {
+        self.surface
+            .as_ref()
+            .is_some_and(CliSurface::declares_mcp_config)
+    }
+
+    /// What this probed build can do, given whether it advertises a model catalog.
+    fn capabilities(&self, model_catalog: bool) -> Capabilities {
+        Capabilities {
+            model_catalog,
+            mcp_passthrough: self.declares_mcp_config(),
+            ..probed_capabilities()
+        }
     }
 }
 
@@ -194,7 +203,7 @@ impl Harness for ClaudeHarness {
 
     async fn probe(&self, host: &HostContext) -> Result<Discovery> {
         let survey = self.survey(host, &self.executable).await;
-        if !survey.installed {
+        if !survey.installed() {
             return Ok(Discovery::not_installed());
         }
 
@@ -221,14 +230,7 @@ impl Harness for ClaudeHarness {
             // read is not a reason to refuse a binary that answered every other question.
             gate: GateVerdict::Usable,
             auth: survey.authentication.state.clone(),
-            capabilities: Capabilities {
-                model_catalog: models.is_some(),
-                mcp_passthrough: survey
-                    .surface
-                    .as_ref()
-                    .is_some_and(CliSurface::declares_mcp_config),
-                ..probed_capabilities()
-            },
+            capabilities: survey.capabilities(models.is_some()),
             models: models.unwrap_or_default(),
         })
     }
@@ -241,7 +243,7 @@ impl Harness for ClaudeHarness {
         let executable = self.executable_for(&request);
         let survey = self.survey(host, &executable).await;
 
-        if !survey.installed {
+        if !survey.installed() {
             return Err(Error::Launch {
                 program: String::from(probe::PROGRAM),
                 message: String::from("the Claude Code CLI did not report a version"),
@@ -264,12 +266,7 @@ impl Harness for ClaudeHarness {
 
         // Refused rather than dropped. A session that quietly ignored the servers a host
         // configured would run every turn without the tools somebody set up, and report success.
-        if !request.mcp_servers.is_empty()
-            && !survey
-                .surface
-                .as_ref()
-                .is_some_and(CliSurface::declares_mcp_config)
-        {
+        if !request.mcp_servers.is_empty() && !survey.declares_mcp_config() {
             return Err(Error::HostConfiguration {
                 expected: "a build that declares --mcp-config, for a session that configures MCP servers",
                 received: format!(
@@ -298,14 +295,7 @@ impl Harness for ClaudeHarness {
             resumed,
             fallback_reason: None,
             effective_configuration: configuration,
-            capabilities: Capabilities {
-                model_catalog: models::catalog(survey.surface.as_ref()).is_some(),
-                mcp_passthrough: survey
-                    .surface
-                    .as_ref()
-                    .is_some_and(CliSurface::declares_mcp_config),
-                ..probed_capabilities()
-            },
+            capabilities: survey.capabilities(models::advertises_catalog(survey.surface.as_ref())),
         };
 
         Ok(Box::new(ClaudeSession::new(
