@@ -193,6 +193,29 @@ impl AcpProfile {
         self
     }
 
+    /// The text a host shows somebody who has to sign in.
+    ///
+    /// The agent's own command when it has one, and its documentation when it does not. A URL rather
+    /// than an invented command: an agent whose sign-in happens inside an interactive session has no
+    /// command to print, and printing a plausible one would send a person to a prompt that does not
+    /// exist.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let opencode = mango_agent_acp::builtin_profile("opencode").expect("a built-in profile");
+    /// assert_eq!(opencode.login_text(), "opencode auth login");
+    ///
+    /// let gemini = mango_agent_acp::builtin_profile("gemini").expect("a built-in profile");
+    /// assert!(gemini.login_text().starts_with("see https://"));
+    /// ```
+    #[must_use]
+    pub fn login_text(&self) -> String {
+        self.login_hint
+            .clone()
+            .unwrap_or_else(|| format!("see {}", self.docs_url))
+    }
+
     /// The program the probe and the session launch, with a host-resolved path winning.
     #[must_use]
     pub fn program(&self, executable: &mango_external_agents::ExecutablePath) -> String {
@@ -290,12 +313,12 @@ pub const ACP_PROTOCOL_DOCS: &str = "https://agentclientprotocol.com/protocol/ov
 /// # Example
 ///
 /// ```
-/// let ids: Vec<&str> = mango_agent_acp::builtin_profiles()
+/// let ids: Vec<String> = mango_agent_acp::builtin_profiles()
 ///     .iter()
-///     .map(|profile| profile.id.as_str())
+///     .map(|profile| profile.id.to_string())
 ///     .collect();
-/// assert!(ids.contains(&"cursor"));
-/// assert!(ids.contains(&"opencode"));
+/// assert!(ids.contains(&String::from("cursor")));
+/// assert!(ids.contains(&String::from("opencode")));
 /// ```
 #[must_use]
 pub fn builtin_profiles() -> Vec<Arc<AcpProfile>> {

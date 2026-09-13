@@ -25,8 +25,7 @@ use crate::reducer;
 /// `id` is the harness's own correlation id rather than anything in the payload: ACP's
 /// `session/request_permission` carries no id of its own, and the tool call id it does carry repeats
 /// when an agent asks about the same call twice. The JSON-RPC request id is unique per connection and
-/// is what the answer has to be routed back to, so that is what the harness uses — see
-/// [`crate::client`].
+/// is what the answer has to be routed back to, so that is what the harness uses.
 #[must_use]
 pub fn request_from(
     request: &RequestPermissionRequest,

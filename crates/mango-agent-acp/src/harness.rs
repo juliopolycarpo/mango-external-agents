@@ -12,7 +12,7 @@
 //! in; the only way to find out is to try `session/new` and see. So the harness does not guess at
 //! discovery, and a signed-out agent surfaces where it actually becomes known: `session/new`
 //! answering `-32000`, which [`AcpHarness::open_session`] turns into
-//! [`Error::AuthRequired`](mango_external_agents::Error::AuthRequired) carrying the profile's own
+//! [`Error::AuthRequired`] carrying the profile's own
 //! documented login command.
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/initialization>
@@ -36,7 +36,6 @@ use mango_external_agents::{
 };
 
 use crate::client::{self, SessionState};
-use crate::error::request_error;
 use crate::profile::{AcpProfile, matrix};
 use crate::session::{AcpSession, refuse_model_selection};
 use crate::transport;
@@ -236,12 +235,21 @@ impl Harness for AcpHarness {
             .await?,
         );
 
-        let handshake = self.initialize(&connection, host).await?;
-        // The working directory is the host's authorised one and nothing wider: the library has no
-        // other directory it is allowed to name to an agent.
-        let opened = self
-            .open(&connection, &request, &handshake, host.cwd().to_path_buf())
-            .await?;
+        // Every failure from here on ends the child. A `Err` returned with the connection still up
+        // would leave an agent running with nothing driving it: the dispatch loop only winds down
+        // when the shutdown channel drops, so the process would outlive the call that started it by
+        // however long the drop took to reach it.
+        let opened = match self.handshake_and_open(&connection, host, &request).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                connection
+                    .shutdown(mango_external_agents::CancelReason::Requested)
+                    .await;
+                return Err(error);
+            }
+        };
+        let (handshake, opened) = opened;
+        let configuration = request.configuration.clone();
 
         let session = AcpSession::new(
             SessionInfo {
@@ -251,7 +259,7 @@ impl Harness for AcpHarness {
                 },
                 resumed: opened.resumed,
                 fallback_reason: opened.fallback_reason,
-                effective_configuration: request.configuration.clone(),
+                effective_configuration: configuration.clone(),
                 capabilities: Self::capabilities_from(&handshake.capabilities),
             },
             Arc::clone(&self.profile),
@@ -265,8 +273,17 @@ impl Harness for AcpHarness {
         // Set only when the profile knows the agent's own id for the level *and* the agent
         // advertised it. A mode this agent never offered is a refusal rather than a request it would
         // reject mid-session.
-        if let Some(mode) = self.mode_for(&request.configuration, opened.modes.as_ref())? {
-            session.set_mode(&mode).await?;
+        if let Err(error) = self
+            .apply_mode(&session, &configuration, opened.modes.as_ref())
+            .await
+        {
+            // Closing the session rather than the connection alone: a session that exists on the
+            // agent's side and is about to be dropped on ours is a session to end, and `close` is
+            // what withdraws its pending questions and ends the child.
+            let _ = session
+                .close(mango_external_agents::CloseReason::Requested)
+                .await;
+            return Err(error);
         }
         Ok(Box::new(session))
     }
@@ -286,15 +303,52 @@ struct Opened {
 }
 
 impl AcpHarness {
+    /// The handshake and the session, as one fallible step the caller can tear down after.
+    async fn handshake_and_open(
+        &self,
+        connection: &client::ConnectionHandle,
+        host: &HostContext,
+        request: &OpenSession,
+    ) -> Result<(Handshake, Opened)> {
+        let handshake = self.initialize(connection, host).await?;
+        // The working directory is the host's authorised one and nothing wider: the library has no
+        // other directory it is allowed to name to an agent.
+        let opened = self
+            .open(
+                connection,
+                host,
+                request,
+                &handshake,
+                host.cwd().to_path_buf(),
+            )
+            .await?;
+        Ok((handshake, opened))
+    }
+
+    /// Tells the agent which of its own modes to run in, when the profile knows one.
+    async fn apply_mode(
+        &self,
+        session: &AcpSession,
+        configuration: &Configuration,
+        modes: Option<&SessionModeState>,
+    ) -> Result<()> {
+        let Some(mode) = self.mode_for(configuration, modes)? else {
+            return Ok(());
+        };
+        session.set_mode(&mode).await
+    }
+
     async fn initialize(
         &self,
         connection: &client::ConnectionHandle,
         host: &HostContext,
     ) -> Result<Handshake> {
         let client = host.client_info();
-        let response = connection
-            .connection()
-            .send_request(
+        let response = self
+            .request(
+                connection,
+                host,
+                "initialize",
                 InitializeRequest::new(ProtocolVersion::V1)
                     .client_capabilities(Self::client_capabilities())
                     // The host's own name, never the library's: an agent reading its logs should see
@@ -304,12 +358,7 @@ impl AcpHarness {
                         client.version.clone(),
                     )),
             )
-            .block_task()
-            .await
-            .map_err(|error| Error::Link {
-                peer: format!("ACP agent {}", self.profile.id),
-                message: client::with_stderr(&error.message, connection.control().as_ref()),
-            })?;
+            .await?;
 
         if response.protocol_version != ProtocolVersion::V1 {
             // A version this harness does not speak is refused before a session exists. Negotiating
@@ -327,67 +376,70 @@ impl AcpHarness {
     async fn open(
         &self,
         connection: &client::ConnectionHandle,
+        host: &HostContext,
         request: &OpenSession,
         handshake: &Handshake,
         cwd: std::path::PathBuf,
     ) -> Result<Opened> {
-        if let Some(resume) = &request.resume {
-            if handshake.capabilities.load_session {
-                let loaded = connection
-                    .connection()
-                    .send_request(LoadSessionRequest::new(
-                        AcpSessionId::new(resume.native_session_id.clone()),
-                        cwd.clone(),
-                    ))
-                    .block_task()
-                    .await;
-                match loaded {
-                    Ok(loaded) => {
-                        return Ok(Opened {
-                            session_id: AcpSessionId::new(resume.native_session_id.clone()),
-                            resumed: true,
-                            fallback_reason: None,
-                            modes: loaded.modes,
-                        });
-                    }
-                    Err(error) if resume.mode == ResumeMode::Strict => {
-                        return Err(self.request_error("session/load", &error));
-                    }
-                    // Fallback: a fresh conversation, and the host is told why rather than left to
-                    // notice that its history disappeared.
-                    Err(error) => {
-                        let mut opened = self.new_session(connection, cwd).await?;
-                        opened.fallback_reason = Some(error.message);
-                        return Ok(opened);
-                    }
-                }
-            }
+        let Some(resume) = &request.resume else {
+            return self.new_session(connection, host, cwd).await;
+        };
+
+        if !handshake.capabilities.load_session {
             if resume.mode == ResumeMode::Strict {
-                return Err(Error::not_supported(
-                    mango_external_agents::Capability::SessionListing,
-                ));
+                // Not `NotSupported`, which names an optional `Session` method: resuming is not one,
+                // and a host asked for a specific conversation this agent cannot reopen.
+                return Err(Error::Protocol {
+                    expected: String::from("an agent advertising loadSession"),
+                    received: format!("{} with loadSession false", self.profile.id),
+                });
             }
-            let mut opened = self.new_session(connection, cwd).await?;
+            let mut opened = self.new_session(connection, host, cwd).await?;
             opened.fallback_reason =
                 Some(String::from("this agent does not advertise session/load"));
             return Ok(opened);
         }
-        self.new_session(connection, cwd).await
+
+        let loaded = self
+            .request(
+                connection,
+                host,
+                "session/load",
+                LoadSessionRequest::new(
+                    AcpSessionId::new(resume.native_session_id.clone()),
+                    cwd.clone(),
+                ),
+            )
+            .await;
+        match loaded {
+            Ok(loaded) => Ok(Opened {
+                session_id: AcpSessionId::new(resume.native_session_id.clone()),
+                resumed: true,
+                fallback_reason: None,
+                modes: loaded.modes,
+            }),
+            Err(error) if resume.mode == ResumeMode::Strict => Err(error),
+            // Fallback: a fresh conversation, and the host is told why rather than left to notice
+            // that its history disappeared.
+            Err(error) => {
+                let mut opened = self.new_session(connection, host, cwd).await?;
+                opened.fallback_reason = Some(error.to_string());
+                Ok(opened)
+            }
+        }
     }
 
     async fn new_session(
         &self,
         connection: &client::ConnectionHandle,
+        host: &HostContext,
         cwd: std::path::PathBuf,
     ) -> Result<Opened> {
         // `mcp_servers` is empty: nothing on `OpenSession` carries servers, and inventing some would
         // attach an MCP server nobody configured to a third party's agent.
-        let response = connection
-            .connection()
-            .send_request(NewSessionRequest::new(cwd))
-            .block_task()
-            .await
-            .map_err(|error| self.request_error("session/new", &error))?;
+        let response = self
+            .request(connection, host, "session/new", NewSessionRequest::new(cwd))
+            .await?;
         Ok(Opened {
             session_id: response.session_id,
             resumed: false,
@@ -396,15 +448,26 @@ impl AcpHarness {
         })
     }
 
-    fn request_error(&self, method: &'static str, error: &agent_client_protocol::Error) -> Error {
-        request_error(method, error, &self.login_hint())
-    }
-
-    fn login_hint(&self) -> String {
-        self.profile
-            .login_hint
-            .clone()
-            .unwrap_or_else(|| format!("see {}", self.profile.docs_url))
+    /// Sends one handshake request under the host's deadline.
+    async fn request<Request>(
+        &self,
+        connection: &client::ConnectionHandle,
+        host: &HostContext,
+        method: &'static str,
+        request: Request,
+    ) -> Result<Request::Response>
+    where
+        Request: agent_client_protocol::JsonRpcRequest,
+        Request::Response: Send,
+    {
+        client::send(
+            connection,
+            &self.profile,
+            host.limits().request_timeout,
+            method,
+            request,
+        )
+        .await
     }
 
     /// The agent's own mode id for this configuration, when one has to be sent.

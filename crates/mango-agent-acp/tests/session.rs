@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mango_agent_acp::testing::{Approval, FakeAcpAgent};
-use mango_agent_acp::{AcpHarness, AcpProfile};
-use mango_external_agents::testing::{FakeLauncher, RecordingBroker};
+use mango_agent_acp::{AcpHarness, AcpProfile, SessionModeIds};
+use mango_external_agents::testing::{FakeLauncher, FakeProcess, RecordingBroker};
 use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, CloseReason, Configuration, DecisionSource,
     Error, EventKind, Harness, HostContext, Limits, OpenSession, PermissionLevel, Session,
@@ -58,6 +58,19 @@ fn permissive() -> Configuration {
     Configuration {
         level: PermissionLevel::Default,
         ..Configuration::default()
+    }
+}
+
+/// The failure a call was expected to produce.
+///
+/// `Result::expect_err` needs its `Ok` to be `Debug`, and neither `Box<dyn Session>` nor `TurnStream`
+/// is one — a live session handle has nothing meaningful to print. This says the same thing without
+/// asking for it.
+#[track_caller]
+fn refusal<T>(result: mango_external_agents::Result<T>) -> Error {
+    match result {
+        Err(error) => error,
+        Ok(_) => panic!("expected a refusal, received success"),
     }
 }
 
@@ -491,6 +504,194 @@ async fn session_listing_follows_what_the_agent_advertised() {
     assert_eq!(page.sessions[0].title.as_deref(), Some("Yesterday"));
 }
 
+/// An agent that accepts the pipe and never answers would otherwise hold `open_session` open for the
+/// life of the process, which looks to a host like a hung machine rather than a misbehaving agent.
+/// `Limits::request_timeout` is the number the host already set for exactly this.
+#[tokio::test(start_paused = true)]
+async fn a_handshake_the_agent_never_answers_ends_on_the_hosts_own_deadline() {
+    let launcher = FakeLauncher::new();
+    // Accepts every line and answers nothing, which is the shape that hangs.
+    launcher.push(FakeProcess::responding(|_| Vec::new()));
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            request_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+
+    // Wrapped so an *unbounded* handshake fails red rather than hanging: with every task parked the
+    // paused clock auto-advances, this fires, and nextest reports a failure instead of a slow test.
+    let opened = tokio::time::timeout(
+        Duration::from_secs(600),
+        AcpHarness::new(profile()).open_session(&host, OpenSession::new("chat-1")),
+    )
+    .await
+    .expect("expected the handshake to give up on its own deadline");
+
+    let error = refusal(opened);
+    let Error::Timeout { operation, after } = &error else {
+        panic!("received {error:?}");
+    };
+    assert!(operation.contains("initialize"), "received {operation:?}");
+    assert_eq!(*after, Duration::from_secs(5));
+}
+
+/// The same hole `open_session` refuses, one layer down. A turn asking for a level the profile cannot
+/// reach would otherwise set no mode, refuse no request, and run as `Default` while the host believed
+/// it had granted more.
+#[tokio::test]
+async fn a_turn_asking_for_a_level_this_profile_cannot_reach_is_refused() {
+    let (session, _launcher) = open(FakeAcpAgent::new(), permissive()).await;
+
+    let error = refusal(
+        session
+            .start_turn(
+                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
+                    level: PermissionLevel::FullAccess,
+                    ..Configuration::default()
+                }),
+            )
+            .await,
+    );
+    assert!(
+        matches!(error, Error::HostConfiguration { .. }),
+        "received {error:?}"
+    );
+}
+
+/// A launcher that records whether the library ended each child it handed out.
+///
+/// Needed because `FakeLauncher` exposes no per-child handle, so nothing outside the library can
+/// otherwise see a `kill` — and an assertion that cannot see one is an assertion that passes with the
+/// teardown disabled.
+#[derive(Clone)]
+struct KillRecordingLauncher {
+    inner: FakeLauncher,
+    killed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl KillRecordingLauncher {
+    fn new(inner: FakeLauncher) -> Self {
+        Self {
+            inner,
+            killed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn kills(&self) -> usize {
+        self.killed.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for KillRecordingLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        let process = self.inner.spawn(spec).await?;
+        Ok(mango_external_agents::ManagedProcess {
+            control: Arc::new(RecordingControl {
+                inner: process.control,
+                killed: Arc::clone(&self.killed),
+            }),
+            ..process
+        })
+    }
+}
+
+struct RecordingControl {
+    inner: Arc<dyn mango_external_agents::ProcessControl>,
+    killed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessControl for RecordingControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<mango_external_agents::ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.killed
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.inner.kill(reason).await
+    }
+}
+
+fn recording_host(launcher: &KillRecordingLauncher) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .build()
+        .expect("expected a host")
+}
+
+/// A failed `open_session` must not leave an agent running with nothing driving it. The dispatch loop
+/// winds down only when the shutdown channel drops, so a child left behind would outlive the call
+/// that started it by however long that took to reach it.
+#[tokio::test]
+async fn a_refused_handshake_ends_the_child_rather_than_leaving_it_running() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().with_protocol_version(2).process());
+    let launcher = KillRecordingLauncher::new(inner);
+
+    refusal(
+        AcpHarness::new(profile())
+            .open_session(&recording_host(&launcher), OpenSession::new("chat-1"))
+            .await,
+    );
+
+    assert_eq!(
+        launcher.kills(),
+        1,
+        "expected the refused handshake to end its child"
+    );
+}
+
+/// The same guarantee on the other error path: a session the agent opened, refused on our side because
+/// the profile named a mode the agent never advertised.
+#[tokio::test]
+async fn a_mode_the_agent_never_advertised_is_refused_and_ends_the_child() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().with_modes(["default"]).process());
+    let launcher = KillRecordingLauncher::new(inner);
+
+    let insists = Arc::new(
+        AcpProfile::custom("fake", ["fake-acp", "acp"], VENDOR).with_modes(SessionModeIds {
+            read_only: Some("plan"),
+            ..SessionModeIds::UNKNOWN
+        }),
+    );
+    let error = refusal(
+        AcpHarness::new(insists)
+            .open_session(&recording_host(&launcher), OpenSession::new("chat-1"))
+            .await,
+    );
+
+    assert!(
+        matches!(&error, Error::Protocol { expected, .. } if expected.contains("plan")),
+        "received {error:?}"
+    );
+    assert_eq!(
+        launcher.kills(),
+        1,
+        "expected the refused session to end its child"
+    );
+}
+
 /// The library never sends `authenticate`: signing in is the agent's own flow, in the user's own
 /// terminal. All it does with `-32000` is say which command a person should run.
 #[tokio::test]
@@ -505,11 +706,11 @@ async fn a_signed_out_agent_yields_the_profiles_own_login_command_and_no_authent
         AcpProfile::custom("fake", ["fake-acp", "acp"], VENDOR).with_login_hint("fake-acp login"),
     );
 
-    let error = AcpHarness::new(signed_out)
-        .open_session(&host(&launcher), OpenSession::new("chat-1"))
-        .await
-        .err()
-        .expect("expected a refusal, received a session");
+    let error = refusal(
+        AcpHarness::new(signed_out)
+            .open_session(&host(&launcher), OpenSession::new("chat-1"))
+            .await,
+    );
 
     assert!(
         matches!(&error, Error::AuthRequired { login_hint } if login_hint == "fake-acp login"),
@@ -557,11 +758,11 @@ async fn an_agent_answering_another_protocol_version_is_refused() {
     let launcher = FakeLauncher::new();
     launcher.push(FakeAcpAgent::new().with_protocol_version(2).process());
 
-    let error = AcpHarness::new(profile())
-        .open_session(&host(&launcher), OpenSession::new("chat-1"))
-        .await
-        .err()
-        .expect("expected a refusal, received a session");
+    let error = refusal(
+        AcpHarness::new(profile())
+            .open_session(&host(&launcher), OpenSession::new("chat-1"))
+            .await,
+    );
     assert!(
         matches!(&error, Error::Protocol { expected, .. } if expected.contains("protocol version 1")),
         "received {error:?}"
@@ -576,18 +777,18 @@ async fn a_level_this_profile_cannot_reach_is_refused_rather_than_downgraded() {
     let launcher = FakeLauncher::new();
     launcher.push(FakeAcpAgent::new().process());
 
-    let error = AcpHarness::new(profile())
-        .open_session(
-            &host(&launcher),
-            OpenSession::new("chat-1").with_configuration(Configuration {
-                level: PermissionLevel::FullAccess,
-                routing: ApprovalRouting::User,
-                ..Configuration::default()
-            }),
-        )
-        .await
-        .err()
-        .expect("expected a refusal, received a session");
+    let error = refusal(
+        AcpHarness::new(profile())
+            .open_session(
+                &host(&launcher),
+                OpenSession::new("chat-1").with_configuration(Configuration {
+                    level: PermissionLevel::FullAccess,
+                    routing: ApprovalRouting::User,
+                    ..Configuration::default()
+                }),
+            )
+            .await,
+    );
     assert!(
         matches!(error, Error::HostConfiguration { .. }),
         "received {error:?}"

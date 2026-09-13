@@ -9,7 +9,7 @@
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/content>
 //!
 //! The library never reads a file: the bytes arrive on
-//! [`Attachment`](mango_external_agents::Attachment) from the host, which owns the filesystem.
+//! [`Attachment`] from the host, which owns the filesystem.
 
 use agent_client_protocol::schema::v1::{
     BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource, ImageContent,

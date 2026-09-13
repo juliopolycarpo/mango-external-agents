@@ -20,6 +20,13 @@ default = []
 # The named fake ACP agent this crate's own tests replay, for a host writing tests of its own.
 testing = ["mango-external-agents/testing"]
 
+# Driven end to end against the fake agent, which only exists under `testing`. Declared so the
+# `--no-default-features` lane skips the target instead of failing to resolve the import.
+[[test]]
+name = "session"
+path = "tests/session.rs"
+required-features = ["testing"]
+
 [dependencies]
 # ACP v1 only: `unstable_protocol_v2` and the other draft features stay off, so the wire this
 # crate speaks is the one agentclientprotocol.com documents as stable.
@@ -36,6 +43,7 @@ serde_json = { version = "1.0.151", default-features = false, features = ["std"]
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
+async-trait = "0.1.92"
 mango-external-agents = { workspace = true, features = ["testing"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 

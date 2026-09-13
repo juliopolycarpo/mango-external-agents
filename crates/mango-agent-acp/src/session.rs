@@ -25,9 +25,8 @@ use mango_external_agents::{
 };
 
 use crate::client::{
-    Answered, ConnectionHandle, SessionState, TurnHandle, link_failure, with_stderr,
+    self, Answered, ConnectionHandle, SessionState, TurnHandle, link_failure, with_stderr,
 };
-use crate::error::request_error;
 use crate::profile::AcpProfile;
 use crate::{content, permission, reducer};
 
@@ -96,7 +95,9 @@ impl AcpSession {
         .map(|_| ())
     }
 
-    /// Sends one request and maps its failure.
+    /// Sends one request under the host's deadline.
+    ///
+    /// Everything but `session/prompt`, which is a turn and stays unbounded.
     async fn request<Request>(
         &self,
         method: &'static str,
@@ -106,44 +107,41 @@ impl AcpSession {
         Request: agent_client_protocol::JsonRpcRequest,
         Request::Response: Send,
     {
-        self.connection
-            .connection()
-            .send_request(request)
-            .block_task()
-            .await
-            .map_err(|error| self.map_error(method, &error))
-    }
-
-    /// One agent failure as a core failure, with the link's own diagnosis when the link is what broke.
-    fn map_error(&self, method: &'static str, error: &agent_client_protocol::Error) -> Error {
-        if agent_client_protocol::is_incoming_transport_closed(error) {
-            return Error::Link {
-                peer: format!("ACP agent {}", self.profile.id),
-                message: with_stderr(&error.message, self.connection.control().as_ref()),
-            };
-        }
-        request_error(method, error, &self.login_hint())
-    }
-
-    /// The agent's own login command, or its documentation when it has none.
-    ///
-    /// A URL rather than an invented command: an agent whose sign-in happens inside an interactive
-    /// session has no command to print, and printing a plausible one would send a person to a
-    /// prompt that does not exist.
-    fn login_hint(&self) -> String {
-        self.profile
-            .login_hint
-            .clone()
-            .unwrap_or_else(|| format!("see {}", self.profile.docs_url))
+        client::send(
+            &self.connection,
+            &self.profile,
+            self.host.limits().request_timeout,
+            method,
+            request,
+        )
+        .await
     }
 
     /// The configuration one turn runs under, refusing what ACP v1 has no surface for.
+    ///
+    /// A per-turn configuration goes through exactly the checks `open_session` applies, and for the
+    /// same reason: a pair this profile cannot run has to be refused rather than quietly replaced by
+    /// one it can. The case that made this a real hole was a turn asking for
+    /// [`PermissionLevel::FullAccess`](mango_external_agents::PermissionLevel) on a profile with no
+    /// mode for it — nothing would have set a mode, nothing would have refused a request, and the
+    /// turn would have run as `Default` while the host believed it had granted more.
     fn effective(&self, request: &TurnRequest) -> Result<Configuration> {
         let configuration = request
             .configuration
             .clone()
             .unwrap_or_else(|| self.info.effective_configuration.clone());
         refuse_model_selection(&configuration)?;
+        if !crate::profile::matrix(&self.profile.modes)
+            .supports(configuration.level, configuration.routing)
+        {
+            return Err(Error::HostConfiguration {
+                expected: "a (level, routing) pair this profile supports",
+                received: format!(
+                    "{:?}/{:?} on {}",
+                    configuration.level, configuration.routing, self.profile.id
+                ),
+            });
+        }
         if configuration.level != self.info.effective_configuration.level
             && self.profile.modes.for_level(configuration.level).is_some()
         {
@@ -307,10 +305,15 @@ impl Session for AcpSession {
         // `stop_reason: cancelled`, and the task that ends the turn has to report *this* reason
         // rather than flattening a shutdown or a withdrawn consent into "requested".
         self.state.record_cancel_reason(reason);
+        // A notification, so there is no answer to wait for and no deadline to apply: `session/cancel`
+        // is queued to the transport and the agent reports the outcome on the prompt response.
         self.connection
             .connection()
             .send_notification(CancelNotification::new(self.native_session_id.clone()))
-            .map_err(|error| self.map_error("session/cancel", &error))
+            .map_err(|error| Error::Link {
+                peer: format!("ACP agent {}", self.profile.id),
+                message: with_stderr(&error.message, self.connection.control().as_ref()),
+            })
     }
 
     async fn close(&self, reason: CloseReason) -> Result<()> {

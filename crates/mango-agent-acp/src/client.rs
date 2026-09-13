@@ -288,11 +288,14 @@ async fn on_request_permission(
     // Decided before the host is told, so a policy the host already installed does not race the
     // interface the host would otherwise render. The dispatch loop is held while the broker thinks,
     // which is correct: the agent is waiting on this question either way.
-    let decided = standing_refusal(turn.level, &question).or(broker_response(
-        state.broker.as_ref(),
-        &question,
-    )
-    .await);
+    //
+    // A `match` rather than `Option::or`, whose argument is evaluated either way: a read-only
+    // session that already refused must not also consult the broker, or a host reading its own
+    // policy's log would find a question the policy never decided.
+    let decided = match standing_refusal(turn.level, &question) {
+        Some(refusal) => Some(refusal),
+        None => broker_response(state.broker.as_ref(), &question).await,
+    };
 
     // An undecided question is parked *before* it is emitted. A host reading its own stream can
     // answer the instant it sees the event, and an entry inserted afterwards would lose that race
@@ -485,6 +488,49 @@ impl ConnectionHandle {
 
 /// How long the dispatch loop is given to wind down before the child is ended anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Sends one request under the host's own deadline and maps whatever came back.
+///
+/// Every request this harness sends goes through here **except** `session/prompt`, which is a turn
+/// and may legitimately take as long as the agent needs. The rest are handshakes and bookkeeping: an
+/// agent that accepted the pipe and never answered `initialize` would otherwise hold `open_session`
+/// open for the life of the process, which looks to a host exactly like a hung machine rather than a
+/// misbehaving agent. `Limits::request_timeout` is the number the host already set for this.
+///
+/// # Errors
+///
+/// [`Error::Timeout`] when the deadline passed, [`Error::Link`] when the transport went away — with
+/// the child's own stderr, which is the only thing that can explain an agent that exited mid-call —
+/// and otherwise whatever [`request_error`](crate::error::request_error) made of the agent's answer.
+pub(crate) async fn send<Request>(
+    connection: &ConnectionHandle,
+    profile: &crate::profile::AcpProfile,
+    timeout: Duration,
+    method: &'static str,
+    request: Request,
+) -> Result<Request::Response>
+where
+    Request: agent_client_protocol::JsonRpcRequest,
+    Request::Response: Send,
+{
+    let sent = connection.connection().send_request(request);
+    let answered = tokio::time::timeout(timeout, sent.block_task()).await;
+    let Ok(answered) = answered else {
+        return Err(Error::Timeout {
+            operation: format!("{method} on ACP agent {}", profile.id),
+            after: timeout,
+        });
+    };
+    answered.map_err(|error| {
+        if agent_client_protocol::is_incoming_transport_closed(&error) {
+            return Error::Link {
+                peer: format!("ACP agent {}", profile.id),
+                message: with_stderr(&error.message, connection.control().as_ref()),
+            };
+        }
+        crate::error::request_error(method, &error, &profile.login_text())
+    })
+}
 
 /// A message with the child's stderr appended, when it wrote any.
 ///

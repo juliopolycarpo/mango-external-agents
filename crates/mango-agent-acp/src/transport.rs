@@ -7,7 +7,8 @@
 //! the pipes.
 //!
 //! What it receives them as is why this module builds [`Lines`] rather than the crate's
-//! `ByteStreams`: a [`ManagedProcess`] hands over a [`ByteSource`] of chunks and a [`ByteSink`],
+//! `ByteStreams`: a [`ManagedProcess`] hands over a [`ByteSource`](mango_external_agents::ByteSource)
+//! of chunks and a [`ByteSink`],
 //! not a `futures::io::AsyncRead`, so there is nothing for `tokio_util::compat` to convert.
 //! `Lines` wants a `Stream<Item = io::Result<String>>` and a `Sink<String>`, which is exactly what
 //! the core's own [`LineStream`] and [`ByteSink`] are — so the framing, and the cap it reads the
