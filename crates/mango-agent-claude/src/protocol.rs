@@ -15,6 +15,8 @@
 //! `type` is the only discriminator that is trusted, and even it is read as a plain string so that
 //! an unknown value falls through to the ignore path.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value};
 
 /// One line of `claude --print --output-format stream-json`, before it has been recognised.
@@ -244,17 +246,21 @@ impl<'a> ContentBlock<'a> {
     /// A `tool_result` block's payload, flattened.
     ///
     /// The payload is text on some calls and an array of blocks on others, so both are read here
-    /// rather than at the one call site that would then have to know the difference.
-    pub fn result_text(&self) -> String {
+    /// rather than at the one call site that would then have to know the difference. Borrowed for
+    /// the plain-string case rather than cloned: a `Read` or `Bash` result can run to hundreds of
+    /// kilobytes, and every caller bounds this to a few thousand characters before it is kept.
+    pub fn result_text(&self) -> Cow<'a, str> {
         match self.fields.get("content") {
-            Some(Value::String(content)) => content.clone(),
-            Some(Value::Array(blocks)) => blocks
-                .iter()
-                .filter_map(block_text)
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
+            Some(Value::String(content)) => Cow::Borrowed(content.as_str()),
+            Some(Value::Array(blocks)) => Cow::Owned(
+                blocks
+                    .iter()
+                    .filter_map(block_text)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => Cow::Borrowed(""),
         }
     }
 }

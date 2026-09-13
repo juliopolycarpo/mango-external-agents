@@ -24,6 +24,7 @@
 //! `rate_limit_event` all appear on one live run — and it will keep growing. A type this reducer
 //! has never seen is dropped silently; only a `result` ends the turn.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use mango_external_agents::normalize::TextLimit;
@@ -530,6 +531,7 @@ impl TurnReducer {
             let detail = self
                 .denied_activities
                 .remove(call_id)
+                .map(Cow::Owned)
                 .unwrap_or_else(|| block.result_text());
             events.push(EventKind::ActivityCompleted {
                 call_id: call_id.to_owned(),
