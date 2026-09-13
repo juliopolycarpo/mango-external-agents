@@ -73,7 +73,7 @@ impl ConfigFile {
         tokio::fs::write(&path, document.to_string())
             .await
             .map_err(|error| launch_failure("write an MCP configuration", &path, &error))?;
-        restrict_to_owner(&path).await?;
+        restrict_to_owner(&path, 0o600).await?;
 
         Ok(Some(Self { directory, argument }))
     }
@@ -179,31 +179,26 @@ async fn create_private_directory(directory: &Path) -> Result<()> {
     tokio::fs::create_dir(directory)
         .await
         .map_err(|error| launch_failure("create a scratch directory", directory, &error))?;
-    restrict_to_owner(directory).await
+    restrict_to_owner(directory, 0o700).await
 }
 
 /// Takes group and other off a path, on the platforms that have them.
 ///
 /// A no-op on Windows, where the temporary directory is already per-user and the mode bits mean
 /// nothing. Stated rather than silently skipped, because "the permissions were set" is a claim the
-/// module's own docs make.
+/// module's own docs make. `mode` comes from the caller rather than a read-then-branch on the
+/// path's own metadata: every caller already knows whether it just created a directory or a file.
 #[cfg(unix)]
-async fn restrict_to_owner(path: &Path) -> Result<()> {
+async fn restrict_to_owner(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|error| launch_failure("read the permissions of", path, &error))?;
-    let owner_only = if metadata.is_dir() { 0o700 } else { 0o600 };
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(owner_only);
-    tokio::fs::set_permissions(path, permissions)
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .await
         .map_err(|error| launch_failure("restrict the permissions of", path, &error))
 }
 
 #[cfg(not(unix))]
-async fn restrict_to_owner(_path: &Path) -> Result<()> {
+async fn restrict_to_owner(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
