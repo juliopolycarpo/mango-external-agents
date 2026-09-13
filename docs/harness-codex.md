@@ -236,6 +236,9 @@ this tool letting an agent out of its sandbox, checked into the repository.
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
+- `SteerRejection::TurnNotSteerable` is never produced. The app-server's refusal for a turn that
+  refuses steering — a review, a compaction — has not been observed, so a steer it declines for any
+  reason other than "no active turn" surfaces as the vendor error rather than as that reason.
 - A session that is closed while its host has stopped reading its turn offers the turn's terminal
   under a 200 ms grace and then drops the stream. `EventSink::cancel` is two events, so a grace
   that elapses between them shows that host a cancellation marker with no terminal after it. Only
