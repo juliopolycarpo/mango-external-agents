@@ -442,6 +442,46 @@ mod a_turn {
         );
     }
 
+    /// The handle a host persists has to be the one its next open can resume.
+    ///
+    /// Turns after the first already follow a `session_id` the run reported instead of the one
+    /// `--session-id` proposed. A host reading `ids()` has to see the same handle, or it stores
+    /// the abandoned one and its next `open_session` fails at the first turn with the vendor's
+    /// "no conversation found". `info()` is the opening snapshot and keeps the minted id, which is
+    /// what makes the change legible.
+    #[tokio::test]
+    async fn reports_the_session_handle_the_run_chose_rather_than_the_one_it_minted() {
+        const CHOSEN: &str = "9d2b7c14-6f0a-4b8e-9a31-2c5d7e0f4a6b";
+        let transcript = format!(
+            "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{CHOSEN}\"}}\n{{\"type\":\"result\",\"is_error\":false}}"
+        );
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&transcript)));
+        let session = open(&launcher).await;
+        let minted = session.ids().native_session_id;
+        assert_ne!(
+            minted, CHOSEN,
+            "expected the run to report a handle other than the minted one"
+        );
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "start"))
+            .await
+            .expect("expected a turn");
+        drain(&mut turn).await;
+
+        assert_eq!(
+            session.ids().native_session_id,
+            CHOSEN,
+            "expected the handle the run chose, received {:?}",
+            session.ids().native_session_id
+        );
+        assert_eq!(
+            session.info().ids.native_session_id,
+            minted,
+            "expected opening's own snapshot to stay as it answered"
+        );
+    }
+
     /// The echoed handle is a vendor-chosen value that a later argv carries.
     ///
     /// `system/init` is followed because it names the conversation that now exists — but following

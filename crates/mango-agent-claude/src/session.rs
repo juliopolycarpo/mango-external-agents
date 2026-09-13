@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use mango_external_agents::{
     CancelReason, CloseReason, Configuration, Error, ErrorCode, EventSink, ExecutablePath,
-    HostContext, PermissionResponse, Result, SessionInfo, StdioSpec, TurnRequest, TurnStream,
-    VendorError, transports::stdio,
+    HostContext, PermissionResponse, Result, SessionIds, SessionInfo, StdioSpec, TurnRequest,
+    TurnStream, VendorError, transports::stdio,
 };
 use serde_json::json;
 
@@ -175,6 +175,20 @@ async fn end_turn(
 impl mango_external_agents::Session for ClaudeSession {
     fn info(&self) -> &SessionInfo {
         &self.shared.info
+    }
+
+    /// The handle in force, which is not always the one opening minted.
+    ///
+    /// `--session-id` proposes a UUID and `system/init` normally echoes it back, but a run is free
+    /// to report another, and from then on that is the only handle `--resume` accepts. Every turn
+    /// after the first already follows it; this is what lets a host see it too, so the value it
+    /// persists is the one its next `open_session` can actually resume. `info()` keeps the id
+    /// opening answered with, which is what makes the change legible rather than silent.
+    fn ids(&self) -> SessionIds {
+        SessionIds {
+            native_session_id: self.shared.lock().native_session_id.clone(),
+            ..self.shared.info.ids.clone()
+        }
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {

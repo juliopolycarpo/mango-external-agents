@@ -88,6 +88,10 @@ id, and each turn spawns, streams and reaps its own child.
   a host holds a resumable handle before any tokens are spent. The first turn passes
   `--session-id`; every later one passes `--resume`, using whatever handle the run's own
   `system/init` reported.
+- **`Session::ids()` is the handle in force; `Session::info()` is the opening snapshot.** A run may
+  report a `session_id` other than the one `--session-id` proposed, and from then on that is the
+  only handle `--resume` accepts — so it is the one a host persists. `info().ids` keeps the id
+  opening answered with, which is what makes the change legible rather than silent.
 - **Resume is vetted for shape, never verified for existence.** Verifying that a conversation is
   still there would cost a process launch per open, and a wrong guess is recoverable: a session the
   vendor has forgotten fails at the first turn with the vendor's own message. `ResumeMode::Fallback`
