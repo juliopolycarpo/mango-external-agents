@@ -16,7 +16,7 @@
 //!   stream end and writes the terminal pair. Two tasks racing to emit a terminal is the one defect
 //!   a host cannot work around.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use mango_external_agents::{
@@ -38,32 +38,10 @@ use crate::reducer::{RunInit, TurnReducer};
 /// How a run ended, and who decided.
 ///
 /// One transition, taken once. Everything that can stop a turn — a host's `cancel`, a `close`, the
-/// host's own shutdown token — records its reason here and stops; the pump reads it after the
-/// stream ends and writes the terminal pair. Nothing else emits, so "exactly one terminal" is a
-/// property of the code's shape rather than of its timing.
-#[derive(Debug, Default)]
-struct TurnEnd {
-    reason: Mutex<Option<CancelReason>>,
-}
-
-impl TurnEnd {
-    /// Records why this turn is stopping, if nothing recorded one first.
-    ///
-    /// Answers whether this caller was the first, so a close racing a cancel does not kill the
-    /// child twice or report two reasons.
-    fn record(&self, reason: CancelReason) -> bool {
-        let mut recorded = self.reason.lock().unwrap_or_else(PoisonError::into_inner);
-        if recorded.is_some() {
-            return false;
-        }
-        *recorded = Some(reason);
-        true
-    }
-
-    fn reason(&self) -> Option<CancelReason> {
-        *self.reason.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
+/// host's own shutdown token — races to [`set`](OnceLock::set) the reason here and stops; the pump
+/// reads it after the stream ends and writes the terminal pair. Nothing else emits, so "exactly one
+/// terminal" is a property of the code's shape rather than of its timing.
+type TurnEnd = OnceLock<CancelReason>;
 
 /// The turn a session is running right now.
 struct ActiveTurn {
@@ -165,7 +143,7 @@ async fn end_turn(active: Option<ActiveTurn>, reason: CancelReason) {
     let Some(active) = active else {
         return;
     };
-    if !active.end.record(reason) {
+    if active.end.set(reason).is_err() {
         return;
     }
     let _ = active.control.kill(reason).await;
@@ -396,7 +374,7 @@ async fn pump(
     loop {
         let line = tokio::select! {
             () = cancel_token.cancelled() => {
-                end.record(CancelReason::Shutdown);
+                let _ = end.set(CancelReason::Shutdown);
                 let _ = control.kill(CancelReason::Shutdown).await;
                 break;
             }
@@ -431,7 +409,7 @@ async fn pump(
                 // The host dropped the stream. There is nobody to tell, and a turn nobody is
                 // reading is a turn to stop feeding.
                 Err(Error::Closed { .. }) => {
-                    end.record(CancelReason::Requested);
+                    let _ = end.set(CancelReason::Requested);
                     let _ = control.kill(CancelReason::Requested).await;
                     clear_active(&shared, &end);
                     return;
@@ -462,7 +440,7 @@ async fn finish(
     if reducer.finished() {
         // The vendor's own `result` already ended the turn. A cancel that arrived after it changes
         // nothing: the turn did finish.
-    } else if let Some(reason) = end.reason() {
+    } else if let Some(&reason) = end.get() {
         for event in reducer.cancel() {
             let _ = sink.emit(event).await;
         }
@@ -549,13 +527,10 @@ fn no_result_error(
             "Claude Code was stopped before the turn finished",
         );
     }
-    let ended = match exit {
-        Some(exit) => match (exit.code, exit.signal) {
-            (Some(code), _) => format!("exit code {code}"),
-            (None, Some(signal)) => format!("signal {signal}"),
-            (None, None) => String::from("no exit status"),
-        },
-        None => String::from("no exit status"),
+    let ended = match exit.map(|exit| (exit.code, exit.signal)) {
+        Some((Some(code), _)) => format!("exit code {code}"),
+        Some((None, Some(signal))) => format!("signal {signal}"),
+        Some((None, None)) | None => String::from("no exit status"),
     };
     let detail = stderr_tail.trim().to_owned();
     let message = if detail.is_empty() {
@@ -573,13 +548,13 @@ mod tests {
 
     #[test]
     fn only_the_first_caller_to_stop_a_turn_records_the_reason() {
-        let end = TurnEnd::default();
-        assert!(end.record(CancelReason::Requested));
+        let end = TurnEnd::new();
+        assert!(end.set(CancelReason::Requested).is_ok());
         assert!(
-            !end.record(CancelReason::Shutdown),
+            end.set(CancelReason::Shutdown).is_err(),
             "expected the second call to lose"
         );
-        assert_eq!(end.reason(), Some(CancelReason::Requested));
+        assert_eq!(end.get().copied(), Some(CancelReason::Requested));
     }
 
     #[test]
