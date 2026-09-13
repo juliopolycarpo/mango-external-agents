@@ -50,6 +50,12 @@ pub const TURN_ALREADY_RUNNING: ErrorCode = ErrorCode::from_static("codex-turn-a
 /// The session or the connection would not take a call.
 pub const CALL_FAILED: ErrorCode = ErrorCode::from_static("codex-call-failed");
 
+/// How long a closing session offers a turn its terminal before dropping the stream.
+///
+/// A bound on a slow reader, not on a person: a host that is merely behind sees its turn end
+/// normally, and a host that has stopped reading sees the stream close instead.
+const TERMINAL_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// One live conversation with a `codex app-server`.
 pub struct CodexSession {
     info: SessionInfo,
@@ -148,15 +154,34 @@ enum Answer {
 impl Shared {
     /// Puts one event on the running turn's stream.
     ///
-    /// A turn whose host has stopped reading is finished here rather than fed: the sink refuses,
-    /// and there is nobody left to tell.
+    /// The sink is taken out from under the lock before it is used, and that is the whole point of
+    /// the extra statement. The turn channel is bounded: a host that stops reading parks this
+    /// `emit`, and parking while holding the turn lock would park every other caller of it —
+    /// `cancel`, `close`, the next `start_turn` — on a host that is never coming back. A close
+    /// that cannot return is worse than a turn that cannot be fed.
+    ///
+    /// A turn whose host has dropped the stream is finished here rather than fed: the sink
+    /// refuses, and there is nobody left to tell.
     async fn emit(&self, kind: EventKind) {
-        let mut turn = self.turn.lock().await;
-        let Some(active) = turn.as_ref() else {
+        let running = {
+            let turn = self.turn.lock().await;
+            turn.as_ref()
+                .map(|active| (active.sink.clone(), active.turn_id.clone()))
+        };
+        let Some((sink, turn_id)) = running else {
             return;
         };
-        if active.sink.emit(kind).await.is_err() {
-            *turn = None;
+        if sink.emit(kind).await.is_err() {
+            // Cleared only if it is still the same turn. While this was parked, a `finish` may
+            // have ended it and a later `start_turn` installed another, and dropping that one
+            // would strand a stream a host is reading right now.
+            let mut turn = self.turn.lock().await;
+            if turn
+                .as_ref()
+                .is_some_and(|active| active.turn_id == turn_id)
+            {
+                *turn = None;
+            }
         }
     }
 
@@ -190,6 +215,23 @@ impl Shared {
             }
             (None, None) => active.sink.complete().await,
         };
+    }
+
+    /// Ends the running turn without waiting on a host that is not reading.
+    ///
+    /// The turn channel is bounded, and that bound is backpressure on the *vendor* — which is the
+    /// right answer while a turn is running and the wrong one while a session is closing. A close
+    /// that parked on a full channel would hold a `codex app-server` open for the life of the
+    /// process, waiting for a reader that has already walked away.
+    ///
+    /// So the terminal is offered under a grace, and the sink is dropped either way. A host that
+    /// is merely behind gets its `Cancelled` and `Completed`; a host that has stopped reading gets
+    /// the end of its stream, which is the same ending by a different route.
+    async fn abandon(&self, reason: CancelReason) {
+        let Some(active) = self.turn.lock().await.take() else {
+            return;
+        };
+        let _ = tokio::time::timeout(TERMINAL_GRACE, active.sink.cancel(reason)).await;
     }
 
     /// Settles every question the server is still waiting on.
@@ -327,8 +369,14 @@ impl CodexHandler {
             .await;
 
         if let Some(response) = broker_response(self.shared.host.broker(), &bounded).await {
-            let decision = pending.decision_for(&response.option_id)?;
-            self.resolved(&request.id, &response.option_id, response.source)
+            // A policy answering with an id this question never offered is a policy that cannot be
+            // applied here. Refusing is the answer that grants nothing; sending the id on would
+            // have the server refuse a frame a person already thinks was answered.
+            let decision = pending
+                .decision_for(&response.option_id)
+                .unwrap_or_else(|| pending.refusal());
+            let option_id = decision.option_id().to_owned();
+            self.resolved(&request.id, &option_id, response.source)
                 .await;
             return Some(decision);
         }
@@ -657,13 +705,7 @@ impl Session for CodexSession {
             // The turn's own handle has not come back yet, so there is nothing to name in an
             // interrupt. The stream is ended here rather than left waiting on a `turn/completed`
             // for a turn the server may not have started.
-            self.shared
-                .finish(Outcome::Finish {
-                    events: Vec::new(),
-                    cancelled: Some(reason),
-                    failure: None,
-                })
-                .await;
+            self.shared.abandon(reason).await;
             return Ok(());
         }
 
@@ -684,13 +726,7 @@ impl Session for CodexSession {
         self.shared.release_pending(DecisionSource::Cancelled).await;
         // The turn ends here rather than on a notification: the connection is about to go, and a
         // host holding a stream that will never terminate is worse than one told why it stopped.
-        self.shared
-            .finish(Outcome::Finish {
-                events: Vec::new(),
-                cancelled: Some(CancelReason::from(reason)),
-                failure: None,
-            })
-            .await;
+        self.shared.abandon(CancelReason::from(reason)).await;
 
         let closed = self.client.close().await;
         let killed = self.control.kill(CancelReason::from(reason)).await;
@@ -741,9 +777,16 @@ impl Session for CodexSession {
                 mango_external_agents::ReviewTarget::UncommittedChanges => {
                     ReviewTarget::UncommittedChanges
                 }
-                // The core marks its target enum non-exhaustive so a vendor's own targets can be
-                // added. Anything this harness has not learned to spell is the one it has.
-                _ => ReviewTarget::UncommittedChanges,
+                // The core marks its target enum non-exhaustive so a vendor's own targets — a base
+                // branch, a commit — can be added later. Substituting the one target this harness
+                // knows would run a review of something nobody asked about and report it as the
+                // thing they did.
+                other => {
+                    return Err(Error::Protocol {
+                        expected: String::from("a review target this harness can spell"),
+                        received: format!("{other:?}"),
+                    });
+                }
             },
         };
         let (turn, review_thread_id) = self

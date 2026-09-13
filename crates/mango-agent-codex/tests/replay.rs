@@ -84,6 +84,24 @@ fn with_launcher(
     launcher: Arc<FakeLauncher>,
     broker: Option<Arc<dyn PermissionBroker>>,
 ) -> (HostContext, Arc<FakeLauncher>) {
+    with_launcher_limits(
+        launcher,
+        broker,
+        mango_external_agents::Limits {
+            // A call the replay has no answer for is a bug in the fixture or in the harness, and
+            // the default two minutes would report it as a test that hangs rather than one that
+            // fails.
+            request_timeout: std::time::Duration::from_secs(5),
+            ..mango_external_agents::Limits::default()
+        },
+    )
+}
+
+fn with_launcher_limits(
+    launcher: Arc<FakeLauncher>,
+    broker: Option<Arc<dyn PermissionBroker>>,
+    limits: mango_external_agents::Limits,
+) -> (HostContext, Arc<FakeLauncher>) {
     let mut builder = HostContext::builder()
         .launcher(launcher.clone())
         .cwd("/workspace")
@@ -93,12 +111,7 @@ fn with_launcher(
             ("CODEX_HOME", "/home/user/.codex"),
             ("CONNECTOR_SECRET", "never-forward-this"),
         ]))
-        // A call the replay has no answer for is a bug in the fixture or in the harness, and the
-        // default two minutes would report it as a test that hangs rather than one that fails.
-        .limits(mango_external_agents::Limits {
-            request_timeout: std::time::Duration::from_secs(5),
-            ..mango_external_agents::Limits::default()
-        });
+        .limits(limits);
     if let Some(broker) = broker {
         builder = builder.broker(broker);
     }
@@ -472,6 +485,58 @@ async fn a_cancelled_turn_still_completes_and_says_why_it_stopped() {
             .any(|line| line.contains("turn/interrupt")),
         "expected the vendor to be told to stop"
     );
+}
+
+/// A host that stops reading its turn must not be able to stop the session from closing.
+///
+/// The turn channel is bounded, so an unread stream parks whatever is feeding it. If that park
+/// happens while the turn lock is held, every other caller of that lock — `cancel`, `close`, the
+/// next `start_turn` — parks behind a host that is never coming back, and a close that cannot
+/// return leaves a `codex app-server` running for the life of the process.
+///
+/// The capacity is exactly what `start_turn` emits before the vendor says anything: one
+/// `SessionStarted`. The channel is therefore full the instant the turn is returned, and the
+/// pump's first real event parks. A larger capacity and the test proves nothing; a smaller one and
+/// `start_turn` itself parks and this hangs instead of failing.
+#[tokio::test(start_paused = true)]
+async fn a_host_that_stops_reading_cannot_stop_the_session_from_closing() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("turn").as_process());
+    let (host, _) = with_launcher_limits(
+        launcher,
+        None,
+        mango_external_agents::Limits {
+            turn_channel_capacity: 1,
+            request_timeout: std::time::Duration::from_secs(5),
+            ..mango_external_agents::Limits::default()
+        },
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+
+    let turn = session
+        .start_turn(TurnRequest::new("turn-1", "run echo mango"))
+        .await
+        .expect("expected a turn");
+    // Held, never read: this is the host that walked away.
+    let _unread = turn;
+
+    // Twice, so the pump gets the thread and then reaches its park inside the emit.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Comfortably past the grace a closing session offers the terminal under. With the guard held
+    // across the emit there is no timer at all, so a paused runtime advances straight to this one
+    // and the close is still parked when it fires.
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        session.close(CloseReason::Shutdown),
+    )
+    .await
+    .expect("expected the close to answer rather than park behind an unread turn");
+    closed.expect("expected a clean close");
 }
 
 /// Closing twice must not fail the second caller, and the child goes with the first.
