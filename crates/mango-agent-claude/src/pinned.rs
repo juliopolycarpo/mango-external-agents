@@ -77,6 +77,13 @@ pub const SIGTERM_EXIT_CODE: i32 = 143;
 /// seconds is a probe that is not going to.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a turn's stream may go quiet before the turn is abandoned.
+///
+/// Generous, because a single Claude tool call can legitimately run for minutes and the vendor
+/// emits nothing while it does. A host's own turn budget sits above this; what this bounds is a
+/// process that stopped writing without exiting, which no budget above would notice promptly.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Who owns the CLI, and the documents a host's disclosure links.
 pub const VENDOR: VendorInfo = VendorInfo {
     company: "Anthropic",

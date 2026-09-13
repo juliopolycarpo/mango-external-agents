@@ -196,6 +196,21 @@ impl TurnReducer {
         events
     }
 
+    /// Ends the run without a failure, closing every call it left open.
+    ///
+    /// The terminal pair is the caller's: a cancellation's marker carries a reason only the caller
+    /// knows, so this closes the activities and
+    /// [`EventSink::cancel`](mango_external_agents::EventSink::cancel) says why the turn stopped.
+    /// Returns nothing for a run that already ended, so a cancel racing a `result` cannot end a
+    /// turn twice.
+    pub fn cancel(&mut self) -> Vec<EventKind> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        self.close_open_activities()
+    }
+
     fn reduce_system(&mut self, record: &StreamRecord) -> Reduction {
         match record.subtype() {
             // Held rather than forwarded: it names the call it refuses, but the activity it

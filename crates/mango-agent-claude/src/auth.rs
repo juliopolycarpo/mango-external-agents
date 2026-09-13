@@ -56,6 +56,13 @@ pub struct Authentication {
 impl Authentication {
     /// What an invocation that produced nothing usable reads as.
     pub fn unknown() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for Authentication {
+    /// Unknown, which is the only honest answer before `auth status` has answered.
+    fn default() -> Self {
         Self {
             state: AuthState::Unknown,
             kind: None,
