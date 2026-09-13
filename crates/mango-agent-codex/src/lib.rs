@@ -1,6 +1,18 @@
 #![doc = include_str!("../README.md")]
 
+pub mod activity;
+pub mod approvals;
+pub mod discovery;
+pub mod harness;
+pub mod permissions;
 pub mod protocol;
+pub mod rate_limits;
+pub mod reducer;
+pub mod session;
+
+pub use harness::CodexHarness;
+pub use protocol::schema::{MINIMUM_CODEX_VERSION, PIN};
+pub use session::CodexSession;
 
 /// The harness kind this crate implements, as the core registry names it.
 pub const HARNESS_KIND: &str = "codex";
