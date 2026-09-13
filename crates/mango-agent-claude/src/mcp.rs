@@ -117,7 +117,24 @@ fn document_for(servers: &[McpServer]) -> Result<Value> {
             expected: "an MCP transport this harness maps onto --mcp-config",
             received: format!("{:?} on server {:?}", server.transport, server.name),
         })?;
-        configured.insert(server.name.clone(), entry);
+        // The vendor's `mcpServers` is a map, so a repeated name can only keep one entry — and
+        // `insert` would keep the last quietly. That is the same drop this module refuses an
+        // unusable transport for: a turn that runs without the tools somebody configured, reported
+        // as though it had been set up. Which of the two the host meant is not this harness's guess
+        // to make.
+        if let Some(collision) = configured.insert(server.name.clone(), entry) {
+            let count = servers
+                .iter()
+                .filter(|other| other.name == server.name)
+                .count();
+            return Err(Error::HostConfiguration {
+                expected: "one MCP server per name, because the vendor lists them in a map",
+                received: format!(
+                    "{count} servers named {:?}; the first maps to {collision}",
+                    server.name
+                ),
+            });
+        }
     }
     Ok(json!({ "mcpServers": Value::Object(configured) }))
 }
@@ -228,6 +245,19 @@ mod tests {
                 },
             },
         ]
+    }
+
+    #[test]
+    fn refuses_two_servers_that_claim_the_same_name() {
+        let mut servers = servers();
+        servers.push(McpServer::stdio("docs", "other-docs-mcp"));
+
+        let error = document_for(&servers).expect_err("expected the collision to be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("docs") && message.contains('2'),
+            "expected the colliding name and how many asked for it, received {message}"
+        );
     }
 
     #[test]
