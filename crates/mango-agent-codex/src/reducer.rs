@@ -165,9 +165,14 @@ pub const TURN_FAILED: ErrorCode = ErrorCode::from_static("codex-turn-failed");
 
 fn finish(status: Option<TurnStatus>, turn: &crate::protocol::requests::TurnHandle) -> Outcome {
     match status {
-        // Still running, but the server says the turn is over. Nothing sensible follows, so the
-        // turn ends rather than waiting for a completion that has already been sent.
-        Some(TurnStatus::Completed) | Some(TurnStatus::InProgress) | None => Outcome::Finish {
+        // Still running, or spelled in a way this build does not know, but the server says the
+        // turn is over. Nothing sensible follows, so the turn ends rather than waiting for a
+        // completion that has already been sent. An unknown ending claims neither a cancellation
+        // nor a failure, because neither is evidenced.
+        Some(TurnStatus::Completed)
+        | Some(TurnStatus::InProgress)
+        | Some(TurnStatus::Unknown)
+        | None => Outcome::Finish {
             events: Vec::new(),
             cancelled: None,
             failure: None,
@@ -431,6 +436,31 @@ mod tests {
                 cancelled: None,
                 failure: None
             }
+        );
+    }
+
+    /// The one frame whose unknown spelling must not cost the turn. A strict enum would fail the
+    /// whole notification here, and the host would hold a stream that never terminates on a
+    /// session that refuses every later turn as one already running.
+    #[test]
+    fn an_ending_this_build_cannot_name_is_still_an_ending() {
+        let outcome = reduce(
+            &notification(
+                method::TURN_COMPLETED,
+                json!({"threadId": THREAD, "turn": {"id": "u",
+                                                    "status": "somethingTheNextReleaseAdded"}}),
+            ),
+            THREAD,
+            now(),
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Finish {
+                events: Vec::new(),
+                cancelled: None,
+                failure: None
+            },
+            "expected an unknown status to end the turn, received {outcome:?}"
         );
     }
 

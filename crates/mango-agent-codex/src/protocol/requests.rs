@@ -264,6 +264,15 @@ pub enum TurnStatus {
     Interrupted,
     /// It failed.
     Failed,
+    /// A spelling this build does not know.
+    ///
+    /// Every other unknown value in this crate costs one event. This one would cost the turn:
+    /// `turn/completed` is the only frame that ends one, and a strict enum would fail the whole
+    /// notification over a status the next release adds — leaving the host a stream that never
+    /// terminates and a session that refuses every later turn as already running. An ending
+    /// nobody can name is still an ending, and it is read as one.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What the server said about a failed turn.
