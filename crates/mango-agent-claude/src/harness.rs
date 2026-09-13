@@ -122,12 +122,15 @@ impl ClaudeHarness {
             };
         }
 
-        let authentication = probe::output(host, executable, &["auth", "status"])
-            .await
-            .map_or_else(Authentication::unknown, |stdout| {
-                auth::parse_status(&stdout)
-            });
-        let auto_mode_disabled_by_policy = read_auto_mode_policy(host).await;
+        // Neither read depends on the other's result: one is a process boot, the other a file read.
+        let (authentication, auto_mode_disabled_by_policy) = tokio::join!(
+            async {
+                probe::output(host, executable, &["auth", "status"])
+                    .await
+                    .map_or_else(Authentication::unknown, |stdout| auth::parse_status(&stdout))
+            },
+            read_auto_mode_policy(host)
+        );
         let availability = ModeAvailability {
             account_kind: authentication.kind,
             auto_mode_disabled_by_policy,
