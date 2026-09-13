@@ -50,31 +50,18 @@ fn reduce_lines(lines: &[&str]) -> Vec<EventKind> {
 }
 
 /// Each event named by its kind, for asserting on a whole run's shape at once.
-fn shape(events: &[EventKind]) -> Vec<&'static str> {
+fn shape(events: &[EventKind]) -> Vec<String> {
     events.iter().map(name_of).collect()
 }
 
-fn name_of(event: &EventKind) -> &'static str {
-    match event {
-        EventKind::SessionStarted { .. } => "session_started",
-        EventKind::CommandsAvailable { .. } => "commands_available",
-        EventKind::TextDelta { .. } => "text_delta",
-        EventKind::ReasoningStarted => "reasoning_started",
-        EventKind::ReasoningDelta { .. } => "reasoning_delta",
-        EventKind::ReasoningEnded => "reasoning_ended",
-        EventKind::ActivityStarted { .. } => "activity_started",
-        EventKind::ActivityUpdated { .. } => "activity_updated",
-        EventKind::ActivityCompleted { .. } => "activity_completed",
-        EventKind::ApprovalRequested { .. } => "approval_requested",
-        EventKind::ApprovalResolved { .. } => "approval_resolved",
-        EventKind::Usage { .. } => "usage",
-        EventKind::ThreadUsage { .. } => "thread_usage",
-        EventKind::AccountLimits { .. } => "account_limits",
-        EventKind::Cancelled { .. } => "cancelled",
-        EventKind::Completed => "completed",
-        EventKind::Error { .. } => "error",
-        _ => "unknown",
-    }
+/// The event's own `type` tag, read back through the same [`serde::Serialize`] impl the wire
+/// format uses — rather than a hand-maintained copy of `EventKind`'s `#[serde(rename_all)]` table,
+/// which would silently read a variant this match forgot as "unknown" instead of failing.
+fn name_of(event: &EventKind) -> String {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| String::from("unknown"))
 }
 
 fn text_of(events: &[EventKind]) -> String {
