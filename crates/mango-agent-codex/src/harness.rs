@@ -55,11 +55,9 @@ const VENDOR_ENVIRONMENT_KEYS: &[&str] = &["CODEX_HOME"];
 
 /// What this harness could support, given a new enough CLI.
 ///
-/// Every flag here was checked against a running `codex app-server`, not read off a document. The
-/// one that is false is the one that matters: MCP servers are configured in the user's own
-/// `config.toml` or with `codex mcp`, and there is no app-server call that takes a server
-/// definition from a client — so a host cannot pass one through, and this harness does not
-/// pretend otherwise.
+/// Enabled features were checked against a running `codex app-server`. Host-supplied MCP
+/// configuration is not implemented; servers configured in the user's own `config.toml` or with
+/// `codex mcp` remain available to the vendor.
 const CAPABILITIES: Capabilities = Capabilities {
     structured_streaming: true,
     reasoning_stream: true,
@@ -194,6 +192,12 @@ impl Harness for CodexHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
+        if !request.mcp_servers.is_empty() {
+            return Err(Error::HostConfiguration {
+                expected: "a Codex session without host-supplied MCP servers; MCP passthrough is unsupported",
+                received: format!("{} host-supplied MCP server(s)", request.mcp_servers.len()),
+            });
+        }
         let executable = self.program_for(&request);
         let transport = stdio::open(
             host,

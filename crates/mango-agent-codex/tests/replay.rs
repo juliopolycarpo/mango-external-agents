@@ -1417,3 +1417,35 @@ async fn the_harness_passes_the_cores_conformance_suite() {
         report.checks
     );
 }
+
+/// Host MCP requests are unsupported on fresh and resumed Codex sessions.
+#[tokio::test]
+async fn host_mcp_servers_are_refused_before_spawning_codex() {
+    for mode in [
+        None,
+        Some(mango_external_agents::ResumeMode::Strict),
+        Some(mango_external_agents::ResumeMode::Fallback),
+    ] {
+        let (host, launcher) = host_replaying(&["handshake"]);
+        let request = OpenSession::new("chat-1").with_mcp_servers(vec![
+            mango_external_agents::McpServer::stdio("docs", "docs-mcp"),
+        ]);
+
+        let request = match mode {
+            Some(mode) => request.resuming("existing-thread", mode),
+            None => request,
+        };
+        let result = CodexHarness::new().open_session(&host, request).await;
+
+        assert_eq!(
+            launcher.launches().len(),
+            0,
+            "expected unsupported MCP configuration to be refused before spawning Codex"
+        );
+        assert!(
+            matches!(result, Err(mango_external_agents::Error::HostConfiguration { expected, received })
+                if expected.contains("MCP") && received == "1 host-supplied MCP server(s)"),
+            "expected an MCP configuration refusal naming the received server count"
+        );
+    }
+}
