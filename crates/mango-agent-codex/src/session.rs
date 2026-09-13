@@ -975,16 +975,26 @@ impl Session for CodexSession {
 
 /// Whether a steer failed because the turn it named is not the one running.
 ///
-/// The app-server answers `-32600 "no active turn to steer"`. Matched on the message as well as
-/// the code, because `-32600` is the generic invalid-request code and a different invalid request
-/// is a different failure.
+/// The app-server answers `-32600 "no active turn to steer"`. Both halves are checked, because
+/// neither is enough on its own: `-32600` is the generic invalid-request code and carries every
+/// other malformed steer with it, and a message match alone would take a `-32600` this harness
+/// has not seen and report it to a host as a turn that simply finished first.
+///
+/// A code the vendor later changes falls through to the vendor error, which is the conservative
+/// failure: a host is told what the server said rather than told something that did not happen.
 fn is_no_active_turn(error: &VendorError) -> bool {
-    error.message.to_lowercase().contains("no active turn")
+    error.vendor_code.as_deref() == Some(NO_ACTIVE_TURN_CODE)
+        && error.message.to_lowercase().contains("no active turn")
 }
+
+/// The JSON-RPC code the app-server refuses a steer with: the generic invalid-request code.
+const NO_ACTIVE_TURN_CODE: &str = "-32600";
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use mango_external_agents::error::VendorError;
 
     use mango_external_agents::HostContext;
     use mango_external_agents::event::{EventKind, TurnId};
@@ -1105,6 +1115,29 @@ mod tests {
         assert!(
             stream.recv().await.is_none(),
             "expected the stream to end after its terminal"
+        );
+    }
+
+    /// A steer refused because the turn already finished is a rejection a host can act on; any
+    /// other `-32600` is a failure it has to be told about, and the two share a code.
+    #[test]
+    fn only_the_refusal_the_app_server_spells_out_reads_as_a_turn_that_already_finished() {
+        let refusal = VendorError::new(super::CALL_FAILED, "no active turn to steer")
+            .with_vendor_code("-32600", false);
+        assert!(super::is_no_active_turn(&refusal));
+
+        let other = VendorError::new(super::CALL_FAILED, "expectedTurnId is not a uuid")
+            .with_vendor_code("-32600", false);
+        assert!(
+            !super::is_no_active_turn(&other),
+            "expected another invalid request under the same code to stay a failure"
+        );
+
+        let unrecognised = VendorError::new(super::CALL_FAILED, "no active turn to steer")
+            .with_vendor_code("-31999", false);
+        assert!(
+            !super::is_no_active_turn(&unrecognised),
+            "expected a code this harness has not seen to fall through to the vendor error"
         );
     }
 
