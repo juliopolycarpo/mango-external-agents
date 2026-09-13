@@ -22,7 +22,6 @@ mango-external-agents = { workspace = true, features = ["stdio"] }
 
 async-trait = "0.1.92"
 semver = { version = "1.0.28", default-features = false, features = ["std"] }
-serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["fs", "macros", "rt", "sync", "time"] }
 # `--session-id` takes a UUID and nothing else, so the harness mints one rather

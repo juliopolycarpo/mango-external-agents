@@ -268,7 +268,6 @@ dependencies = [
  "async-trait",
  "mango-external-agents",
  "semver",
- "serde",
  "serde_json",
  "tokio",
  "uuid",
