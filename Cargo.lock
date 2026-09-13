@@ -303,6 +303,7 @@ dependencies = [
 name = "mea"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "mango-agent-acp",
  "mango-agent-claude",
  "mango-agent-codex",

@@ -26,3 +26,8 @@ mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio
 
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+async-trait = "0.1.92"
+mango-external-agents = { workspace = true, features = ["testing"] }
+tokio = { version = "1.53.1", default-features = false, features = ["test-util"] }

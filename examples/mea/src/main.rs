@@ -16,6 +16,7 @@
 
 mod capture;
 mod redact;
+mod turn;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -223,18 +224,12 @@ async fn turn(options: &Options) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     eprintln!("session: {}", session.ids().native_session_id);
 
-    let mut stream = session
-        .start_turn(TurnRequest::new("mea-turn-1", options.prompt.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    while let Some(event) = stream.recv().await {
-        println!("{}", serde_json::json!(event.kind));
-    }
-    session
-        .close(mango_external_agents::CloseReason::Requested)
-        .await
-        .map_err(|e| e.to_string())
+    turn::run(
+        session.as_ref(),
+        TurnRequest::new("mea-turn-1", options.prompt.clone()),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn capture(arguments: &[String]) -> Result<(), String> {
