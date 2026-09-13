@@ -62,9 +62,8 @@ const TRANSPORTS: &[TransportKind] = &[TransportKind::Acp];
 ///   [`refuse_model_selection`].
 /// * **No native review and no account usage.** Neither exists on the v1 surface. `usage_update`
 ///   reports a session's context window, which is thread usage rather than plan quota.
-/// * **No MCP passthrough yet.** The wire carries `session/new.mcpServers`, but nothing on
-///   [`OpenSession`] carries servers for it to be filled from, so this harness sends none and says
-///   so rather than advertising a passthrough that passes nothing.
+/// * **No MCP passthrough yet.** Host-supplied servers are refused before launch. The harness sends
+///   an empty `session/new.mcpServers` list.
 fn ceiling() -> Capabilities {
     Capabilities {
         structured_streaming: true,
@@ -224,6 +223,12 @@ impl Harness for AcpHarness {
                     "{:?}/{:?} on {}",
                     request.configuration.level, request.configuration.routing, self.profile.id
                 ),
+        if !request.mcp_servers.is_empty() {
+            return Err(Error::HostConfiguration {
+                expected: "no host-supplied MCP servers: ACP passthrough is not implemented",
+                received: format!("{} host-supplied MCP server(s)", request.mcp_servers.len()),
+            });
+        }
             });
         }
 
@@ -447,8 +452,7 @@ impl AcpHarness {
         host: &HostContext,
         cwd: std::path::PathBuf,
     ) -> Result<Opened> {
-        // `mcp_servers` is empty: nothing on `OpenSession` carries servers, and inventing some would
-        // attach an MCP server nobody configured to a third party's agent.
+        // Host-supplied MCP servers were refused before launch; none are attached here.
         let response = self
             .request(connection, host, "session/new", NewSessionRequest::new(cwd))
             .await?;

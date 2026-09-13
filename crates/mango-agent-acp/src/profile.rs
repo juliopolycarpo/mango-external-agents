@@ -415,7 +415,6 @@ fn gemini() -> AcpProfile {
         &["gemini", "--acp"],
         "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md",
     )
-    .with_vendor_environment_keys(&["GEMINI_API_KEY", "GOOGLE_API_KEY"])
 }
 
 /// GitHub Copilot CLI in ACP mode.
@@ -484,7 +483,7 @@ fn codex_acp() -> AcpProfile {
     // `NO_BROWSER` is the adapter's own documented way to stop it opening a sign-in page. The
     // library never opens a browser; letting the variable through is how a host says the adapter
     // must not either.
-    .with_vendor_environment_keys(&["CODEX_API_KEY", "OPENAI_API_KEY", "NO_BROWSER"])
+    .with_vendor_environment_keys(&["NO_BROWSER"])
 }
 
 /// The ACP adapter that fronts Claude Code.
@@ -507,7 +506,6 @@ fn claude_agent_acp() -> AcpProfile {
         "https://github.com/agentclientprotocol/claude-agent-acp",
     )
     .with_login_hint("claude auth login")
-    .with_vendor_environment_keys(&["ANTHROPIC_API_KEY"])
 }
 
 #[cfg(test)]

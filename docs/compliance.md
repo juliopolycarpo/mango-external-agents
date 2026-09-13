@@ -145,7 +145,7 @@ what was and was not found.
   declined, so a vendor-initiated file or terminal request is answered with a JSON-RPC error and never
   executed. Every agent here uses its own tools instead.
 - **No MCP servers.** `session/new.mcpServers` is sent empty; nothing is attached that a host did not
-  configure, and nothing on the host's request surface carries servers yet.
+  configure. Nonempty `OpenSession::mcp_servers` is refused before launching the agent.
 
 **Per profile.** Every agent below documents its own ACP mode, and for none of them was a statement
 about third-party harnesses found either way — "not found" is the finding, not "permitted".

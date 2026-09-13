@@ -249,18 +249,9 @@ No profile pins a `minimum_version`. A floor nobody has checked would refuse a b
 
 ### Environment keys
 
-Beyond the core's base allowlist, each profile names only variables the agent's own documentation
-describes. The library never sets a value; it lets the host's own through by name.
-
-| Profile            | Keys                                            | Source                              |
-| ------------------ | ----------------------------------------------- | ----------------------------------- |
-| `gemini`           | `GEMINI_API_KEY`, `GOOGLE_API_KEY`              | its documented non-interactive auth |
-| `codex-acp`        | `CODEX_API_KEY`, `OPENAI_API_KEY`, `NO_BROWSER` | the adapter's README                |
-| `claude-agent-acp` | `ANTHROPIC_API_KEY`                             | the adapter's README                |
-
-Every other profile ships none. `NO_BROWSER` earns its place for the same reason the rest do and one
-more: it is the adapter's own documented way to stop it opening a sign-in page, which is this library's
-invariant too.
+Built-in profiles do not forward API keys or tokens from the host's environment. Sign-in remains
+the user's arrangement with the installed CLI. Beyond the core's base allowlist, only `codex-acp`
+adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a sign-in page.
 
 ## Sessions
 
@@ -296,10 +287,8 @@ never going to work.
 
 ## Known caveats
 
-- **No MCP passthrough.** The wire carries `session/new.mcpServers`, but nothing on `OpenSession`
-  carries servers for it to be filled from, so this harness sends none and reports
-  `mcp_passthrough: false` rather than advertising a passthrough that passes nothing. Carrying them
-  needs an additive core change.
+- **No MCP passthrough.** `OpenSession::mcp_servers` is refused when nonempty, before launching the
+  agent. This harness sends an empty `session/new.mcpServers` and reports `mcp_passthrough: false`.
 - **No model selection.** ACP v1 has no surface for one, so a `Configuration` naming a model or a
   reasoning effort is refused rather than silently ignored, and `model_catalog` is never reported.
 - **A host that drops a `TurnStream` mid-turn stops reading, and nothing else.** No `session/cancel` is
