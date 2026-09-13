@@ -1,6 +1,10 @@
 #![doc = include_str!("../README.md")]
 
+pub mod content;
+pub mod error;
+pub mod permission;
 pub mod profile;
+pub mod reducer;
 pub mod transport;
 pub mod version;
 
