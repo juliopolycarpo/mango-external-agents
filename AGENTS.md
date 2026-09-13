@@ -53,8 +53,11 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 - **TLS is `ring` everywhere.** `deny.toml` bans `aws-lc-rs` and `openssl`; `scripts/check-tls.sh`
   proves the tree is clean. `agent-client-protocol` and the smol family stay inside
   `mango-agent-acp`.
-- **Vendor fixtures are captured by `mea capture`, never hand-edited.** Vendored Codex sources
-  are copied by `scripts/vendor-codex.sh` from a pinned tag, never patched in place.
+- **Vendor fixtures are captured by `mea capture`, never hand-edited.** The Codex wire contract is
+  vendored as OpenAI's own schema, not as its Rust sources: `scripts/vendor-codex.sh` regenerates
+  `crates/mango-agent-codex/vendor/` from `codex app-server generate-json-schema` at the pinned
+  version, and the file is never patched in place. See `docs/harness-codex.md` for why the source
+  tree is not vendored.
 - **Toolchain policy.** `rust-toolchain.toml` is bumped within a week of a stable release;
   `rust-version` is stable − 2 and enforced by the MSRV lane.
 - Every new function gets a test. A bug fix gets a regression test that fails first with the

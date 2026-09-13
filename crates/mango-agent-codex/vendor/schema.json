@@ -1,0 +1,637 @@
+{
+  "codexVersion": "0.153.4",
+  "definitions": {
+    "Account": {
+      "properties": [
+        "email",
+        "planType",
+        "type",
+        "usesCodexManagedCredentials"
+      ],
+      "values": [
+        "amazonBedrock",
+        "apiKey",
+        "chatgpt"
+      ]
+    },
+    "AccountRateLimitsUpdatedNotification": {
+      "properties": [
+        "rateLimits"
+      ]
+    },
+    "AgentMessageDeltaNotification": {
+      "properties": [
+        "delta",
+        "itemId",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "ApprovalsReviewer": {
+      "values": [
+        "auto_review",
+        "guardian_subagent",
+        "user"
+      ]
+    },
+    "AskForApproval": {
+      "properties": [
+        "granular"
+      ],
+      "values": [
+        "never",
+        "on-request",
+        "untrusted"
+      ]
+    },
+    "ClientInfo": {
+      "properties": [
+        "name",
+        "title",
+        "version"
+      ]
+    },
+    "CommandExecutionApprovalDecision": {
+      "properties": [
+        "acceptWithExecpolicyAmendment",
+        "applyNetworkPolicyAmendment"
+      ],
+      "values": [
+        "accept",
+        "acceptForSession",
+        "cancel",
+        "decline"
+      ]
+    },
+    "CommandExecutionRequestApprovalParams": {
+      "properties": [
+        "approvalId",
+        "command",
+        "commandActions",
+        "cwd",
+        "environmentId",
+        "itemId",
+        "kind",
+        "networkApprovalContext",
+        "proposedExecpolicyAmendment",
+        "proposedNetworkPolicyAmendments",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "CommandExecutionRequestApprovalResponse": {
+      "properties": [
+        "decision"
+      ]
+    },
+    "CommandExecutionStatus": {
+      "values": [
+        "completed",
+        "declined",
+        "failed",
+        "inProgress"
+      ]
+    },
+    "ErrorNotification": {
+      "properties": [
+        "error",
+        "threadId",
+        "turnId",
+        "willRetry"
+      ]
+    },
+    "FileChangeApprovalDecision": {
+      "values": [
+        "accept",
+        "acceptForSession",
+        "cancel",
+        "decline"
+      ]
+    },
+    "FileChangeRequestApprovalParams": {
+      "properties": [
+        "grantRoot",
+        "itemId",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "FileChangeRequestApprovalResponse": {
+      "properties": [
+        "decision"
+      ]
+    },
+    "GetAccountParams": {
+      "properties": [
+        "refreshToken"
+      ]
+    },
+    "GetAccountResponse": {
+      "properties": [
+        "account",
+        "requiresOpenaiAuth"
+      ]
+    },
+    "InitializeParams": {
+      "properties": [
+        "capabilities",
+        "clientInfo"
+      ]
+    },
+    "InitializeResponse": {
+      "properties": [
+        "codexHome",
+        "platformFamily",
+        "platformOs",
+        "userAgent"
+      ]
+    },
+    "ItemCompletedNotification": {
+      "properties": [
+        "completedAtMs",
+        "item",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "ItemStartedNotification": {
+      "properties": [
+        "item",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "McpToolCallStatus": {
+      "values": [
+        "completed",
+        "failed",
+        "inProgress"
+      ]
+    },
+    "Model": {
+      "properties": [
+        "additionalSpeedTiers",
+        "availabilityNux",
+        "defaultReasoningEffort",
+        "defaultServiceTier",
+        "description",
+        "displayName",
+        "hidden",
+        "id",
+        "inputModalities",
+        "isDefault",
+        "model",
+        "modelSpecialty",
+        "multiAgentVersion",
+        "serviceTiers",
+        "supportedReasoningEfforts",
+        "supportsPersonality",
+        "upgrade",
+        "upgradeInfo"
+      ]
+    },
+    "ModelListParams": {
+      "properties": [
+        "cursor",
+        "includeHidden",
+        "limit"
+      ]
+    },
+    "ModelListResponse": {
+      "properties": [
+        "data",
+        "nextCursor"
+      ]
+    },
+    "PatchApplyStatus": {
+      "values": [
+        "completed",
+        "declined",
+        "failed",
+        "inProgress"
+      ]
+    },
+    "RateLimitSnapshot": {
+      "properties": [
+        "credits",
+        "individualLimit",
+        "limitId",
+        "limitName",
+        "planType",
+        "primary",
+        "rateLimitReachedType",
+        "secondary",
+        "spendControlReached"
+      ]
+    },
+    "RateLimitWindow": {
+      "properties": [
+        "resetsAt",
+        "usedPercent",
+        "windowDurationMins"
+      ]
+    },
+    "ReasoningEffortOption": {
+      "properties": [
+        "description",
+        "reasoningEffort"
+      ]
+    },
+    "ReasoningSummaryTextDeltaNotification": {
+      "properties": [
+        "delta",
+        "itemId",
+        "summaryIndex",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "ReasoningTextDeltaNotification": {
+      "properties": [
+        "contentIndex",
+        "delta",
+        "itemId",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "ReviewStartParams": {
+      "properties": [
+        "delivery",
+        "target",
+        "threadId"
+      ]
+    },
+    "ReviewStartResponse": {
+      "properties": [
+        "reviewThreadId",
+        "turn"
+      ]
+    },
+    "ReviewTarget": {
+      "properties": [
+        "branch",
+        "instructions",
+        "sha",
+        "title",
+        "type"
+      ],
+      "values": [
+        "baseBranch",
+        "commit",
+        "custom",
+        "uncommittedChanges"
+      ]
+    },
+    "SandboxMode": {
+      "values": [
+        "danger-full-access",
+        "read-only",
+        "workspace-write"
+      ]
+    },
+    "ServerRequestResolvedNotification": {
+      "properties": [
+        "requestId",
+        "threadId"
+      ]
+    },
+    "Thread": {
+      "properties": [
+        "agentNickname",
+        "agentRole",
+        "cliVersion",
+        "createdAt",
+        "cwd",
+        "ephemeral",
+        "forkedFromId",
+        "gitInfo",
+        "historyMode",
+        "id",
+        "model",
+        "modelProvider",
+        "name",
+        "parentThreadId",
+        "path",
+        "preview",
+        "projectId",
+        "reasoningEffort",
+        "recencyAt",
+        "section",
+        "sectionEnteredAt",
+        "sessionId",
+        "source",
+        "status",
+        "threadSource",
+        "turns",
+        "updatedAt"
+      ]
+    },
+    "ThreadItem": {
+      "properties": [
+        "action",
+        "agentPath",
+        "agentThreadId",
+        "agentsStates",
+        "aggregatedOutput",
+        "appContext",
+        "arguments",
+        "changes",
+        "clientId",
+        "command",
+        "commandActions",
+        "content",
+        "contentItems",
+        "cwd",
+        "delivery",
+        "durationMs",
+        "error",
+        "exitCode",
+        "failure",
+        "fragments",
+        "id",
+        "kind",
+        "mcpAppResourceUri",
+        "memoryCitation",
+        "model",
+        "name",
+        "namespace",
+        "output",
+        "path",
+        "phase",
+        "pluginId",
+        "processId",
+        "prompt",
+        "query",
+        "questions",
+        "readOnlyHint",
+        "reasoningEffort",
+        "receiverThreadIds",
+        "result",
+        "results",
+        "review",
+        "revisedPrompt",
+        "savedPath",
+        "scriptPath",
+        "senderThreadId",
+        "server",
+        "source",
+        "status",
+        "success",
+        "summary",
+        "text",
+        "tool",
+        "transparentBackground",
+        "type"
+      ],
+      "values": [
+        "agentMessage",
+        "collabAgentToolCall",
+        "commandExecution",
+        "contextCompaction",
+        "dynamicToolCall",
+        "enteredReviewMode",
+        "exitedReviewMode",
+        "fileChange",
+        "functionCallOutput",
+        "hookPrompt",
+        "imageGeneration",
+        "imageView",
+        "mcpToolCall",
+        "plan",
+        "reasoning",
+        "sleep",
+        "subAgentActivity",
+        "userMessage",
+        "webSearch"
+      ]
+    },
+    "ThreadListParams": {
+      "properties": [
+        "archived",
+        "cursor",
+        "cwd",
+        "limit",
+        "modelProviders",
+        "searchTerm",
+        "sectionId",
+        "sortDirection",
+        "sortKey",
+        "sourceKinds",
+        "useStateDbOnly"
+      ]
+    },
+    "ThreadListResponse": {
+      "properties": [
+        "backwardsCursor",
+        "data",
+        "nextCursor"
+      ]
+    },
+    "ThreadResumeParams": {
+      "properties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "baseInstructions",
+        "config",
+        "cwd",
+        "developerInstructions",
+        "excludeTurns",
+        "model",
+        "modelProvider",
+        "personality",
+        "sandbox",
+        "serviceTier",
+        "threadId"
+      ]
+    },
+    "ThreadResumeResponse": {
+      "properties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "cwd",
+        "instructionSources",
+        "itemsBackwardsCursor",
+        "model",
+        "modelProvider",
+        "reasoningEffort",
+        "sandbox",
+        "serviceTier",
+        "thread",
+        "turnsBackwardsCursor"
+      ]
+    },
+    "ThreadStartParams": {
+      "properties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "baseInstructions",
+        "config",
+        "cwd",
+        "developerInstructions",
+        "ephemeral",
+        "model",
+        "modelProvider",
+        "personality",
+        "sandbox",
+        "serviceName",
+        "serviceTier",
+        "sessionStartSource",
+        "threadSource"
+      ]
+    },
+    "ThreadStartResponse": {
+      "properties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "cwd",
+        "instructionSources",
+        "model",
+        "modelProvider",
+        "reasoningEffort",
+        "sandbox",
+        "serviceTier",
+        "thread"
+      ]
+    },
+    "ThreadStartedNotification": {
+      "properties": [
+        "thread"
+      ]
+    },
+    "ThreadTokenUsage": {
+      "properties": [
+        "last",
+        "modelContextWindow",
+        "total"
+      ]
+    },
+    "ThreadTokenUsageUpdatedNotification": {
+      "properties": [
+        "threadId",
+        "tokenUsage",
+        "turnId"
+      ]
+    },
+    "TokenUsageBreakdown": {
+      "properties": [
+        "cacheWriteInputTokens",
+        "cachedInputTokens",
+        "inputTokens",
+        "outputTokens",
+        "reasoningOutputTokens",
+        "totalTokens"
+      ]
+    },
+    "Turn": {
+      "properties": [
+        "completedAt",
+        "durationMs",
+        "error",
+        "id",
+        "items",
+        "itemsView",
+        "startedAt",
+        "status"
+      ]
+    },
+    "TurnCompletedNotification": {
+      "properties": [
+        "threadId",
+        "turn"
+      ]
+    },
+    "TurnError": {
+      "properties": [
+        "additionalDetails",
+        "codexErrorInfo",
+        "message",
+        "misalignment"
+      ]
+    },
+    "TurnInterruptParams": {
+      "properties": [
+        "threadId",
+        "turnId"
+      ]
+    },
+    "TurnStartParams": {
+      "properties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "clientUserMessageId",
+        "cwd",
+        "effort",
+        "input",
+        "model",
+        "outputSchema",
+        "personality",
+        "sandboxPolicy",
+        "serviceTier",
+        "serviceTierForTurn",
+        "summary",
+        "threadId",
+        "toolOutput",
+        "turnTrigger"
+      ]
+    },
+    "TurnStartResponse": {
+      "properties": [
+        "turn"
+      ]
+    },
+    "TurnStartedNotification": {
+      "properties": [
+        "threadId",
+        "turn"
+      ]
+    },
+    "TurnStatus": {
+      "values": [
+        "completed",
+        "failed",
+        "inProgress",
+        "interrupted"
+      ]
+    },
+    "TurnSteerParams": {
+      "properties": [
+        "clientUserMessageId",
+        "expectedTurnId",
+        "input",
+        "threadId"
+      ]
+    },
+    "TurnSteerResponse": {
+      "properties": [
+        "turnId"
+      ]
+    },
+    "UserInput": {
+      "properties": [
+        "detail",
+        "name",
+        "path",
+        "text",
+        "text_elements",
+        "type",
+        "url"
+      ],
+      "values": [
+        "audio",
+        "image",
+        "localAudio",
+        "localImage",
+        "mention",
+        "skill",
+        "text"
+      ]
+    }
+  },
+  "note": "Generated by scripts/vendor-codex.sh from `codex app-server generate-json-schema`. Do not edit by hand."
+}
