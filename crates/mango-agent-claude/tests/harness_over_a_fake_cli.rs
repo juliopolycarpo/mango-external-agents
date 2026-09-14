@@ -973,7 +973,12 @@ mod a_turn {
             .await
             .expect_err("expected the attachment to be refused rather than silently dropped");
         assert!(
-            matches!(error, Error::HostConfiguration { .. }),
+            matches!(
+                error,
+                Error::NotSupported {
+                    capability: mango_external_agents::Capability::Images
+                }
+            ),
             "received {error:?}"
         );
         assert!(launcher.turn_argvs().is_empty());
@@ -988,7 +993,12 @@ mod a_turn {
             .await
             .expect_err("expected a refusal");
         assert!(
-            matches!(error, Error::Vendor(ref vendor) if vendor.code.as_str() == "claude-approvals-unsupported"),
+            matches!(
+                error,
+                Error::NotSupported {
+                    capability: mango_external_agents::Capability::InteractiveApprovals
+                }
+            ),
             "received {error:?}"
         );
     }
@@ -1122,7 +1132,12 @@ mod mcp_passthrough {
             .map(drop)
             .expect_err("expected a refusal rather than a session without the servers");
         assert!(
-            matches!(error, Error::HostConfiguration { .. }),
+            matches!(
+                error,
+                Error::NotSupported {
+                    capability: mango_external_agents::Capability::McpPassthrough
+                }
+            ),
             "received {error:?}"
         );
     }

@@ -13,7 +13,9 @@ async fn unsupported_host_mcp_servers_are_refused_before_launch() {
         .open_session(&host(launcher.clone()), request)
         .await;
     match result {
-        Err(Error::HostConfiguration { expected, .. }) => assert!(expected.contains("MCP")),
+        Err(Error::NotSupported {
+            capability: mango_external_agents::Capability::McpPassthrough,
+        }) => {}
         Err(error) => panic!("expected an unsupported MCP configuration, received {error}"),
         Ok(session) => {
             session
@@ -26,6 +28,30 @@ async fn unsupported_host_mcp_servers_are_refused_before_launch() {
     assert!(
         launcher.launches().is_empty(),
         "expected refusal before launch"
+    );
+}
+
+#[tokio::test]
+async fn strict_resume_is_a_typed_refusal_when_the_agent_does_not_advertise_it() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(FakeAcpAgent::new().without_load_session().process());
+    let result = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(
+            &host(launcher),
+            mango_external_agents::OpenSession::new("resume")
+                .resuming("agent-session", mango_external_agents::ResumeMode::Strict),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::NotSupported {
+                capability: mango_external_agents::Capability::Resume
+            })
+        ),
+        "expected the advertised missing resume capability"
     );
 }
 

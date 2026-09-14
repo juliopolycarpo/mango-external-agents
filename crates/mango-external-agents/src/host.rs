@@ -155,6 +155,12 @@ pub struct Limits {
     pub stderr_tail_bytes: usize,
     /// How long one request waits for its answer before it is a failure.
     pub request_timeout: Duration,
+    /// How long a vendor approval stays answerable before the harness refuses it.
+    ///
+    /// Separate from [`Self::request_timeout`]: a request deadline bounds a protocol call, while an
+    /// approval is work deliberately waiting for a person or the host's policy. Keeping them apart
+    /// lets a host fail a stalled handshake promptly without cutting an approval short.
+    pub approval_timeout: Duration,
     /// How long a child is given to exit on its own before the launcher escalates.
     pub kill_grace: Duration,
 }
@@ -166,6 +172,7 @@ impl Default for Limits {
             line: LineLimits::default(),
             stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
             request_timeout: Duration::from_secs(120),
+            approval_timeout: Duration::from_secs(30 * 60),
             kill_grace: Duration::from_secs(2),
         }
     }

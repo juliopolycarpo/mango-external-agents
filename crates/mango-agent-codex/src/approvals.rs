@@ -16,13 +16,6 @@ use crate::protocol::approvals::{
     ApprovalDecisionValue, CommandExecutionApprovalParams, FileChangeApprovalParams, ServerRequest,
 };
 
-/// How long a question stays answerable.
-///
-/// The app-server sets no deadline of its own: it blocks until the client replies, and a prompt
-/// nobody answers is a turn that never ends. The core's `ApprovalDeadline` measures this budget
-/// from the request's creation; the harness sends the vendor's refusal when it expires.
-pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
 /// One question, and the answers this harness will take for it.
 ///
 /// The options are derived from the decision values the pinned schema declares, narrowed by the
@@ -65,15 +58,25 @@ impl PendingApproval {
 ///
 /// `None` for a request this harness refuses; the caller answers those with a protocol error.
 #[must_use]
-pub fn to_request(request: &ServerRequest, now: SystemTime) -> Option<PendingApproval> {
+pub(crate) fn to_request(
+    request: &ServerRequest,
+    now: SystemTime,
+    approval_timeout: Duration,
+) -> Option<PendingApproval> {
     match request {
-        ServerRequest::CommandExecution(params) => Some(from_command(params, now)),
-        ServerRequest::FileChange(params) => Some(from_file_change(params, now)),
+        ServerRequest::CommandExecution(params) => {
+            Some(from_command(params, now, approval_timeout))
+        }
+        ServerRequest::FileChange(params) => Some(from_file_change(params, now, approval_timeout)),
         ServerRequest::Refused { .. } => None,
     }
 }
 
-fn from_command(params: &CommandExecutionApprovalParams, now: SystemTime) -> PendingApproval {
+fn from_command(
+    params: &CommandExecutionApprovalParams,
+    now: SystemTime,
+    approval_timeout: Duration,
+) -> PendingApproval {
     let command = params.command.as_deref().unwrap_or("a command");
     let title = format!("Run {command}");
     let detail = match (params.reason.as_deref(), params.cwd.as_deref()) {
@@ -109,10 +112,15 @@ fn from_command(params: &CommandExecutionApprovalParams, now: SystemTime) -> Pen
         detail,
         decisions,
         now,
+        approval_timeout,
     )
 }
 
-fn from_file_change(params: &FileChangeApprovalParams, now: SystemTime) -> PendingApproval {
+fn from_file_change(
+    params: &FileChangeApprovalParams,
+    now: SystemTime,
+    approval_timeout: Duration,
+) -> PendingApproval {
     let title = match params.grant_root.as_deref() {
         Some(root) => format!("Write under {root}"),
         None => String::from("Apply file changes"),
@@ -124,6 +132,7 @@ fn from_file_change(params: &FileChangeApprovalParams, now: SystemTime) -> Pendi
         params.reason.clone(),
         base_decisions(),
         now,
+        approval_timeout,
     )
 }
 
@@ -144,6 +153,7 @@ fn build(
     detail: Option<String>,
     decisions: Vec<ApprovalDecisionValue>,
     now: SystemTime,
+    approval_timeout: Duration,
 ) -> PendingApproval {
     let options = decisions.iter().map(option_for).collect();
     let decisions = decisions
@@ -167,7 +177,7 @@ fn build(
             title,
             detail,
             options,
-            expires_at: now + APPROVAL_TIMEOUT,
+            expires_at: now + approval_timeout,
             truncated: false,
         },
         decisions,
@@ -225,16 +235,28 @@ mod tests {
                 "command": "rm -rf /tmp/mango",
             }),
         );
-        super::to_request(&request, std::time::SystemTime::UNIX_EPOCH)
-            .expect("expected a question a person can be asked")
+        super::to_request(
+            &request,
+            std::time::SystemTime::UNIX_EPOCH,
+            approval_timeout(),
+        )
+        .expect("expected a question a person can be asked")
     }
 
-    use super::{APPROVAL_TIMEOUT, to_request};
+    use super::to_request as build_request;
     use crate::protocol::approvals::{ApprovalDecisionValue, ServerRequest, method};
     use mango_external_agents::event::ActivityKind;
     use mango_external_agents::permission::PermissionOptionKind;
     use serde_json::json;
     use std::time::{Duration, SystemTime};
+
+    fn approval_timeout() -> Duration {
+        mango_external_agents::Limits::default().approval_timeout
+    }
+
+    fn to_request(request: &ServerRequest, now: SystemTime) -> Option<super::PendingApproval> {
+        build_request(request, now, approval_timeout())
+    }
 
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_283_381)
@@ -302,7 +324,7 @@ mod tests {
             "expected the working directory in the detail, received {:?}",
             pending.request.detail
         );
-        assert_eq!(pending.request.expires_at, now() + APPROVAL_TIMEOUT);
+        assert_eq!(pending.request.expires_at, now() + approval_timeout());
     }
 
     /// `cancel` aborts the turn. The core's RejectOnce means the turn goes on, so mapping it there

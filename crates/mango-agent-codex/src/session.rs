@@ -725,7 +725,9 @@ impl PeerHandler for CodexHandler {
         // a host clock that moved backward between the two reads extend the monotonic approval
         // window past what `expires_at` advertised.
         let now = self.shared.host.now();
-        let Some(pending) = approvals::to_request(&request, now) else {
+        let Some(pending) =
+            approvals::to_request(&request, now, self.shared.host.limits().approval_timeout)
+        else {
             return ServerRequestOutcome::Failure(JsonRpcError {
                 code: -32601,
                 message: String::from("expected an approval this client can put to a person"),
@@ -1335,6 +1337,7 @@ impl Session for CodexSession {
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        self.validate_turn_request(&request)?;
         // Codex already persists its accepted settings. Omission leaves those settings alone.
         let configuration = request.configuration.clone().unwrap_or_default();
         let vendor = crate::permissions::overrides(&configuration);
@@ -1374,6 +1377,7 @@ impl Session for CodexSession {
     }
 
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
+        self.require_capability(mango_external_agents::Capability::InteractiveApprovals)?;
         let route = self
             .shared
             .active_turn_route()

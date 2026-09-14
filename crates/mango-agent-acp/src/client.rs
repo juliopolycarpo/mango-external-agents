@@ -210,7 +210,7 @@ impl SessionState {
             session_id,
             clock: Arc::clone(host.clock()),
             broker: host.broker().cloned(),
-            approval_timeout: host.limits().request_timeout,
+            approval_timeout: host.limits().approval_timeout,
             turn: Mutex::new(None),
             configuration: Mutex::new(configuration),
             turn_start: Mutex::new(()),

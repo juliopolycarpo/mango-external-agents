@@ -244,6 +244,7 @@ impl Harness for ClaudeHarness {
                 },
                 auth: AuthState::Unknown,
                 capabilities: Capabilities::none(),
+                permission_matrix: permissions::matrix(&survey.availability),
                 models: Vec::new(),
             });
         }
@@ -257,6 +258,7 @@ impl Harness for ClaudeHarness {
             gate: GateVerdict::Usable,
             auth: survey.authentication.state.clone(),
             capabilities: survey.capabilities(models.is_some()),
+            permission_matrix: permissions::matrix(&survey.availability),
             models: models.unwrap_or_default(),
         })
     }
@@ -266,6 +268,7 @@ impl Harness for ClaudeHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
+        self.validate_open_session(&request)?;
         let executable = self.executable_for(&request);
         let survey = self.survey(host, &executable).await;
 
@@ -293,13 +296,9 @@ impl Harness for ClaudeHarness {
         // Refused rather than dropped. A session that quietly ignored the servers a host
         // configured would run every turn without the tools somebody set up, and report success.
         if !request.mcp_servers.is_empty() && !survey.declares_mcp_config() {
-            return Err(Error::HostConfiguration {
-                expected: "a build that declares --mcp-config, for a session that configures MCP servers",
-                received: format!(
-                    "{} servers on a build that does not",
-                    request.mcp_servers.len()
-                ),
-            });
+            return Err(Error::not_supported(
+                mango_external_agents::Capability::McpPassthrough,
+            ));
         }
         let resumed = request.resume.is_some();
         let native_session_id = match &request.resume {
@@ -363,6 +362,7 @@ const fn probed_capabilities() -> Capabilities {
         resume: true,
         cancellation: true,
         usage_reporting: true,
+        configuration: true,
         model_catalog: false,
         mcp_passthrough: false,
         interactive_approvals: false,

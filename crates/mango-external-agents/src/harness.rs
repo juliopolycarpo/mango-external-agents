@@ -138,6 +138,8 @@ pub struct Capabilities {
     pub account_usage: bool,
     /// The vendor accepts MCP servers the host configured, passed through untouched.
     pub mcp_passthrough: bool,
+    /// Explicit configuration can apply to one turn without opening a new session.
+    pub configuration: bool,
 }
 
 impl Capabilities {
@@ -157,6 +159,7 @@ impl Capabilities {
             native_review: true,
             account_usage: true,
             mcp_passthrough: true,
+            configuration: true,
         }
     }
 
@@ -176,6 +179,7 @@ impl Capabilities {
             native_review: false,
             account_usage: false,
             mcp_passthrough: false,
+            configuration: false,
         }
     }
 
@@ -186,6 +190,47 @@ impl Capabilities {
             Capability::SessionListing => self.session_listing,
             Capability::NativeReview => self.native_review,
             Capability::AccountUsage => self.account_usage,
+            Capability::Resume => self.resume,
+            Capability::Configuration => self.configuration,
+            Capability::InteractiveApprovals => self.interactive_approvals,
+            Capability::Images => self.images,
+            Capability::McpPassthrough => self.mcp_passthrough,
+        }
+    }
+
+    /// Refuses a request for a capability this session or harness did not advertise.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`](crate::Error::NotSupported) when `capability` is false.
+    pub fn require(&self, capability: Capability) -> crate::Result<()> {
+        if self.has(capability) {
+            return Ok(());
+        }
+        Err(crate::Error::not_supported(capability))
+    }
+
+    /// Removes every capability not present in `ceiling`.
+    ///
+    /// A probe learns facts from one installed build. The descriptor is the harness's hard limit,
+    /// so a host must never receive a claim from the probe that the harness cannot honour.
+    #[must_use]
+    pub const fn clamped_to(self, ceiling: &Self) -> Self {
+        Self {
+            structured_streaming: self.structured_streaming && ceiling.structured_streaming,
+            reasoning_stream: self.reasoning_stream && ceiling.reasoning_stream,
+            interactive_approvals: self.interactive_approvals && ceiling.interactive_approvals,
+            resume: self.resume && ceiling.resume,
+            model_catalog: self.model_catalog && ceiling.model_catalog,
+            images: self.images && ceiling.images,
+            usage_reporting: self.usage_reporting && ceiling.usage_reporting,
+            cancellation: self.cancellation && ceiling.cancellation,
+            steering: self.steering && ceiling.steering,
+            session_listing: self.session_listing && ceiling.session_listing,
+            native_review: self.native_review && ceiling.native_review,
+            account_usage: self.account_usage && ceiling.account_usage,
+            mcp_passthrough: self.mcp_passthrough && ceiling.mcp_passthrough,
+            configuration: self.configuration && ceiling.configuration,
         }
     }
 
@@ -222,6 +267,7 @@ impl Capabilities {
             native_review,
             account_usage,
             mcp_passthrough,
+            configuration,
         } = *self;
         let pairs = [
             (
@@ -249,6 +295,7 @@ impl Capabilities {
             ("nativeReview", native_review, ceiling.native_review),
             ("accountUsage", account_usage, ceiling.account_usage),
             ("mcpPassthrough", mcp_passthrough, ceiling.mcp_passthrough),
+            ("configuration", configuration, ceiling.configuration),
         ];
         pairs
             .into_iter()
@@ -281,6 +328,16 @@ pub enum Capability {
     NativeReview,
     /// [`Session::refresh_account_usage`](crate::Session::refresh_account_usage).
     AccountUsage,
+    /// [`OpenSession::resuming`](crate::OpenSession::resuming).
+    Resume,
+    /// [`TurnRequest::with_configuration`](crate::TurnRequest::with_configuration).
+    Configuration,
+    /// [`Session::respond`](crate::Session::respond).
+    InteractiveApprovals,
+    /// Image attachments on [`TurnRequest`](crate::TurnRequest).
+    Images,
+    /// [`OpenSession::with_mcp_servers`](crate::OpenSession::with_mcp_servers).
+    McpPassthrough,
 }
 
 impl fmt::Display for Capability {
@@ -290,6 +347,11 @@ impl fmt::Display for Capability {
             Self::SessionListing => "session listing",
             Self::NativeReview => "native review",
             Self::AccountUsage => "account usage",
+            Self::Resume => "resume",
+            Self::Configuration => "per-turn configuration",
+            Self::InteractiveApprovals => "interactive approvals",
+            Self::Images => "images",
+            Self::McpPassthrough => "MCP passthrough",
         })
     }
 }
@@ -363,7 +425,32 @@ pub trait Harness: Send + Sync {
     ///
     /// Whatever the probe hit.
     async fn discover(&self, host: &crate::HostContext) -> crate::Result<crate::Discovery> {
-        Ok(self.probe(host).await?.normalized())
+        Ok(self
+            .probe(host)
+            .await?
+            .normalized()
+            .bounded_by(&self.descriptor().capabilities, &self.permission_matrix()))
+    }
+
+    /// Refuses session options outside this harness's declared capability ceiling.
+    ///
+    /// Call this before launching. A probe may narrow the declaration for one installed build, but
+    /// it cannot make a harness accept a feature its descriptor never promised.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`](crate::Error::NotSupported) when the request carries an undeclared
+    /// resume or host-supplied MCP server.
+    fn validate_open_session(&self, request: &crate::OpenSession) -> crate::Result<()> {
+        if request.resume.is_some() {
+            self.descriptor().capabilities.require(Capability::Resume)?;
+        }
+        if !request.mcp_servers.is_empty() {
+            self.descriptor()
+                .capabilities
+                .require(Capability::McpPassthrough)?;
+        }
+        Ok(())
     }
 
     /// Probes the machine.
@@ -438,6 +525,10 @@ mod tests {
 
         async fn probe(&self, _host: &crate::HostContext) -> crate::Result<crate::Discovery> {
             Ok(crate::Discovery {
+                capabilities: Capabilities::all(),
+                permission_matrix: crate::permission::PermissionMatrix::build(|_, _| {
+                    crate::permission::ConfigurationVerdict::supported()
+                }),
                 models: vec![
                     crate::Model::new("gpt\u{202e}5-mini"),
                     crate::Model::new("opus"),
@@ -479,6 +570,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["opus"],
             "expected the unbounded id to be dropped by the trait, not by the harness"
+        );
+        assert_eq!(
+            discovery.capabilities,
+            Capabilities::none(),
+            "expected the probe's wider capability claim to be clamped to the descriptor"
+        );
+        assert!(
+            discovery
+                .permission_matrix
+                .cells()
+                .iter()
+                .all(|cell| !cell.supported),
+            "expected a probe to be unable to widen the declared permission matrix"
         );
     }
 
@@ -565,5 +669,19 @@ mod tests {
         assert!(!capabilities.has(Capability::SessionListing));
         assert!(capabilities.has(Capability::NativeReview));
         assert!(!capabilities.has(Capability::AccountUsage));
+        assert!(!capabilities.has(Capability::Resume));
+        assert!(!capabilities.has(Capability::Configuration));
+        assert!(!capabilities.has(Capability::InteractiveApprovals));
+        assert!(!capabilities.has(Capability::Images));
+        assert!(!capabilities.has(Capability::McpPassthrough));
+        assert!(
+            matches!(
+                capabilities.require(Capability::Images),
+                Err(Error::NotSupported {
+                    capability: Capability::Images
+                })
+            ),
+            "expected the unsupported capability itself in the typed refusal"
+        );
     }
 }

@@ -72,6 +72,7 @@ impl FakeHarness {
                     usage_reporting: true,
                     cancellation: true,
                     steering: true,
+                    configuration: true,
                     ..Capabilities::none()
                 },
                 transports: &[TransportKind::Stdio],
@@ -119,6 +120,7 @@ impl Harness for FakeHarness {
                 mode: AuthMode::Subscription,
             },
             capabilities: self.descriptor.capabilities,
+            permission_matrix: self.permission_matrix(),
             models: vec![Model::new("fake-default")],
         })
     }
@@ -256,6 +258,7 @@ impl Session for FakeSession {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed { subject: "session" });
         }
+        self.validate_turn_request(&request)?;
         if let Some(overrides) = &request.configuration {
             let mut configuration = self.configuration.lock().await;
             *configuration = configuration.with_overrides(overrides);
@@ -332,6 +335,7 @@ impl Session for FakeSession {
     }
 
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
+        self.require_capability(crate::Capability::InteractiveApprovals)?;
         if self.rejects_answers {
             return Err(Error::Vendor(VendorError::new(
                 ErrorCode::from_static("fake-answer-rejected"),

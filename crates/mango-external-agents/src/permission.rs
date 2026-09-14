@@ -228,6 +228,54 @@ impl PermissionMatrix {
     pub fn supports(&self, level: PermissionLevel, routing: ApprovalRouting) -> bool {
         self.cell(level, routing).is_some_and(|cell| cell.supported)
     }
+
+    /// Keeps only the pairs this harness declared, while preserving probe-time refusals.
+    ///
+    /// The declaration is the upper bound. A probe can discover that an account, an administrator
+    /// policy, or an older build removes a pair; it cannot make an undeclared pair available.
+    #[must_use]
+    pub fn bounded_by(&self, declaration: &Self) -> Self {
+        Self::build(|level, routing| {
+            let Some(declared) = declaration.cell(level, routing) else {
+                return ConfigurationVerdict::unsupported(UnsupportedReason::Other(String::from(
+                    "the declaration did not describe this permission configuration",
+                )));
+            };
+            if !declared.supported {
+                return ConfigurationVerdict::Unsupported {
+                    reason: declared
+                        .unsupported_reason
+                        .clone()
+                        .unwrap_or(UnsupportedReason::NotOfferedByVendor),
+                    vendor_id: declared.vendor_id.clone(),
+                };
+            }
+
+            let Some(probed) = self.cell(level, routing) else {
+                return ConfigurationVerdict::unsupported(UnsupportedReason::Other(String::from(
+                    "the probe did not describe this permission configuration",
+                )));
+            };
+            if probed.supported {
+                return ConfigurationVerdict::Supported {
+                    vendor_id: probed
+                        .vendor_id
+                        .clone()
+                        .or_else(|| declared.vendor_id.clone()),
+                };
+            }
+            ConfigurationVerdict::Unsupported {
+                reason: probed
+                    .unsupported_reason
+                    .clone()
+                    .unwrap_or(UnsupportedReason::NotOfferedByVendor),
+                vendor_id: probed
+                    .vendor_id
+                    .clone()
+                    .or_else(|| declared.vendor_id.clone()),
+            }
+        })
+    }
 }
 
 /// What one approval option means, whoever the vendor is.
@@ -652,6 +700,35 @@ mod tests {
                 "expected a reason exactly when unsupported, received {cell:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_probe_can_narrow_a_declared_cell_but_cannot_widen_one() {
+        let declaration = PermissionMatrix::build(|level, routing| {
+            if level == PermissionLevel::FullAccess && routing == ApprovalRouting::AutoReview {
+                return ConfigurationVerdict::unsupported(
+                    UnsupportedReason::UnattendedNotPermitted,
+                );
+            }
+            ConfigurationVerdict::supported()
+        });
+        let probe = PermissionMatrix::build(|level, routing| {
+            if level == PermissionLevel::ReadOnly && routing == ApprovalRouting::User {
+                return ConfigurationVerdict::unsupported(UnsupportedReason::RequiresNewerVersion);
+            }
+            ConfigurationVerdict::supported()
+        });
+
+        let bounded = probe.bounded_by(&declaration);
+
+        assert!(
+            !bounded.supports(PermissionLevel::FullAccess, ApprovalRouting::AutoReview),
+            "a probe must not widen a declared refusal"
+        );
+        assert!(
+            !bounded.supports(PermissionLevel::ReadOnly, ApprovalRouting::User),
+            "a probe's narrower reading must reach the host"
+        );
     }
 
     #[test]

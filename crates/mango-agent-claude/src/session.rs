@@ -199,6 +199,7 @@ impl mango_external_agents::Session for ClaudeSession {
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        self.validate_turn_request(&request)?;
         if !request.attachments.is_empty() {
             // Claude Code's stream-json input takes content blocks, but nothing here encodes one
             // and `Capabilities::images` is false. Refusing is the honest answer: silently
@@ -365,13 +366,8 @@ impl mango_external_agents::Session for ClaudeSession {
     /// an approval. See `docs/harness-claude.md` for what the vendor does offer and why this
     /// harness does not drive it.
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
-        Err(Error::Vendor(VendorError::new(
-            ErrorCode::from_static("claude-approvals-unsupported"),
-            format!(
-                "expected an approval this harness raised, received an answer to {:?}; Claude Code delivers no answerable approval over its documented headless surface",
-                response.request_id
-            ),
-        )))
+        let _ = response;
+        self.require_capability(mango_external_agents::Capability::InteractiveApprovals)
     }
 
     async fn cancel(&self, reason: CancelReason) -> Result<()> {
