@@ -344,7 +344,9 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
         }
         HarnessKind::Codex => capture::codex_contract(&out, &workspace.path).await,
         HarnessKind::Claude => capture::claude(&out, &workspace.path).await,
-        HarnessKind::Acp(profile) => capture::acp(&out, &workspace.path, &profile.to_string()).await,
+        HarnessKind::Acp(profile) => {
+            capture::acp(&out, &workspace.path, &profile.to_string()).await
+        }
         _ => {
             return Err(format!(
                 "expected claude, codex or an ACP profile, received {kind}"
