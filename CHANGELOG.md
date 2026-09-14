@@ -17,6 +17,7 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### 🐛 Bug Fixes
 
+- **(core)** Match Windows environment keys without case sensitivity
 - **(core)** Refuse unrepresentable approval deadlines
 - **(core)** Allow fallback resume through capability validation
 - **(core)** Bound permission matrix vendor values during discovery
