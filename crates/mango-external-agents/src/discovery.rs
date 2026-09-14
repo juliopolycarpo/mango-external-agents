@@ -75,6 +75,7 @@ impl Discovery {
                 .map(|version| normalize::bound_text(&version, TextLimit::AccountLabel).text),
             gate: self.gate.normalized(),
             auth: self.auth.normalized(),
+            permission_matrix: self.permission_matrix.normalized(),
             models: self
                 .models
                 .into_iter()
