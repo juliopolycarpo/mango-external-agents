@@ -232,6 +232,15 @@ impl SessionState {
                 received: String::from("a turn that has not ended"),
             });
         }
+        // A question belongs to a turn, and a turn that is starting has none. Anything still parked
+        // here outlived the turn it was asked under and would otherwise be answerable during this one.
+        //
+        // Drained before the new handle is published, and under the same guard. Published first, a
+        // `session/request_permission` arriving in between would read the *new* turn out of the slot,
+        // park itself, and then be withdrawn by a drain meant for its predecessor. The permission
+        // handler's first act is to take this guard, so holding it here closes the window; the
+        // answers themselves go out after it drops.
+        let stale = self.take_pending_responders();
         let handle = TurnHandle {
             sink,
             level,
@@ -242,10 +251,10 @@ impl SessionState {
         *turn = Some(handle.clone());
         *self.lock_reducer() = Reducer::new();
         *self.lock_cancel_reason() = None;
-        // A question belongs to a turn, and a turn that is starting has none. Anything still parked
-        // here outlived the turn it was asked under and would otherwise be answerable during this one.
         drop(turn);
-        self.withdraw_pending();
+        for responder in stale {
+            let _ = responder.respond(permission::cancelled());
+        }
         Ok(handle)
     }
 
@@ -278,11 +287,7 @@ impl SessionState {
         }
         let mut cancelling = self.lock_cancel_reason();
         cancelling.get_or_insert(reason);
-        let pending: Vec<Responder<RequestPermissionResponse>> = self
-            .lock_pending()
-            .drain()
-            .map(|(_, held)| held.responder)
-            .collect();
+        let pending = self.take_pending_responders();
         drop(cancelling);
         drop(turn);
         for responder in pending {
@@ -333,11 +338,7 @@ impl SessionState {
             // These are all owned by the current turn. Capture them before releasing the slot: a
             // newly started prompt clears the reducer and may park approvals of its own.
             let reason = self.lock_cancel_reason().take();
-            let pending: Vec<Responder<RequestPermissionResponse>> = self
-                .lock_pending()
-                .drain()
-                .map(|(_, held)| held.responder)
-                .collect();
+            let pending = self.take_pending_responders();
             let closing = self.lock_reducer().finish();
             (turn, reason, pending, closing)
         };
@@ -367,14 +368,20 @@ impl SessionState {
     ///
     /// Taken out from under the lock in one statement, so nothing is held while the answers go out.
     pub(crate) fn withdraw_pending(&self) {
-        let pending: Vec<Responder<RequestPermissionResponse>> = self
-            .lock_pending()
-            .drain()
-            .map(|(_, held)| held.responder)
-            .collect();
-        for responder in pending {
+        for responder in self.take_pending_responders() {
             let _ = responder.respond(permission::cancelled());
         }
+    }
+
+    /// Empties the question map, handing back the responders each one still owes an answer.
+    ///
+    /// The four places a turn can end all owe the same debt, and each of them takes the responders
+    /// out in one statement so nothing is held while the answers go out.
+    fn take_pending_responders(&self) -> Vec<Responder<RequestPermissionResponse>> {
+        self.lock_pending()
+            .drain()
+            .map(|(_, held)| held.responder)
+            .collect()
     }
 
     /// Parks an agent question unless cancellation already won its race.
