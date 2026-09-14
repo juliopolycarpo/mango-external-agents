@@ -336,6 +336,30 @@ mod tests {
         }
     }
 
+    /// `opaque_id` is identity-or-error, never sanitise-in-place.
+    ///
+    /// Load-bearing well beyond this module: a harness that parks a vendor question under the raw
+    /// wire id and announces the normalised one to the host would correlate the host's answer
+    /// against a key that no longer matches, if this ever returned a *repaired* id. `bound_text`
+    /// counts a stripped character as truncation precisely so that cannot happen.
+    #[test]
+    fn an_id_with_one_strippable_character_is_refused_rather_than_repaired() {
+        for raw in ["req\u{1}1", "sess_01H\u{202e}", "\u{200f}thread_7"] {
+            let error = opaque_id(raw, "approval request id")
+                .expect_err("expected a refusal, received a repaired id");
+            assert!(
+                matches!(
+                    error,
+                    Error::InvalidVendorValue {
+                        field: "approval request id",
+                        ..
+                    }
+                ),
+                "expected {raw:?} to be refused, received {error:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_path_is_sanitised_but_never_shortened() {
         assert_eq!(
