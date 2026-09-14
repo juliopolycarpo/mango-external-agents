@@ -1,31 +1,23 @@
 //! `mea`: the unpublished smoke and capture CLI for mango-external-agents.
 //!
-//! Three subcommands against a real installed vendor CLI:
-//!
-//! ```text
-//! mea discover [--harness claude|codex|acp:<profile>]
-//! mea turn     [--harness claude|codex|acp:<profile>] [--level read-only|default|full-access] <prompt>
-//! mea capture codex [--out DIR] [--workspace DIR]
-//! ```
-//!
-//! `doctor` lands with the vendor-drift workflow. What is here is what proves a
-//! harness against the binary a user actually has, which no fixture can: fixtures prove the
-//! dialect, and this proves the fixtures still describe the vendor.
-//!
-//! It is not published, and nothing in the library depends on it.
+//! `discover` and `doctor` probe installed CLIs without handling login. `turn` drives a
+//! conversation with terminal approvals and optional NDJSON. `capture` records public contracts
+//! and explicit archival transcripts. The binary is built from source and is not published.
 
 mod capture;
+mod doctor;
+mod options;
 mod redact;
+mod terminal;
 mod turn;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::{
     ApprovalRouting, AuthState, EnvSource, ExecutablePath, HarnessKind, HarnessRegistry,
-    HostContext, OpenSession, PermissionLevel, TurnRequest,
+    HostContext, OpenSession, TurnRequest,
 };
 
 /// Every harness kind the binary links, in registry order.
@@ -54,10 +46,18 @@ fn registry() -> HarnessRegistry {
 /// `mea` is the host here, so it answers the three questions a host owes the library: how to spawn,
 /// which directory is authorised, and who it says it is. The environment allowlist still applies —
 /// reading this process's environment is not the same as passing it on.
-fn host() -> Result<HostContext, String> {
+fn host(cwd: Option<&std::path::Path>) -> Result<HostContext, String> {
     HostContext::builder()
         .launcher(Arc::new(TokioLauncher::new()))
-        .cwd(std::env::current_dir().map_err(|error| format!("no working directory: {error}"))?)
+        .cwd(match cwd {
+            Some(path) => path.canonicalize().map_err(|error| {
+                format!("expected an existing working directory {path:?}, received {error}")
+            })?,
+            None => {
+                std::env::current_dir().map_err(|error| format!("no working directory: {error}"))?
+            }
+        })
+        .broker(Arc::new(terminal::TerminalBroker))
         .environment(EnvSource::from_process())
         .client_info("mea", env!("CARGO_PKG_VERSION"))
         .build()
@@ -81,8 +81,17 @@ async fn run(arguments: &[String]) -> Result<(), String> {
         print_banner();
         return Ok(());
     };
+    if rest
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        print_banner();
+        return Ok(());
+    }
     match command.as_str() {
         "discover" => discover(&Options::parse(rest)?).await,
+        "doctor" => doctor(&Options::parse(rest)?).await,
         "turn" => turn(&Options::parse(rest)?).await,
         "capture" => capture(rest).await,
         "help" | "--help" | "-h" => {
@@ -90,7 +99,7 @@ async fn run(arguments: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "expected `discover`, `turn` or `capture`, received {other:?}"
+            "expected `discover`, `doctor`, `turn` or `capture`, received {other:?}"
         )),
     }
 }
@@ -104,11 +113,16 @@ fn print_banner() {
     for kind in harness_kinds() {
         println!("harness: {kind}");
     }
-    println!("usage: mea discover [--harness claude|codex|acp:<profile>]");
     println!(
-        "       mea turn [--harness claude|codex|acp:<profile>] [--level read-only|default|full-access] <prompt>"
+        "usage: mea discover|doctor [--harness claude|codex|acp:<profile>] [--json] [--cwd DIR]"
     );
-    println!("       mea capture codex [--out DIR] [--workspace DIR]");
+    println!(
+        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|acp] [--cwd DIR] [--json] [--level read-only|default|full-access] <prompt>"
+    );
+    println!(
+        "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts]"
+    );
+    println!("       mea capture codex [--out DIR] [--workspace DIR] (archival transcripts)");
     println!("ACP profiles: {}", acp_profile_ids().join(", "));
 }
 
@@ -140,66 +154,7 @@ fn describe(discovery: &mango_external_agents::Discovery) -> String {
     }
 }
 
-/// What a subcommand was asked for.
-struct Options {
-    kind: Option<HarnessKind>,
-    level: Option<PermissionLevel>,
-    prompt: String,
-}
-
-impl Options {
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let mut kind = None;
-        let mut level = None;
-        let mut words: Vec<&str> = Vec::new();
-        let mut rest = arguments.iter();
-        while let Some(argument) = rest.next() {
-            match argument.as_str() {
-                "--harness" => {
-                    let named = rest
-                        .next()
-                        .ok_or("expected a harness kind after --harness")?;
-                    kind = Some(match named.as_str() {
-                        "claude" => HarnessKind::Claude,
-                        "codex" => HarnessKind::Codex,
-                        named if let Some(profile) = named.strip_prefix("acp:") => {
-                            if mango_agent_acp::builtin_profile(profile).is_none() {
-                                return Err(format!(
-                                    "expected a built-in ACP profile after `acp:`, received {profile:?}"
-                                ));
-                            }
-                            HarnessKind::Acp(mango_external_agents::AcpProfileId::new(profile))
-                        }
-                        other => {
-                            return Err(format!(
-                                "expected `claude`, `codex` or `acp:<profile>`, received {other:?}"
-                            ));
-                        }
-                    });
-                }
-                "--level" => {
-                    let named = rest.next().ok_or("expected a level after --level")?;
-                    level = match named.as_str() {
-                        "read-only" => Some(PermissionLevel::ReadOnly),
-                        "default" => Some(PermissionLevel::Default),
-                        "full-access" => Some(PermissionLevel::FullAccess),
-                        other => {
-                            return Err(format!(
-                                "expected `read-only`, `default` or `full-access`, received {other:?}"
-                            ));
-                        }
-                    };
-                }
-                word => words.push(word),
-            }
-        }
-        Ok(Self {
-            kind,
-            level,
-            prompt: words.join(" "),
-        })
-    }
-}
+use options::Options;
 
 struct DiscoveryReport {
     kind: HarnessKind,
@@ -261,9 +216,13 @@ async fn discover_with(
 }
 
 async fn discover(options: &Options) -> Result<(), String> {
-    let host = host()?;
+    let host = host(options.cwd.as_deref())?;
     let registry = registry();
     let mut reports = discover_with(&registry, &host, options.kind.as_ref()).await?;
+    if options.json {
+        println!("{}", doctor::json(&reports));
+        return Ok(());
+    }
     let Some(kind) = &options.kind else {
         for report in reports {
             let line = match report.result {
@@ -278,7 +237,6 @@ async fn discover(options: &Options) -> Result<(), String> {
         .pop()
         .expect("expected one report for an explicit harness")
         .result?;
-    let harness = registry.require(kind).map_err(|error| error.to_string())?;
 
     println!("harness:      {kind}");
     println!("installed:    {:?}", discovery.version);
@@ -294,12 +252,8 @@ async fn discover(options: &Options) -> Result<(), String> {
             .map(|model| model.id.as_str())
             .collect::<Vec<_>>()
     );
-    // The harness's own declaration, not a probed one: `Discovery` has no field for the matrix
-    // this account and this build actually allow, so what is printed here is the ceiling and a
-    // narrowed cell only surfaces as an `open_session` refusal. Labelled rather than quietly
-    // printed, because it sits two lines under a probed `auth:` and would read as one.
-    println!("declared matrix (before any probe):");
-    for cell in harness.permission_matrix().cells() {
+    println!("probed permission matrix:");
+    for cell in discovery.permission_matrix.cells() {
         println!(
             "  {:?} / {:?}: {}{}",
             cell.level,
@@ -314,14 +268,37 @@ async fn discover(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+async fn doctor(options: &Options) -> Result<(), String> {
+    let reports = discover_with(
+        &registry(),
+        &host(options.cwd.as_deref())?,
+        options.kind.as_ref(),
+    )
+    .await?;
+    if options.json {
+        println!("{}", doctor::json(&reports));
+    } else {
+        for report in &reports {
+            println!("{}", doctor::text(report));
+        }
+    }
+    Ok(())
+}
+
 async fn turn(options: &Options) -> Result<(), String> {
     if options.prompt.trim().is_empty() {
         return Err(String::from("expected a prompt, received none"));
     }
-    let host = host()?;
+    let host = host(options.cwd.as_deref())?;
     let registry = registry();
     let kind = options.kind.clone().unwrap_or(HarnessKind::Claude);
     let harness = registry.require(&kind).map_err(|e| e.to_string())?;
+    if let Some(transport) = options.transport {
+        harness
+            .descriptor()
+            .require_transport(&transport)
+            .map_err(|error| error.to_string())?;
+    }
 
     let discovery = harness.discover(&host).await.map_err(|e| e.to_string())?;
     if let AuthState::LoggedOut { login_hint } = &discovery.auth {
@@ -345,37 +322,46 @@ async fn turn(options: &Options) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     eprintln!("session: {}", session.ids().native_session_id);
 
-    turn::run(
+    turn::run_with_format(
         session.as_ref(),
         TurnRequest::new("mea-turn-1", options.prompt.clone()),
+        options.json,
     )
     .await
     .map_err(|e| e.to_string())
 }
 
 async fn capture(arguments: &[String]) -> Result<(), String> {
-    let harness = arguments.first().map(String::as_str).unwrap_or("codex");
-    if harness != "codex" {
-        return Err(format!(
-            "expected a harness this command can capture (`codex`), received {harness:?}"
-        ));
-    }
-    let out = flag(arguments, "--out").map_or_else(capture::default_out_dir, PathBuf::from);
-    let workspace = flag(arguments, "--workspace")
-        .map_or_else(|| std::env::temp_dir().join("mea-capture"), PathBuf::from);
-    std::fs::create_dir_all(&workspace)
-        .map_err(|error| format!("expected a writable capture workspace, received {error}"))?;
-    capture::codex(&out, &workspace)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-fn flag(arguments: &[String], name: &str) -> Option<String> {
-    arguments
-        .iter()
-        .position(|argument| argument == name)
-        .and_then(|at| arguments.get(at + 1))
-        .cloned()
+    let options = options::CaptureOptions::parse(arguments)?;
+    let kind = options.kind()?;
+    let vendor = match kind {
+        HarnessKind::Claude => "claude",
+        HarnessKind::Codex => "codex",
+        _ => "acp",
+    };
+    let out = options
+        .out
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("fixtures/{vendor}")));
+    let workspace = options
+        .workspace
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("mea-capture-{}", uuid_like())));
+    std::fs::create_dir_all(&workspace).map_err(|error| {
+        format!("expected a writable capture workspace {workspace:?}, received {error}")
+    })?;
+    let result = match kind {
+        HarnessKind::Codex if options.legacy.is_some() || options.transcripts => {
+            capture::codex(&out, &workspace).await
+        }
+        HarnessKind::Codex => capture::codex_contract(&out, &workspace).await,
+        HarnessKind::Claude => capture::claude(&out, &workspace).await,
+        HarnessKind::Acp(profile) => capture::acp(&out, &workspace, &profile.to_string()).await,
+        _ => {
+            return Err(format!(
+                "expected claude, codex or an ACP profile, received {kind}"
+            ));
+        }
+    };
+    result.map_err(|error| error.to_string())
 }
 
 /// A session id nobody has to be able to reproduce.
@@ -393,9 +379,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{
-        Options, acp_profile_ids, describe, discover_with, flag, harness_kinds, registry, run,
-    };
+    use super::{Options, acp_profile_ids, describe, discover_with, harness_kinds, registry, run};
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{
         AcpProfileId, Capabilities, ConfigurationVerdict, Discovery, EnvSource, Error, GateVerdict,
@@ -536,6 +520,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_unsupported_transport_is_rejected_before_discovery() {
+        let args = [
+            "turn",
+            "--harness",
+            "codex",
+            "--transport",
+            "websocket",
+            "hello",
+        ]
+        .map(String::from);
+        let error = run(&args)
+            .await
+            .expect_err("Codex does not support WebSocket");
+        assert_eq!(
+            error,
+            "expected a transport codex supports, received websocket"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_rejects_unknown_harnesses_before_discovery() {
+        let args = ["doctor", "--harness", "no-such-harness"].map(String::from);
+        let error = run(&args)
+            .await
+            .expect_err("unknown harness must be rejected");
+        assert!(
+            error.contains("received harness Some(\"no-such-harness\")"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn leaves_the_harness_unspecified_for_discover_all() {
         let options = Options::parse(&[String::from("say"), String::from("hello")])
@@ -582,22 +598,6 @@ mod tests {
             Some(HarnessKind::Acp(AcpProfileId::new("cursor")))
         );
         assert_eq!(options.prompt, "ship");
-    }
-
-    #[test]
-    fn a_capture_flag_reads_the_argument_after_it() {
-        let arguments: Vec<String> = ["codex", "--out", "fixtures/codex"]
-            .iter()
-            .map(|argument| (*argument).to_owned())
-            .collect();
-        assert_eq!(flag(&arguments, "--out").as_deref(), Some("fixtures/codex"));
-        assert_eq!(flag(&arguments, "--workspace"), None);
-    }
-
-    #[test]
-    fn a_capture_flag_with_no_value_reads_as_absent() {
-        let arguments = vec![String::from("--out")];
-        assert_eq!(flag(&arguments, "--out"), None);
     }
 
     #[test]

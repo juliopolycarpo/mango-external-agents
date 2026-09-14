@@ -182,7 +182,8 @@ mod tests {
     use mango_external_agents::{AuthMode, AuthState};
 
     /// Every key the committed contract capture declares, as the vendor spells them.
-    const CONTRACT: &str = include_str!("../../../fixtures/claude/contract/auth-status.json");
+    const CONTRACT: &str =
+        include_str!("../../../fixtures/claude/historical/contract/auth-status.json");
 
     /// The captured contract still carries the three fields this parser reads.
     ///

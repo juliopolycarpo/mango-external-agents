@@ -1,4 +1,4 @@
-# `claude --help`, as captured
+# Historical `claude --help` captures
 
 Three files, and the difference between them is the point. A single regenerated fixture would
 delete the older half of every pair, and the older half is what proves that a build predating a
@@ -11,7 +11,7 @@ feature keeps working with that feature simply off.
 | `2.1.227.txt`  | an excerpt from the build before the pair below | 2026-08-11 |
 
 The two excerpts are trimmed to the options the harness reads plus enough neighbours to exercise
-the parser's real problems, and they are deliberately **not** re-captured:
+the parser's real problems. All three files are deliberately **not** re-captured:
 
 - A description that *mentions* a flag it does not declare (`--forward-subagent-text` names
   `--output-format=stream-json`), which is what a parser scanning the whole text would report as
@@ -26,6 +26,6 @@ the parser's real problems, and they are deliberately **not** re-captured:
   the current session.", which is what proves an absent catalog stays absent instead of becoming an
   empty one.
 
-`2.1.270.txt` is the whole surface as the installed binary prints it, and is what a drift check
-compares against. `mea capture` re-captures it once that command exists; nothing here is ever
-hand-edited.
+`2.1.270.txt` is the full 2026-09-13 capture, kept to test the parser against the observed layout.
+It is archival, not the drift artifact. `mea capture --harness claude` regenerates the current
+public contract in `fixtures/claude/contract/`; see the [fixture rules](../../README.md).

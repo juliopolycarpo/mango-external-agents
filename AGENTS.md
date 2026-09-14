@@ -53,7 +53,10 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 - **TLS is `ring` everywhere.** `deny.toml` bans `aws-lc-rs` and `openssl`; `scripts/check-tls.sh`
   proves the tree is clean. `agent-client-protocol` and the smol family stay inside
   `mango-agent-acp`.
-- **Vendor fixtures are captured by `mea capture`, never hand-edited.** The Codex wire contract is
+- **Vendor fixtures are captured by `mea capture`, never hand-edited.** Public contracts are
+  regenerated at the pinned vendor versions. A labelled historical capture stays fixed: it records
+  behaviour that a current CLI cannot reproduce byte-for-byte, such as an authenticated transcript
+  or a help surface predating a feature. See `fixtures/README.md`. The Codex wire contract is
   vendored as OpenAI's own schema, not as its Rust sources: `scripts/vendor-codex.sh` regenerates
   `crates/mango-agent-codex/vendor/` from `codex app-server generate-json-schema` at the pinned
   version, and the file is never patched in place. See `docs/harness-codex.md` for why the source

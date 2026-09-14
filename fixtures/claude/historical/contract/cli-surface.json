@@ -83,10 +83,10 @@
     "sonnet"
   ],
   "effortLevels": [
-    "low",
-    "medium",
     "high",
-    "xhigh",
-    "max"
+    "low",
+    "max",
+    "medium",
+    "xhigh"
   ]
 }

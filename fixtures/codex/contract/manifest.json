@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "probes": [
+    "codex --version",
+    "codex app-server generate-json-schema --out <workspace>/codex-schema"
+  ],
+  "reproducible": true,
+  "schemaFiles": [
+    "initialize-params.schema.json",
+    "initialize-response.schema.json"
+  ]
+}

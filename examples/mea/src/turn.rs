@@ -21,10 +21,20 @@ const TURN_DEADLINE: Duration = Duration::from_secs(300);
 /// ```text
 /// mea turn --harness codex "summarise this repository"
 /// ```
+#[cfg(test)]
 pub async fn run(session: &dyn Session, request: TurnRequest) -> Result<()> {
+    run_with_format(session, request, false).await
+}
+
+/// Runs and closes a turn, optionally emitting NDJSON. Example: `mea turn --json "hello"`.
+pub async fn run_with_format(
+    session: &dyn Session,
+    request: TurnRequest,
+    json: bool,
+) -> Result<()> {
     let outcome = async {
         let mut stream = session.start_turn(request).await?;
-        match tokio::time::timeout(TURN_DEADLINE, print_turn(session, &mut stream)).await {
+        match tokio::time::timeout(TURN_DEADLINE, print_turn(session, &mut stream, json)).await {
             Ok(result) => result,
             Err(_) => {
                 session.cancel(CancelReason::Timeout).await?;
@@ -41,19 +51,27 @@ pub async fn run(session: &dyn Session, request: TurnRequest) -> Result<()> {
 }
 
 /// Prints one turn's events and refuses every approval it raises.
-async fn print_turn(session: &dyn Session, turn: &mut TurnStream) -> Result<()> {
+async fn print_turn(session: &dyn Session, turn: &mut TurnStream, json: bool) -> Result<()> {
     while let Some(event) = turn.recv().await {
+        if json {
+            println!("{}", serde_json::json!(event));
+        }
         match &event.kind {
-            EventKind::TextDelta { text } => print!("{text}"),
+            EventKind::TextDelta { text } if !json => print!("{text}"),
             EventKind::ApprovalRequested { request } => {
-                println!("{}", serde_json::json!(event.kind));
+                if !json {
+                    println!("{}", serde_json::json!(event.kind));
+                }
                 session.respond(request.deny()?).await?;
             }
             EventKind::Error { error } => {
-                println!("{}", serde_json::json!(event.kind));
+                if !json {
+                    println!("{}", serde_json::json!(event.kind));
+                }
                 return Err(Error::Vendor(error.clone()));
             }
-            other => println!("{}", serde_json::json!(other)),
+            other if !json => println!("{}", serde_json::json!(other)),
+            _ => {}
         }
     }
     Ok(())
@@ -106,6 +124,28 @@ mod tests {
             .await
             .expect_err("expected the session to have been closed");
         assert!(matches!(error, Error::Closed { subject: "session" }));
+    }
+
+    #[tokio::test]
+    async fn json_turn_finishes_and_closes_the_session() {
+        let session = FakeHarness::new()
+            .without_approvals()
+            .open_session(&host(), OpenSession::new("json-test"))
+            .await
+            .expect("fake session");
+        super::run_with_format(
+            session.as_ref(),
+            TurnRequest::new("json-turn", "hello"),
+            true,
+        )
+        .await
+        .expect("JSON turn completes");
+        assert!(matches!(
+            session
+                .start_turn(TurnRequest::new("closed", "hello"))
+                .await,
+            Err(Error::Closed { subject: "session" })
+        ));
     }
 
     struct VendorFailureSession {
