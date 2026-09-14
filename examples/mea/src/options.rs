@@ -148,6 +148,27 @@ mod tests {
         assert!(kind(Some("acp"), None).is_err());
         assert!(acp("cursor").is_ok());
     }
+
+    #[test]
+    fn every_accepted_level_and_transport_names_its_own_variant() {
+        // Refusing the values outside the set says nothing about the ones inside it: a swapped arm
+        // here runs the turn at a permission level the caller did not ask for.
+        assert_eq!(
+            level("read-only").expect("read-only"),
+            PermissionLevel::ReadOnly
+        );
+        assert_eq!(level("default").expect("default"), PermissionLevel::Default);
+        assert_eq!(
+            level("full-access").expect("full-access"),
+            PermissionLevel::FullAccess
+        );
+        assert_eq!(transport("stdio").expect("stdio"), TransportKind::Stdio);
+        assert_eq!(
+            transport("websocket").expect("websocket"),
+            TransportKind::WebSocket
+        );
+        assert_eq!(transport("acp").expect("acp"), TransportKind::Acp);
+    }
 }
 
 /// Contract capture arguments. `capture codex` preserves the historical transcript command.
