@@ -83,7 +83,13 @@ async fn print_turn(
                     println!("{}", serde_json::json!(event.kind));
                 }
                 let response = match broker.decide(request).await {
-                    BrokerDecision::Allow => request.allow()?,
+                    // A question the vendor raised without an allowing option is still a question
+                    // that has to be answered. Falling back to the refusal keeps the turn alive
+                    // and grants nothing, where propagating would cancel the turn instead.
+                    BrokerDecision::Allow => match request.allow() {
+                        Ok(allow) => allow,
+                        Err(_) => request.deny()?,
+                    },
                     BrokerDecision::Deny { .. } | BrokerDecision::Ask => request.deny()?,
                 };
                 session.respond(response).await?;
