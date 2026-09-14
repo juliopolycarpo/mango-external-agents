@@ -50,9 +50,9 @@ jobs:
         name: Resolve the version from the tag
         env:
           INPUT_VERSION: ${{ inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF: ${{ github.ref }}
         run: |
-          if [ -n "$INPUT_VERSION" ]; then version="$INPUT_VERSION"; else version="${REF_NAME#v}"; fi
+          version=$(scripts/release-version.sh "$RELEASE_REF" "$INPUT_VERSION")
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -64,8 +64,13 @@ jobs:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: scripts/check-versions.sh "$VERSION"
       - run: scripts/check.sh
+      - name: Verify all publishable packages
+        run: cargo publish --workspace --dry-run --locked
       - name: Package contents
-        run: cargo package -p mango-external-agents --locked --list
+        run: |
+          for crate in $CRATES; do
+            cargo package -p "$crate" --locked --list
+          done
 
   crates:
     name: Publish to crates.io
@@ -92,11 +97,11 @@ jobs:
             status=$(curl -sS -o /dev/null -w '%{http_code}' \
               -A 'mango-external-agents release workflow (github.com/juliopolycarpo/mango-external-agents)' \
               "https://crates.io/api/v1/crates/$crate/$VERSION")
-            if [ "$status" = "200" ]; then
-              echo "$crate $VERSION is already on crates.io; skipping"
-            else
-              pending="$pending $crate"
-            fi
+            case "$status" in
+              200) echo "$crate $VERSION is already on crates.io; skipping" ;;
+              404) pending="$pending $crate" ;;
+              *) echo "expected crates.io status 200 or 404 for $crate, received $status" >&2; exit 1 ;;
+            esac
           done
           echo "list=${pending# }" >> "$GITHUB_OUTPUT"
       # The token exchange fails outright while a crate has no trusted-publishing
