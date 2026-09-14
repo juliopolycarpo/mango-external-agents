@@ -150,9 +150,18 @@ test_codex_output_arguments() {
 
 test_codex_generator_requires_an_installed_cli() {
   local original_path="$PATH"
-  PATH='/usr/bin:/bin'
+  local empty_bin="$test_root/no-codex-bin"
+  # An empty directory rather than the system ones: a machine that happens to carry /usr/bin/codex
+  # would run the real generator and pass this test for the wrong reason. `vendor_dir` is set here
+  # too, so the refusal cannot depend on whatever the previous test left in the global.
+  mkdir -p "$empty_bin"
+  local vendor_dir="$test_root/unused-vendor-dir"
+  PATH="$empty_bin"
   expect_status 2 generate_inventory
   PATH="$original_path"
+  if [ -e "$vendor_dir" ]; then
+    fail 'a refused Codex generator must not create its output directory'
+  fi
 }
 
 test_codex_generator_cleans_up_in_a_standalone_process() {
