@@ -24,8 +24,11 @@ use crate::reducer;
 ///
 /// `id` is the harness's own correlation id rather than anything in the payload: ACP's
 /// `session/request_permission` carries no id of its own, and the tool call id it does carry repeats
-/// when an agent asks about the same call twice. The JSON-RPC request id is unique per connection and
-/// is what the answer has to be routed back to, so that is what the harness uses.
+/// when an agent asks about the same call twice. It is not the JSON-RPC request id either — that id
+/// is the agent's to choose, and an agent is free to reuse one once the request it named is no longer
+/// outstanding, which would let a host answer meant for one question land on a later, unrelated one
+/// that happened to reuse the same id. The harness mints this id itself, once per question and never
+/// reused, and passes it in here already resolved.
 #[must_use]
 pub fn request_from(
     request: &RequestPermissionRequest,

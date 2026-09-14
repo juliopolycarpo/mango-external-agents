@@ -175,8 +175,18 @@ pub(crate) struct SessionState {
     cancel_reason: Mutex<Option<CancelReason>>,
     /// Touched only by the notification handler, which the dispatch loop runs one at a time.
     reducer: Mutex<Reducer>,
-    /// Questions the agent is waiting on, keyed by the JSON-RPC id the answer routes back to.
+    /// Questions the agent is waiting on, keyed by [`SessionState::mint_approval_id`]'s id.
+    ///
+    /// Not the JSON-RPC id `session/request_permission` arrived on: that id is the peer's to choose
+    /// and a peer is free to reuse it once the request it named is no longer outstanding — expired,
+    /// answered, or withdrawn. A key drawn from the wire would let a host answer that was already in
+    /// flight for the first request land on a second, unrelated one that reused the same id, because
+    /// nothing here distinguishes "the question this answer was written for" from "whatever question
+    /// currently sits at this id". Minting the key ourselves, once per question and never reused,
+    /// closes that off: a stale answer's key can only ever name the question it was issued for.
     pending: Mutex<HashMap<String, PendingApproval>>,
+    /// Source of [`Self::mint_approval_id`]'s ids. Separate from `generations`, which stamps turns.
+    next_approval: AtomicU64,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -208,7 +218,18 @@ impl SessionState {
             cancel_reason: Mutex::new(None),
             reducer: Mutex::new(Reducer::new()),
             pending: Mutex::new(HashMap::new()),
+            next_approval: AtomicU64::new(0),
         }
+    }
+
+    /// A host-facing approval id this session has never handed out before.
+    ///
+    /// See the note on [`Self::pending`] for why this cannot be the JSON-RPC id instead.
+    fn mint_approval_id(&self) -> String {
+        format!(
+            "approval-{}",
+            self.next_approval.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     /// Opens a turn, refusing a second one.
@@ -618,7 +639,7 @@ async fn on_request_permission(
     responder: Responder<RequestPermissionResponse>,
     connection: ConnectionTo<Agent>,
 ) -> agent_client_protocol::Result<()> {
-    let id = responder.id().to_string();
+    let id = state.mint_approval_id();
     let Some(turn) = state.turn() else {
         // No turn: nobody is reading, and an unanswered request would hold the agent forever.
         return responder.respond(permission::cancelled());

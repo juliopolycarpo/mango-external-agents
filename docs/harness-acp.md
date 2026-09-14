@@ -161,8 +161,10 @@ prompt is queued prevents that prompt from being sent.
 
 ACP's four option kinds map one-to-one onto the core's, so a host policy can answer without reading a
 label in a language it does not know. The option set itself is passed through with the agent's own
-ids, order and words. The request id is the JSON-RPC id, not the tool call id, which repeats when an
-agent asks about the same call twice.
+ids, order and words. The request id is one the harness mints itself, never reused for the life of
+the session — not the tool call id, which repeats when an agent asks about the same call twice, and
+not the JSON-RPC id, which is the agent's own to choose and to reuse once a request is no longer
+outstanding.
 
 `PermissionRequest::expires_at` comes from `Limits::request_timeout`. The core's
 `ApprovalDeadline` starts when the question arrives and covers broker deliberation and host response

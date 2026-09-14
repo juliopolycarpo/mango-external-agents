@@ -63,6 +63,15 @@ pub struct FakeAcpAgent {
     never_finishes: bool,
     /// Raises a permission request when the client sends `session/close`.
     asks_when_closing: bool,
+    /// Once the first `session/request_permission` is answered, raises a second one reusing the
+    /// same JSON-RPC id instead of ending the turn.
+    ///
+    /// What a protocol-violating peer looks like: the JSON-RPC spec only asks that an id stay
+    /// unique among a peer's *outstanding* requests, so a peer that reuses one the moment its first
+    /// use is settled is within its rights. `agent-client-protocol`'s own
+    /// `RequestCancellationRegistry` test documents exactly this peer as one it dispatches rather
+    /// than refuses.
+    reuse_request_id_for_second_ask: bool,
     updates: Vec<serde_json::Value>,
     stop_reason: String,
     version_output: String,
@@ -88,6 +97,7 @@ impl FakeAcpAgent {
             new_session_error: None,
             never_finishes: false,
             asks_when_closing: false,
+            reuse_request_id_for_second_ask: false,
             updates: vec![
                 serde_json::json!({
                     "sessionUpdate": "available_commands_update",
@@ -164,6 +174,14 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn asking_when_closing(mut self) -> Self {
         self.asks_when_closing = true;
+        self
+    }
+
+    /// Once the first `session/request_permission` of a turn is answered, raises a second one on
+    /// the same JSON-RPC id rather than ending the turn.
+    #[must_use]
+    pub fn reusing_the_request_id_on_a_second_ask(mut self) -> Self {
+        self.reuse_request_id_for_second_ask = true;
         self
     }
 
@@ -419,6 +437,26 @@ impl FakeAcpAgent {
         message: &serde_json::Value,
         pending: &Arc<Mutex<PendingTurn>>,
     ) -> Vec<String> {
+        // `/result/outcome/outcome`, not `/result/outcome`: `RequestPermissionResponse` carries the
+        // outcome as a field and the enum is internally tagged `outcome`, so the tag sits one level in.
+        let withdrawn = message
+            .pointer("/result/outcome/outcome")
+            .and_then(serde_json::Value::as_str)
+            == Some("cancelled");
+
+        if self.reuse_request_id_for_second_ask && !withdrawn {
+            let mut guard = pending.lock().unwrap_or_else(PoisonError::into_inner);
+            if guard.asks == 1 {
+                let request_id = guard.reopen_with_the_same_id();
+                drop(guard);
+                return vec![request(
+                    request_id,
+                    "session/request_permission",
+                    self.permission_params(),
+                )];
+            }
+        }
+
         let turn = pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -426,12 +464,6 @@ impl FakeAcpAgent {
         let Some(turn) = turn else {
             return Vec::new();
         };
-        // `/result/outcome/outcome`, not `/result/outcome`: `RequestPermissionResponse` carries the
-        // outcome as a field and the enum is internally tagged `outcome`, so the tag sits one level in.
-        let withdrawn = message
-            .pointer("/result/outcome/outcome")
-            .and_then(serde_json::Value::as_str)
-            == Some("cancelled");
         let stop_reason = match withdrawn {
             true => "cancelled",
             false => self.stop_reason.as_str(),
@@ -474,13 +506,28 @@ struct PendingTurn {
     /// `session/cancel` regardless would let a harness that never withdrew look correct.
     question_open: bool,
     next_request_id: i64,
+    /// The id of the most recent `session/request_permission`, so a reused-id ask can repeat it.
+    last_request_id: Option<i64>,
+    /// How many `session/request_permission` this turn has raised.
+    asks: u32,
 }
 
 impl PendingTurn {
     fn open(&mut self, prompt_id: serde_json::Value) -> i64 {
         self.prompt_id = Some(prompt_id);
         self.question_open = true;
-        self.next_request_id()
+        self.asks += 1;
+        let id = self.next_request_id();
+        self.last_request_id = Some(id);
+        id
+    }
+
+    /// Raises a second question in the same turn, on the same JSON-RPC id the first one used.
+    fn reopen_with_the_same_id(&mut self) -> i64 {
+        self.question_open = true;
+        self.asks += 1;
+        self.last_request_id
+            .expect("expected a first ask before a second reuses its id")
     }
 
     /// The next id for a request this fake sends.

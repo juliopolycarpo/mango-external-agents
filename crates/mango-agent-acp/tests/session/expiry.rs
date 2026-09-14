@@ -482,6 +482,85 @@ async fn an_invalid_host_option_leaves_the_approval_answerable() {
     session.close(CloseReason::Shutdown).await.expect("close");
 }
 
+/// A stale host answer must not cross a reused JSON-RPC id onto a later, unrelated question.
+///
+/// `agent-client-protocol`'s own `RequestCancellationRegistry` test dispatches exactly this shape —
+/// "a protocol-violating peer reuses an in-flight request ID" — rather than refusing it, so nothing
+/// upstream stops an agent from asking for a *second* permission under the same wire id once the
+/// first has expired. A pending map keyed by that wire id would let a host answer written for the
+/// first question resolve the second instead, because both would sit at the same key. See
+/// `SessionState::mint_approval_id`.
+#[tokio::test(start_paused = true)]
+async fn a_stale_answer_cannot_cross_a_reused_wire_id_onto_a_later_question() {
+    let (session, launcher) = open(
+        FakeAcpAgent::new()
+            .asking_for_approval(Approval::Once)
+            .reusing_the_request_id_on_a_second_ask(),
+        permissive(),
+    )
+    .await;
+
+    let mut turn = session
+        .start_turn(TurnRequest::new("reuse", "run it"))
+        .await
+        .expect("expected a turn");
+
+    let first = loop {
+        let event = turn.recv().await.expect("expected the first approval");
+        if let EventKind::ApprovalRequested { request } = event.kind {
+            break request;
+        }
+    };
+
+    // Past the deadline: the first question expires and is answered `reject` on the wire, and the
+    // fake immediately reuses that same JSON-RPC id to raise a second, unrelated question.
+    tokio::time::advance(Duration::from_secs(121)).await;
+    let second = loop {
+        let event = turn.recv().await.expect("expected the second approval");
+        if let EventKind::ApprovalRequested { request } = event.kind {
+            break request;
+        }
+    };
+    assert_ne!(
+        first.id, second.id,
+        "expected distinct host-facing ids for two questions that merely share a wire id"
+    );
+
+    // A stale answer for the first question, as if the host's reply had been in flight since before
+    // it expired. It must not be able to grant the second question, whatever id the wire reused.
+    session
+        .respond(mango_external_agents::PermissionResponse::from_user(
+            &first.id, "allow",
+        ))
+        .await
+        .expect("expected the stale reply to be accepted rather than erroring");
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !outcome_lines(&launcher)
+            .iter()
+            .any(|line| line.contains("\"optionId\":\"allow\"")),
+        "expected the stale reply not to grant the second, unrelated question, received {:?}",
+        outcome_lines(&launcher)
+    );
+
+    // The second question is still genuinely open, and its own answer still reaches the agent.
+    session
+        .respond(second.deny().expect("expected a refusing option"))
+        .await
+        .expect("expected the second question to remain answerable");
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(
+            |event| matches!(event, EventKind::ApprovalResolved { decision, .. }
+            if decision.option_id == "reject" && decision.source == DecisionSource::User)
+        ),
+        "expected the second question's own answer to reach the agent, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
+
 /// A standing refusal is still a refusal, and expiry has to reach for it.
 ///
 /// `PermissionRequest::deny` prefers `reject_once` and falls back to `reject_always`, which is what
