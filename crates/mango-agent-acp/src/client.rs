@@ -33,9 +33,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1::{
-    RequestPermissionRequest, RequestPermissionResponse, SessionNotification,
+    CancelNotification, RequestPermissionRequest, RequestPermissionResponse, SessionNotification,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
+use mango_external_agents::approval::ApprovalDeadline;
 use mango_external_agents::event::{EventKind, SessionId};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
@@ -46,13 +47,14 @@ use mango_external_agents::{
     Clock, Error, EventSink, HostContext, ProcessControl, Result, VendorError,
 };
 
+use crate::approval_events::ApprovalEvents;
 use crate::error::vendor_error;
 use crate::permission;
 use crate::reducer::Reducer;
 use crate::transport::LaunchedAgent;
 
 /// Whether a host's answer reached the agent, or arrived after the question was already settled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Answered {
     /// It reached the agent.
     Sent,
@@ -80,6 +82,7 @@ pub(crate) struct TurnHandle {
     /// task; resuming afterwards would put the rest of that frame's events *after* the terminal,
     /// which the core's conformance suite refuses. Checked before every emit.
     finished: Arc<AtomicBool>,
+    pub(crate) approvals: Arc<ApprovalEvents>,
 }
 
 /// One agent request waiting for either the harness or the host to answer it.
@@ -89,6 +92,44 @@ pub(crate) struct TurnHandle {
 struct PendingApproval {
     responder: Responder<RequestPermissionResponse>,
     host_answerable: bool,
+    question: mango_external_agents::PermissionRequest,
+    announced: bool,
+    deadline: ApprovalDeadline,
+    expiry_option: Option<String>,
+    connection: ConnectionTo<Agent>,
+    cancel: CancelNotification,
+    turn: TurnHandle,
+    /// Dropping a resolved question stops its timer task.
+    _timer_done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl PendingApproval {
+    /// Register only a question that is answerable or has already reached its deadline.
+    fn announce(&mut self) {
+        if self.announced {
+            return;
+        }
+        self.announced = true;
+        self.turn.approvals.push(EventKind::ApprovalRequested {
+            request: self.question.clone(),
+        });
+    }
+
+    /// Publish a successful decision before prompt completion can flush the terminal.
+    fn respond_with_resolution(
+        self,
+        response: RequestPermissionResponse,
+        option_id: String,
+        source: DecisionSource,
+    ) -> agent_client_protocol::Result<()> {
+        let event = EventKind::ApprovalResolved {
+            request_id: self.question.id.clone(),
+            decision: ApprovalDecision { option_id, source },
+        };
+        self.turn
+            .approvals
+            .record_response(event, || self.responder.respond(response))
+    }
 }
 
 impl TurnHandle {
@@ -196,6 +237,7 @@ impl SessionState {
             level,
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
             finished: Arc::new(AtomicBool::new(false)),
+            approvals: Arc::new(ApprovalEvents::default()),
         };
         *turn = Some(handle.clone());
         *self.lock_reducer() = Reducer::new();
@@ -260,10 +302,7 @@ impl SessionState {
     }
 
     /// Whether it is still safe to submit this handle's ACP prompt.
-    pub(crate) fn can_submit_prompt(&self, closed: bool, handle: &TurnHandle) -> bool {
-        if closed {
-            return false;
-        }
+    pub(crate) fn can_submit_prompt(&self, handle: &TurnHandle) -> bool {
         self.lock_turn()
             .as_ref()
             .is_some_and(|current| current.generation == handle.generation)
@@ -343,29 +382,23 @@ impl SessionState {
     /// Cancellation holds the same guard before draining pending responders. A request that arrives
     /// after `session/cancel` must receive ACP's `Cancelled` outcome rather than wait forever for a
     /// host event that cancellation made obsolete.
-    pub(crate) fn park_pending(
+    fn park_pending(
         &self,
         id: String,
-        responder: Responder<RequestPermissionResponse>,
+        pending: PendingApproval,
     ) -> agent_client_protocol::Result<bool> {
         let cancelling = self.lock_cancel_reason();
         if cancelling.is_some() {
             drop(cancelling);
-            responder.respond(permission::cancelled())?;
+            pending.responder.respond(permission::cancelled())?;
             return Ok(false);
         }
-        self.lock_pending().insert(
-            id,
-            PendingApproval {
-                responder,
-                host_answerable: false,
-            },
-        );
+        self.lock_pending().insert(id, pending);
         Ok(true)
     }
 
-    /// Makes an undecided request answerable by the host, unless cancellation withdrew it first.
-    pub(crate) fn make_pending_host_answerable(&self, id: &str) -> bool {
+    /// Publishes a broker-settled request, making an undecided one answerable by the host.
+    pub(crate) fn announce_pending(&self, id: &str, host_answerable: bool) -> bool {
         let cancelling = self.lock_cancel_reason();
         if cancelling.is_some() {
             return false;
@@ -374,7 +407,8 @@ impl SessionState {
         let Some(pending) = pending.get_mut(id) else {
             return false;
         };
-        pending.host_answerable = true;
+        pending.host_answerable = host_answerable;
+        pending.announce();
         true
     }
 
@@ -386,21 +420,42 @@ impl SessionState {
         &self,
         id: &str,
         requested: RequestPermissionResponse,
+        source: DecisionSource,
     ) -> agent_client_protocol::Result<Answered> {
-        let cancelling = self.lock_cancel_reason();
+        let mut cancelling = self.lock_cancel_reason();
         let pending = self.lock_pending().remove(id);
-        let Some(pending) = pending else {
+        let Some(mut pending) = pending else {
             return Ok(Answered::AlreadyResolved);
         };
-        let outcome = match cancelling.is_some() {
-            true => permission::cancelled(),
-            false => requested,
-        };
-        pending.responder.respond(outcome)?;
-        match cancelling.is_some() {
-            true => Ok(Answered::AlreadyResolved),
-            false => Ok(Answered::Sent),
+        if cancelling.is_some() {
+            pending.responder.respond(permission::cancelled())?;
+            return Ok(Answered::AlreadyResolved);
         }
+        if !pending.deadline.is_elapsed() {
+            if let agent_client_protocol::schema::v1::RequestPermissionOutcome::Selected(outcome) =
+                &requested.outcome
+            {
+                let option_id = outcome.option_id.to_string();
+                pending.respond_with_resolution(requested, option_id, source)?;
+                return Ok(Answered::Sent);
+            }
+            pending.responder.respond(requested)?;
+            return Ok(Answered::Sent);
+        }
+
+        pending.announce();
+        let Some(option_id) = pending.expiry_option.as_ref() else {
+            cancelling.get_or_insert(CancelReason::Timeout);
+            self.withdraw_pending();
+            let sent = pending.connection.send_notification(pending.cancel);
+            pending.responder.respond(permission::cancelled())?;
+            sent?;
+            return Ok(Answered::AlreadyResolved);
+        };
+        let outcome = permission::selected(option_id);
+        let option_id = option_id.clone();
+        pending.respond_with_resolution(outcome, option_id, DecisionSource::Expired)?;
+        Ok(Answered::AlreadyResolved)
     }
 
     /// Withdraws one pending request when its turn cannot continue.
@@ -438,12 +493,33 @@ impl SessionState {
     ///
     /// Whatever the transport reported while sending the answer.
     pub(crate) fn answer(&self, response: &PermissionResponse) -> Result<Answered> {
-        let host_answerable = self
-            .lock_pending()
-            .get(&response.request_id)
-            .is_some_and(|pending| pending.host_answerable);
-        if !host_answerable {
-            return Ok(Answered::AlreadyResolved);
+        {
+            let pending = self.lock_pending();
+            let Some(pending) = pending
+                .get(&response.request_id)
+                .filter(|pending| pending.host_answerable)
+            else {
+                return Ok(Answered::AlreadyResolved);
+            };
+            if !pending
+                .question
+                .options
+                .iter()
+                .any(|option| option.id == response.option_id)
+            {
+                return Err(Error::Protocol {
+                    expected: format!(
+                        "one of the offered approval option ids: {:?}",
+                        pending
+                            .question
+                            .options
+                            .iter()
+                            .map(|option| &option.id)
+                            .collect::<Vec<_>>()
+                    ),
+                    received: response.option_id.clone(),
+                });
+            }
         }
         let alive = self.turn().is_some_and(|turn| !turn.is_finished());
         let outcome = match alive {
@@ -451,10 +527,10 @@ impl SessionState {
             false => permission::cancelled(),
         };
         let answered = self
-            .respond_pending(&response.request_id, outcome)
+            .respond_pending(&response.request_id, outcome, response.source)
             .map_err(|error| Error::Vendor(vendor_error("session/request_permission", &error)))?;
-        match alive && answered == Answered::Sent {
-            true => Ok(Answered::Sent),
+        match alive {
+            true => Ok(answered),
             false => Ok(Answered::AlreadyResolved),
         }
     }
@@ -533,6 +609,7 @@ async fn on_request_permission(
     state: &Arc<SessionState>,
     request: RequestPermissionRequest,
     responder: Responder<RequestPermissionResponse>,
+    connection: ConnectionTo<Agent>,
 ) -> agent_client_protocol::Result<()> {
     let id = responder.id().to_string();
     let Some(turn) = state.turn() else {
@@ -556,9 +633,29 @@ async fn on_request_permission(
         Err(_) => return responder.respond(permission::cancelled()),
     };
 
-    if !state.park_pending(id.clone(), responder)? {
+    let deadline = ApprovalDeadline::new(question.expires_at, state.now());
+    let (timer_done, done) = tokio::sync::oneshot::channel();
+    let pending = PendingApproval {
+        responder,
+        host_answerable: false,
+        question: question.clone(),
+        announced: false,
+        deadline,
+        expiry_option: question
+            .options
+            .iter()
+            .find(|option| option.kind == mango_external_agents::PermissionOptionKind::RejectOnce)
+            .map(|option| option.id.clone()),
+        connection,
+        cancel: CancelNotification::new(request.session_id),
+        turn: turn.clone(),
+        _timer_done: timer_done,
+    };
+    if !state.park_pending(id.clone(), pending)? {
         return Ok(());
     }
+
+    expire_pending(state, &turn, id.clone(), deadline, done);
 
     // Decided before the host is told, so a policy the host already installed does not race the
     // interface the host would otherwise render. The dispatch loop is held while the broker thinks,
@@ -571,49 +668,50 @@ async fn on_request_permission(
     // is nobody's but a person's, which is what leaving `decided` empty arranges.
     let decided = match turn.level {
         Some(PermissionLevel::ReadOnly) => standing_refusal(&question),
-        Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => {
-            broker_response(state.broker.as_ref(), &question).await
-        }
+        Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => deadline
+            .run(broker_response(state.broker.as_ref(), &question))
+            .await
+            .flatten(),
     };
 
-    if decided.is_none() && !state.make_pending_host_answerable(&id) {
-        // Cancellation withdrew the request while a broker was deciding. It has already sent the
-        // wire outcome, so there is no host event or second response to produce.
-        return Ok(());
-    }
-
-    if turn.is_finished()
-        || turn
-            .sink
-            .emit(EventKind::ApprovalRequested {
-                request: question.clone(),
-            })
-            .await
-            .is_err()
-    {
-        // The turn slot is left alone — it belongs to the `session/prompt` in flight. The parked
-        // responder is withdrawn because a host answer can no longer arrive.
+    state.announce_pending(&id, decided.is_none());
+    if turn.approvals.flush(&turn.sink).await.is_err() {
         return state.withdraw_pending_by_id(&id);
     }
-
-    if let Some(decision) = decided
-        && state.respond_pending(&id, permission::selected(&decision.option_id))? == Answered::Sent
-    {
-        // The cancellation guard in `respond_pending` chose the wire outcome. Only report an
-        // approval resolution when the agent received the selected option rather than a
-        // cancellation withdrawal.
-        let _ = turn
-            .sink
-            .emit(EventKind::ApprovalResolved {
-                request_id: question.id,
-                decision: ApprovalDecision {
-                    option_id: decision.option_id,
-                    source: decision.source,
-                },
-            })
-            .await;
+    if let Some(decision) = decided {
+        state.respond_pending(
+            &id,
+            permission::selected(&decision.option_id),
+            decision.source,
+        )?;
+        let _ = turn.approvals.flush(&turn.sink).await;
     }
     Ok(())
+}
+
+/// Starts enforcement before broker deliberation or event backpressure can park the handler.
+fn expire_pending(
+    state: &Arc<SessionState>,
+    turn: &TurnHandle,
+    id: String,
+    deadline: ApprovalDeadline,
+    done: tokio::sync::oneshot::Receiver<()>,
+) {
+    let state = Arc::downgrade(state);
+    let turn = turn.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = done => return,
+            () = deadline.wait() => {},
+        }
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        // respond_pending registers the resolution before its response can complete the prompt.
+        let _ = state.respond_pending(&id, permission::cancelled(), DecisionSource::Expired);
+        let _ = turn.approvals.flush(&turn.sink).await;
+    });
 }
 
 /// The refusal a read-only session owes a question, when the agent offered a way to refuse.
@@ -680,8 +778,8 @@ pub(crate) async fn drive(
                 agent_client_protocol::on_receive_notification!(),
             )
             .on_receive_request(
-                async move |request: RequestPermissionRequest, responder, _cx| {
-                    on_request_permission(&approvals, request, responder).await
+                async move |request: RequestPermissionRequest, responder, cx| {
+                    on_request_permission(&approvals, request, responder, cx).await
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -886,7 +984,7 @@ mod tests {
         state.end_turn();
 
         assert!(
-            !state.can_submit_prompt(false, &first),
+            !state.can_submit_prompt(&first),
             "an ended handle must not retain authority to submit a prompt"
         );
     }

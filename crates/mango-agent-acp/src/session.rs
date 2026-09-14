@@ -8,7 +8,6 @@
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -21,10 +20,11 @@ use mango_external_agents::session::{
     SessionInfo, SessionPage, SessionQuery, TurnRequest,
 };
 use mango_external_agents::{
-    Capability, Error, EventSink, HostContext, PermissionResponse, Result, TurnStream,
+    Capability, Error, EventSink, HostContext, PermissionResponse, Result, SessionLifecycle,
+    TurnStream,
 };
 
-use crate::client::{self, Answered, ConnectionHandle, SessionState, link_failure, with_stderr};
+use crate::client::{self, ConnectionHandle, SessionState, link_failure, with_stderr};
 use crate::profile::AcpProfile;
 use crate::{content, reducer};
 
@@ -43,7 +43,7 @@ pub struct AcpSession {
     connection: Arc<ConnectionHandle>,
     native_session_id: AcpSessionId,
     agent_capabilities: AgentCapabilities,
-    closed: AtomicBool,
+    lifecycle: SessionLifecycle,
 }
 
 impl std::fmt::Debug for AcpSession {
@@ -52,7 +52,7 @@ impl std::fmt::Debug for AcpSession {
             .debug_struct("AcpSession")
             .field("profile", &self.profile.id)
             .field("ids", &self.info.ids)
-            .field("closed", &self.closed.load(Ordering::Acquire))
+            .field("closed", &self.lifecycle.is_closed())
             .finish_non_exhaustive()
     }
 }
@@ -75,7 +75,7 @@ impl AcpSession {
             connection,
             native_session_id,
             agent_capabilities,
-            closed: AtomicBool::new(false),
+            lifecycle: SessionLifecycle::default(),
         }
     }
 
@@ -204,7 +204,7 @@ impl Session for AcpSession {
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.lifecycle.is_closed() {
             return Err(Error::Closed { subject: "session" });
         }
         let prompt = content::prompt(
@@ -223,10 +223,10 @@ impl Session for AcpSession {
         // caller must not merge from an old snapshot while this one accepts its settings, then win
         // the slot later and restore the stale snapshot over the newer restriction.
         let handle = {
-            let _starting = self.state.lock_turn_start();
-            if self.closed.load(Ordering::Acquire) {
+            let Some(_lifecycle) = self.lifecycle.begin_start() else {
                 return Err(Error::Closed { subject: "session" });
-            }
+            };
+            let _starting = self.state.lock_turn_start();
             let configuration = self.effective(&request)?;
             let handle = self.state.begin_turn(sink.clone(), configuration.level)?;
             self.state.accept_configuration(configuration);
@@ -251,11 +251,11 @@ impl Session for AcpSession {
         // already won that window, queue a second notification after the prompt so the agent applies
         // it to this turn rather than treating the earlier notification as a no-op.
         let (sent, retry_cancel_error) = {
+            let Some(_lifecycle) = self.lifecycle.begin_start() else {
+                return Err(Error::Closed { subject: "session" });
+            };
             let _starting = self.state.lock_turn_start();
-            if !self
-                .state
-                .can_submit_prompt(self.closed.load(Ordering::Acquire), &handle)
-            {
+            if !self.state.can_submit_prompt(&handle) {
                 return Err(Error::Closed { subject: "session" });
             }
             let sent = self
@@ -297,6 +297,9 @@ impl Session for AcpSession {
             if !turn.finish() {
                 return;
             }
+            if turn.approvals.flush(&turn.sink).await.is_err() {
+                return;
+            }
             for kind in closing {
                 if turn.sink.emit(kind).await.is_err() {
                     return;
@@ -336,24 +339,11 @@ impl Session for AcpSession {
     }
 
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
-        if self.state.answer(&response)? == Answered::AlreadyResolved {
-            // The question was settled before this answer arrived, and the decision the agent acted
-            // on has already been reported. A second `ApprovalResolved` would put a decision in the
-            // transcript that never reached the agent.
-            return Ok(());
-        }
         let Some(turn) = self.state.turn() else {
             return Ok(());
         };
-        turn.sink
-            .emit(EventKind::ApprovalResolved {
-                request_id: response.request_id,
-                decision: mango_external_agents::permission::ApprovalDecision {
-                    option_id: response.option_id,
-                    source: response.source,
-                },
-            })
-            .await
+        self.state.answer(&response)?;
+        turn.approvals.flush(&turn.sink).await
     }
 
     async fn cancel(&self, reason: CancelReason) -> Result<()> {
@@ -384,15 +374,16 @@ impl Session for AcpSession {
     }
 
     async fn close(&self, reason: CloseReason) -> Result<()> {
-        // Share the same guard as cancellation and host answers before publishing the closed state.
-        // Once this starts, a request that wins neither side of the lock is withdrawn rather than
-        // selected while the session tears down.
+        // Claim the core lifecycle before the local prompt-start gate. A start either reserves and
+        // submits under that same lifecycle transition, or observes this close before it can gain
+        // authority over the ACP session.
         let ending = {
-            let _starting = self.state.lock_turn_start();
-            self.state.begin_cancellation(reason.into());
-            if self.closed.swap(true, Ordering::AcqRel) {
+            let mut lifecycle = self.lifecycle.lock();
+            if !lifecycle.close() {
                 return Ok(());
             }
+            let _starting = self.state.lock_turn_start();
+            self.state.begin_cancellation(reason.into());
             self.state.end_turn()
         };
 
@@ -444,6 +435,9 @@ impl Session for AcpSession {
             // `Completed`. The core's conformance suite requires exactly one terminal. Spawned, the
             // terminal lands the moment the host reads, or is dropped when the host drops the stream.
             tokio::spawn(async move {
+                if turn.approvals.flush(&turn.sink).await.is_err() {
+                    return;
+                }
                 for kind in closing {
                     if turn.sink.emit(kind).await.is_err() {
                         return;

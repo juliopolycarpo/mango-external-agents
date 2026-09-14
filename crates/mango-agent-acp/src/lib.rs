@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod approval_events;
 mod client;
 pub mod content;
 pub mod error;

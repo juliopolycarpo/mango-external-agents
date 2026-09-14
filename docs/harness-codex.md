@@ -171,10 +171,15 @@ Nothing is auto-answered. Without a `PermissionBroker` every question reaches th
 attributed to `DecisionSource::AutoReview`.
 
 A question has a 30-minute deadline (`approvals::APPROVAL_TIMEOUT`), because the app-server sets
-none of its own and blocks until the client replies. On expiry, on a cancel and on a close, every
-waiting question is answered `decline` — never `cancel`, which would stop a turn a deadline has no
-business stopping. `serverRequest/resolved` releases a question the server stopped waiting on, so
-the task composing a reply does not outlive the question.
+none of its own and blocks until the client replies. Its `expires_at` is translated once into the
+core `ApprovalDeadline`, so event backpressure cannot restart the timer and broker deliberation
+and a host response share the same deadline; a late host choice is refused even if the expiry
+waiter has not run yet. Backpressure may delay the app-server reply while an approval audit waits
+for the host stream, as for all turn events. On expiry, on a cancel and on a close, every waiting
+question is answered `decline` — never `cancel`, which would stop a turn a deadline has no business
+stopping. `serverRequest/resolved` releases a question the server stopped waiting on, so the task
+composing a reply does not outlive the question. This is client-side timing only: it adds no
+app-server method or wire field beyond the existing [documented surface][readme].
 
 Every other server-initiated request is refused with a JSON-RPC error rather than left hanging:
 

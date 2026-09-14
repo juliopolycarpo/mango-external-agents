@@ -19,9 +19,8 @@ use crate::protocol::approvals::{
 /// How long a question stays answerable.
 ///
 /// The app-server sets no deadline of its own: it blocks until the client replies, and a prompt
-/// nobody answers is a turn that never ends. The core carries `expires_at` on every request and
-/// leaves the timer to whoever owns the vendor connection, so this is that number. Generous on
-/// purpose — it bounds a forgotten prompt, not a person thinking.
+/// nobody answers is a turn that never ends. The core's `ApprovalDeadline` measures this budget
+/// from the request's creation; the harness sends the vendor's refusal when it expires.
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// One question, and the answers this harness will take for it.

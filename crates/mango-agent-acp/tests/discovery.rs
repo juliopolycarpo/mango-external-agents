@@ -4,7 +4,6 @@
 #[path = "discovery/policy.rs"]
 mod policy;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mango_agent_acp::AcpHarness;
@@ -15,36 +14,108 @@ use mango_external_agents::{
     ProcessLauncher, Result,
 };
 
-/// Models the stable aliases and whichever installer last claimed `agent`.
+/// A program available from one entry on the fixture `PATH`.
+#[derive(Clone, Copy)]
+struct InstalledProgram {
+    command: &'static str,
+    version: &'static str,
+}
+
+/// One directory of programs available to the fixture launcher.
+#[derive(Clone, Copy)]
+struct PathEntry {
+    directory: &'static str,
+    programs: &'static [InstalledProgram],
+}
+
+const CURSOR_BIN: PathEntry = PathEntry {
+    directory: "/opt/cursor/bin",
+    programs: &[
+        InstalledProgram {
+            command: "agent",
+            version: "2026.09.10",
+        },
+        InstalledProgram {
+            command: "cursor-agent",
+            version: "2026.09.10",
+        },
+    ],
+};
+
+const GROK_BIN: PathEntry = PathEntry {
+    directory: "/opt/grok/bin",
+    programs: &[
+        InstalledProgram {
+            command: "agent",
+            version: "0.1.0",
+        },
+        InstalledProgram {
+            command: "grok",
+            version: "0.1.0",
+        },
+    ],
+};
+
+#[derive(Clone, Copy)]
+enum InstallOrder {
+    CursorThenGrok,
+    GrokThenCursor,
+}
+
+/// Models stable aliases and the two PATH-resolution orders for the shared `agent` command.
 struct InstalledAgents {
-    programs: BTreeMap<&'static str, &'static str>,
+    path: Vec<PathEntry>,
     launches: FakeLauncher,
 }
 
 impl InstalledAgents {
-    fn both(shared_version: &'static str) -> Self {
+    fn with_path(path: impl IntoIterator<Item = PathEntry>) -> Self {
         Self {
-            programs: BTreeMap::from([
-                ("agent", shared_version),
-                ("cursor-agent", "2026.09.10"),
-                ("grok", "0.1.0"),
-            ]),
+            path: path.into_iter().collect(),
             launches: FakeLauncher::new(),
         }
     }
+
+    fn both(order: InstallOrder) -> Self {
+        match order {
+            InstallOrder::CursorThenGrok => Self::with_path([CURSOR_BIN, GROK_BIN]),
+            InstallOrder::GrokThenCursor => Self::with_path([GROK_BIN, CURSOR_BIN]),
+        }
+    }
+
+    fn resolve(&self, command: &str) -> Option<ResolvedProgram> {
+        self.path.iter().find_map(|entry| {
+            entry
+                .programs
+                .iter()
+                .find(|program| program.command == command)
+                .map(|program| ResolvedProgram {
+                    directory: entry.directory,
+                    version: program.version,
+                })
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedProgram {
+    directory: &'static str,
+    version: &'static str,
 }
 
 #[async_trait::async_trait]
 impl ProcessLauncher for InstalledAgents {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
         let program = spec.argv.first().map_or("", String::as_str);
-        let Some(version) = self.programs.get(program) else {
+        let Some(resolved) = self.resolve(program) else {
             return Err(Error::Launch {
                 program: program.to_owned(),
-                message: String::from("expected an installed executable, received no match"),
+                message: format!(
+                    "expected an executable on the fixture PATH, received {program:?}"
+                ),
             });
         };
-        let agent = FakeAcpAgent::new().printing_version(*version);
+        let agent = FakeAcpAgent::new().printing_version(resolved.version);
         let process = if spec.argv.get(1).is_some_and(|arg| arg == "--version") {
             agent.version_process()
         } else {
@@ -66,10 +137,7 @@ fn host(launcher: Arc<dyn ProcessLauncher>) -> HostContext {
 
 #[tokio::test]
 async fn cursor_discovery_does_not_mistake_grok_for_cursor() {
-    let launcher = Arc::new(InstalledAgents {
-        programs: BTreeMap::from([("agent", "0.1.0"), ("grok", "0.1.0")]),
-        launches: FakeLauncher::new(),
-    });
+    let launcher = Arc::new(InstalledAgents::with_path([GROK_BIN]));
     let discovery = AcpHarness::builtin("cursor")
         .expect("expected Cursor profile")
         .discover(&host(launcher))
@@ -84,8 +152,20 @@ async fn cursor_discovery_does_not_mistake_grok_for_cursor() {
 
 #[tokio::test]
 async fn both_install_orders_discover_and_launch_distinct_agents() {
-    for shared_version in ["0.1.0", "2026.09.10"] {
-        let launcher = Arc::new(InstalledAgents::both(shared_version));
+    for (order, shared_directory, shared_version) in [
+        (
+            InstallOrder::CursorThenGrok,
+            "/opt/cursor/bin",
+            "2026.09.10",
+        ),
+        (InstallOrder::GrokThenCursor, "/opt/grok/bin", "0.1.0"),
+    ] {
+        let launcher = Arc::new(InstalledAgents::both(order));
+        let shared_agent = launcher
+            .resolve("agent")
+            .expect("expected the shared command on the fixture PATH");
+        assert_eq!(shared_agent.directory, shared_directory);
+        assert_eq!(shared_agent.version, shared_version);
         let context = host(launcher.clone());
         for (id, version, argv) in [
             ("cursor", "2026.09.10", vec!["cursor-agent", "acp"]),

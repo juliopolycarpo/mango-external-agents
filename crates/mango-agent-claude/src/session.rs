@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use mango_external_agents::{
     CancelReason, CloseReason, Configuration, Error, ErrorCode, EventSink, ExecutablePath,
-    HostContext, PermissionResponse, Result, SessionIds, SessionInfo, StdioSpec, TurnRequest,
-    TurnStream, VendorError, transports::stdio,
+    HostContext, PermissionResponse, Result, SessionIds, SessionInfo, SessionLifecycle, StdioSpec,
+    TurnRequest, TurnStream, VendorError, transports::stdio,
 };
 use serde_json::json;
 
@@ -73,7 +73,6 @@ struct SessionState {
     mcp_config: Option<ConfigFile>,
     /// The settings a turn without an override inherits.
     configuration: Configuration,
-    closed: bool,
 }
 
 /// What a session needs for its whole life, shared with the task each turn runs on.
@@ -83,6 +82,7 @@ struct Shared {
     info: SessionInfo,
     availability: ModeAvailability,
     surface: Option<CliSurface>,
+    lifecycle: SessionLifecycle,
     state: Mutex<SessionState>,
 }
 
@@ -122,7 +122,6 @@ impl ClaudeSession {
             active: None,
             mcp_config,
             configuration: info.effective_configuration.clone(),
-            closed: false,
         };
         Self {
             shared: Arc::new(Shared {
@@ -131,6 +130,7 @@ impl ClaudeSession {
                 info,
                 availability,
                 surface,
+                lifecycle: SessionLifecycle::default(),
                 state: Mutex::new(state),
             }),
         }
@@ -228,10 +228,10 @@ impl mango_external_agents::Session for ClaudeSession {
         // record its reason against.
         let end = Arc::new(TurnEnd::default());
         let previous = {
-            let mut state = self.shared.lock();
-            if state.closed {
+            let Some(_lifecycle) = self.shared.lifecycle.begin_start() else {
                 return Err(Error::Closed { subject: "session" });
-            }
+            };
+            let mut state = self.shared.lock();
             let previous = take_turn(&mut state, CancelReason::Requested);
             state.active = Some(ActiveTurn {
                 end: Arc::clone(&end),
@@ -306,11 +306,13 @@ impl mango_external_agents::Session for ClaudeSession {
         // the child that just started and refuses instead of planting a live process nobody holds
         // a handle to.
         let stopped = {
+            let lifecycle = self.shared.lifecycle.lock();
             let mut state = self.shared.lock();
-            if state
-                .active
-                .as_ref()
-                .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
+            if !lifecycle.is_closed()
+                && state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
             {
                 if requested_configuration.is_some() {
                     // `stdio::open` is the successful start boundary for the batch CLI: there is
@@ -329,7 +331,7 @@ impl mango_external_agents::Session for ClaudeSession {
         };
         if let Some(reason) = stopped {
             let _ = control.kill(reason).await;
-            return Err(if self.shared.lock().closed {
+            return Err(if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
                 Error::Cancelled { reason }
@@ -381,8 +383,11 @@ impl mango_external_agents::Session for ClaudeSession {
         // Idempotent: a close racing a cancel, or two closes from different tasks, must not fail
         // the second caller. Both takes happen under the guard; nothing slow happens under it.
         let (control, mcp_config) = {
+            let mut lifecycle = self.shared.lifecycle.lock();
+            if !lifecycle.close() {
+                return Ok(());
+            }
             let mut state = self.shared.lock();
-            state.closed = true;
             let control = take_turn(&mut state, CancelReason::from(reason));
             (control, state.mcp_config.take())
         };

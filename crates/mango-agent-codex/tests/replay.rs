@@ -7,8 +7,9 @@
 mod support;
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
-use mango_agent_codex::CodexHarness;
+use mango_agent_codex::{CodexHarness, approvals::APPROVAL_TIMEOUT};
 use mango_external_agents::event::EventKind;
 use mango_external_agents::permission::{
     BrokerDecision, DecisionSource, PermissionBroker, PermissionOptionKind, PermissionRequest,
@@ -16,10 +17,19 @@ use mango_external_agents::permission::{
 };
 use mango_external_agents::testing::{FakeLauncher, FakeProcess};
 use mango_external_agents::{
-    ApprovalRouting, CancelReason, CloseReason, Configuration, EnvSource, Harness, HostContext,
-    OpenSession, PermissionLevel, Session, SessionQuery, Steer, TurnRequest,
+    ApprovalRouting, CancelReason, Clock, CloseReason, Configuration, EnvSource, Harness,
+    HostContext, OpenSession, PermissionLevel, Session, SessionQuery, Steer, TurnRequest,
 };
 use support::Transcript;
+
+/// A host clock fixed at the instant a paused-time approval test begins.
+struct FixedClock(SystemTime);
+
+impl Clock for FixedClock {
+    fn now(&self) -> SystemTime {
+        self.0
+    }
+}
 
 /// A broker that answers every question the same way, and remembers what it was asked.
 ///
@@ -314,17 +324,30 @@ fn with_launcher(
     launcher: Arc<FakeLauncher>,
     broker: Option<Arc<dyn PermissionBroker>>,
 ) -> (HostContext, Arc<FakeLauncher>) {
-    with_launcher_limits(
+    with_launcher_limits(launcher, broker, replay_limits())
+}
+
+fn with_launcher_and_clock(
+    launcher: Arc<FakeLauncher>,
+    broker: Option<Arc<dyn PermissionBroker>>,
+    clock: Arc<dyn Clock>,
+) -> (HostContext, Arc<FakeLauncher>) {
+    with_launcher_limits_and_cancel_and_clock(
         launcher,
         broker,
-        mango_external_agents::Limits {
-            // A call the replay has no answer for is a bug in the fixture or in the harness, and
-            // the default two minutes would report it as a test that hangs rather than one that
-            // fails.
-            request_timeout: std::time::Duration::from_secs(5),
-            ..mango_external_agents::Limits::default()
-        },
+        replay_limits(),
+        mango_external_agents::CancelToken::new(),
+        Some(clock),
     )
+}
+
+fn replay_limits() -> mango_external_agents::Limits {
+    mango_external_agents::Limits {
+        // A call the replay has no answer for is a bug in the fixture or in the harness, and the
+        // default two minutes would report it as a test that hangs rather than one that fails.
+        request_timeout: std::time::Duration::from_secs(5),
+        ..mango_external_agents::Limits::default()
+    }
 }
 
 fn with_launcher_limits(
@@ -346,6 +369,16 @@ fn with_launcher_limits_and_cancel(
     limits: mango_external_agents::Limits,
     cancel: mango_external_agents::CancelToken,
 ) -> (HostContext, Arc<FakeLauncher>) {
+    with_launcher_limits_and_cancel_and_clock(launcher, broker, limits, cancel, None)
+}
+
+fn with_launcher_limits_and_cancel_and_clock(
+    launcher: Arc<FakeLauncher>,
+    broker: Option<Arc<dyn PermissionBroker>>,
+    limits: mango_external_agents::Limits,
+    cancel: mango_external_agents::CancelToken,
+    clock: Option<Arc<dyn Clock>>,
+) -> (HostContext, Arc<FakeLauncher>) {
     let mut builder = HostContext::builder()
         .launcher(launcher.clone())
         .cwd("/workspace")
@@ -357,6 +390,9 @@ fn with_launcher_limits_and_cancel(
         ]))
         .limits(limits)
         .cancel(cancel);
+    if let Some(clock) = clock {
+        builder = builder.clock(clock);
+    }
     if let Some(broker) = broker {
         builder = builder.broker(broker);
     }
@@ -1006,6 +1042,154 @@ async fn a_question_is_answerable_the_instant_the_host_is_told_about_it() {
                 if decision.source == DecisionSource::User
         )),
         "expected the person's answer to be the one that stood, received {events:#?}"
+    );
+}
+
+/// The deadline begins when the request is created, so an unresponsive broker cannot extend it.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_broker_is_refused_at_the_original_approval_deadline() {
+    let broker = SlowBroker::new();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("approval").as_process());
+    let (host, launcher) = with_launcher_and_clock(
+        launcher,
+        Some(broker),
+        Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+
+    await_approval(&mut turn).await;
+    tokio::time::advance(APPROVAL_TIMEOUT).await;
+    let events = drain(&mut turn).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ApprovalResolved { decision, .. }
+                if decision.option_id == "decline" && decision.source == DecisionSource::Expired
+        )),
+        "expected the original deadline to refuse the stalled broker, received {events:#?}"
+    );
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"decision\":\"decline\"")),
+        "expected the deadline refusal to reach the vendor"
+    );
+}
+
+/// A choice accepted before expiry remains accepted if the handler runs after expiry.
+#[tokio::test(start_paused = true)]
+async fn a_timely_host_choice_is_not_retroactively_expired() {
+    let broker = SlowBroker::new();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("approval").as_process());
+    let (host, launcher) = with_launcher_and_clock(
+        launcher,
+        Some(broker),
+        Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+
+    let request = await_approval(&mut turn).await;
+    session
+        .respond(request.allow().expect("expected an allow option"))
+        .await
+        .expect("expected the pre-deadline host grant to be accepted");
+    tokio::time::advance(APPROVAL_TIMEOUT).await;
+    let events = drain(&mut turn).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ApprovalResolved { decision, .. }
+                if decision.option_id == "accept" && decision.source == DecisionSource::User
+        )),
+        "expected the accepted host grant to survive the handler delay, received {events:#?}"
+    );
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"decision\":\"accept\"")),
+        "expected the timely host grant to reach the vendor"
+    );
+}
+
+/// A late host grant must be refused whether or not the expiry waiter has already run.
+#[tokio::test(start_paused = true)]
+async fn a_host_decision_after_the_approval_deadline_is_rejected() {
+    let broker = SlowBroker::new();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("approval").as_process());
+    let (host, launcher) = with_launcher_and_clock(
+        launcher,
+        Some(broker),
+        Arc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+
+    let request = await_approval(&mut turn).await;
+    tokio::time::advance(APPROVAL_TIMEOUT).await;
+    let error = session
+        .respond(request.allow().expect("expected an allow option"))
+        .await
+        .expect_err("expected an expired approval to reject the host grant");
+    assert!(
+        matches!(error, mango_external_agents::Error::Protocol { .. }),
+        "expected an expired approval protocol refusal, received {error:?}"
+    );
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ApprovalResolved { decision, .. }
+                if decision.option_id == "decline" && decision.source == DecisionSource::Expired
+        )),
+        "expected the late grant to become an expiry refusal before completion, received {events:#?}"
+    );
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"decision\":\"decline\"")),
+        "expected the expiry refusal to reach the vendor"
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"decision\":\"accept\"")),
+        "expected the late grant to stay off the wire, received {:?}",
+        launcher.written()
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventKind::Completed)),
+        "expected the refused approval to let the turn finish, received {events:#?}"
     );
 }
 

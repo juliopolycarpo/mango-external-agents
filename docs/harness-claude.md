@@ -117,6 +117,10 @@ id, and each turn spawns, streams and reaps its own child.
 
   <https://code.claude.com/docs/en/cli-reference.md>
 - **A second `start_turn` ends the first.** A host that starts one has decided the first is over.
+- **`start_turn` and `close` share the core lifecycle gate.** It covers the synchronous child
+  reservation and teardown claim, then releases before every await. Close therefore either takes the
+  reservation or makes the starting call reap the child it launched, rather than leaving a process
+  with no session authority.
 - **Steering is not supported.** `--input-format stream-json` accepts a second message, but it runs
   as its own turn with its own `result` — a queued follow-up, not same-turn steering.
 - **The turn's own kill pre-empts no background subagent.** A run waits for background subagents and

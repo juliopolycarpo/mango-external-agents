@@ -328,12 +328,9 @@ pub struct PermissionRequest {
     pub options: Vec<PermissionOption>,
     /// When this question stops being answerable.
     ///
-    /// Carried so that a host rendering the prompt, and the harness that raised it, agree on one
-    /// deadline rather than inventing two. Nothing in the core compares it to a clock today: the
-    /// harness that owns the vendor connection is what times the question out and resolves it with
-    /// [`DecisionSource::Expired`]. Moving that timer into the core is the obvious next step —
-    /// three harnesses each writing their own is three chances to forget — and is deliberately
-    /// left until there is a harness to move it out of.
+    /// The host and harness share this deadline. Harnesses use the core's
+    /// [`ApprovalDeadline`](crate::approval::ApprovalDeadline) to bound broker deliberation and
+    /// host response time, resolving unanswered requests with [`DecisionSource::Expired`].
     pub expires_at: SystemTime,
     /// True when any field above was cut to fit its bound.
     #[serde(default)]

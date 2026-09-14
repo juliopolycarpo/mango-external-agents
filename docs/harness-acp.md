@@ -77,6 +77,10 @@ for one stream of updates with nothing on the wire to tell them apart; a second 
 answers or the session closes — and each turn carries a generation, so a prompt that answers late can
 only ever end its own turn.
 
+`start_turn` and `close` share the core lifecycle gate while they synchronously claim the prompt slot
+or close the session. The gate is released before every await, so a close either sees a claimed prompt
+to end or prevents the start from submitting one after teardown begins.
+
 `TurnStream::native_turn_id` is the prompt request's own JSON-RPC id — ACP has no turn id of its own.
 
 Steering is `Error::NotSupported` on every profile: ACP v1 has no surface for adding to a turn that is
@@ -160,9 +164,17 @@ label in a language it does not know. The option set itself is passed through wi
 ids, order and words. The request id is the JSON-RPC id, not the tool call id, which repeats when an
 agent asks about the same call twice.
 
-`PermissionRequest::expires_at` is carried from `Limits::request_timeout` and nothing compares it to a
-clock yet — the core-owned approval timer is the recorded follow-up. A host that needs a deadline
-enforced today reaches it with `Session::cancel`.
+`PermissionRequest::expires_at` comes from `Limits::request_timeout`. The core's
+`ApprovalDeadline` starts when the question arrives and covers broker deliberation and host response
+time. Answers at or after the deadline cannot allow work, even before the timer task runs.
+Expiry selects the agent's `reject_once` option and records `DecisionSource::Expired`. If the agent
+offers no one-time refusal, the harness cancels the turn with `CancelReason::Timeout` and
+withdraws the question with ACP's `Cancelled` outcome;
+there is no `ApprovalResolved` selection event because no vendor option was selected. It never
+chooses `reject_always` for a timeout. These outcomes follow the
+[ACP v1 permission specification](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission).
+The timer answers the agent even if the bounded event channel is full. Approval events remain
+ordered before the turn terminal and arrive when the host resumes reading.
 
 ## Auth
 
