@@ -4,33 +4,33 @@ use std::path::PathBuf;
 
 pub(crate) struct CaptureWorkspace {
     pub path: PathBuf,
-    temporary: bool,
+    _temporary: Option<tempfile::TempDir>,
 }
 
 impl CaptureWorkspace {
     /// Creates a scratch directory or retains a caller-owned workspace. Example: `--workspace /tmp/capture`.
     pub fn new(explicit: Option<PathBuf>) -> Result<Self, String> {
-        let temporary = explicit.is_none();
-        let path = explicit.unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("mea-capture-{}", crate::uuid_like()))
-        });
-        let created = if temporary {
-            std::fs::create_dir(&path)
-        } else {
-            std::fs::create_dir_all(&path)
-        };
-        created.map_err(|error| {
-            format!("expected a writable capture workspace {path:?}, received {error}")
-        })?;
-        Ok(Self { path, temporary })
-    }
-}
-
-impl Drop for CaptureWorkspace {
-    fn drop(&mut self) {
-        if self.temporary {
-            let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(path) = explicit {
+            std::fs::create_dir_all(&path).map_err(|error| {
+                format!("expected a writable capture workspace {path:?}, received {error}")
+            })?;
+            return Ok(Self {
+                path,
+                _temporary: None,
+            });
         }
+        let root = std::env::temp_dir();
+        let directory = tempfile::Builder::new()
+            .prefix("mea-capture-")
+            .rand_bytes(12)
+            .tempdir_in(&root)
+            .map_err(|error| {
+                format!("expected a unique capture workspace under {root:?}, received {error}")
+            })?;
+        Ok(Self {
+            path: directory.path().to_owned(),
+            _temporary: Some(directory),
+        })
     }
 }
 
