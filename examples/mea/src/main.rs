@@ -57,7 +57,6 @@ fn host(cwd: Option<&std::path::Path>) -> Result<HostContext, String> {
                 std::env::current_dir().map_err(|error| format!("no working directory: {error}"))?
             }
         })
-        .broker(Arc::new(terminal::TerminalBroker))
         .environment(EnvSource::from_process())
         .client_info("mea", env!("CARGO_PKG_VERSION"))
         .build()
