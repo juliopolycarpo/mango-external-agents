@@ -1,9 +1,27 @@
-//! Agent Client Protocol harness for `mango-external-agents`.
-//!
-//! Drives any Agent Client Protocol agent over the official `agent-client-protocol` crate through its documented programmatic surface only. The behaviour lands with the harness itself;
-//! this crate currently declares its harness kind.
+#![doc = include_str!("../README.md")]
+
+mod approval_events;
+mod client;
+pub mod content;
+pub mod error;
+pub mod harness;
+pub mod permission;
+pub mod profile;
+pub mod reducer;
+pub mod session;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+pub mod transport;
+pub mod version;
+
+pub use harness::AcpHarness;
+pub use profile::{AcpProfile, SessionModeIds, builtin_profile, builtin_profiles};
+pub use session::AcpSession;
 
 /// The harness kind this crate implements, as the core registry names it.
+///
+/// A whole [`HarnessKind`](mango_external_agents::HarnessKind) also names the profile — `acp:cursor`,
+/// `acp:opencode` — because one ACP harness drives one agent.
 pub const HARNESS_KIND: &str = "acp";
 
 #[cfg(test)]

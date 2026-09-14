@@ -121,14 +121,78 @@ and nothing implying an official or endorsed integration.
 
 ## Agent Client Protocol agents (`mango-agent-acp`)
 
-**Surface used:** ACP v1 over the official `agent-client-protocol` crate; each profile links the
-agent's own documentation for its ACP mode.
+**Surface used:** ACP v1 over the official `agent-client-protocol` crate, `unstable_protocol_v2` and
+every other draft feature off. Every method driven is listed with its specification page in
+[harness-acp.md](harness-acp.md#the-surface-driven). Profile facts were read on 2026-09-13.
 
-**Posture:** the protocol exists for exactly this use. Per profile:
+**Posture:** the protocol exists for exactly this use — it is published by its authors as the way a
+client drives an agent, and every profile here is an agent that ships an ACP mode of its own accord.
+That is a statement about the protocol, not a licence from each vendor; the per-profile notes below say
+what was and was not found.
 
-- **Cursor** (`agent acp`): documented; no third-party-harness statement found either way. The
-  doc says "not found", not "permitted".
-- **OpenCode**, **Gemini CLI**, **Copilot CLI**, **Goose**, the `codex-acp` and `claude-code-acp`
-  shims: to be filled by the ACP harness, each with its documentation link.
+**What this harness does not do:**
 
-**Quotes:** to be filled by the ACP harness.
+- **No login.** `authenticate` is never sent, no browser is opened, and no credential is read, stored
+  or forwarded. `AuthState` is always `Unknown` for every ACP agent, because ACP's `initialize` reports
+  which auth *methods* exist and has no field for whether anyone is signed in. A signed-out agent
+  surfaces as `session/new` answering `-32000`, which becomes `Error::AuthRequired` carrying the
+  agent's own login command as text for a person to run.
+- **No downloaded binaries.** Neither npm shim is launched through `npx -y`, even though both READMEs
+  document that form for a person to run: a library that invoked a package fetcher would be downloading
+  a binary on its own initiative. Both profiles launch the installed binary, and a test asserts no
+  built-in argv names a fetcher.
+- **No host filesystem or terminal for the agent.** `clientCapabilities.fs` and `.terminal` are
+  declined, so a vendor-initiated file or terminal request is answered with a JSON-RPC error and never
+  executed. Every agent here uses its own tools instead.
+- **No MCP servers.** `session/new.mcpServers` is sent empty; nothing is attached that a host did not
+  configure. Nonempty `OpenSession::mcp_servers` is refused before launching the agent.
+
+**Per profile.** Every agent below documents its own ACP mode, and for none of them was a statement
+about third-party harnesses found either way — "not found" is the finding, not "permitted".
+
+| Agent              | Owner                         | ACP mode documented at                             |
+| ------------------ | ----------------------------- | -------------------------------------------------- |
+| Cursor CLI         | Anysphere                     | [cursor.com/docs/cli/acp][cursor-acp]              |
+| Grok Build         | SpaceXAI                      | [Grok Headless & Scripting][grok-acp]              |
+| OpenCode           | Anomaly Innovations           | [opencode.ai/docs/acp][opencode-acp]               |
+| Gemini CLI         | Google                        | [gemini-cli/docs/cli/acp-mode.md][gemini-acp]      |
+| GitHub Copilot CLI | GitHub                        | [ACP server reference][copilot-acp]                |
+| Goose              | Block                         | [block.github.io/goose ACP protocol][goose-acp]    |
+| `codex-acp`        | OpenAI's CLI, via the adapter | [agentclientprotocol/codex-acp][codex-acp]         |
+| `claude-agent-acp` | Claude Code, via the adapter  | [agentclientprotocol/claude-agent-acp][claude-acp] |
+
+[cursor-acp]: https://cursor.com/docs/cli/acp
+[grok-acp]: https://docs.x.ai/build/cli/headless-scripting
+[opencode-acp]: https://opencode.ai/docs/acp/
+[gemini-acp]: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md
+[copilot-acp]: https://docs.github.com/copilot/reference/copilot-cli-reference/acp-server
+[goose-acp]: https://block.github.io/goose/docs/advanced/acp-protocol
+[codex-acp]: https://github.com/agentclientprotocol/codex-acp
+[claude-acp]: https://github.com/agentclientprotocol/claude-agent-acp
+
+Some profiles need a note beyond the link:
+
+- **Grok's example includes ACP `authenticate`.** This harness never sends it and never forwards
+  `XAI_API_KEY`. It only supports the installed CLI when `initialize` and `session/new` can reuse
+  the user's existing local login. The profile disables background updates with the documented
+  `--no-auto-update` flag. A smoke turn passed against Grok 1.0.30 on 2026-09-13 without
+  `authenticate`; that is an observation of this build, not a documented promise about other builds.
+
+- **Goose has no corporate terms of service.** It is Apache-2.0 and brings the user's own model
+  credentials, and Block publishes no page covering it — only product-specific terms for unrelated
+  products. Its `terms_url` therefore points at the project's own
+  [acceptable-usage document](https://github.com/block/goose/blob/main/ACCEPTABLE_USAGE.md), which is
+  the document that does govern the tool, rather than at a page that does not.
+- **Gemini's terms and privacy vary by the authentication method the user chose.** The profile links
+  Google's general pages; a host whose disclosure has to be exact should read Gemini CLI's own
+  terms-and-privacy index.
+- **`codex-acp` proxies to Codex's own auth.** OpenAI has publicly welcomed third-party harnesses on
+  subscriptions (press coverage, 2026-02); the posture cites that as reported, not as a licence term.
+- **`claude-agent-acp` drives the user's own `claude`**, so the Claude Code section above applies
+  unchanged. The package moved twice and the older `@zed-industries/claude-code-acp` is orphaned.
+
+Every profile except `cursor` and `grok` is `verified: false`: the entry is documented but nobody has driven the
+agent. A host can say so in its own interface.
+
+**Quotes:** none of these vendors publishes an operative sentence about third-party harnesses for its
+ACP mode, so there is nothing to quote.

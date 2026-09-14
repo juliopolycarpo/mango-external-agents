@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod approval;
 pub mod discovery;
 pub mod env;
 pub mod error;
@@ -8,6 +9,7 @@ pub mod harness;
 pub mod host;
 pub mod jsonrpc;
 pub mod launcher;
+pub mod lifecycle;
 pub mod link;
 pub mod normalize;
 pub mod permission;
@@ -38,6 +40,7 @@ pub use jsonrpc::{
     Client as JsonRpcClient, ClientOptions as JsonRpcOptions, JsonRpcError, PeerHandler, RequestId,
     ServerRequestOutcome,
 };
+pub use lifecycle::{SessionLifecycle, SessionLifecycleGuard};
 pub use link::{Link, LinkReceiver, LinkSender};
 pub use permission::{
     ApprovalDecision, ApprovalRouting, BrokerDecision, ConfigurationVerdict, DecisionSource,

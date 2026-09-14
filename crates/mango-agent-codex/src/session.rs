@@ -9,8 +9,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use mango_external_agents::HostContext;
+use mango_external_agents::approval::ApprovalDeadline;
 use mango_external_agents::error::{Error, ErrorCode, Result, VendorError};
 use mango_external_agents::event::{EventKind, TurnId};
 use mango_external_agents::jsonrpc::{
@@ -293,6 +295,8 @@ struct PendingEntry {
     /// The turn that owns the server request and its host-visible prompt.
     route: ActiveTurnRoute,
     pending: PendingApproval,
+    /// The request's original wall-clock expiry, translated once for every later wait.
+    deadline: ApprovalDeadline,
     answer: oneshot::Sender<Answer>,
 }
 
@@ -308,6 +312,24 @@ enum Answer {
     },
     /// The server stopped waiting on its own, so nothing needs sending.
     ResolvedByTheServer,
+}
+
+/// The first result while the broker and host race under one approval deadline.
+enum BrokerWait {
+    /// The host or server settled the question before the broker did.
+    Answer(Option<Answer>),
+    /// The broker completed, or the shared deadline elapsed while it deliberated.
+    Broker(Option<Option<PermissionResponse>>),
+}
+
+/// Whether a waiting question still belongs to the turn that is resolving it.
+enum PendingTake {
+    /// The caller owns the question and removed it.
+    Taken,
+    /// Another path already removed the question.
+    Missing,
+    /// A newer turn owns the same request id.
+    Foreign,
 }
 
 impl Shared {
@@ -532,6 +554,19 @@ impl Shared {
             let _ = tokio::time::timeout(remaining, self.emit_for(&route, event)).await;
         }
     }
+
+    /// Takes a question only when the same turn that registered it still owns it.
+    async fn take_pending_for(&self, request_id: &str, route: &ActiveTurnRoute) -> PendingTake {
+        let mut pending = self.pending.lock().await;
+        let Some(entry) = pending.remove(request_id) else {
+            return PendingTake::Missing;
+        };
+        if Arc::ptr_eq(&entry.route.owner, &route.owner) {
+            return PendingTake::Taken;
+        }
+        pending.insert(request_id.to_owned(), entry);
+        PendingTake::Foreign
+    }
 }
 
 /// What the app-server says, and what this client says back.
@@ -686,7 +721,11 @@ impl PeerHandler for CodexHandler {
             });
         }
 
-        let Some(pending) = approvals::to_request(&request, self.shared.host.now()) else {
+        // One read, reused in `decide`: a second `host.now()` call to build the deadline would let
+        // a host clock that moved backward between the two reads extend the monotonic approval
+        // window past what `expires_at` advertised.
+        let now = self.shared.host.now();
+        let Some(pending) = approvals::to_request(&request, now) else {
             return ServerRequestOutcome::Failure(JsonRpcError {
                 code: -32601,
                 message: String::from("expected an approval this client can put to a person"),
@@ -694,7 +733,7 @@ impl PeerHandler for CodexHandler {
             });
         };
 
-        match self.decide(pending, &id, route).await {
+        match self.decide(pending, &id, route, now).await {
             Some(decision) => ServerRequestOutcome::Answer(
                 serde_json::to_value(ApprovalResponse { decision })
                     .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
@@ -719,8 +758,15 @@ impl CodexHandler {
         pending: PendingApproval,
         id: &RequestId,
         route: ActiveTurnRoute,
+        now: SystemTime,
     ) -> Option<ApprovalDecisionValue> {
         let request = pending.request.clone();
+        // Translate the request's original wall-clock deadline once. Every later await must share
+        // it, otherwise a full event channel or a slow broker would restart the host's timer. `now`
+        // is the same read `to_request` stamped `expires_at` from, not a fresh one: a second host
+        // clock read here could drift from the first and stretch the window past what
+        // `expires_at` advertised.
+        let deadline = ApprovalDeadline::new(request.expires_at, now);
 
         // A request the core refuses to bound is a request nothing could render, and refusing it
         // here is better than a prompt nobody sees behind a turn that waits.
@@ -734,7 +780,7 @@ impl CodexHandler {
         // otherwise find nothing waiting: `respond` would refuse, the host would have spent its
         // only handle on a protocol error, and the server would stay blocked until the deadline
         // declined on its behalf.
-        let (answer, waiting) = oneshot::channel();
+        let (answer, mut waiting) = oneshot::channel();
         {
             let mut pending_entries = self.shared.pending.lock().await;
             if pending_entries.contains_key(&request.id) {
@@ -746,6 +792,7 @@ impl CodexHandler {
                     request_key: id.key(),
                     route: route.clone(),
                     pending: pending.clone(),
+                    deadline,
                     answer,
                 },
             );
@@ -785,6 +832,8 @@ impl CodexHandler {
             return None;
         }
 
+        // The stream deliberately backpressures the app-server. The deadline was created before
+        // this await, so a full stream may delay its reply but cannot restart the decision window.
         self.shared
             .emit_for(
                 &route,
@@ -794,32 +843,58 @@ impl CodexHandler {
             )
             .await;
 
-        if let Some(response) = broker_response(self.shared.host.broker(), &bounded).await {
-            // Only if nobody answered first. Taking the entry back is what says so — a policy that
-            // deliberated while a person chose does not get to overrule them.
-            let entry = self.shared.pending.lock().await.remove(&request.id);
-            let owns_entry = entry
-                .as_ref()
-                .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner));
-            if !owns_entry {
-                if let Some(entry) = entry {
-                    self.shared
-                        .pending
-                        .lock()
-                        .await
-                        .insert(request.id.clone(), entry);
+        let broker = deadline.run(broker_response(self.shared.host.broker(), &bounded));
+        tokio::pin!(broker);
+        let broker_wait = tokio::select! {
+            biased;
+            answer = &mut waiting => BrokerWait::Answer(answer.ok()),
+            response = &mut broker => BrokerWait::Broker(response),
+        };
+
+        match broker_wait {
+            BrokerWait::Answer(Some(answer)) => {
+                return self.settle_answer(answer, &route, &request.id).await;
+            }
+            BrokerWait::Answer(None) => {
+                let PendingTake::Taken = self.shared.take_pending_for(&request.id, &route).await
+                else {
+                    return None;
+                };
+                return Some(self.expire(&pending, &route, &request.id).await);
+            }
+            BrokerWait::Broker(None) => {
+                match self.shared.take_pending_for(&request.id, &route).await {
+                    PendingTake::Taken => {
+                        return Some(self.expire(&pending, &route, &request.id).await);
+                    }
+                    // `respond` claims the map entry before sending its answer. The expiry race must
+                    // wait for that already-accepted result instead of turning it into an empty reply.
+                    PendingTake::Missing => {
+                        let answer = waiting.await.ok()?;
+                        return self.settle_answer(answer, &route, &request.id).await;
+                    }
+                    PendingTake::Foreign => return None,
                 }
-            } else {
-                // A policy answering with an id this question never offered is a policy that
-                // cannot be applied here. Refusing is the answer that grants nothing; sending the
-                // id on would have the server refuse a frame a person already thinks was answered.
-                let decision = pending
-                    .decision_for(&response.option_id)
-                    .unwrap_or_else(|| pending.refusal());
-                let option_id = decision.option_id().to_owned();
-                self.resolved(&route, &request.id, &option_id, response.source)
-                    .await;
-                return Some(decision);
+            }
+            BrokerWait::Broker(Some(None)) => {}
+            BrokerWait::Broker(Some(Some(response))) => {
+                // Only if nobody answered first. Taking the entry back is what says so — a policy that
+                // deliberated while a person chose does not get to overrule them.
+                if matches!(
+                    self.shared.take_pending_for(&request.id, &route).await,
+                    PendingTake::Taken
+                ) {
+                    // A policy answering with an id this question never offered is a policy that
+                    // cannot be applied here. Refusing is the answer that grants nothing; sending the
+                    // id on would have the server refuse a frame a person already thinks was answered.
+                    let decision = pending
+                        .decision_for(&response.option_id)
+                        .unwrap_or_else(|| pending.refusal());
+                    let option_id = decision.option_id().to_owned();
+                    self.resolved(&route, &request.id, &option_id, response.source)
+                        .await;
+                    return Some(decision);
+                }
             }
         }
 
@@ -829,7 +904,7 @@ impl CodexHandler {
             biased;
             () = self.shared.host.cancel().cancelled() => None,
             answer = waiting => answer.ok(),
-            () = tokio::time::sleep(approvals::APPROVAL_TIMEOUT) => None,
+            () = deadline.wait() => None,
         };
 
         let removed = self.shared.pending.lock().await.remove(&request.id);
@@ -875,6 +950,51 @@ impl CodexHandler {
                 Some(decision)
             }
         }
+    }
+
+    /// Records the answer that won while the broker was still deliberating.
+    async fn settle_answer(
+        &self,
+        answer: Answer,
+        route: &ActiveTurnRoute,
+        request_id: &str,
+    ) -> Option<ApprovalDecisionValue> {
+        match answer {
+            Answer::Chosen {
+                decision,
+                option_id,
+                source,
+                reported,
+            } => {
+                if !reported {
+                    self.resolved(route, request_id, &option_id, source).await;
+                }
+                Some(decision)
+            }
+            Answer::ResolvedByTheServer => {
+                self.resolved(route, request_id, "cancel", DecisionSource::Cancelled)
+                    .await;
+                None
+            }
+        }
+    }
+
+    /// Refuses an expired question and records the expiry before replying to the app-server.
+    async fn expire(
+        &self,
+        pending: &PendingApproval,
+        route: &ActiveTurnRoute,
+        request_id: &str,
+    ) -> ApprovalDecisionValue {
+        let decision = pending.refusal();
+        self.resolved(
+            route,
+            request_id,
+            decision.option_id(),
+            DecisionSource::Expired,
+        )
+        .await;
+        decision
     }
 
     async fn resolved(
@@ -1279,6 +1399,20 @@ impl Session for CodexSession {
                 received: response.request_id,
             });
         };
+        if entry.deadline.is_elapsed() {
+            let decision = entry.pending.refusal();
+            let option_id = decision.option_id().to_owned();
+            let _ = entry.answer.send(Answer::Chosen {
+                decision,
+                option_id,
+                source: DecisionSource::Expired,
+                reported: false,
+            });
+            return Err(Error::Protocol {
+                expected: String::from("an approval whose deadline has not expired"),
+                received: response.request_id,
+            });
+        }
         let Some(decision) = entry.pending.decision_for(&response.option_id) else {
             // Put back: the server is still waiting, and an id nobody offered is the caller's
             // mistake rather than a reason to leave the vendor blocked.
