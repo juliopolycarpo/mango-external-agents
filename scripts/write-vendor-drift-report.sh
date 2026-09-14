@@ -10,18 +10,12 @@ set -euo pipefail
 
 readonly MAX_DIFF_BYTES=60000
 
+# shellcheck source=vendor-contract-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/vendor-contract-lib.sh"
+
 usage() {
   echo "usage: scripts/write-vendor-drift-report.sh <vendor> <committed-path> <observed-path> <report-file>" >&2
   echo "       scripts/write-vendor-drift-report.sh --failure <vendor> <stage> <report-file>" >&2
-}
-
-validate_contract_path() {
-  local label="$1"
-  local path="$2"
-  if [ ! -e "$path" ]; then
-    printf 'expected %s path %s, received none\n' "$label" "$path" >&2
-    return 2
-  fi
 }
 
 write_report() {

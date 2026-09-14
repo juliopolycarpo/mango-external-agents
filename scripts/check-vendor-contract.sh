@@ -4,17 +4,11 @@
 # Usage: scripts/check-vendor-contract.sh <vendor> <committed-dir> <captured-dir>
 set -euo pipefail
 
+# shellcheck source=vendor-contract-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/vendor-contract-lib.sh"
+
 usage() {
   echo "usage: scripts/check-vendor-contract.sh <vendor> <committed-dir> <captured-dir>" >&2
-}
-
-validate_contract_path() {
-  local label="$1"
-  local path="$2"
-  if [ ! -e "$path" ]; then
-    printf 'expected %s path %s, received none\n' "$label" "$path" >&2
-    return 2
-  fi
 }
 
 compare_contract() {
