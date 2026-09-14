@@ -66,6 +66,7 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### 🧪 Testing
 
+- **(mea)** Assert every accepted level and transport name
 - **(ci)** Isolate the Codex generator refusal test
 - **(codex)** Keep the replay approval deadline off the wall clock
 
