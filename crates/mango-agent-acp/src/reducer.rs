@@ -216,12 +216,15 @@ fn transcript(update: &SessionUpdate) -> bool {
         | SessionUpdate::UsageUpdate(_)
         | SessionUpdate::CurrentModeUpdate(_)
         | SessionUpdate::ConfigOptionUpdate(_)
-        | SessionUpdate::SessionInfoUpdate(_) => false,
+        | SessionUpdate::SessionInfoUpdate(_)
+        // The command catalog is session state, like the mode and config updates above: see
+        // `EventKind::CommandsAvailable`'s own doc comment. It still produces an event in `body`,
+        // it just must not close a reasoning block on its way through.
+        | SessionUpdate::AvailableCommandsUpdate(_) => false,
         SessionUpdate::AgentMessageChunk(_)
         | SessionUpdate::ToolCall(_)
         | SessionUpdate::ToolCallUpdate(_)
-        | SessionUpdate::Plan(_)
-        | SessionUpdate::AvailableCommandsUpdate(_) => true,
+        | SessionUpdate::Plan(_) => true,
         _ => false,
     }
 }
@@ -484,6 +487,10 @@ mod tests {
             json!({
                 "sessionUpdate": "user_message_chunk",
                 "content": { "type": "text", "text": "our own prompt" }
+            }),
+            json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [{ "name": "review", "description": "Review the diff" }]
             }),
         ] {
             let events = reduce(vec![thought.clone(), interruption.clone(), thought.clone()]);
