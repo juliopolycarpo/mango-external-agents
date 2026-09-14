@@ -2397,9 +2397,10 @@ async fn host_mcp_servers_are_refused_before_spawning_codex() {
         assert!(
             matches!(
                 result,
-                Err(mango_external_agents::Error::NotSupported {
-                    capability: mango_external_agents::Capability::McpPassthrough
-                })
+                Err(mango_external_agents::Error::HostConfiguration {
+                    expected: "no MCP servers for a harness without MCP passthrough",
+                    ref received,
+                }) if received == "MCP server count 1"
             ),
             "expected the typed MCP passthrough refusal"
         );

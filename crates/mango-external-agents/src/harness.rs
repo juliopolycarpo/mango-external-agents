@@ -439,8 +439,9 @@ pub trait Harness: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`Error::NotSupported`](crate::Error::NotSupported) when the request carries an undeclared
-    /// strict resume or host-supplied MCP server.
+    /// [`Error::NotSupported`](crate::Error::NotSupported) for undeclared strict resume, or
+    /// [`Error::HostConfiguration`](crate::Error::HostConfiguration) with the supplied server count
+    /// when host-supplied MCP servers are unsupported.
     fn validate_open_session(&self, request: &crate::OpenSession) -> crate::Result<()> {
         if request
             .resume
@@ -449,10 +450,16 @@ pub trait Harness: Send + Sync {
         {
             self.descriptor().capabilities.require(Capability::Resume)?;
         }
-        if !request.mcp_servers.is_empty() {
-            self.descriptor()
+        if !request.mcp_servers.is_empty()
+            && !self
+                .descriptor()
                 .capabilities
-                .require(Capability::McpPassthrough)?;
+                .has(Capability::McpPassthrough)
+        {
+            return Err(crate::Error::HostConfiguration {
+                expected: "no MCP servers for a harness without MCP passthrough",
+                received: format!("MCP server count {}", request.mcp_servers.len()),
+            });
         }
         Ok(())
     }
@@ -652,6 +659,22 @@ mod tests {
         harness
             .validate_open_session(&request)
             .expect("expected fallback resume to reach the harness implementation");
+    }
+
+    #[test]
+    fn rejected_mcp_configuration_reports_the_received_server_count() {
+        let harness = UnboundedProbe::new();
+        let request = crate::OpenSession::new("chat-1").with_mcp_servers(vec![
+            crate::McpServer::stdio("one", "first-mcp"),
+            crate::McpServer::stdio("two", "second-mcp"),
+        ]);
+        let error = harness
+            .validate_open_session(&request)
+            .expect_err("unsupported MCP servers");
+        assert!(
+            error.to_string().contains("received MCP server count 2"),
+            "expected the rejected MCP server count in the diagnostic, received {error}"
+        );
     }
 
     #[test]

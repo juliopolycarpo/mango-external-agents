@@ -13,9 +13,10 @@ async fn unsupported_host_mcp_servers_are_refused_before_launch() {
         .open_session(&host(launcher.clone()), request)
         .await;
     match result {
-        Err(Error::NotSupported {
-            capability: mango_external_agents::Capability::McpPassthrough,
-        }) => {}
+        Err(Error::HostConfiguration {
+            expected: "no MCP servers for a harness without MCP passthrough",
+            received,
+        }) => assert_eq!(received, "MCP server count 1"),
         Err(error) => panic!("expected an unsupported MCP configuration, received {error}"),
         Ok(session) => {
             session
