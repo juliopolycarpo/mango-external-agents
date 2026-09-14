@@ -5,7 +5,8 @@ documents, over one child process per turn. It never logs in, never reads a cred
 downloads a binary.
 
 Facts below were read on 2026-09-13 against `claude` **2.1.270** and the vendor's own pages.
-Re-verify before relying on them; `mea capture` re-captures the fixtures under `fixtures/claude/`.
+Re-verify before relying on them; `mea capture --harness claude` regenerates the public contract
+under `fixtures/claude/contract/`.
 
 Compliance posture: see [compliance.md](compliance.md).
 
@@ -42,6 +43,19 @@ recorded rather than gated on:
   [sessions.md](https://code.claude.com/docs/en/sessions.md) still describes the old behaviour
   unqualified. This harness passes the same working directory on resume either way, so the
   inconsistency cannot bite — but it is a live docs contradiction worth re-checking.
+
+## Fixture capture
+
+`mea capture --harness claude` runs only `claude --version` and `claude --help`. It writes the raw
+help text, a parsed CLI surface, and a version record under `fixtures/claude/contract/`. The command
+does not read `claude auth status`, open a session, or send a prompt, so the pinned drift job can
+reproduce the directory without a login.
+
+`fixtures/claude/historical/contract/auth-status.json`, the versioned files in
+`fixtures/claude/help/`, and `fixtures/claude/transcripts/` are historical captures. They cover an
+older CLI surface and authenticated turns that cannot be reproduced byte-for-byte. Keep them fixed;
+do not regenerate them during a routine drift check. [Fixture rules](../fixtures/README.md) record
+the distinction.
 
 ## The surface driven
 
@@ -197,10 +211,10 @@ A mode this build's own `--permission-mode` does not list narrows that cell to
 ## Approvals: none, and why
 
 `Capabilities::interactive_approvals` is **false**. No `ApprovalRequested` is ever emitted, and
-`Session::respond` returns a typed `claude-approvals-unsupported` refusal. A tool the permission
-mode refuses arrives as `system/permission_denied` followed by a `tool_result` marked in error, and
-is rendered as one failed activity carrying the vendor's own reason — the run continues and exits
-zero, so a refused tool is not a failed turn.
+`Session::respond` returns `Error::NotSupported { capability: Capability::InteractiveApprovals }`.
+A tool the permission mode refuses arrives as `system/permission_denied` followed by a
+`tool_result` marked in error, and is rendered as one failed activity carrying the vendor's own
+reason — the run continues and exits zero, so a refused tool is not a failed turn.
 
 This is a measured verdict, and the measurement is worth recording because it is not obvious:
 
@@ -274,9 +288,10 @@ inline-string form the flag also accepts: inline would put `env` and `headers` o
 anybody can read. The file goes in a directory of its own with an unguessable name, both owner-only
 where the platform has permissions, and is removed when the session is closed or dropped.
 
-A build that does not declare `--mcp-config`, or a transport kind this harness does not map, is
-refused. Accepting either would run every turn without the tools somebody configured and report
-success.
+A build that does not declare `--mcp-config` returns
+`Error::NotSupported { capability: Capability::McpPassthrough }`; a transport kind this harness
+does not map is refused as host configuration. Accepting either would run every turn without the
+tools somebody configured and report success.
 
 ## The event stream
 

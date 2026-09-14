@@ -11,15 +11,14 @@ tool call reach the host's tools. See [`docs/compliance.md`](docs/compliance.md)
 
 ## The matrix
 
-```
-                     Transport kind
-                     stdio            websocket             acp (official crate)
-Harness kind  ┌──────────────────┬──────────────────────┬────────────────────────┐
-claude        │ ✓ per-turn child │ ✗                    │ ✗ (shim = acp profile) │
-codex         │ ✓ app-server     │ experimental, feature │ ✗ (shim = acp profile) │
-acp (generic) │ ✓ child pipes    │ ✓ acp-http, feature  │ ✓ default              │
-              └──────────────────┴──────────────────────┴────────────────────────┘
-```
+| Harness      | Declared transport | Carrier                                          |
+| ------------ | ------------------ | ------------------------------------------------ |
+| Claude       | `stdio`            | Per-turn child process                           |
+| Codex        | `stdio`            | App-server child process                         |
+| ACP profiles | `acp`              | Child pipes, or HTTP with the `acp-http` feature |
+
+Core also provides a WebSocket transport for host integrations. The Codex harness does not enable
+OpenAI's experimental WebSocket interface. ACP over HTTP still uses the `acp` transport kind.
 
 A harness declares which transport kinds it supports; the library refuses an unsupported pair with
 a typed error before anything is spawned.
@@ -81,9 +80,25 @@ host can log or route one without matching on what happened first.
 - [`docs/harness-claude.md`](docs/harness-claude.md), [`docs/harness-codex.md`](docs/harness-codex.md), [`docs/harness-acp.md`](docs/harness-acp.md)
 - [`docs/releasing.md`](docs/releasing.md)
 
+## Smoke CLI
+
+Build `mea` from this repository. It is an unpublished diagnostic tool; v0.1 ships library crates
+only, with no downloadable `mea` binaries.
+
+```sh
+cargo run -p mea -- doctor --json
+cargo run -p mea -- discover --harness claude
+cargo run -p mea -- turn --harness codex --cwd /path/to/workspace --json "say hello"
+cargo run -p mea -- turn --harness acp --profile cursor "say hello"
+cargo run -p mea -- capture --harness claude --out /tmp/claude-contract
+```
+
+`doctor` reports installation, version, gate and auth state for every registered harness. A
+logged-out vendor gets its own login command as a hint. Unknown auth stays unknown. `turn` asks
+for explicit terminal approval; redirected stdin denies requests. `--json` emits a JSON report for
+probes and one complete event per line for turns. See [fixture capture rules](fixtures/README.md).
+
 ## Status
 
-The core crate is complete: traits, events, normalisation, the permission matrix, the host ports,
-the stdio and WebSocket transports, a JSON-RPC client and the `testing` fakes, including the
-conformance suite the three harness crates must pass. The harnesses themselves land next, crate by
-crate; `CHANGELOG.md` tracks it. Rust 1.96 or newer, edition 2024, MIT.
+The core and all three harness crates are implemented. Rust 1.96 or newer, edition 2024, MIT.
+Release and publishing steps are in [docs/releasing.md](docs/releasing.md).

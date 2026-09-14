@@ -1,8 +1,8 @@
 # Releasing
 
 One git tag releases the four crates to crates.io in dependency order (`mango-external-agents`,
-`mango-agent-claude`, `mango-agent-codex`, `mango-agent-acp`) and creates a GitHub release. The tag
-is the only trigger; no token is stored in the repository or in CI.
+`mango-agent-claude`, `mango-agent-codex`, `mango-agent-acp`) and creates a GitHub release. Both the tag trigger and manual retries require a matching `refs/tags/v<version>` ref. No token is
+stored in the repository or in CI.
 
 ## Cut a release
 
@@ -25,7 +25,8 @@ is the only trigger; no token is stored in the repository or in CI.
 3. Review the diff, commit, tag and push. The tag must be signed.
 
    ```sh
-   git add -A && git commit -m "chore(release): v0.2.0"
+   git add Cargo.toml Cargo.lock CHANGELOG.md
+   git commit -m "chore(release): v0.2.0" -m "Release the four crates at the same version."
    git tag -s v0.2.0 -m "v0.2.0"
    git push origin main v0.2.0
    ```
@@ -33,6 +34,23 @@ is the only trigger; no token is stored in the repository or in CI.
 4. Watch the `Release` workflow. It verifies the manifests match the tag, runs `scripts/check.sh`,
    publishes each crate that is not on crates.io yet, and creates the GitHub release with
    git-cliff notes.
+
+## First release checklist
+
+Before publishing 0.1.0, run `scripts/check.sh` and `cargo publish --workspace --dry-run --locked`.
+The workspace dry run stages local crate dependencies, so it can verify all four packages before
+any of their names exist on crates.io. Inspect the packaged contents and verify each crate's docs
+with `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`.
+
+Run `mea doctor` and a harmless `mea turn` against Claude, Codex and Cursor on the maintainer's
+Linux and Windows installations. Pinned CI covers Linux, macOS and Windows public contracts;
+authenticated turns require the maintainer's existing vendor login and are not a PR CI job.
+
+After the first manual publish, check all four 0.1.0 crate pages and docs.rs builds. Configure
+trusted publishing before relying on an automatic later release. Publishing and tagging happen
+only after the release PR is reviewed and merged; a passing PR does not prove a registry upload.
+
+`mea` remains source-only and unpublished. No binaries are attached to v0.1 releases.
 
 ## Pre-releases
 
