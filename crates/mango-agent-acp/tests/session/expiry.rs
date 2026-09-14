@@ -1,5 +1,88 @@
 use super::*;
 
+/// A clock that steps backward by `drift` on every read after its first.
+///
+/// Proves that a caller reused one `now()` rather than reading twice: two reads taken back to
+/// back land on different instants, exactly what a host clock correction looks like mid-request.
+#[derive(Debug)]
+struct RewindingClock {
+    calls: std::sync::atomic::AtomicU32,
+    drift: Duration,
+}
+
+impl RewindingClock {
+    fn new(drift: Duration) -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicU32::new(0),
+            drift,
+        }
+    }
+}
+
+impl Clock for RewindingClock {
+    fn now(&self) -> SystemTime {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SystemTime::now() - self.drift * call
+    }
+}
+
+/// A second `Clock::now()` read between stamping a request's deadline and translating it back
+/// into a wait would let a host clock correction stretch the monotonic approval window past what
+/// the wire advertised. See `ApprovalDeadline::new`'s call sites in `client.rs`.
+#[tokio::test(start_paused = true)]
+async fn the_deadline_reuses_one_clock_read_despite_a_backward_jump() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .asking_for_approval(Approval::Once)
+            .process(),
+    );
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .clock(Arc::new(RewindingClock::new(Duration::from_secs(5))))
+        .limits(Limits {
+            request_timeout: Duration::from_secs(10),
+            ..Limits::default()
+        })
+        .build()
+        .expect("host");
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host,
+            OpenSession::new("chat").with_configuration(permissive()),
+        )
+        .await
+        .expect("session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("expiry", "run it"))
+        .await
+        .expect("turn");
+    loop {
+        let event = turn.recv().await.expect("approval");
+        if matches!(event.kind, EventKind::ApprovalRequested { .. }) {
+            break;
+        }
+    }
+    // Past the advertised 10s deadline, but short of the 15s a stray second clock read would
+    // stretch it to.
+    tokio::time::advance(Duration::from_secs(11)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"optionId\":\"reject\"")),
+        "expected the advertised 10s deadline to expire on schedule, received {:?}",
+        launcher.written()
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_unanswered_approval_expires_without_host_cancellation() {
     let (session, launcher) = open(

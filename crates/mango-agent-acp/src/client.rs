@@ -631,8 +631,11 @@ async fn on_request_permission(
         return responder.respond(permission::cancelled());
     }
 
-    let question =
-        permission::request_from(&request, id.clone(), state.now() + state.approval_timeout);
+    // One read, reused below: a second `state.now()` call to translate `expires_at` back into a
+    // deadline would let a host clock that moved backward between the two reads extend the
+    // monotonic approval window past what the wire advertised.
+    let now = state.now();
+    let question = permission::request_from(&request, id.clone(), now + state.approval_timeout);
     let question = match question.normalized() {
         Ok(question) => question,
         // A question nobody could render — no options, or an id that cannot survive bounding — is
@@ -640,7 +643,7 @@ async fn on_request_permission(
         Err(_) => return responder.respond(permission::cancelled()),
     };
 
-    let deadline = ApprovalDeadline::new(question.expires_at, state.now());
+    let deadline = ApprovalDeadline::new(question.expires_at, now);
     let (timer_done, done) = tokio::sync::oneshot::channel();
     let pending = PendingApproval {
         responder,
