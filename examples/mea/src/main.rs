@@ -131,7 +131,9 @@ fn describe(discovery: &mango_external_agents::Discovery) -> String {
             Some(version) => format!("installed  {version}"),
             None => String::from("installed"),
         },
-        GateVerdict::Unknown | _ => match &discovery.version {
+        // `Unknown`, and whatever the core adds next: a verdict this build cannot read is the same
+        // honest answer as one that says the probe could not tell.
+        _ => match &discovery.version {
             Some(version) => format!("unknown    started, reported {version}"),
             None => String::from("unknown    started, printed no version"),
         },
