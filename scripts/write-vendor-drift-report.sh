@@ -36,6 +36,8 @@ write_report() {
   validate_contract_path 'committed contract' "$committed" || return $?
   validate_contract_path 'observed contract' "$observed" || return $?
   temporary=$(mktemp "${TMPDIR:-/tmp}/mea-vendor-diff.XXXXXX")
+  # Capture the quoted local path while this function still owns it.
+  # shellcheck disable=SC2064
   trap "rm -f -- $(printf '%q' "$temporary")" RETURN
 
   if git diff --no-index --no-ext-diff -- "$committed" "$observed" > "$temporary"; then

@@ -242,6 +242,8 @@ download() {
   binary=$(binary_name "$vendor" "$target")
   released_binary=$(released_binary_name "$vendor" "$target" "$asset")
   temporary=$(mktemp -d "${TMPDIR:-/tmp}/mea-vendor.XXXXXX")
+  # Capture the quoted local path while this function still owns it.
+  # shellcheck disable=SC2064
   trap "rm -rf -- $(printf '%q' "$temporary")" RETURN
 
   gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$temporary" --clobber

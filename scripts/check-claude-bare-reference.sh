@@ -29,6 +29,8 @@ download_and_validate() {
   local reference
   local status
   reference=$(mktemp "${TMPDIR:-/tmp}/mea-claude-bare-reference.XXXXXX")
+  # Capture the quoted local path while this function still owns it.
+  # shellcheck disable=SC2064
   trap "rm -f -- $(printf '%q' "$reference")" RETURN
   curl --fail --silent --show-error --location "$CLAUDE_HEADLESS_REFERENCE" --output "$reference"
   if validate_reference "$reference"; then

@@ -67,6 +67,8 @@ generate_inventory() {
   fi
 
   workdir=$(mktemp -d)
+  # Capture the quoted local path while this function still owns it.
+  # shellcheck disable=SC2064
   trap "rm -rf -- $(printf '%q' "$workdir")" RETURN
   codex app-server generate-json-schema --out "$workdir" >/dev/null
 
