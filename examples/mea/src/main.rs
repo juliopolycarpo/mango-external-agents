@@ -10,6 +10,7 @@ mod options;
 mod redact;
 mod terminal;
 mod turn;
+mod workspace;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -336,19 +337,14 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
     let out = options
         .out
         .unwrap_or_else(|| options::capture_output(&kind));
-    let workspace = options
-        .workspace
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("mea-capture-{}", uuid_like())));
-    std::fs::create_dir_all(&workspace).map_err(|error| {
-        format!("expected a writable capture workspace {workspace:?}, received {error}")
-    })?;
+    let workspace = workspace::CaptureWorkspace::new(options.workspace)?;
     let result = match kind {
         HarnessKind::Codex if options.legacy.is_some() || options.transcripts => {
-            capture::codex(&out, &workspace).await
+            capture::codex(&out, &workspace.path).await
         }
-        HarnessKind::Codex => capture::codex_contract(&out, &workspace).await,
-        HarnessKind::Claude => capture::claude(&out, &workspace).await,
-        HarnessKind::Acp(profile) => capture::acp(&out, &workspace, &profile.to_string()).await,
+        HarnessKind::Codex => capture::codex_contract(&out, &workspace.path).await,
+        HarnessKind::Claude => capture::claude(&out, &workspace.path).await,
+        HarnessKind::Acp(profile) => capture::acp(&out, &workspace.path, &profile.to_string()).await,
         _ => {
             return Err(format!(
                 "expected claude, codex or an ACP profile, received {kind}"
