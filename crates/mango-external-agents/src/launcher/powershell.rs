@@ -34,6 +34,11 @@ fn script_launch(spec: &LaunchSpec, files: &impl ScriptFiles) -> Option<LaunchSp
     } else {
         let path = environment(spec, "PATH")?;
         std::env::split_paths(path)
+            // An empty element — a trailing or doubled `;`, which Windows `PATH` values carry
+            // routinely — joins to the working directory, and that directory is the workspace the
+            // agent was pointed at rather than a place the host installed a CLI. A `cursor-agent.ps1`
+            // committed in a repository must never be what the launcher runs.
+            .filter(|directory| !directory.as_os_str().is_empty())
             .map(|directory| spec.cwd.join(directory).join(&script_name))
             .find(|path| files.is_file(path))?
     };
@@ -98,6 +103,20 @@ mod tests {
         assert!(resolved.stdin && resolved.hide_window);
         assert_eq!(environment(&original, "path"), Some(r"C:\tools"));
         assert_eq!(environment(&original, "LOCALAPPDATA"), None);
+    }
+
+    #[test]
+    fn an_empty_path_element_does_not_reach_the_working_directory() {
+        let mut original = spec();
+        original.env.insert("Path".into(), r"C:\tools;".into());
+        let files = FakeScriptFiles(BTreeSet::from([PathBuf::from(
+            r"C:\workspace\cursor-agent.ps1",
+        )]));
+
+        assert!(
+            script_launch(&original, &files).is_none(),
+            "expected an empty PATH element not to resolve to the authorised workspace"
+        );
     }
 
     #[test]
