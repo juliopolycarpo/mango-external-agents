@@ -63,6 +63,8 @@ jobs:
           tool: cargo-deny,dprint
       - run: cargo deny check
       - run: scripts/check-versions.sh
+      - run: scripts/test-release.sh
+      - run: scripts/test-vendor-drift.sh
       - run: dprint check
 
   msrv:
