@@ -17,6 +17,9 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### 🐛 Bug Fixes
 
+- **(mea)** Answer an unallowable question instead of cancelling the turn
+- **(mea)** Refuse permission levels and transports outside the accepted set
+- **(core)** Reject empty PATH elements when resolving a launcher script
 - **(mea)** Allocate capture workspaces without clock collisions
 - **(ci)** Isolate vendor execution from drift issue publication
 - **(core)** Retain rejected MCP configuration counts
@@ -45,11 +48,26 @@ project adheres to [Semantic Versioning](https://semver.org).
 - **(ci)** Document deliberate cleanup trap expansion
 - Bootstrap the workspace
 
+### ⚡ Performance
+
+- **(mea)** Read doctor's terminal line from the discovery
+
+### ♻️ Refactor
+
+- **(ci)** Share the contract path check between the comparators
+- **(mea)** Match the ACP harness prefix with strip_prefix
+
 ### 📚 Documentation
 
+- **(acp)** Describe the capture redaction the code performs
 - Document host adoption and first-release validation
 - Point at crates, not at plan files (#1)
 - Repo rules, compliance skeleton, adopt guide
+
+### 🧪 Testing
+
+- **(ci)** Isolate the Codex generator refusal test
+- **(codex)** Keep the replay approval deadline off the wall clock
 
 ### 👷 CI
 
