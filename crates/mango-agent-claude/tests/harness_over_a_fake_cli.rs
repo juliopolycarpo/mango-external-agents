@@ -66,6 +66,12 @@ mod discovery {
             }
         );
         assert!(discovery.is_usable());
+        assert!(
+            discovery
+                .permission_matrix
+                .supports(PermissionLevel::Default, ApprovalRouting::AutoReview),
+            "expected subscription discovery to retain supported auto-review"
+        );
         assert!(discovery.capabilities.structured_streaming);
         assert!(
             discovery.capabilities.model_catalog,
@@ -206,6 +212,12 @@ mod discovery {
             AuthState::LoggedOut {
                 login_hint: String::from("claude auth login")
             }
+        );
+        assert!(
+            !discovery
+                .permission_matrix
+                .supports(PermissionLevel::Default, ApprovalRouting::AutoReview),
+            "expected an account with no verified subscription to refuse auto-review"
         );
         assert!(
             !discovery.is_usable(),

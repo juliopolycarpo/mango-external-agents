@@ -197,7 +197,8 @@ unsupported with a reason rather than being rounded to the nearest mode.
 `dontAsk` is never selected. It points the opposite way from `auto` — pre-approved tools only, for
 locked-down CI — and substituting it would silently narrow what a user asked to widen.
 
-**`auto` is resolved per account, not declared.** It needs a qualifying plan tier, and an
+The static declaration includes `auto` as a possible mode. The probed matrix narrows it per
+account: it needs a qualifying plan tier, and an
 administrator can remove it with `disableAutoMode` in the platform's managed-settings document,
 which makes the CLI reject `--permission-mode auto` *at startup* — indistinguishable from any other
 startup failure. So discovery reads that document (policy, not a secret; only the literal
@@ -333,10 +334,7 @@ catalog an earlier run published.
   specific cause. The fixture-backed surface test is what names it for a maintainer.
 - A real `ResumeMode::Fallback`, and a core-owned way to ask a launcher for an interrupt rather
   than a kill, are both recorded above as follow-ups.
-- **The probed permission matrix has nowhere to go.** `Harness::permission_matrix` is the harness's
-  own declaration, answered before any probe, so it cannot know this account or this build — it
-  refuses `auto` unconditionally. `Discovery` carries capabilities and models but no matrix, so the
-  narrowing discovery actually performs (an account that does qualify for `auto`, a build missing a
-  mode) is invisible until `open_session` refuses. Every cell and its reason are computed; a host
-  simply cannot read them in time to grey a row out. Giving `Discovery` a matrix field is the
-  obvious fix and is a product call about the core's shape rather than a Claude one.
+
+Discovery exposes the account and build restrictions in `Discovery.permission_matrix`; the static
+`Harness::permission_matrix` is its upper bound. Hosts can use the probed matrix to disable
+unavailable choices before opening a session.
