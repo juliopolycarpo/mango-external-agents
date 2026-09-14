@@ -31,6 +31,33 @@ impl Clock for FixedClock {
     }
 }
 
+/// A host clock that steps backward by a fixed drift on every read after its first.
+///
+/// Proves a caller reused one `now()` rather than reading twice: two reads taken back to back
+/// land on different instants, exactly what a host clock correction looks like mid-request.
+struct RewindingClock {
+    calls: std::sync::atomic::AtomicU32,
+    start: SystemTime,
+    drift: std::time::Duration,
+}
+
+impl RewindingClock {
+    fn new(start: SystemTime, drift: std::time::Duration) -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicU32::new(0),
+            start,
+            drift,
+        }
+    }
+}
+
+impl Clock for RewindingClock {
+    fn now(&self) -> SystemTime {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.start - self.drift * call
+    }
+}
+
 /// A broker that answers every question the same way, and remembers what it was asked.
 ///
 /// Named rather than an inline closure so a test reads as "this host had a policy" instead of as
@@ -1190,6 +1217,58 @@ async fn a_host_decision_after_the_approval_deadline_is_rejected() {
             .iter()
             .any(|event| matches!(event, EventKind::Completed)),
         "expected the refused approval to let the turn finish, received {events:#?}"
+    );
+}
+
+/// A second `host.now()` read between stamping an approval's deadline and translating it back
+/// into a wait would let a host clock correction stretch the monotonic window past what
+/// `expires_at` advertised. See `CodexHandler::decide`'s clock read in `session.rs`.
+#[tokio::test(start_paused = true)]
+async fn the_approval_deadline_reuses_one_clock_read_despite_a_backward_jump() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("approval").as_process());
+    let (host, launcher) = with_launcher_and_clock(
+        launcher,
+        None,
+        Arc::new(RewindingClock::new(
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(86_400),
+            std::time::Duration::from_secs(300),
+        )),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+
+    await_approval(&mut turn).await;
+    // Past the advertised 30-minute deadline, but short of the 35 minutes a stray second clock
+    // read (5-minute drift) would stretch it to. Checked on the wire rather than by draining to
+    // the terminal: a still-open deadline leaves the turn running, which `drain`'s own timeout
+    // would report as a hang rather than as the missed deadline this test is about.
+    tokio::time::advance(APPROVAL_TIMEOUT + std::time::Duration::from_secs(1)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"decision\":\"decline\"")),
+        "expected the advertised 30-minute deadline to expire on schedule, received {:?}",
+        launcher.written()
+    );
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ApprovalResolved { decision, .. }
+                if decision.option_id == "decline" && decision.source == DecisionSource::Expired
+        )),
+        "expected the on-schedule deadline to be reported as an expiry, received {events:#?}"
     );
 }
 

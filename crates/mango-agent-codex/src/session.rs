@@ -9,6 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use mango_external_agents::HostContext;
 use mango_external_agents::approval::ApprovalDeadline;
@@ -720,7 +721,11 @@ impl PeerHandler for CodexHandler {
             });
         }
 
-        let Some(pending) = approvals::to_request(&request, self.shared.host.now()) else {
+        // One read, reused in `decide`: a second `host.now()` call to build the deadline would let
+        // a host clock that moved backward between the two reads extend the monotonic approval
+        // window past what `expires_at` advertised.
+        let now = self.shared.host.now();
+        let Some(pending) = approvals::to_request(&request, now) else {
             return ServerRequestOutcome::Failure(JsonRpcError {
                 code: -32601,
                 message: String::from("expected an approval this client can put to a person"),
@@ -728,7 +733,7 @@ impl PeerHandler for CodexHandler {
             });
         };
 
-        match self.decide(pending, &id, route).await {
+        match self.decide(pending, &id, route, now).await {
             Some(decision) => ServerRequestOutcome::Answer(
                 serde_json::to_value(ApprovalResponse { decision })
                     .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
@@ -753,11 +758,15 @@ impl CodexHandler {
         pending: PendingApproval,
         id: &RequestId,
         route: ActiveTurnRoute,
+        now: SystemTime,
     ) -> Option<ApprovalDecisionValue> {
         let request = pending.request.clone();
         // Translate the request's original wall-clock deadline once. Every later await must share
-        // it, otherwise a full event channel or a slow broker would restart the host's timer.
-        let deadline = ApprovalDeadline::new(request.expires_at, self.shared.host.now());
+        // it, otherwise a full event channel or a slow broker would restart the host's timer. `now`
+        // is the same read `to_request` stamped `expires_at` from, not a fresh one: a second host
+        // clock read here could drift from the first and stretch the window past what
+        // `expires_at` advertised.
+        let deadline = ApprovalDeadline::new(request.expires_at, now);
 
         // A request the core refuses to bound is a request nothing could render, and refusing it
         // here is better than a prompt nobody sees behind a turn that waits.
