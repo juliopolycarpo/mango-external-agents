@@ -242,7 +242,17 @@ impl Session for AcpSession {
             })
             .await
         {
-            self.state.end_turn();
+            // Matched, and claimed: the same release every other turn-end performs. An unconditional
+            // take would leave this handle's `finished` flag clear for a turn that is over, and would
+            // skip the cancel reason and the questions `end_turn_matching` settles with the slot.
+            //
+            // Like the teardown guards in `client.rs`, this arm has no regression test: an emit here
+            // fails only if the receiving half of the stream is already gone, and the stream is built
+            // in this function and handed to the caller after it returns, so nothing can have dropped
+            // it yet. It is the correct release for a path that exists as defence in depth.
+            if let Some((turn, _, _)) = self.state.end_turn_matching(&handle) {
+                let _ = turn.finish();
+            }
             return Err(error);
         }
 
