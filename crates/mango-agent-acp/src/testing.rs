@@ -24,6 +24,12 @@ pub enum Approval {
     /// Ask once per turn, offering only choices that allow — so a client with nothing to refuse with
     /// has to put the question to a person.
     OnlyAllows,
+    /// Ask once per turn, offering a standing refusal and no one-time one.
+    ///
+    /// What an agent that only knows "reject always" looks like. A client that recognises only
+    /// `reject_once` reads this option set as "nothing here refuses" and has to reach for something
+    /// heavier than an answer.
+    OnlyStandingRefusal,
     /// Ask once per turn and end the turn anyway, without waiting for the answer.
     ///
     /// What a misbehaving agent does, and what a well-behaved one looks like from the client's side
@@ -390,6 +396,10 @@ impl FakeAcpAgent {
             Approval::OnlyAllows => serde_json::json!([
                 { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
                 { "optionId": "allow-all", "name": "Always", "kind": "allow_always" },
+            ]),
+            Approval::OnlyStandingRefusal => serde_json::json!([
+                { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                { "optionId": "reject-all", "name": "Never", "kind": "reject_always" },
             ]),
             _ => serde_json::json!([
                 { "optionId": "allow", "name": "Allow", "kind": "allow_once" },

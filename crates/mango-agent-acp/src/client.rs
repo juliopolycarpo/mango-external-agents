@@ -641,11 +641,11 @@ async fn on_request_permission(
         question: question.clone(),
         announced: false,
         deadline,
-        expiry_option: question
-            .options
-            .iter()
-            .find(|option| option.kind == mango_external_agents::PermissionOptionKind::RejectOnce)
-            .map(|option| option.id.clone()),
+        // The same choice the standing refusal makes, through the core's own preference order:
+        // the one-time refusal when the agent offered one, the standing refusal otherwise. Matching
+        // only `RejectOnce` here would leave an agent that offers `reject_always` alone with no
+        // expiry answer, and the branch below cancels the whole turn when there is none.
+        expiry_option: question.deny().ok().map(|refusal| refusal.option_id),
         connection,
         cancel: CancelNotification::new(request.session_id),
         turn: turn.clone(),

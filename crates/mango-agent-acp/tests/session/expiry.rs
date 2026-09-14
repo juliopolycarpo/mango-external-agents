@@ -398,3 +398,65 @@ async fn an_invalid_host_option_leaves_the_approval_answerable() {
     );
     session.close(CloseReason::Shutdown).await.expect("close");
 }
+
+/// A standing refusal is still a refusal, and expiry has to reach for it.
+///
+/// `PermissionRequest::deny` prefers `reject_once` and falls back to `reject_always`, which is what
+/// the read-only standing refusal already does. An expiry path that recognised only `reject_once`
+/// read this option set as "nothing here refuses" and cancelled the whole prompt — withdrawing every
+/// other question with it — for a question the agent had given it a safe answer to.
+#[tokio::test(start_paused = true)]
+async fn expiry_refuses_with_a_standing_option_when_the_agent_offers_no_one_time_one() {
+    let (session, launcher) = open(
+        FakeAcpAgent::new().asking_for_approval(Approval::OnlyStandingRefusal),
+        permissive(),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("expiry", "run it"))
+        .await
+        .expect("turn");
+    loop {
+        let event = turn.recv().await.expect("approval");
+        if matches!(event.kind, EventKind::ApprovalRequested { .. }) {
+            break;
+        }
+    }
+    tokio::time::advance(Duration::from_secs(120)).await;
+    let events = drain(&mut turn).await;
+
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"optionId\":\"reject-all\"")),
+        "expected the standing refusal to reach the agent, received {:?}",
+        launcher.written()
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("session/cancel")),
+        "expected one refused question rather than a cancelled prompt, received {:?}",
+        launcher.written()
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ApprovalResolved { decision, .. }
+                if decision.option_id == "reject-all" && decision.source == DecisionSource::Expired
+        )),
+        "expected the expiry to be reported as a refusal, received {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            EventKind::Cancelled {
+                reason: CancelReason::Timeout
+            }
+        )),
+        "a refusable question must not take the turn down with it, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
