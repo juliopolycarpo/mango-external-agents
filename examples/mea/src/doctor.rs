@@ -17,11 +17,7 @@ fn row(report: &DiscoveryReport) -> Value {
             return json!({"harness": report.kind.to_string(), "installed": null, "version": null, "gate": "unknown", "auth": "unknown", "error": mango_external_agents::redact::stderr_text(error)});
         }
     };
-    let (auth, login_hint) = match &discovery.auth {
-        AuthState::LoggedIn { .. } => ("logged-in", None),
-        AuthState::LoggedOut { login_hint } => ("logged-out", Some(login_hint)),
-        _ => ("unknown", None),
-    };
+    let (auth, login_hint) = account(discovery);
     json!({
         "harness": report.kind.to_string(),
         "installed": installed(discovery),
@@ -41,6 +37,15 @@ fn row(report: &DiscoveryReport) -> Value {
     })
 }
 
+/// The account state and the vendor's own login command, when it named one.
+fn account(discovery: &Discovery) -> (&'static str, Option<&str>) {
+    match &discovery.auth {
+        AuthState::LoggedIn { .. } => ("logged-in", None),
+        AuthState::LoggedOut { login_hint } => ("logged-out", Some(login_hint.as_str())),
+        _ => ("unknown", None),
+    }
+}
+
 fn installed(discovery: &Discovery) -> Option<bool> {
     match discovery.gate {
         GateVerdict::NotInstalled => Some(false),
@@ -51,21 +56,31 @@ fn installed(discovery: &Discovery) -> Option<bool> {
 }
 
 /// Renders one probe for a terminal. Example: `mea doctor --harness claude`.
+///
+/// Reads the discovery directly rather than through [`row`]: a terminal line needs five scalars,
+/// and building the JSON document would serialise this harness's capabilities, model catalog and
+/// six-cell permission matrix only to drop them.
 pub(crate) fn text(report: &DiscoveryReport) -> String {
-    let data = row(report);
+    let discovery = match &report.result {
+        Ok(discovery) => discovery,
+        Err(error) => {
+            return format!(
+                "{}: installed=null version=unknown gate=unknown auth=unknown; {}",
+                report.kind,
+                mango_external_agents::redact::stderr_text(error)
+            );
+        }
+    };
+    let (auth, login_hint) = account(discovery);
     let mut line = format!(
-        "{}: installed={} version={} gate={} auth={}",
+        "{}: installed={} version={} gate={:?} auth={auth}",
         report.kind,
-        data["installed"],
-        data["version"].as_str().unwrap_or("unknown"),
-        data["gateDetail"].as_str().unwrap_or("unknown"),
-        data["auth"].as_str().unwrap_or("unknown")
+        installed(discovery).map_or_else(|| String::from("null"), |found| found.to_string()),
+        discovery.version.as_deref().unwrap_or("unknown"),
+        discovery.gate,
     );
-    if let Some(hint) = data["loginHint"].as_str() {
+    if let Some(hint) = login_hint {
         line.push_str(&format!("; run `{hint}`"));
-    }
-    if let Some(error) = data["error"].as_str() {
-        line.push_str(&format!("; {error}"));
     }
     line
 }
