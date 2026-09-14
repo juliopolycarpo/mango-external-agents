@@ -83,7 +83,7 @@ fn kind(harness: Option<&str>, profile: Option<&str>) -> Result<Option<HarnessKi
         (Some("claude"), None) => Ok(Some(HarnessKind::Claude)),
         (Some("codex"), None) => Ok(Some(HarnessKind::Codex)),
         (Some("acp"), Some(profile)) => acp(profile),
-        (Some(name), None) if name.starts_with("acp:") => acp(&name[4..]),
+        (Some(name), None) if let Some(profile) = name.strip_prefix("acp:") => acp(profile),
         _ => Err(format!(
             "expected claude, codex, acp:<profile> or acp --profile <id>; received harness {harness:?}, profile {profile:?}"
         )),
