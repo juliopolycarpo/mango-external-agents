@@ -64,14 +64,13 @@ jobs:
           cargo run --locked -p mea -- capture --harness acp:opencode --out "$capture_dir/acp/opencode"
           scripts/check-vendor-contract.sh acp-opencode fixtures/acp/opencode/contract "$capture_dir/acp/opencode/contract"
 
-  latest:
+  latest-capture:
     name: Latest public contract (${{ matrix.vendor }})
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
-      issues: write
     strategy:
       fail-fast: false
       matrix:
@@ -120,27 +119,27 @@ jobs:
               ;;
             acp-opencode) cargo run --locked -p mea -- capture --harness acp:opencode --out "$capture_dir/acp/opencode" ;;
           esac
-      - name: Open or update drift issues
+      - name: Create the drift result
         if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          report_dir="$RUNNER_TEMP/vendor-drift-reports"
+          result_dir="$RUNNER_TEMP/vendor-drift-result/${{ matrix.vendor }}"
           vendor="${{ matrix.vendor }}"
-          report="$report_dir/$vendor.md"
+          report="$result_dir/report.md"
+          state="$result_dir/state"
+          mkdir -p "$result_dir"
           if [ "${{ steps.install.outcome }}" != 'success' ]; then
             scripts/write-vendor-drift-report.sh --failure "$vendor" 'native CLI installation' "$report"
-            scripts/upsert-vendor-drift-issue.sh "$GITHUB_REPOSITORY" "$vendor" "$report"
+            echo drift > "$state"
             exit 0
           fi
           if [ "$vendor" = 'claude' ] && [ "${{ steps.bare-reference.outcome }}" != 'success' ]; then
             scripts/write-vendor-drift-report.sh --failure "$vendor" 'the documented --bare default reference watch' "$report"
-            scripts/upsert-vendor-drift-issue.sh "$GITHUB_REPOSITORY" "$vendor" "$report"
+            echo drift > "$state"
             exit 0
           fi
           if [ "${{ steps.capture.outcome }}" != 'success' ]; then
             scripts/write-vendor-drift-report.sh --failure "$vendor" 'public contract capture' "$report"
-            scripts/upsert-vendor-drift-issue.sh "$GITHUB_REPOSITORY" "$vendor" "$report"
+            echo drift > "$state"
             exit 0
           fi
 
@@ -160,12 +159,114 @@ jobs:
           esac
           if scripts/write-vendor-drift-report.sh "$vendor" "$committed" "$observed" "$report"; then
             echo "no $vendor drift"
+            echo no-drift > "$state"
             exit 0
           else
             status=$?
           fi
           if [ "$status" -ne 1 ]; then
             echo "could not compare $vendor public contract" >&2
+            echo error > "$state"
             exit "$status"
+          fi
+          echo drift > "$state"
+      - name: Bound the drift result
+        id: bound
+        if: always()
+        run: |
+          result_dir="$RUNNER_TEMP/vendor-drift-result/${{ matrix.vendor }}"
+          state="$result_dir/state"
+          report="$result_dir/report.md"
+          if [ ! -f "$state" ] || [ -L "$state" ]; then
+            echo "expected a regular drift state file at $state, received none" >&2
+            exit 2
+          fi
+          state_bytes=$(wc -c < "$state")
+          if [ "$state_bytes" -gt 16 ]; then
+            echo "expected a drift state at most 16 bytes, received $state_bytes" >&2
+            exit 2
+          fi
+          if [ -f "$report" ] && [ ! -L "$report" ]; then
+            bytes=$(wc -c < "$report")
+            if [ "$bytes" -gt 65536 ]; then
+              echo "expected a drift report at most 65536 bytes, received $bytes" >&2
+              exit 2
+            fi
+          fi
+      - name: Upload the bounded drift result
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vendor-drift-${{ matrix.vendor }}
+          path: |
+            ${{ runner.temp }}/vendor-drift-result/${{ matrix.vendor }}/state
+            ${{ runner.temp }}/vendor-drift-result/${{ matrix.vendor }}/report.md
+          if-no-files-found: error
+          retention-days: 1
+
+  latest-report:
+    name: Publish latest drift (${{ matrix.vendor }})
+    if: always() && github.event_name == 'schedule'
+    needs: latest-capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        vendor: [claude, codex, acp-opencode]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download the bounded drift result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vendor-drift-${{ matrix.vendor }}
+          path: ${{ runner.temp }}/vendor-drift-result
+      - name: Validate and publish the drift result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          result_dir="$RUNNER_TEMP/vendor-drift-result"
+          vendor="${{ matrix.vendor }}"
+          state="$result_dir/state"
+          report="$result_dir/report.md"
+          if [ ! -f "$state" ] || [ -L "$state" ]; then
+            echo "expected a regular drift state file at $state, received none" >&2
+            exit 2
+          fi
+          state_bytes=$(wc -c < "$state")
+          if [ "$state_bytes" -gt 16 ]; then
+            echo "expected a drift state at most 16 bytes, received $state_bytes" >&2
+            exit 2
+          fi
+          case "$(cat "$state")" in
+            no-drift) exit 0 ;;
+            drift) ;;
+            error)
+              echo "the unprivileged $vendor comparison failed" >&2
+              exit 2
+              ;;
+            *)
+              echo "expected drift state no-drift, drift or error, received $(cat "$state")" >&2
+              exit 2
+              ;;
+          esac
+          if [ ! -f "$report" ] || [ -L "$report" ]; then
+            echo "expected a regular drift report at $report, received none" >&2
+            exit 2
+          fi
+          bytes=$(wc -c < "$report")
+          if [ "$bytes" -gt 65536 ]; then
+            echo "expected a drift report at most 65536 bytes, received $bytes" >&2
+            exit 2
+          fi
+          if ! grep -Fxq "<!-- vendor-drift:$vendor -->" "$report"; then
+            echo "expected the $vendor drift marker in $report, received none" >&2
+            exit 2
           fi
           scripts/upsert-vendor-drift-issue.sh "$GITHUB_REPOSITORY" "$vendor" "$report"

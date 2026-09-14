@@ -29,11 +29,13 @@ are deliberately excluded from the pull-request reproduction check. They remain 
 and are never hand-edited. A historical capture is labelled as archival and is not re-captured just
 because a newer CLI exists.
 
-Every Monday, `latest` installs the newest published release, recreates the same public artifacts,
-and writes or updates one open `drift(<vendor>)` issue per vendor when a diff exists. The issue body
-contains the diff. Codex compares both its `fixtures/codex/contract/` public app-server capture and
-the generated schema inventory; the version pin by itself is not a schema drift report. The scheduled
-job has issue write permission; pull-request jobs do not create, edit, or close issues.
+Every Monday, `latest-capture` installs the newest published release and recreates the same public
+artifacts without issue-write permission. It uploads only a bounded drift result. A fresh
+`latest-report` job checks out the scheduled commit, validates that result, and writes or updates one
+open `drift(<vendor>)` issue per vendor when a diff exists. The issue body contains the diff. Codex
+compares both its `fixtures/codex/contract/` public app-server capture and the generated schema
+inventory; the version pin by itself is not a schema drift report. Pull-request jobs do not create,
+edit, or close issues.
 
 The Claude scheduled lane also checks Anthropic's [headless CLI reference](https://code.claude.com/docs/en/headless)
 for its documented statement that `--bare` is opt-in. A changed or missing statement opens the same

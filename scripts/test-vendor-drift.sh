@@ -263,4 +263,5 @@ test_contract_comparison
 test_drift_report
 test_claude_bare_reference
 test_issue_deduplication
+python3 scripts/test-vendor-result.py
 echo 'vendor drift script tests passed'
