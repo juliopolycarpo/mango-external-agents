@@ -333,14 +333,9 @@ async fn turn(options: &Options) -> Result<(), String> {
 async fn capture(arguments: &[String]) -> Result<(), String> {
     let options = options::CaptureOptions::parse(arguments)?;
     let kind = options.kind()?;
-    let vendor = match kind {
-        HarnessKind::Claude => "claude",
-        HarnessKind::Codex => "codex",
-        _ => "acp",
-    };
     let out = options
         .out
-        .unwrap_or_else(|| std::path::PathBuf::from(format!("fixtures/{vendor}")));
+        .unwrap_or_else(|| options::capture_output(&kind));
     let workspace = options
         .workspace
         .unwrap_or_else(|| std::env::temp_dir().join(format!("mea-capture-{}", uuid_like())));

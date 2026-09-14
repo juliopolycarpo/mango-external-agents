@@ -203,3 +203,42 @@ mod capture_tests {
         }
     }
 }
+
+/// The fixture root for one captured profile. Example: ACP OpenCode lives in `fixtures/acp/opencode`.
+pub(crate) fn capture_output(kind: &HarnessKind) -> PathBuf {
+    let vendor = match kind {
+        HarnessKind::Claude => "claude",
+        HarnessKind::Codex => "codex",
+        _ => "acp",
+    };
+    let root = PathBuf::from("fixtures").join(vendor);
+    match kind {
+        HarnessKind::Acp(profile) => root.join(profile.to_string()),
+        _ => root,
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn acp_captures_default_to_separate_profile_directories() {
+        assert_eq!(
+            capture_output(&HarnessKind::Acp(AcpProfileId::new("opencode"))),
+            PathBuf::from("fixtures/acp/opencode")
+        );
+        assert_eq!(
+            capture_output(&HarnessKind::Acp(AcpProfileId::new("cursor"))),
+            PathBuf::from("fixtures/acp/cursor")
+        );
+        assert_eq!(
+            capture_output(&HarnessKind::Claude),
+            PathBuf::from("fixtures/claude")
+        );
+        assert_eq!(
+            capture_output(&HarnessKind::Codex),
+            PathBuf::from("fixtures/codex")
+        );
+    }
+}
