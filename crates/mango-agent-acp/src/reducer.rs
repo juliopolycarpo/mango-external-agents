@@ -74,11 +74,13 @@ impl Reducer {
     /// );
     /// ```
     pub fn update(&mut self, update: SessionUpdate) -> Vec<EventKind> {
-        // Every arm but the thought chunk closes an open reasoning block: a host that never saw
-        // `ReasoningEnded` would render a reasoning phase that stays open for the rest of the turn.
-        let mut events = match &update {
-            SessionUpdate::AgentThoughtChunk(_) => Vec::new(),
-            _ => self.close_reasoning(),
+        // A transcript frame closes an open reasoning block: a host that never saw `ReasoningEnded`
+        // would render a reasoning phase that stays open for the rest of the turn. A frame that
+        // produces no transcript must *not*, or a usage report or a mode change arriving between two
+        // thought chunks would split one continuous thought into two rendered blocks.
+        let mut events = match transcript(&update) {
+            true => self.close_reasoning(),
+            false => Vec::new(),
         };
         events.extend(self.body(update));
         events
@@ -117,6 +119,10 @@ impl Reducer {
         vec![EventKind::ReasoningEnded]
     }
 
+    /// The events one frame's own arm produces, with no reasoning bookkeeping.
+    ///
+    /// Every arm added here needs a matching decision in [`transcript`]: whether the frame is part of
+    /// the turn's transcript, and so whether it closes an open reasoning block.
     fn body(&mut self, update: SessionUpdate) -> Vec<EventKind> {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => text_delta(chunk),
@@ -194,6 +200,29 @@ impl Reducer {
                 truncated: false,
             },
         }]
+    }
+}
+
+/// Whether this frame is part of the turn's transcript rather than of the session's own state.
+///
+/// The thought chunk is transcript and is excluded anyway: it is the frame that *opens* a reasoning
+/// block, so closing one for it would end every block on its second chunk. Everything listed as
+/// `false` is what [`Reducer::body`] drops — the `#[non_exhaustive]` tail with it, because a frame
+/// this build cannot read is not evidence that the agent stopped thinking.
+fn transcript(update: &SessionUpdate) -> bool {
+    match update {
+        SessionUpdate::AgentThoughtChunk(_)
+        | SessionUpdate::UserMessageChunk(_)
+        | SessionUpdate::UsageUpdate(_)
+        | SessionUpdate::CurrentModeUpdate(_)
+        | SessionUpdate::ConfigOptionUpdate(_)
+        | SessionUpdate::SessionInfoUpdate(_) => false,
+        SessionUpdate::AgentMessageChunk(_)
+        | SessionUpdate::ToolCall(_)
+        | SessionUpdate::ToolCallUpdate(_)
+        | SessionUpdate::Plan(_)
+        | SessionUpdate::AvailableCommandsUpdate(_) => true,
+        _ => false,
     }
 }
 
@@ -435,6 +464,46 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A frame that produces no transcript must not break a thought in half.
+    ///
+    /// Agents report usage and mode changes whenever they like, including between two thought
+    /// chunks. Closing the reasoning block for one of them would hand a host two collapsed reasoning
+    /// panels for a single continuous thought — and `usage_update` in particular arrives on most
+    /// turns, so this was not a rare shape.
+    #[test]
+    fn a_session_state_frame_between_thoughts_does_not_split_the_reasoning_block() {
+        let thought = json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": { "type": "text", "text": "weighing it" }
+        });
+        for interruption in [
+            json!({ "sessionUpdate": "usage_update", "used": 1200, "size": 200_000 }),
+            json!({ "sessionUpdate": "current_mode_update", "currentModeId": "default" }),
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "our own prompt" }
+            }),
+        ] {
+            let events = reduce(vec![thought.clone(), interruption.clone(), thought.clone()]);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::ReasoningStarted))
+                    .count(),
+                1,
+                "expected one reasoning block across {interruption}, received {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EventKind::ReasoningEnded))
+                    .count(),
+                1,
+                "expected one reasoning block across {interruption}, received {events:?}"
+            );
+        }
     }
 
     /// A turn that ends mid-thought still owes the host the closing half.
