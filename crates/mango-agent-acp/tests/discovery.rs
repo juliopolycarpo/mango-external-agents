@@ -116,7 +116,10 @@ impl ProcessLauncher for InstalledAgents {
             });
         };
         let agent = FakeAcpAgent::new().printing_version(resolved.version);
-        let process = if spec.argv.get(1).is_some_and(|arg| arg == "--version") {
+        // Named anywhere in the argv, not only second: a profile may put its own flags — Grok's
+        // `--no-auto-update` — ahead of `--version`, and a fixture that only looked at `argv[1]`
+        // would hand such a probe a full ACP agent and wait out the request timeout.
+        let process = if spec.argv.iter().any(|arg| arg == "--version") {
             agent.version_process()
         } else {
             agent.process()

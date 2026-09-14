@@ -192,7 +192,9 @@ printing a plausible command would send a person to a prompt that does not exist
 ## Discovery
 
 The probe runs the profile's version argv through the host's launcher and reads what the agent printed.
-It does **not** search `PATH` (the library never does; a host that resolved a path passes it on
+That argv is usually `<executable> --version`, but a profile may carry its own: Grok's version argv is
+`grok --no-auto-update --version`, so a probe does not trigger the background self-update the session
+argv already declines (see [Profiles](#profiles)). It does **not** search `PATH` (the library never does; a host that resolved a path passes it on
 `AcpHarness::with_executable`) and it does **not** run `initialize`, because a handshake is a session
 and discovering an agent should not open one.
 
@@ -254,7 +256,10 @@ of the same executable. Grok also installs an `agent` command, so the Cursor pro
 number from that command cannot establish which vendor owns it.
 
 The Grok command is `grok --no-auto-update agent stdio`, using the ACP invocation and update control
-documented in [Headless & Scripting][p-grok]. Using the distinct executable names allows
+documented in [Headless & Scripting][p-grok]. Its version argv carries the same flag —
+`grok --no-auto-update --version` — because a probe is the one call a host makes before it has decided
+to run this agent at all, and it should not be the call that updates it. Verified against Grok 1.0.30,
+which prints `grok 1.0.30 (04b7ffed98c6) [stable]`. Using the distinct executable names allows
 both installations to coexist regardless of which installer last claimed `agent`. Hosts with a
 custom installation can supply their own resolved executable path.
 

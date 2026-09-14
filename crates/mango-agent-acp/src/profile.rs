@@ -397,6 +397,10 @@ fn grok() -> AcpProfile {
         &["grok", "--no-auto-update", "agent", "stdio"],
         "https://docs.x.ai/build/cli/headless-scripting",
     )
+    // The derived `grok --version` would drop the flag and let a probe start a background
+    // self-update: downloading a binary is not something a discovery sweep may do on its own
+    // initiative, and the session argv disables it for exactly that reason.
+    .with_version_argv(["grok", "--no-auto-update", "--version"])
     .with_login_hint("grok login")
     // `tests/smoke.rs` passed against Grok 1.0.30 on 2026-09-13 with the existing local login,
     // without an ACP `authenticate` request. No permission-mode mapping is claimed.
@@ -612,6 +616,28 @@ mod tests {
                     profile.id
                 );
             }
+        }
+    }
+
+    /// A flag that stops the CLI updating itself has to be on the probe's argv too. `--version` is
+    /// the one command a discovery sweep runs unprompted, so a profile that only disabled background
+    /// updates for its session left the sweep downloading a binary on the library's initiative.
+    #[test]
+    fn a_flag_that_stops_a_self_update_is_on_the_probe_argv_as_well() {
+        for profile in builtin_profiles() {
+            let Some(flag) = profile
+                .argv
+                .iter()
+                .find(|word| word.contains("auto-update") || word.contains("no-update"))
+            else {
+                continue;
+            };
+            assert!(
+                profile.version_argv.contains(flag),
+                "expected {flag:?} on the probe argv, received {:?} for {}",
+                profile.version_argv,
+                profile.id
+            );
         }
     }
 
