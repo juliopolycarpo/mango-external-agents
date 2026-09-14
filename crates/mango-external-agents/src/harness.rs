@@ -440,9 +440,13 @@ pub trait Harness: Send + Sync {
     /// # Errors
     ///
     /// [`Error::NotSupported`](crate::Error::NotSupported) when the request carries an undeclared
-    /// resume or host-supplied MCP server.
+    /// strict resume or host-supplied MCP server.
     fn validate_open_session(&self, request: &crate::OpenSession) -> crate::Result<()> {
-        if request.resume.is_some() {
+        if request
+            .resume
+            .as_ref()
+            .is_some_and(|resume| resume.mode == crate::ResumeMode::Strict)
+        {
             self.descriptor().capabilities.require(Capability::Resume)?;
         }
         if !request.mcp_servers.is_empty() {
@@ -637,6 +641,17 @@ mod tests {
         descriptor()
             .require_transport(&TransportKind::Stdio)
             .expect("expected stdio to be accepted, received a refusal");
+    }
+
+    #[test]
+    fn fallback_resume_reaches_a_harness_that_does_not_declare_resume() {
+        let harness = UnboundedProbe::new();
+        let request =
+            crate::OpenSession::new("chat-1").resuming("native-1", crate::ResumeMode::Fallback);
+
+        harness
+            .validate_open_session(&request)
+            .expect("expected fallback resume to reach the harness implementation");
     }
 
     #[test]
