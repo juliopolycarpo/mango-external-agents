@@ -843,11 +843,6 @@ impl CodexHandler {
         };
 
         match broker_wait {
-            BrokerWait::Answer(Some(Answer::ResolvedByTheServer)) => {
-                return self
-                    .settle_answer(Answer::ResolvedByTheServer, &route, &request.id)
-                    .await;
-            }
             BrokerWait::Answer(Some(answer)) => {
                 return self.settle_answer(answer, &route, &request.id).await;
             }
