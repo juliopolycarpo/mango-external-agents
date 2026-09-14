@@ -352,10 +352,12 @@ never going to work.
   `TurnStream`, and `Session::cancel` is the call that does it today.
 - **Public OpenCode contract capture.** `mea capture --harness acp --profile opencode` records the
   installed CLI's version and its v1 `initialize` answer under `fixtures/acp/opencode/contract/`.
-  It sends no `authenticate` or `session/new` request. The capture retains capability and auth-method
-  identifiers, drops extension metadata and path-shaped values, and ends the child immediately after
-  the answer. `testing::FakeAcpAgent` still covers the full v1 lifecycle; `tests/smoke.rs` drives a
-  real agent on demand.
+  It sends no `authenticate` or `session/new` request. The capture keeps each auth method's `type`,
+  `id` and `name` and the shape of `agentCapabilities`, drops `_meta` extension objects, and
+  replaces every string *value* inside `agentCapabilities` with `[REDACTED]` rather than guessing
+  which of them is a machine path. It ends the child immediately after the answer.
+  `testing::FakeAcpAgent` still covers the full v1 lifecycle; `tests/smoke.rs` drives a real agent
+  on demand.
 
 ## Smoke test
 
