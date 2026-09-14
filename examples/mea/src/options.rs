@@ -12,9 +12,9 @@ struct Arguments {
     harness: Option<String>,
     #[arg(long)]
     profile: Option<String>,
-    #[arg(long, value_parser = ["read-only", "default", "full-access"])]
+    #[arg(long)]
     level: Option<String>,
-    #[arg(long, value_parser = ["stdio", "websocket", "acp"])]
+    #[arg(long)]
     transport: Option<String>,
     #[arg(long)]
     cwd: Option<PathBuf>,
@@ -41,20 +41,39 @@ impl Options {
         .map_err(|error| error.to_string())?;
         Ok(Self {
             kind: kind(args.harness.as_deref(), args.profile.as_deref())?,
-            level: args.level.map(|level| match level.as_str() {
-                "read-only" => PermissionLevel::ReadOnly,
-                "full-access" => PermissionLevel::FullAccess,
-                _ => PermissionLevel::Default,
-            }),
-            transport: args.transport.map(|transport| match transport.as_str() {
-                "acp" => TransportKind::Acp,
-                "websocket" => TransportKind::WebSocket,
-                _ => TransportKind::Stdio,
-            }),
+            level: args.level.as_deref().map(level).transpose()?,
+            transport: args.transport.as_deref().map(transport).transpose()?,
             cwd: args.cwd,
             json: args.json,
             prompt: args.prompt.join(" "),
         })
+    }
+}
+
+/// The permission level this name asks for. Example: `--level read-only`.
+///
+/// Named here rather than through clap's `value_parser` so the accepted set is written once: a
+/// list on the field and a `_` arm here would let a new value parse into the wrong level.
+fn level(named: &str) -> Result<PermissionLevel, String> {
+    match named {
+        "read-only" => Ok(PermissionLevel::ReadOnly),
+        "default" => Ok(PermissionLevel::Default),
+        "full-access" => Ok(PermissionLevel::FullAccess),
+        other => Err(format!(
+            "expected `read-only`, `default` or `full-access`, received {other:?}"
+        )),
+    }
+}
+
+/// The transport this name asks for. Example: `--transport stdio`.
+fn transport(named: &str) -> Result<TransportKind, String> {
+    match named {
+        "stdio" => Ok(TransportKind::Stdio),
+        "websocket" => Ok(TransportKind::WebSocket),
+        "acp" => Ok(TransportKind::Acp),
+        other => Err(format!(
+            "expected `stdio`, `websocket` or `acp`, received {other:?}"
+        )),
     }
 }
 
@@ -117,6 +136,10 @@ mod tests {
             vec!["--cwd"],
             vec!["--harness", "codex", "--profile", "cursor"],
             vec!["--harness", "acp:no-such-profile"],
+            // A value outside the accepted set must be refused, never quietly read as the
+            // permissive end of the axis.
+            vec!["--level", "plan"],
+            vec!["--transport", "unix-socket"],
         ] {
             assert!(
                 Options::parse(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
