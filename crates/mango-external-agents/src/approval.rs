@@ -17,12 +17,19 @@ impl ApprovalDeadline {
     /// ```
     /// use mango_external_agents::approval::ApprovalDeadline;
     /// let now = std::time::SystemTime::now();
-    /// let deadline = ApprovalDeadline::new(now, now);
+    /// let deadline = ApprovalDeadline::new(now, now).expect("a current deadline");
     /// assert!(deadline.is_elapsed());
     /// ```
+    /// Returns None when the runtime clock cannot represent the remaining interval.
     #[must_use]
-    pub fn new(expires_at: SystemTime, now: SystemTime) -> Self {
-        Self(tokio::time::Instant::now() + expires_at.duration_since(now).unwrap_or_default())
+    pub fn new(expires_at: SystemTime, now: SystemTime) -> Option<Self> {
+        let remaining = expires_at.duration_since(now).unwrap_or_default();
+        Self::from_remaining(remaining)
+    }
+
+    /// Builds a deadline from a monotonic interval, refusing an interval the runtime cannot hold.
+    fn from_remaining(remaining: std::time::Duration) -> Option<Self> {
+        tokio::time::Instant::now().checked_add(remaining).map(Self)
     }
 
     /// Checks the deadline before accepting a decision, even if the timer task has not run yet.
@@ -39,7 +46,7 @@ impl ApprovalDeadline {
     /// # async fn example() {
     /// use mango_external_agents::approval::ApprovalDeadline;
     /// let now = std::time::SystemTime::now();
-    /// ApprovalDeadline::new(now, now).wait().await;
+    /// ApprovalDeadline::new(now, now).expect("a current deadline").wait().await;
     /// # }
     /// ```
     pub async fn wait(self) {
@@ -54,7 +61,10 @@ impl ApprovalDeadline {
     /// # async fn example() {
     /// use mango_external_agents::approval::ApprovalDeadline;
     /// let now = std::time::SystemTime::now();
-    /// assert_eq!(ApprovalDeadline::new(now, now).run(async { "allow" }).await, None);
+    /// assert_eq!(
+    ///     ApprovalDeadline::new(now, now).expect("a current deadline").run(async { "allow" }).await,
+    ///     None
+    /// );
     /// # }
     /// ```
     pub async fn run<T>(self, future: impl Future<Output = T>) -> Option<T> {
@@ -78,7 +88,7 @@ mod tests {
     async fn elapsed_deadlines_never_accept_ready_decisions() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         for expires in [now, now - Duration::from_secs(1)] {
-            let deadline = ApprovalDeadline::new(expires, now);
+            let deadline = ApprovalDeadline::new(expires, now).expect("representable deadline");
             assert!(deadline.is_elapsed());
             assert_eq!(deadline.run(async { "allow" }).await, None);
             deadline.wait().await;
@@ -88,7 +98,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn broker_wait_does_not_restart_the_host_deadline() {
         let now = SystemTime::UNIX_EPOCH;
-        let deadline = ApprovalDeadline::new(now + Duration::from_secs(10), now);
+        let deadline = ApprovalDeadline::new(now + Duration::from_secs(10), now).expect("deadline");
         assert_eq!(deadline.run(async { "ask host" }).await, Some("ask host"));
         tokio::time::advance(Duration::from_secs(7)).await;
         let start = tokio::time::Instant::now();
@@ -100,8 +110,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stalled_broker_cannot_outlive_the_deadline() {
         let now = SystemTime::UNIX_EPOCH;
-        let deadline = ApprovalDeadline::new(now + Duration::from_secs(10), now);
+        let deadline = ApprovalDeadline::new(now + Duration::from_secs(10), now).expect("deadline");
         assert_eq!(deadline.run(std::future::pending::<()>()).await, None);
         assert!(deadline.is_elapsed());
+    }
+
+    #[test]
+    fn a_runtime_deadline_that_cannot_be_represented_is_refused() {
+        assert!(
+            ApprovalDeadline::from_remaining(Duration::MAX).is_none(),
+            "expected the runtime clock to refuse Duration::MAX rather than panic"
+        );
     }
 }

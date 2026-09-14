@@ -178,6 +178,41 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// Computes the wall-clock deadline for one approval.
+    ///
+    /// The configured timeout is checked instead of added unchecked. A host clock near the edge of
+    /// SystemTime receives a typed configuration refusal instead of causing a harness callback to
+    /// panic. For example, the default timeout after the Unix epoch produces a later instant.
+    ///
+    /// # Errors
+    ///
+    /// Returns Error::HostConfiguration when this timeout cannot be represented after now.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::SystemTime;
+    ///
+    /// use mango_external_agents::Limits;
+    ///
+    /// let expires_at = Limits::default()
+    ///     .approval_expires_at(SystemTime::UNIX_EPOCH)
+    ///     .expect("default approval deadline");
+    /// assert!(expires_at > SystemTime::UNIX_EPOCH);
+    /// ```
+    pub fn approval_expires_at(&self, now: SystemTime) -> Result<SystemTime> {
+        now.checked_add(self.approval_timeout)
+            .ok_or_else(|| Error::HostConfiguration {
+                expected: "an approval deadline representable from the host clock",
+                received: format!(
+                    "host clock {now:?} with approval timeout {:?}",
+                    self.approval_timeout
+                ),
+            })
+    }
+}
+
 /// Everything a harness may use without reaching into host state.
 ///
 /// Cheap to clone: the launcher and the clock are behind `Arc`, and a harness that opens several
@@ -364,6 +399,9 @@ impl HostContextBuilder {
             received: String::from("none"),
         })?;
 
+        let limits = self.limits.unwrap_or_default();
+        limits.approval_expires_at(SystemTime::UNIX_EPOCH)?;
+
         Ok(HostContext {
             launcher,
             cwd,
@@ -372,7 +410,7 @@ impl HostContextBuilder {
             clock: self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
             cancel: self.cancel.unwrap_or_default(),
             broker: self.broker,
-            limits: self.limits.unwrap_or_default(),
+            limits,
         })
     }
 }
@@ -465,6 +503,31 @@ mod tests {
                 }
             ),
             "expected a client-identity refusal, received {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_context_rejects_an_approval_timeout_that_cannot_form_a_deadline() {
+        let error = HostContext::builder()
+            .launcher(Arc::new(RefusingLauncher))
+            .cwd("/workspace")
+            .client_info("mangostudio", "1.4.0")
+            .limits(Limits {
+                approval_timeout: Duration::MAX,
+                ..Limits::default()
+            })
+            .build()
+            .expect_err("expected Duration::MAX to be rejected before a deadline can panic");
+
+        assert!(
+            matches!(
+                error,
+                Error::HostConfiguration {
+                    expected: "an approval deadline representable from the host clock",
+                    ..
+                }
+            ),
+            "expected an approval-timeout configuration refusal, received {error:?}"
         );
     }
 

@@ -149,8 +149,8 @@ pub(crate) struct SessionState {
     session_id: SessionId,
     clock: Arc<dyn Clock>,
     broker: Option<Arc<dyn PermissionBroker>>,
-    /// How long an approval stays answerable, carried on every request the host sees.
-    approval_timeout: Duration,
+    /// The host limits used to form every approval deadline.
+    limits: mango_external_agents::Limits,
     turn: Mutex<Option<TurnHandle>>,
     /// The explicit settings the next turn inherits.
     ///
@@ -210,7 +210,7 @@ impl SessionState {
             session_id,
             clock: Arc::clone(host.clock()),
             broker: host.broker().cloned(),
-            approval_timeout: host.limits().approval_timeout,
+            limits: *host.limits(),
             turn: Mutex::new(None),
             configuration: Mutex::new(configuration),
             turn_start: Mutex::new(()),
@@ -656,7 +656,10 @@ async fn on_request_permission(
     // deadline would let a host clock that moved backward between the two reads extend the
     // monotonic approval window past what the wire advertised.
     let now = state.now();
-    let question = permission::request_from(&request, id.clone(), now + state.approval_timeout);
+    let Ok(expires_at) = state.limits.approval_expires_at(now) else {
+        return responder.respond(permission::cancelled());
+    };
+    let question = permission::request_from(&request, id.clone(), expires_at);
     let question = match question.normalized() {
         Ok(question) => question,
         // A question nobody could render — no options, or an id that cannot survive bounding — is
@@ -664,7 +667,9 @@ async fn on_request_permission(
         Err(_) => return responder.respond(permission::cancelled()),
     };
 
-    let deadline = ApprovalDeadline::new(question.expires_at, now);
+    let Some(deadline) = ApprovalDeadline::new(question.expires_at, now) else {
+        return responder.respond(permission::cancelled());
+    };
     let (timer_done, done) = tokio::sync::oneshot::channel();
     let pending = PendingApproval {
         responder,
