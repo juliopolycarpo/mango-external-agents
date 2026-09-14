@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Downloads one immutable, vendor-published CLI release into a private bin directory.
+# Downloads one vendor-published CLI release into a private bin directory.
 #
 # The pin lane cannot use each vendor's normal installer: those installers intentionally follow the
 # latest release. This helper instead downloads an exact release asset from the vendor's official
-# GitHub release. It never signs in to the CLI and it does not put the binary on a user's PATH.
+# GitHub release. Pinned archives must match the recorded digest before extraction. Latest archives
+# use the current release API digest, so they can detect asset corruption without pretending that a
+# moving release is a pin. It never signs in to the CLI and it does not put the binary on a user's
+# PATH.
 #
 # Usage: scripts/install-vendor-cli.sh <claude|codex|opencode> <version|latest> <bin-dir>
 set -euo pipefail
@@ -113,6 +116,99 @@ released_binary_name() {
   esac
 }
 
+pinned_archive_digest() {
+  local vendor="$1"
+  local version="$2"
+  local asset="$3"
+  local digest
+  local registry
+  registry="$(dirname "${BASH_SOURCE[0]}")/vendor-cli-pinned-sha256sums.txt"
+  if [ ! -f "$registry" ]; then
+    printf 'expected pinned vendor checksum registry %s, received none\n' "$registry" >&2
+    return 2
+  fi
+  digest=$(awk -v vendor="$vendor" -v version="$version" -v asset="$asset" '
+    $1 == vendor && $2 == version && $3 == asset { print $4; exit }
+  ' "$registry")
+  if [ -z "$digest" ]; then
+    printf 'expected a pinned SHA-256 for %s %s asset %s, received none\n' \
+      "$vendor" "$version" "$asset" >&2
+    return 2
+  fi
+  printf '%s\n' "$digest"
+}
+
+latest_archive_digest() {
+  local repo="$1"
+  local tag="$2"
+  local asset="$3"
+  local digest
+  if ! digest=$(gh release view "$tag" --repo "$repo" --json assets | \
+    python3 -c '
+import json
+import sys
+
+asset = sys.argv[1]
+for candidate in json.load(sys.stdin)["assets"]:
+    if candidate["name"] == asset:
+        digest = candidate.get("digest", "")
+        checksum = digest.removeprefix("sha256:")
+        if (
+            digest.startswith("sha256:")
+            and len(checksum) == 64
+            and all(char in "0123456789abcdef" for char in checksum)
+        ):
+            print(checksum)
+            raise SystemExit(0)
+raise SystemExit(f"expected a SHA-256 release digest for asset {asset}, received none")
+' "$asset"); then
+    return 2
+  fi
+  printf '%s\n' "$digest"
+}
+
+archive_sha256() {
+  local archive="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$archive" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$archive" | awk '{print $1}'
+    return
+  fi
+  printf 'expected sha256sum or shasum to verify %s, received neither on PATH\n' "$archive" >&2
+  return 2
+}
+
+verify_sha256() {
+  local expected="$1"
+  local archive="$2"
+  local actual
+  actual=$(archive_sha256 "$archive")
+  if [ "$actual" = "$expected" ]; then
+    return
+  fi
+  printf 'expected SHA-256 %s for %s, received %s\n' "$expected" "$archive" "$actual" >&2
+  return 1
+}
+
+verify_archive() {
+  local vendor="$1"
+  local version="$2"
+  local repo="$3"
+  local tag="$4"
+  local asset="$5"
+  local archive="$6"
+  local expected
+  if [ "$version" = 'latest' ]; then
+    expected=$(latest_archive_digest "$repo" "$tag" "$asset")
+  else
+    expected=$(pinned_archive_digest "$vendor" "$version" "$asset")
+  fi
+  verify_sha256 "$expected" "$archive"
+}
+
 unpack_asset() {
   local archive="$1"
   local directory="$2"
@@ -149,6 +245,7 @@ download() {
   trap "rm -rf -- $(printf '%q' "$temporary")" RETURN
 
   gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$temporary" --clobber
+  verify_archive "$vendor" "$version" "$repo" "$tag" "$asset" "$temporary/$asset"
   unpack_asset "$temporary/$asset" "$temporary"
   extracted="$temporary/$released_binary"
   if [ ! -f "$extracted" ]; then

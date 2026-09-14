@@ -67,7 +67,7 @@ generate_inventory() {
   fi
 
   workdir=$(mktemp -d)
-  trap 'rm -rf "$workdir"' EXIT
+  trap "rm -rf -- $(printf '%q' "$workdir")" RETURN
   codex app-server generate-json-schema --out "$workdir" >/dev/null
 
   mkdir -p "$vendor_dir"
@@ -78,6 +78,8 @@ generate_inventory() {
     "$version" \
     > "$vendor_dir/schema.json"
 
+  trap - RETURN
+  rm -rf -- "$workdir"
   echo "generated the codex $version schema inventory in $vendor_dir"
 }
 

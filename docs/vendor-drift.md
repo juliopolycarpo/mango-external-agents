@@ -14,9 +14,12 @@ them with the committed files:
 | OpenAI Codex | `0.154.0` | `fixtures/codex/contract/` and the vendored schema inventory |
 | OpenCode ACP | `1.18.30` | `fixtures/acp/opencode/contract/`                            |
 
-The installer uses the vendor's immutable GitHub release rather than a mutable `latest` installer.
-That is only a CI pinning mechanism. People install the CLIs using the vendors' documented native
-installers: [Claude Code setup](https://code.claude.com/docs/en/setup), [Codex CLI setup](https://learn.chatgpt.com/docs/codex/cli), and [OpenCode installation](https://opencode.ai/docs/).
+Release tags and assets can change, so pinned assets are not treated as immutable. Before extracting
+an archive, the installer verifies its SHA-256 against [the recorded per-platform digests](../scripts/vendor-cli-pinned-sha256sums.txt).
+Those digests came from the vendor release assets' GitHub API metadata. The weekly latest lane instead
+verifies each downloaded archive against that release's current API digest; it intentionally has no
+in-repository checksum because finding a new release is its purpose. This is only a CI pinning
+mechanism. People install the CLIs using the vendors' documented native installers: [Claude Code setup](https://code.claude.com/docs/en/setup), [Codex CLI setup](https://learn.chatgpt.com/docs/codex/cli), and [OpenCode installation](https://opencode.ai/docs/).
 OpenCode documents `opencode acp` as its JSON-RPC-over-stdio ACP command, and Codex documents the
 app-server surface used to generate the schema inventory.
 

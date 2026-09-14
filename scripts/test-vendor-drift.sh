@@ -64,8 +64,79 @@ test_vendor_release_mapping() {
   assert_eq "$(binary_name codex windows-x64)" 'codex.exe' 'Codex installed Windows name'
   assert_eq "$(released_binary_name codex linux-x64 codex-x86_64-unknown-linux-musl.tar.gz)" \
     'codex-x86_64-unknown-linux-musl' 'Codex release binary name'
+  assert_eq "$(pinned_archive_digest claude 2.1.270 claude-linux-x64.tar.gz)" \
+    'b069b327de3ad6c8cda70886675da46fb213797ac99a367df384e2202b37e0b7' \
+    'Claude pinned archive digest'
   expect_status 2 vendor_repo unknown
   expect_status 2 asset_name claude solaris-sparc
+}
+
+test_archive_checksum_verification() {
+  local archive="$test_root/pinned-archive"
+  local error="$test_root/pinned-archive.error"
+  local digest
+  printf 'the recorded bytes\n' > "$archive"
+  digest=$(archive_sha256 "$archive")
+  verify_sha256 "$digest" "$archive"
+  if verify_sha256 \
+    '0000000000000000000000000000000000000000000000000000000000000000' \
+    "$archive" > "$error" 2>&1; then
+    fail 'a mismatched archive checksum must be rejected'
+  fi
+  assert_contains "$error" 'expected SHA-256 0000000000000000000000000000000000000000000000000000000000000000' \
+    'checksum mismatch shape'
+}
+
+test_every_pinned_platform_has_a_checksum() {
+  local entry
+  local vendor
+  local version
+  local target
+  local asset
+  local digest
+  for entry in \
+    'claude 2.1.270 linux-x64' \
+    'claude 2.1.270 linux-arm64' \
+    'claude 2.1.270 darwin-x64' \
+    'claude 2.1.270 darwin-arm64' \
+    'claude 2.1.270 windows-x64' \
+    'claude 2.1.270 windows-arm64' \
+    'codex 0.154.0 linux-x64' \
+    'codex 0.154.0 linux-arm64' \
+    'codex 0.154.0 darwin-x64' \
+    'codex 0.154.0 darwin-arm64' \
+    'codex 0.154.0 windows-x64' \
+    'codex 0.154.0 windows-arm64' \
+    'opencode 1.18.30 linux-x64' \
+    'opencode 1.18.30 linux-arm64' \
+    'opencode 1.18.30 darwin-x64' \
+    'opencode 1.18.30 darwin-arm64' \
+    'opencode 1.18.30 windows-x64' \
+    'opencode 1.18.30 windows-arm64'; do
+    read -r vendor version target <<EOF
+$entry
+EOF
+    asset=$(asset_name "$vendor" "$target")
+    digest=$(pinned_archive_digest "$vendor" "$version" "$asset")
+    assert_eq "${#digest}" '64' "pinned digest length for $vendor $target"
+  done
+}
+
+test_latest_checksum_lookup() {
+  local fake_bin="$test_root/latest-gh-bin"
+  local original_path="$PATH"
+  mkdir -p "$fake_bin"
+  ln -s "$repo_root/scripts/test-fixtures/fake-release-cli.sh" "$fake_bin/gh"
+  export PATH="$fake_bin:$PATH"
+  export FAKE_RELEASE_ASSET='codex-linux.tar.gz'
+  export FAKE_RELEASE_DIGEST='d7e18b2597ae8f242f5f31ee9e90deef48dbc9edd634d9868fb6435d08c07f02'
+  assert_eq "$(latest_archive_digest openai/codex rust-v0.154.0 "$FAKE_RELEASE_ASSET")" \
+    "$FAKE_RELEASE_DIGEST" 'latest release API digest'
+  export FAKE_RELEASE_DIGEST=''
+  expect_status 2 latest_archive_digest openai/codex rust-v0.154.0 "$FAKE_RELEASE_ASSET"
+  unset FAKE_RELEASE_ASSET
+  unset FAKE_RELEASE_DIGEST
+  export PATH="$original_path"
 }
 
 test_codex_output_arguments() {
@@ -82,6 +153,22 @@ test_codex_generator_requires_an_installed_cli() {
   PATH='/usr/bin:/bin'
   expect_status 2 generate_inventory
   PATH="$original_path"
+}
+
+test_codex_generator_cleans_up_in_a_standalone_process() {
+  local fake_bin="$test_root/codex-bin"
+  local output="$test_root/codex-output"
+  local original_path="$PATH"
+  mkdir -p "$fake_bin"
+  ln -s "$repo_root/scripts/test-fixtures/fake-codex-schema.sh" "$fake_bin/codex"
+  ln -s "$repo_root/scripts/test-fixtures/fake-python3.sh" "$fake_bin/python3"
+  export PATH="$fake_bin:$PATH"
+  export FAKE_CODEX_SCHEMA="$repo_root/crates/mango-agent-codex/vendor/schema.json"
+  "$repo_root/scripts/vendor-codex.sh" 0.154.0 --out "$output" >/dev/null
+  assert_contains "$output/schema.json" '"codexVersion": "0.154.0"' \
+    'standalone Codex inventory output'
+  unset FAKE_CODEX_SCHEMA
+  export PATH="$original_path"
 }
 
 test_contract_comparison() {
@@ -166,8 +253,12 @@ test_issue_deduplication() {
 }
 
 test_vendor_release_mapping
+test_archive_checksum_verification
+test_every_pinned_platform_has_a_checksum
+test_latest_checksum_lookup
 test_codex_output_arguments
 test_codex_generator_requires_an_installed_cli
+test_codex_generator_cleans_up_in_a_standalone_process
 test_contract_comparison
 test_drift_report
 test_claude_bare_reference

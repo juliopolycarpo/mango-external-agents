@@ -1,0 +1,22 @@
+# Pinned CLI archive checksums from the GitHub Releases API asset `digest` field, 2026-09-14.
+# Sources: anthropics/claude-code v2.1.270; openai/codex rust-v0.154.0;
+# anomalyco/opencode v1.18.30.
+# Format: vendor version asset sha256. The installer matches all three fields before extraction.
+claude 2.1.270 claude-darwin-arm64.tar.gz 844b574a4f66103138a0d3090e7ef6117f83790b4d637c25a798057a735e68e9
+claude 2.1.270 claude-darwin-x64.tar.gz bfc4a3bb1f785e389035b7b49ac752e0fd92d908efdc6d1b4ec590e545c54730
+claude 2.1.270 claude-linux-arm64.tar.gz 005d990a52bc16a5dd9ac51f2cc959f686a2c502b343b2eab92351ababf50f7f
+claude 2.1.270 claude-linux-x64.tar.gz b069b327de3ad6c8cda70886675da46fb213797ac99a367df384e2202b37e0b7
+claude 2.1.270 claude-win32-arm64.zip 2ee976f38978295394af9f2f9e7708fec4b84c2b05dabff31acdab9f432007b8
+claude 2.1.270 claude-win32-x64.zip bc0b26b266b0b7c1bd983ebaa68d8239d557f44f4ffdf27bb65788888ea902bf
+codex 0.154.0 codex-aarch64-apple-darwin.tar.gz 344310a0a591c1b192e04feff304321a69907c9498baaac331ca7e16ebcef9d7
+codex 0.154.0 codex-aarch64-pc-windows-msvc.exe.zip 5da0e4b828d125bb72ecefc882bd068443625df32d56269e687afb7026b2a65d
+codex 0.154.0 codex-aarch64-unknown-linux-musl.tar.gz 583b48df32804213bdcd338c2e5adb06b34340821fa757a726cc0a524fa33c27
+codex 0.154.0 codex-x86_64-apple-darwin.tar.gz 1219c837d8f813b493a424c125c0038b5d9ca16279bc6d3fe6ce037a3e18a6e7
+codex 0.154.0 codex-x86_64-pc-windows-msvc.exe.zip 53685f9f6bd171d4bd7d6c2be724fc04f6737a4001eb8471ec59824e5adc8042
+codex 0.154.0 codex-x86_64-unknown-linux-musl.tar.gz d7e18b2597ae8f242f5f31ee9e90deef48dbc9edd634d9868fb6435d08c07f02
+opencode 1.18.30 opencode-darwin-arm64.zip a5e43d6887386efc7d68ce49ae28e3bbdfdee3dfd1d7169b612c3ce67e53b1e8
+opencode 1.18.30 opencode-darwin-x64.zip 7453007e58ff122401438d95ccb24334874b5908dcaee77883f96c23395d5710
+opencode 1.18.30 opencode-linux-arm64.tar.gz 4111a55c2a02c0fac314bd51e9a2330280e6d29d2b85b9554fff6d62612566ed
+opencode 1.18.30 opencode-linux-x64.tar.gz 55007246858165496ff85ba1c2b648f7421e8e2013bf4189a680c9ff8e699d17
+opencode 1.18.30 opencode-windows-arm64.zip 35d6ff7d80aff5ade71ac06fc32dd89357b5b0bac050fc6db41ecf0929cea560
+opencode 1.18.30 opencode-windows-x64.zip c8c0e0d05ac3dac544a0edfad8de9eb244bf46c6c7a131c38619d40fcf31bd1f
