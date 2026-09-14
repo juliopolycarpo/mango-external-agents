@@ -103,6 +103,7 @@ impl EnvSource {
 /// `vendor_keys` comes from the harness's own descriptor — documented variables that vendor's CLI
 /// reads — never from a host request. Any `LC_*` key survives on top of the base list, because the
 /// locale set is open and a missing one changes how a CLI formats what it prints.
+/// Key matching follows the operating system: case-insensitive on Windows, exact on Unix.
 ///
 /// # Example
 ///
@@ -131,6 +132,15 @@ pub fn allowlist(source: &EnvSource, vendor_keys: &[&str]) -> BTreeMap<String, S
 }
 
 fn is_allowed(key: &str, vendor_keys: &[&str]) -> bool {
+    if cfg!(windows) {
+        return BASE_ENVIRONMENT_KEYS
+            .iter()
+            .chain(vendor_keys)
+            .any(|allowed| key.eq_ignore_ascii_case(allowed))
+            || key
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LC_"));
+    }
     BASE_ENVIRONMENT_KEYS.contains(&key) || vendor_keys.contains(&key) || key.starts_with("LC_")
 }
 
@@ -203,5 +213,35 @@ mod tests {
     #[test]
     fn an_empty_source_yields_an_empty_environment() {
         assert!(allowlist(&EnvSource::empty(), &["ANYTHING"]).is_empty());
+    }
+
+    #[test]
+    fn environment_key_casing_follows_the_host_platform() {
+        let source = EnvSource::from_pairs([
+            ("SYSTEMROOT", r"C:\Windows"),
+            ("COMSPEC", r"C:\Windows\system32\cmd.exe"),
+            ("vendor_config", "allowed"),
+            ("lc_messages", "en_US.UTF-8"),
+            ("VENDOR_CONFIG_SECRET", "forbidden"),
+        ]);
+        let child = allowlist(&source, &["VENDOR_CONFIG"]);
+        if cfg!(windows) {
+            assert_eq!(
+                child.get("SYSTEMROOT").map(String::as_str),
+                Some(r"C:\Windows"),
+                "expected Git Bash's uppercase SYSTEMROOT to survive the Windows allowlist"
+            );
+            assert_eq!(child.len(), 4);
+            assert_eq!(
+                child.get("vendor_config").map(String::as_str),
+                Some("allowed")
+            );
+            assert!(!child.contains_key("VENDOR_CONFIG_SECRET"));
+            return;
+        }
+        assert!(
+            child.is_empty(),
+            "expected case-sensitive environment keys on Unix"
+        );
     }
 }
