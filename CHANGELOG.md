@@ -17,6 +17,7 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### 🐛 Bug Fixes
 
+- **(mea)** Allocate capture workspaces without clock collisions
 - **(ci)** Isolate vendor execution from drift issue publication
 - **(core)** Retain rejected MCP configuration counts
 - **(core)** Match Windows environment keys without case sensitivity
