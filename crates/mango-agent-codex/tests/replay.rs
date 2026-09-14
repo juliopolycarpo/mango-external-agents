@@ -377,7 +377,13 @@ fn replay_limits() -> mango_external_agents::Limits {
         // A call the replay has no answer for is a bug in the fixture or in the harness, and the
         // default two minutes would report it as a test that hangs rather than one that fails.
         request_timeout: std::time::Duration::from_secs(5),
-        approval_timeout: std::time::Duration::from_millis(100),
+        // Deliberately long, and not shortened the way `request_timeout` was. Every test that
+        // exercises this deadline runs under `start_paused`, where `tokio::time::advance` reaches
+        // it instantly whatever it is; every other test in this file runs on the real clock and
+        // answers its approval from host code. A short value there is a wall-clock budget between
+        // `await_approval` and `respond`, which a loaded runner spends before the answer lands —
+        // the harness then declines on the host's behalf and the decision arrives as `Expired`.
+        approval_timeout: std::time::Duration::from_secs(30 * 60),
         ..mango_external_agents::Limits::default()
     }
 }
