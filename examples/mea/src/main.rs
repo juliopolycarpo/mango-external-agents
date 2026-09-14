@@ -231,14 +231,28 @@ async fn discover_with(
             })
             .collect::<Result<Vec<_>, String>>()?,
     };
-    let mut reports = Vec::with_capacity(harnesses.len());
-    for (kind, harness) in harnesses {
+    // Probed concurrently, in registry order. Each probe spawns a child and waits on it for up to
+    // `Limits::request_timeout`, and the probes share nothing — run one after another, a sweep over
+    // ten harnesses costs ten timeouts instead of one.
+    let probes: Vec<(HarnessKind, tokio::task::JoinHandle<_>)> = harnesses
+        .into_iter()
+        .map(|(kind, harness)| {
+            let host = host.clone();
+            (
+                kind,
+                tokio::spawn(
+                    async move { harness.discover(&host).await.map_err(|e| e.to_string()) },
+                ),
+            )
+        })
+        .collect();
+    let mut reports = Vec::with_capacity(probes.len());
+    for (kind, probe) in probes {
         reports.push(DiscoveryReport {
             kind,
-            result: harness
-                .discover(host)
-                .await
-                .map_err(|error| error.to_string()),
+            // Folded into the row rather than into the sweep: one harness that panicked is one
+            // line that says so, not nine probes nobody gets to read.
+            result: probe.await.unwrap_or_else(|error| Err(error.to_string())),
         });
     }
     Ok(reports)
