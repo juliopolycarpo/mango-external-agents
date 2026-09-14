@@ -4,7 +4,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.1.0] - 2026-09-14
+
+### 🚀 Features
+
+- **(mea)** Add diagnostics and reproducible public contract capture
+- **(core)** Finalize discovery and approval policy before 0.1
+- **(acp)** The Agent Client Protocol harness, with per-agent profiles (#5)
+- **(codex)** Codex app-server harness (#4)
+- **(claude)** The Claude Code harness (#3)
+- **(core)** Traits, events, host ports, transports and testing fakes (#2)
+
+### 🐛 Bug Fixes
+
+- **(mea)** Let the event consumer own terminal approval decisions
+- **(release)** Validate tag dispatch and verify every package
+- **(core)** Launch installed PowerShell CLI entrypoints on Windows
 
 ### 🏗️ Build
 
@@ -16,9 +31,12 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### 📚 Documentation
 
+- Document host adoption and first-release validation
+- Point at crates, not at plan files (#1)
 - Repo rules, compliance skeleton, adopt guide
 
 ### 👷 CI
 
+- Verify pinned vendor contracts and report weekly drift
 - Fmt, clippy, tests, deny, msrv on three OSes
 
