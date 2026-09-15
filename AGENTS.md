@@ -30,7 +30,7 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 | `crates/mango-external-agents/` | Core: `Harness`/`Session` traits, events, normalisation, permission matrix, host ports, transports, testing |
 | `crates/mango-agent-claude/`    | Claude Code harness: stream-json dialect, reducer, auth probe, models, permissions                          |
 | `crates/mango-agent-codex/`     | Codex harness: app-server dialect, reducer, approvals, rate limits; vendored protocol types under `vendor/` |
-| `crates/mango-agent-acp/`       | Generic ACP harness over the official crate, per-agent profiles, `acp` and `acp-http` transports            |
+| `crates/mango-agent-acp/`       | Generic ACP harness over the official crate, per-agent profiles, `acp` transport                            |
 | `examples/mea/`                 | Unpublished CLI: discover, turn, capture, doctor (the smoke and drift tool)                                 |
 | `fixtures/<vendor>/`            | Captured contracts and transcripts, replayed by the fakes                                                   |
 | `docs/`                         | Compliance posture, host adoption guide, one guide per harness, releasing                                   |
