@@ -8,7 +8,7 @@
 //! This is the only way a fixture is made. Hand-writing one produces a transcript that agrees with
 //! whatever the author believed, which is exactly the belief a fixture exists to check.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +21,10 @@ use mango_external_agents::transports::stdio;
 use serde_json::{Map, Value, json};
 
 use crate::redact;
+
+mod contracts;
+
+pub use contracts::{DEFAULT_ACP_CAPTURE_PROFILE, acp, claude, codex_contract};
 
 /// Which direction a recorded line went.
 ///
@@ -471,12 +475,6 @@ fn review_target(scenario: &str) -> Value {
         }
         _ => json!({"type": "uncommittedChanges"}),
     }
-}
-
-/// Where fixtures live, relative to the repository root.
-#[must_use]
-pub fn default_out_dir() -> PathBuf {
-    PathBuf::from("fixtures/codex")
 }
 
 #[cfg(test)]

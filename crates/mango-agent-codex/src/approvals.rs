@@ -5,7 +5,7 @@
 //! only judgement this module makes is which neutral kind each one is — which is what lets a
 //! host's policy answer "allow" without reading a label in a language it does not know.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use mango_external_agents::event::ActivityKind;
 use mango_external_agents::permission::{
@@ -15,13 +15,6 @@ use mango_external_agents::permission::{
 use crate::protocol::approvals::{
     ApprovalDecisionValue, CommandExecutionApprovalParams, FileChangeApprovalParams, ServerRequest,
 };
-
-/// How long a question stays answerable.
-///
-/// The app-server sets no deadline of its own: it blocks until the client replies, and a prompt
-/// nobody answers is a turn that never ends. The core's `ApprovalDeadline` measures this budget
-/// from the request's creation; the harness sends the vendor's refusal when it expires.
-pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// One question, and the answers this harness will take for it.
 ///
@@ -65,15 +58,21 @@ impl PendingApproval {
 ///
 /// `None` for a request this harness refuses; the caller answers those with a protocol error.
 #[must_use]
-pub fn to_request(request: &ServerRequest, now: SystemTime) -> Option<PendingApproval> {
+pub(crate) fn to_request(
+    request: &ServerRequest,
+    expires_at: SystemTime,
+) -> Option<PendingApproval> {
     match request {
-        ServerRequest::CommandExecution(params) => Some(from_command(params, now)),
-        ServerRequest::FileChange(params) => Some(from_file_change(params, now)),
+        ServerRequest::CommandExecution(params) => Some(from_command(params, expires_at)),
+        ServerRequest::FileChange(params) => Some(from_file_change(params, expires_at)),
         ServerRequest::Refused { .. } => None,
     }
 }
 
-fn from_command(params: &CommandExecutionApprovalParams, now: SystemTime) -> PendingApproval {
+fn from_command(
+    params: &CommandExecutionApprovalParams,
+    expires_at: SystemTime,
+) -> PendingApproval {
     let command = params.command.as_deref().unwrap_or("a command");
     let title = format!("Run {command}");
     let detail = match (params.reason.as_deref(), params.cwd.as_deref()) {
@@ -108,11 +107,11 @@ fn from_command(params: &CommandExecutionApprovalParams, now: SystemTime) -> Pen
         title,
         detail,
         decisions,
-        now,
+        expires_at,
     )
 }
 
-fn from_file_change(params: &FileChangeApprovalParams, now: SystemTime) -> PendingApproval {
+fn from_file_change(params: &FileChangeApprovalParams, expires_at: SystemTime) -> PendingApproval {
     let title = match params.grant_root.as_deref() {
         Some(root) => format!("Write under {root}"),
         None => String::from("Apply file changes"),
@@ -123,7 +122,7 @@ fn from_file_change(params: &FileChangeApprovalParams, now: SystemTime) -> Pendi
         title,
         params.reason.clone(),
         base_decisions(),
-        now,
+        expires_at,
     )
 }
 
@@ -143,7 +142,7 @@ fn build(
     title: String,
     detail: Option<String>,
     decisions: Vec<ApprovalDecisionValue>,
-    now: SystemTime,
+    expires_at: SystemTime,
 ) -> PendingApproval {
     let options = decisions.iter().map(option_for).collect();
     let decisions = decisions
@@ -167,7 +166,7 @@ fn build(
             title,
             detail,
             options,
-            expires_at: now + APPROVAL_TIMEOUT,
+            expires_at,
             truncated: false,
         },
         decisions,
@@ -225,19 +224,48 @@ mod tests {
                 "command": "rm -rf /tmp/mango",
             }),
         );
-        super::to_request(&request, std::time::SystemTime::UNIX_EPOCH)
-            .expect("expected a question a person can be asked")
+        super::to_request(
+            &request,
+            mango_external_agents::Limits::default()
+                .approval_expires_at(std::time::SystemTime::UNIX_EPOCH)
+                .expect("default approval deadline"),
+        )
+        .expect("expected a question a person can be asked")
     }
 
-    use super::{APPROVAL_TIMEOUT, to_request};
+    use super::to_request as build_request;
     use crate::protocol::approvals::{ApprovalDecisionValue, ServerRequest, method};
     use mango_external_agents::event::ActivityKind;
     use mango_external_agents::permission::PermissionOptionKind;
     use serde_json::json;
     use std::time::{Duration, SystemTime};
 
+    fn to_request(request: &ServerRequest, now: SystemTime) -> Option<super::PendingApproval> {
+        build_request(
+            request,
+            mango_external_agents::Limits::default()
+                .approval_expires_at(now)
+                .ok()?,
+        )
+    }
+
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_283_381)
+    }
+
+    /// The last instant this platform's `SystemTime` can represent after the Unix epoch.
+    fn latest_system_time() -> SystemTime {
+        let mut seconds = 0_u64;
+        for bit in (0..u64::BITS).rev() {
+            let candidate = seconds | (1_u64 << bit);
+            if SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(candidate))
+                .is_some()
+            {
+                seconds = candidate;
+            }
+        }
+        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
     }
 
     fn command_request(extra: serde_json::Value) -> ServerRequest {
@@ -302,7 +330,29 @@ mod tests {
             "expected the working directory in the detail, received {:?}",
             pending.request.detail
         );
-        assert_eq!(pending.request.expires_at, now() + APPROVAL_TIMEOUT);
+        assert_eq!(
+            pending.request.expires_at,
+            mango_external_agents::Limits::default()
+                .approval_expires_at(now())
+                .expect("default approval deadline")
+        );
+    }
+
+    #[test]
+    fn a_host_clock_that_cannot_represent_an_approval_expiry_is_refused_without_panicking() {
+        let result = std::panic::catch_unwind(|| {
+            to_request(&command_request(json!({})), latest_system_time())
+        });
+
+        assert!(
+            result.is_ok(),
+            "expected an unrepresentable host-clock deadline to be refused without panicking"
+        );
+        assert_eq!(
+            result.expect("the panic check above passed"),
+            None,
+            "expected an unrepresentable host-clock deadline to be refused"
+        );
     }
 
     /// `cancel` aborts the turn. The core's RejectOnce means the turn goes on, so mapping it there

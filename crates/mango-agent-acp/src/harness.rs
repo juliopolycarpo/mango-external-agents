@@ -74,6 +74,7 @@ fn ceiling() -> Capabilities {
         usage_reporting: true,
         cancellation: true,
         session_listing: true,
+        configuration: true,
         ..Capabilities::none()
     }
 }
@@ -214,6 +215,7 @@ impl Harness for AcpHarness {
             // run. The ceiling is what the harness could reach; `open_session` reports what the
             // agent actually advertised on `SessionInfo::capabilities`.
             capabilities: ceiling(),
+            permission_matrix: self.permission_matrix(),
             models: Vec::new(),
         })
     }
@@ -223,12 +225,7 @@ impl Harness for AcpHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        if !request.mcp_servers.is_empty() {
-            return Err(Error::HostConfiguration {
-                expected: "no host-supplied MCP servers: ACP passthrough is not implemented",
-                received: format!("{} host-supplied MCP server(s)", request.mcp_servers.len()),
-            });
-        }
+        self.validate_open_session(&request)?;
         refuse_model_selection(&request.configuration)?;
         let matrix = self.permission_matrix();
         if request.configuration.level.is_some_and(|level| {
@@ -427,12 +424,9 @@ impl AcpHarness {
 
         if !handshake.capabilities.load_session {
             if resume.mode == ResumeMode::Strict {
-                // Not `NotSupported`, which names an optional `Session` method: resuming is not one,
-                // and a host asked for a specific conversation this agent cannot reopen.
-                return Err(Error::Protocol {
-                    expected: String::from("an agent advertising loadSession"),
-                    received: format!("{} with loadSession false", self.profile.id),
-                });
+                return Err(Error::not_supported(
+                    mango_external_agents::Capability::Resume,
+                ));
             }
             let mut opened = self.new_session(connection, host, cwd).await?;
             opened.fallback_reason =

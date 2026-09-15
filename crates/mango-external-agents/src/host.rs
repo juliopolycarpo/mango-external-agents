@@ -155,6 +155,12 @@ pub struct Limits {
     pub stderr_tail_bytes: usize,
     /// How long one request waits for its answer before it is a failure.
     pub request_timeout: Duration,
+    /// How long a vendor approval stays answerable before the harness refuses it.
+    ///
+    /// Separate from [`Self::request_timeout`]: a request deadline bounds a protocol call, while an
+    /// approval is work deliberately waiting for a person or the host's policy. Keeping them apart
+    /// lets a host fail a stalled handshake promptly without cutting an approval short.
+    pub approval_timeout: Duration,
     /// How long a child is given to exit on its own before the launcher escalates.
     pub kill_grace: Duration,
 }
@@ -166,8 +172,44 @@ impl Default for Limits {
             line: LineLimits::default(),
             stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
             request_timeout: Duration::from_secs(120),
+            approval_timeout: Duration::from_secs(30 * 60),
             kill_grace: Duration::from_secs(2),
         }
+    }
+}
+
+impl Limits {
+    /// Computes the wall-clock deadline for one approval.
+    ///
+    /// The configured timeout is checked instead of added unchecked. A host clock near the edge of
+    /// SystemTime receives a typed configuration refusal instead of causing a harness callback to
+    /// panic. For example, the default timeout after the Unix epoch produces a later instant.
+    ///
+    /// # Errors
+    ///
+    /// Returns Error::HostConfiguration when this timeout cannot be represented after now.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::SystemTime;
+    ///
+    /// use mango_external_agents::Limits;
+    ///
+    /// let expires_at = Limits::default()
+    ///     .approval_expires_at(SystemTime::UNIX_EPOCH)
+    ///     .expect("default approval deadline");
+    /// assert!(expires_at > SystemTime::UNIX_EPOCH);
+    /// ```
+    pub fn approval_expires_at(&self, now: SystemTime) -> Result<SystemTime> {
+        now.checked_add(self.approval_timeout)
+            .ok_or_else(|| Error::HostConfiguration {
+                expected: "an approval deadline representable from the host clock",
+                received: format!(
+                    "host clock {now:?} with approval timeout {:?}",
+                    self.approval_timeout
+                ),
+            })
     }
 }
 
@@ -357,6 +399,9 @@ impl HostContextBuilder {
             received: String::from("none"),
         })?;
 
+        let limits = self.limits.unwrap_or_default();
+        limits.approval_expires_at(SystemTime::UNIX_EPOCH)?;
+
         Ok(HostContext {
             launcher,
             cwd,
@@ -365,7 +410,7 @@ impl HostContextBuilder {
             clock: self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
             cancel: self.cancel.unwrap_or_default(),
             broker: self.broker,
-            limits: self.limits.unwrap_or_default(),
+            limits,
         })
     }
 }
@@ -458,6 +503,31 @@ mod tests {
                 }
             ),
             "expected a client-identity refusal, received {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_context_rejects_an_approval_timeout_that_cannot_form_a_deadline() {
+        let error = HostContext::builder()
+            .launcher(Arc::new(RefusingLauncher))
+            .cwd("/workspace")
+            .client_info("mangostudio", "1.4.0")
+            .limits(Limits {
+                approval_timeout: Duration::MAX,
+                ..Limits::default()
+            })
+            .build()
+            .expect_err("expected Duration::MAX to be rejected before a deadline can panic");
+
+        assert!(
+            matches!(
+                error,
+                Error::HostConfiguration {
+                    expected: "an approval deadline representable from the host clock",
+                    ..
+                }
+            ),
+            "expected an approval-timeout configuration refusal, received {error:?}"
         );
     }
 

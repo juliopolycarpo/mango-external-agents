@@ -5,6 +5,9 @@
 //! is the ordinary answer: a child in its own process group, no console window on Windows, and an
 //! escalation that asks before it insists.
 
+#[cfg(all(feature = "launcher-tokio", windows))]
+mod powershell;
+
 #[cfg(feature = "launcher-tokio")]
 mod tokio_launcher;
 

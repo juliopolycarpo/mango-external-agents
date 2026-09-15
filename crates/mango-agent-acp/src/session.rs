@@ -207,6 +207,7 @@ impl Session for AcpSession {
         if self.lifecycle.is_closed() {
             return Err(Error::Closed { subject: "session" });
         }
+        self.validate_turn_request(&request)?;
         let prompt = content::prompt(
             &request.input,
             &request.attachments,
@@ -349,6 +350,7 @@ impl Session for AcpSession {
     }
 
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
+        self.require_capability(Capability::InteractiveApprovals)?;
         let Some(turn) = self.state.turn() else {
             return Ok(());
         };

@@ -790,6 +790,37 @@ pub trait Session: Send + Sync {
         self.info().ids.clone()
     }
 
+    /// Refuses a call that this opened session did not advertise.
+    ///
+    /// Harness implementations call this before they encode a vendor request. Keeping the check on
+    /// the session uses the capability reading from the handshake when a protocol exposes one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] when the session did not advertise `capability`.
+    fn require_capability(&self, capability: Capability) -> Result<()> {
+        self.info().capabilities.require(capability)
+    }
+
+    /// Refuses per-turn input that needs a capability the session did not advertise.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] when configuration or an image attachment is unsupported.
+    fn validate_turn_request(&self, request: &TurnRequest) -> Result<()> {
+        if request.configuration.is_some() {
+            self.require_capability(Capability::Configuration)?;
+        }
+        if request
+            .attachments
+            .iter()
+            .any(|attachment| matches!(attachment.kind, AttachmentKind::Image))
+        {
+            self.require_capability(Capability::Images)?;
+        }
+        Ok(())
+    }
+
     /// Starts a turn and returns its bounded event stream.
     ///
     /// Awaited rather than synchronous because a vendor answers with the turn's own handle, which

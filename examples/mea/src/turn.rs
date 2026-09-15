@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use mango_external_agents::event::EventKind;
 use mango_external_agents::{
-    CancelReason, CloseReason, Error, Result, Session, TurnRequest, TurnStream,
+    BrokerDecision, CancelReason, CloseReason, Error, PermissionBroker, Result, Session,
+    TurnRequest, TurnStream,
 };
 
 /// How long one turn is given before it is cancelled.
@@ -21,10 +22,34 @@ const TURN_DEADLINE: Duration = Duration::from_secs(300);
 /// ```text
 /// mea turn --harness codex "summarise this repository"
 /// ```
+#[cfg(test)]
 pub async fn run(session: &dyn Session, request: TurnRequest) -> Result<()> {
+    run_with_format(session, request, false).await
+}
+
+/// Runs and closes a turn, optionally emitting NDJSON. Example: `mea turn --json "hello"`.
+pub async fn run_with_format(
+    session: &dyn Session,
+    request: TurnRequest,
+    json: bool,
+) -> Result<()> {
+    run_with_broker(session, request, json, &crate::terminal::TerminalBroker).await
+}
+
+async fn run_with_broker(
+    session: &dyn Session,
+    request: TurnRequest,
+    json: bool,
+    broker: &dyn PermissionBroker,
+) -> Result<()> {
     let outcome = async {
         let mut stream = session.start_turn(request).await?;
-        match tokio::time::timeout(TURN_DEADLINE, print_turn(session, &mut stream)).await {
+        match tokio::time::timeout(
+            TURN_DEADLINE,
+            print_turn(session, &mut stream, json, broker),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => {
                 session.cancel(CancelReason::Timeout).await?;
@@ -40,20 +65,43 @@ pub async fn run(session: &dyn Session, request: TurnRequest) -> Result<()> {
     outcome.and(closed)
 }
 
-/// Prints one turn's events and refuses every approval it raises.
-async fn print_turn(session: &dyn Session, turn: &mut TurnStream) -> Result<()> {
+/// Prints events and lets the host broker answer each approval once.
+async fn print_turn(
+    session: &dyn Session,
+    turn: &mut TurnStream,
+    json: bool,
+    broker: &dyn PermissionBroker,
+) -> Result<()> {
     while let Some(event) = turn.recv().await {
+        if json {
+            println!("{}", serde_json::json!(event));
+        }
         match &event.kind {
-            EventKind::TextDelta { text } => print!("{text}"),
+            EventKind::TextDelta { text } if !json => print!("{text}"),
             EventKind::ApprovalRequested { request } => {
-                println!("{}", serde_json::json!(event.kind));
-                session.respond(request.deny()?).await?;
+                if !json {
+                    println!("{}", serde_json::json!(event.kind));
+                }
+                let response = match broker.decide(request).await {
+                    // A question the vendor raised without an allowing option is still a question
+                    // that has to be answered. Falling back to the refusal keeps the turn alive
+                    // and grants nothing, where propagating would cancel the turn instead.
+                    BrokerDecision::Allow => match request.allow() {
+                        Ok(allow) => allow,
+                        Err(_) => request.deny()?,
+                    },
+                    BrokerDecision::Deny { .. } | BrokerDecision::Ask => request.deny()?,
+                };
+                session.respond(response).await?;
             }
             EventKind::Error { error } => {
-                println!("{}", serde_json::json!(event.kind));
+                if !json {
+                    println!("{}", serde_json::json!(event.kind));
+                }
                 return Err(Error::Vendor(error.clone()));
             }
-            other => println!("{}", serde_json::json!(other)),
+            other if !json => println!("{}", serde_json::json!(other)),
+            _ => {}
         }
     }
     Ok(())
@@ -106,6 +154,52 @@ mod tests {
             .await
             .expect_err("expected the session to have been closed");
         assert!(matches!(error, Error::Closed { subject: "session" }));
+    }
+
+    #[tokio::test]
+    async fn json_turn_finishes_and_closes_the_session() {
+        let session = FakeHarness::new()
+            .without_approvals()
+            .open_session(&host(), OpenSession::new("json-test"))
+            .await
+            .expect("fake session");
+        super::run_with_format(
+            session.as_ref(),
+            TurnRequest::new("json-turn", "hello"),
+            true,
+        )
+        .await
+        .expect("JSON turn completes");
+        assert!(matches!(
+            session
+                .start_turn(TurnRequest::new("closed", "hello"))
+                .await,
+            Err(Error::Closed { subject: "session" })
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_events_consult_the_terminal_broker_before_answering() {
+        let session = FakeHarness::new()
+            .open_session(&host(), OpenSession::new("approval-test"))
+            .await
+            .expect("fake session");
+        let broker = mango_external_agents::testing::RecordingBroker::new(
+            mango_external_agents::BrokerDecision::Allow,
+        );
+        super::run_with_broker(
+            session.as_ref(),
+            TurnRequest::new("approval-turn", "hello"),
+            true,
+            &broker,
+        )
+        .await
+        .expect("approved turn completes");
+        assert_eq!(
+            broker.requests().len(),
+            1,
+            "expected the event consumer to ask its broker once before responding"
+        );
     }
 
     struct VendorFailureSession {

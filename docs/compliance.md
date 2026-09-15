@@ -1,8 +1,8 @@
 # Compliance posture
 
 What each vendor's public documents say about driving their CLI from another program, and what
-this library does and does not do in response. Quotes are filled in per harness as each lands
-(Claude, Codex, ACP); until then a section states the posture and the source it will quote.
+this library does and does not do in response. Each harness section identifies the documented
+interface, the relevant vendor statements and the limits of the integration.
 
 Facts were read on 2026-09-12; re-verify against the vendor's current page before relying on them.
 

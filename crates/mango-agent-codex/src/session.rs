@@ -725,7 +725,17 @@ impl PeerHandler for CodexHandler {
         // a host clock that moved backward between the two reads extend the monotonic approval
         // window past what `expires_at` advertised.
         let now = self.shared.host.now();
-        let Some(pending) = approvals::to_request(&request, now) else {
+        let expires_at = match self.shared.host.limits().approval_expires_at(now) {
+            Ok(expires_at) => expires_at,
+            Err(error) => {
+                return ServerRequestOutcome::Failure(JsonRpcError {
+                    code: -32602,
+                    message: error.to_string(),
+                    data: None,
+                });
+            }
+        };
+        let Some(pending) = approvals::to_request(&request, expires_at) else {
             return ServerRequestOutcome::Failure(JsonRpcError {
                 code: -32601,
                 message: String::from("expected an approval this client can put to a person"),
@@ -766,7 +776,9 @@ impl CodexHandler {
         // is the same read `to_request` stamped `expires_at` from, not a fresh one: a second host
         // clock read here could drift from the first and stretch the window past what
         // `expires_at` advertised.
-        let deadline = ApprovalDeadline::new(request.expires_at, now);
+        let Some(deadline) = ApprovalDeadline::new(request.expires_at, now) else {
+            return Some(pending.refusal());
+        };
 
         // A request the core refuses to bound is a request nothing could render, and refusing it
         // here is better than a prompt nobody sees behind a turn that waits.
@@ -1335,6 +1347,7 @@ impl Session for CodexSession {
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        self.validate_turn_request(&request)?;
         // Codex already persists its accepted settings. Omission leaves those settings alone.
         let configuration = request.configuration.clone().unwrap_or_default();
         let vendor = crate::permissions::overrides(&configuration);
@@ -1374,6 +1387,7 @@ impl Session for CodexSession {
     }
 
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
+        self.require_capability(mango_external_agents::Capability::InteractiveApprovals)?;
         let route = self
             .shared
             .active_turn_route()

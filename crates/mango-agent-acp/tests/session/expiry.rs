@@ -26,6 +26,57 @@ impl Clock for RewindingClock {
     }
 }
 
+/// An approval is deliberately longer-lived than a single RPC request. A stalled handshake must
+/// not force a host to give every person the same short deadline.
+#[tokio::test]
+async fn the_approval_deadline_uses_its_own_host_limit() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .asking_for_approval(Approval::Once)
+            .process(),
+    );
+    let clock = FrozenClock::at(SystemTime::UNIX_EPOCH);
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .clock(Arc::new(clock))
+        .limits(Limits {
+            request_timeout: Duration::from_secs(60),
+            approval_timeout: Duration::from_secs(10),
+            ..Limits::default()
+        })
+        .build()
+        .expect("host");
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host,
+            OpenSession::new("chat").with_configuration(permissive()),
+        )
+        .await
+        .expect("session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("expiry", "run it"))
+        .await
+        .expect("turn");
+
+    let request = loop {
+        let event = turn.recv().await.expect("approval");
+        if let EventKind::ApprovalRequested { request } = event.kind {
+            break request;
+        }
+    };
+
+    assert_eq!(
+        request.expires_at,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        "expected the approval limit instead of the 60s RPC limit"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
+
 /// A second `Clock::now()` read between stamping a request's deadline and translating it back
 /// into a wait would let a host clock correction stretch the monotonic approval window past what
 /// the wire advertised. See `ApprovalDeadline::new`'s call sites in `client.rs`.
@@ -45,6 +96,7 @@ async fn the_deadline_reuses_one_clock_read_despite_a_backward_jump() {
         .clock(Arc::new(RewindingClock::new(Duration::from_secs(5))))
         .limits(Limits {
             request_timeout: Duration::from_secs(10),
+            approval_timeout: Duration::from_secs(10),
             ..Limits::default()
         })
         .build()
@@ -180,6 +232,10 @@ async fn broker_deliberation_consumes_the_approval_deadline() {
         .cwd(std::env::temp_dir())
         .client_info("mea-tests", "0.1.0")
         .broker(Arc::new(SlowAllowBroker))
+        .limits(Limits {
+            approval_timeout: Duration::from_secs(120),
+            ..Limits::default()
+        })
         .build()
         .expect("host");
     let session = AcpHarness::new(profile())
@@ -282,6 +338,7 @@ async fn a_full_event_channel_does_not_postpone_the_wire_deadline() {
         .client_info("mea-tests", "0.1.0")
         .limits(Limits {
             turn_channel_capacity: 1,
+            approval_timeout: Duration::from_secs(120),
             ..Limits::default()
         })
         .broker(broker.clone())
@@ -340,7 +397,8 @@ async fn a_fast_agent_cannot_complete_before_its_expiry_audit_on_another_worker(
         .cwd(std::env::temp_dir())
         .client_info("mea-tests", "0.1.0")
         .limits(Limits {
-            request_timeout: Duration::from_millis(100),
+            request_timeout: Duration::from_secs(5),
+            approval_timeout: Duration::from_millis(100),
             ..Limits::default()
         })
         .build()

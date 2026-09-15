@@ -18,6 +18,8 @@ if [ "$skip_format" = false ]; then
   run cargo fmt --all -- --check
   run dprint check
 fi
+run scripts/test-release.sh
+run scripts/test-vendor-drift.sh
 run cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 run cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 run cargo nextest run --workspace --all-features --locked

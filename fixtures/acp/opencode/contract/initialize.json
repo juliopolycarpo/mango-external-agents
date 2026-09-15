@@ -1,0 +1,30 @@
+{
+  "protocolVersion": 1,
+  "agentCapabilities": {
+    "loadSession": true,
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "promptCapabilities": {
+      "embeddedContext": true,
+      "image": true
+    },
+    "sessionCapabilities": {
+      "close": {},
+      "fork": {},
+      "list": {},
+      "resume": {}
+    }
+  },
+  "authMethods": [
+    {
+      "id": "opencode-login",
+      "name": "Login with opencode"
+    }
+  ],
+  "agentInfo": {
+    "name": "OpenCode",
+    "version": "1.18.30"
+  }
+}

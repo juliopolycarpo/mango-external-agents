@@ -72,6 +72,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     native_review: true,
     account_usage: true,
     mcp_passthrough: false,
+    configuration: true,
 };
 
 /// The transports this harness accepts.
@@ -172,6 +173,7 @@ impl Harness for CodexHarness {
                 gate,
                 auth: AuthState::Unknown,
                 capabilities: Capabilities::none(),
+                permission_matrix: self.permission_matrix(),
                 models: Vec::new(),
             });
         }
@@ -183,6 +185,7 @@ impl Harness for CodexHarness {
             gate,
             auth,
             capabilities: CAPABILITIES,
+            permission_matrix: self.permission_matrix(),
             models,
         })
     }
@@ -192,12 +195,7 @@ impl Harness for CodexHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        if !request.mcp_servers.is_empty() {
-            return Err(Error::HostConfiguration {
-                expected: "a Codex session without host-supplied MCP servers; MCP passthrough is unsupported",
-                received: format!("{} host-supplied MCP server(s)", request.mcp_servers.len()),
-            });
-        }
+        self.validate_open_session(&request)?;
         let executable = self.program_for(&request);
         let transport = stdio::open(
             host,
