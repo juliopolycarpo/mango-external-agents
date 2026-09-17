@@ -11,7 +11,7 @@ use mango_external_agents::{
     ConfigurationChange, ConfigurationOptionId, ConfigurationPatch, ConfigurationValue,
     DiscoveryReceipt, Dispatch, Error, EventKind, ExecutablePath, GateVerdict, Harness, HarnessId,
     HostContext, InteractionId, Limits, LineLimits, OpenSession, PermissionLevel,
-    PermissionResponse, ResumeMode, Session, TurnRequest, TurnStream,
+    PermissionResponse, ResumeMode, Session, SessionStatus, TurnRequest, TurnStream,
 };
 use support::{
     FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, host, host_under,
@@ -1419,6 +1419,78 @@ mod mcp_passthrough {
                 None,
                 "expected the unconfigured turn to inherit nothing from the refused one, received {argv:?}"
             );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
+    #[test]
+    fn close_stays_closing_until_blocked_mcp_cleanup_finishes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+            let scratch =
+                std::env::temp_dir().join(format!("mea-close-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher)
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session: Arc<dyn Session> = Arc::from(
+                ClaudeHarness::new()
+                    .open_session(
+                        &host,
+                        OpenSession::new("chat-1").with_mcp_servers(servers()),
+                    )
+                    .await
+                    .expect("expected a session"),
+            );
+            let mut state_changes = session.subscribe();
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+            let closing = tokio::spawn({
+                let session = Arc::clone(&session);
+                async move { session.close(CloseReason::Requested).await }
+            });
+
+            let closing_state =
+                tokio::time::timeout(Duration::from_secs(5), state_changes.changed())
+                    .await
+                    .expect("expected close to publish a state change")
+                    .expect("expected the session state to stay alive");
+            assert_eq!(closing_state.status, SessionStatus::Closing);
+            assert!(
+                !closing.is_finished(),
+                "expected close to await the blocked MCP cleanup"
+            );
+
+            drop(release_pool);
+            occupied
+                .await
+                .expect("expected the blocking task to finish");
+            closing
+                .await
+                .expect("expected the close task to finish")
+                .expect("expected MCP cleanup to succeed");
+
+            let closed_state =
+                tokio::time::timeout(Duration::from_secs(5), state_changes.changed())
+                    .await
+                    .expect("expected cleanup completion to publish a state change")
+                    .expect("expected the session state to stay alive");
+            assert_eq!(closed_state.status, SessionStatus::Closed);
 
             let _ = std::fs::remove_dir_all(&scratch);
         });

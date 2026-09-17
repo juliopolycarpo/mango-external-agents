@@ -618,7 +618,10 @@ impl mango_external_agents::Session for ClaudeSession {
             // closed, so a following close returns before reaching here.
             (control, crate::mcp::Prepared::new(state.mcp_config.take()))
         };
-        self.shared.core_state.set_status(SessionStatus::Closed);
+        // Closing is visible while teardown is still in flight. A host that sees `Closed` may
+        // release its own resources, so publishing it before the child and its MCP artifact are
+        // actually handled lies about the session's lifetime.
+        self.shared.core_state.set_status(SessionStatus::Closing);
         end_turn(control, CancelReason::from(reason)).await;
         // The session releases its reference here. A start still awaiting a child holds its own
         // `Arc` until it releases it just before its post-release ownership check, and that check
@@ -628,7 +631,12 @@ impl mango_external_agents::Session for ClaudeSession {
         // the directory is a synchronous filesystem call against the host's own scratch root.
         // Reported rather than swallowed: this close promised the session's resources were
         // released, and the file holds the `env` and `headers` a host configured its servers with.
-        crate::mcp::remove_on_close(mcp_config.take()).await
+        let cleanup = crate::mcp::remove_on_close(mcp_config.take()).await;
+        // A failed removal still concludes this session. The error reports the artifact left on
+        // disk, but no later session operation can make progress against a lifecycle the close
+        // transition already claimed.
+        self.shared.core_state.set_status(SessionStatus::Closed);
+        cleanup
     }
 }
 
