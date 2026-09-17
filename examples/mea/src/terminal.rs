@@ -37,8 +37,13 @@ fn decision(answer: &str) -> BrokerDecision {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
-    use mango_external_agents::{ActivityKind, PermissionOption, PermissionOptionKind};
+    use mango_external_agents::{
+        ActivityKind, Interaction, InteractionId, InteractionKind, PermissionEffect,
+        PermissionOption, PermissionScope, SessionId,
+    };
 
     #[test]
     fn only_an_explicit_yes_grants_permission() {
@@ -55,18 +60,21 @@ mod tests {
         if std::io::stdin().is_terminal() {
             return;
         }
-        let request = PermissionRequest {
-            id: "approval-1".into(),
-            kind: ActivityKind::Command,
-            title: "write a file".into(),
-            detail: None,
-            expires_at: std::time::SystemTime::now(),
-            truncated: false,
-            options: vec![PermissionOption::new(
-                "allow",
-                PermissionOptionKind::AllowOnce,
-            )],
-        };
+        let interaction = Interaction::new(
+            InteractionId::new("approval-1"),
+            InteractionKind::Permission,
+            SessionId::new("session-1"),
+            SystemTime::now() + Duration::from_secs(60),
+        );
+        let request = PermissionRequest::new(
+            interaction,
+            ActivityKind::Command,
+            "write a file",
+            vec![
+                PermissionOption::new("allow", PermissionEffect::Allow)
+                    .with_scope(PermissionScope::Once),
+            ],
+        );
         assert!(matches!(
             TerminalBroker.decide(&request).await,
             BrokerDecision::Deny { .. }
