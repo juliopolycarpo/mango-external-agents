@@ -73,8 +73,15 @@ async fn the_approval_round_trip_is_skipped_rather_than_claimed() {
         .collect();
     assert_eq!(
         skipped,
-        vec!["an approval can be answered"],
-        "expected exactly one skip, received {:#?}",
+        vec![
+            "an approval can be answered",
+            // Claude declares no `Questions` capability, so the suite's positive question check
+            // has nothing to run against. Named here rather than filtered out: a build that starts
+            // declaring questions should turn this into a failing test rather than into silence,
+            // exactly like the approval above it.
+            "a question round-trips with the vendor's own ids",
+        ],
+        "expected exactly these skips, received {:#?}",
         report.skipped()
     );
 

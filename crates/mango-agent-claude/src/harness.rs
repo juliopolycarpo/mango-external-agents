@@ -276,7 +276,7 @@ impl Harness for ClaudeHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        self.validate_open_session(&request)?;
+        self.validate_open_session(host, &request)?;
         // Claude's model and permission-mode flags are argv on a fresh child: there is no surface
         // to un-set one on an already-open session, so a reset is refused wherever a host could
         // ask for one rather than silently treated as "leave it alone".
@@ -316,7 +316,7 @@ impl Harness for ClaudeHarness {
         Ok(Box::new(ClaudeSession::new(
             host.clone(),
             executable,
-            opened.core_state,
+            SessionState::new(std::sync::Arc::clone(host.clock()), opened.snapshot),
             opened.availability,
             opened.surface,
             mcp_config.take(),
@@ -326,7 +326,7 @@ impl Harness for ClaudeHarness {
 
 /// What a passed open decided, before the session takes ownership of its MCP artifact.
 struct OpenedSession {
-    core_state: SessionState,
+    snapshot: SessionSnapshot,
     availability: ModeAvailability,
     surface: Option<CliSurface>,
 }
@@ -424,9 +424,9 @@ impl ClaudeHarness {
         };
 
         Ok(OpenedSession {
-            core_state: SessionState::new(snapshot),
-            survey.availability,
-            survey.surface,
+            snapshot,
+            availability: survey.availability,
+            surface: survey.surface,
         })
     }
 }

@@ -410,7 +410,7 @@ impl mango_external_agents::Session for ClaudeSession {
         let (sink, events) = EventSink::new(
             self.shared.core_state.snapshot().ids.session_id.clone(),
             request.turn_id.clone(),
-            request.attempt.clone(),
+            request.attempt,
             Arc::clone(self.shared.host.clock()),
             limits.turn_channel_capacity,
         );
