@@ -13,14 +13,16 @@ use std::time::SystemTime;
 
 use mango_external_agents::HostContext;
 use mango_external_agents::approval::ApprovalDeadline;
-use mango_external_agents::configuration::{ConfigurationState, refuse_unsupported_reset};
+use mango_external_agents::configuration::{
+    ConfigurationState, refuse_unsupported_native, refuse_unsupported_reset,
+};
 use mango_external_agents::error::{Error, ErrorCode, Result, VendorError};
 use mango_external_agents::event::{EventKind, SessionId, TurnId};
 use mango_external_agents::interaction::InteractionId;
 use mango_external_agents::jsonrpc::{
     Client, JsonRpcError, PeerHandler, PeerTermination, RequestId, ServerRequestOutcome,
 };
-use mango_external_agents::operation::{AttemptId, OperationRef};
+use mango_external_agents::operation::{AttemptId, Dispatch, OperationRef};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionResponse, broker_response,
 };
@@ -30,7 +32,7 @@ use mango_external_agents::session::{
     Session, SessionPage, SessionQuery, Steer, SteerOutcome, SteerRejection, TURN_MAX_ATTACHMENTS,
     TurnRequest,
 };
-use mango_external_agents::state::SessionState;
+use mango_external_agents::state::{SessionState, SessionStatus};
 use mango_external_agents::stream::{EventSink, ReviewStream, TurnStream};
 use serde_json::Value;
 use tokio::sync::{Mutex, oneshot};
@@ -96,45 +98,61 @@ struct AcceptedConfiguration {
 }
 
 impl AcceptedConfiguration {
-    fn accept(&mut self, generation: u64, configuration: mango_external_agents::Configuration) {
-        apply_selected(
+    fn accept(
+        &mut self,
+        generation: u64,
+        configuration: mango_external_agents::Configuration,
+    ) -> mango_external_agents::Configuration {
+        let mut changed = mango_external_agents::Configuration::unknown();
+        if apply_selected(
             &mut self.accepted.model,
             &mut self.accepted_generation[0],
             generation,
-            configuration.model,
-        );
-        apply_selected(
+            &configuration.model,
+        ) {
+            changed.model = configuration.model;
+        }
+        if apply_selected(
             &mut self.accepted.effort,
             &mut self.accepted_generation[1],
             generation,
-            configuration.effort,
-        );
-        apply_selected(
+            &configuration.effort,
+        ) {
+            changed.effort = configuration.effort;
+        }
+        if apply_selected(
             &mut self.accepted.level,
             &mut self.accepted_generation[2],
             generation,
-            configuration.level,
-        );
-        apply_selected(
+            &configuration.level,
+        ) {
+            changed.level = configuration.level;
+        }
+        if apply_selected(
             &mut self.accepted.routing,
             &mut self.accepted_generation[3],
             generation,
-            configuration.routing,
-        );
+            &configuration.routing,
+        ) {
+            changed.routing = configuration.routing;
+        }
+        changed
     }
 }
 
 /// A later successful request only supersedes fields it explicitly selected.
-fn apply_selected<T>(
+fn apply_selected<T: Clone>(
     accepted: &mut Option<T>,
     last_generation: &mut u64,
     generation: u64,
-    selected: Option<T>,
-) {
+    selected: &Option<T>,
+) -> bool {
     if selected.is_some() && generation > *last_generation {
-        *accepted = selected;
+        *accepted = selected.clone();
         *last_generation = generation;
+        return true;
     }
+    false
 }
 
 impl std::fmt::Debug for CodexSession {
@@ -393,20 +411,22 @@ impl Shared {
         &self,
         owner: &Arc<()>,
         native_turn_id: &str,
-    ) -> Option<(EventSink, String)> {
-        if native_turn_id.is_empty() {
-            return None;
-        }
+    ) -> Result<Option<(EventSink, String)>> {
+        let native_turn_id =
+            mango_external_agents::normalize::opaque_id(native_turn_id, "native turn id")?;
         let mut turn = self.turn.lock().await;
         let active = turn
             .as_mut()
-            .filter(|active| Arc::ptr_eq(&active.owner, owner))?;
+            .filter(|active| Arc::ptr_eq(&active.owner, owner));
+        let Some(active) = active else {
+            return Ok(None);
+        };
         if active.announced {
-            return None;
+            return Ok(None);
         }
         active.announced = true;
-        active.native_turn_id = native_turn_id.to_owned();
-        Some((active.sink.clone(), native_turn_id.to_owned()))
+        active.native_turn_id = native_turn_id.clone();
+        Ok(Some((active.sink.clone(), native_turn_id)))
     }
 
     /// Puts one event on the stream that still belongs to this start attempt.
@@ -677,13 +697,39 @@ impl PeerHandler for CodexHandler {
         if active_route.native_turn_id.is_empty()
             && notification.requires_native_turn_match()
             && let Some(turn_id) = notification.turn_id()
-            && let Some((sink, native_turn_id)) = self
+        {
+            match self
                 .shared
                 .claim_announcement(&active_route.owner, turn_id)
                 .await
-        {
-            active_route.native_turn_id.clone_from(&native_turn_id);
-            let _ = sink.emit(EventKind::TurnStarted { native_turn_id }).await;
+            {
+                Ok(Some((sink, native_turn_id))) => {
+                    active_route.native_turn_id.clone_from(&native_turn_id);
+                    if sink
+                        .emit(EventKind::TurnStarted { native_turn_id })
+                        .await
+                        .is_err()
+                    {
+                        self.shared
+                            .poison(VendorError::new(
+                                reducer::PROTOCOL_ERROR,
+                                "expected a host stream that accepts an accepted turn announcement",
+                            ))
+                            .await;
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    self.shared
+                        .poison(VendorError::new(
+                            reducer::PROTOCOL_ERROR,
+                            "expected an app-server notification with a usable native turn id",
+                        ))
+                        .await;
+                    return;
+                }
+            }
         }
 
         let outcome = reducer::reduce_for_active_turn(
@@ -1216,7 +1262,7 @@ impl CodexSession {
         R: serde::de::DeserializeOwned,
     {
         if self.closed.load(Ordering::Acquire) || self.shared.is_shutting_down() {
-            return Err(Error::Closed { subject: "session" });
+            return Err(Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted));
         }
 
         let (sink, events) = EventSink::new(
@@ -1241,7 +1287,8 @@ impl CodexSession {
                          another is live; the app-server would take it as a steer",
                     )
                     .with_vendor_code("turn-active", true),
-                ));
+                )
+                .with_dispatch(Dispatch::NotSubmitted));
             }
             // Installed before the call, because notifications for this turn can arrive before its
             // own response does.
@@ -1270,7 +1317,7 @@ impl CodexSession {
                     // the app-server accepted the request. Keeping the slot occupied prevents
                     // the next start from becoming a steer of a vendor turn whose handle never
                     // reached this client.
-                    return Err(error);
+                    return Err(error.with_dispatch(Dispatch::AcceptanceUnknown));
                 }
                 // The turn never started, so the stream it would have written to is closed here
                 // rather than left for a `turn/completed` that will never come. Nothing to
@@ -1283,18 +1330,22 @@ impl CodexSession {
                 {
                     turn.take();
                 }
-                return Err(error);
+                return Err(error.with_dispatch(Dispatch::Accepted));
             }
         };
 
-        if handle.id.trim().is_empty() {
-            // A successful frame without a usable id may describe a running turn this session
-            // cannot interrupt or route. Its slot stays occupied until the connection closes.
-            return Err(Error::Protocol {
-                expected: String::from("a turn/start result with a non-empty turn id"),
-                received: String::from("a result whose turn id was empty"),
-            });
-        }
+        let native_turn_id =
+            mango_external_agents::normalize::opaque_id(&handle.id, "native turn id")
+                .map_err(|error| error.with_dispatch(Dispatch::Accepted));
+        let native_turn_id = match native_turn_id {
+            Ok(native_turn_id) => native_turn_id,
+            Err(error) => {
+                // A positive response that cannot be routed is already vendor work. Tear down
+                // the connection so a later request cannot become a steer of that hidden turn.
+                let _ = self.close(CloseReason::Shutdown).await;
+                return Err(error);
+            }
+        };
 
         // The turn-scoped counterpart to opening a session: the vendor accepted this attempt and
         // named its own handle for it. Replacing what used to ride the first turn as a
@@ -1304,35 +1355,59 @@ impl CodexSession {
         // A notification naming this turn's id can already have won this race — captured
         // fixtures show it arriving before this response is even a real race, not a rare one —
         // in which case this call claims nothing and announces nothing.
-        if let Some((sink, native_turn_id)) =
-            self.shared.claim_announcement(&owner, &handle.id).await
+        let announcement = match self
+            .shared
+            .claim_announcement(&owner, &native_turn_id)
+            .await
         {
-            let _ = sink.emit(EventKind::TurnStarted { native_turn_id }).await;
+            Ok(announcement) => announcement,
+            Err(error) => {
+                let _ = self.close(CloseReason::Shutdown).await;
+                return Err(error.with_dispatch(Dispatch::Accepted));
+            }
+        };
+        if let Some((sink, announced_turn_id)) = announcement
+            && let Err(error) = sink
+                .emit(EventKind::TurnStarted {
+                    native_turn_id: announced_turn_id,
+                })
+                .await
+        {
+            let _ = self.close(CloseReason::Shutdown).await;
+            return Err(error.with_dispatch(Dispatch::Accepted));
         }
 
         if let Some(configuration) = configuration {
-            let accepted = {
-                let mut state = self.configuration.lock().await;
-                state.accept(generation, configuration);
-                state.accepted.clone()
-            };
-            // What this harness really encoded on the wire: `turn/start` carries every axis, so
-            // nothing here is dropped. The vendor's own open-time reading is carried forward
-            // untouched — no turn response reports settings back, so it is not this call's to
-            // overwrite.
-            let observed = self.state.snapshot().configuration.observed.clone();
-            self.state.set_configuration(ConfigurationState::new(
-                accepted.clone(),
-                accepted,
-                observed,
-            ));
+            let mut state = self.configuration.lock().await;
+            let changed = state.accept(generation, configuration);
+            if !changed.is_unknown() {
+                let mut observed = self.state.snapshot().configuration.observed.clone();
+                if changed.model.is_some() {
+                    observed.model = None;
+                }
+                if changed.effort.is_some() {
+                    observed.effort = None;
+                }
+                if changed.level.is_some() {
+                    observed.level = None;
+                }
+                if changed.routing.is_some() {
+                    observed.routing = None;
+                }
+                let accepted = state.accepted.clone();
+                self.state.set_configuration(ConfigurationState::new(
+                    accepted.clone(),
+                    accepted,
+                    observed,
+                ));
+            }
         }
 
         let cancel_before_start = {
             let mut turn = self.shared.turn.lock().await;
             match turn.as_mut() {
                 Some(active) if Arc::ptr_eq(&active.owner, &owner) => {
-                    active.native_turn_id.clone_from(&handle.id);
+                    active.native_turn_id.clone_from(&native_turn_id);
                     active.cancel_before_start
                 }
                 _ => false,
@@ -1346,7 +1421,7 @@ impl CodexSession {
         }
 
         Ok((
-            TurnStream::accepted(turn_id, attempt, handle.id, events),
+            TurnStream::accepted(turn_id, attempt, native_turn_id, events),
             extra,
         ))
     }
@@ -1445,18 +1520,23 @@ impl Session for CodexSession {
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
-        self.validate_turn_request(&request)?;
+        self.validate_turn_request(&request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         // Codex already persists its accepted settings. Omission leaves those settings alone.
         let patch = request.configuration.clone().unwrap_or_default();
         // Codex has no "drop my override" semantics on `turn/start`, so a reset is refused
         // explicitly rather than silently dropped into a no-op keep.
-        refuse_unsupported_reset(&patch)?;
+        refuse_unsupported_native(&patch)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        refuse_unsupported_reset(&patch)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let vendor = crate::permissions::overrides(&patch);
         let configuration = patch.requested();
 
         let params = TurnStartParams {
             thread_id: self.shared.thread_id().to_owned(),
-            input: Self::input_for(&request)?,
+            input: Self::input_for(&request)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?,
             model: configuration.model.clone(),
             effort: configuration.effort.clone(),
             approval_policy: vendor.approval_policy,
@@ -1621,6 +1701,7 @@ impl Session for CodexSession {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.state.set_status(SessionStatus::Closing);
         self.shutdown_watcher.abort();
         self.shared.stop_new_work();
         self.shared.release_pending(DecisionSource::Cancelled).await;
@@ -1632,6 +1713,7 @@ impl Session for CodexSession {
 
         let closed = self.client.close().await;
         let killed = self.control.kill(CancelReason::from(reason)).await;
+        self.state.set_status(SessionStatus::Closed);
         closed.and(killed)
     }
 

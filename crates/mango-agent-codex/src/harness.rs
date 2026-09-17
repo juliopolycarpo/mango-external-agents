@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use mango_external_agents::Dispatch;
 use mango_external_agents::configuration::{Configuration, ConfigurationCatalog};
 use mango_external_agents::discovery::{AuthState, Discovery, GateVerdict, Model, ReasoningEffort};
 use mango_external_agents::error::{Error, Result};
@@ -16,8 +17,7 @@ use mango_external_agents::jsonrpc::{Client, ClientOptions};
 use mango_external_agents::permission::PermissionMatrix;
 use mango_external_agents::process::LaunchSpec;
 use mango_external_agents::session::{
-    OpenSession, ResumeMode, Session, SessionIds,
-    resume_fallback_reason,
+    OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason,
 };
 use mango_external_agents::state::{SessionSnapshot, SessionState, TransportSelection};
 use mango_external_agents::transport::{ExecutablePath, StdioSpec, TransportKind};
@@ -209,8 +209,14 @@ impl Harness for CodexHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        self.validate_open_session(host, &request)?;
-        let effective_transport = self.descriptor().resolve_transport(request.transport)?;
+        self.validate_open_session(host, &request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        mango_external_agents::configuration::refuse_unsupported_native(&request.configuration)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        let effective_transport = self
+            .descriptor()
+            .resolve_transport(request.transport)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let executable = self.program_for(&request);
         let transport = stdio::open(
             host,

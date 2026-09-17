@@ -4,6 +4,8 @@
 //! replays them. That is the only way to test a dialect on a machine where the vendor's CLI is not
 //! installed — which is every machine, in CI.
 
+#[path = "replay/contracts.rs"]
+mod contracts;
 mod support;
 
 use std::sync::Arc;
@@ -684,7 +686,7 @@ async fn a_second_turn_started_while_one_is_running_is_refused_rather_than_steer
         .expect_err("expected a refusal, received a second turn");
 
     assert!(
-        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
                  if vendor.code.as_str() == "codex-turn-already-running"),
         "expected the turn-already-running refusal, received {error:?}"
     );
@@ -722,7 +724,7 @@ async fn a_cancelled_start_holds_the_slot_until_its_vendor_handle_arrives() {
         .await
         .expect_err("expected the unnamed vendor turn to keep the slot occupied");
     assert!(
-        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
                  if vendor.code.as_str() == "codex-turn-already-running"),
         "expected a running-turn refusal, received {error:?}"
     );
@@ -807,7 +809,7 @@ async fn an_ambiguous_start_timeout_on_a_full_one_slot_stream_cannot_become_a_st
         .await
         .expect_err("expected the unanswered start to time out");
     assert!(
-        matches!(first, mango_external_agents::Error::Timeout { .. }),
+        matches!(first.cause(), mango_external_agents::Error::Timeout { .. }),
         "expected an ambiguous timeout, received {first:?}"
     );
 
@@ -816,7 +818,7 @@ async fn an_ambiguous_start_timeout_on_a_full_one_slot_stream_cannot_become_a_st
         .await
         .expect_err("expected the ambiguous first turn to retain the slot");
     assert!(
-        matches!(&second, mango_external_agents::Error::Vendor(vendor)
+        matches!(second.cause(), mango_external_agents::Error::Vendor(vendor)
             if vendor.code.as_str() == "codex-turn-already-running"),
         "expected a local running-turn refusal, received {second:?}"
     );
@@ -863,8 +865,12 @@ async fn a_delayed_start_success_cannot_replace_the_live_turns_vendor_handle() {
                 .await
             {
                 Ok(turn) => break turn,
-                Err(mango_external_agents::Error::Vendor(vendor))
-                    if vendor.code.as_str() == "codex-turn-already-running" =>
+                Err(error)
+                    if matches!(
+                        error.cause(),
+                        mango_external_agents::Error::Vendor(vendor)
+                            if vendor.code.as_str() == "codex-turn-already-running"
+                    ) =>
                 {
                     tokio::task::yield_now().await;
                 }
@@ -922,8 +928,12 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
                 .await
             {
                 Ok(turn) => break turn,
-                Err(mango_external_agents::Error::Vendor(vendor))
-                    if vendor.code.as_str() == "codex-turn-already-running" =>
+                Err(error)
+                    if matches!(
+                        error.cause(),
+                        mango_external_agents::Error::Vendor(vendor)
+                            if vendor.code.as_str() == "codex-turn-already-running"
+                    ) =>
                 {
                     tokio::task::yield_now().await;
                 }
@@ -947,7 +957,7 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
         .await
         .expect_err("expected the live replacement to keep the slot");
     assert!(
-        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
                  if vendor.code.as_str() == "codex-turn-already-running"),
         "expected a running-turn refusal, received {error:?}"
     );
@@ -995,7 +1005,7 @@ async fn a_turn_whose_host_stopped_reading_still_holds_the_slot_against_a_steer(
         .await
         .expect_err("expected a refusal, received a second turn on a live one");
     assert!(
-        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
                  if vendor.code.as_str() == "codex-turn-already-running"),
         "expected the turn-already-running refusal, received {error:?}"
     );
@@ -1670,7 +1680,7 @@ async fn closing_twice_is_harmless_and_ends_the_child() {
         .await
         .expect_err("expected a closed session to refuse a turn");
     assert!(
-        matches!(error, mango_external_agents::Error::Closed { .. }),
+        matches!(error.cause(), mango_external_agents::Error::Closed { .. }),
         "expected a closed-session refusal, received {error:?}"
     );
 }
@@ -1937,10 +1947,15 @@ async fn a_first_turn_the_server_refused_does_not_take_the_sessions_identity_wit
         "expected the session's own identity to be known before any turn ran"
     );
 
-    session
+    let error = session
         .start_turn(TurnRequest::new("turn-1", "one"))
         .await
         .expect_err("expected the server's refusal to reach the caller");
+    assert_eq!(
+        error.dispatch(),
+        mango_external_agents::Dispatch::Accepted,
+        "expected a definitive server rejection not to be safe to replay"
+    );
 
     let mut second = session
         .start_turn(TurnRequest::new("turn-2", "two"))
@@ -2436,15 +2451,23 @@ async fn host_mcp_servers_are_refused_before_spawning_codex() {
             0,
             "expected unsupported MCP configuration to be refused before spawning Codex"
         );
+        let error = match result {
+            Ok(_) => panic!("expected the typed MCP passthrough refusal"),
+            Err(error) => error,
+        };
         assert!(
             matches!(
-                result,
-                Err(mango_external_agents::Error::HostConfiguration {
+                error.cause(),
+                mango_external_agents::Error::HostConfiguration {
                     expected: "no MCP servers for a harness without MCP passthrough",
-                    ref received,
-                }) if received == "MCP server count 1"
+                    received,
+                } if received == "MCP server count 1"
             ),
             "expected the typed MCP passthrough refusal"
+        );
+        assert_eq!(
+            error.dispatch(),
+            mango_external_agents::Dispatch::NotSubmitted
         );
     }
 }
@@ -2467,7 +2490,7 @@ async fn a_reset_requested_at_open_is_refused_rather_than_silently_dropped() {
 
     assert!(
         matches!(
-            error,
+            error.cause(),
             mango_external_agents::Error::HostConfiguration { .. }
         ),
         "expected a typed configuration refusal, received {error:?}"
@@ -2508,7 +2531,7 @@ async fn a_reset_requested_on_a_turn_is_refused_rather_than_silently_dropped() {
 
     assert!(
         matches!(
-            error,
+            error.cause(),
             mango_external_agents::Error::HostConfiguration { .. }
         ),
         "expected a typed configuration refusal, received {error:?}"

@@ -141,9 +141,12 @@ fields shown in the current online documentation.
 
 Codex persists successful turn overrides. `Session::snapshot().configuration` reports the settings
 a later turn inherits, split three ways: `requested` is what the host asked for, `accepted` is what
-this harness encoded onto `thread/start` and `turn/start`, and `observed` stays unknown because the
-app-server reports no surface saying what it is running under. A patch axis left at `keep` retains
-the last host selection, or the user's Codex defaults if there has been no selection.
+this harness encoded onto `thread/start` and `turn/start`, and `observed` contains only fields the
+app-server returned while opening the thread. A successful turn override clears an observed value
+only for the axis it actually superseded, because `turn/start` does not report the setting it used.
+An older delayed success cannot clear an observation a newer generation already owns. A patch axis
+left at `keep` retains the last host selection, or the user's Codex defaults if there has been no
+selection.
 Native reviews inherit the same current settings. Hosts use the shared `Session` trait and need
 no Codex-specific permission state machine.
 
