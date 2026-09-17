@@ -413,14 +413,19 @@ impl mango_external_agents::Session for ClaudeSession {
     async fn close(&self, reason: CloseReason) -> Result<()> {
         // Idempotent: a close racing a cancel, or two closes from different tasks, must not fail
         // the second caller. Both takes happen under the guard; nothing slow happens under it.
-        let (control, mcp_config) = {
+        let (control, mut mcp_config) = {
             let mut lifecycle = self.shared.lifecycle.lock();
             if !lifecycle.close() {
                 return Ok(());
             }
             let mut state = self.shared.lock();
             let control = take_turn(&mut state, CancelReason::from(reason));
-            (control, state.mcp_config.take())
+            // In the same cancellation-safe owner the open and the turn use: the kill below is a
+            // `ProcessControl` call that can take as long as the host's escalation grace, and a
+            // caller that gives up on the close in that window would otherwise drop this on the
+            // async worker. There is no second chance at it either — the lifecycle is already
+            // closed, so a following close returns before reaching here.
+            (control, crate::mcp::Prepared::new(state.mcp_config.take()))
         };
         end_turn(control, CancelReason::from(reason)).await;
         // The session releases its reference here. A start that is still awaiting a child retains
@@ -429,7 +434,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // the directory is a synchronous filesystem call against the host's own scratch root.
         // Reported rather than swallowed: this close promised the session's resources were
         // released, and the file holds the `env` and `headers` a host configured its servers with.
-        crate::mcp::remove_on_close(mcp_config).await
+        crate::mcp::remove_on_close(mcp_config.take()).await
     }
 }
 
