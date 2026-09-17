@@ -363,9 +363,8 @@ impl fmt::Display for Error {
                 "expected version {minimum} or newer, received a vendor-reported version ({} bytes)",
                 found.len()
             ),
-            Self::AuthRequired { login_hint } => write!(
-                formatter,
-                "expected a signed-in CLI, received a signed-out one; the vendor's own command is `{login_hint}`"
+            Self::AuthRequired { .. } => formatter.write_str(
+                "expected a signed-in CLI, received a signed-out one; inspect the typed login hint",
             ),
             Self::Launch { program, message } => write!(
                 formatter,
@@ -554,12 +553,13 @@ mod tests {
         }
     }
 
-    /// The two arms whose fields are the library's own, not a vendor's.
+    /// A version gate retains its library-owned minimum, while the typed login hint stays out of
+    /// diagnostics because custom profiles can supply caller-owned text.
     ///
     /// A version gate and a signed-out CLI are the errors a person is meant to fix, and the
-    /// instruction is the whole content: `minimum` is a harness constant and `login_hint` is a
-    /// published vendor command. Only `found` is vendor stdout — a harness that cannot parse a
-    /// version falls back to the line the CLI printed — so only `found` is reduced to its size.
+    /// instruction is the whole content for a version gate: `minimum` is a harness constant. Only
+    /// `found` is vendor stdout — a harness that cannot parse a version falls back to the line the
+    /// CLI printed — so only `found` is reduced to its size.
     #[test]
     fn a_gate_and_a_signed_out_cli_still_say_what_to_do_about_them() {
         let gate = Error::VersionGate {
@@ -578,9 +578,9 @@ mod tests {
         let signed_out = Error::AuthRequired {
             login_hint: String::from("claude auth login"),
         };
-        assert!(
-            signed_out.to_string().contains("`claude auth login`"),
-            "expected the vendor command a user is meant to run, received {signed_out}"
+        assert_eq!(
+            signed_out.to_string(),
+            "expected a signed-in CLI, received a signed-out one; inspect the typed login hint"
         );
     }
 

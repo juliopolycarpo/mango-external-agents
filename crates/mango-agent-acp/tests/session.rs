@@ -1230,11 +1230,14 @@ async fn a_handshake_the_agent_never_answers_ends_on_the_hosts_own_deadline() {
     assert_eq!(*after, Duration::from_secs(5));
 }
 
-/// A custom profile's id is host-authored text, not a library constant, so a hostile one must not
-/// reach the timeout diagnostic verbatim.
+/// A custom profile's id is host-authored text, so a timeout must describe the ACP operation without
+/// copying an identifier that could contain tenant data or credentials into diagnostics.
 #[tokio::test(start_paused = true)]
-async fn a_custom_profiles_id_is_bounded_in_the_timeout_diagnostic() {
-    let hostile_id = format!("fake\u{7}\x1b[31m{}", "x".repeat(4_000));
+async fn a_custom_profiles_id_stays_out_of_the_timeout_diagnostic() {
+    let hostile_id = format!(
+        "fake\u{7}\x1b[31m credential=profile-secret {}",
+        "x".repeat(4_000)
+    );
     let launcher = FakeLauncher::new();
     launcher.push(FakeProcess::responding(|_| Vec::new()));
     let host = HostContext::builder()
@@ -1264,15 +1267,75 @@ async fn a_custom_profiles_id_is_bounded_in_the_timeout_diagnostic() {
     let Error::Timeout { operation, .. } = &error else {
         panic!("received {error:?}");
     };
+    assert_eq!(operation, "initialize on an ACP agent");
     assert!(
-        !operation.contains('\u{7}') && !operation.contains('\x1b'),
-        "received an operation with unstripped control characters: {operation:?}"
+        !operation.contains("profile-secret"),
+        "received a caller-owned profile id in diagnostics: {operation:?}"
     );
+}
+
+/// Once the transport is ready, an agent can still exit under `initialize` or `session/new`. The
+/// opening call returns no control handle, so its redacted stderr must travel through the typed
+/// vendor failure before cleanup drops the handle.
+#[tokio::test]
+async fn an_agent_that_exits_after_connecting_keeps_its_stderr_on_the_open_failure() {
+    let close_stdout = mango_external_agents::CancelToken::new();
+    let close_after_initialize = close_stdout.clone();
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeProcess::responding(move |line| {
+            let message: serde_json::Value =
+                serde_json::from_str(line).expect("expected a JSON-RPC request");
+            let method = message["method"].as_str();
+            let id = message["id"].clone();
+            if method == Some("initialize") {
+                return vec![
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": 1,
+                            "agentInfo": { "name": "fake-acp", "version": "1.2.3" },
+                            "agentCapabilities": {
+                                "loadSession": true,
+                                "promptCapabilities": { "image": true, "embeddedContext": true },
+                                "sessionCapabilities": {},
+                            },
+                            "authMethods": [],
+                        },
+                    })
+                    .to_string(),
+                ];
+            }
+            if method == Some("session/new") {
+                close_after_initialize.cancel();
+            }
+            Vec::new()
+        })
+        .ending_stdout_when(close_stdout)
+        .with_stderr("invalid ACP configuration"),
+    );
+
+    let error = refusal(
+        AcpHarness::new(profile())
+            .open_session(&host(&launcher), OpenSession::new("chat-1"))
+            .await,
+    );
+    let Error::Vendor(vendor) = &error else {
+        panic!("expected a vendor failure, received {error:?}");
+    };
+    assert_eq!(vendor.code.as_str(), "acp-link-closed");
     assert!(
-        operation.len() < 1_000,
-        "received an unbounded operation: {} bytes",
-        operation.len()
+        vendor.message.contains("invalid ACP configuration"),
+        "expected the redacted stderr tail on the typed field, received {:?}",
+        vendor.message
     );
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        assert!(
+            !rendered.contains("invalid ACP configuration"),
+            "expected the stderr tail to stay out of diagnostics, received {rendered:?}"
+        );
+    }
 }
 
 /// The same hole `open_session` refuses, one layer down. A turn asking for a level the profile cannot

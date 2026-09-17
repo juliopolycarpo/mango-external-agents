@@ -418,7 +418,7 @@ impl Client {
     {
         let answer = self.call(method, params, timeout).await?;
         serde_json::from_value(answer).map_err(|error| Error::Protocol {
-            expected: format!("a result {method} could answer with"),
+            expected: String::from("a JSON-RPC result"),
             received: error.to_string(),
         })
     }
@@ -534,12 +534,12 @@ impl Client {
             ))),
             Ok(Err(_)) => Err(Error::Link {
                 peer: self.state.options.peer_name.clone(),
-                message: format!("a peer that went away before answering {method}"),
+                message: String::from("a peer that went away before answering a JSON-RPC request"),
             }),
             Err(_) => {
                 self.state.pending.lock().await.remove(&id);
                 Err(Error::Timeout {
-                    operation: format!("{} {method}", self.state.options.peer_name),
+                    operation: String::from("a JSON-RPC request"),
                     after: timeout,
                 })
             }
@@ -584,7 +584,7 @@ impl ClientState {
         frame.insert(String::from("method"), json!(method));
 
         let params = serde_json::to_value(params).map_err(|error| Error::Protocol {
-            expected: format!("serialisable params for {method}"),
+            expected: String::from("serialisable JSON-RPC params"),
             received: error.to_string(),
         })?;
         // A dialect that validates strictly refuses a `params: null` it never declared, so an
@@ -1338,6 +1338,34 @@ mod tests {
             matches!(error, Error::Timeout { .. }),
             "expected a timeout, received {error:?}"
         );
+    }
+
+    /// Client labels identify a peer to the caller but can be host-authored text, so they must not
+    /// cross a timeout diagnostic alongside the exact method sent on the wire.
+    #[tokio::test(start_paused = true)]
+    async fn caller_defined_peer_and_method_names_stay_out_of_timeout_diagnostics() {
+        let link = ScriptedLink::new();
+        let client = Client::connect(
+            link.into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::new("peer credential=peer-secret"),
+        );
+
+        let error = client
+            .request_with_timeout::<_, Value>(
+                "method credential=method-secret",
+                json!({}),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("expected a timeout, received an answer");
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("peer-secret") && !rendered.contains("method-secret"),
+                "expected no caller-defined labels in diagnostics, received {rendered:?}"
+            );
+        }
     }
 
     #[tokio::test]

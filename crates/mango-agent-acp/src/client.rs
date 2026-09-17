@@ -38,7 +38,6 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use mango_external_agents::approval::ApprovalDeadline;
 use mango_external_agents::event::{EventKind, SessionId};
-use mango_external_agents::normalize::{TextLimit, bound_text};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
     broker_response,
@@ -913,11 +912,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 ///
 /// # Errors
 ///
-/// [`Error::Timeout`] when the deadline passed, [`Error::Link`] naming the call the transport
-/// closed under, and otherwise whatever [`request_error`](crate::error::request_error) made of the
-/// agent's answer. The child's own stderr — the only thing that can explain an agent that exited
-/// mid-call — stays on [`StderrTail`](mango_external_agents::StderrTail) rather than on the error,
-/// and the turn's own failure event still carries it.
+/// [`Error::Timeout`] when the deadline passed, [`Error::Vendor`] with the child's redacted stderr
+/// when the transport closed, and otherwise whatever [`request_error`](crate::error::request_error)
+/// made of the agent's answer. An opening call returns no session or control handle, so this is the
+/// only path that preserves the tail for a host to inspect.
 pub(crate) async fn send<Request>(
     connection: &ConnectionHandle,
     profile: &crate::profile::AcpProfile,
@@ -932,20 +930,17 @@ where
     let sent = connection.connection().send_request(request);
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
-        // A custom profile's id is host-authored, not a library constant, and `Timeout.operation`
-        // is written verbatim by `Display` — bounded the same way a custom login hint is.
-        let id = bound_text(profile.id.as_str(), TextLimit::Title).text;
         return Err(Error::Timeout {
-            operation: format!("{method} on ACP agent {id}"),
+            operation: format!("{method} on an ACP agent"),
             after: timeout,
         });
     };
     answered.map_err(|error| {
         if agent_client_protocol::is_incoming_transport_closed(&error) {
-            return Error::Link {
-                peer: format!("ACP agent {}", profile.id),
-                message: format!("a transport that closed under {method}"),
-            };
+            return Error::Vendor(link_failure(with_stderr(
+                &format!("a transport that closed under {method}"),
+                connection.control().as_ref(),
+            )));
         }
         crate::error::request_error(method, &error, &profile.login_text())
     })
