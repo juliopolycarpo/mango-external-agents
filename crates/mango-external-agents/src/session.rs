@@ -534,7 +534,7 @@ impl TurnRequest {
     ///
     /// let turn = TurnRequest::new("turn-1", "say hello");
     /// assert_eq!(turn.turn_id.as_str(), "turn-1");
-    /// assert_eq!(turn.attempt.as_str(), "attempt-1");
+    /// assert_eq!(turn.attempt.get(), 1);
     /// assert!(turn.attachments.is_empty());
     /// ```
     pub fn new(turn_id: impl Into<String>, input: impl Into<String>) -> Self {
@@ -554,9 +554,9 @@ impl TurnRequest {
     /// ```
     /// use mango_external_agents::{AttemptId, TurnRequest};
     ///
-    /// let retry = TurnRequest::new("turn-1", "say hello").as_attempt(AttemptId::new("attempt-2"));
+    /// let retry = TurnRequest::new("turn-1", "say hello").as_attempt(AttemptId::new(2));
     /// assert_eq!(retry.turn_id.as_str(), "turn-1");
-    /// assert_eq!(retry.attempt.as_str(), "attempt-2");
+    /// assert_eq!(retry.attempt.get(), 2);
     /// ```
     #[must_use]
     pub fn as_attempt(mut self, attempt: AttemptId) -> Self {
@@ -1391,7 +1391,7 @@ mod tests {
         assert_eq!(turn.attempt, AttemptId::default());
         assert_eq!(turn.configuration, None);
 
-        let retry = turn.clone().as_attempt(AttemptId::new("attempt-2"));
+        let retry = turn.clone().as_attempt(AttemptId::new(2));
         assert_eq!(
             retry.turn_id, turn.turn_id,
             "expected a retry to stay the same logical turn"

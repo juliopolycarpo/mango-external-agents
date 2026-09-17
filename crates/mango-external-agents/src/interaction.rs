@@ -1069,14 +1069,14 @@ mod tests {
         let owned = interaction().during(OperationRef::new(
             SessionId::new("chat-1"),
             TurnId::new("turn-1"),
-            AttemptId::new("attempt-2"),
+            AttemptId::new(2),
         ));
         assert_eq!(
             owned
                 .operation
                 .as_ref()
-                .map(|operation| operation.attempt.as_str()),
-            Some("attempt-2")
+                .map(|operation| operation.attempt.get()),
+            Some(2)
         );
         assert!(owned.is_open());
         assert!(!owned.resolved_as(InteractionStatus::Expired).is_open());

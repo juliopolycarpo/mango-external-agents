@@ -257,9 +257,9 @@ fn every_protected_request_type_is_constructible_through_its_builders() {
     assert!(open.configuration.asks_for_a_reset());
 
     let turn = TurnRequest::new("turn-1", "ship it")
-        .as_attempt(AttemptId::new("attempt-2"))
+        .as_attempt(AttemptId::new(2))
         .with_configuration(ConfigurationPatch::new().model(ConfigurationChange::Reset));
-    assert_eq!(turn.attempt.as_str(), "attempt-2");
+    assert_eq!(turn.attempt.get(), 2);
 
     let interaction = Interaction::new(
         InteractionId::new("ask-1"),
@@ -568,9 +568,9 @@ fn a_failure_states_how_far_its_request_got_without_promising_idempotency() {
     let first = OperationRef::new(
         SessionId::new("chat-1"),
         TurnId::new("turn-1"),
-        AttemptId::new("attempt-1"),
+        AttemptId::new(1),
     );
-    let retry = first.clone().retried_as(AttemptId::new("attempt-2"));
+    let retry = first.clone().retried_as(AttemptId::new(2));
     assert!(first.is_same_turn(&retry));
     assert!(first.is_superseded_by(&retry));
     assert!(!retry.is_superseded_by(&first));

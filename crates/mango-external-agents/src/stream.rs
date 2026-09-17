@@ -82,7 +82,7 @@ impl TurnStream {
 
     /// Which session, turn and attempt this stream belongs to.
     pub fn operation(&self, session_id: SessionId) -> OperationRef {
-        OperationRef::new(session_id, self.turn_id.clone(), self.attempt.clone())
+        OperationRef::new(session_id, self.turn_id.clone(), self.attempt)
     }
 
     /// The next event, or `None` once the turn is over.
@@ -296,7 +296,7 @@ impl EventSink {
         Ok(AgentEvent {
             session_id: self.session_id.clone(),
             turn_id: self.turn_id.clone(),
-            attempt: self.attempt.clone(),
+            attempt: self.attempt,
             at: self.clock.now(),
             kind: kind.normalized()?,
         })
@@ -329,7 +329,7 @@ impl EventSink {
         OperationRef::new(
             self.session_id.clone(),
             self.turn_id.clone(),
-            self.attempt.clone(),
+            self.attempt,
         )
     }
 }
@@ -363,7 +363,7 @@ mod tests {
         EventSink::new(
             SessionId::new("session-1"),
             TurnId::new("turn-1"),
-            AttemptId::new("attempt-1"),
+            AttemptId::new(1),
             Arc::new(SystemClock),
             capacity,
         )
@@ -437,7 +437,7 @@ mod tests {
         let (sink, mut events) = EventSink::new(
             SessionId::new("session-1"),
             TurnId::new("turn-1"),
-            AttemptId::new("attempt-2"),
+            AttemptId::new(2),
             Arc::new(FrozenClock(stamped)),
             4,
         );
@@ -453,7 +453,7 @@ mod tests {
         assert_eq!(event.turn_id, TurnId::new("turn-1"));
         assert_eq!(
             event.attempt,
-            AttemptId::new("attempt-2"),
+            AttemptId::new(2),
             "expected the attempt on the event, so a late one from an abandoned dispatch is              recognisable"
         );
         assert_eq!(event.at, stamped);
@@ -654,12 +654,8 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_turn_still_completes() {
         let (sink, events) = sink(4);
-        let mut turn = TurnStream::accepted(
-            TurnId::new("turn-1"),
-            AttemptId::new("attempt-1"),
-            "native-1",
-            events,
-        );
+        let mut turn =
+            TurnStream::accepted(TurnId::new("turn-1"), AttemptId::new(1), "native-1", events);
         assert_eq!(turn.dispatch(), Dispatch::Accepted);
         assert_eq!(turn.native_turn_id(), "native-1");
 

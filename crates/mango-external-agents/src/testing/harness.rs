@@ -495,7 +495,7 @@ impl Session for FakeSession {
         let (sink, events) = EventSink::new(
             snapshot.ids.session_id.clone(),
             request.turn_id.clone(),
-            request.attempt.clone(),
+            request.attempt,
             Arc::clone(self.host.clock()),
             self.host.limits().turn_channel_capacity,
         );
@@ -520,7 +520,7 @@ impl Session for FakeSession {
         let stream = || {
             TurnStream::accepted(
                 request.turn_id.clone(),
-                request.attempt.clone(),
+                request.attempt,
                 native_turn_id.clone(),
                 events,
             )

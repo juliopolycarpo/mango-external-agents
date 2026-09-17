@@ -141,7 +141,7 @@ impl AgentEvent {
         OperationRef::new(
             self.session_id.clone(),
             self.turn_id.clone(),
-            self.attempt.clone(),
+            self.attempt,
         )
     }
 }

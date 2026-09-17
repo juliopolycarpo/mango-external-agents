@@ -341,10 +341,9 @@ fn minimal_answers(request: &QuestionRequest) -> QuestionResponse {
                     }
                     (QuestionForm::FreeText { .. }, true) => {
                         AnswerValue::text("conformance-suite-placeholder")
-                    }
-                    // No catch-all: `QuestionForm` is non-exhaustive to everyone else, but in
-                    // here a new arm is a compile error, which is right. Deciding what this suite
-                    // says to a new kind of question is part of adding one.
+                    } // No catch-all: `QuestionForm` is non-exhaustive to everyone else, but in
+                      // here a new arm is a compile error, which is right. Deciding what this suite
+                      // says to a new kind of question is part of adding one.
                 };
                 Answer::new(question.id.clone(), value)
             })

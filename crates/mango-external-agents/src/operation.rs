@@ -20,54 +20,75 @@ use std::fmt;
 
 use crate::event::{SessionId, TurnId};
 
-/// One dispatch of one logical turn.
+/// Which dispatch of one logical turn this is.
 ///
-/// A retry that means "the same turn, again" keeps its [`crate::TurnId`] and mints a new
-/// one of these. Host-minted, like every other id in this library: an id the library chose is an
-/// id the host cannot reproduce after a restart, and an id it cannot reproduce is one it cannot
-/// reconcile with.
+/// A **generation**, not a name. A retry that means "the same turn, again" keeps its
+/// [`crate::TurnId`] and takes the [`AttemptId::next`] generation, and the whole point of the type
+/// is that two of them can be compared: a result carrying an older generation belongs to work the
+/// host already replaced.
+///
+/// It is a number rather than an opaque string for exactly that reason. An opaque id would have to
+/// be ordered somehow, and every ordering available to this library would be wrong — `attempt-10`
+/// sorts before `attempt-2` on any lexicographic comparison, which is the shape a host naming its
+/// attempts would reach for first. A host that also wants its own opaque handle per attempt keeps
+/// one beside this; what the library needs in order to recognise stale work is the generation.
 ///
 /// # Example
 ///
 /// ```
 /// use mango_external_agents::AttemptId;
 ///
-/// let first = AttemptId::new("attempt-1");
-/// let retry = AttemptId::new("attempt-2");
-/// assert_ne!(first, retry);
+/// let first = AttemptId::FIRST;
+/// let retry = first.next();
+/// assert!(retry > first);
+/// assert_eq!(retry.get(), 2);
 /// ```
 #[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(transparent)]
-pub struct AttemptId(String);
+pub struct AttemptId(u64);
+
+impl Default for AttemptId {
+    /// [`AttemptId::FIRST`], not generation zero.
+    ///
+    /// Derived, this would have been `0`, which is a generation no host would mint and one that
+    /// reads as "before the first attempt" everywhere it is compared.
+    fn default() -> Self {
+        Self::FIRST
+    }
+}
 
 impl AttemptId {
-    /// Names one attempt.
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+    /// The first dispatch of a turn, and what a host that never retries always uses.
+    ///
+    /// Also [`Default`], so a host with no recovery policy of its own does not have to think about
+    /// generations at all.
+    pub const FIRST: Self = Self(1);
+
+    /// One generation, numbered by the host.
+    pub const fn new(generation: u64) -> Self {
+        Self(generation)
     }
 
-    /// The id as written.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// The generation as a number, for persisting or comparing.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The generation after this one.
+    ///
+    /// Saturating rather than wrapping, for the same reason a session revision is: a counter that
+    /// went backwards would make a host discard the attempt that replaced the one it has.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
     }
 }
 
 impl fmt::Display for AttemptId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl Default for AttemptId {
-    /// The attempt a host that does not retry never has to name.
-    ///
-    /// A host with no recovery policy of its own still has to put *something* on every turn, and a
-    /// constant is better than a mint: it says plainly that this host does not distinguish
-    /// attempts, rather than implying a generation counter nothing increments.
-    fn default() -> Self {
-        Self(String::from("attempt-1"))
+        write!(formatter, "{}", self.0)
     }
 }
 
@@ -100,9 +121,9 @@ impl OperationRef {
     /// let reference = OperationRef::new(
     ///     SessionId::new("chat-1"),
     ///     TurnId::new("turn-1"),
-    ///     AttemptId::new("attempt-2"),
+    ///     AttemptId::new(2),
     /// );
-    /// assert_eq!(reference.attempt.as_str(), "attempt-2");
+    /// assert_eq!(reference.attempt.get(), 2);
     /// ```
     pub fn new(session_id: SessionId, turn_id: TurnId, attempt: AttemptId) -> Self {
         Self {
@@ -120,9 +141,9 @@ impl OperationRef {
     /// Whether `other` is a later attempt at the same turn.
     ///
     /// What a host asks before letting something apply: a result carrying an attempt the host has
-    /// already replaced must not mutate the one that replaced it. Attempts are compared as the
-    /// host spelled them, because the host minted them and this library never assumes an order it
-    /// did not define.
+    /// already replaced must not mutate the one that replaced it. The comparison is between
+    /// generations, so it is right for `attempt 10` against `attempt 2` — which is the case any
+    /// string-shaped attempt id would have got wrong.
     ///
     /// # Example
     ///
@@ -132,9 +153,9 @@ impl OperationRef {
     /// let first = OperationRef::new(
     ///     SessionId::new("chat-1"),
     ///     TurnId::new("turn-1"),
-    ///     AttemptId::new("attempt-1"),
+    ///     AttemptId::FIRST,
     /// );
-    /// let retry = first.clone().retried_as(AttemptId::new("attempt-2"));
+    /// let retry = first.clone().retried_as(first.attempt.next());
     /// assert!(first.is_superseded_by(&retry));
     /// assert!(!retry.is_superseded_by(&first));
     /// ```
@@ -215,7 +236,7 @@ mod tests {
     use super::{AttemptId, Dispatch, OperationRef};
     use crate::event::{SessionId, TurnId};
 
-    fn reference(turn: &str, attempt: &str) -> OperationRef {
+    fn reference(turn: &str, attempt: u64) -> OperationRef {
         OperationRef::new(
             SessionId::new("chat-1"),
             TurnId::new(turn),
@@ -225,37 +246,51 @@ mod tests {
 
     #[test]
     fn two_attempts_at_one_turn_are_the_same_turn() {
-        assert!(reference("turn-1", "attempt-1").is_same_turn(&reference("turn-1", "attempt-2")));
-        assert!(!reference("turn-1", "attempt-1").is_same_turn(&reference("turn-2", "attempt-1")));
+        assert!(reference("turn-1", 1).is_same_turn(&reference("turn-1", 2)));
+        assert!(!reference("turn-1", 1).is_same_turn(&reference("turn-2", 1)));
     }
 
     /// The check a host runs before letting a late result apply. Without it a result from an
     /// abandoned attempt would mutate the attempt that replaced it.
     #[test]
     fn a_later_attempt_supersedes_an_earlier_one_and_not_the_other_way_round() {
-        let first = reference("turn-1", "attempt-1");
-        let retry = reference("turn-1", "attempt-2");
+        let first = reference("turn-1", 1);
+        let retry = reference("turn-1", 2);
         assert!(first.is_superseded_by(&retry));
         assert!(!retry.is_superseded_by(&first));
         assert!(!first.is_superseded_by(&first));
     }
 
+    /// The case that decided the type. Any string-shaped attempt id a host would reach for —
+    /// `attempt-2`, `attempt-10` — sorts the wrong way lexicographically, so a host would quietly
+    /// let a result from generation 2 overwrite the work of generation 10.
+    #[test]
+    fn the_tenth_attempt_supersedes_the_second_rather_than_sorting_before_it() {
+        let second = reference("turn-1", 2);
+        let tenth = reference("turn-1", 10);
+
+        assert!(second.is_superseded_by(&tenth));
+        assert!(!tenth.is_superseded_by(&second));
+        assert!(
+            AttemptId::new(10) > AttemptId::new(2),
+            "expected generations to compare as numbers"
+        );
+    }
+
     /// A different turn is not a supersession, however its attempts sort.
     #[test]
     fn an_attempt_at_another_turn_never_supersedes_this_one() {
-        assert!(
-            !reference("turn-1", "attempt-9").is_superseded_by(&reference("turn-2", "attempt-1"))
-        );
+        assert!(!reference("turn-1", 9).is_superseded_by(&reference("turn-2", 1)));
     }
 
     #[test]
     fn a_reference_round_trips_and_prints_all_three_identities() {
-        let reference = reference("turn-1", "attempt-2");
-        assert_eq!(reference.to_string(), "chat-1/turn-1/attempt-2");
+        let reference = reference("turn-1", 2);
+        assert_eq!(reference.to_string(), "chat-1/turn-1/2");
         let encoded = serde_json::to_value(&reference).expect("expected a serializable reference");
         assert_eq!(encoded["sessionId"], "chat-1");
         assert_eq!(encoded["turnId"], "turn-1");
-        assert_eq!(encoded["attempt"], "attempt-2");
+        assert_eq!(encoded["attempt"], 2);
         assert_eq!(
             serde_json::from_value::<OperationRef>(encoded).expect("expected the reference back"),
             reference
@@ -272,10 +307,17 @@ mod tests {
         assert!(!Dispatch::NotSubmitted.needs_reconciliation());
     }
 
-    /// A host with no recovery policy still has to put something on every turn.
+    /// A host with no recovery policy still has to put something on every turn, and it should not
+    /// have to think about generations to do it.
     #[test]
-    fn the_default_attempt_is_a_constant_rather_than_a_mint() {
-        assert_eq!(AttemptId::default(), AttemptId::default());
-        assert_eq!(AttemptId::default().as_str(), "attempt-1");
+    fn the_default_attempt_is_the_first_generation() {
+        assert_eq!(AttemptId::default(), AttemptId::FIRST);
+        assert_eq!(AttemptId::FIRST.get(), 1);
+        assert_eq!(AttemptId::FIRST.next().get(), 2);
+        assert_eq!(
+            AttemptId::new(u64::MAX).next().get(),
+            u64::MAX,
+            "expected the generation to stick rather than wrap backwards"
+        );
     }
 }
