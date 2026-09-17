@@ -388,6 +388,14 @@ impl ProcessControl for Child {
 
     /// 128 + SIGTERM, which is what the vendor documents for a `claude -p` run stopped that way.
     async fn kill(&self, _reason: CancelReason) -> Result<()> {
+        // A child that already ended is not killed again. `TokioChild` escalates once and the
+        // second caller waits on the first caller's outcome without signalling anything, so a fake
+        // that recorded a second observation here would be inventing a kill the real launcher
+        // never performs — and the turn's own stream task does call `kill` after a close already
+        // did.
+        if self.is_finished() {
+            return Ok(());
+        }
         if let Some(path) = &self.mcp_config {
             lock(&self.config_at_kill).push(path.exists());
         }

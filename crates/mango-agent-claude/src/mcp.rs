@@ -65,20 +65,27 @@ impl ConfigFile {
     /// starting one that silently dropped a server the host asked for would run turns without the
     /// tools somebody configured.
     pub async fn write(servers: &[McpServer], scratch: &Path) -> Result<Option<Self>> {
+        Self::write_on_blocking_pool(servers, scratch, PrivateFileWriter).await
+    }
+
+    /// The write, on the blocking pool, with the writer injected so a test can watch the thread.
+    async fn write_on_blocking_pool(
+        servers: &[McpServer],
+        scratch: &Path,
+        writer: impl FileWriter + Send + 'static,
+    ) -> Result<Option<Self>> {
         let servers = servers.to_vec();
         let scratch = scratch.to_path_buf();
         // Every step of the write is a synchronous filesystem call, and the host owns the scratch
         // root: it may sit on a FUSE, container or network mount whose `metadata` alone takes
         // seconds. Opening one session must not park the async worker that every other session on
         // that runtime is rendering its turn on.
-        tokio::task::spawn_blocking(move || {
-            Self::write_with(&servers, &scratch, &PrivateFileWriter)
-        })
-        .await
-        .map_err(|_| Error::HostConfiguration {
-            expected: "a blocking pool that can run the MCP configuration write",
-            received: String::from("a blocking task that did not finish"),
-        })?
+        tokio::task::spawn_blocking(move || Self::write_with(&servers, &scratch, &writer))
+            .await
+            .map_err(|_| Error::HostConfiguration {
+                expected: "a blocking pool that can run the MCP configuration write",
+                received: String::from("a blocking task that did not finish"),
+            })?
     }
 
     fn write_with(
@@ -167,11 +174,36 @@ impl ConfigFile {
 impl Drop for ConfigFile {
     /// Removes the whole directory, so a session that was never closed still leaves nothing behind.
     ///
-    /// Synchronous, deliberately: this is one `rmdir` of one small local directory, and an async
-    /// cleanup would need a runtime that may already be shutting down when the session drops.
+    /// Synchronous, deliberately: a value dropped without a close has no runtime to hand the call
+    /// to, and by the time the last session drops the runtime may already be shutting down. A
+    /// close that does have one goes through `remove_off_worker` instead.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
     }
+}
+
+/// Releases a configuration artifact without running the host's filesystem on the async worker.
+///
+/// Dropping the last reference removes the directory with a synchronous `remove_dir_all` against
+/// a root the host chose, which may be a FUSE, container or network mount — the same call
+/// [`ConfigFile::write`] runs on the blocking pool for the same reason. A reference that is not
+/// the last one costs a blocking task that does nothing, which is the cheaper half of the trade.
+///
+/// Awaited rather than detached: a close that returned before the artifact was gone would be a
+/// close that did not clean up.
+pub(crate) async fn remove_off_worker(file: Option<std::sync::Arc<ConfigFile>>) {
+    release_off_worker(file).await;
+}
+
+/// Drops a value on the blocking pool, so whatever its `Drop` does is not done on a worker.
+///
+/// Generic so a test can hand it a value whose `Drop` reports which thread ran it; `ConfigFile`'s
+/// own `Drop` has nothing to report but the directory being gone.
+async fn release_off_worker<T: Send + 'static>(value: Option<T>) {
+    let Some(value) = value else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || drop(value)).await;
 }
 
 /// The `mcpServers` document, as the vendor's own configuration files spell it.
@@ -566,31 +598,119 @@ mod tests {
 
     /// Opening a session must not run the host's filesystem on the async worker.
     ///
-    /// A current-thread runtime states it sharply: every step of the write is a synchronous call,
-    /// and the host's scratch root may be a FUSE, container or network mount whose `metadata`
-    /// alone takes seconds. Off the worker, awaiting the write lets the other tasks sharing it
-    /// make progress; run inline, the same call reaches its answer without ever yielding, and one
-    /// slow mount stalls every session on that runtime.
+    /// Every step of the write is a synchronous call, and the host's scratch root may be a FUSE,
+    /// container or network mount whose `metadata` alone takes seconds. Run inline, one slow
+    /// mount stalls every session on that runtime.
+    ///
+    /// Asserted on the thread the write ran on rather than on whether another task got a turn:
+    /// a `spawn_blocking` whose closure has already finished can be awaited without yielding, so
+    /// "some other task progressed" passes or fails on how warm the blocking pool is. On a
+    /// current-thread runtime that pool is provably a different thread.
     #[tokio::test(flavor = "current_thread")]
-    async fn writing_the_configuration_yields_the_async_worker() {
+    async fn writing_the_configuration_runs_off_the_async_worker() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+        use std::thread::ThreadId;
+
+        /// Writes for real, and reports which thread it was called on.
+        struct ThreadRecordingWriter(Arc<Mutex<Option<ThreadId>>>);
+
+        impl FileWriter for ThreadRecordingWriter {
+            fn write_new(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+                *self.0.lock().expect("an uncontended recorder") =
+                    Some(std::thread::current().id());
+                write_private_file(path, contents)
+            }
+        }
 
         let scratch = tempdir();
-        let progressed = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&progressed);
-        tokio::spawn(async move { flag.store(true, Ordering::SeqCst) });
+        let wrote_on = Arc::new(Mutex::new(None));
+        let file = ConfigFile::write_on_blocking_pool(
+            &servers(),
+            &scratch,
+            ThreadRecordingWriter(Arc::clone(&wrote_on)),
+        )
+        .await
+        .expect("expected a file")
+        .expect("expected servers to produce one");
 
-        let file = ConfigFile::write(&servers(), &scratch)
-            .await
-            .expect("expected a file")
-            .expect("expected servers to produce one");
-
+        let wrote_on = *wrote_on.lock().expect("an uncontended recorder");
         assert!(
-            progressed.load(Ordering::SeqCst),
-            "expected the configuration write to leave the async worker free for other tasks"
+            wrote_on.is_some(),
+            "expected the writer to have been called"
+        );
+        assert_ne!(
+            wrote_on,
+            Some(std::thread::current().id()),
+            "expected the write to run on the blocking pool, received the async worker"
         );
         drop(file);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Closing a session must not run the host's filesystem on the async worker either.
+    ///
+    /// The mirror of the write: `remove_dir_all` is the same synchronous call against the same
+    /// host-chosen root, and `ClaudeSession::close` drops the last reference.
+    ///
+    /// Asserted on the thread the `Drop` ran on rather than on whether another task got a turn.
+    /// A `spawn_blocking` whose closure has already finished can be awaited without yielding, so
+    /// "some other task progressed" is a race; "not this thread" is the property itself, and on a
+    /// current-thread runtime the blocking pool is provably a different thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn releasing_the_configuration_runs_its_drop_off_the_async_worker() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::thread::ThreadId;
+
+        /// Reports which thread dropped it.
+        struct ThreadProbe(Arc<Mutex<Option<ThreadId>>>);
+
+        impl Drop for ThreadProbe {
+            fn drop(&mut self) {
+                *self.0.lock().expect("an uncontended probe") = Some(std::thread::current().id());
+            }
+        }
+
+        let dropped_on = Arc::new(Mutex::new(None));
+        super::release_off_worker(Some(ThreadProbe(Arc::clone(&dropped_on)))).await;
+
+        let dropped_on = *dropped_on.lock().expect("an uncontended probe");
+        assert!(
+            dropped_on.is_some(),
+            "expected the value to have been dropped, received a live one"
+        );
+        assert_ne!(
+            dropped_on,
+            Some(std::thread::current().id()),
+            "expected the drop to run on the blocking pool, received the async worker"
+        );
+    }
+
+    /// And the artifact is gone by the time the release returns, not merely scheduled.
+    #[tokio::test]
+    async fn releasing_the_configuration_removes_the_artifact_before_it_returns() {
+        use std::sync::Arc;
+
+        let scratch = tempdir();
+        let file = Arc::new(
+            ConfigFile::write(&servers(), &scratch)
+                .await
+                .expect("expected a file")
+                .expect("expected servers to produce one"),
+        );
+        let directory = file
+            .path()
+            .parent()
+            .expect("a file sits in a directory")
+            .to_path_buf();
+
+        super::remove_off_worker(Some(file)).await;
+
+        assert!(
+            !directory.exists(),
+            "expected the artifact to be gone once the release returned, received {directory:?}"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

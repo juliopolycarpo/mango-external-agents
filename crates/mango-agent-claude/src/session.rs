@@ -404,8 +404,9 @@ impl mango_external_agents::Session for ClaudeSession {
         end_turn(control, CancelReason::from(reason)).await;
         // The session releases its reference here. A start that is still awaiting a child retains
         // its own `Arc` through the post-spawn lifecycle check, then kills that child before the
-        // final reference can remove the file. Off the lock as well, because cleanup can block.
-        drop(mcp_config);
+        // final reference can remove the file. Off the lock, and off the async worker: removing
+        // the directory is a synchronous filesystem call against the host's own scratch root.
+        crate::mcp::remove_off_worker(mcp_config).await;
         Ok(())
     }
 }
