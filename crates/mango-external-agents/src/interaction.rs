@@ -856,6 +856,36 @@ impl AnswerValue {
     pub const fn is_declined(&self) -> bool {
         matches!(self, Self::Declined)
     }
+
+    /// This value with the vendor's own ids and text bounded.
+    ///
+    /// The door for an answer a harness reports without a host having written it — a vendor that
+    /// answered its own question, or a fake. A host's own answer reached here through
+    /// [`QuestionRequest::validate`], which checks the same ceilings by refusing rather than
+    /// cutting.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when an option id does not
+    /// survive bounding. Refused rather than shortened: a cut id names a different option.
+    pub fn normalized(self) -> Result<Self> {
+        Ok(match self {
+            Self::Chosen { option_ids } => Self::Chosen {
+                option_ids: option_ids
+                    .iter()
+                    .map(|id| {
+                        normalize::opaque_id(id.as_str(), "question option id")
+                            .map(QuestionOptionId::new)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            // `TextLimit::Detail` is `ANSWER_TEXT_MAX_LENGTH`, the ceiling `validate` enforces.
+            Self::Text { text } => Self::Text {
+                text: normalize::bound_text(&text, TextLimit::Detail).text,
+            },
+            Self::Declined => Self::Declined,
+        })
+    }
 }
 
 /// One question's answer.
@@ -882,6 +912,22 @@ impl Answer {
     /// One answer to one question.
     pub fn new(question_id: QuestionId, value: AnswerValue) -> Self {
         Self { question_id, value }
+    }
+
+    /// This answer with the vendor's own id and value bounded.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when the question id or an
+    /// option id does not survive bounding.
+    pub fn normalized(self) -> Result<Self> {
+        Ok(Self {
+            question_id: QuestionId::new(normalize::opaque_id(
+                self.question_id.as_str(),
+                "question id",
+            )?),
+            value: self.value.normalized()?,
+        })
     }
 }
 
@@ -1025,6 +1071,33 @@ impl fmt::Debug for QuestionOutcome {
 }
 
 impl QuestionOutcome {
+    /// This outcome with every vendor-supplied value bounded.
+    ///
+    /// Applied by [`EventSink`](crate::EventSink) through
+    /// [`EventKind::normalized`](crate::EventKind::normalized), so the label on a
+    /// [`UnsupportedQuestion::UnrecognisedForm`] and the ids in an answer are held to the same
+    /// bounds as the question they resolve rather than travelling as the vendor wrote them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when an id carried by an
+    /// answer does not survive bounding.
+    pub fn normalized(self) -> Result<Self> {
+        Ok(match self {
+            Self::Answered { answers } => Self::Answered {
+                answers: answers
+                    .into_iter()
+                    .map(Answer::normalized)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Self::Refused { reason } => Self::Refused {
+                reason: reason.normalized(),
+            },
+            // Nothing a vendor wrote: the whole outcome is its name.
+            unchanged @ (Self::Expired | Self::Cancelled) => unchanged,
+        })
+    }
+
     /// The status this outcome leaves its interaction in.
     pub const fn status(&self) -> InteractionStatus {
         match self {
@@ -1215,8 +1288,10 @@ mod tests {
     /// silently or refuses the whole answer — neither is what `validate` reporting "valid" promised.
     #[test]
     fn a_multi_select_question_refuses_the_same_option_twice() {
-        let request =
-            QuestionRequest::new(interaction(), vec![choice("targets", &["main", "next"], true)]);
+        let request = QuestionRequest::new(
+            interaction(),
+            vec![choice("targets", &["main", "next"], true)],
+        );
         let error = request
             .validate(&QuestionResponse::new(
                 InteractionId::new("ask-1"),

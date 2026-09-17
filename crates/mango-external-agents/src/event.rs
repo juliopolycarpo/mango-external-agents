@@ -387,7 +387,7 @@ impl EventKind {
                 outcome,
             } => Self::QuestionResolved {
                 interaction_id: interaction_id.normalized()?,
-                outcome,
+                outcome: outcome.normalized()?,
             },
             Self::AccountLimits { limits } => Self::AccountLimits {
                 limits: limits.normalized(),
@@ -1017,6 +1017,11 @@ mod tests {
         Command, EventKind, RateLimitWindow,
     };
     use crate::error::{Error, ErrorCode, VendorError};
+    use crate::interaction::{
+        Answer, AnswerValue, InteractionId, QuestionId, QuestionOptionId, QuestionOutcome,
+        UnsupportedQuestion,
+    };
+    use crate::normalize::TextLimit;
 
     fn commands(names: &[(&str, Option<&str>)]) -> Vec<Command> {
         names
@@ -1292,6 +1297,64 @@ mod tests {
                 }
             ),
             "expected an invalid call id, received {error:?}"
+        );
+    }
+
+    /// The label on an unrecognised form is vendor text, and `normalized` promises every
+    /// vendor-supplied value is bounded. Passing the outcome through untouched let it past the one
+    /// door a turn event has.
+    #[test]
+    fn bounds_the_vendor_label_a_refused_question_carries() {
+        let kind = EventKind::QuestionResolved {
+            interaction_id: InteractionId::new("ask-1"),
+            outcome: QuestionOutcome::Refused {
+                reason: UnsupportedQuestion::UnrecognisedForm {
+                    received: "f".repeat(4_096),
+                },
+            },
+        };
+
+        let EventKind::QuestionResolved {
+            outcome:
+                QuestionOutcome::Refused {
+                    reason: UnsupportedQuestion::UnrecognisedForm { received },
+                },
+            ..
+        } = kind.normalized().expect("expected a bounded event")
+        else {
+            panic!("expected the refusal to survive as a refusal");
+        };
+        assert_eq!(received.chars().count(), TextLimit::Title.max_code_points());
+    }
+
+    /// An answer a harness reports itself never passed `QuestionRequest::validate`, so the sink is
+    /// the only place its ids are held to a bound.
+    #[test]
+    fn refuses_an_answered_outcome_whose_option_id_cannot_survive_bounding() {
+        let kind = EventKind::QuestionResolved {
+            interaction_id: InteractionId::new("ask-1"),
+            outcome: QuestionOutcome::Answered {
+                answers: vec![Answer::new(
+                    QuestionId::new("branch"),
+                    AnswerValue::Chosen {
+                        option_ids: vec![QuestionOptionId::new("o".repeat(129))],
+                    },
+                )],
+            },
+        };
+
+        let error = kind
+            .normalized()
+            .expect_err("expected a refusal, received an event");
+        assert!(
+            matches!(
+                error,
+                Error::InvalidVendorValue {
+                    field: "question option id",
+                    ..
+                }
+            ),
+            "expected an invalid option id, received {error:?}"
         );
     }
 
