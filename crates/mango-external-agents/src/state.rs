@@ -458,11 +458,28 @@ impl SessionState {
     /// explicit `close` and a harness watcher that saw the vendor connection die — so without this
     /// the loser of that race publishes `Closing` after `Closed` and a host watching the
     /// subscription sees the lifecycle run backwards.
+    ///
+    /// The comparison happens inside the write rather than before it, which is the whole point:
+    /// a read-then-[`update`](Self::update) pair is two operations, and the racing `close` reads
+    /// `Ready`, loses the whole wind-down to the watcher, and then writes its stale `Closing` over
+    /// the `Closed` that landed in between. Nothing here is a no-op notification either — a status
+    /// that does not advance leaves the revision alone, because a subscriber woken with an
+    /// identical picture cannot tell that from a change.
     pub fn set_status(&self, status: SessionStatus) {
-        if status <= self.snapshot().status {
-            return;
-        }
-        self.update(|snapshot| snapshot.status = status);
+        let now = self.clock.now();
+        self.sender.send_if_modified(|current| {
+            if status <= current.status {
+                return false;
+            }
+            // The same bookkeeping `update` does, because a subscriber cannot tell which door a
+            // snapshot came through.
+            let mut next = SessionSnapshot::clone(current);
+            next.status = status;
+            next.revision = current.revision.next();
+            next.observed_at = now;
+            *current = Arc::new(next);
+            true
+        });
     }
 }
 
@@ -725,10 +742,15 @@ mod tests {
 
         let closing = state();
         closing.set_status(SessionStatus::Closing);
+        let settled = closing.snapshot().revision;
         closing.set_status(SessionStatus::Ready);
         assert_eq!(closing.snapshot().status, SessionStatus::Closing);
+        // The observable consequence of comparing inside the write: a status that does not advance
+        // publishes nothing at all, rather than waking subscribers with the same picture.
+        assert_eq!(closing.snapshot().revision, settled);
         closing.set_status(SessionStatus::Closed);
         assert_eq!(closing.snapshot().status, SessionStatus::Closed);
+        assert!(closing.snapshot().revision > settled);
     }
 
     #[test]
