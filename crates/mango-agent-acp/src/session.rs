@@ -159,9 +159,9 @@ impl AcpSession {
         let session_mode = session_level.and_then(|level| self.profile.modes.for_level(level));
         if configuration.level != session_level && wanted_mode != session_mode {
             return Err(Error::Protocol {
-                expected: format!(
-                    "a turn whose level runs under the session's own mode {:?}: ACP modes are set when the session opens",
-                    session_mode
+                // As in `AcpHarness::mode_for`: the relationship, never the mode id.
+                expected: String::from(
+                    "a turn whose level runs under the mode this profile maps the session's own level to: ACP modes are set when the session opens",
                 ),
                 received: format!(
                     "{:?}, which wants mode {wanted_mode:?}",

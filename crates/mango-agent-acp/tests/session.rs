@@ -802,7 +802,12 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
             .await,
     );
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("bypassPermissions")),
+        matches!(&error, Error::Protocol { expected, .. } if expected.contains("the session's own level")),
+        "received {error:?}"
+    );
+    // The refusal names the relationship, not the agent's mode id.
+    assert!(
+        !error.to_string().contains("bypassPermissions"),
         "received {error:?}"
     );
 }
@@ -1425,6 +1430,84 @@ async fn a_custom_profile_id_stays_out_of_pair_refusals() {
     }
 }
 
+/// A custom profile's mode ids are host-authored too, and `Error::Protocol` writes `expected`
+/// verbatim — it has no shape gate of its own, unlike the code and profile-id renderings. Both
+/// mode refusals named the id: the one for a mode the agent never advertised, and the one for a
+/// turn whose level would need a different mode than the session opened with.
+#[tokio::test]
+async fn a_custom_mode_id_stays_out_of_protocol_refusals() {
+    let profile = || {
+        Arc::new(
+            AcpProfile::custom("in-house", ["fake-acp", "acp"], VENDOR).with_modes(
+                SessionModeIds {
+                    read_only: None,
+                    default: Some("tenant credential=session-mode-secret"),
+                    full_access: Some("tenant credential=turn-mode-secret"),
+                },
+            ),
+        )
+    };
+
+    // The agent advertises neither id, so `session/new` is refused before a turn exists.
+    let unadvertised = FakeLauncher::new();
+    unadvertised.push(FakeAcpAgent::new().process());
+    let refused_open = match AcpHarness::new(profile())
+        .open_session(
+            &host(&unadvertised),
+            OpenSession::new("chat-1").with_configuration(Configuration {
+                level: Some(PermissionLevel::Default),
+                ..Configuration::default()
+            }),
+        )
+        .await
+    {
+        Ok(_) => panic!("expected an unadvertised mode to be refused"),
+        Err(error) => error,
+    };
+
+    // The agent advertises the session's mode, so the session opens and the turn is refused for
+    // wanting a level the session's own mode does not cover.
+    let advertised = FakeLauncher::new();
+    advertised.push(
+        FakeAcpAgent::new()
+            .with_modes(["tenant credential=session-mode-secret"])
+            .process(),
+    );
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&advertised),
+            OpenSession::new("chat-2").with_configuration(Configuration {
+                level: Some(PermissionLevel::Default),
+                ..Configuration::default()
+            }),
+        )
+        .await
+        .expect("expected a session");
+    let refused_turn = refusal(
+        session
+            .start_turn(
+                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
+                    level: Some(PermissionLevel::FullAccess),
+                    ..Configuration::default()
+                }),
+            )
+            .await,
+    );
+
+    for error in [&refused_open, &refused_turn] {
+        assert!(
+            matches!(error, Error::Protocol { .. }),
+            "expected a protocol refusal, received {error:?}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("secret"),
+                "expected the mode id to stay out of diagnostics, received {rendered:?}"
+            );
+        }
+    }
+}
+
 /// A launcher that records whether the library ended each child it handed out.
 ///
 /// Needed because `FakeLauncher` exposes no per-child handle, so nothing outside the library can
@@ -1550,9 +1633,11 @@ async fn a_mode_the_agent_never_advertised_is_refused_and_ends_the_child() {
     );
 
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("plan")),
+        matches!(&error, Error::Protocol { expected, .. } if expected.contains("the requested level")),
         "received {error:?}"
     );
+    // The refusal names the relationship, not the profile's mode id.
+    assert!(!error.to_string().contains("plan"), "received {error:?}");
     assert_eq!(
         launcher.kills(),
         1,

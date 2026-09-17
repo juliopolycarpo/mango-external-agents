@@ -532,7 +532,12 @@ impl AcpHarness {
         });
         if !advertised {
             return Err(Error::Protocol {
-                expected: format!("an agent advertising the mode {wanted:?}"),
+                // The relationship, never the id: a mode id is this profile's own string, which
+                // `AcpProfile::custom` lets a host write, and `Error::Protocol` renders `expected`
+                // verbatim. The host holds the mode table it supplied and the level it asked for.
+                expected: String::from(
+                    "an agent advertising the mode this profile maps the requested level to",
+                ),
                 received: format!(
                     "{:?}",
                     modes.map(|state| state
