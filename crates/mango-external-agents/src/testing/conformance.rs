@@ -139,8 +139,12 @@ pub async fn run(harness: &dyn Harness, host: &HostContext, options: Options) ->
     };
 
     check_ids(session.as_ref(), &options, &mut report);
-    check_session_state(session.as_ref(), &options, &mut report).await;
+    // Opened before the first turn and judged after it, so this check costs no turn of its own.
+    // A suite that started one would make every harness's recorded fixture one turn short, which
+    // is a cost the suite has no business imposing to observe something a turn already produces.
+    let watching = check_session_state(session.as_ref(), &options, &mut report);
     check_turn(session.as_ref(), &options, &mut report).await;
+    check_session_update(watching, &options, &mut report).await;
     check_questions(session.as_ref(), &options, &mut report).await;
     check_cancelled_turn(session.as_ref(), &options, &mut report).await;
     check_optional_methods(session.as_ref(), &mut report).await;
@@ -696,11 +700,19 @@ async fn check_questions(session: &dyn Session, options: &Options, report: &mut 
     let _ = session.cancel(CancelReason::Requested).await;
 }
 
-/// Session state is readable before any turn has run, and a subscription cannot miss a change.
+/// Session state is readable before any turn has run.
 ///
 /// The check that would have caught the old shape: a harness carrying its session facts on the
 /// turn stream has nothing to answer here until somebody starts a turn.
-async fn check_session_state(session: &dyn Session, options: &Options, report: &mut Report) {
+///
+/// Returns the subscription [`check_session_update`] judges, opened here because subscribing is
+/// reading — a subscription opened after the turn could not tell a harness that published nothing
+/// from one that published before anybody was listening.
+fn check_session_state(
+    session: &dyn Session,
+    options: &Options,
+    report: &mut Report,
+) -> WatchedSession {
     let snapshot = session.snapshot();
     let mut failures = Vec::new();
     if snapshot.ids.session_id.as_str() != options.session_id {
@@ -730,45 +742,70 @@ async fn check_session_state(session: &dyn Session, options: &Options, report: &
         outcome_for(failures),
     );
 
-    // Subscribing is reading, so a change published afterwards cannot fall into a gap between the
-    // two. What this proves is that a harness publishes its state through `SessionState` at all:
-    // one that mutated a private field would leave the subscriber waiting forever.
-    let mut subscription = session.subscribe();
-    let before = subscription.current().revision;
-    let started = session
-        .start_turn(TurnRequest::new(
-            "conformance-state-turn",
-            options.prompt.clone(),
-        ))
-        .await;
-    let outcome = match started {
-        // Only an unstartable turn is a skip. A turn that *did* start and then published nothing is
-        // the failure this check exists for — a harness mutating private state instead of
-        // publishing through `SessionState` leaves a subscriber waiting forever, and reporting that
-        // as a skip would make the one check written to catch it unable to fail.
-        Err(error) => Outcome::Skipped(format!(
-            "a turn could not be started to observe a session change: {error}"
+    WatchedSession {
+        // Read here, not where the check is judged: `current()` answers with the live value, so a
+        // revision read after the turn would already be the one the turn published, and the check
+        // would be comparing a change against itself.
+        opened_at: snapshot.revision,
+        subscription: session.subscribe(),
+    }
+}
+
+/// A subscription and the revision it was opened at.
+struct WatchedSession {
+    opened_at: crate::state::SessionRevision,
+    subscription: crate::state::SessionSubscription,
+}
+
+/// A session update published while a turn ran reached the subscriber that was already listening.
+///
+/// What this proves is that a harness publishes its state through
+/// [`SessionState`](crate::SessionState) at all: one that mutated a private field instead would
+/// leave this subscription waiting forever. The subscription was opened before the turn, and
+/// `watch` coalesces rather than drops, so a change published at any point during it is still
+/// waiting here.
+///
+/// Skipped only when the turn it would have observed never started. A turn that ran and published
+/// nothing is a **failure**: reporting it as a skip would make the one check written to catch that
+/// harness unable to fail, because `Report::passed` ignores skips.
+async fn check_session_update(watching: WatchedSession, options: &Options, report: &mut Report) {
+    const NAME: &str = "a session update reaches a subscriber";
+
+    let WatchedSession {
+        opened_at: before,
+        mut subscription,
+    } = watching;
+    if !report
+        .checks
+        .iter()
+        .any(|check| check.name == "a turn starts" && check.outcome == Outcome::Passed)
+    {
+        report.record(
+            NAME,
+            Outcome::Skipped(String::from(
+                "no turn ran, so there was nothing for a session update to accompany",
+            )),
+        );
+        return;
+    }
+
+    let outcome = match tokio::time::timeout(options.turn_timeout, subscription.changed()).await {
+        Ok(Some(seen)) if seen.revision > before => Outcome::Passed,
+        Ok(Some(seen)) => Outcome::Failed(format!(
+            "expected a later revision than {before}, received {}",
+            seen.revision
         )),
-        Ok(_turn) => match tokio::time::timeout(options.turn_timeout, subscription.changed()).await
-        {
-            Ok(Some(seen)) if seen.revision > before => Outcome::Passed,
-            Ok(Some(seen)) => Outcome::Failed(format!(
-                "expected a later revision than {before}, received {}",
-                seen.revision
-            )),
-            Ok(None) => Outcome::Failed(String::from(
-                "expected a session update while a turn ran, received a dropped subscription",
-            )),
-            Err(_) => Outcome::Failed(format!(
-                "expected a session update within {:?} of a turn starting, received none — a \
-                 harness that mutates its own state instead of publishing through SessionState \
-                 leaves every subscriber waiting",
-                options.turn_timeout
-            )),
-        },
+        Ok(None) => Outcome::Failed(String::from(
+            "expected a session update while a turn ran, received a dropped subscription",
+        )),
+        Err(_) => Outcome::Failed(format!(
+            "expected a session update within {:?} of a turn running, received none — a harness \
+             that mutates its own state instead of publishing through SessionState leaves every \
+             subscriber waiting",
+            options.turn_timeout
+        )),
     };
-    report.record("a session update reaches a subscriber", outcome);
-    let _ = session.cancel(CancelReason::Requested).await;
+    report.record(NAME, outcome);
 }
 
 async fn check_close(session: &dyn Session, report: &mut Report) {
