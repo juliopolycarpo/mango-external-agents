@@ -753,7 +753,7 @@ fn result_error(record: &StreamRecord) -> Option<VendorError> {
         format!("Claude Code ended the turn with \"{subtype}\".")
     };
 
-    let error = VendorError::new(ErrorCode::new(format!("claude-{subtype}")), message);
+    let error = VendorError::new(result_code(subtype), message);
     match (result.api_error_status(), terminal_reason) {
         (Some(status), _) => {
             Some(error.with_vendor_code(status.to_string(), retryable_status(status)))
@@ -761,6 +761,26 @@ fn result_error(record: &StreamRecord) -> Option<VendorError> {
         (None, Some(reason)) => Some(error.with_vendor_code(reason, false)),
         (None, None) => Some(error),
     }
+}
+
+/// The result subtypes this harness will name in a code of its own.
+///
+/// Every terminal `subtype` the vendor documents for a failed `--print` run, plus the bare `error`
+/// a record with no subtype falls back to.
+const NAMED_RESULT_SUBTYPES: &[&str] = &["error", "error_during_execution", "error_max_turns"];
+
+/// The harness's code for a failed result, from a subtype it recognises.
+///
+/// `subtype` is a field the vendor fills in, and an [`ErrorCode`] is diagnostic text: `Display`
+/// writes it, `resume_fallback_reason` puts it in a sentence a host shows. Bounding its shape
+/// afterwards would still be printing whatever the vendor sent inside those bounds, so the list is
+/// held here, where the code is made. A subtype nobody has documented becomes the generic
+/// `claude-error`, and the vendor's own word stays on the message the record carried.
+fn result_code(subtype: &str) -> ErrorCode {
+    if NAMED_RESULT_SUBTYPES.contains(&subtype) {
+        return ErrorCode::new(format!("claude-{subtype}"));
+    }
+    ErrorCode::from_static("claude-error")
 }
 
 /// Whether an identical retry of a failed vendor API call could plausibly succeed.
@@ -917,6 +937,25 @@ mod tests {
             error.retryable,
             "expected a 529 to be worth another attempt"
         );
+    }
+
+    /// A subtype is a field the vendor fills in, and a code is diagnostic text a host is shown.
+    ///
+    /// The documented subtypes become the harness's own label. Anything else becomes the generic
+    /// one rather than a `claude-` prefix wrapped around whatever arrived — bounding its shape
+    /// afterwards would still be printing the vendor's own string inside those bounds.
+    #[test]
+    fn a_result_subtype_nobody_documented_does_not_become_a_code() {
+        let mut reducer = TurnReducer::new(false);
+        let events = reduce(
+            &mut reducer,
+            r#"{"type":"result","subtype":"sk-live-subtype-canary","is_error":true}"#,
+        );
+        let EventKind::Error { error } = events.last().expect("expected a terminal") else {
+            panic!("expected an error, received {events:?}");
+        };
+        assert_eq!(error.code.as_str(), "claude-error");
+        assert_eq!(error.code.to_string(), "claude-error");
     }
 
     #[test]

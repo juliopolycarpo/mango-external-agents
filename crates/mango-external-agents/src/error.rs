@@ -62,10 +62,14 @@ impl fmt::Display for ErrorCode {
     /// Writes the code when it has a label's shape, and `vendor-code` when it does not.
     ///
     /// Shape, not allocation. [`ErrorCode::new`] is how this crate mints its own codes —
-    /// `claude-{subtype}` from a result frame, `{peer}-call-failed` from a JSON-RPC client — and
-    /// `#[serde(transparent)]` hands back a `Cow::Owned` for a code that was
+    /// `claude-{subtype}` from a subtype the harness recognises, `{peer}-call-failed` from a
+    /// JSON-RPC client — and `#[serde(transparent)]` hands back a `Cow::Owned` for a code that was
     /// [`from_static`](ErrorCode::from_static) before it crossed a wire, so where the bytes live
-    /// says nothing about where they came from. What is safe to print is a short lowercase label:
+    /// says nothing about where they came from.
+    ///
+    /// This bound is the second gate, not the first: what a code may contain is decided where it
+    /// is made, by the harness that knows which of its inputs a vendor filled in. What is safe to
+    /// print is a short lowercase label:
     /// at most 48 bytes of `a-z`, `0-9`, `-` and `_`. A code carrying a space, a
     /// capital, a quote or more length than that is vendor prose wearing a code's field, and it
     /// is reported as `vendor-code` instead. [`as_str`](ErrorCode::as_str) stays the protocol
