@@ -760,6 +760,17 @@ fn validate_answer(question: &Question, answer: &Answer) -> Result<()> {
                     received: option_ids.len().to_string(),
                 });
             }
+            // A selection is a set, not a list. The same id twice passes every other check here —
+            // it exists, and one answer named one question — yet a vendor reading it either
+            // collapses the repeat silently or refuses the whole answer, so `validate` would have
+            // called a response valid that the agent will not take.
+            let mut chosen_once = HashSet::with_capacity(option_ids.len());
+            if option_ids.iter().any(|chosen| !chosen_once.insert(chosen)) {
+                return Err(Error::Protocol {
+                    expected: String::from("each chosen option named at most once"),
+                    received: String::from("a repeated option id"),
+                });
+            }
             for chosen in option_ids {
                 if !options.iter().any(|option| &option.id == chosen) {
                     return Err(Error::Protocol {
@@ -1198,6 +1209,33 @@ mod tests {
                 )],
             ))
             .expect("expected several answers to be accepted");
+    }
+
+    /// A selection is a set. The same id twice names one choice, and a vendor either collapses it
+    /// silently or refuses the whole answer — neither is what `validate` reporting "valid" promised.
+    #[test]
+    fn a_multi_select_question_refuses_the_same_option_twice() {
+        let request =
+            QuestionRequest::new(interaction(), vec![choice("targets", &["main", "next"], true)]);
+        let error = request
+            .validate(&QuestionResponse::new(
+                InteractionId::new("ask-1"),
+                vec![Answer::new(
+                    QuestionId::new("targets"),
+                    AnswerValue::Chosen {
+                        option_ids: vec![
+                            QuestionOptionId::new("main"),
+                            QuestionOptionId::new("main"),
+                        ],
+                    },
+                )],
+            ))
+            .expect_err("expected a repeated option id to be refused");
+        let Error::Protocol { expected, received } = error.cause() else {
+            panic!("expected a protocol refusal, received {error:?}");
+        };
+        assert_eq!(expected, "each chosen option named at most once");
+        assert_eq!(received, "a repeated option id");
     }
 
     #[test]
