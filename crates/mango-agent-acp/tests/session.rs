@@ -233,6 +233,14 @@ async fn an_agent_that_dies_ends_the_published_lifecycle() {
         SessionStatus::Closed,
         "expected a dead dispatch loop to end the published lifecycle"
     );
+    // The half a status assertion alone cannot see. `ending_stdout_when` closes the pipe and leaves
+    // the child running, which is exactly the shape a watcher that publishes `Closed` without
+    // reaping would report as "nothing more will happen".
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected Closed to mean the child is gone, not only that the pipe closed"
+    );
 }
 
 /// The other half of the watcher, and the one a clean EOF cannot reach: a session dropped instead
@@ -240,7 +248,7 @@ async fn an_agent_that_dies_ends_the_published_lifecycle() {
 /// no EOF to report. Without the driver-done arm the lifecycle would stop at `Ready` there.
 #[tokio::test]
 async fn a_session_dropped_without_a_close_still_ends_its_lifecycle() {
-    let (session, _launcher) = open(FakeAcpAgent::new(), permissive()).await;
+    let (session, launcher) = open(FakeAcpAgent::new(), permissive()).await;
     let mut lifecycle = session.subscribe();
     assert_eq!(lifecycle.current().status, SessionStatus::Ready);
 
@@ -250,6 +258,11 @@ async fn a_session_dropped_without_a_close_still_ends_its_lifecycle() {
         status_once_settled(&mut lifecycle).await,
         SessionStatus::Closed,
         "expected a dropped session to reach its terminal rather than stay Ready forever"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the watcher to reap the child the dropped session abandoned"
     );
 }
 

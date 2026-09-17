@@ -358,30 +358,12 @@ impl Harness for AcpHarness {
             }
         });
 
-        // An agent can die without anyone calling `close`: it exits, or its transport fails.
-        // Nothing on that path touched the lifecycle, so the handle went on reporting `Ready`
-        // while every request failed against a dead connection. Spawned rather than folded into
-        // `close`, because the whole point is the path `close` never runs.
-        //
-        // Both signals, because neither covers the other: a clean EOF closes the incoming half and
-        // leaves the loop running, and a failed transport ends the loop without a clean EOF.
-        //
-        // The task holds a connection clone rather than the handle, so it cannot outlive what it
-        // is watching: a session dropped without a close releases the loop's shutdown channel with
-        // the handle, the loop winds down, and this wakes and ends.
-        //
-        // Safe on the ordinary close path too: `close` has already published `Closed` by the time
-        // the loop winds down, and `set_status` is monotonic.
+        // Cheap clones taken before the session takes ownership; the watcher they feed is spawned
+        // only once every refusal below is behind us.
         let watched = connection.connection().clone();
         let driver_done = connection.driver_done().clone();
+        let orphan = Arc::clone(connection.control());
         let closing_state = session_state.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                () = watched.incoming_closed() => {}
-                () = driver_done.cancelled() => {}
-            }
-            closing_state.set_status(mango_external_agents::SessionStatus::Closed);
-        });
 
         let session = AcpSession::new(
             Arc::clone(&self.profile),
@@ -408,6 +390,40 @@ impl Harness for AcpHarness {
                 .await;
             return Err(error);
         }
+
+        // An agent can die without anyone calling `close`: it exits, or its transport fails.
+        // Nothing on that path touched the lifecycle or the child, so the handle went on reporting
+        // `Ready` while every request failed against a dead connection. Spawned rather than folded
+        // into `close`, because the whole point is the path `close` never runs.
+        //
+        // Both signals, because neither covers the other: a clean EOF closes the incoming half and
+        // leaves the loop running, and a failed transport ends the loop without a clean EOF.
+        //
+        // The task holds a connection clone and the child's control rather than the handle, so it
+        // cannot outlive what it is watching: a session dropped without a close releases the loop's
+        // shutdown channel with the handle, the loop winds down, and this wakes and ends. A
+        // `ProcessControl` holds no connection, so keeping one here cannot keep the loop alive; the
+        // session's own `SessionState` would, through a parked question's connection clone, which
+        // is why the pending questions a teardown owes are not settled from here.
+        //
+        // Safe on the ordinary close path too: `close` has already published `Closed` by the time
+        // the loop winds down, and `set_status` is monotonic.
+        tokio::spawn(async move {
+            tokio::select! {
+                () = watched.incoming_closed() => {}
+                () = driver_done.cancelled() => {}
+            }
+            // `Closing` first, and the child ended before `Closed`, because `Closed` says nothing
+            // more will happen on this session. Neither signal implies the agent has exited: a
+            // clean EOF closes the incoming half while the process may still be running, and this
+            // is the only path that will reap it when no `close` is coming. `close` does its own
+            // teardown; the second `kill` that costs is tracked, not papered over here.
+            closing_state.set_status(mango_external_agents::SessionStatus::Closing);
+            let _ = orphan
+                .kill(mango_external_agents::CancelReason::Shutdown)
+                .await;
+            closing_state.set_status(mango_external_agents::SessionStatus::Closed);
+        });
         Ok(Box::new(session))
     }
 }
