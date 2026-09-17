@@ -30,7 +30,17 @@ pub const EXTENSIONS_MAX_ENTRIES: usize = 32;
 pub const EXTENSION_KEY_MAX_LENGTH: usize = 64;
 
 /// How many code points an extension text value may carry.
-pub const EXTENSION_VALUE_MAX_LENGTH: usize = 512;
+///
+/// Derived from the cap [`ExtensionValue::normalized`] actually applies rather than written out
+/// beside it, so the published number and the enforced one cannot drift: a host sizing a column or
+/// a renderer off a constant that disagreed with the code would be wrong and have no way to tell.
+pub const EXTENSION_VALUE_MAX_LENGTH: usize = EXTENSION_VALUE_LIMIT.max_code_points();
+
+/// The bound one extension text value is cut to.
+///
+/// A label's length, because that is what an extension value is for: a word or two a host renders
+/// beside an activity. Anything longer belongs in a field of its own.
+const EXTENSION_VALUE_LIMIT: TextLimit = TextLimit::ApprovalOptionLabel;
 
 /// One value a vendor reported that this crate has no field for.
 ///
@@ -68,7 +78,7 @@ impl ExtensionValue {
         match self {
             Self::Text(value) => {
                 let redacted = crate::redact::stderr_text(&value);
-                let bounded = normalize::bound_text(&redacted, TextLimit::ApprovalOptionLabel);
+                let bounded = normalize::bound_text(&redacted, EXTENSION_VALUE_LIMIT);
                 (!bounded.text.is_empty()).then_some(Self::Text(bounded.text))
             }
             Self::Float(value) => value.is_finite().then_some(Self::Float(value)),
@@ -229,7 +239,11 @@ mod tests {
         let Some(ExtensionValue::Text(value)) = extensions.get("note") else {
             panic!("expected the entry to survive, received {extensions:?}");
         };
-        assert_eq!(value.chars().count(), 128);
+        assert_eq!(
+            value.chars().count(),
+            super::EXTENSION_VALUE_MAX_LENGTH,
+            "expected the published cap to be the one the code applies"
+        );
     }
 
     #[test]

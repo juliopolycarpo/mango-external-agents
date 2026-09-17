@@ -232,7 +232,9 @@ impl Configuration {
     /// This configuration with every vendor-written value bounded.
     ///
     /// Ids that cannot survive bounding are dropped rather than cut: a shortened model id names a
-    /// model the vendor does not have, and it would be sent straight back as the chosen one.
+    /// model the vendor does not have, and it would be sent straight back as the chosen one. A
+    /// native entry is dropped whole when either half cannot be carried — an option id is echoed
+    /// back to the vendor exactly like a model id, so it is refused on the same terms.
     #[must_use]
     pub fn normalized(self) -> Self {
         Self {
@@ -245,7 +247,12 @@ impl Configuration {
             native: self
                 .native
                 .into_iter()
-                .filter_map(|(option, value)| Some((option, value.normalized()?)))
+                .filter_map(|(option, value)| {
+                    let option = ConfigurationOptionId::new(
+                        normalize::opaque_id(option.as_str(), "configuration option id").ok()?,
+                    );
+                    Some((option, value.normalized()?))
+                })
                 .collect(),
             ..self
         }
@@ -350,11 +357,42 @@ impl ConfigurationPatch {
     /// What a harness checks before encoding: a vendor with no reset semantics refuses here rather
     /// than sending a request it knows will be read as something else.
     pub fn asks_for_a_reset(&self) -> bool {
-        self.model.is_reset()
-            || self.effort.is_reset()
-            || self.level.is_reset()
-            || self.routing.is_reset()
-            || self.native.values().any(ConfigurationChange::is_reset)
+        !self.resetting_axes().is_empty()
+    }
+
+    /// Every axis this patch asks to remove an override on, by name.
+    ///
+    /// What a refusal puts in its message: a harness turning down a five-axis patch with "a patch
+    /// asking to remove an override" leaves a maintainer nothing to act on.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{ConfigurationChange, ConfigurationPatch};
+    ///
+    /// let patch = ConfigurationPatch::new()
+    ///     .model(ConfigurationChange::Reset)
+    ///     .effort(ConfigurationChange::Reset);
+    /// assert_eq!(patch.resetting_axes(), vec!["model", "effort"]);
+    /// ```
+    pub fn resetting_axes(&self) -> Vec<String> {
+        let mut axes: Vec<String> = [
+            ("model", self.model.is_reset()),
+            ("effort", self.effort.is_reset()),
+            ("level", self.level.is_reset()),
+            ("routing", self.routing.is_reset()),
+        ]
+        .into_iter()
+        .filter(|(_, reset)| *reset)
+        .map(|(name, _)| String::from(name))
+        .collect();
+        axes.extend(
+            self.native
+                .iter()
+                .filter(|(_, change)| change.is_reset())
+                .map(|(option, _)| option.to_string()),
+        );
+        axes
     }
 
     /// The values this patch would set, as a plain configuration.
@@ -423,6 +461,22 @@ impl ConfigurationState {
     pub fn with_observed(mut self, observed: Configuration) -> Self {
         self.observed = observed;
         self
+    }
+
+    /// All three readings with every vendor-written value bounded.
+    ///
+    /// Applied by [`SessionState::set_configuration`](crate::SessionState::set_configuration), so
+    /// a harness cannot publish an unbounded vendor value onto a session snapshot by forgetting to
+    /// call it. The `observed` half is the one that matters most — it is filled straight from
+    /// whatever the vendor said about itself — but all three go through it, because a `requested`
+    /// value a host echoed back from a vendor catalog is a vendor value too.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self {
+            requested: self.requested.normalized(),
+            accepted: self.accepted.normalized(),
+            observed: self.observed.normalized(),
+        }
     }
 
     /// The value to show for the model, and where it came from.
@@ -717,6 +771,7 @@ impl ConfigurationOption {
             description: self
                 .description
                 .map(|text| normalize::bound_text(&text, TextLimit::Detail).text),
+            value_type: self.value_type.normalized(),
             values: self
                 .values
                 .into_iter()
@@ -726,6 +781,17 @@ impl ConfigurationOption {
             current: self.current.and_then(ConfigurationValue::normalized),
             ..self
         })
+    }
+}
+
+impl ConfigurationValueType {
+    /// This type with a vendor-written name bounded.
+    #[must_use]
+    fn normalized(self) -> Self {
+        match self {
+            Self::Other(name) => Self::Other(normalize::bound_text(&name, TextLimit::Title).text),
+            known => known,
+        }
     }
 }
 
@@ -1097,12 +1163,16 @@ impl fmt::Display for Rollback {
 /// assert!(configuration::refuse_unsupported_reset(&patch).is_err());
 /// ```
 pub fn refuse_unsupported_reset(patch: &ConfigurationPatch) -> Result<()> {
-    if !patch.asks_for_a_reset() {
+    let axes = patch.resetting_axes();
+    if axes.is_empty() {
         return Ok(());
     }
     Err(Error::HostConfiguration {
         expected: "a patch that sets or keeps every axis, for a vendor with no reset",
-        received: String::from("a patch asking to remove an override"),
+        received: format!(
+            "a patch asking to remove the override on {}",
+            axes.join(", ")
+        ),
     })
 }
 
@@ -1177,12 +1247,17 @@ mod tests {
     #[test]
     fn a_reset_is_refused_by_name_for_a_vendor_that_has_none() {
         let error = super::refuse_unsupported_reset(
-            &ConfigurationPatch::new().level(ConfigurationChange::Reset),
+            &ConfigurationPatch::new()
+                .level(ConfigurationChange::Reset)
+                .native(
+                    ConfigurationOptionId::new("web-search"),
+                    ConfigurationChange::Reset,
+                ),
         )
         .expect_err("expected a refusal, received acceptance");
         assert!(
-            error.to_string().contains("remove an override"),
-            "expected the refusal to name what was asked, received {error}"
+            error.to_string().contains("level, web-search"),
+            "expected the refusal to name every axis that asked, received {error}"
         );
         super::refuse_unsupported_reset(
             &ConfigurationPatch::new().level(ConfigurationChange::Set(PermissionLevel::ReadOnly)),
@@ -1374,6 +1449,77 @@ mod tests {
         assert_eq!(requested.model.as_deref(), Some("opus"));
         assert_eq!(requested.routing, Some(ApprovalRouting::User));
         assert_eq!(requested.level, None);
+    }
+
+    /// The one reading that is filled straight from what a vendor said about itself. Nothing else
+    /// stands between it and a host's picker, so it has to be bounded here or it is not bounded.
+    #[test]
+    fn every_reading_of_a_state_is_bounded_including_the_one_the_vendor_wrote() {
+        let state = ConfigurationState::new(
+            Configuration::unknown().with_model("opus"),
+            Configuration::unknown().with_effort("e".repeat(129)),
+            Configuration::unknown()
+                .with_model("opus\u{202e}gnihton")
+                .with_native(
+                    ConfigurationOptionId::new("o".repeat(129)),
+                    ConfigurationValue::Boolean(true),
+                )
+                .with_native(
+                    ConfigurationOptionId::new("web-search"),
+                    ConfigurationValue::Boolean(true),
+                ),
+        )
+        .normalized();
+
+        assert_eq!(state.requested.model.as_deref(), Some("opus"));
+        assert_eq!(
+            state.accepted.effort, None,
+            "expected an id too long to carry to be dropped rather than cut"
+        );
+        assert_eq!(
+            state.observed.model, None,
+            "expected an id carrying an override to be refused rather than repaired"
+        );
+        assert_eq!(
+            state.observed.native.len(),
+            1,
+            "expected only the unusable native key to be dropped, received {:?}",
+            state.observed.native
+        );
+        assert!(
+            state
+                .observed
+                .native
+                .contains_key(&ConfigurationOptionId::new("web-search"))
+        );
+    }
+
+    /// A category this crate has no arm for is bounded; so is a value type. Both are vendor-written
+    /// and both reach a host's renderer.
+    #[test]
+    fn a_vendor_named_value_type_is_bounded_like_a_vendor_named_category() {
+        let catalog = ConfigurationCatalog::new(vec![ConfigurationOption::new(
+            ConfigurationOptionId::new("budget"),
+            ConfigurationCategory::Other("c".repeat(300)),
+            ConfigurationValueType::Other("t".repeat(300)),
+        )])
+        .normalized();
+
+        let option = &catalog.options()[0];
+        let ConfigurationCategory::Other(category) = &option.category else {
+            panic!(
+                "expected a vendor-named category, received {:?}",
+                option.category
+            );
+        };
+        let ConfigurationValueType::Other(value_type) = &option.value_type else {
+            panic!(
+                "expected a vendor-named value type, received {:?}",
+                option.value_type
+            );
+        };
+        assert_eq!(category.chars().count(), 256);
+        assert_eq!(value_type.chars().count(), 256);
     }
 
     #[test]

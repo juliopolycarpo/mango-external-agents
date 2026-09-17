@@ -34,6 +34,7 @@ use tokio::sync::watch;
 use crate::configuration::{ConfigurationCatalog, ConfigurationState};
 use crate::event::Command;
 use crate::harness::SessionCapabilities;
+use crate::host::Clock;
 use crate::identity::HarnessIdentity;
 use crate::session::SessionIds;
 use crate::transport::TransportKind;
@@ -199,6 +200,10 @@ pub struct SessionSnapshot {
     /// Why a requested resume did not happen, when one was asked for and did not.
     pub fallback_reason: Option<String>,
     /// When this picture was taken, from the host's clock.
+    ///
+    /// Re-stamped on every published change, so two snapshots of one session carry two instants.
+    /// A host comparing it against its own cache is asking "how old is what I am looking at",
+    /// which a value frozen at open could not answer.
     pub observed_at: SystemTime,
 }
 
@@ -289,15 +294,30 @@ impl SessionSnapshot {
 /// Held by the harness's session implementation and read through
 /// [`Session::snapshot`](crate::Session::snapshot). Cheap to clone: every clone shares one
 /// picture, so a reducer task and the session handle cannot disagree about what is current.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionState {
+    clock: Arc<dyn Clock>,
     sender: watch::Sender<Arc<SessionSnapshot>>,
 }
 
+impl fmt::Debug for SessionState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionState")
+            .field("snapshot", &self.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
 impl SessionState {
-    /// A state holding this opening picture.
-    pub fn new(snapshot: SessionSnapshot) -> Self {
+    /// A state holding this opening picture, stamped by the host's own clock.
+    ///
+    /// The clock is the host's for the same reason [`EventSink`](crate::EventSink)'s is: a
+    /// library reading `SystemTime::now()` on its own behalf is a library a host cannot put under
+    /// a test clock, and every instant it publishes is one a host will compare against its own.
+    pub fn new(clock: Arc<dyn Clock>, snapshot: SessionSnapshot) -> Self {
         Self {
+            clock,
             sender: watch::Sender::new(Arc::new(snapshot)),
         }
     }
@@ -325,20 +345,23 @@ impl SessionState {
     ///
     /// ```
     /// use mango_external_agents::{
-    ///     HarnessIdentity, SessionId, SessionIds, SessionSnapshot, SessionState, SessionStatus,
-    ///     TransportKind, TransportSelection,
+    ///     Clock, HarnessIdentity, SessionId, SessionIds, SessionSnapshot, SessionState,
+    ///     SessionStatus, SystemClock, TransportKind, TransportSelection,
     /// };
-    /// use std::time::SystemTime;
     ///
-    /// let state = SessionState::new(SessionSnapshot::opening(
-    ///     SessionIds {
-    ///         session_id: SessionId::new("chat-1"),
-    ///         native_session_id: String::from("native-1"),
-    ///     },
-    ///     HarnessIdentity::claude(),
-    ///     TransportSelection::new(None, TransportKind::Stdio),
-    ///     SystemTime::UNIX_EPOCH,
-    /// ));
+    /// let clock = std::sync::Arc::new(SystemClock);
+    /// let state = SessionState::new(
+    ///     clock.clone(),
+    ///     SessionSnapshot::opening(
+    ///         SessionIds {
+    ///             session_id: SessionId::new("chat-1"),
+    ///             native_session_id: String::from("native-1"),
+    ///         },
+    ///         HarnessIdentity::claude(),
+    ///         TransportSelection::new(None, TransportKind::Stdio),
+    ///         clock.now(),
+    ///     ),
+    /// );
     ///
     /// let before = state.snapshot().revision;
     /// state.update(|snapshot| snapshot.status = SessionStatus::Closing);
@@ -346,10 +369,12 @@ impl SessionState {
     /// assert_eq!(state.snapshot().status, SessionStatus::Closing);
     /// ```
     pub fn update(&self, change: impl FnOnce(&mut SessionSnapshot)) {
+        let now = self.clock.now();
         self.sender.send_modify(|current| {
             let mut next = SessionSnapshot::clone(current);
             change(&mut next);
             next.revision = current.revision.next();
+            next.observed_at = now;
             *current = Arc::new(next);
         });
     }
@@ -377,8 +402,13 @@ impl SessionState {
         self.update(|snapshot| snapshot.commands = commands);
     }
 
-    /// Records what the session is now set to.
+    /// Records what the session is now set to, bounded on the way in.
+    ///
+    /// The `observed` half is filled straight from whatever a vendor said about itself, and this
+    /// is the only boundary between that and a host's picker — a turn event would have passed
+    /// through `EventSink`, and a session update has no such door of its own.
     pub fn set_configuration(&self, configuration: ConfigurationState) {
+        let configuration = configuration.normalized();
         if self.snapshot().configuration == configuration {
             return;
         }
@@ -432,18 +462,27 @@ mod tests {
     use crate::identity::HarnessIdentity;
     use crate::session::SessionIds;
     use crate::transport::TransportKind;
-    use std::time::SystemTime;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn state() -> SessionState {
-        SessionState::new(SessionSnapshot::opening(
-            SessionIds {
-                session_id: SessionId::new("chat-1"),
-                native_session_id: String::from("native-1"),
-            },
-            HarnessIdentity::claude(),
-            TransportSelection::new(None, TransportKind::Stdio),
-            SystemTime::UNIX_EPOCH,
-        ))
+        state_on(Arc::new(crate::host::SystemClock))
+    }
+
+    fn state_on(clock: Arc<dyn crate::host::Clock>) -> SessionState {
+        let opened_at = clock.now();
+        SessionState::new(
+            clock,
+            SessionSnapshot::opening(
+                SessionIds {
+                    session_id: SessionId::new("chat-1"),
+                    native_session_id: String::from("native-1"),
+                },
+                HarnessIdentity::claude(),
+                TransportSelection::new(None, TransportKind::Stdio),
+                opened_at,
+            ),
+        )
     }
 
     fn command(name: &str) -> Command {
@@ -539,6 +578,29 @@ mod tests {
 
         state.set_native_session_id("native-1");
         assert_eq!(state.snapshot().revision, after_first);
+    }
+
+    /// A session runs for hours. A host reading `observed_at` to decide whether its cached picture
+    /// is worth re-rendering would get the opening instant for every snapshot in the session, and
+    /// `SessionSnapshot` is non-exhaustive, so it would have no way to notice the field never moved.
+    #[test]
+    fn every_published_picture_carries_the_instant_it_was_taken() {
+        let clock = Arc::new(crate::testing::FrozenClock::default());
+        let state = state_on(clock.clone());
+        let opened_at = state.snapshot().observed_at;
+
+        clock.advance(Duration::from_secs(90));
+        state.set_commands(vec![command("review")]);
+        let after_first = state.snapshot().observed_at;
+        assert_eq!(after_first, opened_at + Duration::from_secs(90));
+
+        clock.advance(Duration::from_secs(30));
+        state.set_status(SessionStatus::Closing);
+        assert_eq!(
+            state.snapshot().observed_at,
+            after_first + Duration::from_secs(30),
+            "expected each published change to carry its own instant"
+        );
     }
 
     #[test]

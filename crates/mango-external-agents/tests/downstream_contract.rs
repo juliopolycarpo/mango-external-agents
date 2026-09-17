@@ -105,6 +105,7 @@ impl AcmeSession {
     fn new() -> Self {
         Self {
             state: SessionState::new(
+                Arc::new(mango_external_agents::SystemClock),
                 SessionSnapshot::opening(
                     SessionIds {
                         session_id: SessionId::new("chat-1"),
@@ -453,10 +454,16 @@ fn permission_scope_and_policy_effects_survive_serialization() {
     assert_eq!(encoded["scope"], "persistent");
     assert_eq!(encoded["policyChanging"], true);
 
-    // An unstated scope stays unstated rather than becoming the narrow reading.
+    // An unstated scope stays unstated on the wire, and is treated as standing rather than as the
+    // narrow reading: an unmeasured reach is the one thing a host must not be told is narrow.
     let unstated = PermissionOption::new("maybe", PermissionEffect::Other);
     assert_eq!(unstated.scope, None);
-    assert!(!unstated.is_standing());
+    assert!(unstated.is_standing());
+    assert!(
+        !PermissionOption::new("once", PermissionEffect::Allow)
+            .with_scope(PermissionScope::Once)
+            .is_standing()
+    );
 }
 
 /// A question round-trips with the vendor's own question and option ids, and a plain question is
@@ -625,8 +632,11 @@ fn a_discovery_receipt_states_its_own_identity_and_freshness() {
     assert!(!receipt.is_fresh(observed + Duration::from_secs(61)));
     assert_eq!(
         receipt.age(observed + Duration::from_secs(30)),
-        Duration::from_secs(30)
+        Some(Duration::from_secs(30))
     );
+    // A clock that went backwards is reported as an age this library cannot measure, not as zero.
+    assert_eq!(receipt.age(observed - Duration::from_secs(1)), None);
+    assert!(!receipt.is_fresh(observed - Duration::from_secs(1)));
 
     let descriptor = AcmeHarness::new();
     let error = receipt

@@ -18,7 +18,10 @@ rationale and the compatibility surface.
 because the same dialect rides more than one of them.
 
 All three identifiers are validated strings: 1–64 characters of ASCII lowercase, digits and
-`-`, `_`, `.`, `:`, not beginning or ending with a separator and with no separator doubled.
+`-`, `_`, `.`, `:`, not beginning or ending with a separator and with no separator doubled. A
+`ProfileId` is capped at 60 instead, so that `acp:` plus the profile still fits inside the same
+ceiling — a profile that only fitted until it was prefixed would be a validated value producing an
+unvalidated one.
 They are map keys, log fields, and path components in a host's own storage, so a value that only
 sometimes round-trips is worse than one that is refused. Construction and deserialization go
 through the same rules, and a refusal names the offending value.
@@ -207,9 +210,15 @@ so: it travels on the `OpenSession` that uses it, is checked for harness identit
 identity and freshness, and is then forgotten. Nothing in this library stores one or looks one up,
 and there is no process-global cache.
 
-The executable and environment fingerprints are opaque and host-computed. The library compares them
-for equality and never interprets them, so a host that hashes the binary, reads its mtime or
-records a package version all work.
+The executable and environment fingerprints are opaque and host-computed, and `verify_for`
+deliberately does **not** check them: measuring what the executable looks like *now* is something
+only the host can do. A host that wants the check measures again at open time and calls
+`DiscoveryReceipt::describes`, which compares the two for equality and never interprets either — so
+a host that hashes the binary, reads its mtime or records a package version all work.
+
+A receipt for a resolved executable also refuses a request that names none. The launcher would
+resolve the program name off `PATH`, which may answer with a different file, and a receipt that
+vouches for one binary cannot vouch for whichever one that turns out to be.
 
 ## Listing and account readings without a conversation
 

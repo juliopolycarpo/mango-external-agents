@@ -486,10 +486,14 @@ impl Error {
             | Self::VersionGate { .. }
             | Self::AuthRequired { .. }
             | Self::Launch { .. }
-            | Self::HostConfiguration { .. }
-            | Self::InvalidVendorValue { .. } => Dispatch::NotSubmitted,
-            // The vendor answered, which means it read the request.
-            Self::Vendor(_) | Self::Protocol { .. } => Dispatch::Accepted,
+            | Self::HostConfiguration { .. } => Dispatch::NotSubmitted,
+            // The vendor answered, which means it read the request. `InvalidVendorValue` belongs
+            // here and not above it: it is the refusal of a value *the vendor wrote*, so by the
+            // time it is raised the request has been read and whatever it asked for may already be
+            // running. Replaying it would start a second one.
+            Self::Vendor(_) | Self::Protocol { .. } | Self::InvalidVendorValue { .. } => {
+                Dispatch::Accepted
+            }
             // Something broke around the request, and nothing here knows which side of it.
             Self::Link { .. }
             | Self::LimitExceeded { .. }
@@ -588,12 +592,30 @@ mod tests {
             assert!(error.dispatch().is_safe_to_replay());
         }
 
-        let accepted = Error::Vendor(VendorError::new(
-            ErrorCode::from_static("codex-busy"),
-            "busy",
-        ));
-        assert_eq!(accepted.dispatch(), Dispatch::Accepted);
-        assert!(!accepted.dispatch().is_safe_to_replay());
+        let accepted = [
+            Error::Vendor(VendorError::new(
+                ErrorCode::from_static("codex-busy"),
+                "busy",
+            )),
+            Error::Protocol {
+                expected: String::from("a frame"),
+                received: String::from("nothing"),
+            },
+            // The one that reads like a library refusal and is not: the value it refused is one
+            // the vendor wrote, so the vendor had already read the request.
+            Error::InvalidVendorValue {
+                field: "activity call id",
+                received: String::from("   "),
+            },
+        ];
+        for error in accepted {
+            assert_eq!(
+                error.dispatch(),
+                Dispatch::Accepted,
+                "expected {error:?} to mean the vendor read the request"
+            );
+            assert!(!error.dispatch().is_safe_to_replay());
+        }
 
         let unknown = [
             Error::Closed { subject: "link" },

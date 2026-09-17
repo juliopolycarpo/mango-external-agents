@@ -735,29 +735,37 @@ async fn check_session_state(session: &dyn Session, options: &Options, report: &
     // one that mutated a private field would leave the subscriber waiting forever.
     let mut subscription = session.subscribe();
     let before = subscription.current().revision;
-    let woke = tokio::time::timeout(options.turn_timeout, async {
-        session
-            .start_turn(TurnRequest::new(
-                "conformance-state-turn",
-                options.prompt.clone(),
-            ))
-            .await
-            .ok()?;
-        subscription.changed().await
-    })
-    .await;
-    let outcome = match woke {
-        Ok(Some(seen)) if seen.revision > before => Outcome::Passed,
-        Ok(Some(seen)) => Outcome::Failed(format!(
-            "expected a later revision than {before}, received {}",
-            seen.revision
+    let started = session
+        .start_turn(TurnRequest::new(
+            "conformance-state-turn",
+            options.prompt.clone(),
+        ))
+        .await;
+    let outcome = match started {
+        // Only an unstartable turn is a skip. A turn that *did* start and then published nothing is
+        // the failure this check exists for — a harness mutating private state instead of
+        // publishing through `SessionState` leaves a subscriber waiting forever, and reporting that
+        // as a skip would make the one check written to catch it unable to fail.
+        Err(error) => Outcome::Skipped(format!(
+            "a turn could not be started to observe a session change: {error}"
         )),
-        Ok(None) => Outcome::Skipped(String::from(
-            "this harness published no session change while a turn ran",
-        )),
-        Err(_) => Outcome::Skipped(String::from(
-            "this harness published no session change while a turn ran",
-        )),
+        Ok(_turn) => match tokio::time::timeout(options.turn_timeout, subscription.changed()).await
+        {
+            Ok(Some(seen)) if seen.revision > before => Outcome::Passed,
+            Ok(Some(seen)) => Outcome::Failed(format!(
+                "expected a later revision than {before}, received {}",
+                seen.revision
+            )),
+            Ok(None) => Outcome::Failed(String::from(
+                "expected a session update while a turn ran, received a dropped subscription",
+            )),
+            Err(_) => Outcome::Failed(format!(
+                "expected a session update within {:?} of a turn starting, received none — a \
+                 harness that mutates its own state instead of publishing through SessionState \
+                 leaves every subscriber waiting",
+                options.turn_timeout
+            )),
+        },
     };
     report.record("a session update reaches a subscriber", outcome);
     let _ = session.cancel(CancelReason::Requested).await;
@@ -879,6 +887,38 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "an approval can be answered"),
             "expected the approval check to be skipped, received {skipped:?}"
+        );
+    }
+
+    /// The negative fixture for the session-state check. A harness that keeps its state to itself
+    /// leaves every subscriber waiting, and before this the suite reported that as a skip — which
+    /// `Report::passed` treats as green, making the one check written to catch it unable to fail.
+    #[tokio::test]
+    async fn a_harness_that_publishes_no_session_state_fails_the_subscription_check() {
+        let report = run(
+            &FakeHarness::new().without_session_updates(),
+            &host(),
+            Options {
+                // Short, because the whole point is that nothing ever arrives.
+                turn_timeout: std::time::Duration::from_millis(50),
+                ..Options::default()
+            },
+        )
+        .await;
+
+        let failures = report.failures();
+        assert!(
+            failures
+                .iter()
+                .any(|check| check.name == "a session update reaches a subscriber"),
+            "expected the subscription check to fail, received {failures:?}"
+        );
+        assert!(
+            report
+                .skipped()
+                .iter()
+                .all(|check| check.name != "a session update reaches a subscriber"),
+            "expected the failure not to be reported as a skip"
         );
     }
 

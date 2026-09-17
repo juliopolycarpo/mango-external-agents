@@ -141,11 +141,17 @@ pub struct DiscoveryReceipt {
     pub discovery: Discovery,
     /// An opaque fingerprint of the executable the host probed, when it computed one.
     ///
-    /// The library never computes or interprets it: a host that hashes the binary, reads its
-    /// mtime, or records its package version all produce something this type can compare for
-    /// equality, which is all it needs to.
+    /// The library never computes or interprets one: a host that hashes the binary, reads its
+    /// mtime, or records its package version all produce something [`DiscoveryReceipt::describes`]
+    /// can compare for equality, which is all it needs to.
+    ///
+    /// It is **not** checked by [`DiscoveryReceipt::verify_for`], and cannot be: measuring what
+    /// the executable looks like *now* is something only the host can do. A host that wants the
+    /// check measures again at open time and calls [`DiscoveryReceipt::describes`].
     pub executable_fingerprint: Option<String>,
     /// An opaque fingerprint of the environment the probe ran under, when the host computed one.
+    ///
+    /// Compared by [`DiscoveryReceipt::describes`] on the same terms as the executable's.
     pub environment_fingerprint: Option<String>,
     /// When the probe ran.
     pub observed_at: SystemTime,
@@ -199,18 +205,67 @@ impl DiscoveryReceipt {
         self
     }
 
-    /// How old this receipt is at `now`.
+    /// How old this receipt is at `now`, or nothing when `now` is before it was taken.
     ///
-    /// A clock that went backwards reads as age zero rather than as a negative interval, because
-    /// the failure worth preventing is a receipt that *looks* fresh forever — and an unsigned
-    /// duration cannot express the other direction anyway.
-    pub fn age(&self, now: SystemTime) -> Duration {
-        now.duration_since(self.observed_at).unwrap_or_default()
+    /// The second case is not hypothetical: a clock steps backwards on an NTP correction, a
+    /// resumed virtual machine, or a receipt stamped by a machine that was ahead of this one. An
+    /// unsigned duration cannot express it, so it is reported as absence rather than folded into
+    /// zero — folding it into zero is what would make such a receipt look fresh for as long as the
+    /// skew lasted.
+    pub fn age(&self, now: SystemTime) -> Option<Duration> {
+        now.duration_since(self.observed_at).ok()
     }
 
     /// Whether this receipt is still inside its own freshness window.
+    ///
+    /// False when `now` is before [`observed_at`](Self::observed_at): a receipt this library
+    /// cannot age is a receipt it will not vouch for.
     pub fn is_fresh(&self, now: SystemTime) -> bool {
-        self.age(now) <= self.max_age
+        self.age(now).is_some_and(|age| age <= self.max_age)
+    }
+
+    /// Refuses a receipt that does not match what the host is measuring now.
+    ///
+    /// The half [`DiscoveryReceipt::verify_for`] cannot do. A fingerprint is whatever the host
+    /// chose it to be — a hash, an mtime, a package version — so the only thing that can say
+    /// whether the executable on disk is still the one that was probed is the host, measuring
+    /// again. This compares the two.
+    ///
+    /// A fingerprint the receipt does not carry is not checked: a host that recorded nothing is
+    /// vouching without one, which is its decision to make.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HostConfiguration`] naming which fingerprint moved.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Discovery, DiscoveryReceipt, HarnessId};
+    /// use std::time::SystemTime;
+    ///
+    /// let receipt = DiscoveryReceipt::new(HarnessId::claude(), Discovery::not_installed(),
+    ///     SystemTime::now())
+    ///     .with_executable_fingerprint("sha256:abc");
+    ///
+    /// assert!(receipt.describes(Some("sha256:abc"), None).is_ok());
+    /// assert!(receipt.describes(Some("sha256:def"), None).is_err());
+    /// ```
+    pub fn describes(
+        &self,
+        executable_fingerprint: Option<&str>,
+        environment_fingerprint: Option<&str>,
+    ) -> Result<()> {
+        compare(
+            "executable",
+            self.executable_fingerprint.as_deref(),
+            executable_fingerprint,
+        )?;
+        compare(
+            "environment",
+            self.environment_fingerprint.as_deref(),
+            environment_fingerprint,
+        )
     }
 
     /// Refuses a receipt that does not describe the session about to be opened.
@@ -238,13 +293,13 @@ impl DiscoveryReceipt {
             });
         }
         if !self.is_fresh(now) {
+            let age = self.age(now).map_or_else(
+                || String::from("one taken in the future"),
+                |age| format!("one {}s old", age.as_secs()),
+            );
             return Err(Error::HostConfiguration {
                 expected: "a discovery receipt inside its own freshness window",
-                received: format!(
-                    "one {}s old, valid for {}s",
-                    self.age(now).as_secs(),
-                    self.max_age.as_secs()
-                ),
+                received: format!("{age}, valid for {}s", self.max_age.as_secs()),
             });
         }
         let requested = request.executable.get();
@@ -260,8 +315,30 @@ impl DiscoveryReceipt {
                     ),
                 })
             }
+            // The probe resolved a path and the request did not, so the launcher will resolve the
+            // program name itself — off a `PATH` that may well answer with a different file. A
+            // receipt that vouches for one binary cannot vouch for whichever one that turns out to
+            // be, so it is refused rather than quietly applied to it.
+            (None, Some(probed)) => Err(Error::HostConfiguration {
+                expected: "a request naming the executable its receipt was a probe of",
+                received: format!(
+                    "a receipt for {}, launching whatever the program name resolves to",
+                    probed.display()
+                ),
+            }),
             _ => Ok(()),
         }
+    }
+}
+
+/// Refuses one fingerprint that moved since the probe.
+fn compare(subject: &'static str, recorded: Option<&str>, measured: Option<&str>) -> Result<()> {
+    match (recorded, measured) {
+        (Some(recorded), Some(measured)) if recorded != measured => Err(Error::HostConfiguration {
+            expected: "a discovery receipt whose fingerprints still match",
+            received: format!("the {subject} fingerprint moved from {recorded:?} to {measured:?}"),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -708,6 +785,12 @@ mod tests {
         );
     }
 
+    fn request() -> crate::OpenSession {
+        crate::OpenSession::new("chat-1").with_executable(
+            crate::transport::ExecutablePath::resolved("/usr/local/bin/claude"),
+        )
+    }
+
     fn descriptor() -> crate::harness::HarnessDescriptor {
         crate::harness::HarnessDescriptor {
             identity: crate::identity::HarnessIdentity::claude(),
@@ -732,7 +815,7 @@ mod tests {
             .with_executable_fingerprint("sha256:abc")
             .with_environment_fingerprint("env-1");
 
-        assert_eq!(receipt.age(now), std::time::Duration::ZERO);
+        assert_eq!(receipt.age(now), Some(std::time::Duration::ZERO));
         assert!(receipt.is_fresh(now));
         receipt
             .verify_for(
@@ -743,6 +826,45 @@ mod tests {
                 ),
             )
             .expect("expected a fresh matching receipt to be accepted");
+
+        // The fingerprints are the host's own check, because only the host can measure what the
+        // file looks like now.
+        receipt
+            .describes(Some("sha256:abc"), Some("env-1"))
+            .expect("expected matching fingerprints to be accepted");
+        let error = receipt
+            .describes(Some("sha256:def"), Some("env-1"))
+            .expect_err("expected a moved executable fingerprint to be refused");
+        assert!(
+            error.to_string().contains("executable fingerprint moved"),
+            "expected the diagnostic to name which fingerprint moved, received {error}"
+        );
+        let error = receipt
+            .describes(Some("sha256:abc"), Some("env-2"))
+            .expect_err("expected a moved environment fingerprint to be refused");
+        assert!(
+            error.to_string().contains("environment fingerprint moved"),
+            "received {error}"
+        );
+        // A host that recorded nothing is vouching without a fingerprint, which is its decision.
+        receipt
+            .describes(None, None)
+            .expect("expected an unmeasured fingerprint to be left alone");
+    }
+
+    /// A receipt for a resolved path cannot vouch for whatever a bare program name resolves to.
+    #[test]
+    fn a_receipt_for_a_resolved_executable_refuses_a_request_that_names_none() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let error = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
+            .verify_for(&descriptor(), now, &crate::OpenSession::new("chat-1"))
+            .expect_err("expected a refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("whatever the program name resolves to"),
+            "received {error}"
+        );
     }
 
     /// A host that upgraded the CLI between the probe and the open has a receipt that no longer
@@ -769,7 +891,7 @@ mod tests {
     fn a_receipt_for_another_harness_is_refused_by_name() {
         let now = std::time::SystemTime::UNIX_EPOCH;
         let error = DiscoveryReceipt::new(HarnessId::codex(), usable(), now)
-            .verify_for(&descriptor(), now, &crate::OpenSession::new("chat-1"))
+            .verify_for(&descriptor(), now, &request())
             .expect_err("expected a refusal");
         assert!(
             error.to_string().contains("a receipt for codex"),
@@ -786,7 +908,7 @@ mod tests {
 
         assert!(!receipt.is_fresh(later));
         let error = receipt
-            .verify_for(&descriptor(), later, &crate::OpenSession::new("chat-1"))
+            .verify_for(&descriptor(), later, &request())
             .expect_err("expected a refusal");
         assert!(
             error.to_string().contains("61s old, valid for 60s"),
@@ -794,14 +916,22 @@ mod tests {
         );
     }
 
-    /// A clock that went backwards must not make a receipt look fresh forever.
+    /// A clock that went backwards must not make a receipt look fresh forever — which is exactly
+    /// what folding an un-measurable age into zero would have done, for as long as the skew lasted.
     #[test]
-    fn a_clock_that_went_backwards_reads_as_age_zero_rather_than_as_eternal_freshness() {
+    fn a_receipt_this_library_cannot_age_is_one_it_will_not_vouch_for() {
         let observed = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         let receipt = DiscoveryReceipt::new(HarnessId::claude(), usable(), observed);
         let earlier = std::time::SystemTime::UNIX_EPOCH;
 
-        assert_eq!(receipt.age(earlier), std::time::Duration::ZERO);
-        assert!(receipt.is_fresh(earlier));
+        assert_eq!(receipt.age(earlier), None);
+        assert!(!receipt.is_fresh(earlier));
+        let error = receipt
+            .verify_for(&descriptor(), earlier, &request())
+            .expect_err("expected a refusal");
+        assert!(
+            error.to_string().contains("taken in the future"),
+            "received {error}"
+        );
     }
 }

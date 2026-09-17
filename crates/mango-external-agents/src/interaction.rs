@@ -335,6 +335,7 @@ impl QuestionOption {
 #[non_exhaustive]
 pub enum QuestionForm {
     /// Pick from the choices the vendor offered.
+    #[serde(rename_all = "camelCase")]
     Choice {
         /// The choices, in the vendor's own order.
         options: Vec<QuestionOption>,
@@ -553,6 +554,7 @@ impl QuestionRequest {
                 received: response.interaction_id.to_string(),
             });
         }
+        let mut answered: Vec<&QuestionId> = Vec::with_capacity(response.answers.len());
         for answer in &response.answers {
             let Some(question) = self.question(&answer.question_id) else {
                 return Err(Error::Protocol {
@@ -560,6 +562,16 @@ impl QuestionRequest {
                     received: answer.question_id.to_string(),
                 });
             };
+            // Checked across the whole response, not inside one answer. Two `Answer`s naming the
+            // same single-select question each validate alone, and the vendor honours whichever it
+            // reads last — which is a choice nobody made.
+            if answered.contains(&&answer.question_id) {
+                return Err(Error::Protocol {
+                    expected: format!("one answer to question {}", answer.question_id),
+                    received: String::from("two"),
+                });
+            }
+            answered.push(&answer.question_id);
             validate_answer(question, answer)?;
         }
         for question in self.questions.iter().filter(|question| question.required) {
@@ -647,6 +659,7 @@ fn validate_answer(question: &Question, answer: &Answer) -> Result<()> {
 #[non_exhaustive]
 pub enum AnswerValue {
     /// These options, by the vendor's own ids.
+    #[serde(rename_all = "camelCase")]
     Chosen {
         /// What was chosen, in the order it was chosen.
         option_ids: Vec<QuestionOptionId>,
@@ -885,7 +898,7 @@ mod tests {
         let encoded = serde_json::to_value(&response).expect("expected a serializable response");
         assert_eq!(encoded["interactionId"], "ask-1");
         assert_eq!(encoded["answers"][0]["questionId"], "branch");
-        assert_eq!(encoded["answers"][0]["value"]["option_ids"][0], "next");
+        assert_eq!(encoded["answers"][0]["value"]["optionIds"][0], "next");
         assert_eq!(encoded["answers"][1]["value"]["text"], "ship it");
         assert_eq!(
             serde_json::from_value::<QuestionResponse>(encoded)
@@ -936,6 +949,35 @@ mod tests {
         assert!(
             error.to_string().contains("single-select"),
             "received {error}"
+        );
+    }
+
+    /// Two answers to one single-select question each validate alone, and the vendor honours
+    /// whichever it reads last — so the check has to be across the response, not inside an answer.
+    #[test]
+    fn two_answers_to_one_question_are_refused_however_each_one_looks_alone() {
+        let request = QuestionRequest::new(
+            interaction(),
+            vec![choice("branch", &["main", "next"], false)],
+        );
+        let error = request
+            .validate(&QuestionResponse::new(
+                InteractionId::new("ask-1"),
+                vec![
+                    Answer::new(
+                        QuestionId::new("branch"),
+                        AnswerValue::chosen(QuestionOptionId::new("main")),
+                    ),
+                    Answer::new(
+                        QuestionId::new("branch"),
+                        AnswerValue::chosen(QuestionOptionId::new("next")),
+                    ),
+                ],
+            ))
+            .expect_err("expected a refusal, received acceptance");
+        assert!(
+            error.to_string().contains("one answer to question branch"),
+            "expected the doubled question in the diagnostic, received {error}"
         );
     }
 

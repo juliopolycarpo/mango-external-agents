@@ -1567,6 +1567,7 @@ mod tests {
 
     fn opening_state(native_session_id: &str) -> SessionState {
         SessionState::new(
+            std::sync::Arc::new(crate::host::SystemClock),
             SessionSnapshot::opening(
                 SessionIds {
                     session_id: crate::event::SessionId::new("chat-1"),

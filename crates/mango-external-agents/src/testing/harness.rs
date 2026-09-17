@@ -66,6 +66,7 @@ pub struct FakeHarness {
     asks_for_approval: bool,
     asks_a_question: bool,
     rejects_answers: bool,
+    publishes_session_updates: bool,
 }
 
 impl Default for FakeHarness {
@@ -110,6 +111,7 @@ impl FakeHarness {
             asks_for_approval: true,
             asks_a_question: false,
             rejects_answers: false,
+            publishes_session_updates: true,
         }
     }
 
@@ -129,6 +131,17 @@ impl FakeHarness {
     pub fn asking_a_question(mut self) -> Self {
         self.asks_a_question = true;
         self.asks_for_approval = false;
+        self
+    }
+
+    /// The same harness that keeps its session state to itself.
+    ///
+    /// The shape a harness has when it mutates its own fields instead of publishing through
+    /// [`SessionState`]: every subscriber waits forever. It exists so the conformance suite's
+    /// session-state check has something it is supposed to fail.
+    #[must_use]
+    pub fn without_session_updates(mut self) -> Self {
+        self.publishes_session_updates = false;
         self
     }
 
@@ -238,11 +251,12 @@ impl Harness for FakeHarness {
         }
 
         Ok(Box::new(FakeSession {
-            state: SessionState::new(snapshot),
+            state: SessionState::new(Arc::clone(host.clock()), snapshot),
             host: host.clone(),
             asks_for_approval: self.asks_for_approval,
             asks_a_question: self.asks_a_question,
             rejects_answers: self.rejects_answers,
+            publishes_session_updates: self.publishes_session_updates,
             pending: Mutex::new(None),
             turns: AtomicU64::new(0),
             closed: AtomicBool::new(false),
@@ -257,6 +271,7 @@ struct FakeSession {
     asks_for_approval: bool,
     asks_a_question: bool,
     rejects_answers: bool,
+    publishes_session_updates: bool,
     pending: Mutex<Option<PendingTurn>>,
     turns: AtomicU64,
     closed: AtomicBool,
@@ -503,10 +518,12 @@ impl Session for FakeSession {
 
         // The command catalog is session state, not transcript: it says what a person may type
         // next, so it is published where a host can read it before any turn has run.
-        self.state
-            .set_commands(crate::event::normalized_catalog(vec![
-                Command::new("review").with_description("Reviews the diff"),
-            ]));
+        if self.publishes_session_updates {
+            self.state
+                .set_commands(crate::event::normalized_catalog(vec![
+                    Command::new("review").with_description("Reviews the diff"),
+                ]));
+        }
 
         sink.emit(EventKind::TurnStarted {
             native_turn_id: native_turn_id.clone(),

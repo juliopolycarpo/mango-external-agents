@@ -608,23 +608,31 @@ impl PermissionOption {
 
     /// Whether choosing this decides anything beyond the request in front of it.
     ///
-    /// True for a scope wider than [`PermissionScope::Once`] and for anything that writes a
-    /// standing rule. An option whose scope the vendor did not state is **not** treated as narrow:
-    /// an unstated reach is a reach nobody measured.
+    /// True for a scope wider than [`PermissionScope::Once`], for anything that writes a standing
+    /// rule, and for an option whose scope the vendor never stated. The last is the one worth
+    /// spelling out: an unstated reach is a reach nobody measured, and the only answer that cannot
+    /// understate what somebody is agreeing to is to treat it as standing.
     pub const fn is_standing(&self) -> bool {
         if self.policy_changing {
             return true;
         }
         match self.scope {
             Some(scope) => scope.is_standing(),
-            None => false,
+            // Unmeasured, so not known to be narrow.
+            None => true,
         }
     }
 
-    /// How wide this option is, for preferring the narrowest that does the job.
+    /// How much this option decides, for preferring the choice that decides least.
     ///
-    /// An option with no stated scope sorts after every stated one: a policy choosing
-    /// automatically should reach for the choice whose reach is known.
+    /// Two keys, in order:
+    ///
+    /// 1. **Whether it writes a standing rule.** The loudest signal there is: an option marked
+    ///    `policy_changing` will be applied by the vendor to requests nobody has seen yet, whatever
+    ///    its scope says.
+    /// 2. **The reach it states.** Narrowest first, with an unstated reach sorting after every
+    ///    stated one — a policy choosing automatically should reach for the choice whose reach is
+    ///    known, and an unstated reach could be any of them.
     fn breadth(&self) -> (u8, u8) {
         let scope = match self.scope {
             Some(PermissionScope::Once) => 0,
@@ -633,7 +641,7 @@ impl PermissionOption {
             Some(PermissionScope::Persistent) => 3,
             None => 4,
         };
-        (scope, u8::from(self.policy_changing))
+        (u8::from(self.policy_changing), scope)
     }
 }
 
@@ -834,10 +842,11 @@ impl PermissionRequest {
             .collect()
     }
 
-    /// The narrowest option with this effect.
+    /// The option with this effect that decides least.
     ///
     /// A standing grant is a decision about every future request and not just this one, so it is
-    /// never preferred over an answer that says exactly as much as it means.
+    /// never preferred over an answer that says exactly as much as it means. See
+    /// [`PermissionOption::breadth`] for the order and why writing a standing rule outranks reach.
     fn narrowest(&self, effect: PermissionEffect, expected: &str) -> Result<PermissionResponse> {
         let chosen = self
             .options
@@ -1398,13 +1407,39 @@ mod tests {
             "once"
         );
         assert!(
-            !PermissionOption::new("unknown", PermissionEffect::Allow).is_standing(),
-            "an unstated scope is not itself a standing grant"
+            PermissionOption::new("unknown", PermissionEffect::Allow).is_standing(),
+            "an unstated reach is a reach nobody measured, so it cannot be reported as narrow"
         );
         assert!(
             PermissionOption::new("session", PermissionEffect::Allow)
                 .with_scope(PermissionScope::Session)
                 .is_standing()
+        );
+        assert!(
+            !PermissionOption::new("once", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once)
+                .is_standing(),
+            "expected a stated one-time reach to be the only thing that is not standing"
+        );
+    }
+
+    /// The case that decides the order of the two keys. A vendor offering an explicit
+    /// "always, and remember it" beside a plain "allow" whose reach it never stated must not have
+    /// the first one chosen automatically: `policy_changing` is the only flag here that says for
+    /// certain the vendor will apply this to requests nobody has seen yet.
+    #[test]
+    fn a_stated_persistent_rule_loses_to_an_option_whose_reach_was_never_stated() {
+        let request = request(vec![
+            PermissionOption::new("allow-always", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Persistent)
+                .policy_changing(),
+            PermissionOption::new("allow", PermissionEffect::Allow),
+        ]);
+
+        assert_eq!(
+            request.allow().expect("expected an allow").option_id,
+            "allow",
+            "expected the choice that is not known to write a standing rule"
         );
     }
 
