@@ -39,6 +39,13 @@ let host = HostContext::builder()
 
 let harness = FakeHarness::new();
 let session = harness.open_session(&host, OpenSession::new("chat-1")).await?;
+
+// Session state is readable before any turn has run, and watchable while one does. The vendor's
+// own handle, the command catalog and the settings in force are facts about the session, so they
+// are read here rather than waited for on a turn's stream.
+let opened = session.snapshot();
+println!("resuming {}", opened.ids.native_session_id);
+
 let mut turn = session
     .start_turn(TurnRequest::new("turn-1", "say hello"))
     .await?;
@@ -52,13 +59,18 @@ while let Some(event) = turn.recv().await {
         _ => {}
     }
 }
+
+// Whatever the turn changed about the session is on the next snapshot, under a higher revision.
+assert!(session.snapshot().revision >= opened.revision);
 session.close(CloseReason::Requested).await?;
 # Ok(())
 # }
 ```
 
 See [`docs/adopt.md`](https://github.com/juliopolycarpo/mango-external-agents/blob/main/docs/adopt.md)
-for the ports a host implements and how a harness is proven against `testing::conformance`.
+for the ports a host implements and how a harness is proven against `testing::conformance`, and
+[`docs/contracts.md`](https://github.com/juliopolycarpo/mango-external-agents/blob/main/docs/contracts.md)
+for what each public contract guarantees and which types are protected against future growth.
 
 ## Features
 

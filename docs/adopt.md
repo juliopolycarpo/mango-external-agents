@@ -81,38 +81,72 @@ already logged into with the vendor's own CLI.
 ## What the host reads
 
 - `Harness::discover` → `Discovery { executable, version, gate, auth, capabilities,
-  permission_matrix, models }`, bounded by the trait before the host sees it. Capabilities and
-  permission cells can narrow the harness declaration after a probe, but never widen it. The
-  harness never caches; the host decides freshness. `AuthState` is `LoggedIn { mode }`, `LoggedOut
-  { login_hint }` or `Unknown` — filled only from a surface that does not involve reading a
-  credential, and `Unknown` when the only way to know would be to read one. The `executable` it
-  found is what the host passes back on `OpenSession::with_executable`: a resolved path belongs to
-  one harness, so it rides on the request rather than on the context every harness shares.
-- `Harness::open_session` → a `Box<dyn Session>`. `SessionInfo` carries both ids, whether the
-  vendor resumed, the configuration it actually accepted and what this build can do.
-- `Session::configuration()` → the defaults a later turn inherits. `SessionInfo` is the opening
-  snapshot; vendors such as Codex persist successful turn overrides. Read the shared accessor
-  when displaying current settings or constructing the next request.
-- `Session::start_turn` → a `TurnStream`: a bounded channel of `AgentEvent`. A host that stops
-  reading slows the vendor instead of growing the library's memory.
-- `AgentEvent { session_id, turn_id, at, kind }`. The `kind` is one of seventeen: session started,
-  commands available, text and reasoning deltas with their block markers, the activity lifecycle,
-  approval requested and resolved, usage, thread usage, account limits, cancelled, completed and
-  error. `AgentEvent::is_terminal` answers "is this turn over" without a match.
+  permission_matrix, models, configuration_catalog }`, bounded by the trait before the host sees
+  it. Capabilities and permission cells can narrow the harness declaration after a probe, but
+  never widen it. The harness never caches; the host decides freshness. `AuthState` is `LoggedIn
+  { mode }`, `LoggedOut { login_hint }` or `Unknown` — filled only from a surface that does not
+  involve reading a credential, and `Unknown` when the only way to know would be to read one. The
+  `executable` it found is what the host passes back on `OpenSession::with_executable`: a resolved
+  path belongs to one harness, so it rides on the request rather than on the context every harness
+  shares.
+- `Harness::list_sessions` and `Harness::account_usage` answer **without** an open conversation, so
+  a picker can be drawn before anybody has started one. Both refuse as `Error::NotSupported` on a
+  harness that does not have them.
+- `Harness::open_session` → a `Box<dyn Session>`. A host that has just probed can hand the answer
+  back on `OpenSession::with_discovery(DiscoveryReceipt)` rather than paying for the probe twice;
+  the receipt is checked for harness identity, executable identity and freshness, and then
+  forgotten. It is not a cache and nothing in the library stores one.
+- `Session::snapshot()` → a `SessionSnapshot`: the two ids, the harness identity, the transport
+  selection, the lifecycle status, this session's capabilities, the configuration state, the
+  configuration catalog, the slash commands, and whether the vendor resumed. It is a value, so two
+  fields read off one snapshot were read at one instant.
+- `Session::subscribe()` → a `SessionSubscription` that cannot miss a change made after it was
+  opened: subscribing *is* reading, so there is no window between the read and the subscription.
+  Every snapshot carries a `SessionRevision` that only increases.
+- `Session::configure(ConfigurationPatch)` → a `ConfigurationOutcome`, for a vendor that can be
+  reconfigured on an open session. Most vendors cannot set several options atomically, so the
+  outcome says which axes landed, which were refused and why, and what became of the rest.
+- `Session::start_turn` → a `TurnStream`: a bounded channel of `AgentEvent` read through `recv()`.
+  A host that stops reading slows the vendor instead of growing the library's memory.
+- `AgentEvent { session_id, turn_id, attempt, at, kind }`. The `kind` is turn-scoped, always:
+  turn started, text and reasoning deltas with their block markers, the activity lifecycle,
+  approval requested and resolved, question asked and resolved, usage, thread usage, account
+  limits, cancelled, completed and error. `AgentEvent::is_terminal` answers "is this turn over"
+  without a match, and `AgentEvent::operation()` answers "whose work was this".
+
+Session facts are **not** turn events. The vendor's own session handle and the slash-command
+catalog are read from the snapshot, because they change between turns and before the first one —
+and because carrying them on a turn stream meant inventing a turn id for something no turn
+produced.
 
 Cancellation is a marker, not a terminal: it is emitted immediately before `Completed` and never
 instead of it, so a host that does not recognise it still sees its turn end.
 
-Start with `Configuration::default()` to leave permissions under the user's vendor profile.
-Select a level explicitly with `level: Some(PermissionLevel::Default)` and select approval routing
-with `routing: Some(ApprovalRouting::User)`. Successful explicit settings become session defaults;
-later omitted fields retain them. Hosts need not resend settings on every turn. An absent value
-from `Session::configuration()` means no reported selection, not read-only access.
+Settings are a **patch**, not a set of values. `ConfigurationPatch::new()` changes nothing and
+leaves every axis under the user's own vendor profile; `.level(ConfigurationChange::Set(
+PermissionLevel::Default))` selects one, and `.model(ConfigurationChange::Reset)` removes an
+override the host had set. A vendor that cannot reset refuses explicitly rather than reporting a
+success it did not have.
+
+Read the result through `Session::snapshot().configuration`, which keeps three readings apart:
+`requested` is what the host asked for, `accepted` is what the harness confirmed it encoded, and
+`observed` is what the vendor reported about itself. Only the third is evidence — an accepted
+command-line flag is not a vendor-observed model — and an absent value on any of them means
+unknown, never read-only.
+
+A vendor that stops to ask a **question** rather than for an approval sends
+`EventKind::QuestionAsked`, answered through `Session::answer`. It grants nothing: no
+`PermissionBroker` is consulted about one, and `InteractionKind::grants_authority` is the field a
+host's audit trail reads to keep the two apart. Secret collection and arbitrary forms are outside
+scope and are refused by name rather than reshaped into free text.
 
 For native review, pass a `ReviewRequest` to `Session::start_review`. `ReviewTarget` covers
 uncommitted changes, a base branch, a commit, and custom instructions. The returned `ReviewStream`
 contains an ordinary `TurnStream`, so the same event relay handles both. A harness that cannot
 review returns `Error::NotSupported`; the host needs no vendor protocol code.
+
+See [`contracts.md`](contracts.md) for the rationale behind each of these shapes, the identifier
+mapping a host persists, and which public types are protected against future growth.
 
 ## Mapping events to your own product
 
@@ -141,9 +175,14 @@ assert_eq!(launcher.last_launch().unwrap().env.get("CONNECTOR_SECRET"), None);
 
 ## Writing a harness
 
-Implement `Harness` and `Session`, push every event through the `EventSink` a turn's stream comes
-from — it normalises and bounds on the way through, so a reducer cannot emit an unbounded event by
-accident — and leave the four optional methods to their defaults unless the vendor has them.
+Implement `Harness` and `Session`, push every turn event through the `EventSink` a turn's stream
+comes from — it normalises and bounds on the way through, so a reducer cannot emit an unbounded
+event by accident — publish every *session* fact through the `SessionState` the session holds, and
+leave the optional methods to their defaults unless the vendor has them. A capability the harness
+does not implement stays `false`: unfinished behaviour is unadvertised, not silently accepted.
+
+`Session` requires exactly one method for state — `fn state(&self) -> &SessionState` — and
+`snapshot`, `subscribe`, `ids`, `capabilities` and `require_capability` are provided from it.
 
 A harness holds a `HostContext`, not a bag of durations, so take the bounds from it rather than
 from a constant: `ClientOptions::new("Codex app-server").with_limits(host.limits())`. A harness
@@ -163,10 +202,11 @@ report.assert_passed();
 ```
 
 It checks what a host is entitled to assume: a turn ends exactly once and nothing follows its
-terminal, every event names its own session and turn, an approval can be answered, a cancelled turn
-still completes, closing twice is not an error, every capability the descriptor did not declare
-refuses as unsupported, and a probe never claims more than the descriptor's ceiling. A check that
-cannot run on your fixture is reported as skipped rather than passed.
+terminal, every event names its own session, turn and attempt, an approval can be answered, a
+cancelled turn still completes, closing twice is not an error, session state is readable before any
+turn has run, a session update reaches a subscriber, every capability the descriptor did not
+declare refuses as unsupported, and a probe never claims more than the descriptor's ceiling. A
+check that cannot run on your fixture is reported as skipped rather than passed.
 
 ## Worked integration: mangostudio runtime
 
@@ -182,20 +222,26 @@ The runtime is the host. Its session supervisor owns a map from the application'
 3. Discover the selected harness. Show its capability and permission matrix in the session setup
    UI. Display `LoggedOut.login_hint` as text; an `Unknown` account state must not become a login
    form or trigger credential inspection.
-4. Open the vendor session and retain its `SessionInfo` alongside the application session id.
-   Create one task per active turn to drain its bounded event stream.
+4. Open the vendor session and retain its handle alongside the application session id. Subscribe
+   to `Session::subscribe()` once, so a renamed vendor handle, a re-announced command catalog or a
+   settings change reaches the browser without a turn having to be running. Create one task per
+   active turn to drain its bounded event stream.
 
 A runtime permission broker returns `Ask` when the user must decide. The event relay stores the
-approval request id and its vendor option ids, then sends that question to the browser. When the
-user chooses an option, the runtime calls `Session::respond` with that exact option id. Requests
-that expire or belong to a closed session are removed from the pending map. The runtime must not
-register the vendor's tools as application tools.
+interaction id and its vendor option ids, then sends that question to the browser. When the user
+chooses an option, the runtime calls `Session::respond` with that exact option id. Render the
+option's `scope` and `policy_changing` flag: "allow for this session" and "allow from now on" are
+different decisions, and a host that shows one as the other widens an authorisation nobody gave.
+Requests that expire or belong to a closed session are removed from the pending map. The runtime
+must not register the vendor's tools as application tools.
 
 | Library event or call                                       | Runtime integration                                          |
 | ----------------------------------------------------------- | ------------------------------------------------------------ |
 | `TextDelta`                                                 | Append to the vendor session's assistant message             |
 | `ActivityStarted` / `ActivityUpdated` / `ActivityCompleted` | Update that message's tool activity view                     |
-| `ApprovalRequested` / `ApprovalResolved`                    | Add or remove the pending approval UI                        |
+| `TurnStarted`                                               | Record the vendor's handle for this attempt                  |
+| `ApprovalRequested` / `ApprovalResolved`                    | Add or remove the pending approval UI, with its reach shown  |
+| `QuestionAsked` / `QuestionResolved`                        | Add or remove a question prompt — never an approval prompt   |
 | `Usage` / `ThreadUsage` / `AccountLimits`                   | Update usage displays without inferring prices               |
 | `Error`                                                     | Show the bounded error and retain the failed turn's identity |
 | `Completed`                                                 | Stop the turn relay and release its pending UI state         |

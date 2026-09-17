@@ -33,7 +33,7 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 | `crates/mango-agent-acp/`       | Generic ACP harness over the official crate, per-agent profiles, `acp` transport                            |
 | `examples/mea/`                 | Unpublished CLI: discover, turn, capture, doctor (the smoke and drift tool)                                 |
 | `fixtures/<vendor>/`            | Captured contracts and transcripts, replayed by the fakes                                                   |
-| `docs/`                         | Compliance posture, host adoption guide, one guide per harness, releasing                                   |
+| `docs/`                         | Compliance posture, host adoption guide, public contracts, one guide per harness, releasing                 |
 | `scripts/`                      | Shell: check, fix, changelog, lockstep versions, TLS rule, Codex vendoring                                  |
 
 ## Global Rules
