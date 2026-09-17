@@ -785,9 +785,12 @@ impl std::fmt::Debug for ConnectionHandle {
 ///
 /// # Errors
 ///
-/// [`Error::Link`] when the connection ended before it produced a handle, carrying the child's
-/// stderr tail — which is what an agent that printed a usage message and exited looks like from
-/// here.
+/// [`Error::Link`] when the connection ended before it produced a handle, naming which of the
+/// three shapes it was: a transport that failed, a connection that closed, or a task that did not
+/// finish. The child's own stderr — which is what an agent that printed a usage message and exited
+/// looks like from here — stays on [`StderrTail`](mango_external_agents::StderrTail), reachable
+/// through the [`ProcessControl`] the host holds, because `Error::Link`'s summary is written
+/// verbatim by `Display`.
 pub(crate) async fn drive(
     launched: LaunchedAgent,
     state: Arc<SessionState>,
@@ -904,9 +907,11 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 ///
 /// # Errors
 ///
-/// [`Error::Timeout`] when the deadline passed, [`Error::Link`] when the transport went away — with
-/// the child's own stderr, which is the only thing that can explain an agent that exited mid-call —
-/// and otherwise whatever [`request_error`](crate::error::request_error) made of the agent's answer.
+/// [`Error::Timeout`] when the deadline passed, [`Error::Link`] naming the call the transport
+/// closed under, and otherwise whatever [`request_error`](crate::error::request_error) made of the
+/// agent's answer. The child's own stderr — the only thing that can explain an agent that exited
+/// mid-call — stays on [`StderrTail`](mango_external_agents::StderrTail) rather than on the error,
+/// and the turn's own failure event still carries it.
 pub(crate) async fn send<Request>(
     connection: &ConnectionHandle,
     profile: &crate::profile::AcpProfile,
