@@ -1529,8 +1529,12 @@ async fn host_shutdown_publishes_the_lifecycle_its_watcher_drove() {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(Transcript::load("turn").as_process());
     let cancel = mango_external_agents::CancelToken::new();
-    let (host, _) =
-        with_launcher_limits_and_cancel(launcher, None, replay_limits(), cancel.clone());
+    let (host, _) = with_launcher_limits_and_cancel(
+        Arc::clone(&launcher),
+        None,
+        replay_limits(),
+        cancel.clone(),
+    );
     let session = CodexHarness::new()
         .open_session(&host, OpenSession::new("chat-1"))
         .await
@@ -1544,6 +1548,11 @@ async fn host_shutdown_publishes_the_lifecycle_its_watcher_drove() {
         status_once_settled(&mut lifecycle).await,
         SessionStatus::Closed,
         "expected the watcher to publish the terminal close publishes"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected Closed to mean the child is gone, not only that the status moved"
     );
 }
 
