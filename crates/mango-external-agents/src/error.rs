@@ -175,8 +175,14 @@ pub enum Error {
     /// The installed CLI is older than the harness's pinned floor.
     VersionGate {
         /// The version the CLI reported.
+        ///
+        /// Vendor stdout: a harness that could not parse a version falls back to the line the CLI
+        /// printed, so [`Display`](fmt::Display) reports its size rather than its text.
         found: String,
         /// The oldest version this harness drives.
+        ///
+        /// The harness's own compile-time constant, and the half of this error a user can act on,
+        /// so [`Display`](fmt::Display) names it.
         minimum: String,
     },
 
@@ -186,6 +192,10 @@ pub enum Error {
     /// runs it: it does not handle logins, and it never reads or forwards a credential.
     AuthRequired {
         /// The vendor's login command, verbatim, for the host to display.
+        ///
+        /// Every harness sets this from a constant of its own — `claude auth login`,
+        /// `codex login`, an ACP profile's literal — so it is a published command rather than
+        /// vendor output, and [`Display`](fmt::Display) shows it.
         login_hint: String,
     },
 
@@ -285,12 +295,12 @@ impl fmt::Display for Error {
             ),
             Self::VersionGate { minimum, found } => write!(
                 formatter,
-                "expected a configured minimum version, received a vendor-reported version ({} and {} bytes)",
-                minimum.len(),
+                "expected version {minimum} or newer, received a vendor-reported version ({} bytes)",
                 found.len()
             ),
-            Self::AuthRequired { .. } => formatter.write_str(
-                "expected a signed-in CLI, received a signed-out one; the vendor login command is available on the error",
+            Self::AuthRequired { login_hint } => write!(
+                formatter,
+                "expected a signed-in CLI, received a signed-out one; the vendor's own command is `{login_hint}`"
             ),
             Self::Launch { program, .. } => write!(
                 formatter,
@@ -311,7 +321,10 @@ impl fmt::Display for Error {
                 "expected at most {limit} bytes of {subject}, received {received}"
             ),
             Self::InvalidVendorValue { field, .. } => {
-                write!(formatter, "expected a usable {field}, received invalid vendor data")
+                write!(
+                    formatter,
+                    "expected a usable {field}, received invalid vendor data"
+                )
             }
             Self::Protocol { expected, .. } => write!(
                 formatter,
@@ -325,7 +338,10 @@ impl fmt::Display for Error {
             ),
             Self::Cancelled { reason } => write!(formatter, "cancelled: {reason}"),
             Self::Closed { subject } => {
-                write!(formatter, "expected an open {subject}, received a closed one")
+                write!(
+                    formatter,
+                    "expected an open {subject}, received a closed one"
+                )
             }
             Self::HostConfiguration { expected, received } => {
                 write!(formatter, "expected {expected}, received {received}")
@@ -469,6 +485,36 @@ mod tests {
                 "expected useful shape metadata, received {rendered}"
             );
         }
+    }
+
+    /// The two arms whose fields are the library's own, not a vendor's.
+    ///
+    /// A version gate and a signed-out CLI are the errors a person is meant to fix, and the
+    /// instruction is the whole content: `minimum` is a harness constant and `login_hint` is a
+    /// published vendor command. Only `found` is vendor stdout — a harness that cannot parse a
+    /// version falls back to the line the CLI printed — so only `found` is reduced to its size.
+    #[test]
+    fn a_gate_and_a_signed_out_cli_still_say_what_to_do_about_them() {
+        let gate = Error::VersionGate {
+            found: String::from("claude-code/9.9.9 (banner-secret)"),
+            minimum: String::from("2.1.211"),
+        };
+        assert_eq!(
+            gate.to_string(),
+            "expected version 2.1.211 or newer, received a vendor-reported version (33 bytes)"
+        );
+        assert!(
+            !gate.to_string().contains("banner-secret"),
+            "expected the reported banner line to stay out, received {gate}"
+        );
+
+        let signed_out = Error::AuthRequired {
+            login_hint: String::from("claude auth login"),
+        };
+        assert!(
+            signed_out.to_string().contains("`claude auth login`"),
+            "expected the vendor command a user is meant to run, received {signed_out}"
+        );
     }
 
     #[test]

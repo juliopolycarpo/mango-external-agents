@@ -24,7 +24,9 @@ Facts were read on 2026-09-12; re-verify against the vendor's current page befor
   `Debug` and `Display` for process, transport, MCP, JSON-RPC, error and event payload carriers
   report only safe metadata; callers handle the original values through typed fields rather than
   diagnostics. The one exception is a host configuration refusal, which names the payload-free
-  summary the library crates themselves wrote so the host can see what to fix. `examples/mea` is
+  summary the library crates themselves wrote so the host can see what to fix, together with the
+  pinned minimum version and the vendor's own login command, which are the library's own constants
+  and the whole content of the two errors a person is meant to act on. `examples/mea` is
   an unpublished smoke tool, not part of that guarantee: its own refusals name the paths and OS
   messages its operator needs.
 - **No telemetry, no listener, no downloaded binaries.**
