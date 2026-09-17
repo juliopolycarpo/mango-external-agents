@@ -427,6 +427,32 @@ impl OpenSession {
     }
 }
 
+/// Explains why resume fell back without including vendor payloads.
+///
+/// ```
+/// use mango_external_agents::{Capability, Error, resume_fallback_reason};
+/// let reason = resume_fallback_reason("session/load", &Error::not_supported(Capability::Resume));
+/// assert_eq!(reason, "session/load needs resume, which this agent does not declare");
+/// ```
+pub fn resume_fallback_reason(operation: &str, error: &Error) -> String {
+    match error.cause() {
+        Error::Vendor(vendor) => format!(
+            "{operation} was refused by the vendor ({}, retryable {})",
+            vendor.code, vendor.retryable
+        ),
+        Error::NotSupported { capability } => {
+            format!("{operation} needs {capability}, which this agent does not declare")
+        }
+        Error::Timeout { after, .. } => format!("{operation} did not answer within {after:?}"),
+        Error::Protocol { .. } => {
+            format!("{operation} answered with a shape this harness does not read")
+        }
+        Error::Link { .. } => format!("{operation} lost the vendor link"),
+        Error::Closed { subject } => format!("{operation} found a closed {subject}"),
+        other => format!("{operation} failed: {other}"),
+    }
+}
+
 /// The largest attachment the vendor wire carries, and how many of them.
 pub const ATTACHMENT_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// How many attachments one turn may carry.
@@ -1152,17 +1178,16 @@ mod tests {
 
     /// `Debug` stays on the public snapshot, because a host wrapping it derives its own.
     #[test]
-    fn session_info_debug_reports_metadata_without_ids_or_vendor_text() {
-        let info = SessionInfo {
-            ids: SessionIds {
+    fn session_snapshot_debug_reports_metadata_without_ids_or_vendor_text() {
+        let info = SessionSnapshot::opening(
+            SessionIds {
                 session_id: crate::SessionId::new("chat-id-secret"),
                 native_session_id: String::from("native-id-secret"),
             },
-            resumed: false,
-            fallback_reason: Some(String::from("fallback-text-secret")),
-            effective_configuration: Configuration::default(),
-            capabilities: crate::Capabilities::none(),
-        };
+            HarnessIdentity::claude(),
+            TransportSelection::new(None, TransportKind::Stdio),
+            SystemTime::UNIX_EPOCH,
+        ).with_fallback_reason("fallback-text-secret");
 
         // `ids()` is the value a host reaches for on its own, so it carries the same claim.
         let rendered = format!("{info:?} {:?}", info.ids);
@@ -1282,11 +1307,9 @@ mod tests {
     #[test]
     fn nested_request_debug_omits_prompts_ids_and_host_configuration_values() {
         let request = OpenSession::new("session-id-secret")
-            .with_configuration(Configuration {
-                model: Some(String::from("model-secret")),
-                effort: Some(String::from("effort-secret")),
-                ..Configuration::default()
-            })
+            .with_configuration(ConfigurationPatch::new()
+                .model(ConfigurationChange::Set(String::from("model-secret")))
+                .effort(ConfigurationChange::Set(String::from("effort-secret"))))
             .resuming("resume-id-secret", ResumeMode::Fallback)
             .with_mcp_servers(vec![McpServer::stdio("server-name-secret", "docs-mcp")]);
         let turn = TurnRequest::new("turn-id-secret", "prompt-secret").with_attachments(vec![

@@ -80,7 +80,7 @@ async fn a_fallback_resume_reports_why_the_load_failed() {
         .await
         .expect("expected the fallback to open a fresh session");
 
-    let info = session.info();
+    let info = session.snapshot();
     assert!(!info.resumed, "expected a fresh conversation");
     let reason = info
         .fallback_reason

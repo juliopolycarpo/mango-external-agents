@@ -1386,10 +1386,7 @@ async fn a_custom_profile_id_stays_out_of_pair_refusals() {
     let refused_open = match harness
         .open_session(
             &host(&launcher),
-            OpenSession::new("chat-1").with_configuration(Configuration {
-                level: Some(PermissionLevel::FullAccess),
-                ..Configuration::default()
-            }),
+            OpenSession::new("chat-1").with_configuration(at_level(PermissionLevel::FullAccess)),
         )
         .await
     {
@@ -1407,10 +1404,7 @@ async fn a_custom_profile_id_stays_out_of_pair_refusals() {
     let refused_turn = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
-                    level: Some(PermissionLevel::FullAccess),
-                    ..Configuration::default()
-                }),
+                TurnRequest::new("turn-1", "do everything").with_configuration(at_level(PermissionLevel::FullAccess)),
             )
             .await,
     );
@@ -1457,10 +1451,7 @@ async fn a_custom_mode_id_stays_out_of_protocol_refusals() {
     let refused_open = match AcpHarness::new(profile())
         .open_session(
             &host(&unadvertised),
-            OpenSession::new("chat-1").with_configuration(Configuration {
-                level: Some(PermissionLevel::Default),
-                ..Configuration::default()
-            }),
+            OpenSession::new("chat-1").with_configuration(at_level(PermissionLevel::Default)),
         )
         .await
     {
@@ -1479,20 +1470,14 @@ async fn a_custom_mode_id_stays_out_of_protocol_refusals() {
     let session = AcpHarness::new(profile())
         .open_session(
             &host(&advertised),
-            OpenSession::new("chat-2").with_configuration(Configuration {
-                level: Some(PermissionLevel::Default),
-                ..Configuration::default()
-            }),
+            OpenSession::new("chat-2").with_configuration(at_level(PermissionLevel::Default)),
         )
         .await
         .expect("expected a session");
     let refused_turn = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
-                    level: Some(PermissionLevel::FullAccess),
-                    ..Configuration::default()
-                }),
+                TurnRequest::new("turn-1", "do everything").with_configuration(at_level(PermissionLevel::FullAccess)),
             )
             .await,
     );

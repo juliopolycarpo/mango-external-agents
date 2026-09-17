@@ -370,7 +370,7 @@ mod tests {
         let (sink, _events) = EventSink::new(
             SessionId::new("session-id-secret"),
             TurnId::new("turn-id-secret"),
-            AttemptId::new("attempt-id-secret"),
+            AttemptId::FIRST,
             Arc::new(SystemClock),
             1,
         );
@@ -394,14 +394,14 @@ mod tests {
         let (_sink, events) = EventSink::new(
             SessionId::new("session-1"),
             TurnId::new("turn-1"),
-            AttemptId::new("attempt-1"),
+            AttemptId::FIRST,
             Arc::new(SystemClock),
             1,
         );
         let review = crate::stream::ReviewStream {
             turn: TurnStream {
                 turn_id: TurnId::new("turn-id-secret"),
-                attempt: AttemptId::new("attempt-id-secret"),
+                attempt: AttemptId::FIRST,
                 native_turn_id: String::from("native-turn-id-secret"),
                 dispatch: Dispatch::Accepted,
                 events,

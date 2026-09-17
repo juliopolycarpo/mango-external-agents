@@ -1080,6 +1080,7 @@ mod tests {
             title: String::from("activity-title-secret"),
             detail: Some(String::from("activity-detail-secret")),
             truncated: false,
+            ..Activity::default()
         };
         let update = ActivityUpdate {
             title: Some(String::from("update-title-secret")),

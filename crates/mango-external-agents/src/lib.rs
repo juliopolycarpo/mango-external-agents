@@ -79,6 +79,7 @@ pub use process::{
 };
 pub use registry::HarnessRegistry;
 pub use session::{
+    resume_fallback_reason,
     AccountUsage, Attachment, AttachmentKind, CancelReason, CloseReason, McpServer, McpTransport,
     NativeSession, OpenSession, Resume, ResumeMode, ReviewRequest, ReviewTarget, Session,
     SessionIds, SessionPage, SessionQuery, Steer, SteerOutcome, SteerRejection, TurnRequest,
