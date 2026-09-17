@@ -14,6 +14,26 @@ use mango_external_agents::{
 
 const PAYLOAD: &str = "do-not-log-this-payload";
 
+#[test]
+fn invalid_identifier_errors_report_shape_without_replaying_input() {
+    for raw in [
+        format!("{PAYLOAD}="),
+        format!("-{PAYLOAD}"),
+        format!("{PAYLOAD}::id"),
+    ] {
+        for error in [
+            mango_external_agents::HarnessId::new(&raw).expect_err("expected invalid harness id"),
+            mango_external_agents::ProtocolFamily::new(&raw)
+                .expect_err("expected invalid protocol"),
+            mango_external_agents::ProfileId::new(&raw).expect_err("expected invalid profile"),
+        ] {
+            assert_payload_free(&error);
+            assert!(!error.to_string().contains(PAYLOAD));
+            assert!(error.to_string().contains("expected ASCII lowercase"));
+        }
+    }
+}
+
 fn assert_payload_free(value: impl Debug) {
     let diagnostic = format!("{value:?}");
     assert!(

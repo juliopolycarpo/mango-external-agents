@@ -134,9 +134,8 @@ impl AcpProfile {
             // id in this file already satisfies; a host-supplied `custom` id that does not is a
             // configuration mistake worth panicking on at startup rather than carrying a profile
             // this crate cannot ever register.
-            id: ProfileId::new(&id).unwrap_or_else(|error| {
-                panic!("expected a valid profile id, received {id:?}: {error}")
-            }),
+            id: ProfileId::new(&id)
+                .unwrap_or_else(|error| panic!("expected a valid profile id: {error}")),
             vendor,
             argv,
             version_argv,
@@ -543,6 +542,22 @@ fn claude_agent_acp() -> AcpProfile {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_custom_profile_panics_without_replaying_input() {
+        let error = std::panic::catch_unwind(|| {
+            super::AcpProfile::custom("profile-payload-secret=", ["my-agent", "--acp"], VENDOR)
+        })
+        .expect_err("expected invalid profile refusal");
+        let message = error
+            .downcast_ref::<String>()
+            .expect("expected a formatted panic");
+        assert!(message.contains("expected a valid profile id"));
+        assert!(
+            !message.contains("profile-payload-secret"),
+            "panic leaked a host profile: {message}"
+        );
+    }
+
     use super::{AcpProfile, SessionModeIds, builtin_profile, builtin_profiles, matrix};
     use mango_external_agents::permission::{ApprovalRouting, PermissionLevel, UnsupportedReason};
     use mango_external_agents::{ExecutablePath, VendorInfo};

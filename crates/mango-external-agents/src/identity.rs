@@ -68,29 +68,26 @@ fn validate(raw: &str, subject: &'static str, max_length: usize) -> Result<Strin
     if raw.is_empty() {
         return refuse(String::from("was empty"));
     }
-    if raw.chars().count() > max_length {
+    let length = raw.chars().count();
+    if length > max_length {
         return refuse(format!(
-            "was {} characters, over the {max_length} allowed",
-            raw.chars().count()
+            "was {length} characters, over the {max_length} allowed"
         ));
     }
-    if let Some(bad) = raw
-        .chars()
-        .find(|character| !is_identifier_char(*character))
-    {
-        return refuse(format!("{raw:?} contains {bad:?}"));
+    if raw.chars().any(|character| !is_identifier_char(character)) {
+        return refuse(String::from("contains a disallowed character"));
     }
     let first = raw.chars().next().unwrap_or_default();
     let last = raw.chars().next_back().unwrap_or_default();
     if is_separator(first) || is_separator(last) {
-        return refuse(format!("{raw:?} begins or ends with a separator"));
+        return refuse(String::from("begins or ends with a separator"));
     }
     if raw
         .as_bytes()
         .windows(2)
         .any(|pair| is_separator(pair[0] as char) && is_separator(pair[1] as char))
     {
-        return refuse(format!("{raw:?} repeats a separator"));
+        return refuse(String::from("repeats a separator"));
     }
     Ok(raw.to_owned())
 }
@@ -121,7 +118,8 @@ macro_rules! identifier {
             ///
             /// # Errors
             ///
-            /// [`Error::HostConfiguration`] naming the offending value and the shape expected.
+            /// [`Error::HostConfiguration`] naming the invalid shape and the shape expected,
+            /// without copying the caller's value into diagnostics.
             pub fn new(raw: impl AsRef<str>) -> Result<Self> {
                 validate(raw.as_ref(), $subject, $max).map(Self)
             }
