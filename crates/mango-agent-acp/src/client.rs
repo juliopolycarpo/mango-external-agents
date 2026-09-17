@@ -823,6 +823,12 @@ pub(crate) struct ConnectionHandle {
     control: Arc<dyn ProcessControl>,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>>,
+    /// Fires once the dispatch loop is over, whichever way it ended.
+    ///
+    /// Separate from `driver` because both are needed at once: `shutdown` takes the join handle to
+    /// bound its own wind-down, and the session's lifecycle watcher has to observe the same event
+    /// without competing for it.
+    driver_done: mango_external_agents::CancelToken,
 }
 
 impl std::fmt::Debug for ConnectionHandle {
@@ -859,31 +865,39 @@ pub(crate) async fn drive(
 
     let notifications = Arc::clone(&state);
     let approvals = Arc::clone(&state);
-    let driver = tokio::spawn(
-        Client
-            .builder()
-            .name(client_name)
-            .on_receive_notification(
-                async move |notification: SessionNotification, _cx| {
-                    on_session_update(&notifications, notification).await;
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_notification!(),
-            )
-            .on_receive_request(
-                async move |request: RequestPermissionRequest, responder, cx| {
-                    on_request_permission(&approvals, request, responder, cx).await
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
-                // The closure *is* the connection's lifetime, so it hands a clone out and parks.
-                // Returning here shuts the dispatch loop down, which is why only `shutdown` does.
-                let _ = ready_tx.send(connection.clone());
-                let _ = shutdown_rx.await;
+    let driver_done = mango_external_agents::CancelToken::new();
+    let loop_over = driver_done.clone();
+    let connecting = Client
+        .builder()
+        .name(client_name)
+        .on_receive_notification(
+            async move |notification: SessionNotification, _cx| {
+                on_session_update(&notifications, notification).await;
                 Ok(())
-            }),
-    );
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |request: RequestPermissionRequest, responder, cx| {
+                on_request_permission(&approvals, request, responder, cx).await
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
+            // The closure *is* the connection's lifetime, so it hands a clone out and parks.
+            // Returning here shuts the dispatch loop down, which is why only `shutdown` does.
+            let _ = ready_tx.send(connection.clone());
+            let _ = shutdown_rx.await;
+            Ok(())
+        });
+    let driver = tokio::spawn(async move {
+        let outcome = connecting.await;
+        // Signalled whatever the outcome. An agent that exited or a transport that failed ends the
+        // loop without anyone having called `close`, and that is precisely the case a session's
+        // lifecycle would otherwise never hear about.
+        loop_over.cancel();
+        outcome
+    });
 
     let Ok(connection) = ready_rx.await else {
         // The closure never ran, so the transport failed first. Nothing is returned from this
@@ -907,6 +921,7 @@ pub(crate) async fn drive(
         control,
         shutdown: Mutex::new(Some(shutdown_tx)),
         driver: Mutex::new(Some(driver)),
+        driver_done,
     })
 }
 
@@ -923,6 +938,16 @@ impl ConnectionHandle {
     /// The child, for diagnostics and for ending it.
     pub(crate) fn control(&self) -> &Arc<dyn ProcessControl> {
         &self.control
+    }
+
+    /// Fires once the dispatch loop is over, whichever way it ended.
+    ///
+    /// Not the same event as [`ConnectionTo::incoming_closed`]: a clean EOF closes the incoming
+    /// half while the loop stays up, because its outgoing and task actors live for as long as any
+    /// [`ConnectionTo`] clone does — and this handle holds one. A transport that *failed* ends the
+    /// loop itself, and only this reports that. Anything watching for a dead agent wants both.
+    pub(crate) fn driver_done(&self) -> &mango_external_agents::CancelToken {
+        &self.driver_done
     }
 
     /// Ends the dispatch loop and the child. Idempotent.

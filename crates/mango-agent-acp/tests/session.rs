@@ -13,10 +13,10 @@ use mango_agent_acp::testing::{Approval, FakeAcpAgent};
 use mango_agent_acp::{AcpHarness, AcpProfile, SessionModeIds};
 use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, RecordingBroker};
 use mango_external_agents::{
-    ApprovalRouting, BrokerDecision, CancelReason, Capability, Clock, CloseReason, Configuration,
-    ConfigurationChange, ConfigurationPatch, DecisionSource, Error, EventKind, Harness,
-    HostContext, Limits, OpenSession, PermissionLevel, Session, TurnRequest, TurnStream,
-    VendorInfo,
+    ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
+    Configuration, ConfigurationChange, ConfigurationPatch, DecisionSource, Error, EventKind,
+    Harness, HostContext, Limits, OpenSession, PermissionLevel, Session, SessionStatus,
+    SessionSubscription, TurnRequest, TurnStream, VendorInfo,
 };
 
 const VENDOR: VendorInfo = VendorInfo {
@@ -182,6 +182,57 @@ async fn open(
         .await
         .expect("expected a session");
     (session, launcher)
+}
+
+/// The status a session settles on, once it stops changing.
+///
+/// Only the terminal is asserted on: a [`SessionSubscription`] coalesces, so a teardown that does
+/// not block between its transitions legitimately shows a subscriber only the last one. Reports
+/// the status it is stuck on rather than hanging to a bare timeout, so a lifecycle that never ends
+/// fails as "received Ready".
+async fn status_once_settled(lifecycle: &mut SessionSubscription) -> SessionStatus {
+    loop {
+        if lifecycle.current().status == SessionStatus::Closed {
+            return SessionStatus::Closed;
+        }
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), lifecycle.changed()).await,
+            Ok(Some(_))
+        ) {
+            return lifecycle.current().status;
+        }
+    }
+}
+
+/// An agent that exits, or a transport that fails, ends the dispatch loop with no `close` in
+/// sight. Nothing else on that path touches the lifecycle, so without a watcher the handle reports
+/// `Ready` forever and a host learns the connection is dead only from the next request's failure.
+#[tokio::test]
+async fn an_agent_that_dies_ends_the_published_lifecycle() {
+    let launcher = FakeLauncher::new();
+    let agent_gone = CancelToken::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .process()
+            .ending_stdout_when(agent_gone.clone()),
+    );
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    assert_eq!(lifecycle.current().status, SessionStatus::Ready);
+
+    agent_gone.cancel();
+
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected a dead dispatch loop to end the published lifecycle"
+    );
 }
 
 #[tokio::test]

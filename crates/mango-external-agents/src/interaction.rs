@@ -866,7 +866,7 @@ impl AnswerValue {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when an option id does not
+    /// [`Error::InvalidVendorValue`] when an option id does not
     /// survive bounding. Refused rather than shortened: a cut id names a different option.
     pub fn normalized(self) -> Result<Self> {
         Ok(match self {
@@ -918,7 +918,7 @@ impl Answer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when the question id or an
+    /// [`Error::InvalidVendorValue`] when the question id or an
     /// option id does not survive bounding.
     pub fn normalized(self) -> Result<Self> {
         Ok(Self {
@@ -1080,7 +1080,7 @@ impl QuestionOutcome {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when an id carried by an
+    /// [`Error::InvalidVendorValue`] when an id carried by an
     /// answer does not survive bounding.
     pub fn normalized(self) -> Result<Self> {
         Ok(match self {

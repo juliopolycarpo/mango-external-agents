@@ -358,6 +358,31 @@ impl Harness for AcpHarness {
             }
         });
 
+        // An agent can die without anyone calling `close`: it exits, or its transport fails.
+        // Nothing on that path touched the lifecycle, so the handle went on reporting `Ready`
+        // while every request failed against a dead connection. Spawned rather than folded into
+        // `close`, because the whole point is the path `close` never runs.
+        //
+        // Both signals, because neither covers the other: a clean EOF closes the incoming half and
+        // leaves the loop running, and a failed transport ends the loop without a clean EOF.
+        //
+        // The task holds a connection clone rather than the handle, so it cannot outlive what it
+        // is watching: a session dropped without a close releases the loop's shutdown channel with
+        // the handle, the loop winds down, and this wakes and ends.
+        //
+        // Safe on the ordinary close path too: `close` has already published `Closed` by the time
+        // the loop winds down, and `set_status` is monotonic.
+        let watched = connection.connection().clone();
+        let driver_done = connection.driver_done().clone();
+        let closing_state = session_state.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = watched.incoming_closed() => {}
+                () = driver_done.cancelled() => {}
+            }
+            closing_state.set_status(mango_external_agents::SessionStatus::Closed);
+        });
+
         let session = AcpSession::new(
             Arc::clone(&self.profile),
             host.clone(),
