@@ -42,7 +42,7 @@ pub fn vendor_error(method: &str, error: &agent_client_protocol::Error) -> Vendo
 ///
 /// `login_hint` is the profile's own, and is used only for the authentication code — every other
 /// code is the agent's business and reaches the host as a [`VendorError`]. The hint remains exact
-/// for the host UI; [`Error::Display`] deliberately does not render it because a custom profile
+/// for the host UI; [`std::fmt::Display`] deliberately does not render it because a custom profile
 /// can supply caller-owned text.
 ///
 /// # Example
