@@ -326,11 +326,7 @@ impl EventSink {
 
     /// Which session, turn and attempt these events belong to.
     pub fn operation(&self) -> OperationRef {
-        OperationRef::new(
-            self.session_id.clone(),
-            self.turn_id.clone(),
-            self.attempt,
-        )
+        OperationRef::new(self.session_id.clone(), self.turn_id.clone(), self.attempt)
     }
 }
 

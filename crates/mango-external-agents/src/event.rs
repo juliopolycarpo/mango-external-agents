@@ -138,11 +138,7 @@ impl AgentEvent {
 
     /// Which session, turn and attempt this event belongs to.
     pub fn operation(&self) -> OperationRef {
-        OperationRef::new(
-            self.session_id.clone(),
-            self.turn_id.clone(),
-            self.attempt,
-        )
+        OperationRef::new(self.session_id.clone(), self.turn_id.clone(), self.attempt)
     }
 }
 

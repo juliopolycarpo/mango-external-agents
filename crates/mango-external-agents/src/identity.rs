@@ -259,6 +259,25 @@ impl HarnessId {
     pub fn acp(profile: &ProfileId) -> Self {
         Self::trusted(format!("{ACP_PREFIX}{profile}"))
     }
+
+    /// The ACP profile this id names, when it names one.
+    ///
+    /// The other direction of [`HarnessId::acp`], so the `acp:` prefix is spelled in exactly one
+    /// place. A caller that split the string itself would be the second place, and the second
+    /// place is where the two stop agreeing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{HarnessId, ProfileId};
+    ///
+    /// let profile = ProfileId::new("goose").expect("a profile");
+    /// assert_eq!(HarnessId::acp(&profile).acp_profile(), Some(profile));
+    /// assert_eq!(HarnessId::claude().acp_profile(), None);
+    /// ```
+    pub fn acp_profile(&self) -> Option<ProfileId> {
+        self.0.strip_prefix(ACP_PREFIX).map(ProfileId::trusted)
+    }
 }
 
 impl ProtocolFamily {
@@ -503,6 +522,24 @@ mod tests {
         assert!(HarnessIdentity::custom("ACME", "acme-rpc", None).is_err());
         assert!(HarnessIdentity::custom("acme", "acme rpc", None).is_err());
         assert!(HarnessIdentity::custom("acme", "acme-rpc", Some("")).is_err());
+    }
+
+    /// The prefix is spelled once, and the round trip is what pins that. A caller splitting the
+    /// string itself would be the second place it is spelled, and the second place is where the
+    /// two stop agreeing.
+    #[test]
+    fn an_acp_id_round_trips_back_to_the_profile_it_was_built_from() {
+        for name in ["cursor", "opencode", "claude-agent-acp"] {
+            let profile = ProfileId::new(name).expect("expected a valid profile");
+            assert_eq!(HarnessId::acp(&profile).acp_profile(), Some(profile));
+        }
+        assert_eq!(HarnessId::claude().acp_profile(), None);
+        assert_eq!(HarnessId::codex().acp_profile(), None);
+        assert_eq!(
+            HarnessId::new("acpx").expect("a valid id").acp_profile(),
+            None,
+            "expected only the prefix with its separator to count as an ACP id"
+        );
     }
 
     #[test]
