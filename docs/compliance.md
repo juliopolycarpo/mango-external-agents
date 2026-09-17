@@ -21,9 +21,9 @@ Facts were read on 2026-09-12; re-verify against the vendor's current page befor
   with a protocol error, never executed by the host.
 - **Vendor assistant text is never replayed** into the host's own model context by the library.
 - **Redaction.** stderr crossing a diagnostic boundary is redacted for credential-shaped text.
-  `Debug` and `Display` for process, transport, MCP, JSON-RPC, error, session-listing and event
-  payload carriers report only safe metadata; callers handle the original values through typed
-  fields rather than diagnostics. The exceptions are the refusals whose whole content is an
+  `Debug` and `Display` for process, transport, MCP, JSON-RPC, error, session-listing, stream-handle
+  and event payload carriers report only safe metadata; callers handle the original values through
+  typed fields rather than diagnostics. The exceptions are the refusals whose whole content is an
   instruction: a host configuration refusal, a launch failure, a link failure, a protocol refusal
   and a timeout name the payload-free summary the library crates themselves wrote — a structured
   `io::ErrorKind`, an HTTP status, a duration, a method name or a static phrase, never a path, a
