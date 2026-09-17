@@ -26,9 +26,9 @@ trait FileWriter {
     fn write_new(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
 }
 
-struct TokioFileWriter;
+struct PrivateFileWriter;
 
-impl FileWriter for TokioFileWriter {
+impl FileWriter for PrivateFileWriter {
     fn write_new(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
         write_private_file(path, contents)
     }
@@ -65,10 +65,23 @@ impl ConfigFile {
     /// starting one that silently dropped a server the host asked for would run turns without the
     /// tools somebody configured.
     pub async fn write(servers: &[McpServer], scratch: &Path) -> Result<Option<Self>> {
-        Self::write_with(servers, scratch, &TokioFileWriter).await
+        let servers = servers.to_vec();
+        let scratch = scratch.to_path_buf();
+        // Every step of the write is a synchronous filesystem call, and the host owns the scratch
+        // root: it may sit on a FUSE, container or network mount whose `metadata` alone takes
+        // seconds. Opening one session must not park the async worker that every other session on
+        // that runtime is rendering its turn on.
+        tokio::task::spawn_blocking(move || {
+            Self::write_with(&servers, &scratch, &PrivateFileWriter)
+        })
+        .await
+        .map_err(|_| Error::HostConfiguration {
+            expected: "a blocking pool that can run the MCP configuration write",
+            received: String::from("a blocking task that did not finish"),
+        })?
     }
 
-    async fn write_with(
+    fn write_with(
         servers: &[McpServer],
         scratch: &Path,
         writer: &impl FileWriter,
@@ -444,6 +457,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(scratch);
     }
 
+    /// Opening a session must not run the host's filesystem on the async worker.
+    ///
+    /// A current-thread runtime states it sharply: every step of the write is a synchronous call,
+    /// and the host's scratch root may be a FUSE, container or network mount whose `metadata`
+    /// alone takes seconds. Off the worker, awaiting the write lets the other tasks sharing it
+    /// make progress; run inline, the same call reaches its answer without ever yielding, and one
+    /// slow mount stalls every session on that runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn writing_the_configuration_yields_the_async_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scratch = tempdir();
+        let progressed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&progressed);
+        tokio::spawn(async move { flag.store(true, Ordering::SeqCst) });
+
+        let file = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected a file")
+            .expect("expected servers to produce one");
+
+        assert!(
+            progressed.load(Ordering::SeqCst),
+            "expected the configuration write to leave the async worker free for other tasks"
+        );
+        drop(file);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     #[tokio::test]
     async fn no_servers_means_no_file_and_no_flag() {
         let scratch = tempdir();
@@ -617,8 +660,8 @@ mod tests {
     ///
     /// A named writer fails after the production path creates and takes ownership of the session
     /// directory. This avoids relying on platform-specific path-length limits.
-    #[tokio::test]
-    async fn a_failure_after_the_directory_exists_still_leaves_nothing_behind() {
+    #[test]
+    fn a_failure_after_the_directory_exists_still_leaves_nothing_behind() {
         struct FailingFileWriter;
 
         impl FileWriter for FailingFileWriter {
@@ -632,7 +675,6 @@ mod tests {
 
         let scratch = tempdir();
         let error = ConfigFile::write_with(&servers(), &scratch, &FailingFileWriter)
-            .await
             .expect_err("expected the write to be refused");
         assert!(
             matches!(
