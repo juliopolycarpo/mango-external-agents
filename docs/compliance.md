@@ -21,8 +21,12 @@ Facts were read on 2026-09-12; re-verify against the vendor's current page befor
   with a protocol error, never executed by the host.
 - **Vendor assistant text is never replayed** into the host's own model context by the library.
 - **Redaction.** stderr crossing a diagnostic boundary is redacted for credential-shaped text.
-  `Debug` and `Display` for process, transport, MCP, error and event payload carriers report only
-  safe metadata; callers handle the original values through typed fields rather than diagnostics.
+  `Debug` and `Display` for process, transport, MCP, error and event payload carriers
+  report only safe metadata; callers handle the original values through typed fields rather than
+  diagnostics. The one exception is a host configuration refusal, which names the payload-free
+  summary the library crates themselves wrote so the host can see what to fix. `examples/mea` is
+  an unpublished smoke tool, not part of that guarantee: its own refusals name the paths and OS
+  messages its operator needs.
 - **No telemetry, no listener, no downloaded binaries.**
 
 ## Claude Code (`mango-agent-claude`)

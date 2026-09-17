@@ -260,7 +260,12 @@ pub enum Error {
     HostConfiguration {
         /// What the library needed.
         expected: &'static str,
-        /// What it was given.
+        /// A summary of what it was given, written verbatim by [`Display`](fmt::Display).
+        ///
+        /// This is the one diagnostic that still names what arrived, because a host
+        /// configuration failure is the host's own to fix and "invalid" tells it nothing. Every
+        /// construction site in the library crates therefore owes a payload-free summary — a
+        /// count, a shape, a static phrase — and never a value a host or a vendor supplied.
         received: String,
     },
 }
@@ -322,11 +327,9 @@ impl fmt::Display for Error {
             Self::Closed { subject } => {
                 write!(formatter, "expected an open {subject}, received a closed one")
             }
-            Self::HostConfiguration { expected, received } => write!(
-                formatter,
-                "expected {expected}, received {}",
-                safe_host_configuration(received)
-            ),
+            Self::HostConfiguration { expected, received } => {
+                write!(formatter, "expected {expected}, received {received}")
+            }
         }
     }
 }
@@ -354,16 +357,6 @@ impl From<VendorError> for Error {
     fn from(error: VendorError) -> Self {
         Self::Vendor(error)
     }
-}
-
-fn safe_host_configuration(received: &str) -> String {
-    let Some(count) = received.strip_prefix("MCP server count ") else {
-        return String::from("invalid host configuration");
-    };
-    if count.bytes().all(|byte| byte.is_ascii_digit()) {
-        return format!("MCP server count {count}");
-    }
-    String::from("invalid host configuration")
 }
 
 fn safe_link_context(message: &str) -> &'static str {
@@ -474,6 +467,21 @@ mod tests {
             assert!(
                 rendered.contains("protocol response shape (44 bytes)"),
                 "expected useful shape metadata, received {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_configuration_diagnostics_keep_the_summary_the_caller_built() {
+        let error = Error::HostConfiguration {
+            expected: "an absolute UTF-8 scratch directory visible to the Claude child",
+            received: String::from("a relative path"),
+        };
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                rendered.contains("a relative path"),
+                "expected the remediation summary to survive, received {rendered}"
             );
         }
     }

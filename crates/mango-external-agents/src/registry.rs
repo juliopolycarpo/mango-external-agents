@@ -199,8 +199,8 @@ mod tests {
             "expected the raw configuration data to name what is registered, received {error:?}"
         );
         assert!(
-            error.to_string().contains("invalid host configuration"),
-            "expected a safe host diagnostic, received {error}"
+            error.to_string().contains("claude"),
+            "expected the diagnostic to name what is registered, received {error}"
         );
     }
 
