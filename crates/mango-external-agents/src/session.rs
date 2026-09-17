@@ -88,13 +88,29 @@ impl From<CloseReason> for CancelReason {
 }
 
 /// The two ids one session answers to.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionIds {
     /// The host's own id, which the host minted and can rely on.
     pub session_id: SessionId,
     /// The vendor's own handle, opaque and the vendor's to recycle.
     pub native_session_id: String,
+}
+
+impl fmt::Debug for SessionIds {
+    /// Reports that the session answers to both, not what either one is.
+    ///
+    /// The value [`Session::ids`] returns, so this is what a host reaches for with `dbg!` or
+    /// embeds in a type of its own — a carrier, unlike [`SessionId`] itself, which is the id and
+    /// prints it. The vendor's handle is the vendor's, and [`Resume`] and [`SessionInfo`] already
+    /// report it this way.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionIds")
+            .field("has_session_id", &true)
+            .field("has_native_session_id", &!self.native_session_id.is_empty())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Settings a host may explicitly override without opening a new session.
@@ -1190,13 +1206,18 @@ mod tests {
             capabilities: crate::Capabilities::none(),
         };
 
-        let rendered = format!("{info:?}");
+        // `ids()` is the value a host reaches for on its own, so it carries the same claim.
+        let rendered = format!("{info:?} {:?}", info.ids);
         for secret in ["chat-id-secret", "native-id-secret", "fallback-text-secret"] {
             assert!(
                 !rendered.contains(secret),
                 "expected no session payload in diagnostics, received {rendered}"
             );
         }
+        assert!(
+            rendered.contains("has_native_session_id: true"),
+            "expected the vendor handle to be reported as present, received {rendered}"
+        );
         assert!(
             rendered.contains("has_fallback_reason: true"),
             "expected the fallback to be reported as present, received {rendered}"
