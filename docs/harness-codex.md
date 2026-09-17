@@ -153,14 +153,20 @@ Two of the server's questions are approvals a person can answer:
 `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`. Options come from
 the declared `CommandExecutionApprovalDecision` / `FileChangeApprovalDecision` enums:
 
-| Vendor decision                 | Neutral kind         | Note                                             |
-| ------------------------------- | -------------------- | ------------------------------------------------ |
-| `accept`                        | `AllowOnce`          |                                                  |
-| `acceptForSession`              | `AllowAlways`        |                                                  |
-| `decline`                       | `RejectOnce`         | The turn goes on                                 |
-| `cancel`                        | `Other`, destructive | Stops the turn, which `RejectOnce` must not mean |
-| `acceptWithExecpolicyAmendment` | `Other`, destructive | Only when the request proposed one               |
-| `applyNetworkPolicyAmendment`   | `Other`, destructive | Only when the request proposed one               |
+| Vendor decision                 | Effect  | Scope     | Risk        | Writes a rule | Note                                         |
+| ------------------------------- | ------- | --------- | ----------- | ------------- | -------------------------------------------- |
+| `accept`                        | Allow   | `Once`    | unspecified | no            |                                              |
+| `acceptForSession`              | Allow   | `Session` | unspecified | no            | Codex forgets it when the thread ends        |
+| `decline`                       | Reject  | `Once`    | unspecified | no            | The turn goes on                             |
+| `cancel`                        | `Other` | —         | destructive | no            | Stops the turn, which a reject must not mean |
+| `acceptWithExecpolicyAmendment` | `Other` | —         | destructive | **yes**       | Only when the request proposed one           |
+| `applyNetworkPolicyAmendment`   | `Other` | —         | destructive | **yes**       | Only when the request proposed one           |
+
+Four facts rather than one word. The two amendments are the reason: each one writes a policy Codex
+applies to later requests on its own, and the old vocabulary had no way to say that — `Other` said
+"only a person can weigh this" and nothing about what agreeing would leave behind. Their scope is
+left **unstated**, because Codex does not say how far an amendment reaches, and an unstated reach is
+never read as the narrow one.
 
 The running server also writes an `availableDecisions` member that **its own generated schema does
 not declare**. It is deliberately not read: building the option set a person chooses from out of an

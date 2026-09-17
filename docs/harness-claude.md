@@ -215,6 +215,12 @@ A mode this build's own `--permission-mode` does not list narrows that cell to
 
 `Capabilities::interactive_approvals` is **false**. No `ApprovalRequested` is ever emitted, and
 `Session::respond` returns `Error::NotSupported { capability: Capability::InteractiveApprovals }`.
+`Session::answer` and `Session::configure` refuse the same way, under `Capability::Questions` and
+`Capability::SessionConfiguration`: Claude Code's headless surface asks no typed questions, and its
+model and permission-mode flags are argv on a fresh child rather than settings an open session can
+be re-pointed at. `Discovery::configuration_catalog` is empty for the same reason — the CLI
+publishes no settings surface to enumerate, which is a different statement from a catalog whose rows
+are all unsupported.
 A tool the permission mode refuses arrives as `system/permission_denied` followed by a
 `tool_result` marked in error, and is rendered as one failed activity carrying the vendor's own
 reason — the run continues and exits zero, so a refused tool is not a failed turn.
