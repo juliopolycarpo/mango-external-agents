@@ -536,14 +536,11 @@ impl SessionState {
                 .any(|option| option.id == response.option_id)
             {
                 return Err(Error::Protocol {
+                    // The count, never the ids: an option id is the agent's own string, and
+                    // `Display` writes this shape verbatim.
                     expected: format!(
-                        "one of the offered approval option ids: {:?}",
-                        pending
-                            .question
-                            .options
-                            .iter()
-                            .map(|option| &option.id)
-                            .collect::<Vec<_>>()
+                        "one of the {} approval option ids this question offered",
+                        pending.question.options.len()
                     ),
                     received: response.option_id.clone(),
                 });

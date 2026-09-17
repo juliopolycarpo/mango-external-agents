@@ -548,9 +548,12 @@ impl PermissionRequest {
     pub fn respond(&self, option_id: &str, source: DecisionSource) -> Result<PermissionResponse> {
         if !self.options.iter().any(|option| option.id == option_id) {
             return Err(Error::Protocol {
+                // The count, never the ids: an option id is the vendor's own string, and
+                // `Display` writes this shape verbatim. A host that wants the ids reads
+                // `option_ids` off the request it already holds.
                 expected: format!(
-                    "one of the options {:?} this request offered",
-                    self.option_ids()
+                    "one of the {} options this request offered",
+                    self.option_ids().len()
                 ),
                 received: option_id.to_owned(),
             });
@@ -819,6 +822,35 @@ mod tests {
             options,
             expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             truncated: false,
+        }
+    }
+
+    /// `Error::Protocol` writes its expected shape verbatim, so this one counts rather than lists.
+    ///
+    /// An option id is the vendor's own string. Naming the count still tells a host what it got
+    /// wrong — it answered with an id this request never offered — without putting the vendor's
+    /// vocabulary into a log line.
+    #[test]
+    fn an_unoffered_answer_counts_the_options_rather_than_naming_them() {
+        let request = request(vec![
+            PermissionOption::new("option-id-secret", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("other-id-secret", PermissionOptionKind::RejectOnce),
+        ]);
+
+        let error = request
+            .respond("answer-id-secret", DecisionSource::User)
+            .expect_err("expected an unoffered id to be refused");
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.contains("one of the 2 options this request offered"),
+            "expected the option count, received {rendered}"
+        );
+        for secret in ["option-id-secret", "other-id-secret", "answer-id-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no option id in the diagnostic, received {rendered}"
+            );
         }
     }
 

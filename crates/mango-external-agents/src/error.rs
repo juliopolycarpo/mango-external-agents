@@ -278,15 +278,26 @@ pub enum Error {
 
     /// A vendor frame did not have the shape its dialect promises.
     Protocol {
-        /// The shape the dialect documents.
+        /// The shape the dialect documents, written verbatim by [`Display`](fmt::Display).
+        ///
+        /// The library's own sentence about what it was reading — `a turn/start result with a
+        /// non-empty turn id`, `protocol version 1` — and without it a host is told a frame was
+        /// wrong but not which field. Every construction site therefore owes a shape it wrote
+        /// itself, and summarises anything a vendor filled in: `one of the 3 options this request
+        /// offered`, never the ids themselves.
         expected: String,
-        /// What arrived instead, bounded.
+        /// What arrived instead, bounded. Vendor data: never written to a diagnostic.
         received: String,
     },
 
     /// A call did not answer inside its deadline.
     Timeout {
-        /// The call that stalled, such as a JSON-RPC method name.
+        /// The call that stalled, written verbatim by [`Display`](fmt::Display).
+        ///
+        /// A peer name and a method name, both protocol identifiers the library or a profile
+        /// names — `Codex app-server thread/resume`, `session/prompt on ACP agent gemini`. Which
+        /// call stalled is the whole content of a timeout, so every construction site owes a name
+        /// it wrote itself rather than a value a vendor sent.
         operation: String,
         /// How long it was given.
         after: Duration,
@@ -366,13 +377,11 @@ impl fmt::Display for Error {
             }
             Self::Protocol { expected, .. } => write!(
                 formatter,
-                "expected a protocol response shape ({} bytes), received invalid vendor data",
-                expected.len()
+                "expected {expected}, received invalid vendor data"
             ),
             Self::Timeout { operation, after } => write!(
                 formatter,
-                "expected an operation ({} bytes) to answer within {after:?}, received nothing",
-                operation.len()
+                "expected {operation} to answer within {after:?}, received nothing"
             ),
             Self::Cancelled { reason } => write!(formatter, "cancelled: {reason}"),
             Self::Closed { subject } => {
@@ -461,6 +470,8 @@ pub const fn jsonrpc_code_is_retryable(code: i64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{CODE_MAX_LENGTH, Error, ErrorCode, VendorError, jsonrpc_code_is_retryable};
     use crate::harness::Capability;
 
@@ -506,21 +517,35 @@ mod tests {
         );
     }
 
+    /// The two arms whose `expected` half is the library's own sentence about what it was reading.
+    ///
+    /// A host told "invalid vendor data" and nothing else knows a frame was wrong but not which
+    /// field, and a timeout that will not say which call stalled is not actionable at all. Both
+    /// name the library's own shape and keep the vendor's data out.
     #[test]
-    fn protocol_diagnostics_omit_vendor_text_and_expected_shape_contents() {
-        let error = Error::Protocol {
-            expected: String::from("a captured vendor response diagnostic-secret"),
+    fn a_protocol_refusal_and_a_timeout_name_the_shape_they_were_reading() {
+        let protocol = Error::Protocol {
+            expected: String::from("a turn/start result with a non-empty turn id"),
             received: String::from("Authorization: Bearer diagnostic-secret"),
         };
+        let timeout = Error::Timeout {
+            operation: String::from("Codex app-server thread/resume"),
+            after: Duration::from_secs(30),
+        };
 
-        for rendered in [error.to_string(), format!("{error:?}")] {
+        assert_eq!(
+            protocol.to_string(),
+            "expected a turn/start result with a non-empty turn id, received invalid vendor data"
+        );
+        assert_eq!(
+            timeout.to_string(),
+            "expected Codex app-server thread/resume to answer within 30s, received nothing"
+        );
+
+        for rendered in [protocol.to_string(), format!("{protocol:?}")] {
             assert!(
                 !rendered.contains("diagnostic-secret"),
-                "expected redacted error diagnostic, received {rendered}"
-            );
-            assert!(
-                rendered.contains("protocol response shape (44 bytes)"),
-                "expected useful shape metadata, received {rendered}"
+                "expected the vendor's own data to stay out, received {rendered}"
             );
         }
     }
