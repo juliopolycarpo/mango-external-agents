@@ -38,8 +38,8 @@ let host = HostContext::builder()
 3. **Scratch storage when a harness needs an artifact the child reads.** `HostContext::scratch`
    is an absolute, host-created directory. The host owns its ACL and any container or sandbox
    mount that makes the same path visible to the child. On Unix, Claude accepts a root when every
-   directory on its canonical path — the root and each ancestor — is owned by the effective user
-   or root, and is either not group- or other-writable or has the sticky bit (`/tmp` normally
+   directory on its path — the root and each ancestor, both as written and after resolving
+   symlinks — is owned by the effective user or root, and is either not group- or other-writable or has the sticky bit (`/tmp` normally
    does). A private root beneath a world-writable non-sticky parent is refused: the child resolves
    the path by name, so a parent another account can rename names somebody else's file by then.
    Note that WSL DrvFs mounts such as `/mnt/d` report mode `0777` without the sticky bit, so a

@@ -458,34 +458,61 @@ fn validate_scratch(scratch: &Path) -> Result<()> {
 /// this process holds can protect that resolution, so the whole chain has to be non-replaceable
 /// rather than only its last link.
 ///
-/// The chain is the canonical path's ancestors: canonicalising first means the names checked here
-/// are the names the kernel will walk, not symlinks pointing elsewhere.
+/// Two chains, because a symlink makes them different chains. The path as the host wrote it is the
+/// one the child's own resolver walks, so an unsafe directory on it matters even when it holds
+/// nothing but a symlink into a private tree; the canonical path is where that walk lands, so an
+/// unsafe directory on it matters even when no name the host wrote says so. Checking only the
+/// canonical chain would let `/shared/link/scratch` pass on the strength of the tree `link`
+/// happens to point at today, while its owner repoints it tomorrow.
 #[cfg(unix)]
 fn validate_unix_scratch_chain(scratch: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
+    let effective = nix::unistd::Uid::effective().as_raw();
+
+    if !safe_unix_scratch_path(scratch, effective)? {
+        return Err(unsafe_scratch_chain());
+    }
 
     let resolved = std::fs::canonicalize(scratch)
         .map_err(|error| scratch_failure("resolve the scratch directory", &error))?;
-    let effective = nix::unistd::Uid::effective().as_raw();
+    if resolved != scratch && !safe_unix_scratch_path(&resolved, effective)? {
+        return Err(unsafe_scratch_chain());
+    }
+
+    Ok(())
+}
+
+/// Whether no directory on one path can be replaced by a third party.
+#[cfg(unix)]
+fn safe_unix_scratch_path(path: &Path, effective: u32) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
 
     let mut chain = Vec::new();
-    for ancestor in resolved.ancestors() {
+    for ancestor in path.ancestors() {
         let metadata = std::fs::symlink_metadata(ancestor)
             .map_err(|error| scratch_failure("read a scratch directory ancestor", &error))?;
+        // A symlink's own mode is `lrwxrwxrwx` on every Unix worth naming and means nothing: what
+        // a symlink permits is decided by its target, and whether the link itself can be swapped
+        // is decided by the directory holding it, which is the next ancestor this loop reads.
+        // Judging it by its own bits would refuse `/var` on macOS and prove nothing anywhere.
+        if metadata.is_symlink() {
+            continue;
+        }
         chain.push((metadata.mode(), metadata.uid()));
     }
 
-    if safe_unix_scratch_chain(&chain, effective) {
-        return Ok(());
-    }
-
-    Err(Error::HostConfiguration {
-        expected: "a scratch directory reachable only through directories owned by this user or root, each private or sticky when group- or other-writable",
-        received: String::from("a scratch directory another user could replace"),
-    })
+    Ok(safe_unix_scratch_chain(&chain, effective))
 }
 
-/// Whether no link of a resolved scratch chain can be replaced by a third party.
+/// The one refusal both chains share, so a host reads the condition rather than which pass caught it.
+#[cfg(unix)]
+fn unsafe_scratch_chain() -> Error {
+    Error::HostConfiguration {
+        expected: "a scratch directory reachable only through directories owned by this user or root, each private or sticky when group- or other-writable",
+        received: String::from("a scratch directory another user could replace"),
+    }
+}
+
+/// Whether no link of a scratch chain can be replaced by a third party.
 ///
 /// Each entry is `(mode, owner)`, from the leaf outwards. One replaceable ancestor is enough to
 /// replace everything below it, so this is an `all`, not a check of the leaf with context.
@@ -1253,6 +1280,49 @@ mod tests {
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
             .expect("expected cleanup permissions");
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// `canonicalize` resolves a symlink away, so a shared directory holding one disappears from
+    /// the canonical chain — while the child still walks the name the host wrote.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_a_scratch_root_reached_through_a_replaceable_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let private = tempdir();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+            .expect("expected a private target tree");
+        let shared = tempdir();
+        let link = shared.join("link");
+        std::os::unix::fs::symlink(&private, &link).expect("expected a symlinked scratch root");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+            .expect("expected a non-sticky shared directory to hold the symlink");
+
+        let error = ConfigFile::write(&servers(), &link)
+            .await
+            .expect_err("expected a replaceable symlink to be refused");
+        assert!(
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration {
+                    expected: SCRATCH_CHAIN_EXPECTED,
+                    ..
+                }
+            ),
+            "expected an explicit scratch-chain refusal, received {error:?}"
+        );
+
+        assert_eq!(
+            std::fs::read_dir(&private)
+                .expect("expected the symlink target")
+                .count(),
+            0,
+            "expected the refusal to leave no session leaf in the symlinked tree"
+        );
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700))
+            .expect("expected cleanup permissions");
+        let _ = std::fs::remove_dir_all(&shared);
+        let _ = std::fs::remove_dir_all(&private);
     }
 
     #[cfg(unix)]
