@@ -155,6 +155,13 @@ impl TokioLauncher {
 #[async_trait::async_trait]
 impl ProcessLauncher for TokioLauncher {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        // A host may construct LaunchSpec directly. Normalize once before both native spawning
+        // and PowerShell fallback inspect the environment; Windows treats key casing as equal.
+        #[cfg(windows)]
+        let spec = LaunchSpec {
+            env: crate::env::windows_effective_environment(&spec.env),
+            ..spec
+        };
         let Some(program) = spec.program() else {
             return Err(Error::HostConfiguration {
                 expected: "an argv naming a program",
@@ -893,6 +900,40 @@ mod tests {
             );
             assert!(child.control.wait().await.expect("exit status").success());
         }
+        std::fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_lookup_and_child_see_the_same_windows_path_value() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("mea-path-casing-{nonce}"));
+        std::fs::create_dir(&directory).expect("fixture directory");
+        std::fs::write(directory.join("mea-casing.ps1"), "Write-Output $env:Path\n")
+            .expect("fixture script");
+
+        let mut spec = fixture("lines");
+        spec.argv = vec![String::from("mea-casing")];
+        spec.env.insert(
+            String::from("PATH"),
+            directory.to_string_lossy().into_owned(),
+        );
+        spec.env
+            .insert(String::from("Path"), String::from(r"C:\wrong"));
+
+        let child = TokioLauncher::new()
+            .spawn(spec)
+            .await
+            .expect("lookup must use the same PATH as process creation");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        assert_eq!(
+            lines.next_line().await.expect("child PATH"),
+            Some(directory.to_string_lossy().into_owned())
+        );
+        assert!(child.control.wait().await.expect("exit status").success());
         std::fs::remove_dir_all(&directory).expect("remove fixture directory");
     }
 

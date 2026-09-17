@@ -43,8 +43,17 @@ pub const BASE_ENVIRONMENT_KEYS: &[&str] = &[
 ///
 /// A host builds one from its own process, from a toolchain selection it resolved, or from
 /// nothing at all. The library reads it and never `std::env::var`s behind the host's back.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct EnvSource(BTreeMap<String, String>);
+
+impl std::fmt::Debug for EnvSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvSource")
+            .field("keys", &self.0.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
 
 impl EnvSource {
     /// An empty source. A child launched from it sees only what the allowlist can find, which is
@@ -85,8 +94,16 @@ impl EnvSource {
         )
     }
 
-    /// One value, if the host offered it.
+    /// One value, if the host offered it. On Windows, casing is ignored and the first
+    /// spelling in lexical order wins, just as it does in [`allowlist`].
     pub fn get(&self, key: &str) -> Option<&str> {
+        if cfg!(windows) {
+            return self
+                .0
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value.as_str());
+        }
         self.0.get(key).map(String::as_str)
     }
 
@@ -104,6 +121,8 @@ impl EnvSource {
 /// reads — never from a host request. Any `LC_*` key survives on top of the base list, because the
 /// locale set is open and a missing one changes how a CLI formats what it prints.
 /// Key matching follows the operating system: case-insensitive on Windows, exact on Unix.
+/// When Windows sources contain two casings of one key, the first key in lexical order wins.
+/// The child receives only that spelling and value, so executable lookup and launch agree.
 ///
 /// # Example
 ///
@@ -124,15 +143,43 @@ impl EnvSource {
 /// assert_eq!(child.get("CONNECTOR_SECRET"), None);
 /// ```
 pub fn allowlist(source: &EnvSource, vendor_keys: &[&str]) -> BTreeMap<String, String> {
-    source
-        .iter()
-        .filter(|(key, _)| is_allowed(key, vendor_keys))
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect()
+    allowlist_with_case(source, vendor_keys, cfg!(windows))
 }
 
-fn is_allowed(key: &str, vendor_keys: &[&str]) -> bool {
-    if cfg!(windows) {
+fn allowlist_with_case(
+    source: &EnvSource,
+    vendor_keys: &[&str],
+    case_insensitive: bool,
+) -> BTreeMap<String, String> {
+    let allowed = source
+        .iter()
+        .filter(|(key, _)| is_allowed(key, vendor_keys, case_insensitive))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+    if case_insensitive {
+        return windows_effective_environment(&allowed);
+    }
+    allowed
+}
+
+/// Gives Windows lookup and process creation one casing and one value for each key.
+pub(crate) fn windows_effective_environment(
+    environment: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut effective = BTreeMap::new();
+    let mut names: Vec<&str> = Vec::new();
+    for (name, value) in environment {
+        if names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        names.push(name);
+        effective.insert(name.clone(), value.clone());
+    }
+    effective
+}
+
+fn is_allowed(key: &str, vendor_keys: &[&str], case_insensitive: bool) -> bool {
+    if case_insensitive {
         return BASE_ENVIRONMENT_KEYS
             .iter()
             .chain(vendor_keys)
@@ -146,7 +193,7 @@ fn is_allowed(key: &str, vendor_keys: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvSource, allowlist};
+    use super::{EnvSource, allowlist, allowlist_with_case};
     use std::collections::BTreeMap;
 
     fn pairs(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -243,5 +290,57 @@ mod tests {
             child.is_empty(),
             "expected case-sensitive environment keys on Unix"
         );
+    }
+
+    #[test]
+    fn windows_key_casing_has_one_effective_value_for_lookup_and_child() {
+        let source = EnvSource::from_pairs([
+            ("PATH", r"C:\first"),
+            ("Path", r"C:\second"),
+            ("SYSTEMROOT", r"C:\Windows"),
+            ("SystemRoot", r"C:\Other"),
+        ]);
+        let child = allowlist_with_case(&source, &[], true);
+        assert_eq!(child.get("PATH").map(String::as_str), Some(r"C:\first"));
+        assert_eq!(child.get("Path"), None);
+        assert_eq!(
+            child.get("SYSTEMROOT").map(String::as_str),
+            Some(r"C:\Windows")
+        );
+        assert_eq!(child.get("SystemRoot"), None);
+        assert_eq!(child.len(), 2);
+        if cfg!(windows) {
+            assert_eq!(source.get("path"), Some(r"C:\first"));
+            assert_eq!(source.get("systemroot"), Some(r"C:\Windows"));
+        } else {
+            assert_eq!(source.get("path"), None);
+        }
+    }
+
+    #[test]
+    fn windows_single_casing_round_trips_and_unix_keeps_distinct_keys() {
+        let source = EnvSource::from_pairs([("Path", r"C:\tools"), ("PATH", r"/usr/bin")]);
+        let windows = allowlist_with_case(&source, &[], true);
+        assert_eq!(windows, pairs(&[("PATH", "/usr/bin")]));
+
+        let unix = allowlist_with_case(&source, &[], false);
+        assert_eq!(unix, pairs(&[("PATH", "/usr/bin"), ("Path", r"C:\tools")]));
+
+        let only_path = EnvSource::from_pairs([("Path", r"C:\tools")]);
+        assert_eq!(
+            allowlist_with_case(&only_path, &[], true),
+            pairs(&[("Path", r"C:\tools")])
+        );
+    }
+
+    #[test]
+    fn debug_shows_offered_keys_without_their_values() {
+        let source =
+            EnvSource::from_pairs([("CONNECTOR_SECRET", "canary-env-secret"), ("PATH", "/bin")]);
+        let debug = format!("{source:?}");
+        assert!(debug.contains("CONNECTOR_SECRET"));
+        assert!(debug.contains("PATH"));
+        assert!(!debug.contains("canary-env-secret"));
+        assert!(!debug.contains("/bin"));
     }
 }
