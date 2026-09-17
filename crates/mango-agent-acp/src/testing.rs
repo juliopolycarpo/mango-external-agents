@@ -59,6 +59,9 @@ pub struct FakeAcpAgent {
     approval: Approval,
     /// `session/new` answers with this error code instead of a session.
     new_session_error: Option<(i32, String)>,
+    /// `session/load` answers with this error code instead of a loaded session, while the agent
+    /// still advertises the capability.
+    load_session_error: Option<(i32, String)>,
     /// Streams a turn's updates and never answers its `session/prompt`.
     never_finishes: bool,
     /// Raises a permission request when the client sends `session/close`.
@@ -95,6 +98,7 @@ impl FakeAcpAgent {
             modes: Vec::new(),
             approval: Approval::Never,
             new_session_error: None,
+            load_session_error: None,
             never_finishes: false,
             asks_when_closing: false,
             reuse_request_id_for_second_ask: false,
@@ -217,6 +221,18 @@ impl FakeAcpAgent {
         self
     }
 
+    /// Advertises `session/load` and then refuses the call with this JSON-RPC error.
+    ///
+    /// Distinct from [`without_load_session`](Self::without_load_session): an agent that never
+    /// declared the capability is a static refusal, while one that declared it and then failed
+    /// the call is the only way to reach the resume fallback a
+    /// [`ResumeMode::Fallback`](mango_external_agents::ResumeMode) request asks for.
+    #[must_use]
+    pub fn refusing_load_session(mut self, code: i32, message: impl Into<String>) -> Self {
+        self.load_session_error = Some((code, message.into()));
+        self
+    }
+
     /// Streams these `session/update` payloads for a turn instead of the default script.
     #[must_use]
     pub fn with_updates(mut self, updates: Vec<serde_json::Value>) -> Self {
@@ -262,12 +278,14 @@ impl FakeAcpAgent {
         match (method, id) {
             (Some("initialize"), Some(id)) => vec![result(id, self.initialize_result())],
             (Some("session/new"), Some(id)) => vec![self.session_result(id)],
-            (Some("session/load"), Some(id)) => match self.load_session {
-                true => vec![result(
+            (Some("session/load"), Some(id)) => match (self.load_session, &self.load_session_error)
+            {
+                (true, Some((code, message))) => vec![error(id, *code, message)],
+                (true, None) => vec![result(
                     id,
                     serde_json::json!({ "modes": self.mode_state() }),
                 )],
-                false => vec![error(id, -32601, "method not found")],
+                (false, _) => vec![error(id, -32601, "method not found")],
             },
             (Some("session/list"), Some(id)) => vec![result(
                 id,

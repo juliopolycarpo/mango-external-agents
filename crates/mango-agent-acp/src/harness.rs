@@ -28,6 +28,7 @@ use agent_client_protocol::schema::v1::{
 use mango_external_agents::permission::PermissionMatrix;
 use mango_external_agents::session::{
     Configuration, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
+    resume_fallback_reason,
 };
 use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
@@ -456,8 +457,9 @@ impl AcpHarness {
             // Fallback: a fresh conversation, and the host is told why rather than left to notice
             // that its history disappeared.
             Err(error) => {
+                let reason = resume_fallback_reason("session/load", &error);
                 let mut opened = self.new_session(connection, host, cwd).await?;
-                opened.fallback_reason = Some(error.to_string());
+                opened.fallback_reason = Some(reason);
                 Ok(opened)
             }
         }

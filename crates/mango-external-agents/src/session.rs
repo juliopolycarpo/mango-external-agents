@@ -482,6 +482,43 @@ pub struct SessionInfo {
     pub capabilities: Capabilities,
 }
 
+/// Why a requested resume fell back to a fresh conversation, in terms a host can act on.
+///
+/// Built from the error's typed fields rather than from its diagnostic text. `Display` reports
+/// only metadata for anything a vendor filled in, so a reason copied from it says "vendor failure"
+/// and tells a host nothing it did not already know. Every harness that offers
+/// [`ResumeMode::Fallback`] fills [`SessionInfo::fallback_reason`] through this, so the sentence a
+/// host shows does not depend on which vendor produced it.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::{Capability, Error, resume_fallback_reason};
+///
+/// let reason = resume_fallback_reason("session/load", &Error::not_supported(Capability::Resume));
+/// assert_eq!(reason, "session/load needs resume, which this agent does not declare");
+/// ```
+pub fn resume_fallback_reason(operation: &str, error: &Error) -> String {
+    match error {
+        // The code is the harness's own constant, or the static `vendor-code` stand-in for one a
+        // vendor minted; either way it is a label this library controls, not vendor text.
+        Error::Vendor(vendor) => format!(
+            "{operation} was refused by the vendor ({}, retryable {})",
+            vendor.code, vendor.retryable
+        ),
+        Error::NotSupported { capability } => {
+            format!("{operation} needs {capability}, which this agent does not declare")
+        }
+        Error::Timeout { after, .. } => format!("{operation} did not answer within {after:?}"),
+        Error::Protocol { .. } => {
+            format!("{operation} answered with a shape this harness does not read")
+        }
+        Error::Link { .. } => format!("{operation} lost the vendor link"),
+        Error::Closed { subject } => format!("{operation} found a closed {subject}"),
+        other => format!("{operation} failed: {other}"),
+    }
+}
+
 impl fmt::Debug for SessionInfo {
     /// Records what opening decided without logging the ids or the vendor's fallback text.
     ///
@@ -1037,6 +1074,59 @@ mod tests {
         SessionPage, TurnRequest,
     };
     use crate::permission::{ApprovalRouting, PermissionLevel};
+
+    /// The helper both fallback sites depend on, across every arm a resume can fail through.
+    ///
+    /// Only the vendor arm is reachable from a harness test with a recorded transcript, so the
+    /// rest are pinned here: a reason that silently degraded to "thread/resume failed" would be
+    /// invisible until a host asked why its history disappeared.
+    #[test]
+    fn a_resume_fallback_reason_explains_every_way_a_load_can_fail() {
+        use crate::error::{Error, ErrorCode, VendorError};
+        use std::time::Duration;
+
+        let cases = [
+            (
+                Error::Vendor(
+                    VendorError::new(ErrorCode::from_static("acp-request-failed"), "expired")
+                        .with_vendor_code("thread_gone", true),
+                ),
+                "session/load was refused by the vendor (acp-request-failed, retryable true)",
+            ),
+            (
+                Error::Timeout {
+                    operation: String::from("session/load"),
+                    after: Duration::from_secs(30),
+                },
+                "session/load did not answer within 30s",
+            ),
+            (
+                Error::Protocol {
+                    expected: String::from("a loaded session"),
+                    received: String::from("payload-secret"),
+                },
+                "session/load answered with a shape this harness does not read",
+            ),
+            (
+                Error::Link {
+                    peer: String::from("agent"),
+                    message: String::from("link-secret"),
+                },
+                "session/load lost the vendor link",
+            ),
+            (
+                Error::Closed { subject: "link" },
+                "session/load found a closed link",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                crate::resume_fallback_reason("session/load", &error),
+                expected
+            );
+        }
+    }
 
     /// `Debug` stays on the public snapshot, because a host wrapping it derives its own.
     #[test]

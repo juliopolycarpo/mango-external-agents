@@ -15,6 +15,7 @@ use mango_external_agents::permission::PermissionMatrix;
 use mango_external_agents::process::LaunchSpec;
 use mango_external_agents::session::{
     Configuration, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
+    resume_fallback_reason,
 };
 use mango_external_agents::transport::{ExecutablePath, StdioSpec, TransportKind};
 use mango_external_agents::transports::stdio;
@@ -303,7 +304,7 @@ async fn open_thread(
             {
                 Ok(response) => (response, true, None),
                 Err(error) if resume.mode == ResumeMode::Fallback => {
-                    let reason = error.to_string();
+                    let reason = resume_fallback_reason(method::THREAD_RESUME, &error);
                     (
                         start_thread(client, &cwd, configuration, vendor).await?,
                         false,
