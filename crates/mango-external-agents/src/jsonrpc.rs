@@ -73,8 +73,13 @@ impl RequestId {
 }
 
 impl std::fmt::Display for RequestId {
+    /// Names the JSON type, never the id itself.
+    ///
+    /// A peer picks its own ids, so a string id is peer-controlled text that a host writing
+    /// `{id}` into a log would carry across a diagnostic boundary. Correlation happens through
+    /// [`key`](Self::key) and [`as_json`](Self::as_json), which stay exact.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.key())
+        write!(formatter, "a {} request id", json_value_type(&self.0))
     }
 }
 
@@ -1008,6 +1013,21 @@ mod tests {
         )
     }
 
+    /// `Display` is the spelling a host reaches for when it logs `{id}`, so it carries the same
+    /// guarantee `Debug` does. `key()` stays exact: it is how this side correlates the answer.
+    #[test]
+    fn displaying_a_request_id_names_its_type_rather_than_the_peers_value() {
+        let id = RequestId::new(json!("request-id-secret"));
+
+        assert_eq!(id.to_string(), "a string request id");
+        assert_eq!(id.key(), "request-id-secret");
+        assert_eq!(
+            RequestId::new(json!(7)).to_string(),
+            "a number request id",
+            "expected the numeric spelling to be named as such"
+        );
+    }
+
     #[test]
     fn jsonrpc_debug_omits_raw_peer_payloads() {
         let id = RequestId::new(json!("request-id-secret"));
@@ -1021,6 +1041,7 @@ mod tests {
 
         for rendered in [
             format!("{id:?}"),
+            format!("{id}"),
             format!("{failure:?}"),
             format!("{answer:?}"),
             format!("{termination:?}"),
