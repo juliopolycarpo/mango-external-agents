@@ -19,21 +19,25 @@ pub(crate) struct PermissionOverrides {
     pub(crate) approvals_reviewer: Option<ApprovalsReviewer>,
 }
 
-/// Leaves omitted axes to the user's CLI settings. For example, a default configuration emits
-/// no permission overrides.
+/// Leaves omitted axes to the user's CLI settings. For example, a patch that sets neither axis
+/// emits no permission overrides.
 pub(crate) fn overrides(
-    configuration: &mango_external_agents::Configuration,
+    configuration: &mango_external_agents::ConfigurationPatch,
 ) -> PermissionOverrides {
     let level = configuration
         .level
-        .map(|level| VendorConfiguration::for_pair(level, ApprovalRouting::User));
+        .set_value()
+        .map(|level| VendorConfiguration::for_pair(*level, ApprovalRouting::User));
     PermissionOverrides {
         sandbox: level.map(|configuration| configuration.sandbox),
         approval_policy: level.map(|configuration| configuration.approval_policy),
-        approvals_reviewer: configuration.routing.map(|routing| match routing {
-            ApprovalRouting::User => ApprovalsReviewer::User,
-            ApprovalRouting::AutoReview => ApprovalsReviewer::AutoReview,
-        }),
+        approvals_reviewer: configuration
+            .routing
+            .set_value()
+            .map(|routing| match routing {
+                ApprovalRouting::User => ApprovalsReviewer::User,
+                ApprovalRouting::AutoReview => ApprovalsReviewer::AutoReview,
+            }),
     }
 }
 
@@ -149,28 +153,29 @@ mod tests {
     use super::{VendorConfiguration, matrix};
     use crate::protocol::requests::{ApprovalsReviewer, AskForApproval, SandboxMode};
     use mango_external_agents::permission::{ApprovalRouting, PermissionLevel};
+    use mango_external_agents::{ConfigurationChange, ConfigurationPatch};
 
     #[test]
     fn omitted_permission_axes_are_not_filled_in() {
-        let omitted = super::overrides(&mango_external_agents::Configuration::default());
+        let omitted = super::overrides(&ConfigurationPatch::new());
         assert_eq!(omitted.sandbox, None);
         assert_eq!(omitted.approval_policy, None);
         assert_eq!(omitted.approvals_reviewer, None);
-        let explicit = super::overrides(&mango_external_agents::Configuration {
-            level: Some(PermissionLevel::FullAccess),
-            routing: Some(ApprovalRouting::AutoReview),
-            ..mango_external_agents::Configuration::default()
-        });
+        let explicit = super::overrides(
+            &ConfigurationPatch::new()
+                .level(ConfigurationChange::Set(PermissionLevel::FullAccess))
+                .routing(ConfigurationChange::Set(ApprovalRouting::AutoReview)),
+        );
         assert_eq!(explicit.sandbox, Some(SandboxMode::DangerFullAccess));
         assert_eq!(explicit.approval_policy, Some(AskForApproval::Never));
         assert_eq!(
             explicit.approvals_reviewer,
             Some(ApprovalsReviewer::AutoReview)
         );
-        let routing = super::overrides(&mango_external_agents::Configuration {
-            routing: Some(ApprovalRouting::AutoReview),
-            ..mango_external_agents::Configuration::default()
-        });
+        let routing = super::overrides(
+            &ConfigurationPatch::new()
+                .routing(ConfigurationChange::Set(ApprovalRouting::AutoReview)),
+        );
         assert_eq!(routing.sandbox, None);
         assert_eq!(routing.approval_policy, None);
         assert_eq!(

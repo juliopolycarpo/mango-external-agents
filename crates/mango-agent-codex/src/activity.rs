@@ -66,12 +66,10 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
             return None;
         }
     };
-    Some(Activity {
-        name: String::from(name),
-        kind,
-        title,
-        detail,
-        truncated: false,
+    let activity = Activity::new(name, kind, title);
+    Some(match detail {
+        Some(detail) => activity.with_detail(detail),
+        None => activity,
     })
 }
 
