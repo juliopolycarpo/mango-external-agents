@@ -96,9 +96,7 @@ impl fmt::Display for AttemptId {
 ///
 /// Carried by everything that outlives the call that produced it — events, questions, approvals —
 /// so a host can route or discard one without holding the handle that made it.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct OperationRef {
@@ -108,6 +106,16 @@ pub struct OperationRef {
     pub turn_id: TurnId,
     /// Which dispatch of it.
     pub attempt: AttemptId,
+}
+
+impl fmt::Debug for OperationRef {
+    /// Reports an operation generation without logging host session or turn ids.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationRef")
+            .field("attempt", &self.attempt)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OperationRef {

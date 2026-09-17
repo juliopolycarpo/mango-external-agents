@@ -53,7 +53,7 @@ pub const CONFIGURATION_TEXT_MAX_LENGTH: usize = 1_024;
 /// assert_eq!(set.set_value(), Some(&String::from("opus")));
 /// assert!(reset.is_reset());
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", content = "value", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ConfigurationChange<T> {
@@ -70,6 +70,17 @@ pub enum ConfigurationChange<T> {
     /// Not every vendor can do this. One that cannot refuses with
     /// [`SettingRejection::ResetNotSupported`] rather than reporting a success it did not have.
     Reset,
+}
+
+impl<T> fmt::Debug for ConfigurationChange<T> {
+    /// Names the requested operation without formatting a vendor value.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Keep => "Keep",
+            Self::Set(_) => "Set",
+            Self::Reset => "Reset",
+        })
+    }
 }
 
 impl<T> ConfigurationChange<T> {
@@ -120,7 +131,7 @@ impl<T> ConfigurationChange<T> {
 /// could not read what the vendor is set to omits the axis rather than reporting this crate's
 /// preference, because a permission level nobody chose is the one setting that must never be
 /// invented in either direction.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Configuration {
@@ -139,6 +150,20 @@ pub struct Configuration {
     /// Vendor-native options that have no axis of their own, by the vendor's own option id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub native: BTreeMap<ConfigurationOptionId, ConfigurationValue>,
+}
+
+impl fmt::Debug for Configuration {
+    /// Reports known settings without logging opaque vendor identifiers or values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Configuration")
+            .field("has_model", &self.model.is_some())
+            .field("has_effort", &self.effort.is_some())
+            .field("level", &self.level)
+            .field("routing", &self.routing)
+            .field("native_option_count", &self.native.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Configuration {
@@ -277,7 +302,7 @@ impl Configuration {
 /// assert!(!patch.is_empty());
 /// assert!(patch.routing.is_keep());
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ConfigurationPatch {
@@ -296,6 +321,20 @@ pub struct ConfigurationPatch {
     /// What to do about vendor-native options, by the vendor's own option id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub native: BTreeMap<ConfigurationOptionId, ConfigurationChange<ConfigurationValue>>,
+}
+
+impl fmt::Debug for ConfigurationPatch {
+    /// Reports requested axes without logging opaque vendor identifiers or values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationPatch")
+            .field("model", &self.model)
+            .field("effort", &self.effort)
+            .field("level", &self.level)
+            .field("routing", &self.routing)
+            .field("native_change_count", &self.native.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigurationPatch {
@@ -409,7 +448,7 @@ impl ConfigurationPatch {
 ///
 /// The split exists because these three disagree in practice, and a host that shows the wrong one
 /// tells a person their turn is running under a setting it is not.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ConfigurationState {
@@ -425,6 +464,18 @@ pub struct ConfigurationState {
     /// The only one of the three that is evidence. A harness that has no vendor surface reporting
     /// a setting leaves the axis unknown here, permanently, rather than copying `accepted` across.
     pub observed: Configuration,
+}
+
+impl fmt::Debug for ConfigurationState {
+    /// Reports the provenance of settings without logging their vendor values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationState")
+            .field("requested", &self.requested)
+            .field("accepted", &self.accepted)
+            .field("observed", &self.observed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigurationState {
@@ -556,11 +607,16 @@ impl fmt::Display for ConfigurationSource {
 }
 
 /// A vendor's own id for one configurable option.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct ConfigurationOptionId(String);
+
+impl fmt::Debug for ConfigurationOptionId {
+    /// Marks an opaque option id without logging the vendor spelling.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConfigurationOptionId")
+    }
+}
 
 impl ConfigurationOptionId {
     /// Names one option, exactly as the vendor spells it.
@@ -584,7 +640,7 @@ impl fmt::Display for ConfigurationOptionId {
 ///
 /// Scalars only, and bounded. Not a JSON value: an option whose value is an arbitrary document is
 /// a passthrough channel wearing a settings label, and nothing in this library forwards one.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ConfigurationValue {
@@ -594,6 +650,17 @@ pub enum ConfigurationValue {
     Integer(i64),
     /// A flag.
     Boolean(bool),
+}
+
+impl fmt::Debug for ConfigurationValue {
+    /// Names a value type without formatting vendor-provided content.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Text(_) => "Text",
+            Self::Integer(_) => "Integer",
+            Self::Boolean(_) => "Boolean",
+        })
+    }
 }
 
 impl ConfigurationValue {
@@ -631,9 +698,7 @@ impl ConfigurationValue {
 }
 
 /// What kind of value an option takes.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ConfigurationValueType {
@@ -649,14 +714,25 @@ pub enum ConfigurationValueType {
     Other(String),
 }
 
+impl fmt::Debug for ConfigurationValueType {
+    /// Names a value type without logging a vendor-defined type name.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Enumerated => "Enumerated",
+            Self::Text => "Text",
+            Self::Integer => "Integer",
+            Self::Boolean => "Boolean",
+            Self::Other(_) => "Other",
+        })
+    }
+}
+
 /// What an option is for, as far as this crate can tell.
 ///
 /// Open on purpose. A vendor that adds a setting nobody has a name for yet lands in
 /// [`ConfigurationCategory::Other`], which is a row a host can still render and still set — the
 /// rows beside it keep working either way.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ConfigurationCategory {
@@ -672,8 +748,21 @@ pub enum ConfigurationCategory {
     Other(String),
 }
 
+impl fmt::Debug for ConfigurationCategory {
+    /// Names a category without logging a vendor-defined category name.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Model => "Model",
+            Self::ReasoningEffort => "ReasoningEffort",
+            Self::Mode => "Mode",
+            Self::Permission => "Permission",
+            Self::Other(_) => "Other",
+        })
+    }
+}
+
 /// One thing a session can be configured to do, as the vendor describes it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ConfigurationOption {
@@ -701,6 +790,22 @@ pub struct ConfigurationOption {
     /// refused rather than reported as applied.
     #[serde(default)]
     pub resettable: bool,
+}
+
+impl fmt::Debug for ConfigurationOption {
+    /// Reports an option's shape without logging vendor labels, ids, or values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationOption")
+            .field("category", &self.category)
+            .field("has_name", &self.name.is_some())
+            .field("has_description", &self.description.is_some())
+            .field("value_type", &self.value_type)
+            .field("value_count", &self.values.len())
+            .field("has_current", &self.current.is_some())
+            .field("resettable", &self.resettable)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigurationOption {
@@ -807,7 +912,7 @@ impl ConfigurationCategory {
 }
 
 /// One value an enumerated option offers.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ConfigurationOptionValue {
@@ -822,6 +927,19 @@ pub struct ConfigurationOptionValue {
     /// Whether the vendor picks this one when nobody chooses.
     #[serde(default)]
     pub is_default: bool,
+}
+
+impl fmt::Debug for ConfigurationOptionValue {
+    /// Reports an enumerated value's renderable shape without its vendor text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationOptionValue")
+            .field("value", &self.value)
+            .field("has_display_name", &self.display_name.is_some())
+            .field("has_description", &self.description.is_some())
+            .field("is_default", &self.is_default)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigurationOptionValue {
@@ -873,9 +991,19 @@ impl ConfigurationOptionValue {
 }
 
 /// Every option a session exposes, in the vendor's own order.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct ConfigurationCatalog(Vec<ConfigurationOption>);
+
+impl fmt::Debug for ConfigurationCatalog {
+    /// Reports catalog size without logging vendor-defined rows.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationCatalog")
+            .field("option_count", &self.0.len())
+            .finish()
+    }
+}
 
 impl ConfigurationCatalog {
     /// A catalog of these options.
@@ -966,7 +1094,7 @@ impl ConfigurationCatalog {
 /// of three options and was refused the third is [`ConfigurationOutcome::is_partial`], and saying
 /// so is the difference between a host showing the truth and a host showing a transaction that
 /// never happened.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ConfigurationOutcome {
@@ -980,6 +1108,19 @@ pub struct ConfigurationOutcome {
     pub rejected: Vec<RejectedSetting>,
     /// What happened to the settings that had already landed when one was refused.
     pub rollback: Rollback,
+}
+
+impl fmt::Debug for ConfigurationOutcome {
+    /// Reports configuration outcome shape without logging option ids or vendor refusals.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationOutcome")
+            .field("state", &self.state)
+            .field("applied_count", &self.applied.len())
+            .field("rejected_count", &self.rejected.len())
+            .field("rollback", &self.rollback)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigurationOutcome {
@@ -1041,7 +1182,7 @@ impl ConfigurationOutcome {
 }
 
 /// One axis a harness would not set, and why.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct RejectedSetting {
@@ -1049,6 +1190,16 @@ pub struct RejectedSetting {
     pub option: ConfigurationOptionId,
     /// Why not.
     pub reason: SettingRejection,
+}
+
+impl fmt::Debug for RejectedSetting {
+    /// Reports a rejection class without logging the option id or vendor text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RejectedSetting")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RejectedSetting {
@@ -1059,7 +1210,7 @@ impl RejectedSetting {
 }
 
 /// Why one requested setting did not land.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum SettingRejection {
@@ -1082,6 +1233,19 @@ pub enum SettingRejection {
         /// What the vendor said, bounded.
         detail: String,
     },
+}
+
+impl fmt::Debug for SettingRejection {
+    /// Names a rejection without logging vendor-provided details or values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnknownOption => "UnknownOption",
+            Self::UnsupportedValue { .. } => "UnsupportedValue",
+            Self::ResetNotSupported => "ResetNotSupported",
+            Self::NotChangeableAfterOpen => "NotChangeableAfterOpen",
+            Self::RefusedByVendor { .. } => "RefusedByVendor",
+        })
+    }
 }
 
 impl SettingRejection {
@@ -1145,6 +1309,41 @@ impl fmt::Display for Rollback {
     }
 }
 
+/// Refuses native configuration axes for a harness that only supports the common settings.
+///
+/// The shared rule keeps harnesses from each deciding whether an unknown native axis is ignored,
+/// sent, or refused. A `Keep` entry is inert and accepted; a `Set` or `Reset` is refused before a
+/// harness encodes the patch.
+///
+/// # Errors
+///
+/// [`Error::Protocol`] naming the unsupported native option id and the supported axes.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::{
+///     configuration, ConfigurationChange, ConfigurationOptionId, ConfigurationPatch,
+///     ConfigurationValue,
+/// };
+///
+/// let patch = ConfigurationPatch::new().native(
+///     ConfigurationOptionId::new("web-search"),
+///     ConfigurationChange::Set(ConfigurationValue::Boolean(true)),
+/// );
+/// assert!(configuration::refuse_unsupported_native(&patch).is_err());
+/// ```
+pub fn refuse_unsupported_native(patch: &ConfigurationPatch) -> Result<()> {
+    let Some((option, _)) = patch.native.iter().find(|(_, change)| !change.is_keep()) else {
+        return Ok(());
+    };
+
+    Err(Error::Protocol {
+        expected: String::from("a configuration patch using model, effort, level, or routing"),
+        received: option.as_str().to_owned(),
+    })
+}
+
 /// Refuses a patch that asks a vendor without reset semantics to remove an override.
 ///
 /// The one rule shared by every harness whose vendor cannot reset, written once so three crates do
@@ -1184,6 +1383,7 @@ mod tests {
         ConfigurationSource, ConfigurationState, ConfigurationValue, ConfigurationValueType,
         Rollback,
     };
+    use crate::error::Error;
     use crate::permission::{ApprovalRouting, PermissionLevel};
 
     /// The distinction the old optional field could not make: a host that had set an override had
@@ -1241,6 +1441,35 @@ mod tests {
         let resetting = ConfigurationPatch::new().effort(ConfigurationChange::Reset);
         assert!(!resetting.is_empty());
         assert!(resetting.asks_for_a_reset());
+    }
+
+    /// A harness without vendor-native settings must refuse every active native axis, including a
+    /// reset that carries no value. A retained `Keep` entry asks it to encode nothing.
+    #[test]
+    fn unsupported_native_axes_are_refused_but_kept_native_axes_are_inert() {
+        for change in [
+            ConfigurationChange::Set(ConfigurationValue::Boolean(true)),
+            ConfigurationChange::Reset,
+        ] {
+            let error = super::refuse_unsupported_native(
+                &ConfigurationPatch::new().native(ConfigurationOptionId::new("web-search"), change),
+            )
+            .expect_err("expected an active native axis to be refused");
+            let Error::Protocol { expected, received } = error else {
+                panic!("expected a protocol refusal");
+            };
+            assert_eq!(
+                expected,
+                "a configuration patch using model, effort, level, or routing"
+            );
+            assert_eq!(received, "web-search");
+        }
+
+        super::refuse_unsupported_native(&ConfigurationPatch::new().native(
+            ConfigurationOptionId::new("web-search"),
+            ConfigurationChange::Keep,
+        ))
+        .expect("expected an inert native axis to be accepted");
     }
 
     /// A vendor with no reset must refuse rather than report a success it did not have.

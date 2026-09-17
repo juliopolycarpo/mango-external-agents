@@ -104,10 +104,17 @@ macro_rules! identifier {
         /// Validated on construction and serialized as the bare string it was built from, so a
         /// value a host persisted is the value it reads back.
         #[derive(
-            Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+            Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
         )]
         #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
+
+        impl fmt::Debug for $name {
+            /// Marks an identifier without logging its host-provided spelling.
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(stringify!($name))
+            }
+        }
 
         impl $name {
             #[doc = concat!("Checks and wraps one ", $subject, ".")]
@@ -302,9 +309,7 @@ impl ProtocolFamily {
 /// Carried on [`HarnessDescriptor`](crate::HarnessDescriptor) and knowable without touching the
 /// machine. Splitting them is what lets a host group every ACP agent under one protocol while
 /// still dispatching to each by its own id.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct HarnessIdentity {
@@ -315,6 +320,16 @@ pub struct HarnessIdentity {
     /// Which profile inside that dialect, for a family that has more than one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileId>,
+}
+
+impl fmt::Debug for HarnessIdentity {
+    /// Reports identity shape without logging host-selected registration or profile ids.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HarnessIdentity")
+            .field("has_profile", &self.profile.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl HarnessIdentity {

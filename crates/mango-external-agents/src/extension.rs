@@ -20,6 +20,7 @@
 //! and a harness that finds itself putting something load-bearing here should be adding a field.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::normalize::{self, TextLimit};
 
@@ -47,7 +48,7 @@ const EXTENSION_VALUE_LIMIT: TextLimit = TextLimit::ApprovalOptionLabel;
 /// Scalars only. There is no list arm and no map arm, and that is the design: nesting is what
 /// turns a metadata field into a payload channel, and a host that has to walk a tree to render a
 /// label is a host depending on a vendor's wire shape.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ExtensionValue {
@@ -59,6 +60,18 @@ pub enum ExtensionValue {
     Float(f64),
     /// A flag.
     Boolean(bool),
+}
+
+impl fmt::Debug for ExtensionValue {
+    /// Names the extension value type without formatting vendor-provided text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Text(_) => "Text",
+            Self::Integer(_) => "Integer",
+            Self::Float(_) => "Float",
+            Self::Boolean(_) => "Boolean",
+        })
+    }
 }
 
 impl ExtensionValue {
@@ -102,9 +115,19 @@ impl ExtensionValue {
 /// assert_eq!(extensions.get("sandbox"), Some(&ExtensionValue::text("workspace-write")));
 /// assert!(extensions.get("absent").is_none());
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct Extensions(BTreeMap<String, ExtensionValue>);
+
+impl fmt::Debug for Extensions {
+    /// Reports extension count without logging vendor-defined keys or values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Extensions")
+            .field("entry_count", &self.0.len())
+            .finish()
+    }
+}
 
 impl Extensions {
     /// Nothing carried.

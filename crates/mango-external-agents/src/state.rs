@@ -171,7 +171,7 @@ impl TransportSelection {
 ///
 /// A value, not a view: reading two fields off one snapshot reads them from the same instant,
 /// which a set of getters on a live session could not promise.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SessionSnapshot {
     /// Which version of the picture this is.
@@ -205,6 +205,34 @@ pub struct SessionSnapshot {
     /// A host comparing it against its own cache is asking "how old is what I am looking at",
     /// which a value frozen at open could not answer.
     pub observed_at: SystemTime,
+}
+
+impl fmt::Debug for SessionSnapshot {
+    /// Reports session state without logging host ids, vendor ids, commands, or fallback text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionSnapshot")
+            .field("revision", &self.revision)
+            .field(
+                "has_host_session_id",
+                &!self.ids.session_id.as_str().is_empty(),
+            )
+            .field(
+                "has_native_session_id",
+                &!self.ids.native_session_id.is_empty(),
+            )
+            .field("harness", &self.harness)
+            .field("transport", &self.transport)
+            .field("status", &self.status)
+            .field("capabilities", &self.capabilities)
+            .field("configuration", &self.configuration)
+            .field("catalog", &self.catalog)
+            .field("command_count", &self.commands.len())
+            .field("resumed", &self.resumed)
+            .field("has_fallback_reason", &self.fallback_reason.is_some())
+            .field("observed_at", &self.observed_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionSnapshot {
@@ -430,9 +458,19 @@ impl SessionState {
 /// That is the right behaviour for a snapshot — an old picture of the present is not useful — and
 /// it is why [`SessionRevision`] exists, so a consumer that cares can tell coalescing from
 /// stillness.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionSubscription {
     receiver: watch::Receiver<Arc<SessionSnapshot>>,
+}
+
+impl fmt::Debug for SessionSubscription {
+    /// Reports the latest session picture without formatting the watch receiver internals.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionSubscription")
+            .field("current", &self.current())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionSubscription {

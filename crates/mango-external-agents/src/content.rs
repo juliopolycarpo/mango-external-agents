@@ -12,6 +12,8 @@
 //! raw vendor frame, and nothing here is executable — a [`FileChange`] is a description of an edit
 //! the vendor already made or proposes to make, never an instruction a host applies.
 
+use std::fmt;
+
 use crate::normalize::{self, TextLimit};
 
 /// How many steps one plan may carry.
@@ -49,7 +51,7 @@ pub enum PlanStepStatus {
 }
 
 /// One step of a plan the vendor wrote.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct PlanStep {
@@ -62,6 +64,17 @@ pub struct PlanStep {
     pub title: String,
     /// Where it stands.
     pub status: PlanStepStatus,
+}
+
+impl fmt::Debug for PlanStep {
+    /// Reports a plan step's status without replaying vendor text or ids.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlanStep")
+            .field("has_id", &self.id.is_some())
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PlanStep {
@@ -126,7 +139,7 @@ pub enum FileChangeKind {
 /// A description, never an instruction. Nothing in this library applies one, and a host that reads
 /// `unified_diff` is reading a record of what the vendor did inside its own authorised working
 /// directory.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct FileChange {
@@ -146,6 +159,20 @@ pub struct FileChange {
     /// The diff itself, when the vendor sent one and it fits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_diff: Option<String>,
+}
+
+impl fmt::Debug for FileChange {
+    /// Reports a file change's shape without logging paths or diff content.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileChange")
+            .field("kind", &self.kind)
+            .field("has_previous_path", &self.previous_path.is_some())
+            .field("added_lines", &self.added_lines)
+            .field("removed_lines", &self.removed_lines)
+            .field("has_unified_diff", &self.unified_diff.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FileChange {
@@ -208,7 +235,7 @@ impl FileChange {
 /// One arm per shape the library has agreed to carry. A vendor producing something else is carried
 /// as an [`Activity`](crate::Activity) with its `detail` and whatever
 /// [`Extensions`](crate::Extensions) the harness kept — not as an arm nobody can render.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ActivityContent {
@@ -227,6 +254,23 @@ pub enum ActivityContent {
         /// What it produced, bounded.
         text: String,
     },
+}
+
+impl fmt::Debug for ActivityContent {
+    /// Reports activity content shape without replaying vendor payloads.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plan { steps } => formatter
+                .debug_struct("Plan")
+                .field("step_count", &steps.len())
+                .finish(),
+            Self::Diff { files } => formatter
+                .debug_struct("Diff")
+                .field("file_count", &files.len())
+                .finish(),
+            Self::Output { .. } => formatter.write_str("Output"),
+        }
+    }
 }
 
 impl ActivityContent {
