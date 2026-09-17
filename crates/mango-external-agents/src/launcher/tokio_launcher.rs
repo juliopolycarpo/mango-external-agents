@@ -16,6 +16,33 @@ use crate::process::{
 };
 use crate::session::CancelReason;
 
+/// Applies the host's exact working directory, environment and pipe policy to a command.
+fn configured_command(spec: &LaunchSpec, program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(&spec.argv[1..])
+        .current_dir(&spec.cwd)
+        // The allowlist is the whole environment, not an addition to this process's.
+        .env_clear()
+        .envs(&spec.env)
+        .stdin(if spec.stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    if spec.hide_window {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+}
+
 /// How much of a child's output is read at once.
 const CHUNK_BYTES: usize = 16 * 1024;
 
@@ -27,7 +54,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 ///
 /// On Unix a child leads its own process group, so escalation reaches everything it started rather
 /// than only the process the library can see. On Windows the tree is ended through `taskkill /T`,
-/// because a direct child handle does not imply ownership of its descendants there.
+/// because a direct child handle does not imply ownership of its descendants there. Installed
+/// PowerShell entrypoints use `powershell.exe -File` after native executable resolution fails;
+/// script and interpreter paths come only from the supplied launch environment.
 ///
 /// Escalation asks before it insists: the caller closes stdin, then this sends the polite signal,
 /// waits out the grace, and only then insists. A vendor asked to stop writes its own state first,
@@ -133,29 +162,23 @@ impl ProcessLauncher for TokioLauncher {
             });
         };
 
-        let mut command = Command::new(program);
-        command
-            .args(&spec.argv[1..])
-            .current_dir(&spec.cwd)
-            // The allowlist is the whole environment, not an addition to this process's.
-            .env_clear()
-            .envs(&spec.env)
-            .stdin(if spec.stdin {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        #[cfg(unix)]
-        command.process_group(0);
+        let mut command = configured_command(&spec, program);
+        let launched = command.spawn();
         #[cfg(windows)]
-        if spec.hide_window {
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let mut child = command.spawn().map_err(|error| Error::Launch {
+        let launched = launched.or_else(|error| {
+            let script = std::path::Path::new(program)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"));
+            if error.kind() != std::io::ErrorKind::NotFound && !script {
+                return Err(error);
+            }
+            let Some(fallback) = super::powershell::fallback(&spec) else {
+                return Err(error);
+            };
+            configured_command(&fallback, &fallback.argv[0]).spawn()
+        });
+        let mut child = launched.map_err(|error| Error::Launch {
             program: program.to_owned(),
             message: error.to_string(),
         })?;
@@ -839,6 +862,38 @@ mod tests {
             fixture_lines("lines").await,
             vec![String::from("first line"), String::from("second")]
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_powershell_cli_on_path_receives_literal_arguments() {
+        let directory = std::env::temp_dir().join(format!("mea-script-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("fixture directory");
+        let script = directory.join("mea-fixture.ps1");
+        std::fs::write(&script, "Write-Output $args[0]\n").expect("fixture script");
+        let literal = "literal $(Get-Date); & text";
+        for program in [
+            String::from("mea-fixture"),
+            script.to_string_lossy().into_owned(),
+        ] {
+            let mut spec = fixture("lines");
+            spec.argv = vec![program, literal.into()];
+            spec.env
+                .insert("PATH".into(), directory.to_string_lossy().into_owned());
+            let child = match TokioLauncher::new().spawn(spec).await {
+                Ok(child) => child,
+                Err(error) => panic!(
+                    "expected a PowerShell CLI on the supplied PATH to launch, received {error}"
+                ),
+            };
+            let mut lines = LineStream::new(child.stdout, LineLimits::default());
+            assert_eq!(
+                lines.next_line().await.expect("stdout"),
+                Some(literal.into())
+            );
+            assert!(child.control.wait().await.expect("exit status").success());
+        }
+        std::fs::remove_dir_all(&directory).expect("remove fixture directory");
     }
 
     #[tokio::test]

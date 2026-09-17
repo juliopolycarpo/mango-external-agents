@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use mango_agent_acp::testing::{Approval, FakeAcpAgent};
 use mango_agent_acp::{AcpHarness, AcpProfile, SessionModeIds};
-use mango_external_agents::testing::{FakeLauncher, FakeProcess, RecordingBroker};
+use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, RecordingBroker};
 use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, Clock, CloseReason, Configuration,
     DecisionSource, Error, EventKind, Harness, HostContext, Limits, OpenSession, PermissionLevel,
@@ -34,6 +34,10 @@ fn host(launcher: &FakeLauncher) -> HostContext {
         .launcher(Arc::new(launcher.clone()))
         .cwd(std::env::temp_dir())
         .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            approval_timeout: Duration::from_secs(120),
+            ..Limits::default()
+        })
         .build()
         .expect("expected a host")
 }

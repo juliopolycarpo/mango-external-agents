@@ -14,8 +14,8 @@ use crate::event::{AgentEvent, EventKind};
 use crate::harness::{Capability, Harness};
 use crate::host::HostContext;
 use crate::session::{
-    CancelReason, CloseReason, OpenSession, ReviewRequest, ReviewTarget, Session, SessionQuery,
-    Steer, TurnRequest,
+    Attachment, AttachmentKind, CancelReason, CloseReason, Configuration, OpenSession,
+    ReviewRequest, ReviewTarget, Session, SessionQuery, Steer, TurnRequest,
 };
 
 /// How one check went.
@@ -441,6 +441,57 @@ async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
         if !refuses_as_unsupported(&outcome, Capability::AccountUsage) {
             failures.push(String::from(
                 "expected account usage to refuse as unsupported, received something else",
+            ));
+        }
+    }
+
+    if !capabilities.has(Capability::InteractiveApprovals) {
+        let outcome = session
+            .respond(crate::permission::PermissionResponse::from_user(
+                "conformance-approval-unsupported",
+                "deny",
+            ))
+            .await;
+        if !refuses_as_unsupported(&outcome, Capability::InteractiveApprovals) {
+            failures.push(String::from(
+                "expected interactive approvals to refuse as unsupported, received something else",
+            ));
+        }
+    }
+
+    if !capabilities.has(Capability::Configuration) {
+        let outcome = session
+            .start_turn(
+                TurnRequest::new("conformance-configuration-unsupported", "say hello")
+                    .with_configuration(Configuration::default()),
+            )
+            .await
+            .map(|_| ());
+        if !refuses_as_unsupported(&outcome, Capability::Configuration) {
+            failures.push(String::from(
+                "expected per-turn configuration to refuse as unsupported, received something else",
+            ));
+        }
+    }
+
+    if !capabilities.has(Capability::Images) {
+        let outcome = session
+            .start_turn(
+                TurnRequest::new("conformance-image-unsupported", "look at this").with_attachments(
+                    vec![Attachment {
+                        id: String::from("conformance-image"),
+                        name: String::from("image.png"),
+                        mime_type: String::from("image/png"),
+                        kind: AttachmentKind::Image,
+                        bytes: vec![0x89, 0x50],
+                    }],
+                ),
+            )
+            .await
+            .map(|_| ());
+        if !refuses_as_unsupported(&outcome, Capability::Images) {
+            failures.push(String::from(
+                "expected images to refuse as unsupported, received something else",
             ));
         }
     }

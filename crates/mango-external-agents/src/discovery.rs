@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use crate::harness::Capabilities;
 use crate::normalize::{self, MODEL_CATALOG_MAX_ITEMS, REASONING_EFFORT_MAX_ITEMS, TextLimit};
+use crate::permission::{PermissionMatrix, UnsupportedReason};
 
 /// How the installed CLI was found, and what it can do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +28,12 @@ pub struct Discovery {
     pub auth: AuthState,
     /// What this build actually supports, which may be narrower than the harness's ceiling.
     pub capabilities: Capabilities,
+    /// Which permission configurations this installed build can run.
+    ///
+    /// A probe may narrow the harness declaration for account or policy facts it learned. The
+    /// provided [`Harness::discover`](crate::Harness::discover) method clamps it back to that
+    /// declaration before a host receives it.
+    pub permission_matrix: PermissionMatrix,
     /// The models the vendor advertises, when it enumerates them.
     pub models: Vec<Model>,
 }
@@ -40,6 +47,9 @@ impl Discovery {
             gate: GateVerdict::NotInstalled,
             auth: AuthState::Unknown,
             capabilities: Capabilities::none(),
+            permission_matrix: PermissionMatrix::none(UnsupportedReason::Other(String::from(
+                "the agent executable is not installed",
+            ))),
             models: Vec::new(),
         }
     }
@@ -65,6 +75,7 @@ impl Discovery {
                 .map(|version| normalize::bound_text(&version, TextLimit::AccountLabel).text),
             gate: self.gate.normalized(),
             auth: self.auth.normalized(),
+            permission_matrix: self.permission_matrix.normalized(),
             models: self
                 .models
                 .into_iter()
@@ -73,6 +84,18 @@ impl Discovery {
                 .collect(),
             ..self
         }
+    }
+
+    /// This discovery constrained by the harness facts that are true before probing.
+    #[must_use]
+    pub fn bounded_by(
+        mut self,
+        capability_ceiling: &Capabilities,
+        declared_permissions: &PermissionMatrix,
+    ) -> Self {
+        self.capabilities = self.capabilities.clamped_to(capability_ceiling);
+        self.permission_matrix = self.permission_matrix.bounded_by(declared_permissions);
+        self
     }
 }
 
@@ -290,6 +313,7 @@ impl ReasoningEffort {
 mod tests {
     use super::{AuthMode, AuthState, Discovery, GateVerdict, Model, ReasoningEffort};
     use crate::harness::Capabilities;
+    use crate::permission::{PermissionMatrix, UnsupportedReason};
 
     fn usable() -> Discovery {
         Discovery {
@@ -300,6 +324,7 @@ mod tests {
                 mode: AuthMode::Subscription,
             },
             capabilities: Capabilities::none(),
+            permission_matrix: PermissionMatrix::none(UnsupportedReason::NotOfferedByVendor),
             models: Vec::new(),
         }
     }
@@ -310,6 +335,18 @@ mod tests {
         assert_eq!(discovery.gate, GateVerdict::NotInstalled);
         assert_eq!(discovery.auth, AuthState::Unknown);
         assert_eq!(discovery.capabilities, Capabilities::none());
+        assert_eq!(discovery.permission_matrix.cells().len(), 6);
+        assert!(
+            discovery.permission_matrix.cells().iter().all(|cell| {
+                !cell.supported
+                    && matches!(
+                        cell.unsupported_reason,
+                        Some(UnsupportedReason::Other(ref reason))
+                            if reason == "the agent executable is not installed"
+                    )
+            }),
+            "expected every permission configuration to stay unavailable without an executable"
+        );
         assert!(!discovery.is_usable());
     }
 

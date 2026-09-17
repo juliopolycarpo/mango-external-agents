@@ -228,6 +228,98 @@ impl PermissionMatrix {
     pub fn supports(&self, level: PermissionLevel, routing: ApprovalRouting) -> bool {
         self.cell(level, routing).is_some_and(|cell| cell.supported)
     }
+
+    /// Keeps only the pairs this harness declared, while preserving probe-time refusals.
+    ///
+    /// The declaration is the upper bound. A probe can discover that an account, an administrator
+    /// policy, or an older build removes a pair; it cannot make an undeclared pair available.
+    #[must_use]
+    pub fn bounded_by(&self, declaration: &Self) -> Self {
+        Self::build(|level, routing| {
+            let Some(declared) = declaration.cell(level, routing) else {
+                return ConfigurationVerdict::unsupported(UnsupportedReason::Other(String::from(
+                    "the declaration did not describe this permission configuration",
+                )));
+            };
+            if !declared.supported {
+                return ConfigurationVerdict::Unsupported {
+                    reason: declared
+                        .unsupported_reason
+                        .clone()
+                        .unwrap_or(UnsupportedReason::NotOfferedByVendor),
+                    vendor_id: declared.vendor_id.clone(),
+                };
+            }
+
+            let Some(probed) = self.cell(level, routing) else {
+                return ConfigurationVerdict::unsupported(UnsupportedReason::Other(String::from(
+                    "the probe did not describe this permission configuration",
+                )));
+            };
+            if probed.supported {
+                return ConfigurationVerdict::Supported {
+                    vendor_id: probed
+                        .vendor_id
+                        .clone()
+                        .or_else(|| declared.vendor_id.clone()),
+                };
+            }
+            ConfigurationVerdict::Unsupported {
+                reason: probed
+                    .unsupported_reason
+                    .clone()
+                    .unwrap_or(UnsupportedReason::NotOfferedByVendor),
+                vendor_id: probed
+                    .vendor_id
+                    .clone()
+                    .or_else(|| declared.vendor_id.clone()),
+            }
+        })
+        .normalized()
+    }
+
+    /// This matrix with vendor-written ids and explanations bounded.
+    ///
+    /// Permission declarations are static harness facts, but a probe can narrow one with a
+    /// vendor-provided configuration id or policy explanation. Those values reach a host's picker
+    /// and diagnostics, so ids are dropped unless they survive intact and explanations are bounded
+    /// as detail text.
+    pub(crate) fn normalized(&self) -> Self {
+        Self::build(|level, routing| {
+            let Some(configuration) = self.cell(level, routing) else {
+                return ConfigurationVerdict::unsupported(UnsupportedReason::Other(String::from(
+                    "the matrix did not describe this permission configuration",
+                )));
+            };
+            let vendor_id = configuration
+                .vendor_id
+                .as_deref()
+                .and_then(|id| normalize::opaque_id(id, "permission configuration vendor id").ok());
+            if configuration.supported {
+                return ConfigurationVerdict::Supported { vendor_id };
+            }
+            ConfigurationVerdict::Unsupported {
+                reason: configuration
+                    .unsupported_reason
+                    .clone()
+                    .unwrap_or(UnsupportedReason::NotOfferedByVendor)
+                    .normalized(),
+                vendor_id,
+            }
+        })
+    }
+}
+
+impl UnsupportedReason {
+    /// This reason with its vendor-written explanation bounded.
+    fn normalized(self) -> Self {
+        match self {
+            Self::Other(reason) => {
+                Self::Other(normalize::bound_text(&reason, TextLimit::Detail).text)
+            }
+            reason => reason,
+        }
+    }
 }
 
 /// What one approval option means, whoever the vendor is.
@@ -652,6 +744,79 @@ mod tests {
                 "expected a reason exactly when unsupported, received {cell:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_probe_can_narrow_a_declared_cell_but_cannot_widen_one() {
+        let declaration = PermissionMatrix::build(|level, routing| {
+            if level == PermissionLevel::FullAccess && routing == ApprovalRouting::AutoReview {
+                return ConfigurationVerdict::unsupported(
+                    UnsupportedReason::UnattendedNotPermitted,
+                );
+            }
+            ConfigurationVerdict::supported()
+        });
+        let probe = PermissionMatrix::build(|level, routing| {
+            if level == PermissionLevel::ReadOnly && routing == ApprovalRouting::User {
+                return ConfigurationVerdict::unsupported(UnsupportedReason::RequiresNewerVersion);
+            }
+            ConfigurationVerdict::supported()
+        });
+
+        let bounded = probe.bounded_by(&declaration);
+
+        assert!(
+            !bounded.supports(PermissionLevel::FullAccess, ApprovalRouting::AutoReview),
+            "a probe must not widen a declared refusal"
+        );
+        assert!(
+            !bounded.supports(PermissionLevel::ReadOnly, ApprovalRouting::User),
+            "a probe's narrower reading must reach the host"
+        );
+    }
+
+    #[test]
+    fn bounding_a_probe_drops_unsafe_vendor_ids_and_bounds_its_explanation() {
+        let declaration = PermissionMatrix::build(|_, _| ConfigurationVerdict::supported());
+        let probe = PermissionMatrix::build(|level, routing| {
+            if level == PermissionLevel::ReadOnly && routing == ApprovalRouting::User {
+                return ConfigurationVerdict::Unsupported {
+                    reason: UnsupportedReason::Other(format!(
+                        "policy{}\u{202e}",
+                        "x".repeat(5_000)
+                    )),
+                    vendor_id: Some("v".repeat(129)),
+                };
+            }
+            ConfigurationVerdict::Supported {
+                vendor_id: Some(String::from("safe-mode")),
+            }
+        });
+
+        let bounded = probe.bounded_by(&declaration);
+        let refused = bounded
+            .cell(PermissionLevel::ReadOnly, ApprovalRouting::User)
+            .expect("expected the read-only user cell");
+
+        assert_eq!(
+            refused.vendor_id, None,
+            "expected an over-long opaque vendor id to be refused rather than copied"
+        );
+        assert!(
+            matches!(
+                refused.unsupported_reason,
+                Some(UnsupportedReason::Other(ref reason))
+                    if reason.chars().count() == 4_096 && !reason.contains('\u{202e}')
+            ),
+            "expected the vendor explanation to be stripped and bounded, received {refused:?}"
+        );
+        assert_eq!(
+            bounded
+                .cell(PermissionLevel::Default, ApprovalRouting::User)
+                .and_then(|cell| cell.vendor_id.as_deref()),
+            Some("safe-mode"),
+            "expected a safe opaque id to remain exact"
+        );
     }
 
     #[test]

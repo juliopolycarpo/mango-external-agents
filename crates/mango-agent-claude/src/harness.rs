@@ -217,14 +217,15 @@ impl Harness for ClaudeHarness {
         &self.descriptor
     }
 
-    /// The matrix before anything is probed, which can only describe the shape of the six cells.
+    /// The upper bound before a build, account or managed policy narrows the choices.
     ///
-    /// `auto` is refused here because it depends on the account and no account has been read: this
-    /// is the trait's declaration, and [`Discovery`] is where a probed answer lives. A host that
-    /// wants the real matrix opens a session, whose
-    /// [`SessionInfo::effective_configuration`] was vetted against a probe.
+    /// Declaring auto-review here does not enable it. Discovery and session opening still require
+    /// an eligible account and a CLI that advertises the mode.
     fn permission_matrix(&self) -> PermissionMatrix {
-        permissions::matrix(&ModeAvailability::default())
+        permissions::matrix(&ModeAvailability {
+            account_kind: Some(crate::auth::AccountKind::Subscription),
+            ..ModeAvailability::default()
+        })
     }
 
     async fn probe(&self, host: &HostContext) -> Result<Discovery> {
@@ -244,6 +245,7 @@ impl Harness for ClaudeHarness {
                 },
                 auth: AuthState::Unknown,
                 capabilities: Capabilities::none(),
+                permission_matrix: permissions::matrix(&survey.availability),
                 models: Vec::new(),
             });
         }
@@ -257,6 +259,7 @@ impl Harness for ClaudeHarness {
             gate: GateVerdict::Usable,
             auth: survey.authentication.state.clone(),
             capabilities: survey.capabilities(models.is_some()),
+            permission_matrix: permissions::matrix(&survey.availability),
             models: models.unwrap_or_default(),
         })
     }
@@ -266,6 +269,7 @@ impl Harness for ClaudeHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
+        self.validate_open_session(&request)?;
         let executable = self.executable_for(&request);
         let survey = self.survey(host, &executable).await;
 
@@ -293,13 +297,9 @@ impl Harness for ClaudeHarness {
         // Refused rather than dropped. A session that quietly ignored the servers a host
         // configured would run every turn without the tools somebody set up, and report success.
         if !request.mcp_servers.is_empty() && !survey.declares_mcp_config() {
-            return Err(Error::HostConfiguration {
-                expected: "a build that declares --mcp-config, for a session that configures MCP servers",
-                received: format!(
-                    "{} servers on a build that does not",
-                    request.mcp_servers.len()
-                ),
-            });
+            return Err(Error::not_supported(
+                mango_external_agents::Capability::McpPassthrough,
+            ));
         }
         let resumed = request.resume.is_some();
         let native_session_id = match &request.resume {
@@ -363,6 +363,7 @@ const fn probed_capabilities() -> Capabilities {
         resume: true,
         cancellation: true,
         usage_reporting: true,
+        configuration: true,
         model_catalog: false,
         mcp_passthrough: false,
         interactive_approvals: false,
@@ -453,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn the_declared_matrix_describes_all_six_cells_without_promising_auto() {
+    fn the_declared_matrix_is_a_ceiling_for_all_six_cells() {
         let matrix = ClaudeHarness::new().permission_matrix();
         assert_eq!(matrix.cells().len(), 6);
         assert!(
@@ -461,8 +462,8 @@ mod tests {
             "expected the ordinary pair to be selectable before any probe"
         );
         assert!(
-            !matrix.supports(PermissionLevel::Default, ApprovalRouting::AutoReview),
-            "expected auto to fail closed until an account is read"
+            matrix.supports(PermissionLevel::Default, ApprovalRouting::AutoReview),
+            "expected the declaration to retain modes an eligible account can use"
         );
     }
 

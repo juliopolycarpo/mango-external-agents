@@ -9,7 +9,7 @@ mod support;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use mango_agent_codex::{CodexHarness, approvals::APPROVAL_TIMEOUT};
+use mango_agent_codex::CodexHarness;
 use mango_external_agents::event::EventKind;
 use mango_external_agents::permission::{
     BrokerDecision, DecisionSource, PermissionBroker, PermissionOptionKind, PermissionRequest,
@@ -29,6 +29,10 @@ impl Clock for FixedClock {
     fn now(&self) -> SystemTime {
         self.0
     }
+}
+
+fn approval_timeout() -> std::time::Duration {
+    replay_limits().approval_timeout
 }
 
 /// A host clock that steps backward by a fixed drift on every read after its first.
@@ -373,6 +377,13 @@ fn replay_limits() -> mango_external_agents::Limits {
         // A call the replay has no answer for is a bug in the fixture or in the harness, and the
         // default two minutes would report it as a test that hangs rather than one that fails.
         request_timeout: std::time::Duration::from_secs(5),
+        // Deliberately long, and not shortened the way `request_timeout` was. Every test that
+        // exercises this deadline runs under `start_paused`, where `tokio::time::advance` reaches
+        // it instantly whatever it is; every other test in this file runs on the real clock and
+        // answers its approval from host code. A short value there is a wall-clock budget between
+        // `await_approval` and `respond`, which a loaded runner spends before the answer lands —
+        // the harness then declines on the host's behalf and the decision arrives as `Expired`.
+        approval_timeout: std::time::Duration::from_secs(30 * 60),
         ..mango_external_agents::Limits::default()
     }
 }
@@ -1093,7 +1104,7 @@ async fn a_stalled_broker_is_refused_at_the_original_approval_deadline() {
         .expect("expected a turn");
 
     await_approval(&mut turn).await;
-    tokio::time::advance(APPROVAL_TIMEOUT).await;
+    tokio::time::advance(approval_timeout()).await;
     let events = drain(&mut turn).await;
 
     assert!(
@@ -1138,7 +1149,7 @@ async fn a_timely_host_choice_is_not_retroactively_expired() {
         .respond(request.allow().expect("expected an allow option"))
         .await
         .expect("expected the pre-deadline host grant to be accepted");
-    tokio::time::advance(APPROVAL_TIMEOUT).await;
+    tokio::time::advance(approval_timeout()).await;
     let events = drain(&mut turn).await;
 
     assert!(
@@ -1179,7 +1190,7 @@ async fn a_host_decision_after_the_approval_deadline_is_rejected() {
         .expect("expected a turn");
 
     let request = await_approval(&mut turn).await;
-    tokio::time::advance(APPROVAL_TIMEOUT).await;
+    tokio::time::advance(approval_timeout()).await;
     let error = session
         .respond(request.allow().expect("expected an allow option"))
         .await
@@ -1245,11 +1256,11 @@ async fn the_approval_deadline_reuses_one_clock_read_despite_a_backward_jump() {
         .expect("expected a turn");
 
     await_approval(&mut turn).await;
-    // Past the advertised 30-minute deadline, but short of the 35 minutes a stray second clock
-    // read (5-minute drift) would stretch it to. Checked on the wire rather than by draining to
+    // Past the advertised deadline, but short of the extra five minutes a stray second clock
+    // read would add. Checked on the wire rather than by draining to
     // the terminal: a still-open deadline leaves the turn running, which `drain`'s own timeout
     // would report as a hang rather than as the missed deadline this test is about.
-    tokio::time::advance(APPROVAL_TIMEOUT + std::time::Duration::from_secs(1)).await;
+    tokio::time::advance(approval_timeout() + std::time::Duration::from_secs(1)).await;
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
@@ -1258,7 +1269,7 @@ async fn the_approval_deadline_reuses_one_clock_read_despite_a_backward_jump() {
             .written()
             .iter()
             .any(|line| line.contains("\"decision\":\"decline\"")),
-        "expected the advertised 30-minute deadline to expire on schedule, received {:?}",
+        "expected the advertised deadline to expire on schedule, received {:?}",
         launcher.written()
     );
     let events = drain(&mut turn).await;
@@ -2390,9 +2401,14 @@ async fn host_mcp_servers_are_refused_before_spawning_codex() {
             "expected unsupported MCP configuration to be refused before spawning Codex"
         );
         assert!(
-            matches!(result, Err(mango_external_agents::Error::HostConfiguration { expected, received })
-                if expected.contains("MCP") && received == "1 host-supplied MCP server(s)"),
-            "expected an MCP configuration refusal naming the received server count"
+            matches!(
+                result,
+                Err(mango_external_agents::Error::HostConfiguration {
+                    expected: "no MCP servers for a harness without MCP passthrough",
+                    ref received,
+                }) if received == "MCP server count 1"
+            ),
+            "expected the typed MCP passthrough refusal"
         );
     }
 }

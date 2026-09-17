@@ -1,0 +1,7 @@
+{
+  "command": [
+    "claude",
+    "--version"
+  ],
+  "output": "2.1.270 (Claude Code)"
+}

@@ -166,7 +166,7 @@ the session — not the tool call id, which repeats when an agent asks about the
 not the JSON-RPC id, which is the agent's own to choose and to reuse once a request is no longer
 outstanding.
 
-`PermissionRequest::expires_at` comes from `Limits::request_timeout`. The core's
+`PermissionRequest::expires_at` comes from `Limits::approval_timeout`. The core's
 `ApprovalDeadline` starts when the question arrives and covers broker deliberation and host response
 time. Answers at or after the deadline cannot allow work, even before the timer task runs.
 Expiry selects the agent's `reject_once` option and records `DecisionSource::Expired`. If the agent
@@ -235,6 +235,7 @@ file and shell tools and uses them, which is what the activity events describe.
 | `custom`                       | the host's own argv                  | the host's own        | no                  |
 
 [p-cursor]: https://cursor.com/docs/cli/acp
+[p-cursor-install]: https://cursor.com/docs/cli/installation
 [p-grok]: https://docs.x.ai/build/cli/headless-scripting
 [p-opencode]: https://opencode.ai/docs/acp/
 [p-gemini]: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md
@@ -242,6 +243,7 @@ file and shell tools and uses them, which is what the activity events describe.
 [p-goose]: https://block.github.io/goose/docs/advanced/acp-protocol
 [p-codex]: https://github.com/agentclientprotocol/codex-acp
 [p-claude]: https://github.com/agentclientprotocol/claude-agent-acp
+[p-powershell-file]: https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_powershell_exe?view=powershell-5.1
 
 `tests/smoke.rs` passed on 2026-09-13 against `cursor-agent` 2026.09.10-fd3934a and Grok 1.0.30.
 Each opened a session, returned `pong` and closed. Neither run sent ACP `authenticate`.
@@ -256,6 +258,15 @@ Cursor's [installer](https://cursor.com/install) creates both `agent` and `curso
 of the same executable. Grok also installs an `agent` command, so the Cursor profile uses
 `cursor-agent` for discovery, sessions and its login hint. It never falls back to `agent`: a version
 number from that command cannot establish which vendor owns it.
+
+On native Windows, Cursor documents a PowerShell installation and `agent --version` verification in
+its [installation guide][p-cursor-install]. When its native entrypoint resolves to
+`cursor-agent.ps1`, the launcher uses `powershell.exe -NoProfile -NonInteractive -File <script>
+<args>`. PowerShell documents that `-File` passes the following values as script arguments, while
+`-NoProfile` skips user profiles and `-NonInteractive` turns a prompt into a failure rather than a
+hang in [about_PowerShell_exe][p-powershell-file]. The launcher regression tests cover that
+invocation. A native Windows smoke turn completed against Cursor `2026.08.04-aaa8809`,
+with the expected text and a terminal completion event.
 
 The Grok command is `grok --no-auto-update agent stdio`, using the ACP invocation and update control
 documented in [Headless & Scripting][p-grok]. Its version argv carries the same flag —
@@ -339,9 +350,14 @@ never going to work.
   honest reading of a closed channel: the host abandoned the *events*, not the work, and the core has
   no signal that distinguishes the two. Sending the agent's own cancel there needs a drop hook on
   `TurnStream`, and `Session::cancel` is the call that does it today.
-- **No captured ACP fixtures.** `mea capture` currently captures Codex only. ACP tests
-  drive `testing::FakeAcpAgent`, a named fake that composes the v1 wire as JSON, and `tests/smoke.rs`
-  drives a real agent on demand.
+- **Public OpenCode contract capture.** `mea capture --harness acp --profile opencode` records the
+  installed CLI's version and its v1 `initialize` answer under `fixtures/acp/opencode/contract/`.
+  It sends no `authenticate` or `session/new` request. The capture keeps each auth method's `type`,
+  `id` and `name` and the shape of `agentCapabilities`, drops `_meta` extension objects, and
+  replaces every string *value* inside `agentCapabilities` with `[REDACTED]` rather than guessing
+  which of them is a machine path. It ends the child immediately after the answer.
+  `testing::FakeAcpAgent` still covers the full v1 lifecycle; `tests/smoke.rs` drives a real agent
+  on demand.
 
 ## Smoke test
 
