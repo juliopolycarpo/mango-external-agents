@@ -1799,16 +1799,27 @@ async fn a_recorded_review_runs_on_the_thread_this_session_is_subscribed_to() {
         "expected no delivery member, which the server reads as inline; received {frame}"
     );
 
+    // The review's own id, as `review/start` answered it — the one every later item and
+    // completion on this stream is routed against.
+    let native_turn_id = review.turn.native_turn_id().to_owned();
+
     let events = drain(&mut review.turn).await;
     assert!(
         matches!(events.last(), Some(EventKind::Completed)),
         "expected the review to end like any other turn, received {events:#?}"
     );
     // A review is an attempt like any other, and gets its own acceptance first — there is no
-    // session-wide announcement left to ride the stream instead.
-    assert!(
-        matches!(events.first(), Some(EventKind::TurnStarted { .. })),
-        "expected the review to announce its own acceptance, received {events:#?}"
+    // session-wide announcement left to ride the stream instead. Captured transcripts show the
+    // vendor's own `turn/started` notification can name a different id for a review than
+    // `review/start`'s response does; the announcement must carry the response's id regardless
+    // of whether that notification or the response itself won the race to send it.
+    assert_eq!(
+        events.first(),
+        Some(&EventKind::TurnStarted {
+            native_turn_id: native_turn_id.clone()
+        }),
+        "expected the review to announce its own acceptance under its own response id, \
+         received {events:#?}"
     );
 }
 

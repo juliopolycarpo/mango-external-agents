@@ -668,7 +668,14 @@ impl PeerHandler for CodexHandler {
         // The vendor's own turn id can arrive on a notification before `turn/start` answers.
         // Whichever side learns it first announces the turn as accepted, exactly once, before
         // anything else reaches the host on this attempt's stream.
+        //
+        // Gated on `requires_native_turn_match()`, the same test the reducer itself uses to
+        // decide whether a family's id can be trusted — which excludes `turn/started` on
+        // purpose. Captured review transcripts show its id can differ from `review/start`'s own
+        // response and from every later item and completion for the same review; claiming from
+        // it here would announce a review under an id nothing else on its stream agrees with.
         if active_route.native_turn_id.is_empty()
+            && notification.requires_native_turn_match()
             && let Some(turn_id) = notification.turn_id()
             && let Some((sink, native_turn_id)) = self
                 .shared
