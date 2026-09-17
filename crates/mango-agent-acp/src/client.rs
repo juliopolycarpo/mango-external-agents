@@ -38,6 +38,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use mango_external_agents::approval::ApprovalDeadline;
 use mango_external_agents::event::{EventKind, SessionId};
+use mango_external_agents::normalize::{TextLimit, bound_text};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
     broker_response,
@@ -931,8 +932,11 @@ where
     let sent = connection.connection().send_request(request);
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
+        // A custom profile's id is host-authored, not a library constant, and `Timeout.operation`
+        // is written verbatim by `Display` — bounded the same way a custom login hint is.
+        let id = bound_text(profile.id.as_str(), TextLimit::Title).text;
         return Err(Error::Timeout {
-            operation: format!("{method} on ACP agent {}", profile.id),
+            operation: format!("{method} on ACP agent {id}"),
             after: timeout,
         });
     };

@@ -1230,6 +1230,51 @@ async fn a_handshake_the_agent_never_answers_ends_on_the_hosts_own_deadline() {
     assert_eq!(*after, Duration::from_secs(5));
 }
 
+/// A custom profile's id is host-authored text, not a library constant, so a hostile one must not
+/// reach the timeout diagnostic verbatim.
+#[tokio::test(start_paused = true)]
+async fn a_custom_profiles_id_is_bounded_in_the_timeout_diagnostic() {
+    let hostile_id = format!("fake\u{7}\x1b[31m{}", "x".repeat(4_000));
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeProcess::responding(|_| Vec::new()));
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            request_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+
+    let opened = tokio::time::timeout(
+        Duration::from_secs(600),
+        AcpHarness::new(Arc::new(AcpProfile::custom(
+            hostile_id,
+            ["fake-acp", "acp"],
+            VENDOR,
+        )))
+        .open_session(&host, OpenSession::new("chat-1")),
+    )
+    .await
+    .expect("expected the handshake to give up on its own deadline");
+
+    let error = refusal(opened);
+    let Error::Timeout { operation, .. } = &error else {
+        panic!("received {error:?}");
+    };
+    assert!(
+        !operation.contains('\u{7}') && !operation.contains('\x1b'),
+        "received an operation with unstripped control characters: {operation:?}"
+    );
+    assert!(
+        operation.len() < 1_000,
+        "received an unbounded operation: {} bytes",
+        operation.len()
+    );
+}
+
 /// The same hole `open_session` refuses, one layer down. A turn asking for a level the profile cannot
 /// reach would otherwise set no mode, refuse no request, and run as `Default` while the host believed
 /// it had granted more.
