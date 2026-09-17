@@ -776,7 +776,7 @@ impl fmt::Debug for ReviewRequest {
 pub const SESSION_PAGE_LIMIT: usize = 50;
 
 /// Which of a vendor's own sessions to list.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SessionQuery {
     /// Where to continue from, from a previous page.
     pub cursor: Option<String>,
@@ -813,7 +813,7 @@ impl SessionQuery {
 ///
 /// A pointer, not an import: nothing here carries transcript content. Adopting a session records
 /// which vendor conversation a chat continues, and the vendor keeps the history it wrote.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSession {
     /// The vendor's own handle.
@@ -833,7 +833,7 @@ pub struct NativeSession {
 }
 
 /// One page of a vendor's own sessions.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SessionPage {
     /// The rows.
     pub sessions: Vec<NativeSession>,
@@ -849,6 +849,51 @@ pub struct SessionPage {
     /// A vendor given a bounded [`SessionQuery`] never trips this. Seeing it set means the vendor
     /// returned more than it was asked for.
     pub truncated: bool,
+}
+
+impl fmt::Debug for SessionQuery {
+    /// Records the shape of the request without the cursor or the directory it names.
+    ///
+    /// A vendor cursor is an opaque token and a workspace path is host-provided, so both are
+    /// reported as present rather than written.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionQuery")
+            .field("has_cursor", &self.cursor.is_some())
+            .field("limit", &self.limit)
+            .field("has_workspace_path", &self.workspace_path.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for NativeSession {
+    /// Records that a row exists without logging the conversation it points at.
+    ///
+    /// The id, the title, the preview and the working directory are the vendor's own record of
+    /// what somebody talked about and where — a title is often the first thing they typed — so a
+    /// host that logs a listing logs how many rows it received and what each one carries, not what
+    /// any of them say. The fields are public and a host that needs them reads them.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeSession")
+            .field("has_title", &self.title.is_some())
+            .field("has_preview", &self.preview.is_some())
+            .field("has_workspace_path", &self.workspace_path.is_some())
+            .field("updated_at", &self.updated_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for SessionPage {
+    /// Records what the page holds without the rows or the vendor's cursor.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionPage")
+            .field("session_count", &self.sessions.len())
+            .field("has_next_cursor", &self.next_cursor.is_some())
+            .field("truncated", &self.truncated)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionPage {
@@ -1072,7 +1117,7 @@ mod tests {
     use super::{
         Attachment, AttachmentKind, CancelReason, CloseReason, Configuration, McpServer,
         McpTransport, NativeSession, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
-        SessionPage, TurnRequest,
+        SessionPage, SessionQuery, TurnRequest,
     };
     use crate::permission::{ApprovalRouting, PermissionLevel};
 
@@ -1154,6 +1199,52 @@ mod tests {
             rendered.contains("has_fallback_reason: true"),
             "expected the fallback to be reported as present, received {rendered}"
         );
+    }
+
+    /// The listing surface carries more of a conversation than anything else the library returns.
+    ///
+    /// A title is usually the first thing somebody typed, a preview is the conversation itself, and
+    /// a workspace path names the machine and often the person. `list_sessions` is the one call
+    /// that hands a host a page of them, so a host that logs its result must log a shape.
+    #[test]
+    fn session_listing_debug_reports_shape_without_titles_previews_or_paths() {
+        let query = SessionQuery {
+            cursor: Some(String::from("cursor-secret")),
+            limit: Some(10),
+            workspace_path: Some(std::path::PathBuf::from("/home/person-secret/work")),
+        };
+        let page = SessionPage {
+            sessions: vec![NativeSession {
+                native_session_id: String::from("native-id-secret"),
+                title: Some(String::from("title-secret")),
+                preview: Some(String::from("preview-secret")),
+                workspace_path: Some(String::from("/home/person-secret/work")),
+                updated_at: None,
+            }],
+            next_cursor: Some(String::from("next-cursor-secret")),
+            truncated: true,
+        };
+
+        let rendered = format!("{query:?} {page:?} {:?}", page.sessions[0]);
+        for secret in [
+            "cursor-secret",
+            "next-cursor-secret",
+            "person-secret",
+            "native-id-secret",
+            "title-secret",
+            "preview-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no listing payload in diagnostics, received {rendered}"
+            );
+        }
+        for metadata in ["has_cursor: true", "session_count: 1", "truncated: true"] {
+            assert!(
+                rendered.contains(metadata),
+                "expected {metadata} to survive, received {rendered}"
+            );
+        }
     }
 
     #[test]
