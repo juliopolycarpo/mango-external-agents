@@ -289,9 +289,12 @@ child starts, so the turn never silently falls back to another effort.
 `--mcp-config <path>` ([mcp.md](https://code.claude.com/docs/en/mcp.md)). A file, never the
 inline-string form the flag also accepts: inline would put `env` and `headers` on a command line
 anybody can read. The host supplies an absolute scratch root that is visible at the same path to
-the launched child. On Unix, the root must be owned by the effective user or root; a root writable
-by group or other must be sticky, so another account cannot replace the unique session leaf before
-Claude reads it. The host remains responsible for safe ancestors, ACLs, and child mount mapping.
+the launched child. On Unix, every directory on the root's canonical path must be owned by the
+effective user or root, and a directory writable by group or other must be sticky, so no account
+can replace the unique session leaf — or any name above it — before Claude reads it. The check
+covers the ancestors because Claude opens `--mcp-config` by pathname: the child resolves every
+name again, so a handle this process holds cannot protect that walk. The host remains responsible
+for ACLs and child mount mapping.
 The harness creates one unique leaf below it with owner-only Unix permissions, or the host root's
 inherited Windows ACL, and removes that leaf when the session is closed or dropped. It never
 creates, changes or falls back outside the host root. A missing or unusable root refuses opening

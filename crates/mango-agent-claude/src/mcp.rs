@@ -445,32 +445,55 @@ fn validate_scratch(scratch: &Path) -> Result<()> {
     }
 
     #[cfg(unix)]
-    validate_unix_scratch_root(&metadata)?;
+    validate_unix_scratch_chain(scratch)?;
 
     Ok(())
 }
 
-/// Refuses a root whose owner could replace a session leaf before Claude opens it.
+/// Refuses a root that a third party could replace before Claude opens the file inside it.
 ///
-/// A private root is safe. A shared root also is safe only with the sticky bit: it prevents an
-/// unrelated directory user from renaming the leaf this process owns. Root-owned sticky roots
-/// cover the platform temporary directory without trusting a non-root third party to retain the
-/// configuration the host asked Claude to load.
+/// The root itself is not enough. Claude opens `--mcp-config` by pathname, so every name on the
+/// way there is resolved again inside the child, and a directory entry another user may rename is
+/// a directory entry that names somebody else's file by the time the child follows it. No handle
+/// this process holds can protect that resolution, so the whole chain has to be non-replaceable
+/// rather than only its last link.
+///
+/// The chain is the canonical path's ancestors: canonicalising first means the names checked here
+/// are the names the kernel will walk, not symlinks pointing elsewhere.
 #[cfg(unix)]
-fn validate_unix_scratch_root(metadata: &std::fs::Metadata) -> Result<()> {
+fn validate_unix_scratch_chain(scratch: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let mode = metadata.mode();
-    let owner = metadata.uid();
+    let resolved = std::fs::canonicalize(scratch)
+        .map_err(|error| scratch_failure("resolve the scratch directory", &error))?;
     let effective = nix::unistd::Uid::effective().as_raw();
-    if safe_unix_scratch_root(mode, owner, effective) {
+
+    let mut chain = Vec::new();
+    for ancestor in resolved.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|error| scratch_failure("read a scratch directory ancestor", &error))?;
+        chain.push((metadata.mode(), metadata.uid()));
+    }
+
+    if safe_unix_scratch_chain(&chain, effective) {
         return Ok(());
     }
 
     Err(Error::HostConfiguration {
-        expected: "a scratch directory owned by this user or root, and private or sticky when group- or other-writable",
-        received: String::from("an unsafe Unix scratch directory"),
+        expected: "a scratch directory reachable only through directories owned by this user or root, each private or sticky when group- or other-writable",
+        received: String::from("a scratch directory another user could replace"),
     })
+}
+
+/// Whether no link of a resolved scratch chain can be replaced by a third party.
+///
+/// Each entry is `(mode, owner)`, from the leaf outwards. One replaceable ancestor is enough to
+/// replace everything below it, so this is an `all`, not a check of the leaf with context.
+#[cfg(unix)]
+fn safe_unix_scratch_chain(chain: &[(u32, u32)], effective: u32) -> bool {
+    chain
+        .iter()
+        .all(|&(mode, owner)| safe_unix_scratch_root(mode, owner, effective))
 }
 
 /// Whether Unix directory ownership and mode prevent a third party from replacing a session leaf.
@@ -494,7 +517,12 @@ mod tests {
     use std::path::Path;
 
     #[cfg(unix)]
-    use super::safe_unix_scratch_root;
+    use super::{safe_unix_scratch_chain, safe_unix_scratch_root};
+
+    /// The refusal both scratch-chain tests match, kept in one place so a reworded invariant
+    /// fails them rather than silently matching a different `HostConfiguration`.
+    #[cfg(unix)]
+    const SCRATCH_CHAIN_EXPECTED: &str = "a scratch directory reachable only through directories owned by this user or root, each private or sticky when group- or other-writable";
     use super::{ConfigFile, FILE_NAME, FileWriter, document_for, write_private_file};
     use mango_external_agents::{McpServer, McpTransport};
     use serde_json::json;
@@ -1167,7 +1195,7 @@ mod tests {
             matches!(
                 error,
                 mango_external_agents::Error::HostConfiguration {
-                    expected: "a scratch directory owned by this user or root, and private or sticky when group- or other-writable",
+                    expected: SCRATCH_CHAIN_EXPECTED,
                     ..
                 }
             ),
@@ -1184,6 +1212,63 @@ mod tests {
         std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
             .expect("expected cleanup permissions");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A private root under a directory another account can rename is a root that account can
+    /// replace: Claude resolves `--mcp-config` by name, so the leaf's own mode proves nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_a_private_scratch_root_under_a_replaceable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempdir();
+        let scratch = parent.join("root");
+        std::fs::create_dir(&scratch).expect("expected a private scratch root");
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .expect("expected a private scratch root");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+            .expect("expected a non-sticky shared parent");
+
+        let error = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect_err("expected a replaceable parent to be refused");
+        assert!(
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration {
+                    expected: SCRATCH_CHAIN_EXPECTED,
+                    ..
+                }
+            ),
+            "expected an explicit scratch-chain refusal, received {error:?}"
+        );
+
+        assert_eq!(
+            std::fs::read_dir(&scratch)
+                .expect("expected the host scratch root")
+                .count(),
+            0,
+            "expected the refusal to leave no session leaf beneath the host root"
+        );
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("expected cleanup permissions");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_replaceable_ancestor_condemns_the_whole_scratch_chain() {
+        // Leaf outwards: a private root, a shared sticky parent, a root-owned grandparent.
+        let safe = [(0o700, 1000), (0o1777, 0), (0o755, 0)];
+        assert!(safe_unix_scratch_chain(&safe, 1000));
+
+        let mut replaceable_parent = safe;
+        replaceable_parent[1] = (0o777, 1000);
+        assert!(!safe_unix_scratch_chain(&replaceable_parent, 1000));
+
+        let mut foreign_grandparent = safe;
+        foreign_grandparent[2] = (0o1777, 1001);
+        assert!(!safe_unix_scratch_chain(&foreign_grandparent, 1000));
     }
 
     #[cfg(unix)]
