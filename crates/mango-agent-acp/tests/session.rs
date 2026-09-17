@@ -622,7 +622,7 @@ async fn a_second_turn_is_refused_while_one_is_in_flight() {
         .expect_err("expected a refusal, received a second turn");
 
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
         "received {error:?}"
     );
 }
@@ -650,7 +650,7 @@ async fn closing_twice_is_not_an_error_and_a_turn_after_it_is_refused() {
         .await
         .expect_err("expected a closed session");
     assert!(
-        matches!(error, Error::Closed { subject: "session" }),
+        matches!(error.cause(), Error::Closed { subject: "session" }),
         "received {error:?}"
     );
 }
@@ -668,21 +668,41 @@ async fn a_close_between_handle_installation_and_prompt_write_refuses_the_detach
         .await
         .expect("expected a session");
     let session: Arc<dyn Session> = Arc::from(opened);
+    let configuration_before = session.snapshot().configuration.clone();
 
     // Armed only now: opening reads the clock for its own snapshot and again for every session
     // fact the handshake publishes, and blocking any of those would stall the open itself.
     clock.arm();
     let starting = {
         let session = Arc::clone(&session);
-        tokio::spawn(async move { session.start_turn(TurnRequest::new("turn-1", "one")).await })
+        tokio::spawn(async move {
+            session
+                .start_turn(
+                    TurnRequest::new("turn-1", "one")
+                        .with_configuration(at_level(PermissionLevel::ReadOnly)),
+                )
+                .await
+        })
     };
     clock.wait_until_blocked();
 
-    session
-        .close(CloseReason::ConsentRevoked)
-        .await
-        .expect("expected the close to land while the start event was stalled");
+    let mut closing = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::ConsentRevoked).await })
+    };
+    let close_result = tokio::time::timeout(Duration::from_secs(2), &mut closing).await;
+    let close_won = close_result.is_ok();
     clock.release();
+    if let Ok(result) = close_result {
+        result
+            .expect("expected close task")
+            .expect("expected close");
+    } else {
+        closing
+            .await
+            .expect("expected close task")
+            .expect("expected close");
+    }
 
     let error = refusal(
         starting
@@ -690,7 +710,16 @@ async fn a_close_between_handle_installation_and_prompt_write_refuses_the_detach
             .expect("expected the start task to return a result"),
     );
     assert!(
-        matches!(error, Error::Closed { subject: "session" }),
+        close_won,
+        "expected close to finish while TurnStarted is stalled; received a close blocked by configuration publication"
+    );
+    assert_eq!(
+        session.snapshot().configuration,
+        configuration_before,
+        "a turn closed before submission must not publish its configuration"
+    );
+    assert!(
+        matches!(error.cause(), Error::Closed { subject: "session" }),
         "received {error:?}"
     );
     assert!(
@@ -762,7 +791,7 @@ async fn session_listing_follows_what_the_agent_advertised() {
         .await
         .expect_err("expected a refusal");
     assert!(
-        matches!(error, Error::NotSupported { .. }),
+        matches!(error.cause(), Error::NotSupported { .. }),
         "received {error:?}"
     );
 
@@ -812,7 +841,7 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
             .await,
     );
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("the session's own level")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("the session's own level")),
         "received {error:?}"
     );
     // The refusal names the relationship, not the agent's mode id.
@@ -1079,7 +1108,7 @@ async fn a_dropped_turn_stream_does_not_free_the_slot_while_the_prompt_is_in_fli
 
     let error = refusal(session.start_turn(TurnRequest::new("turn-2", "two")).await);
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
         "received {error:?}"
     );
 }
@@ -1105,7 +1134,7 @@ async fn a_rejected_concurrent_turn_does_not_change_the_inherited_configuration(
             .await,
     );
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
         "received {error:?}"
     );
     assert_eq!(
@@ -1244,10 +1273,9 @@ async fn a_handshake_the_agent_never_answers_ends_on_the_hosts_own_deadline() {
 /// copying an identifier that could contain tenant data or credentials into diagnostics.
 #[tokio::test(start_paused = true)]
 async fn a_custom_profiles_id_stays_out_of_the_timeout_diagnostic() {
-    let hostile_id = format!(
-        "fake\u{7}\x1b[31m credential=profile-secret {}",
-        "x".repeat(4_000)
-    );
+    // Profile ids now validate their syntax at construction. A valid tenant-bearing identifier
+    // must still stay out of operation diagnostics rather than bypassing that contract here.
+    let hostile_id = "profile-secret";
     let launcher = FakeLauncher::new();
     launcher.push(FakeProcess::responding(|_| Vec::new()));
     let host = HostContext::builder()
@@ -1364,7 +1392,7 @@ async fn a_turn_asking_for_a_level_this_profile_cannot_reach_is_refused() {
             .await,
     );
     assert!(
-        matches!(error, Error::HostConfiguration { .. }),
+        matches!(error.cause(), Error::HostConfiguration { .. }),
         "received {error:?}"
     );
 }
@@ -1404,14 +1432,15 @@ async fn a_custom_profile_id_stays_out_of_pair_refusals() {
     let refused_turn = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-1", "do everything").with_configuration(at_level(PermissionLevel::FullAccess)),
+                TurnRequest::new("turn-1", "do everything")
+                    .with_configuration(at_level(PermissionLevel::FullAccess)),
             )
             .await,
     );
 
     for error in [&refused_open, &refused_turn] {
         assert!(
-            matches!(error, Error::HostConfiguration { .. }),
+            matches!(error.cause(), Error::HostConfiguration { .. }),
             "expected a host-configuration refusal, received {error:?}"
         );
         for rendered in [error.to_string(), format!("{error:?}")] {
@@ -1477,14 +1506,15 @@ async fn a_custom_mode_id_stays_out_of_protocol_refusals() {
     let refused_turn = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-1", "do everything").with_configuration(at_level(PermissionLevel::FullAccess)),
+                TurnRequest::new("turn-1", "do everything")
+                    .with_configuration(at_level(PermissionLevel::FullAccess)),
             )
             .await,
     );
 
     for error in [&refused_open, &refused_turn] {
         assert!(
-            matches!(error, Error::Protocol { .. }),
+            matches!(error.cause(), Error::Protocol { .. }),
             "expected a protocol refusal, received {error:?}"
         );
         for rendered in [error.to_string(), format!("{error:?}")] {
@@ -1618,7 +1648,7 @@ async fn a_mode_the_agent_never_advertised_is_refused_and_ends_the_child() {
     );
 
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("the requested level")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("the requested level")),
         "received {error:?}"
     );
     // The refusal names the relationship, not the profile's mode id.
@@ -1651,7 +1681,7 @@ async fn a_signed_out_agent_yields_the_profiles_own_login_command_and_no_authent
     );
 
     assert!(
-        matches!(&error, Error::AuthRequired { login_hint } if login_hint == "fake-acp login"),
+        matches!(error.cause(), Error::AuthRequired { login_hint } if login_hint == "fake-acp login"),
         "received {error:?}"
     );
     assert!(
@@ -1702,7 +1732,7 @@ async fn an_agent_answering_another_protocol_version_is_refused() {
             .await,
     );
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("protocol version 1")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("protocol version 1")),
         "received {error:?}"
     );
 }
@@ -1728,7 +1758,7 @@ async fn a_level_this_profile_cannot_reach_is_refused_rather_than_downgraded() {
             .await,
     );
     assert!(
-        matches!(error, Error::HostConfiguration { .. }),
+        matches!(error.cause(), Error::HostConfiguration { .. }),
         "received {error:?}"
     );
 }
@@ -1807,3 +1837,6 @@ async fn the_harness_passes_the_core_conformance_suite() {
 
 #[path = "session/expiry.rs"]
 mod expiry;
+
+#[path = "session/contracts.rs"]
+mod contracts;

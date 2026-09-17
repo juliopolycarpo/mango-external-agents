@@ -150,6 +150,13 @@ explicit selection, later turns inherit it until another accepted override repla
 `Session::snapshot().configuration.accepted` reports that current selection. A rejected turn cannot
 change it.
 
+Native option `Set` and `Reset` patches are refused before launch or prompt submission: this
+adapter has no native configuration catalog or mapping. `Keep` remains a no-op. A turn's local
+settings become inherited only when `session/prompt` enters the SDK, under the same gate that
+excludes close; reserving a turn handle alone does not accept its patch. The
+[v1 prompt lifecycle](https://agentclientprotocol.com/protocol/v1/prompt-turn) defines the prompt
+response as completion, so the adapter does not wait for that response to publish local acceptance.
+
 A per-turn level is compared to the session's **by mode**, and any pair whose mode differs from the one
 the session was opened under is refused in both directions. Narrowing looks harmless and is not: a turn
 asking for `ReadOnly` on a session the agent runs in its own full-access mode would register a

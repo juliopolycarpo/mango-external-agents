@@ -29,7 +29,9 @@ use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
 };
 use mango_external_agents::permission::PermissionMatrix;
-use mango_external_agents::session::{OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason};
+use mango_external_agents::session::{
+    OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason,
+};
 use mango_external_agents::state::{SessionSnapshot, TransportSelection};
 use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
@@ -236,10 +238,15 @@ impl Harness for AcpHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        self.validate_open_session(host, &request)?;
-        refuse_unsupported_reset(&request.configuration)?;
+        self.validate_open_session(host, &request)
+            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
+        mango_external_agents::configuration::refuse_unsupported_native(&request.configuration)
+            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
+        refuse_unsupported_reset(&request.configuration)
+            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
         let configuration = request.configuration.requested();
-        refuse_model_selection(&configuration)?;
+        refuse_model_selection(&configuration)
+            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
         let matrix = self.permission_matrix();
         let routing = configuration
             .routing
@@ -255,14 +262,15 @@ impl Harness for AcpHarness {
                 expected: "a (level, routing) pair this profile supports",
                 // The pair, never the profile. A custom profile's id is host-authored text and
                 // may name a tenant; the host already knows which profile it handed this harness.
-                received: format!(
-                    "{:?}/{:?}",
-                    configuration.level, configuration.routing
-                ),
-            });
+                received: format!("{:?}/{:?}", configuration.level, configuration.routing),
+            }
+            .with_dispatch(mango_external_agents::Dispatch::NotSubmitted));
         }
 
-        let effective_transport = self.descriptor().resolve_transport(request.transport)?;
+        let effective_transport = self
+            .descriptor()
+            .resolve_transport(request.transport)
+            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
 
         let executable = if request.executable.get().is_some() {
             &request.executable

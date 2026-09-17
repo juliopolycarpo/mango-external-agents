@@ -14,7 +14,9 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, ListSessionsRequest, PromptRequest,
     SessionId as AcpSessionId, SetSessionModeRequest,
 };
-use mango_external_agents::configuration::{Configuration, ConfigurationPatch};
+use mango_external_agents::configuration::{
+    Configuration, ConfigurationPatch, refuse_unsupported_native,
+};
 use mango_external_agents::event::EventKind;
 use mango_external_agents::session::{
     AccountUsage, CancelReason, CloseReason, NativeSession, Session, SessionIds, SessionPage,
@@ -22,8 +24,8 @@ use mango_external_agents::session::{
 };
 use mango_external_agents::state::SessionStatus;
 use mango_external_agents::{
-    Capability, Error, EventSink, HostContext, PermissionResponse, Result, SessionLifecycle,
-    TurnStream,
+    Capability, Dispatch, Error, EventSink, HostContext, PermissionResponse, Result,
+    SessionLifecycle, TurnStream,
 };
 
 use crate::client::{self, ConnectionHandle, link_failure, with_stderr};
@@ -136,6 +138,7 @@ impl AcpSession {
         let base = self.connection_state.configuration();
         let configuration = match &request.configuration {
             Some(patch) => {
+                refuse_unsupported_native(patch)?;
                 refuse_unsupported_reset(patch)?;
                 base.patched(patch)
             }
@@ -203,8 +206,8 @@ impl AcpSession {
 
 /// The subset of a [`Configuration`] this harness genuinely encodes: level, through
 /// `session/set_mode`, and routing, which decides locally who answers an approval. Everything else
-/// a patch could carry — model, reasoning effort, a vendor-native option — is either refused before
-/// it reaches here or, for a native option, silently has no ACP surface to land on; see
+/// a patch could carry — model, reasoning effort, a vendor-native option — is refused before
+/// it reaches here; see
 /// [`AcpSession::publish_configuration`].
 pub(crate) fn accepted_axes(configuration: &Configuration) -> Configuration {
     let mut accepted = Configuration::unknown();
@@ -257,14 +260,16 @@ impl Session for AcpSession {
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
         if self.lifecycle.is_closed() {
-            return Err(Error::Closed { subject: "session" });
+            return Err(Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted));
         }
-        self.validate_turn_request(&request)?;
+        self.validate_turn_request(&request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let prompt = content::prompt(
             &request.input,
             &request.attachments,
             &self.agent_capabilities.prompt_capabilities,
-        )?;
+        )
+        .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
         let (sink, events) = EventSink::new(
             self.session_state.snapshot().ids.session_id.clone(),
@@ -285,20 +290,22 @@ impl Session for AcpSession {
         // avoids reordering that gate around a value the wire cannot supply early enough. One real
         // cost: unlike Claude's or Codex's native turn ids, this one never appears in a captured
         // JSON-RPC transcript, so a host correlating captures by turn id will not find it there.
-        let (handle, native_turn_id) = {
+        let (handle, native_turn_id, configuration) = {
             let Some(_lifecycle) = self.lifecycle.begin_start() else {
-                return Err(Error::Closed { subject: "session" });
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
             };
             let _starting = self.connection_state.lock_turn_start();
-            let configuration = self.effective(&request)?;
+            let configuration = self
+                .effective(&request)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
             let handle = self
                 .connection_state
-                .begin_turn(sink.clone(), configuration.level)?;
-            self.connection_state
-                .accept_configuration(configuration.clone());
-            self.publish_configuration(&configuration);
+                .begin_turn(sink.clone(), configuration.level)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
             let native_turn_id = format!("acp-turn-{}", handle.generation);
-            (handle, native_turn_id)
+            (handle, native_turn_id, configuration)
         };
 
         // Emitted before the prompt is sent, so the first event a host reads names the turn the
@@ -320,7 +327,7 @@ impl Session for AcpSession {
             if let Some((turn, _, _)) = self.connection_state.end_turn_matching(&handle) {
                 let _ = turn.finish();
             }
-            return Err(error);
+            return Err(error.with_dispatch(Dispatch::NotSubmitted));
         }
 
         // `TurnStarted` is emitted first, which can give `cancel` a window before ACP has a prompt
@@ -329,16 +336,25 @@ impl Session for AcpSession {
         // it to this turn rather than treating the earlier notification as a no-op.
         let (sent, retry_cancel_error) = {
             let Some(_lifecycle) = self.lifecycle.begin_start() else {
-                return Err(Error::Closed { subject: "session" });
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
             };
             let _starting = self.connection_state.lock_turn_start();
             if !self.connection_state.can_submit_prompt(&handle) {
-                return Err(Error::Closed { subject: "session" });
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
             }
             let sent = self
                 .connection
                 .connection()
                 .send_request(PromptRequest::new(self.native_session_id.clone(), prompt));
+            // The reserved handle alone is not submission. A close can win while TurnStarted is
+            // being published; only inherit this patch once the prompt has entered the SDK.
+            self.connection_state
+                .accept_configuration(configuration.clone());
+            self.publish_configuration(&configuration);
             let retry_cancel_error = match self.connection_state.is_cancelling() {
                 true => self
                     .connection
@@ -407,7 +423,7 @@ impl Session for AcpSession {
         });
 
         if let Some(error) = retry_cancel_error {
-            return Err(error);
+            return Err(error.with_dispatch(Dispatch::AcceptanceUnknown));
         }
 
         Ok(TurnStream::accepted(
