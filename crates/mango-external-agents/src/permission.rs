@@ -15,7 +15,7 @@ use std::time::SystemTime;
 
 use crate::error::{Error, Result};
 use crate::event::ActivityKind;
-use crate::interaction::{Interaction, InteractionId};
+use crate::interaction::{Interaction, InteractionId, InteractionKind};
 use crate::normalize::{self, APPROVAL_MAX_OPTIONS, TextLimit};
 
 /// What the agent is allowed to do. One of the two axes.
@@ -692,11 +692,12 @@ impl fmt::Debug for PermissionRequest {
 impl PermissionRequest {
     /// The vendor is asking about this, with these choices.
     pub fn new(
-        interaction: Interaction,
+        mut interaction: Interaction,
         kind: ActivityKind,
         title: impl Into<String>,
         options: Vec<PermissionOption>,
     ) -> Self {
+        interaction.kind = InteractionKind::Permission;
         Self {
             interaction,
             kind,
@@ -789,6 +790,12 @@ impl PermissionRequest {
     /// [`Error::LimitExceeded`] when it offered more than [`APPROVAL_MAX_OPTIONS`]. A request
     /// nobody can render is refused on its own rather than ending the turn it belongs to.
     pub fn normalized(self) -> Result<Self> {
+        if self.interaction.kind != InteractionKind::Permission {
+            return Err(Error::Protocol {
+                expected: String::from("a permission interaction"),
+                received: self.interaction.kind.to_string(),
+            });
+        }
         if self.options.is_empty() {
             return Err(Error::Protocol {
                 expected: String::from("at least one approval option"),
@@ -1007,7 +1014,7 @@ impl ApprovalDecision {
         }
         match self.scope {
             Some(scope) => scope.is_standing(),
-            None => false,
+            None => !matches!(self.effect, PermissionEffect::Other),
         }
     }
 }
@@ -1601,10 +1608,46 @@ mod tests {
         assert!(decision.policy_changing);
         assert!(decision.is_standing());
 
+        let unknown_scope = ApprovalDecision::from_option(
+            &PermissionOption::new("unknown", PermissionEffect::Allow),
+            DecisionSource::User,
+        );
+        assert!(
+            unknown_scope.is_standing(),
+            "expected a selected option with unknown reach to stay conservative"
+        );
+
         let expired = ApprovalDecision::unresolved("none", DecisionSource::Expired);
         assert!(
             !expired.is_standing(),
             "expected a request nobody answered to grant nothing standing"
+        );
+    }
+
+    #[test]
+    fn a_permission_constructor_sets_its_kind_and_normalization_refuses_a_mutated_kind() {
+        let wrong_kind = Interaction::new(
+            InteractionId::new("approval-1"),
+            InteractionKind::Question,
+            SessionId::new("chat-1"),
+            SystemTime::UNIX_EPOCH,
+        );
+        let request = PermissionRequest::new(
+            wrong_kind,
+            ActivityKind::Command,
+            "cargo test",
+            four_options(),
+        );
+        assert_eq!(request.interaction.kind, InteractionKind::Permission);
+
+        let mut malformed = request;
+        malformed.interaction.kind = InteractionKind::Question;
+        let error = malformed
+            .normalized()
+            .expect_err("expected a question-shaped permission to be refused");
+        assert_eq!(
+            error.to_string(),
+            "expected a permission interaction, received question"
         );
     }
 

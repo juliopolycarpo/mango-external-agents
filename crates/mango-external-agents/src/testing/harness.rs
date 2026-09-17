@@ -462,8 +462,27 @@ impl FakeSession {
             applied.push(id.clone());
         }
 
-        // The accepted half moves; the observed half does not, because nothing observed it.
-        let accepted = current.accepted.patched(patch);
+        // The accepted half records only what the vendor applied. The requested half still records
+        // every host request, including the rejected ones, because the two facts differ here.
+        let mut accepted_patch = ConfigurationPatch::new();
+        if applied.contains(&ConfigurationOptionId::new("model")) {
+            accepted_patch.model = patch.model.clone();
+        }
+        if applied.contains(&ConfigurationOptionId::new("effort")) {
+            accepted_patch.effort = patch.effort.clone();
+        }
+        if applied.contains(&ConfigurationOptionId::new("level")) {
+            accepted_patch.level = patch.level;
+        }
+        if applied.contains(&ConfigurationOptionId::new("routing")) {
+            accepted_patch.routing = patch.routing;
+        }
+        for (id, change) in &patch.native {
+            if applied.contains(id) {
+                accepted_patch.native.insert(id.clone(), change.clone());
+            }
+        }
+        let accepted = current.accepted.patched(&accepted_patch);
         let state = ConfigurationState::new(
             current.requested.patched(patch),
             accepted,
@@ -685,7 +704,7 @@ impl Session for FakeSession {
 
 #[cfg(test)]
 mod tests {
-    use super::FakeHarness;
+    use super::{FAKE_NATIVE_OPTION, FakeHarness};
     use crate::configuration::{
         ConfigurationChange, ConfigurationOptionId, ConfigurationPatch, Rollback,
     };
@@ -1051,6 +1070,62 @@ mod tests {
             session.snapshot().configuration.accepted.model.as_deref(),
             Some("fast"),
             "expected the known option to have landed anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_changes_do_not_mutate_the_fake_sessions_accepted_configuration() {
+        let session = FakeHarness::new()
+            .open_session(&host(), OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        session
+            .configure(ConfigurationPatch::new().native(
+                ConfigurationOptionId::new(FAKE_NATIVE_OPTION),
+                ConfigurationChange::Set(crate::ConfigurationValue::Boolean(true)),
+            ))
+            .await
+            .expect("expected the native setting to land");
+
+        let outcome = session
+            .configure(
+                ConfigurationPatch::new()
+                    .model(ConfigurationChange::Set(String::from("fast")))
+                    .level(ConfigurationChange::Reset)
+                    .native(
+                        ConfigurationOptionId::new(FAKE_NATIVE_OPTION),
+                        ConfigurationChange::Reset,
+                    )
+                    .native(
+                        ConfigurationOptionId::new("invented"),
+                        ConfigurationChange::Set(crate::ConfigurationValue::Boolean(false)),
+                    ),
+            )
+            .await
+            .expect("expected a partial outcome");
+
+        assert_eq!(
+            outcome.applied,
+            vec![ConfigurationOptionId::new("model")],
+            "expected only the accepted model change"
+        );
+        assert_eq!(outcome.state.accepted.model.as_deref(), Some("fast"));
+        assert_eq!(
+            outcome
+                .state
+                .accepted
+                .native
+                .get(&ConfigurationOptionId::new(FAKE_NATIVE_OPTION)),
+            Some(&crate::ConfigurationValue::Boolean(true)),
+            "expected the rejected reset to preserve the accepted native value"
+        );
+        assert!(
+            !outcome
+                .state
+                .accepted
+                .native
+                .contains_key(&ConfigurationOptionId::new("invented")),
+            "expected the rejected option to stay out of accepted configuration"
         );
     }
 

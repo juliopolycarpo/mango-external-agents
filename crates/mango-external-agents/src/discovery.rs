@@ -132,7 +132,7 @@ pub const DISCOVERY_RECEIPT_MAX_AGE: Duration = Duration::from_secs(300);
 /// which executable, and opaque fingerprints of the executable and the environment it was probed
 /// under. A host that upgraded the CLI between the probe and the open has a receipt that no longer
 /// describes the file about to be launched, and [`DiscoveryReceipt::verify_for`] says so.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DiscoveryReceipt {
     /// Which harness this was a probe of.
@@ -157,6 +157,26 @@ pub struct DiscoveryReceipt {
     pub observed_at: SystemTime,
     /// How long after `observed_at` this receipt may still be used.
     pub max_age: Duration,
+}
+
+impl std::fmt::Debug for DiscoveryReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscoveryReceipt")
+            .field("harness", &self.harness)
+            .field("has_executable", &self.discovery.executable.is_some())
+            .field(
+                "has_executable_fingerprint",
+                &self.executable_fingerprint.is_some(),
+            )
+            .field(
+                "has_environment_fingerprint",
+                &self.environment_fingerprint.is_some(),
+            )
+            .field("observed_at", &self.observed_at)
+            .field("max_age", &self.max_age)
+            .finish()
+    }
 }
 
 impl DiscoveryReceipt {
@@ -315,6 +335,13 @@ impl DiscoveryReceipt {
                     ),
                 })
             }
+            (Some(requested), None) => Err(Error::HostConfiguration {
+                expected: "a discovery receipt for the executable being launched",
+                received: format!(
+                    "a receipt without an executable, launching {}",
+                    requested.display()
+                ),
+            }),
             // The probe resolved a path and the request did not, so the launcher will resolve the
             // program name itself — off a `PATH` that may well answer with a different file. A
             // receipt that vouches for one binary cannot vouch for whichever one that turns out to
@@ -865,6 +892,45 @@ mod tests {
                 .contains("whatever the program name resolves to"),
             "received {error}"
         );
+    }
+
+    #[test]
+    fn a_receipt_without_an_executable_cannot_vouch_for_a_requested_one() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let error = DiscoveryReceipt::new(HarnessId::claude(), Discovery::not_installed(), now)
+            .verify_for(
+                &descriptor(),
+                now,
+                &crate::OpenSession::new("chat-1").with_executable(
+                    crate::transport::ExecutablePath::resolved("/opt/claude/bin/claude"),
+                ),
+            )
+            .expect_err("expected an executable requested without a probed path to be refused");
+        assert_eq!(
+            error.to_string(),
+            "expected a discovery receipt for the executable being launched, received a receipt without an executable, launching /opt/claude/bin/claude"
+        );
+    }
+
+    #[test]
+    fn receipt_debug_omits_probe_and_fingerprint_payloads() {
+        let receipt = DiscoveryReceipt::new(
+            HarnessId::claude(),
+            usable(),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .with_executable_fingerprint("executable-fingerprint-secret")
+        .with_environment_fingerprint("environment-fingerprint-secret");
+        let rendered = format!("{receipt:?}");
+        for secret in [
+            "executable-fingerprint-secret",
+            "environment-fingerprint-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no receipt payload in debug output, received {rendered}"
+            );
+        }
     }
 
     /// A host that upgraded the CLI between the probe and the open has a receipt that no longer

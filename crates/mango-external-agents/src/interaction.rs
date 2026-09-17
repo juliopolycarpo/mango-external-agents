@@ -20,6 +20,7 @@
 //! into free text, because a password typed into a box labelled "answer" is a password in a host's
 //! transcript.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::SystemTime;
 
@@ -41,9 +42,7 @@ pub const ANSWER_TEXT_MAX_LENGTH: usize = 4_096;
 ///
 /// Echoed back verbatim with the answer. Shared by permissions and questions so a host can hold
 /// one map of what it is waiting on rather than two.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct InteractionId(String);
 
@@ -66,6 +65,12 @@ impl InteractionId {
     /// cut: a shortened id answers a different question.
     pub fn normalized(self) -> Result<Self> {
         normalize::opaque_id(&self.0, "interaction id").map(Self)
+    }
+}
+
+impl fmt::Debug for InteractionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InteractionId")
     }
 }
 
@@ -141,7 +146,7 @@ impl InteractionStatus {
 /// The lifecycle fields every interaction carries.
 ///
 /// One shape for both kinds, so a host renders, times out and audits them through one path.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Interaction {
@@ -162,6 +167,18 @@ pub struct Interaction {
     pub expires_at: SystemTime,
     /// Where it stands.
     pub status: InteractionStatus,
+}
+
+impl fmt::Debug for Interaction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Interaction")
+            .field("kind", &self.kind)
+            .field("has_operation", &self.operation.is_some())
+            .field("expires_at", &self.expires_at)
+            .field("status", &self.status)
+            .finish()
+    }
 }
 
 impl Interaction {
@@ -215,9 +232,7 @@ impl Interaction {
 }
 
 /// The vendor's own id for one question inside a request.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct QuestionId(String);
 
@@ -233,6 +248,12 @@ impl QuestionId {
     }
 }
 
+impl fmt::Debug for QuestionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("QuestionId")
+    }
+}
+
 impl fmt::Display for QuestionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -240,9 +261,7 @@ impl fmt::Display for QuestionId {
 }
 
 /// The vendor's own id for one choice.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct QuestionOptionId(String);
 
@@ -258,6 +277,12 @@ impl QuestionOptionId {
     }
 }
 
+impl fmt::Debug for QuestionOptionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("QuestionOptionId")
+    }
+}
+
 impl fmt::Display for QuestionOptionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -265,7 +290,7 @@ impl fmt::Display for QuestionOptionId {
 }
 
 /// One choice a question offers.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct QuestionOption {
@@ -277,6 +302,16 @@ pub struct QuestionOption {
     /// What the vendor says it means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+impl fmt::Debug for QuestionOption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuestionOption")
+            .field("has_label", &self.label.is_some())
+            .field("has_description", &self.description.is_some())
+            .finish()
+    }
 }
 
 impl QuestionOption {
@@ -309,18 +344,29 @@ impl QuestionOption {
     ///
     /// [`Error::InvalidVendorValue`] when the id does not survive bounding.
     pub fn normalized(self) -> Result<Self> {
-        Ok(Self {
+        self.normalized_with_truncation().map(|(option, _)| option)
+    }
+
+    fn normalized_with_truncation(self) -> Result<(Self, bool)> {
+        let label = self
+            .label
+            .map(|label| normalize::bound_text(&label, TextLimit::ApprovalOptionLabel));
+        let description = self
+            .description
+            .map(|text| normalize::bound_text(&text, TextLimit::Detail));
+        let truncated = label.as_ref().is_some_and(|label| label.truncated)
+            || description
+                .as_ref()
+                .is_some_and(|description| description.truncated);
+        let option = Self {
             id: QuestionOptionId::new(normalize::opaque_id(
                 self.id.as_str(),
                 "question option id",
             )?),
-            label: self
-                .label
-                .map(|label| normalize::bound_text(&label, TextLimit::ApprovalOptionLabel).text),
-            description: self
-                .description
-                .map(|text| normalize::bound_text(&text, TextLimit::Detail).text),
-        })
+            label: label.map(|label| label.text),
+            description: description.map(|description| description.text),
+        };
+        Ok((option, truncated))
     }
 }
 
@@ -330,7 +376,7 @@ impl QuestionOption {
 /// [`UnsupportedQuestion`], never reshaped into [`QuestionForm::FreeText`]: a password typed into
 /// a box labelled "answer" is a password in a host's transcript, and an arbitrary form is a
 /// rendering surface this library has not agreed to own.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum QuestionForm {
@@ -351,8 +397,27 @@ pub enum QuestionForm {
     },
 }
 
+impl fmt::Debug for QuestionForm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Choice {
+                options,
+                multi_select,
+            } => formatter
+                .debug_struct("Choice")
+                .field("option_count", &options.len())
+                .field("multi_select", multi_select)
+                .finish(),
+            Self::FreeText { placeholder } => formatter
+                .debug_struct("FreeText")
+                .field("has_placeholder", &placeholder.is_some())
+                .finish(),
+        }
+    }
+}
+
 /// One thing the vendor wants to know.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Question {
@@ -368,6 +433,18 @@ pub struct Question {
     /// Whether the vendor needs an answer to this one before it can go on.
     #[serde(default)]
     pub required: bool,
+}
+
+impl fmt::Debug for Question {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Question")
+            .field("has_prompt", &!self.prompt.is_empty())
+            .field("has_detail", &self.detail.is_some())
+            .field("form", &self.form)
+            .field("required", &self.required)
+            .finish()
+    }
 }
 
 impl Question {
@@ -404,7 +481,12 @@ impl Question {
     /// bounding, and [`Error::Protocol`] when a choice offers nothing or more than
     /// [`QUESTION_MAX_OPTIONS`] choices.
     pub fn normalized(self) -> Result<Self> {
-        let form = match self.form {
+        self.normalized_with_truncation()
+            .map(|(question, _)| question)
+    }
+
+    fn normalized_with_truncation(self) -> Result<(Self, bool)> {
+        let (form, form_truncated) = match self.form {
             QuestionForm::Choice {
                 options,
                 multi_select,
@@ -415,28 +497,59 @@ impl Question {
                         received: options.len().to_string(),
                     });
                 }
-                QuestionForm::Choice {
-                    options: options
-                        .into_iter()
-                        .map(QuestionOption::normalized)
-                        .collect::<Result<Vec<_>>>()?,
-                    multi_select,
+                let mut option_ids = HashSet::with_capacity(options.len());
+                if options.iter().any(|option| !option_ids.insert(&option.id)) {
+                    return Err(Error::Protocol {
+                        expected: String::from("unique question option ids"),
+                        received: String::from("duplicate question option id"),
+                    });
                 }
+                let mut truncated = false;
+                let mut normalized_options = Vec::with_capacity(options.len());
+                for option in options {
+                    let (option, option_truncated) = option.normalized_with_truncation()?;
+                    truncated |= option_truncated;
+                    normalized_options.push(option);
+                }
+                (
+                    QuestionForm::Choice {
+                        options: normalized_options,
+                        multi_select,
+                    },
+                    truncated,
+                )
             }
-            QuestionForm::FreeText { placeholder } => QuestionForm::FreeText {
-                placeholder: placeholder
-                    .map(|text| normalize::bound_text(&text, TextLimit::Title).text),
-            },
+            QuestionForm::FreeText { placeholder } => {
+                let placeholder =
+                    placeholder.map(|text| normalize::bound_text(&text, TextLimit::Title));
+                let truncated = placeholder
+                    .as_ref()
+                    .is_some_and(|placeholder| placeholder.truncated);
+                (
+                    QuestionForm::FreeText {
+                        placeholder: placeholder.map(|placeholder| placeholder.text),
+                    },
+                    truncated,
+                )
+            }
         };
-        Ok(Self {
-            id: QuestionId::new(normalize::opaque_id(self.id.as_str(), "question id")?),
-            prompt: normalize::bound_text(&self.prompt, TextLimit::Detail).text,
-            detail: self
-                .detail
-                .map(|detail| normalize::bound_text(&detail, TextLimit::Detail).text),
-            form,
-            required: self.required,
-        })
+        let prompt = normalize::bound_text(&self.prompt, TextLimit::Detail);
+        let detail = self
+            .detail
+            .map(|detail| normalize::bound_text(&detail, TextLimit::Detail));
+        let truncated = form_truncated
+            || prompt.truncated
+            || detail.as_ref().is_some_and(|detail| detail.truncated);
+        Ok((
+            Self {
+                id: QuestionId::new(normalize::opaque_id(self.id.as_str(), "question id")?),
+                prompt: prompt.text,
+                detail: detail.map(|detail| detail.text),
+                form,
+                required: self.required,
+            },
+            truncated,
+        ))
     }
 }
 
@@ -445,7 +558,7 @@ impl Question {
 /// Several questions at once, because a vendor that asks three things in one round trip is
 /// answered in one round trip. Nothing here authorises anything; see
 /// [`PermissionRequest`](crate::PermissionRequest) for the surface that does.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct QuestionRequest {
@@ -459,6 +572,18 @@ pub struct QuestionRequest {
     /// True when any field above was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
+}
+
+impl fmt::Debug for QuestionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuestionRequest")
+            .field("interaction", &self.interaction)
+            .field("has_title", &self.title.is_some())
+            .field("question_count", &self.questions.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 impl QuestionRequest {
@@ -488,7 +613,8 @@ impl QuestionRequest {
     /// );
     /// assert_eq!(request.questions.len(), 1);
     /// ```
-    pub fn new(interaction: Interaction, questions: Vec<Question>) -> Self {
+    pub fn new(mut interaction: Interaction, questions: Vec<Question>) -> Self {
+        interaction.kind = InteractionKind::Question;
         Self {
             interaction,
             title: None,
@@ -517,6 +643,12 @@ impl QuestionRequest {
     /// [`QUESTION_MAX_ITEMS`], and [`Error::InvalidVendorValue`] when an id does not survive
     /// bounding. A round nobody can render is refused on its own rather than ending its turn.
     pub fn normalized(self) -> Result<Self> {
+        if self.interaction.kind != InteractionKind::Question {
+            return Err(Error::Protocol {
+                expected: String::from("a question interaction"),
+                received: self.interaction.kind.to_string(),
+            });
+        }
         if self.questions.is_empty() || self.questions.len() > QUESTION_MAX_ITEMS {
             return Err(Error::Protocol {
                 expected: format!("between 1 and {QUESTION_MAX_ITEMS} questions"),
@@ -526,15 +658,28 @@ impl QuestionRequest {
         let title = self
             .title
             .map(|title| normalize::bound_text(&title, TextLimit::Title));
-        let truncated = self.truncated || title.as_ref().is_some_and(|title| title.truncated);
+        let mut question_ids = HashSet::with_capacity(self.questions.len());
+        if self
+            .questions
+            .iter()
+            .any(|question| !question_ids.insert(&question.id))
+        {
+            return Err(Error::Protocol {
+                expected: String::from("unique question ids"),
+                received: String::from("duplicate question id"),
+            });
+        }
+        let mut truncated = self.truncated || title.as_ref().is_some_and(|title| title.truncated);
+        let mut questions = Vec::with_capacity(self.questions.len());
+        for question in self.questions {
+            let (question, question_truncated) = question.normalized_with_truncation()?;
+            truncated |= question_truncated;
+            questions.push(question);
+        }
         Ok(Self {
             interaction: self.interaction.normalized()?,
             title: title.map(|title| title.text),
-            questions: self
-                .questions
-                .into_iter()
-                .map(Question::normalized)
-                .collect::<Result<Vec<_>>>()?,
+            questions,
             truncated,
         })
     }
@@ -654,7 +799,7 @@ fn validate_answer(question: &Question, answer: &Answer) -> Result<()> {
 }
 
 /// What one question was answered with.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AnswerValue {
@@ -673,6 +818,22 @@ pub enum AnswerValue {
     ///
     /// Distinct from empty text, which is an answer of "nothing".
     Declined,
+}
+
+impl fmt::Debug for AnswerValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Chosen { option_ids } => formatter
+                .debug_struct("Chosen")
+                .field("option_count", &option_ids.len())
+                .finish(),
+            Self::Text { text } => formatter
+                .debug_struct("Text")
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::Declined => formatter.write_str("Declined"),
+        }
+    }
 }
 
 impl AnswerValue {
@@ -695,7 +856,7 @@ impl AnswerValue {
 }
 
 /// One question's answer.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Answer {
@@ -703,6 +864,15 @@ pub struct Answer {
     pub question_id: QuestionId,
     /// What it was answered with.
     pub value: AnswerValue,
+}
+
+impl fmt::Debug for Answer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Answer")
+            .field("value", &self.value)
+            .finish()
+    }
 }
 
 impl Answer {
@@ -713,7 +883,7 @@ impl Answer {
 }
 
 /// The answers to one round of questions.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct QuestionResponse {
@@ -721,6 +891,15 @@ pub struct QuestionResponse {
     pub interaction_id: InteractionId,
     /// The answers, in any order.
     pub answers: Vec<Answer>,
+}
+
+impl fmt::Debug for QuestionResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuestionResponse")
+            .field("answer_count", &self.answers.len())
+            .finish()
+    }
 }
 
 impl QuestionResponse {
@@ -751,7 +930,7 @@ impl QuestionResponse {
 ///
 /// A refusal by name, because the alternative — reshaping the ask into something this library does
 /// carry — is how a credential prompt becomes an ordinary text field in a transcript.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum UnsupportedQuestion {
@@ -767,6 +946,16 @@ pub enum UnsupportedQuestion {
         /// What the vendor called it, bounded.
         received: String,
     },
+}
+
+impl fmt::Debug for UnsupportedQuestion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SecretCollection => "SecretCollection",
+            Self::ArbitraryForm => "ArbitraryForm",
+            Self::UnrecognisedForm { .. } => "UnrecognisedForm",
+        })
+    }
 }
 
 impl UnsupportedQuestion {
@@ -795,7 +984,7 @@ impl fmt::Display for UnsupportedQuestion {
 }
 
 /// How one round of questions ended.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum QuestionOutcome {
@@ -813,6 +1002,23 @@ pub enum QuestionOutcome {
         /// Why not.
         reason: UnsupportedQuestion,
     },
+}
+
+impl fmt::Debug for QuestionOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Answered { answers } => formatter
+                .debug_struct("Answered")
+                .field("answer_count", &answers.len())
+                .finish(),
+            Self::Expired => formatter.write_str("Expired"),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+            Self::Refused { reason } => formatter
+                .debug_struct("Refused")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
 }
 
 impl QuestionOutcome {
@@ -1069,6 +1275,129 @@ mod tests {
             error.to_string().contains("question id"),
             "received {error}"
         );
+    }
+
+    #[test]
+    fn a_question_round_keeps_every_nested_truncation_flag() {
+        let request = QuestionRequest::new(
+            interaction(),
+            vec![
+                Question::new(
+                    QuestionId::new("choice"),
+                    "p".repeat(5_000),
+                    QuestionForm::Choice {
+                        options: vec![
+                            QuestionOption::new(QuestionOptionId::new("yes"))
+                                .with_label("l".repeat(200))
+                                .with_description("d".repeat(5_000)),
+                        ],
+                        multi_select: false,
+                    },
+                )
+                .with_detail("d".repeat(5_000)),
+                Question::new(
+                    QuestionId::new("text"),
+                    "text",
+                    QuestionForm::FreeText {
+                        placeholder: Some("h".repeat(300)),
+                    },
+                ),
+            ],
+        )
+        .normalized()
+        .expect("expected a bounded request");
+
+        assert!(
+            request.truncated,
+            "expected nested truncation to reach the round"
+        );
+    }
+
+    #[test]
+    fn duplicate_question_and_option_ids_are_refused_before_a_host_can_answer_ambiguously() {
+        let duplicate_questions =
+            QuestionRequest::new(interaction(), vec![free_text("same"), free_text("same")])
+                .normalized()
+                .expect_err("expected duplicate question ids to be refused");
+        assert!(
+            duplicate_questions
+                .to_string()
+                .contains("unique question ids"),
+            "received {duplicate_questions}"
+        );
+
+        let duplicate_options = QuestionRequest::new(
+            interaction(),
+            vec![choice("branch", &["same", "same"], false)],
+        )
+        .normalized()
+        .expect_err("expected duplicate option ids to be refused");
+        assert!(
+            duplicate_options
+                .to_string()
+                .contains("unique question option ids"),
+            "received {duplicate_options}"
+        );
+    }
+
+    #[test]
+    fn a_question_constructor_sets_its_kind_and_normalization_refuses_a_mutated_kind() {
+        let wrong_kind = Interaction::new(
+            InteractionId::new("ask-1"),
+            InteractionKind::Permission,
+            SessionId::new("chat-1"),
+            SystemTime::UNIX_EPOCH,
+        );
+        let request = QuestionRequest::new(wrong_kind, vec![free_text("note")]);
+        assert_eq!(request.interaction.kind, InteractionKind::Question);
+
+        let mut malformed = request;
+        malformed.interaction.kind = InteractionKind::Permission;
+        let error = malformed
+            .normalized()
+            .expect_err("expected a permission-shaped question to be refused");
+        assert_eq!(
+            error.to_string(),
+            "expected a question interaction, received permission"
+        );
+    }
+
+    #[test]
+    fn question_debug_omits_ids_and_vendor_text() {
+        let request = QuestionRequest::new(
+            interaction(),
+            vec![Question::new(
+                QuestionId::new("question-id-secret"),
+                "question-prompt-secret",
+                QuestionForm::FreeText {
+                    placeholder: Some(String::from("placeholder-secret")),
+                },
+            )],
+        )
+        .with_title("question-title-secret");
+        let response = QuestionResponse::new(
+            InteractionId::new("interaction-id-secret"),
+            vec![Answer::new(
+                QuestionId::new("question-id-secret"),
+                AnswerValue::text("answer-secret"),
+            )],
+        );
+
+        for rendered in [format!("{request:?}"), format!("{response:?}")] {
+            for secret in [
+                "question-id-secret",
+                "question-prompt-secret",
+                "placeholder-secret",
+                "question-title-secret",
+                "interaction-id-secret",
+                "answer-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no question payload in debug output, received {rendered}"
+                );
+            }
+        }
     }
 
     /// A secret prompt is refused by name rather than reshaped into ordinary free text.
