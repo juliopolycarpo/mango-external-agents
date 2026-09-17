@@ -367,6 +367,19 @@ impl mango_external_agents::Session for ClaudeSession {
             });
         }
 
+        // Before the pump, and this ordering is the whole point: the release parks on the blocking
+        // pool, so it is an await a caller that times out or drops `start_turn` can be cancelled
+        // at. A pump spawned above it would already hold the prompt and the process, and would
+        // send that prompt and let Claude run tools before noticing the receiver this future drops
+        // with — work performed for a turn nobody will ever read. Releasing first leaves nothing
+        // detached: from the spawn below to the return there is no await, so the window is gone.
+        //
+        // Nothing about the file's lifetime moves with it. The lease is an `Arc` clone the session
+        // also holds, so this is usually a cheap decrement; it removes the artifact only when a
+        // `close` already took the session's reference, and that `close` is killing the child
+        // anyway.
+        crate::mcp::release_off_worker(mcp_lease.take()).await;
+
         tokio::spawn(pump(
             Arc::clone(&self.shared),
             transport.link,
@@ -376,13 +389,6 @@ impl mango_external_agents::Session for ClaudeSession {
             request.input,
             established,
         ));
-
-        // Usually a cheap decrement: the session holds the other `Arc`, and this clone existed
-        // only to keep the file alive for the child that just read it. But a `close` can have
-        // taken the session's reference between the lifecycle check above and this line, which
-        // makes this the last one — and a `close` that found nothing to remove has already
-        // answered. So it is released the same way every other path releases it.
-        crate::mcp::release_off_worker(mcp_lease.take()).await;
 
         Ok(TurnStream {
             // `claude --print` names no turn, so the handle is the host's own id: a value the host

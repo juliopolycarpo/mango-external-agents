@@ -1111,6 +1111,69 @@ mod mcp_passthrough {
         assert_eq!(written["mcpServers"]["docs"]["env"]["DOCS_TOKEN"], "s3cret");
     }
 
+    /// A host that times out or drops `start_turn` must not leave Claude working on a turn it will
+    /// never read. The MCP release runs on the blocking pool, so it is an await the future can be
+    /// dropped at — and anything spawned before it keeps running afterwards.
+    ///
+    /// The pool is given exactly one thread and that thread is occupied, so the release is
+    /// deterministically pending rather than "probably slow": the future parks there every run.
+    #[test]
+    fn a_dropped_start_turn_leaves_claude_no_prompt_to_work_on() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+            let scratch =
+                std::env::temp_dir().join(format!("mea-drop-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            // Take the pool's only thread and hold it, so the turn's release cannot complete.
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            let start = session.start_turn(TurnRequest::new("turn-1", "read note.txt"));
+            // Long enough for a pump, had one been spawned, to write its single prompt line.
+            let abandoned = tokio::time::timeout(Duration::from_millis(250), start).await;
+            assert!(
+                abandoned.is_err(),
+                "expected the turn to still be parked on the occupied blocking pool"
+            );
+
+            drop(release_pool);
+            let _ = occupied.await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let written = launcher.written();
+            assert!(
+                written.is_empty(),
+                "expected an abandoned start to send Claude nothing, received {written:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
     #[tokio::test]
     async fn passes_the_host_authorised_scratch_path_to_the_child_unchanged() {
         let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
