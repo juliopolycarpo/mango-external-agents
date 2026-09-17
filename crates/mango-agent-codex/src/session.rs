@@ -1212,9 +1212,16 @@ impl CodexSession {
         let watcher_shared = Arc::clone(&shared);
         let watcher_client = Arc::clone(&client);
         let watcher_control = Arc::clone(&control);
+        // Cheap to clone: every clone publishes into the one picture `close` writes to. Without it
+        // a watcher-driven teardown left the snapshot saying `Ready` while every later start was
+        // refused, so a host watching the subscription never learned the session had ended.
+        let watcher_state = state.clone();
         let shutdown_watcher = tokio::spawn(async move {
             tokio::select! {
                 () = cancel.cancelled() => {
+                    // Published before the wind-down, so a subscriber sees the transition rather
+                    // than only its result. Monotonic, so a `close` racing this cannot walk it back.
+                    watcher_state.set_status(SessionStatus::Closing);
                     if watcher_shared.stop_new_work() {
                         watcher_shared
                             .release_pending(DecisionSource::Cancelled)
@@ -1223,9 +1230,16 @@ impl CodexSession {
                     }
                     let _ = watcher_client.close().await;
                 }
-                () = terminated.cancelled() => {}
+                () = terminated.cancelled() => {
+                    // The connection is already gone; `connection_terminated` or `poison` failed
+                    // the active turn before cancelling this token.
+                    watcher_state.set_status(SessionStatus::Closing);
+                }
             }
             let _ = watcher_control.kill(CancelReason::Shutdown).await;
+            // The child is released, so nothing more can happen on this session whichever branch
+            // ran. Reported even when the kill failed: no later operation can make progress.
+            watcher_state.set_status(SessionStatus::Closed);
         });
         let accepted = state.snapshot().configuration.accepted.clone();
         Self {

@@ -20,8 +20,8 @@ use mango_external_agents::permission::{
 use mango_external_agents::testing::{FakeLauncher, FakeProcess};
 use mango_external_agents::{
     ApprovalRouting, CancelReason, Clock, CloseReason, ConfigurationChange, ConfigurationPatch,
-    EnvSource, Harness, HostContext, OpenSession, PermissionLevel, Session, SessionQuery, Steer,
-    TurnRequest,
+    EnvSource, Harness, HostContext, OpenSession, PermissionLevel, Session, SessionQuery,
+    SessionStatus, SessionSubscription, Steer, TurnRequest,
 };
 use support::Transcript;
 
@@ -1448,6 +1448,28 @@ async fn a_cancelled_turn_still_completes_and_says_why_it_stopped() {
     );
 }
 
+/// The status a session settles on, once it stops changing.
+///
+/// Only the terminal status is asserted on, never the `Closing` before it: a
+/// [`SessionSubscription`] coalesces, so a teardown that does not block between its two
+/// transitions publishes both and a subscriber legitimately sees only the second.
+///
+/// Reports the status it is stuck on rather than hanging to a bare timeout: a lifecycle that never
+/// ends has to fail as "received `Ready`", which names the bug, not as "the test timed out", which
+/// names nothing.
+async fn status_once_settled(lifecycle: &mut SessionSubscription) -> SessionStatus {
+    loop {
+        if lifecycle.current().status == SessionStatus::Closed {
+            return SessionStatus::Closed;
+        }
+        let next =
+            tokio::time::timeout(std::time::Duration::from_secs(5), lifecycle.changed()).await;
+        if !matches!(next, Ok(Some(_))) {
+            return lifecycle.current().status;
+        }
+    }
+}
+
 /// The host's lifetime token stops an ordinary vendor turn even when no approval is pending.
 #[tokio::test]
 async fn host_shutdown_cancels_an_ordinary_turn_and_ends_its_child() {
@@ -1496,6 +1518,65 @@ async fn host_shutdown_cancels_an_ordinary_turn_and_ends_its_child() {
             .await
             .is_err(),
         "expected the shutdown session to reject a second turn"
+    );
+}
+
+/// A session the host's own lifetime token tore down never saw `close`, so the shutdown watcher
+/// owes the lifecycle the transitions `close` publishes. Without them the snapshot keeps saying
+/// `Ready` while every later start is refused, and a subscriber is told nothing at all.
+#[tokio::test]
+async fn host_shutdown_publishes_the_lifecycle_its_watcher_drove() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("turn").as_process());
+    let cancel = mango_external_agents::CancelToken::new();
+    let (host, _) =
+        with_launcher_limits_and_cancel(launcher, None, replay_limits(), cancel.clone());
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    assert_eq!(lifecycle.current().status, SessionStatus::Ready);
+
+    cancel.cancel();
+
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected the watcher to publish the terminal close publishes"
+    );
+}
+
+/// The other way the watcher runs: the app-server disappears on its own. `connection_terminated`
+/// stops new work and cancels `terminated`, and the lifecycle has to follow — a host left holding
+/// a `Ready` session over a dead connection learns it only from the next refusal.
+#[tokio::test]
+async fn a_dead_app_server_connection_publishes_the_session_terminal() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let close_stdout = mango_external_agents::CancelToken::new();
+    launcher.push(
+        Transcript::load("turn")
+            .as_process()
+            .ending_stdout_when(close_stdout.clone()),
+    );
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+
+    close_stdout.cancel();
+
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected a terminated connection to end the published lifecycle"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the watcher to reap the child it reported closed"
     );
 }
 
