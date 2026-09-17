@@ -236,7 +236,7 @@ impl Harness for AcpHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        self.validate_open_session(&request)?;
+        self.validate_open_session(host, &request)?;
         refuse_unsupported_reset(&request.configuration)?;
         let configuration = request.configuration.requested();
         refuse_model_selection(&configuration)?;
@@ -294,7 +294,10 @@ impl Harness for AcpHarness {
                 .with_accepted(accepted_axes(&configuration)),
         )
         .with_catalog(ConfigurationCatalog::empty());
-        let session_state = mango_external_agents::SessionState::new(opening_snapshot);
+        let session_state = mango_external_agents::SessionState::new(
+            std::sync::Arc::clone(host.clock()),
+            opening_snapshot,
+        );
 
         let connection_state = Arc::new(SessionState::new(
             session_id,

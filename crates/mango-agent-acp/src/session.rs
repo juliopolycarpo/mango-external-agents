@@ -269,7 +269,7 @@ impl Session for AcpSession {
         let (sink, events) = EventSink::new(
             self.session_state.snapshot().ids.session_id.clone(),
             request.turn_id.clone(),
-            request.attempt.clone(),
+            request.attempt,
             Arc::clone(self.host.clock()),
             self.host.limits().turn_channel_capacity,
         );
@@ -618,12 +618,15 @@ mod tests {
     /// routing decision can be un-set, so a reset is refused the same way everywhere it is asked.
     #[test]
     fn a_patch_asking_to_reset_an_axis_is_refused_by_name() {
-        let error =
-            refuse_unsupported_reset(&ConfigurationPatch::new().level(ConfigurationChange::Reset))
-                .expect_err("expected a refusal, received acceptance");
+        let error = refuse_unsupported_reset(
+            &ConfigurationPatch::new()
+                .level(ConfigurationChange::Reset)
+                .model(ConfigurationChange::Reset),
+        )
+        .expect_err("expected a refusal, received acceptance");
         assert!(
-            matches!(&error, Error::HostConfiguration { received, .. } if received.contains("remove an override")),
-            "expected the refusal to name what was asked, received {error:?}"
+            matches!(&error, Error::HostConfiguration { received, .. } if received.contains("model, level")),
+            "expected the refusal to name every axis that asked, received {error:?}"
         );
     }
 

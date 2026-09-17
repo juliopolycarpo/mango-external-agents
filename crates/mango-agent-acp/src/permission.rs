@@ -160,7 +160,7 @@ mod tests {
         OperationRef::new(
             SessionId::new("sess_1"),
             TurnId::new("turn-1"),
-            AttemptId::new("attempt-1"),
+            AttemptId::new(1),
         )
     }
 

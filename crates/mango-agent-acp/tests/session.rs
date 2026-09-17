@@ -53,13 +53,15 @@ fn host_with_clock(launcher: &FakeLauncher, clock: Arc<dyn Clock>) -> HostContex
         .expect("expected a host")
 }
 
-/// A named clock that blocks the `TurnStarted` event stamp until a test releases it.
+/// A named clock that blocks the next read after a test arms it, until the test releases it.
 ///
-/// The *first* read is `open_session`'s own `SessionSnapshot::opening(..., host.now())`, which must
-/// pass straight through or opening the session would never return. The second is
-/// `EventSink::emit`'s stamp on `TurnStarted` — the first event a turn can produce — and that is the
-/// one this clock holds, so a test can force a `close` into the window between the turn handle being
-/// installed and its prompt being written to the wire.
+/// Armed rather than counted. Opening a session reads the host's clock more than once — the
+/// opening snapshot's stamp, and again every time the handshake publishes a session fact through
+/// `SessionState` — so a clock that blocked "the second read" would block inside `open_session`
+/// and never return. Arming after the session is open makes the next read the one a test means:
+/// `EventSink::emit`'s stamp on `TurnStarted`, the first event a turn can produce. That is the
+/// window a `close` has to be forced into, between the turn handle being installed and its prompt
+/// being written to the wire.
 #[derive(Debug, Default)]
 struct TurnStartedClock {
     state: Mutex<TurnStartedClockState>,
@@ -68,12 +70,18 @@ struct TurnStartedClock {
 
 #[derive(Debug, Default)]
 struct TurnStartedClockState {
-    reads: u32,
+    armed: bool,
     blocked: bool,
     released: bool,
 }
 
 impl TurnStartedClock {
+    /// Blocks the next read, and only the next one.
+    fn arm(&self) {
+        let mut state = self.state.lock().expect("expected the clock state");
+        state.armed = true;
+    }
+
     fn wait_until_blocked(&self) {
         let mut state = self.state.lock().expect("expected the clock state");
         while !state.blocked {
@@ -91,8 +99,9 @@ impl TurnStartedClock {
 impl Clock for TurnStartedClock {
     fn now(&self) -> SystemTime {
         let mut state = self.state.lock().expect("expected the clock state");
-        state.reads += 1;
-        if state.reads > 1 && !state.released {
+        if state.armed && !state.released {
+            // Disarmed as it blocks, so the reads that follow the release run straight through.
+            state.armed = false;
             state.blocked = true;
             self.changed.notify_all();
             while !state.released {
@@ -660,6 +669,9 @@ async fn a_close_between_handle_installation_and_prompt_write_refuses_the_detach
         .expect("expected a session");
     let session: Arc<dyn Session> = Arc::from(opened);
 
+    // Armed only now: opening reads the clock for its own snapshot and again for every session
+    // fact the handshake publishes, and blocking any of those would stall the open itself.
+    clock.arm();
     let starting = {
         let session = Arc::clone(&session);
         tokio::spawn(async move { session.start_turn(TurnRequest::new("turn-1", "one")).await })

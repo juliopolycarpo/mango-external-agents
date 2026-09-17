@@ -1034,15 +1034,18 @@ mod tests {
 
     /// A bare core session state, for the connection-level state under test to publish facts into.
     fn core_state() -> mango_external_agents::SessionState {
-        mango_external_agents::SessionState::new(SessionSnapshot::opening(
-            SessionIds {
-                session_id: SessionId::new("session-1"),
-                native_session_id: String::from("native-1"),
-            },
-            HarnessIdentity::claude(),
-            TransportSelection::new(None, TransportKind::Acp),
-            std::time::SystemTime::UNIX_EPOCH,
-        ))
+        mango_external_agents::SessionState::new(
+            std::sync::Arc::new(mango_external_agents::SystemClock),
+            SessionSnapshot::opening(
+                SessionIds {
+                    session_id: SessionId::new("session-1"),
+                    native_session_id: String::from("native-1"),
+                },
+                HarnessIdentity::claude(),
+                TransportSelection::new(None, TransportKind::Acp),
+                std::time::SystemTime::UNIX_EPOCH,
+            ),
+        )
     }
 
     fn state() -> (SessionState, HostContext) {
