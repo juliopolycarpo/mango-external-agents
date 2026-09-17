@@ -1,4 +1,4 @@
-//! `session/update` in, [`EventKind`] out.
+//! `session/update` in, [`EventKind`] events and session-scoped facts out.
 //!
 //! Pure: no IO, no clock, no channel. Everything the harness has to decide about an ACP frame is
 //! decided here, against a value parsed from the wire, which is what makes each mapping a test with
@@ -11,9 +11,11 @@
 //!   executor. See the [`event`](mango_external_agents::event) module docs.
 //! * **Our own text never comes back.** `user_message_chunk` is the agent echoing the prompt the
 //!   host just sent; replaying it would duplicate the host's own message.
-//! * **Session state is not transcript.** The mode, config-option and session-info updates describe
-//!   the session rather than the turn, and 0.1 drops them rather than inventing transcript events
-//!   for them.
+//! * **Session state is not transcript.** The mode, config-option, session-info and command-catalog
+//!   updates describe the session rather than the turn. The command catalog is reported as a
+//!   [`SessionFact`] rather than an [`EventKind`], because it is session state — see
+//!   [`state::SessionState::set_commands`](mango_external_agents::state::SessionState::set_commands)
+//!   — and the rest are dropped, because 0.1 has no session-state slot for them yet.
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
@@ -34,6 +36,20 @@ use mango_external_agents::event::{
 /// clear of an agent's own tool call ids.
 pub const PLAN_CALL_ID: &str = "acp:plan";
 
+/// A session-scoped fact one frame carried, alongside whatever it said about the turn.
+///
+/// ACP re-announces its command catalog mid-session; that catalog is session state, not transcript
+/// (see the module's own docs), so it is reported here rather than folded into
+/// [`Reducer::update`]'s event vector. The harness applies it to
+/// [`SessionState::set_commands`](mango_external_agents::state::SessionState::set_commands) instead
+/// of the turn stream, which is what lets a *second* announcement reach a host that already read
+/// the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionFact {
+    /// The agent announced its slash-command catalog.
+    Commands(Vec<Command>),
+}
+
 /// Turns one agent's frames into events, remembering only what a frame alone cannot say.
 ///
 /// Two things: whether a reasoning block is open (ACP streams thought chunks with no start or end
@@ -52,7 +68,7 @@ impl Reducer {
         Self::default()
     }
 
-    /// The events one `session/update` produces, in order.
+    /// The events and session facts one `session/update` produces, in order.
     ///
     /// # Example
     ///
@@ -68,12 +84,11 @@ impl Reducer {
     /// .expect("a v1 agent message chunk");
     ///
     /// let mut reducer = Reducer::new();
-    /// assert_eq!(
-    ///     reducer.update(update),
-    ///     vec![EventKind::TextDelta { text: String::from("hello") }]
-    /// );
+    /// let (events, facts) = reducer.update(update);
+    /// assert_eq!(events, vec![EventKind::TextDelta { text: String::from("hello") }]);
+    /// assert!(facts.is_empty());
     /// ```
-    pub fn update(&mut self, update: SessionUpdate) -> Vec<EventKind> {
+    pub fn update(&mut self, update: SessionUpdate) -> (Vec<EventKind>, Vec<SessionFact>) {
         // A transcript frame closes an open reasoning block: a host that never saw `ReasoningEnded`
         // would render a reasoning phase that stays open for the rest of the turn. A frame that
         // produces no transcript must *not*, or a usage report or a mode change arriving between two
@@ -82,8 +97,9 @@ impl Reducer {
             true => self.close_reasoning(),
             false => Vec::new(),
         };
-        events.extend(self.body(update));
-        events
+        let (body_events, facts) = self.body(update);
+        events.extend(body_events);
+        (events, facts)
     }
 
     /// The events that close out a turn, before its terminal.
@@ -119,20 +135,21 @@ impl Reducer {
         vec![EventKind::ReasoningEnded]
     }
 
-    /// The events one frame's own arm produces, with no reasoning bookkeeping.
+    /// Every event and session fact one frame's own arm produces, with no reasoning bookkeeping.
     ///
     /// Every arm added here needs a matching decision in [`transcript`]: whether the frame is part of
     /// the turn's transcript, and so whether it closes an open reasoning block.
-    fn body(&mut self, update: SessionUpdate) -> Vec<EventKind> {
+    fn body(&mut self, update: SessionUpdate) -> (Vec<EventKind>, Vec<SessionFact>) {
         match update {
-            SessionUpdate::AgentMessageChunk(chunk) => text_delta(chunk),
-            SessionUpdate::AgentThoughtChunk(chunk) => self.reasoning_delta(chunk),
-            SessionUpdate::ToolCall(call) => tool_call(call),
-            SessionUpdate::ToolCallUpdate(update) => tool_call_update(update),
-            SessionUpdate::Plan(plan) => self.plan(plan),
-            SessionUpdate::AvailableCommandsUpdate(catalog) => {
-                vec![EventKind::CommandsAvailable {
-                    commands: catalog
+            SessionUpdate::AgentMessageChunk(chunk) => (text_delta(chunk), Vec::new()),
+            SessionUpdate::AgentThoughtChunk(chunk) => (self.reasoning_delta(chunk), Vec::new()),
+            SessionUpdate::ToolCall(call) => (tool_call(call), Vec::new()),
+            SessionUpdate::ToolCallUpdate(update) => (tool_call_update(update), Vec::new()),
+            SessionUpdate::Plan(plan) => (self.plan(plan), Vec::new()),
+            SessionUpdate::AvailableCommandsUpdate(catalog) => (
+                Vec::new(),
+                vec![SessionFact::Commands(
+                    catalog
                         .available_commands
                         .into_iter()
                         .map(|command| Command {
@@ -140,27 +157,30 @@ impl Reducer {
                             description: Some(command.description),
                         })
                         .collect(),
-                }]
-            }
-            SessionUpdate::UsageUpdate(usage) => vec![EventKind::ThreadUsage {
-                usage: ThreadUsage {
-                    last: None,
-                    total: Some(Usage {
-                        total_tokens: Some(usage.used),
-                        ..Usage::default()
-                    }),
-                    // The one honest denominator: ACP reports the window alongside what was used,
-                    // so a percentage does not have to be guessed from a default.
-                    context_window_tokens: Some(usage.size),
-                },
-            }],
+                )],
+            ),
+            SessionUpdate::UsageUpdate(usage) => (
+                vec![EventKind::ThreadUsage {
+                    usage: ThreadUsage {
+                        last: None,
+                        total: Some(Usage {
+                            total_tokens: Some(usage.used),
+                            ..Usage::default()
+                        }),
+                        // The one honest denominator: ACP reports the window alongside what was
+                        // used, so a percentage does not have to be guessed from a default.
+                        context_window_tokens: Some(usage.size),
+                    },
+                }],
+                Vec::new(),
+            ),
             // Session state rather than transcript, and the `#[non_exhaustive]` tail: an agent that
             // sends an update from a draft feature this build did not opt into is not a failed turn.
             SessionUpdate::UserMessageChunk(_)
             | SessionUpdate::CurrentModeUpdate(_)
             | SessionUpdate::ConfigOptionUpdate(_)
             | SessionUpdate::SessionInfoUpdate(_)
-            | _ => Vec::new(),
+            | _ => (Vec::new(), Vec::new()),
         }
     }
 
@@ -192,13 +212,7 @@ impl Reducer {
         }
         vec![EventKind::ActivityStarted {
             call_id: String::from(PLAN_CALL_ID),
-            activity: Activity {
-                name: String::from("plan"),
-                kind: ActivityKind::Plan,
-                title,
-                detail: Some(detail),
-                truncated: false,
-            },
+            activity: Activity::new("plan", ActivityKind::Plan, title).with_detail(detail),
         }]
     }
 }
@@ -207,8 +221,9 @@ impl Reducer {
 ///
 /// The thought chunk is transcript and is excluded anyway: it is the frame that *opens* a reasoning
 /// block, so closing one for it would end every block on its second chunk. Everything listed as
-/// `false` is what [`Reducer::body`] drops — the `#[non_exhaustive]` tail with it, because a frame
-/// this build cannot read is not evidence that the agent stopped thinking.
+/// `false` is what [`Reducer::body`] drops or reports as a [`SessionFact`] — the `#[non_exhaustive]`
+/// tail with it, because a frame this build cannot read is not evidence that the agent stopped
+/// thinking.
 fn transcript(update: &SessionUpdate) -> bool {
     match update {
         SessionUpdate::AgentThoughtChunk(_)
@@ -218,8 +233,8 @@ fn transcript(update: &SessionUpdate) -> bool {
         | SessionUpdate::ConfigOptionUpdate(_)
         | SessionUpdate::SessionInfoUpdate(_)
         // The command catalog is session state, like the mode and config updates above: see
-        // `EventKind::CommandsAvailable`'s own doc comment. It still produces an event in `body`,
-        // it just must not close a reasoning block on its way through.
+        // `SessionFact::Commands`'s own doc comment. It still produces a fact in `body`, it just
+        // must not close a reasoning block on its way through.
         | SessionUpdate::AvailableCommandsUpdate(_) => false,
         SessionUpdate::AgentMessageChunk(_)
         | SessionUpdate::ToolCall(_)
@@ -251,15 +266,18 @@ fn plain_text(content: ContentBlock) -> Option<String> {
 
 fn tool_call(call: ToolCall) -> Vec<EventKind> {
     let call_id = call.tool_call_id.to_string();
+    let activity = Activity::new(
+        tool_name(&call),
+        activity_kind(call.kind),
+        call.title.clone(),
+    );
+    let activity = match content_detail(&call.content) {
+        Some(detail) => activity.with_detail(detail),
+        None => activity,
+    };
     let mut events = vec![EventKind::ActivityStarted {
         call_id: call_id.clone(),
-        activity: Activity {
-            name: tool_name(&call),
-            kind: activity_kind(call.kind),
-            title: call.title.clone(),
-            detail: content_detail(&call.content),
-            truncated: false,
-        },
+        activity,
     }];
     // An agent may report a call that already finished — a cached read, a refusal — in one frame.
     // Announcing it without completing it would leave a spinner running for something that is over.
@@ -387,7 +405,7 @@ pub fn was_cancelled(stop_reason: StopReason) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PLAN_CALL_ID, Reducer, activity_kind, was_cancelled};
+    use super::{PLAN_CALL_ID, Reducer, SessionFact, activity_kind, was_cancelled};
     use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolKind};
     use mango_external_agents::event::{
         ActivityKind, ActivityStatus, Command, EventKind, ThreadUsage, Usage,
@@ -401,13 +419,20 @@ mod tests {
     }
 
     fn reduce(values: Vec<serde_json::Value>) -> Vec<EventKind> {
+        reduce_with_facts(values).0
+    }
+
+    fn reduce_with_facts(values: Vec<serde_json::Value>) -> (Vec<EventKind>, Vec<SessionFact>) {
         let mut reducer = Reducer::new();
-        let mut events: Vec<EventKind> = values
-            .into_iter()
-            .flat_map(|value| reducer.update(update(value)))
-            .collect();
+        let mut events = Vec::new();
+        let mut facts = Vec::new();
+        for value in values {
+            let (frame_events, frame_facts) = reducer.update(update(value));
+            events.extend(frame_events);
+            facts.extend(frame_facts);
+        }
         events.extend(reducer.finish());
-        events
+        (events, facts)
     }
 
     #[test]
@@ -672,31 +697,34 @@ mod tests {
         assert_eq!(result.status, ActivityStatus::Completed);
     }
 
+    /// The command catalog is session state now, not a turn event: it is reported as a
+    /// [`SessionFact`] rather than folded into the event vector.
+    ///
     /// The name reaches the host bare. Invocation is `/` plus the name, so the sigil belongs to
     /// whoever renders it — and a name with a `/` inside it, like a scoped plugin command, would not
     /// survive being re-slugged.
     #[test]
-    fn the_command_catalog_keeps_the_agents_own_spelling() {
+    fn the_command_catalog_keeps_the_agents_own_spelling_and_is_a_session_fact() {
+        let (events, facts) = reduce_with_facts(vec![json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [
+                { "name": "create_plan", "description": "Draft a plan" },
+                { "name": "my-plugin:review", "description": "Review the diff" }
+            ]
+        })]);
+        assert_eq!(events, Vec::<EventKind>::new(), "expected no turn event");
         assert_eq!(
-            reduce(vec![json!({
-                "sessionUpdate": "available_commands_update",
-                "availableCommands": [
-                    { "name": "create_plan", "description": "Draft a plan" },
-                    { "name": "my-plugin:review", "description": "Review the diff" }
-                ]
-            })]),
-            vec![EventKind::CommandsAvailable {
-                commands: vec![
-                    Command {
-                        name: String::from("create_plan"),
-                        description: Some(String::from("Draft a plan")),
-                    },
-                    Command {
-                        name: String::from("my-plugin:review"),
-                        description: Some(String::from("Review the diff")),
-                    },
-                ]
-            }]
+            facts,
+            vec![SessionFact::Commands(vec![
+                Command {
+                    name: String::from("create_plan"),
+                    description: Some(String::from("Draft a plan")),
+                },
+                Command {
+                    name: String::from("my-plugin:review"),
+                    description: Some(String::from("Review the diff")),
+                },
+            ])]
         );
     }
 

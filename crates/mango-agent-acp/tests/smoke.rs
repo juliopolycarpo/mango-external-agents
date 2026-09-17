@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mango_external_agents::{
-    CloseReason, Configuration, EnvSource, EventKind, Harness, HostContext, OpenSession,
-    PermissionLevel, TurnRequest,
+    CloseReason, ConfigurationChange, ConfigurationPatch, EnvSource, EventKind, Harness,
+    HostContext, OpenSession, PermissionLevel, TurnRequest,
 };
 
 /// Which profile to drive, from the environment. `cursor` unless told otherwise.
@@ -63,17 +63,16 @@ async fn one_real_turn_against_an_installed_agent() {
     let session = harness
         .open_session(
             &host,
-            OpenSession::new("smoke-1").with_configuration(Configuration {
+            OpenSession::new("smoke-1").with_configuration(
                 // Not `ReadOnly`: a read-only session refuses every request the agent raises, and a
                 // smoke test that refused its own agent's tools would prove less than it looks.
-                level: Some(PermissionLevel::Default),
-                ..Configuration::default()
-            }),
+                ConfigurationPatch::new().level(ConfigurationChange::Set(PermissionLevel::Default)),
+            ),
         )
         .await
         .expect("expected a session, received a failure");
     eprintln!("ids: {:?}", session.ids());
-    eprintln!("capabilities: {:?}", session.info().capabilities);
+    eprintln!("capabilities: {:?}", session.capabilities());
     assert!(!session.ids().native_session_id.trim().is_empty());
 
     let mut turn = session
@@ -108,8 +107,8 @@ async fn one_real_turn_against_an_installed_agent() {
         kinds.len()
     );
     assert!(
-        matches!(kinds.first(), Some(EventKind::SessionStarted { .. })),
-        "expected the conversation to be named first, received {kinds:?}"
+        matches!(kinds.first(), Some(EventKind::TurnStarted { .. })),
+        "expected the turn to be named first, received {kinds:?}"
     );
     assert!(
         kinds

@@ -70,7 +70,7 @@ async fn the_approval_deadline_uses_its_own_host_limit() {
     };
 
     assert_eq!(
-        request.expires_at,
+        request.expires_at(),
         SystemTime::UNIX_EPOCH + Duration::from_secs(10),
         "expected the approval limit instead of the 60s RPC limit"
     );
@@ -377,7 +377,7 @@ async fn a_full_event_channel_does_not_postpone_the_wire_deadline() {
     );
     let events = drain(&mut turn).await;
     assert!(
-        matches!(events.as_slice(), [EventKind::SessionStarted { .. }, EventKind::ApprovalRequested { .. }, EventKind::ApprovalResolved { decision, .. }, EventKind::Completed] if decision.source == DecisionSource::Expired),
+        matches!(events.as_slice(), [EventKind::TurnStarted { .. }, EventKind::ApprovalRequested { .. }, EventKind::ApprovalResolved { decision, .. }, EventKind::Completed] if decision.source == DecisionSource::Expired),
         "expected request, expired resolution, then terminal after backpressure clears, received {events:?}"
     );
     session.close(CloseReason::Shutdown).await.expect("close");
@@ -416,7 +416,7 @@ async fn a_fast_agent_cannot_complete_before_its_expiry_audit_on_another_worker(
         .expect("turn");
     let events = drain(&mut turn).await;
     assert!(
-        matches!(events.as_slice(), [EventKind::SessionStarted { .. }, EventKind::ApprovalRequested { .. }, EventKind::ApprovalResolved { decision, .. }, EventKind::Completed] if decision.source == DecisionSource::Expired),
+        matches!(events.as_slice(), [EventKind::TurnStarted { .. }, EventKind::ApprovalRequested { .. }, EventKind::ApprovalResolved { decision, .. }, EventKind::Completed] if decision.source == DecisionSource::Expired),
         "expected requested < expired < terminal across runtime workers, received {events:?}"
     );
     session.close(CloseReason::Shutdown).await.expect("close");
@@ -465,16 +465,17 @@ async fn a_stale_response_cannot_publish_a_question_before_its_broker_is_done() 
         .start_turn(TurnRequest::new("expiry", "run it"))
         .await
         .expect("turn");
-    turn.recv().await.expect("session started");
+    turn.recv().await.expect("turn started");
     broker.entered.cancelled().await;
     session
         .respond(mango_external_agents::PermissionResponse::from_user(
-            "stale", "allow",
+            mango_external_agents::InteractionId::new("stale"),
+            "allow",
         ))
         .await
         .expect("stale reply is harmless");
     assert!(
-        turn.events.try_recv().is_err(),
+        turn.try_recv().is_err(),
         "expected broker-owned question to remain unpublished during an unrelated response"
     );
     broker.released.cancel();
@@ -513,7 +514,7 @@ async fn an_invalid_host_option_leaves_the_approval_answerable() {
     };
     let response = session
         .respond(mango_external_agents::PermissionResponse::from_user(
-            &question.id,
+            question.id().clone(),
             "  ",
         ))
         .await;
@@ -580,7 +581,8 @@ async fn a_stale_answer_cannot_cross_a_reused_wire_id_onto_a_later_question() {
         }
     };
     assert_ne!(
-        first.id, second.id,
+        first.id(),
+        second.id(),
         "expected distinct host-facing ids for two questions that merely share a wire id"
     );
 
@@ -588,7 +590,8 @@ async fn a_stale_answer_cannot_cross_a_reused_wire_id_onto_a_later_question() {
     // it expired. It must not be able to grant the second question, whatever id the wire reused.
     session
         .respond(mango_external_agents::PermissionResponse::from_user(
-            &first.id, "allow",
+            first.id().clone(),
+            "allow",
         ))
         .await
         .expect("expected the stale reply to be accepted rather than erroring");

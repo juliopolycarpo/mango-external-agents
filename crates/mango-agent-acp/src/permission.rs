@@ -1,9 +1,9 @@
 //! `session/request_permission` in, a brokered answer out.
 //!
 //! Nothing here decides anything. The mapping's whole job is to make a decision *possible*: ACP's
-//! four option kinds become the core's four, so a host policy can answer "allow" without reading a
-//! label in a language it does not know, and the option set itself is passed through untouched —
-//! same ids, same order, same words the agent wrote.
+//! four option kinds become the core's effect/scope/policy-changing vocabulary, so a host policy
+//! can answer "allow" without reading a label in a language it does not know, and the option set
+//! itself is passed through untouched — same ids, same order, same words the agent wrote.
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission>
 
@@ -14,9 +14,10 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, ToolCallUpdate,
 };
-use mango_external_agents::permission::{
-    PermissionOption, PermissionOptionKind, PermissionRequest,
-};
+use mango_external_agents::event::SessionId;
+use mango_external_agents::operation::OperationRef;
+use mango_external_agents::permission::{PermissionEffect, PermissionOption, PermissionRequest};
+use mango_external_agents::{Interaction, InteractionId, InteractionKind};
 
 use crate::reducer;
 
@@ -33,17 +34,27 @@ use crate::reducer;
 pub fn request_from(
     request: &RequestPermissionRequest,
     id: String,
+    session_id: SessionId,
+    operation: OperationRef,
     expires_at: SystemTime,
 ) -> PermissionRequest {
     let tool_call = &request.tool_call;
-    PermissionRequest {
-        id,
-        kind: reducer::activity_kind(tool_call.fields.kind.unwrap_or_default()),
-        title: title(tool_call),
-        detail: detail(tool_call),
-        options: request.options.iter().map(option).collect(),
+    let interaction = Interaction::new(
+        InteractionId::new(id),
+        InteractionKind::Permission,
+        session_id,
         expires_at,
-        truncated: false,
+    )
+    .during(operation);
+    let built = PermissionRequest::new(
+        interaction,
+        reducer::activity_kind(tool_call.fields.kind.unwrap_or_default()),
+        title(tool_call),
+        request.options.iter().map(option).collect(),
+    );
+    match detail(tool_call) {
+        Some(detail) => built.with_detail(detail),
+        None => built,
     }
 }
 
@@ -66,31 +77,46 @@ fn detail(tool_call: &ToolCallUpdate) -> Option<String> {
 }
 
 /// One choice, with the agent's own id and words kept exactly as sent.
+///
+/// ACP v1 has no destructive marker on a permission option, so [`PermissionOption::risk`] is left
+/// at its default of `Unspecified` — reporting `Destructive` would put a warning on a choice the
+/// agent never flagged.
 fn option(option: &AcpPermissionOption) -> PermissionOption {
-    PermissionOption {
-        id: option.option_id.to_string(),
-        kind: option_kind(&option.kind),
-        label: Some(option.name.clone()),
-        // ACP v1 has no destructive marker on a permission option. Reporting `true` would put a
-        // warning on a choice the agent never flagged; reporting `false` is what the wire said.
-        destructive: false,
+    let built = PermissionOption::new(option.option_id.to_string(), effect(&option.kind))
+        .with_label(option.name.clone());
+    match scope(&option.kind) {
+        Scoped::Once => built.with_scope(mango_external_agents::PermissionScope::Once),
+        // "Allow/reject this operation and remember the choice" states that a standing rule is
+        // written, but never says how far it reaches — not the rest of the session, not
+        // persistently across sessions. Reporting a scope here would be inventing a reach the
+        // protocol never promised; `policy_changing` alone says everything ACP actually states.
+        Scoped::Remembered => built.policy_changing(),
     }
 }
 
-/// What an ACP option kind means, so a policy can answer without reading a label.
-///
-/// One to one: ACP's four are the same four the core models, which is why a broker written against
-/// the core works against every ACP agent without a per-agent table. The `#[non_exhaustive]` tail
-/// falls to [`PermissionOptionKind::Other`] — a kind this build does not know is a choice only a
-/// person can weigh, and guessing that an unknown kind allows would be the worst possible guess.
-#[must_use]
-pub fn option_kind(kind: &AcpPermissionOptionKind) -> PermissionOptionKind {
+enum Scoped {
+    Once,
+    Remembered,
+}
+
+fn effect(kind: &AcpPermissionOptionKind) -> PermissionEffect {
     match kind {
-        AcpPermissionOptionKind::AllowOnce => PermissionOptionKind::AllowOnce,
-        AcpPermissionOptionKind::AllowAlways => PermissionOptionKind::AllowAlways,
-        AcpPermissionOptionKind::RejectOnce => PermissionOptionKind::RejectOnce,
-        AcpPermissionOptionKind::RejectAlways => PermissionOptionKind::RejectAlways,
-        _ => PermissionOptionKind::Other,
+        AcpPermissionOptionKind::AllowOnce | AcpPermissionOptionKind::AllowAlways => {
+            PermissionEffect::Allow
+        }
+        AcpPermissionOptionKind::RejectOnce | AcpPermissionOptionKind::RejectAlways => {
+            PermissionEffect::Reject
+        }
+        // `#[non_exhaustive]`: a kind this build does not know is a choice only a person can
+        // weigh, and guessing that an unknown kind allows would be the worst possible guess.
+        _ => PermissionEffect::Other,
+    }
+}
+
+fn scope(kind: &AcpPermissionOptionKind) -> Scoped {
+    match kind {
+        AcpPermissionOptionKind::AllowOnce | AcpPermissionOptionKind::RejectOnce => Scoped::Once,
+        _ => Scoped::Remembered,
     }
 }
 
@@ -114,18 +140,28 @@ pub fn cancelled() -> RequestPermissionResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{cancelled, option_kind, request_from, selected};
+    use super::{cancelled, effect, request_from, scope, selected};
     use agent_client_protocol::schema::v1::{
         PermissionOptionKind as AcpPermissionOptionKind, RequestPermissionOutcome,
         RequestPermissionRequest,
     };
     use mango_external_agents::event::ActivityKind;
-    use mango_external_agents::permission::{DecisionSource, PermissionOptionKind};
+    use mango_external_agents::operation::{AttemptId, OperationRef};
+    use mango_external_agents::permission::{DecisionSource, PermissionEffect};
+    use mango_external_agents::{PermissionScope, SessionId, TurnId};
     use serde_json::json;
     use std::time::{Duration, SystemTime};
 
     fn deadline() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    fn operation() -> OperationRef {
+        OperationRef::new(
+            SessionId::new("sess_1"),
+            TurnId::new("turn-1"),
+            AttemptId::new("attempt-1"),
+        )
     }
 
     fn parse(value: serde_json::Value) -> RequestPermissionRequest {
@@ -151,27 +187,53 @@ mod tests {
 
     #[test]
     fn a_request_carries_what_is_being_asked_and_every_choice_untouched() {
-        let request = request_from(&asking(), String::from("rpc-7"), deadline());
+        let request = request_from(
+            &asking(),
+            String::from("rpc-7"),
+            SessionId::new("sess_1"),
+            operation(),
+            deadline(),
+        );
 
-        assert_eq!(request.id, "rpc-7");
+        assert_eq!(request.id().as_str(), "rpc-7");
         assert_eq!(request.kind, ActivityKind::Command);
         assert_eq!(request.title, "Run `rm -rf build`");
         assert_eq!(request.detail.as_deref(), Some("cwd /repo"));
-        assert_eq!(request.expires_at, deadline());
+        assert_eq!(request.expires_at(), deadline());
         assert_eq!(
             request
                 .options
                 .iter()
-                .map(|option| (option.id.as_str(), option.kind, option.label.as_deref()))
+                .map(|option| (
+                    option.id.as_str(),
+                    option.effect,
+                    option.scope,
+                    option.policy_changing,
+                    option.label.as_deref()
+                ))
                 .collect::<Vec<_>>(),
             vec![
-                ("allow", PermissionOptionKind::AllowOnce, Some("Allow")),
+                (
+                    "allow",
+                    PermissionEffect::Allow,
+                    Some(PermissionScope::Once),
+                    false,
+                    Some("Allow")
+                ),
                 (
                     "allow-all",
-                    PermissionOptionKind::AllowAlways,
+                    PermissionEffect::Allow,
+                    None,
+                    true,
                     Some("Always allow")
                 ),
-                ("reject", PermissionOptionKind::RejectOnce, Some("Reject")),
+                (
+                    "reject",
+                    PermissionEffect::Reject,
+                    Some(PermissionScope::Once),
+                    false,
+                    Some("Reject")
+                ),
             ]
         );
     }
@@ -180,7 +242,13 @@ mod tests {
     /// it produces names one of the agent's own option ids.
     #[test]
     fn a_mapped_request_can_be_allowed_and_refused_by_a_policy_that_never_read_a_label() {
-        let request = request_from(&asking(), String::from("rpc-7"), deadline());
+        let request = request_from(
+            &asking(),
+            String::from("rpc-7"),
+            SessionId::new("sess_1"),
+            operation(),
+            deadline(),
+        );
 
         let allow = request.allow().expect("expected an allowing option");
         assert_eq!(allow.option_id, "allow", "expected the narrow allow to win");
@@ -191,32 +259,44 @@ mod tests {
     }
 
     #[test]
-    fn every_acp_option_kind_maps_onto_the_neutral_one() {
+    fn every_acp_option_kind_maps_onto_an_effect() {
         let cases = [
-            (
-                AcpPermissionOptionKind::AllowOnce,
-                PermissionOptionKind::AllowOnce,
-            ),
+            (AcpPermissionOptionKind::AllowOnce, PermissionEffect::Allow),
             (
                 AcpPermissionOptionKind::AllowAlways,
-                PermissionOptionKind::AllowAlways,
+                PermissionEffect::Allow,
             ),
             (
                 AcpPermissionOptionKind::RejectOnce,
-                PermissionOptionKind::RejectOnce,
+                PermissionEffect::Reject,
             ),
             (
                 AcpPermissionOptionKind::RejectAlways,
-                PermissionOptionKind::RejectAlways,
+                PermissionEffect::Reject,
             ),
         ];
         for (acp, expected) in cases {
-            assert_eq!(
-                option_kind(&acp),
-                expected,
-                "received a mismatch for {acp:?}"
-            );
+            assert_eq!(effect(&acp), expected, "received a mismatch for {acp:?}");
         }
+    }
+
+    /// "Remember the choice" is the whole of what ACP states about `*_always`: not "for this
+    /// session", not "forever". Reporting a scope would invent a reach the protocol never
+    /// promised, so only `policy_changing` is set.
+    #[test]
+    fn an_always_option_is_policy_changing_with_no_invented_scope() {
+        assert!(matches!(
+            scope(&AcpPermissionOptionKind::AllowAlways),
+            super::Scoped::Remembered
+        ));
+        assert!(matches!(
+            scope(&AcpPermissionOptionKind::RejectAlways),
+            super::Scoped::Remembered
+        ));
+        assert!(matches!(
+            scope(&AcpPermissionOptionKind::AllowOnce),
+            super::Scoped::Once
+        ));
     }
 
     /// A dialog with no words is a dialog nobody can answer, so the agent's own call id stands in.
@@ -229,6 +309,8 @@ mod tests {
                 "options": [{ "optionId": "ok", "name": "OK", "kind": "allow_once" }]
             })),
             String::from("rpc-1"),
+            SessionId::new("sess_1"),
+            operation(),
             deadline(),
         );
         assert_eq!(request.title, "call_bare");

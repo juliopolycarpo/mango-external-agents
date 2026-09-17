@@ -25,20 +25,22 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, LoadSessionRequest, NewSessionRequest, SessionId as AcpSessionId,
     SessionModeState,
 };
-use mango_external_agents::permission::PermissionMatrix;
-use mango_external_agents::session::{
-    Configuration, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
-    resume_fallback_reason,
+use mango_external_agents::configuration::{
+    Configuration, ConfigurationCatalog, ConfigurationState,
 };
+use mango_external_agents::permission::PermissionMatrix;
+use mango_external_agents::session::{OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason};
+use mango_external_agents::state::{SessionSnapshot, TransportSelection};
 use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
-    AcpSpec, AuthState, Capabilities, Discovery, Error, ExecutablePath, GateVerdict, Harness,
-    HarnessDescriptor, HarnessKind, HostContext, LaunchSpec, LineStream, Result, StdioSpec,
+    AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery, Error,
+    ExecutablePath, GateVerdict, Harness, HarnessDescriptor, HarnessIdentity, HostContext,
+    LaunchSpec, LineStream, Result, StdioSpec,
 };
 
 use crate::client::{self, SessionState};
 use crate::profile::{AcpProfile, matrix};
-use crate::session::{AcpSession, refuse_model_selection};
+use crate::session::{AcpSession, accepted_axes, refuse_model_selection, refuse_unsupported_reset};
 use crate::transport;
 use crate::version::{self, Comparison};
 
@@ -65,6 +67,9 @@ const TRANSPORTS: &[TransportKind] = &[TransportKind::Acp];
 ///   reports a session's context window, which is thread usage rather than plan quota.
 /// * **No MCP passthrough yet.** Host-supplied servers are refused before launch. The harness sends
 ///   an empty `session/new.mcpServers` list.
+/// * **No questions and no mid-session or catalogued configuration.** ACP v1 has a documented
+///   session-config-options surface, but wiring it up is a later PR's job — see
+///   [`Discovery::configuration_catalog`], which this harness reports empty rather than half-built.
 fn ceiling() -> Capabilities {
     Capabilities {
         structured_streaming: true,
@@ -82,17 +87,18 @@ fn ceiling() -> Capabilities {
 
 /// A [`Harness`] for one ACP agent.
 ///
-/// One instance per profile: a [`HarnessKind::Acp`] names the profile, so a host that drives Cursor
-/// and OpenCode registers two of these in its [`HarnessRegistry`](mango_external_agents::HarnessRegistry).
+/// One instance per profile: a [`HarnessIdentity::acp`] names the profile, so a host that drives
+/// Cursor and OpenCode registers two of these in its
+/// [`HarnessRegistry`](mango_external_agents::HarnessRegistry).
 ///
 /// # Example
 ///
 /// ```
 /// use mango_agent_acp::AcpHarness;
-/// use mango_external_agents::{Harness, HarnessKind};
+/// use mango_external_agents::Harness;
 ///
 /// let harness = AcpHarness::builtin("opencode").expect("a built-in profile");
-/// assert_eq!(harness.descriptor().kind.to_string(), "acp:opencode");
+/// assert_eq!(harness.descriptor().id().as_str(), "acp:opencode");
 /// ```
 #[derive(Debug)]
 pub struct AcpHarness {
@@ -105,9 +111,9 @@ impl AcpHarness {
     /// A harness for this profile.
     pub fn new(profile: Arc<AcpProfile>) -> Self {
         let descriptor = HarnessDescriptor {
-            kind: HarnessKind::Acp(profile.id.clone()),
+            identity: HarnessIdentity::acp(profile.id.clone()),
             vendor: profile.vendor,
-            capabilities: ceiling(),
+            capabilities: CapabilityCeiling::new(ceiling()),
             transports: TRANSPORTS,
             vendor_environment_keys: profile.vendor_environment_keys,
         };
@@ -156,9 +162,9 @@ impl AcpHarness {
 
     /// What the agent's own capabilities mean in the neutral vocabulary.
     ///
-    /// Bounded by [`ceiling`] on the way out by
-    /// [`Harness::discover`](mango_external_agents::Harness::discover)'s own normalisation, so a
-    /// reading that drifted wider than the descriptor is caught rather than reported.
+    /// Bounded by [`ceiling`] on the way out: every field this function does not read off the
+    /// handshake keeps `ceiling()`'s own value, which is never wider than the descriptor's own
+    /// declaration.
     fn capabilities_from(agent: &AgentCapabilities) -> Capabilities {
         Capabilities {
             resume: agent.load_session,
@@ -214,10 +220,14 @@ impl Harness for AcpHarness {
             auth: AuthState::Unknown,
             // What this *build* supports is only knowable from `initialize`, which a probe does not
             // run. The ceiling is what the harness could reach; `open_session` reports what the
-            // agent actually advertised on `SessionInfo::capabilities`.
-            capabilities: ceiling(),
+            // agent actually advertised on the session's own capabilities.
+            capabilities: DiscoveredCapabilities::new(ceiling()),
             permission_matrix: self.permission_matrix(),
             models: Vec::new(),
+            // ACP v1's session-config-options surface is not wired up yet; see `ceiling`'s own docs.
+            // Empty is the honest answer for "not enumerated here", a different statement from a
+            // catalog whose rows are all unsupported.
+            configuration_catalog: ConfigurationCatalog::empty(),
         })
     }
 
@@ -227,17 +237,17 @@ impl Harness for AcpHarness {
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
         self.validate_open_session(&request)?;
-        refuse_model_selection(&request.configuration)?;
+        refuse_unsupported_reset(&request.configuration)?;
+        let configuration = request.configuration.requested();
+        refuse_model_selection(&configuration)?;
         let matrix = self.permission_matrix();
-        if request.configuration.level.is_some_and(|level| {
-            !matrix.supports(
-                level,
-                request
-                    .configuration
-                    .routing
-                    .unwrap_or(mango_external_agents::ApprovalRouting::User),
-            )
-        }) {
+        let routing = configuration
+            .routing
+            .unwrap_or(mango_external_agents::ApprovalRouting::User);
+        if configuration
+            .level
+            .is_some_and(|level| !matrix.supports(level, routing))
+        {
             // Refused, never downgraded. Silently running a read-only request under "ask every time"
             // would grant more freedom than anybody chose, which is the one direction a permission
             // mistake must not go.
@@ -247,10 +257,12 @@ impl Harness for AcpHarness {
                 // may name a tenant; the host already knows which profile it handed this harness.
                 received: format!(
                     "{:?}/{:?}",
-                    request.configuration.level, request.configuration.routing
+                    configuration.level, configuration.routing
                 ),
             });
         }
+
+        let effective_transport = self.descriptor().resolve_transport(request.transport)?;
 
         let executable = if request.executable.get().is_some() {
             &request.executable
@@ -261,15 +273,39 @@ impl Harness for AcpHarness {
         let launched =
             transport::connect(host, &spec, self.descriptor.vendor_environment_keys).await?;
 
-        let state = Arc::new(SessionState::new(
-            request.session_id.clone(),
+        // Built ahead of the handshake, with a placeholder native id: `session_state` is handed to
+        // the connection layer so a session fact the reducer surfaces mid-handshake — the command
+        // catalog, in practice only mid-turn — can be published the moment it arrives rather than
+        // waiting for `open_session` to return. `set_native_session_id` and the capability/resume
+        // facts below correct it once the agent has actually answered.
+        let session_id = request.session_id.clone();
+        let opening_snapshot = SessionSnapshot::opening(
+            SessionIds {
+                session_id: session_id.clone(),
+                native_session_id: String::new(),
+            },
+            self.descriptor.identity.clone(),
+            TransportSelection::new(request.transport, effective_transport),
+            host.now(),
+        )
+        .with_configuration(
+            ConfigurationState::unknown()
+                .with_requested(configuration.clone())
+                .with_accepted(accepted_axes(&configuration)),
+        )
+        .with_catalog(ConfigurationCatalog::empty());
+        let session_state = mango_external_agents::SessionState::new(opening_snapshot);
+
+        let connection_state = Arc::new(SessionState::new(
+            session_id,
             host,
-            request.configuration.clone(),
+            configuration.clone(),
+            session_state.clone(),
         ));
         let connection = Arc::new(
             client::drive(
                 launched,
-                Arc::clone(&state),
+                Arc::clone(&connection_state),
                 host.client_info().name.clone(),
             )
             .await?,
@@ -289,22 +325,33 @@ impl Harness for AcpHarness {
             }
         };
         let (handshake, opened) = opened;
-        let configuration = request.configuration.clone();
+
+        session_state.set_native_session_id(opened.session_id.to_string());
+        let session_capabilities = mango_external_agents::SessionCapabilities::new(
+            Self::capabilities_from(&handshake.capabilities),
+        );
+        // Narrowed only against a discovery this request actually vouches for: a probe result the
+        // harness never saw is not something it can honestly narrow against. See
+        // `DiscoveryReceipt::discovery` on `OpenSession::discovery`.
+        let session_capabilities = match request.discovery.as_ref() {
+            Some(receipt) => session_capabilities.narrowed_to(&receipt.discovery.capabilities),
+            None => session_capabilities,
+        };
+        session_state.update(|snapshot| {
+            snapshot.capabilities = session_capabilities;
+            if opened.resumed {
+                snapshot.resumed = true;
+            }
+            if let Some(reason) = &opened.fallback_reason {
+                snapshot.fallback_reason = Some(reason.clone());
+            }
+        });
 
         let session = AcpSession::new(
-            SessionInfo {
-                ids: SessionIds {
-                    session_id: request.session_id,
-                    native_session_id: opened.session_id.to_string(),
-                },
-                resumed: opened.resumed,
-                fallback_reason: opened.fallback_reason,
-                effective_configuration: configuration.clone(),
-                capabilities: Self::capabilities_from(&handshake.capabilities),
-            },
             Arc::clone(&self.profile),
             host.clone(),
-            state,
+            connection_state,
+            session_state,
             Arc::clone(&connection),
             opened.session_id,
             handshake.capabilities,
@@ -621,15 +668,12 @@ fn gate(version: Option<&str>, minimum: Option<&str>) -> GateVerdict {
 #[cfg(test)]
 mod tests {
     use super::{AcpHarness, ceiling, gate};
-    use mango_external_agents::{Capabilities, GateVerdict, Harness, HarnessKind};
+    use mango_external_agents::{Capabilities, CapabilityCeiling, GateVerdict, Harness};
 
     #[test]
     fn a_harness_is_named_by_its_profile() {
         let harness = AcpHarness::builtin("cursor").expect("expected the cursor profile");
-        assert_eq!(
-            harness.descriptor().kind,
-            HarnessKind::Acp(mango_external_agents::AcpProfileId::new("cursor"))
-        );
+        assert_eq!(harness.descriptor().id().as_str(), "acp:cursor");
         assert_eq!(harness.descriptor().transports.len(), 1);
     }
 
@@ -641,8 +685,8 @@ mod tests {
             .expect("expected distinct kinds, received a duplicate");
     }
 
-    /// The four ACP v1 has no surface for. A ceiling that claimed them would make every discovery a
-    /// promise the dialect cannot keep.
+    /// The capabilities ACP v1 has no surface for. A ceiling that claimed them would make every
+    /// discovery a promise the dialect cannot keep.
     #[test]
     fn the_ceiling_claims_nothing_acp_v1_has_no_surface_for() {
         let ceiling = ceiling();
@@ -654,7 +698,24 @@ mod tests {
             !ceiling.mcp_passthrough,
             "nothing on OpenSession carries MCP servers to pass through"
         );
+        assert!(
+            !ceiling.questions,
+            "no vendor surface asks a question distinct from a permission"
+        );
+        assert!(
+            !ceiling.session_configuration,
+            "configure() is not implemented on this harness"
+        );
+        assert!(
+            !ceiling.configuration_catalog,
+            "the session-config-options surface is a later PR's job"
+        );
         assert!(ceiling.within(&Capabilities::all()));
+        assert!(
+            CapabilityCeiling::new(ceiling)
+                .capabilities()
+                .within(&Capabilities::all())
+        );
     }
 
     /// Nobody has pinned a floor for any built-in profile, so a version that cannot be read must not

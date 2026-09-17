@@ -20,7 +20,7 @@ use std::sync::Arc;
 use mango_external_agents::permission::{
     ApprovalRouting, ConfigurationVerdict, PermissionLevel, PermissionMatrix, UnsupportedReason,
 };
-use mango_external_agents::{AcpProfileId, VendorInfo};
+use mango_external_agents::{ProfileId, VendorInfo};
 
 /// The agent's own mode ids for the three permission levels, when a profile knows them.
 ///
@@ -62,8 +62,8 @@ impl SessionModeIds {
 /// Everything about one ACP agent that is not the protocol.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpProfile {
-    /// How this profile is named, which is also half of its [`HarnessKind`](mango_external_agents::HarnessKind).
-    pub id: AcpProfileId,
+    /// How this profile is named, which is also half of its [`HarnessId`](mango_external_agents::HarnessId).
+    pub id: ProfileId,
     /// A name for a person, for a picker row.
     pub display_name: String,
     /// Who owns the CLI, and the documents a host's disclosure links.
@@ -130,7 +130,13 @@ impl AcpProfile {
         let id = id.into();
         Self {
             display_name: id.clone(),
-            id: AcpProfileId::new(id),
+            // `ProfileId::new` validates lowercase ASCII, digits and `-_.:`, which every built-in
+            // id in this file already satisfies; a host-supplied `custom` id that does not is a
+            // configuration mistake worth panicking on at startup rather than carrying a profile
+            // this crate cannot ever register.
+            id: ProfileId::new(&id).unwrap_or_else(|error| {
+                panic!("expected a valid profile id, received {id:?}: {error}")
+            }),
             vendor,
             argv,
             version_argv,
