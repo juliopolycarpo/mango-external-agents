@@ -998,7 +998,7 @@ pub trait Session: Send + Sync {
     ///
     /// Answers with what actually happened rather than a bare success: most vendors cannot set
     /// several options atomically, so a patch can land in part. See
-    /// [`ConfigurationOutcome`](crate::ConfigurationOutcome) for what partial looks like and
+    /// [`crate::ConfigurationOutcome`] for what partial looks like and
     /// [`Rollback`](crate::Rollback) for what became of the part that had already landed.
     ///
     /// # Errors

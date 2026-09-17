@@ -54,7 +54,7 @@ impl fmt::Display for SessionId {
 /// The host's own id for one logical turn.
 ///
 /// A retry that means "the same turn" reuses it; a retry that means "a new turn" mints a new one.
-/// Which dispatch of it is [`AttemptId`](crate::AttemptId), and the vendor's own handle is a third
+/// Which dispatch of it is [`crate::AttemptId`], and the vendor's own handle is a third
 /// thing again — see [`crate::operation`] for why none of the three can stand in for another.
 ///
 /// **Not an idempotency key.** Reusing it does not make a vendor deduplicate anything, and nothing
@@ -458,8 +458,10 @@ impl Command {
 ///
 /// Called by a harness on its way to
 /// [`SessionState::set_commands`](crate::SessionState::set_commands), which is where a catalog
-/// lives now that it is session state rather than a turn event. See [`normalize_commands`] for the
-/// rules and why each one is a drop rather than a repair.
+/// lives now that it is session state rather than a turn event. A name is dropped rather than
+/// truncated, a name with whitespace in it is dropped, a leading `/` is taken off, and the whole
+/// catalog is cut to its ceiling — each of those a drop rather than a repair, because a repaired
+/// command name is a command the CLI does not have.
 ///
 /// # Example
 ///

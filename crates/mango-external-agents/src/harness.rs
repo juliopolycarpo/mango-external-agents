@@ -439,12 +439,12 @@ pub enum Capability {
     /// [`Session::steer`](crate::Session::steer).
     Steering,
     /// [`Session::list_sessions`](crate::Session::list_sessions) and
-    /// [`Harness::list_sessions`](crate::Harness::list_sessions).
+    /// [`Harness::list_sessions`].
     SessionListing,
     /// [`Session::start_review`](crate::Session::start_review).
     NativeReview,
     /// [`Session::refresh_account_usage`](crate::Session::refresh_account_usage) and
-    /// [`Harness::account_usage`](crate::Harness::account_usage).
+    /// [`Harness::account_usage`].
     AccountUsage,
     /// [`OpenSession::resuming`](crate::OpenSession::resuming).
     Resume,

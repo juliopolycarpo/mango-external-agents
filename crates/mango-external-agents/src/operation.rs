@@ -4,7 +4,7 @@
 //!
 //! | Identity | Minted by | Stable across |
 //! | -- | -- | -- |
-//! | [`TurnId`](crate::TurnId) | the host | every attempt at the same logical turn |
+//! | [`crate::TurnId`] | the host | every attempt at the same logical turn |
 //! | [`AttemptId`] | the host | one dispatch of it |
 //! | `native_turn_id` | the vendor | whatever the vendor decides |
 //!
@@ -22,7 +22,7 @@ use crate::event::{SessionId, TurnId};
 
 /// One dispatch of one logical turn.
 ///
-/// A retry that means "the same turn, again" keeps its [`TurnId`](crate::TurnId) and mints a new
+/// A retry that means "the same turn, again" keeps its [`crate::TurnId`] and mints a new
 /// one of these. Host-minted, like every other id in this library: an id the library chose is an
 /// id the host cannot reproduce after a restart, and an id it cannot reproduce is one it cannot
 /// reconcile with.
