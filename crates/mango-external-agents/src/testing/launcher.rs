@@ -227,7 +227,7 @@ impl ProcessLauncher for FakeLauncher {
         let Some(process) = queued else {
             return Err(Error::Launch {
                 program: spec.program().unwrap_or_default().to_owned(),
-                message: String::from("no fake process was queued for this launch"),
+                message: String::from("no fake process queued for this launch"),
             });
         };
 

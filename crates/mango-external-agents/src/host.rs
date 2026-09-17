@@ -465,7 +465,7 @@ mod tests {
         async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
             Err(Error::Launch {
                 program: spec.program().unwrap_or_default().to_owned(),
-                message: String::from("this launcher spawns nothing"),
+                message: String::from("a launcher that spawns nothing"),
             })
         }
     }

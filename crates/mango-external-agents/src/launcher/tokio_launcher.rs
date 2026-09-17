@@ -185,15 +185,18 @@ impl ProcessLauncher for TokioLauncher {
             };
             configured_command(&fallback, &fallback.argv[0]).spawn()
         });
+        // The kind rather than the message: `io::Error`'s own text can name the path the operating
+        // system was given, which is host-provided, while the kind is a bounded enum and is the
+        // half an operator acts on — an absent executable is a different fix from a refused one.
         let mut child = launched.map_err(|error| Error::Launch {
             program: program.to_owned(),
-            message: error.to_string(),
+            message: format!("a launcher failure ({:?})", error.kind()),
         })?;
 
         let pid = child.id();
         let stdout = child.stdout.take().ok_or_else(|| Error::Launch {
             program: program.to_owned(),
-            message: String::from("expected a readable stdout, received none"),
+            message: String::from("a child without a readable stdout"),
         })?;
         let stdin = child.stdin.take();
         let stderr_pipe = child.stderr.take();
@@ -380,7 +383,7 @@ impl ProcessControl for TokioChild {
             } else {
                 Err(Error::Launch {
                     program: String::from("<unknown>"),
-                    message: String::from("expected a process id to end, received none"),
+                    message: String::from("a running child with no process id to end"),
                 })
             };
         };
@@ -397,7 +400,7 @@ impl ProcessControl for TokioChild {
                 Err(Error::Launch {
                     program: format!("process group {pid}"),
                     message: format!(
-                        "expected the escalation already running to end the tree, received a live process after {waited:?}"
+                        "a live process after {waited:?}, with an escalation already running"
                     ),
                 })
             };
@@ -569,7 +572,7 @@ async fn end_process_tree(
     }
     Err(Error::Launch {
         program: format!("process group {pid}"),
-        message: format!("expected the group to end within {grace:?}, received a live member"),
+        message: format!("a live group member after {grace:?}"),
     })
 }
 
@@ -604,11 +607,12 @@ async fn end_process_tree(
     Err(Error::Launch {
         program: format!("process tree {pid}"),
         message: match ran {
-            Ok(Ok(status)) => format!(
-                "expected taskkill to end the tree, received exit status {status} and a live process"
-            ),
-            Ok(Err(error)) => format!("expected taskkill to run, received {error}"),
-            Err(_) => format!("expected taskkill to answer within {grace:?}, received nothing"),
+            Ok(Ok(status)) => {
+                format!("a live process after taskkill exited with status {status}")
+            }
+            // The kind, not the message: see the spawn arm above.
+            Ok(Err(error)) => format!("a taskkill that would not run ({:?})", error.kind()),
+            Err(_) => format!("no answer from taskkill within {grace:?}"),
         },
     })
 }
@@ -1111,6 +1115,17 @@ mod tests {
         assert!(
             matches!(error, crate::Error::Launch { .. }),
             "expected a launch failure, received {error:?}"
+        );
+        // The kind is what an operator acts on, and it is the only part of an `io::Error` that
+        // cannot carry the path the operating system was handed.
+        let rendered = error.to_string();
+        assert!(
+            rendered.ends_with("received a launcher failure (NotFound)"),
+            "expected the io error kind, received {rendered}"
+        );
+        assert!(
+            !rendered.contains("mea-no-such-program"),
+            "expected the requested program to stay out of the diagnostic, received {rendered}"
         );
     }
 

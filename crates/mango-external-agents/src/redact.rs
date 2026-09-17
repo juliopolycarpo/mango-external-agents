@@ -60,9 +60,8 @@ const REDACTED: &str = "[REDACTED]";
 ///
 /// The two first-party CLIs, then the `argv[0]` of each built-in ACP profile in
 /// `mango-agent-acp`. A profile whose executable is missing here is reported as
-/// `custom executable`, which is the only thing a launch failure has left to say about which
-/// agent it was — `Error::Launch` keeps its launcher message off the diagnostic. The ACP crate
-/// holds the list to this one in
+/// `custom executable`, and a launch failure then names a cause without naming which agent it
+/// belonged to. The ACP crate holds the list to this one in
 /// `every_builtin_profile_is_named_rather_than_redacted_in_a_diagnostic`, so adding a profile
 /// without adding its program fails there rather than degrading in a log.
 const KNOWN_PROGRAMS: &[&str] = &[
@@ -371,8 +370,8 @@ mod tests {
 
     /// The ACP adapters a launch failure could otherwise only call `custom executable`.
     ///
-    /// `Error::Launch` keeps its launcher message out of the diagnostic, so this name is the only
-    /// remaining statement of which agent failed to start.
+    /// This name is the only statement of *which* agent failed to start: the rest of a
+    /// `Error::Launch` diagnostic says what stopped it, not whose CLI it was.
     #[test]
     fn program_name_keeps_every_built_in_acp_executable() {
         for program in [

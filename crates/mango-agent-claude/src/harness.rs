@@ -291,7 +291,7 @@ impl Harness for ClaudeHarness {
         if !survey.installed() {
             return Err(Error::Launch {
                 program: String::from(probe::PROGRAM),
-                message: String::from("the Claude Code CLI did not report a version"),
+                message: String::from("a CLI that reported no version"),
             });
         }
         if survey.refusal.is_some() {

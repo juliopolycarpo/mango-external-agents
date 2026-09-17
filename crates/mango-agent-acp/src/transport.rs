@@ -123,7 +123,7 @@ pub fn frame(process: ManagedProcess, host: &HostContext) -> Result<LaunchedAgen
     } = process;
     let stdin = stdin.ok_or_else(|| Error::Link {
         peer: String::from("ACP agent"),
-        message: String::from("expected a writable stdin, received a child without one"),
+        message: String::from("a child without a writable stdin"),
     })?;
 
     let incoming: IncomingLines =

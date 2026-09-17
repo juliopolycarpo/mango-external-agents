@@ -229,8 +229,19 @@ pub enum Error {
     /// The CLI could not be found, or could not be started.
     Launch {
         /// The executable the launcher was asked for.
+        ///
+        /// Host-provided text: [`Display`](fmt::Display) reports it through
+        /// [`redact::program_name`], which names the programs this workspace drives and calls
+        /// anything else a custom executable.
         program: String,
-        /// What the host's launcher reported.
+        /// A payload-free summary of what stopped the launch, written verbatim by
+        /// [`Display`](fmt::Display).
+        ///
+        /// Named for the same reason `HostConfiguration`'s `received` is: an absent executable, a
+        /// permission refusal and a process tree that would not end are the operator's own to
+        /// fix, and "a launcher failure" does not distinguish them. Every construction site
+        /// therefore owes a summary built from a structured value — an [`std::io::ErrorKind`], a
+        /// duration, a static phrase — and never a path, an argv or a line a program printed.
         message: String,
     },
 
@@ -329,9 +340,9 @@ impl fmt::Display for Error {
                 formatter,
                 "expected a signed-in CLI, received a signed-out one; the vendor's own command is `{login_hint}`"
             ),
-            Self::Launch { program, .. } => write!(
+            Self::Launch { program, message } => write!(
                 formatter,
-                "expected to launch {}, received a launcher failure",
+                "expected to launch {}, received {message}",
                 redact::program_name(program)
             ),
             Self::Link { message, .. } => write!(
@@ -541,6 +552,33 @@ mod tests {
         assert!(
             signed_out.to_string().contains("`claude auth login`"),
             "expected the vendor command a user is meant to run, received {signed_out}"
+        );
+    }
+
+    /// A launch failure that says only "a launcher failure" cannot be acted on.
+    ///
+    /// An absent executable, a permission refusal and a process tree that outlived its kill are
+    /// three different fixes. The summary is the library's own — the launcher builds it from an
+    /// `io::ErrorKind` or a duration, never from the path the operating system was handed — so it
+    /// is named, while the program it belonged to still goes through `program_name`.
+    #[test]
+    fn launch_diagnostics_keep_the_cause_and_redact_the_program() {
+        let absent = Error::Launch {
+            program: String::from("/opt/secret-canary/claude"),
+            message: String::from("a launcher failure (NotFound)"),
+        };
+        assert_eq!(
+            absent.to_string(),
+            "expected to launch claude, received a launcher failure (NotFound)"
+        );
+
+        let host_program = Error::Launch {
+            program: String::from("/opt/bin/customer-secret-canary"),
+            message: String::from("a launcher failure (PermissionDenied)"),
+        };
+        assert_eq!(
+            host_program.to_string(),
+            "expected to launch custom executable, received a launcher failure (PermissionDenied)"
         );
     }
 
