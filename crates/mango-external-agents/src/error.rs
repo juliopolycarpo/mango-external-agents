@@ -22,6 +22,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// harness refused without needing a second field. The library never translates one, and a host
 /// maps it to its own copy.
 ///
+/// Part of a code can still be vendor text — `claude-{subtype}` takes its tail from a result
+/// frame — so [`Display`](fmt::Display) prints only what has a label's shape. `as_str` is the
+/// protocol field and keeps the code as written.
+///
 /// # Example
 ///
 /// ```
@@ -51,23 +55,46 @@ impl ErrorCode {
     }
 }
 
+/// The longest a code may be before it stops being a label and starts being a sentence.
+const CODE_MAX_LENGTH: usize = 48;
+
 impl fmt::Display for ErrorCode {
+    /// Writes the code when it has a label's shape, and `vendor-code` when it does not.
+    ///
+    /// Shape, not allocation. [`ErrorCode::new`] is how this crate mints its own codes —
+    /// `claude-{subtype}` from a result frame, `{peer}-call-failed` from a JSON-RPC client — and
+    /// `#[serde(transparent)]` hands back a `Cow::Owned` for a code that was
+    /// [`from_static`](ErrorCode::from_static) before it crossed a wire, so where the bytes live
+    /// says nothing about where they came from. What is safe to print is a short lowercase label:
+    /// at most 48 bytes of `a-z`, `0-9`, `-` and `_`. A code carrying a space, a
+    /// capital, a quote or more length than that is vendor prose wearing a code's field, and it
+    /// is reported as `vendor-code` instead. [`as_str`](ErrorCode::as_str) stays the protocol
+    /// field and is never bounded.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            Cow::Borrowed(code) => formatter.write_str(code),
-            Cow::Owned(_) => formatter.write_str("vendor-code"),
+        if is_label_shaped(&self.0) {
+            return formatter.write_str(&self.0);
         }
+        formatter.write_str("vendor-code")
     }
 }
 
 impl fmt::Debug for ErrorCode {
-    /// Prints only static harness codes; vendor-provided codes remain data, not diagnostics.
+    /// Prints only label-shaped codes; vendor prose remains data, not diagnostics.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_tuple("ErrorCode")
             .field(&self.to_string())
             .finish()
     }
+}
+
+/// Whether a code reads as a label a log line can carry rather than as vendor text.
+fn is_label_shaped(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= CODE_MAX_LENGTH
+        && code.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 /// A failure a vendor reported, with its own structure intact.
@@ -423,7 +450,7 @@ pub const fn jsonrpc_code_is_retryable(code: i64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, ErrorCode, VendorError, jsonrpc_code_is_retryable};
+    use super::{CODE_MAX_LENGTH, Error, ErrorCode, VendorError, jsonrpc_code_is_retryable};
     use crate::harness::Capability;
 
     #[test]
@@ -528,6 +555,62 @@ mod tests {
             assert!(
                 rendered.contains("a relative path"),
                 "expected the remediation summary to survive, received {rendered}"
+            );
+        }
+    }
+
+    /// Whether a code is safe to print is a fact about its shape, not about where it is allocated.
+    ///
+    /// Both codes this crate mints at run time go through `ErrorCode::new`, and
+    /// `#[serde(transparent)]` hands every code back as `Cow::Owned` after a round trip. Gating
+    /// `Display` on ownership made all four of those print `vendor-code`, so a resume refusal and
+    /// a Claude turn failure read identically in a log.
+    #[test]
+    fn a_label_shaped_code_names_itself_however_it_was_built() {
+        for minted in [
+            "claude-error_during_execution",
+            "codex-call-failed",
+            "acp-request-failed",
+        ] {
+            assert_eq!(
+                ErrorCode::new(minted).to_string(),
+                minted,
+                "expected a run-time code to name itself, received a stand-in"
+            );
+        }
+
+        let json = serde_json::to_string(&ErrorCode::from_static("acp-request-failed"))
+            .expect("a code serialises as a string");
+        let round_tripped: ErrorCode =
+            serde_json::from_str(&json).expect("a code deserialises from a string");
+        assert_eq!(
+            round_tripped.to_string(),
+            "acp-request-failed",
+            "expected a round trip to leave the display form alone, received a stand-in"
+        );
+    }
+
+    /// The half of a minted code a vendor fills in is still vendor text.
+    #[test]
+    fn a_code_carrying_vendor_prose_is_reported_as_a_stand_in() {
+        let payloads = [
+            String::new(),
+            String::from("claude-Authorization: Bearer code-secret"),
+            String::from("claude-CODE_SECRET"),
+            format!("claude-{}", "a".repeat(CODE_MAX_LENGTH)),
+        ];
+
+        for payload in payloads {
+            let code = ErrorCode::new(payload.clone());
+            assert_eq!(
+                code.to_string(),
+                "vendor-code",
+                "expected a stand-in for {payload:?}, received the code itself"
+            );
+            assert_eq!(
+                code.as_str(),
+                payload,
+                "expected the protocol field to keep the code as written, received a bounded one"
             );
         }
     }

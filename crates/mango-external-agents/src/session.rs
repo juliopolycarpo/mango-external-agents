@@ -500,8 +500,9 @@ pub struct SessionInfo {
 /// ```
 pub fn resume_fallback_reason(operation: &str, error: &Error) -> String {
     match error {
-        // The code is the harness's own constant, or the static `vendor-code` stand-in for one a
-        // vendor minted; either way it is a label this library controls, not vendor text.
+        // The code prints only when it has a label's shape — `acp-request-failed`,
+        // `codex-call-failed` — and the `vendor-code` stand-in otherwise, so this sentence names
+        // which call refused without carrying a vendor's own words.
         Error::Vendor(vendor) => format!(
             "{operation} was refused by the vendor ({}, retryable {})",
             vendor.code, vendor.retryable
