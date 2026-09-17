@@ -371,6 +371,13 @@ impl mango_external_agents::Session for ClaudeSession {
             established,
         ));
 
+        // Usually a cheap decrement: the session holds the other `Arc`, and this clone existed
+        // only to keep the file alive for the child that just read it. But a `close` can have
+        // taken the session's reference between the lifecycle check above and this line, which
+        // makes this the last one — and a `close` that found nothing to remove has already
+        // answered. So it is released the same way every other path releases it.
+        crate::mcp::release_off_worker(mcp_lease).await;
+
         Ok(TurnStream {
             // `claude --print` names no turn, so the handle is the host's own id: a value the host
             // can reproduce, which is what a retry needs.
