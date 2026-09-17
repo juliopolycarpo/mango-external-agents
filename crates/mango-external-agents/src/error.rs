@@ -265,15 +265,19 @@ pub enum Error {
         message: String,
     },
 
-    /// A line or a buffer passed the cap the library reads vendors under.
+    /// A line, a buffer or a collection passed the cap the library works under.
     ///
     /// A vendor that prints a 100 MB line is a bug, not a request to allocate 100 MB.
     LimitExceeded {
-        /// What was being read, such as `one stdout line`.
+        /// What was counted, unit included, such as `bytes of one vendor output line` or
+        /// `attachments on one turn`.
+        ///
+        /// The unit lives here rather than in [`Display`](fmt::Display) because these caps are not
+        /// all byte counts, and "at most 4 bytes of attachments" is a sentence about nothing.
         subject: &'static str,
         /// The cap that was passed.
         limit: usize,
-        /// How much had been read when the cap was passed.
+        /// How many there were when the cap was passed.
         received: usize,
     },
 
@@ -377,7 +381,7 @@ impl fmt::Display for Error {
                 received,
             } => write!(
                 formatter,
-                "expected at most {limit} bytes of {subject}, received {received}"
+                "expected at most {limit} {subject}, received {received}"
             ),
             Self::InvalidVendorValue { field, .. } => {
                 write!(

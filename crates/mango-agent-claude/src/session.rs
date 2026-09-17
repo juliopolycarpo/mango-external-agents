@@ -739,7 +739,7 @@ mod tests {
     fn a_link_failure_is_reported_as_one_rather_than_as_a_missing_result() {
         let error = no_result_error(
             Some(mango_external_agents::Error::LimitExceeded {
-                subject: "one vendor output line",
+                subject: "bytes of one vendor output line",
                 limit: 1024,
                 received: 2048,
             }),

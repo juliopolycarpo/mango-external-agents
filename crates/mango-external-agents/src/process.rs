@@ -297,7 +297,7 @@ impl LineStream {
         let buffered = self.buffer.len() + self.queued_bytes;
         if buffered > self.limits.max_buffered_bytes {
             return Err(Error::LimitExceeded {
-                subject: "unread vendor output",
+                subject: "bytes of unread vendor output",
                 limit: self.limits.max_buffered_bytes,
                 received: buffered,
             });
@@ -314,7 +314,7 @@ impl LineStream {
 
         if self.buffer.len() > self.limits.max_line_bytes {
             return Err(Error::LimitExceeded {
-                subject: "one vendor output line",
+                subject: "bytes of one vendor output line",
                 limit: self.limits.max_line_bytes,
                 received: self.buffer.len(),
             });
@@ -335,7 +335,7 @@ impl LineStream {
     fn queue(&mut self, record: Vec<u8>) -> Result<()> {
         if record.len() > self.limits.max_line_bytes {
             return Err(Error::LimitExceeded {
-                subject: "one vendor output line",
+                subject: "bytes of one vendor output line",
                 limit: self.limits.max_line_bytes,
                 received: record.len(),
             });
@@ -522,7 +522,7 @@ mod tests {
             matches!(
                 error,
                 Error::LimitExceeded {
-                    subject: "one vendor output line",
+                    subject: "bytes of one vendor output line",
                     limit: 16,
                     received: 32
                 }
@@ -549,7 +549,7 @@ mod tests {
             matches!(
                 error,
                 Error::LimitExceeded {
-                    subject: "unread vendor output",
+                    subject: "bytes of unread vendor output",
                     limit: 8,
                     ..
                 }

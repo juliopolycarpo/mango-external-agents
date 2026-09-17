@@ -164,7 +164,7 @@ impl SocketReceiver {
     fn bounded(&self, message: String) -> Result<Option<String>> {
         if message.len() > self.max_bytes {
             return Err(Error::LimitExceeded {
-                subject: "one websocket message",
+                subject: "bytes of one websocket message",
                 limit: self.max_bytes,
                 received: message.len(),
             });
@@ -191,7 +191,7 @@ impl LinkReceiver for SocketReceiver {
                 // way the check below reports it, so a host sees one shape whichever layer noticed.
                 Err(WsError::Capacity(CapacityError::MessageTooLong { size, max_size })) => {
                     return Err(Error::LimitExceeded {
-                        subject: "one websocket message",
+                        subject: "bytes of one websocket message",
                         limit: max_size,
                         received: size,
                     });
@@ -486,7 +486,7 @@ mod tests {
             matches!(
                 error,
                 crate::Error::LimitExceeded {
-                    subject: "one websocket message",
+                    subject: "bytes of one websocket message",
                     limit: 64,
                     received: 105,
                 }
