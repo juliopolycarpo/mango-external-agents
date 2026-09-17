@@ -1645,10 +1645,11 @@ mod tests {
         let error = malformed
             .normalized()
             .expect_err("expected a question-shaped permission to be refused");
-        assert_eq!(
-            error.to_string(),
-            "expected a permission interaction, received question"
-        );
+        let Error::Protocol { expected, received } = error.cause() else {
+            panic!("expected a protocol refusal, received {error:?}");
+        };
+        assert_eq!(expected, "a permission interaction");
+        assert_eq!(received, "question");
     }
 
     #[test]

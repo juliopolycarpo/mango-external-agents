@@ -9,6 +9,7 @@
 //! know would be to read a token file, the answer is [`AuthState::Unknown`] and the host tells the
 //! user to run the vendor's own login command.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -20,7 +21,7 @@ use crate::normalize::{self, MODEL_CATALOG_MAX_ITEMS, REASONING_EFFORT_MAX_ITEMS
 use crate::permission::{PermissionMatrix, UnsupportedReason};
 
 /// How the installed CLI was found, and what it can do.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Discovery {
     /// Where the executable is, when the probe found one.
     pub executable: Option<PathBuf>,
@@ -50,6 +51,26 @@ pub struct Discovery {
     /// Empty is "the vendor does not publish its settings", which is a different statement from a
     /// catalog whose rows are all unsupported.
     pub configuration_catalog: ConfigurationCatalog,
+}
+
+impl fmt::Debug for Discovery {
+    /// Reports discovery shape without logging probe-written paths, labels, or catalog values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Discovery")
+            .field("has_executable", &self.executable.is_some())
+            .field("has_version", &self.version.is_some())
+            .field("gate", &self.gate)
+            .field("auth", &self.auth)
+            .field("capabilities", &self.capabilities)
+            .field("permission_matrix", &self.permission_matrix)
+            .field("model_count", &self.models.len())
+            .field(
+                "configuration_option_count",
+                &self.configuration_catalog.options().len(),
+            )
+            .finish()
+    }
 }
 
 impl Discovery {
@@ -159,8 +180,8 @@ pub struct DiscoveryReceipt {
     pub max_age: Duration,
 }
 
-impl std::fmt::Debug for DiscoveryReceipt {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for DiscoveryReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DiscoveryReceipt")
             .field("harness", &self.harness)
@@ -306,10 +327,7 @@ impl DiscoveryReceipt {
         if &self.harness != descriptor.id() {
             return Err(Error::HostConfiguration {
                 expected: "a discovery receipt for the harness being opened",
-                received: format!(
-                    "a receipt for {}, opening {}",
-                    self.harness, descriptor.identity.id
-                ),
+                received: String::from("a receipt for a different harness"),
             });
         }
         if !self.is_fresh(now) {
@@ -328,30 +346,20 @@ impl DiscoveryReceipt {
             (Some(requested), Some(probed)) if requested != probed => {
                 Err(Error::HostConfiguration {
                     expected: "a discovery receipt for the executable being launched",
-                    received: format!(
-                        "a receipt for {}, launching {}",
-                        probed.display(),
-                        requested.display()
-                    ),
+                    received: String::from("a receipt and request that name different executables"),
                 })
             }
-            (Some(requested), None) => Err(Error::HostConfiguration {
+            (Some(_), None) => Err(Error::HostConfiguration {
                 expected: "a discovery receipt for the executable being launched",
-                received: format!(
-                    "a receipt without an executable, launching {}",
-                    requested.display()
-                ),
+                received: String::from("a receipt without an executable and a request with one"),
             }),
             // The probe resolved a path and the request did not, so the launcher will resolve the
             // program name itself — off a `PATH` that may well answer with a different file. A
             // receipt that vouches for one binary cannot vouch for whichever one that turns out to
             // be, so it is refused rather than quietly applied to it.
-            (None, Some(probed)) => Err(Error::HostConfiguration {
+            (None, Some(_)) => Err(Error::HostConfiguration {
                 expected: "a request naming the executable its receipt was a probe of",
-                received: format!(
-                    "a receipt for {}, launching whatever the program name resolves to",
-                    probed.display()
-                ),
+                received: String::from("a receipt with an executable and a request without one"),
             }),
             _ => Ok(()),
         }
@@ -363,7 +371,7 @@ fn compare(subject: &'static str, recorded: Option<&str>, measured: Option<&str>
     match (recorded, measured) {
         (Some(recorded), Some(measured)) if recorded != measured => Err(Error::HostConfiguration {
             expected: "a discovery receipt whose fingerprints still match",
-            received: format!("the {subject} fingerprint moved from {recorded:?} to {measured:?}"),
+            received: format!("the {subject} fingerprint changed"),
         }),
         _ => Ok(()),
     }
@@ -382,7 +390,7 @@ fn bounded_executable(executable: PathBuf) -> Option<PathBuf> {
 }
 
 /// Whether the installed build can be driven.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GateVerdict {
     /// It can.
@@ -401,6 +409,18 @@ pub enum GateVerdict {
     /// Deliberately not a refusal: a CLI that changed the shape of `--version` is not a CLI that
     /// stopped working, and a host may still choose to try.
     Unknown,
+}
+
+impl fmt::Debug for GateVerdict {
+    /// Names the gate result without logging versions reported by a probe.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usable => formatter.write_str("Usable"),
+            Self::NotInstalled => formatter.write_str("NotInstalled"),
+            Self::VersionTooOld { .. } => formatter.write_str("VersionTooOld"),
+            Self::Unknown => formatter.write_str("Unknown"),
+        }
+    }
 }
 
 impl GateVerdict {
@@ -424,7 +444,7 @@ impl GateVerdict {
 ///
 /// Reported, never established. The library has no login method anywhere, opens no browser and
 /// reads no token: this is what a non-secret vendor surface said, or `Unknown`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthState {
     /// Somebody is signed in.
@@ -441,6 +461,20 @@ pub enum AuthState {
     },
     /// The probe could not tell without reading a credential, so it did not look.
     Unknown,
+}
+
+impl fmt::Debug for AuthState {
+    /// Names the auth state without logging a vendor login hint.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoggedIn { mode } => formatter
+                .debug_struct("LoggedIn")
+                .field("mode", mode)
+                .finish(),
+            Self::LoggedOut { .. } => formatter.write_str("LoggedOut"),
+            Self::Unknown => formatter.write_str("Unknown"),
+        }
+    }
 }
 
 impl AuthState {
@@ -463,7 +497,7 @@ impl AuthState {
 }
 
 /// How an account is signed in.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthMode {
     /// A consumer subscription.
@@ -472,6 +506,17 @@ pub enum AuthMode {
     ApiKey,
     /// Something else the vendor named.
     Other(String),
+}
+
+impl fmt::Debug for AuthMode {
+    /// Names the auth mode without logging a vendor-defined mode label.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Subscription => "Subscription",
+            Self::ApiKey => "ApiKey",
+            Self::Other(_) => "Other",
+        })
+    }
 }
 
 impl AuthMode {
@@ -488,7 +533,7 @@ impl AuthMode {
 }
 
 /// A model as the vendor advertised it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {
     /// The vendor's own id, sent back verbatim when this model is chosen.
@@ -508,6 +553,24 @@ pub struct Model {
     /// Which of them applies when nobody chooses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<String>,
+}
+
+impl fmt::Debug for Model {
+    /// Reports model shape without logging vendor ids or labels.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Model")
+            .field("has_id", &!self.id.is_empty())
+            .field("has_display_name", &self.display_name.is_some())
+            .field("has_description", &self.description.is_some())
+            .field("is_default", &self.is_default)
+            .field("reasoning_effort_count", &self.reasoning_efforts.len())
+            .field(
+                "has_default_reasoning_effort",
+                &self.default_reasoning_effort.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Model {
@@ -550,7 +613,7 @@ impl Model {
 }
 
 /// One vendor-defined reasoning choice, kept without flattening it to an enum of ours.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningEffort {
     /// The vendor's own id.
@@ -561,6 +624,18 @@ pub struct ReasoningEffort {
     /// What the vendor says it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+impl fmt::Debug for ReasoningEffort {
+    /// Reports reasoning-effort shape without logging a vendor id or labels.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReasoningEffort")
+            .field("has_id", &!self.id.is_empty())
+            .field("has_display_name", &self.display_name.is_some())
+            .field("has_description", &self.description.is_some())
+            .finish()
+    }
 }
 
 impl ReasoningEffort {
@@ -863,14 +938,16 @@ mod tests {
             .describes(Some("sha256:def"), Some("env-1"))
             .expect_err("expected a moved executable fingerprint to be refused");
         assert!(
-            error.to_string().contains("executable fingerprint moved"),
+            error.to_string().contains("executable fingerprint changed"),
             "expected the diagnostic to name which fingerprint moved, received {error}"
         );
         let error = receipt
             .describes(Some("sha256:abc"), Some("env-2"))
             .expect_err("expected a moved environment fingerprint to be refused");
         assert!(
-            error.to_string().contains("environment fingerprint moved"),
+            error
+                .to_string()
+                .contains("environment fingerprint changed"),
             "received {error}"
         );
         // A host that recorded nothing is vouching without a fingerprint, which is its decision.
@@ -879,7 +956,7 @@ mod tests {
             .expect("expected an unmeasured fingerprint to be left alone");
     }
 
-    /// A receipt for a resolved path cannot vouch for whatever a bare program name resolves to.
+    /// A receipt for a resolved path cannot vouch for a request without an executable.
     #[test]
     fn a_receipt_for_a_resolved_executable_refuses_a_request_that_names_none() {
         let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
@@ -889,7 +966,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("whatever the program name resolves to"),
+                .contains("a receipt with an executable and a request without one"),
             "received {error}"
         );
     }
@@ -908,7 +985,7 @@ mod tests {
             .expect_err("expected an executable requested without a probed path to be refused");
         assert_eq!(
             error.to_string(),
-            "expected a discovery receipt for the executable being launched, received a receipt without an executable, launching /opt/claude/bin/claude"
+            "expected a discovery receipt for the executable being launched, received a receipt without an executable and a request with one"
         );
     }
 
@@ -933,10 +1010,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn discovery_diagnostics_omit_probe_payloads() {
+        let secret_executable = "/private/discovery-executable-secret";
+        let secret_version = "discovery-version-secret";
+        let secret_login_hint = "discovery-login-hint-secret";
+        let secret_model = "discovery-model-secret";
+        let secret_effort = "discovery-effort-secret";
+        let discovery = Discovery {
+            executable: Some(secret_executable.into()),
+            version: Some(String::from(secret_version)),
+            gate: GateVerdict::VersionTooOld {
+                found: String::from(secret_version),
+                minimum: String::from("discovery-minimum-secret"),
+            },
+            auth: AuthState::LoggedOut {
+                login_hint: String::from(secret_login_hint),
+            },
+            models: vec![Model {
+                id: String::from(secret_model),
+                display_name: Some(String::from("discovery-model-name-secret")),
+                description: Some(String::from("discovery-model-description-secret")),
+                reasoning_efforts: vec![ReasoningEffort {
+                    id: String::from(secret_effort),
+                    display_name: Some(String::from("discovery-effort-name-secret")),
+                    description: Some(String::from("discovery-effort-description-secret")),
+                }],
+                default_reasoning_effort: Some(String::from(secret_effort)),
+                ..Model::default()
+            }],
+            ..usable()
+        };
+        let receipt = DiscoveryReceipt::new(
+            HarnessId::claude(),
+            discovery.clone(),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .with_executable_fingerprint("recorded-fingerprint-secret");
+        let fingerprint_error = receipt
+            .describes(Some("measured-fingerprint-secret"), None)
+            .expect_err("expected a changed fingerprint to be refused");
+        let executable_error = DiscoveryReceipt::new(
+            HarnessId::claude(),
+            discovery,
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .verify_for(
+            &descriptor(),
+            std::time::SystemTime::UNIX_EPOCH,
+            &crate::OpenSession::new("chat-1").with_executable(
+                crate::transport::ExecutablePath::resolved("/private/requested-executable-secret"),
+            ),
+        )
+        .expect_err("expected a different executable to be refused");
+
+        for rendered in [
+            format!("{receipt:?}"),
+            format!("{:#?}", receipt.discovery),
+            format!(
+                "{:?}",
+                GateVerdict::VersionTooOld {
+                    found: String::from(secret_version),
+                    minimum: String::from("discovery-minimum-secret"),
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthState::LoggedIn {
+                    mode: AuthMode::Other(String::from("discovery-auth-mode-secret")),
+                }
+            ),
+            format!(
+                "{:?}",
+                Model {
+                    id: String::from(secret_model),
+                    display_name: Some(String::from("discovery-model-name-secret")),
+                    description: Some(String::from("discovery-model-description-secret")),
+                    reasoning_efforts: vec![ReasoningEffort {
+                        id: String::from(secret_effort),
+                        display_name: Some(String::from("discovery-effort-name-secret")),
+                        description: Some(String::from("discovery-effort-description-secret")),
+                    }],
+                    default_reasoning_effort: Some(String::from(secret_effort)),
+                    ..Model::default()
+                }
+            ),
+            format!(
+                "{:?}",
+                ReasoningEffort {
+                    id: String::from(secret_effort),
+                    display_name: Some(String::from("discovery-effort-name-secret")),
+                    description: Some(String::from("discovery-effort-description-secret")),
+                }
+            ),
+            fingerprint_error.to_string(),
+            executable_error.to_string(),
+        ] {
+            for secret in [
+                secret_executable,
+                secret_version,
+                secret_login_hint,
+                secret_model,
+                secret_effort,
+                "discovery-minimum-secret",
+                "discovery-model-name-secret",
+                "discovery-model-description-secret",
+                "discovery-effort-name-secret",
+                "discovery-effort-description-secret",
+                "discovery-auth-mode-secret",
+                "recorded-fingerprint-secret",
+                "measured-fingerprint-secret",
+                "/private/requested-executable-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no probe payload in diagnostics, received {rendered}"
+                );
+            }
+        }
+    }
+
     /// A host that upgraded the CLI between the probe and the open has a receipt that no longer
     /// describes the file about to be launched.
     #[test]
-    fn a_receipt_for_another_executable_is_refused_by_name() {
+    fn a_receipt_for_another_executable_is_refused_by_shape() {
         let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let error = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
             .verify_for(
@@ -948,20 +1145,24 @@ mod tests {
             )
             .expect_err("expected a refusal");
         assert!(
-            error.to_string().contains("/opt/claude/bin/claude"),
-            "expected the executable being launched in the diagnostic, received {error}"
+            error
+                .to_string()
+                .contains("a receipt and request that name different executables"),
+            "expected an executable mismatch shape, received {error}"
         );
     }
 
     #[test]
-    fn a_receipt_for_another_harness_is_refused_by_name() {
+    fn a_receipt_for_another_harness_is_refused_by_shape() {
         let now = std::time::SystemTime::UNIX_EPOCH;
         let error = DiscoveryReceipt::new(HarnessId::codex(), usable(), now)
             .verify_for(&descriptor(), now, &request())
             .expect_err("expected a refusal");
         assert!(
-            error.to_string().contains("a receipt for codex"),
-            "expected both harness ids in the diagnostic, received {error}"
+            error
+                .to_string()
+                .contains("a receipt for a different harness"),
+            "expected a harness mismatch shape, received {error}"
         );
     }
 

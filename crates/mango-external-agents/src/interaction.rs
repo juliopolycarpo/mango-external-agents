@@ -695,16 +695,19 @@ impl QuestionRequest {
     pub fn validate(&self, response: &QuestionResponse) -> Result<()> {
         if response.interaction_id != self.interaction.id {
             return Err(Error::Protocol {
-                expected: format!("an answer to {}", self.interaction.id),
-                received: response.interaction_id.to_string(),
+                expected: String::from("an answer to this question request"),
+                received: String::from("an answer for a different interaction"),
             });
         }
         let mut answered: Vec<&QuestionId> = Vec::with_capacity(response.answers.len());
         for answer in &response.answers {
             let Some(question) = self.question(&answer.question_id) else {
                 return Err(Error::Protocol {
-                    expected: format!("one of the questions {:?} this request asked", self.ids()),
-                    received: answer.question_id.to_string(),
+                    expected: format!(
+                        "one of the {} questions this request asked",
+                        self.questions.len()
+                    ),
+                    received: String::from("an answer for an unknown question"),
                 });
             };
             // Checked across the whole response, not inside one answer. Two `Answer`s naming the
@@ -712,8 +715,8 @@ impl QuestionRequest {
             // reads last — which is a choice nobody made.
             if answered.contains(&&answer.question_id) {
                 return Err(Error::Protocol {
-                    expected: format!("one answer to question {}", answer.question_id),
-                    received: String::from("two"),
+                    expected: String::from("at most one answer per question"),
+                    received: String::from("multiple answers for one question"),
                 });
             }
             answered.push(&answer.question_id);
@@ -726,19 +729,12 @@ impl QuestionRequest {
                 .any(|answer| answer.question_id == question.id && !answer.value.is_declined());
             if !answered {
                 return Err(Error::Protocol {
-                    expected: format!("an answer to the required question {}", question.id),
+                    expected: String::from("an answer to a required question"),
                     received: String::from("no answer"),
                 });
             }
         }
         Ok(())
-    }
-
-    fn ids(&self) -> Vec<&str> {
-        self.questions
-            .iter()
-            .map(|question| question.id.as_str())
-            .collect()
     }
 }
 
@@ -760,7 +756,7 @@ fn validate_answer(question: &Question, answer: &Answer) -> Result<()> {
             }
             if !multi_select && option_ids.len() > 1 {
                 return Err(Error::Protocol {
-                    expected: format!("one option for the single-select question {}", question.id),
+                    expected: String::from("one option for a single-select question"),
                     received: option_ids.len().to_string(),
                 });
             }
@@ -768,14 +764,10 @@ fn validate_answer(question: &Question, answer: &Answer) -> Result<()> {
                 if !options.iter().any(|option| &option.id == chosen) {
                     return Err(Error::Protocol {
                         expected: format!(
-                            "one of the options {:?} question {} offered",
-                            options
-                                .iter()
-                                .map(|option| option.id.as_str())
-                                .collect::<Vec<_>>(),
-                            question.id
+                            "one of the {} options this question offered",
+                            options.len()
                         ),
-                        received: chosen.to_string(),
+                        received: String::from("an unknown option"),
                     });
                 }
             }
@@ -791,9 +783,9 @@ fn validate_answer(question: &Question, answer: &Answer) -> Result<()> {
             Ok(())
         }
         (_, AnswerValue::Declined) => Ok(()),
-        (form, value) => Err(Error::Protocol {
-            expected: format!("an answer matching {form:?}"),
-            received: format!("{value:?}"),
+        (_, _) => Err(Error::Protocol {
+            expected: String::from("an answer matching the question form"),
+            received: String::from("an answer with an incompatible form"),
         }),
     }
 }
@@ -1040,6 +1032,7 @@ mod tests {
         Question, QuestionForm, QuestionId, QuestionOption, QuestionOptionId, QuestionOutcome,
         QuestionRequest, QuestionResponse, UnsupportedQuestion,
     };
+    use crate::Error;
     use crate::event::SessionId;
     use std::time::{Duration, SystemTime};
 
@@ -1115,7 +1108,7 @@ mod tests {
 
     /// A host cannot invent a choice: the vendor would refuse it, or worse, accept a different one.
     #[test]
-    fn an_option_the_question_did_not_offer_is_refused_by_name() {
+    fn an_option_the_question_did_not_offer_is_refused_by_shape() {
         let request = QuestionRequest::new(interaction(), vec![choice("branch", &["main"], false)]);
         let error = request
             .validate(&QuestionResponse::new(
@@ -1126,10 +1119,11 @@ mod tests {
                 )],
             ))
             .expect_err("expected a refusal, received acceptance");
-        assert!(
-            error.to_string().contains("trunk"),
-            "expected the rejected option in the diagnostic, received {error}"
-        );
+        let Error::Protocol { expected, received } = error.cause() else {
+            panic!("expected a protocol refusal, received {error:?}");
+        };
+        assert_eq!(expected, "one of the 1 options this question offered");
+        assert_eq!(received, "an unknown option");
     }
 
     #[test]
@@ -1152,10 +1146,11 @@ mod tests {
                 )],
             ))
             .expect_err("expected a refusal");
-        assert!(
-            error.to_string().contains("single-select"),
-            "received {error}"
-        );
+        let Error::Protocol { expected, received } = error.cause() else {
+            panic!("expected a protocol refusal, received {error:?}");
+        };
+        assert_eq!(expected, "one option for a single-select question");
+        assert_eq!(received, "2");
     }
 
     /// Two answers to one single-select question each validate alone, and the vendor honours
@@ -1181,10 +1176,11 @@ mod tests {
                 ],
             ))
             .expect_err("expected a refusal, received acceptance");
-        assert!(
-            error.to_string().contains("one answer to question branch"),
-            "expected the doubled question in the diagnostic, received {error}"
-        );
+        let Error::Protocol { expected, received } = error.cause() else {
+            panic!("expected a protocol refusal, received {error:?}");
+        };
+        assert_eq!(expected, "at most one answer per question");
+        assert_eq!(received, "multiple answers for one question");
     }
 
     #[test]
@@ -1219,7 +1215,11 @@ mod tests {
                 )],
             ))
             .expect_err("expected a refusal");
-        assert!(error.to_string().contains("note"), "received {error}");
+        let Error::Protocol { expected, received } = error.cause() else {
+            panic!("expected a protocol refusal, received {error:?}");
+        };
+        assert_eq!(expected, "an answer to a required question");
+        assert_eq!(received, "no answer");
     }
 
     /// Declining is an answer that says nothing, and it does not satisfy a required question.
@@ -1244,7 +1244,11 @@ mod tests {
                 Vec::new(),
             ))
             .expect_err("expected a refusal");
-        assert!(error.to_string().contains("ask-2"), "received {error}");
+        let Error::Protocol { expected, received } = error.cause() else {
+            panic!("expected a protocol refusal, received {error:?}");
+        };
+        assert_eq!(expected, "an answer to this question request");
+        assert_eq!(received, "an answer for a different interaction");
     }
 
     /// Answering a question grants nothing. The distinction is what stops a "which branch?" prompt
@@ -1356,10 +1360,11 @@ mod tests {
         let error = malformed
             .normalized()
             .expect_err("expected a permission-shaped question to be refused");
-        assert_eq!(
-            error.to_string(),
-            "expected a question interaction, received permission"
-        );
+        let Error::Protocol { expected, received } = error.cause() else {
+            panic!("expected a protocol refusal, received {error:?}");
+        };
+        assert_eq!(expected, "a question interaction");
+        assert_eq!(received, "permission");
     }
 
     #[test]
@@ -1395,6 +1400,62 @@ mod tests {
                 assert!(
                     !rendered.contains(secret),
                     "expected no question payload in debug output, received {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn question_validation_diagnostics_omit_interaction_and_choice_ids() {
+        let request = QuestionRequest::new(
+            Interaction::new(
+                InteractionId::new("interaction-id-secret"),
+                InteractionKind::Question,
+                SessionId::new("chat-1"),
+                SystemTime::UNIX_EPOCH,
+            ),
+            vec![choice("question-id-secret", &["option-id-secret"], false).required()],
+        );
+        let errors = [
+            request
+                .validate(&QuestionResponse::new(
+                    InteractionId::new("other-interaction-id-secret"),
+                    Vec::new(),
+                ))
+                .expect_err("expected another interaction to be refused"),
+            request
+                .validate(&QuestionResponse::new(
+                    InteractionId::new("interaction-id-secret"),
+                    vec![Answer::new(
+                        QuestionId::new("other-question-id-secret"),
+                        AnswerValue::Declined,
+                    )],
+                ))
+                .expect_err("expected another question to be refused"),
+            request
+                .validate(&QuestionResponse::new(
+                    InteractionId::new("interaction-id-secret"),
+                    vec![Answer::new(
+                        QuestionId::new("question-id-secret"),
+                        AnswerValue::chosen(QuestionOptionId::new("other-option-id-secret")),
+                    )],
+                ))
+                .expect_err("expected another option to be refused"),
+        ];
+
+        for error in errors {
+            let rendered = error.to_string();
+            for secret in [
+                "interaction-id-secret",
+                "other-interaction-id-secret",
+                "question-id-secret",
+                "other-question-id-secret",
+                "option-id-secret",
+                "other-option-id-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no question id in diagnostics, received {rendered}"
                 );
             }
         }
