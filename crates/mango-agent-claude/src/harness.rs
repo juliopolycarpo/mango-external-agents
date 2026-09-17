@@ -276,7 +276,9 @@ impl Harness for ClaudeHarness {
         // vendor process. The host owns the container or sandbox mapping that makes this path
         // visible to the child. A later opening refusal drops this value and removes only its
         // scoped artifact.
-        let mcp_config = if request.mcp_servers.is_empty() {
+        // Held in `Prepared` rather than as a bare value: three child processes are awaited before
+        // the session can take it, and a caller that cancels in between drops it on the worker.
+        let mut mcp_config = crate::mcp::Prepared::new(if request.mcp_servers.is_empty() {
             None
         } else {
             let scratch = host.scratch().ok_or_else(|| Error::HostConfiguration {
@@ -284,7 +286,7 @@ impl Harness for ClaudeHarness {
                 received: String::from("none"),
             })?;
             ConfigFile::write(&request.mcp_servers, scratch).await?
-        };
+        });
         let executable = self.executable_for(&request);
         let survey = self.survey(host, &executable).await;
 
@@ -295,7 +297,7 @@ impl Harness for ClaudeHarness {
         let opened = match Self::opened(request, survey) {
             Ok(opened) => opened,
             Err(error) => {
-                crate::mcp::release_off_worker(mcp_config).await;
+                crate::mcp::release_off_worker(mcp_config.take()).await;
                 return Err(error);
             }
         };
@@ -306,7 +308,7 @@ impl Harness for ClaudeHarness {
             opened.info,
             opened.availability,
             opened.surface,
-            mcp_config,
+            mcp_config.take(),
         )))
     }
 }

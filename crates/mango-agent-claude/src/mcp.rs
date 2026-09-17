@@ -176,9 +176,54 @@ impl Drop for ConfigFile {
     ///
     /// Synchronous, deliberately: a value dropped without a close has no runtime to hand the call
     /// to, and by the time the last session drops the runtime may already be shutting down. A
-    /// close that does have one goes through `release_off_worker` instead.
+    /// close that does have one goes through `release_off_worker` instead, and a call that was
+    /// cancelled mid-open through `Prepared`.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// A configuration artifact owned by a call that may be cancelled before it finishes.
+///
+/// `open_session` writes the file, then awaits three child processes before the session can take
+/// it. A caller that drops that future in between drops the artifact on the async worker, and
+/// `ConfigFile`'s own `Drop` would run `remove_dir_all` there — the same stall the write, the
+/// close and the raced turn were all moved off. Cancellation is not a refusal: there is no error
+/// path to release on and nothing left to await, so the removal is handed off and left to finish.
+pub(crate) struct Prepared(Option<ConfigFile>);
+
+impl Prepared {
+    /// Takes ownership of what an open just wrote, if it wrote anything.
+    pub(crate) fn new(file: Option<ConfigFile>) -> Self {
+        Self(file)
+    }
+
+    /// Hands the artifact to whoever owns it next, leaving nothing for this value to remove.
+    pub(crate) fn take(&mut self) -> Option<ConfigFile> {
+        self.0.take()
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        let Some(file) = self.0.take() else {
+            return;
+        };
+        release_on_drop(file);
+    }
+}
+
+/// Hands a value's `Drop` to the blocking pool when there is a runtime to hand it to.
+///
+/// Fire and forget, because a `Drop` cannot await. A thread with no runtime — a host that built
+/// the session outside one, or a runtime already shutting down — drops it where it stands, which
+/// is what the value would have done anyway.
+fn release_on_drop<T: Send + 'static>(value: T) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(move || drop(value));
+        }
+        Err(_) => drop(value),
     }
 }
 
@@ -682,6 +727,62 @@ mod tests {
             Some(std::thread::current().id()),
             "expected the drop to run on the blocking pool, received the async worker"
         );
+    }
+
+    /// A cancelled open has no error path to release on, so the `Drop` has to do the handing off.
+    ///
+    /// `open_session` writes the artifact and then awaits three child processes. A caller that
+    /// drops that future in between reaches no return at all, and `ConfigFile`'s own `Drop` would
+    /// run `remove_dir_all` on the thread polling it. The oneshot makes the assertion
+    /// deterministic: it resolves inside the drop, so there is nothing to wait out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_prepared_artifact_dropped_without_a_return_still_leaves_the_worker() {
+        use std::thread::ThreadId;
+
+        /// Reports which thread dropped it, before the receiver can be polled.
+        struct ThreadProbe(Option<tokio::sync::oneshot::Sender<ThreadId>>);
+
+        impl Drop for ThreadProbe {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(std::thread::current().id());
+                }
+            }
+        }
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        super::release_on_drop(ThreadProbe(Some(sender)));
+
+        let dropped_on = receiver.await.expect("expected the probe to be dropped");
+        assert_ne!(
+            dropped_on,
+            std::thread::current().id(),
+            "expected the drop to run on the blocking pool, received the async worker"
+        );
+    }
+
+    /// Outside a runtime there is nothing to hand it to, so it is dropped where it stands.
+    #[test]
+    fn a_prepared_artifact_dropped_without_a_runtime_is_removed_in_place() {
+        let scratch = tempdir();
+        let directory = {
+            let file = ConfigFile::write_with(&servers(), &scratch, &super::PrivateFileWriter)
+                .expect("expected a file")
+                .expect("expected servers to produce one");
+            let directory = file
+                .path()
+                .parent()
+                .expect("a file sits in a directory")
+                .to_path_buf();
+            drop(super::Prepared::new(Some(file)));
+            directory
+        };
+
+        assert!(
+            !directory.exists(),
+            "expected the artifact to be gone, received {directory:?}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// And the artifact is gone by the time the release returns, not merely scheduled.
