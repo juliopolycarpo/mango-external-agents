@@ -243,9 +243,11 @@ impl Harness for AcpHarness {
             // mistake must not go.
             return Err(Error::HostConfiguration {
                 expected: "a (level, routing) pair this profile supports",
+                // The pair, never the profile. A custom profile's id is host-authored text and
+                // may name a tenant; the host already knows which profile it handed this harness.
                 received: format!(
-                    "{:?}/{:?} on {}",
-                    request.configuration.level, request.configuration.routing, self.profile.id
+                    "{:?}/{:?}",
+                    request.configuration.level, request.configuration.routing
                 ),
             });
         }

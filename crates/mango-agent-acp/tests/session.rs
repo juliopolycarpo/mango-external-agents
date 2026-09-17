@@ -1361,6 +1361,70 @@ async fn a_turn_asking_for_a_level_this_profile_cannot_reach_is_refused() {
     );
 }
 
+/// A custom profile's id is host-authored text: the host names its own in-house agent, and that
+/// name may carry a tenant or a credential. Both pair refusals — `open_session`'s and the turn's —
+/// summarised it into a diagnostic the formatter writes verbatim.
+#[tokio::test]
+async fn a_custom_profile_id_stays_out_of_pair_refusals() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().process());
+    let harness = AcpHarness::new(Arc::new(AcpProfile::custom(
+        "tenant-secret",
+        ["fake-acp", "acp"],
+        VENDOR,
+    )));
+
+    // `Box<dyn Session>` is not `Debug`, so the success arm is named rather than unwrapped.
+    let refused_open = match harness
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(Configuration {
+                level: Some(PermissionLevel::FullAccess),
+                ..Configuration::default()
+            }),
+        )
+        .await
+    {
+        Ok(_) => panic!("expected an unsupported pair to be refused"),
+        Err(error) => error,
+    };
+
+    let session = harness
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-2").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let refused_turn = refusal(
+        session
+            .start_turn(
+                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
+                    level: Some(PermissionLevel::FullAccess),
+                    ..Configuration::default()
+                }),
+            )
+            .await,
+    );
+
+    for error in [&refused_open, &refused_turn] {
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "expected a host-configuration refusal, received {error:?}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("tenant-secret"),
+                "expected the profile id to stay out of diagnostics, received {rendered:?}"
+            );
+            assert!(
+                rendered.contains("FullAccess"),
+                "expected the refused level to survive the summary, received {rendered:?}"
+            );
+        }
+    }
+}
+
 /// A launcher that records whether the library ended each child it handed out.
 ///
 /// Needed because `FakeLauncher` exposes no per-child handle, so nothing outside the library can

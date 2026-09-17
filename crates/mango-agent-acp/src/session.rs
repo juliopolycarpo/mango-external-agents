@@ -136,7 +136,9 @@ impl AcpSession {
             if !crate::profile::matrix(&self.profile.modes).supports(level, routing) {
                 return Err(Error::HostConfiguration {
                     expected: "a (level, routing) pair this profile supports",
-                    received: format!("{level:?}/{routing:?} on {}", self.profile.id),
+                    // As in `AcpHarness::open_session`: the pair is the library's own vocabulary,
+                    // the profile id is the host's.
+                    received: format!("{level:?}/{routing:?}"),
                 });
             }
         }
