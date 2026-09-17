@@ -179,7 +179,6 @@ fn take_turn(
 struct AbandonedStart {
     shared: Arc<Shared>,
     end: Arc<TurnEnd>,
-    control: Arc<dyn mango_external_agents::ProcessControl>,
     armed: bool,
 }
 
@@ -195,22 +194,27 @@ impl Drop for AbandonedStart {
         if !self.armed {
             return;
         }
-        // Out of the session under the lock, so a later close or start finds no active turn
-        // pointing at a child this is reaping. Only if it is still ours: a stop that already took
-        // it owns what it took.
-        {
+        // The take decides the kill. `ProcessControl::kill` documents that the library asks once,
+        // so a stop that already took this turn owns its teardown and must not be asked again;
+        // taking it out under the lock is also what stops a later close or start from finding an
+        // active turn pointing at a child being reaped here.
+        let taken = {
             let mut state = self.shared.lock();
             if state
                 .active
                 .as_ref()
                 .is_some_and(|active| Arc::ptr_eq(&active.end, &self.end))
             {
-                let _ = take_turn(&mut state, CancelReason::Requested);
+                take_turn(&mut state, CancelReason::Requested)
+            } else {
+                None
             }
-        }
+        };
+        let Some(control) = taken else {
+            return;
+        };
         // `kill` is async and a `Drop` is not, so the reap runs on a task of its own. Off a
         // runtime there is nothing to spawn onto and nothing left that could await a child.
-        let control = Arc::clone(&self.control);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _ = control.kill(CancelReason::Requested).await;
@@ -437,7 +441,6 @@ impl mango_external_agents::Session for ClaudeSession {
         let mut abandoned = AbandonedStart {
             shared: Arc::clone(&self.shared),
             end: Arc::clone(&end),
-            control: Arc::clone(&control),
             armed: true,
         };
 
@@ -466,10 +469,12 @@ impl mango_external_agents::Session for ClaudeSession {
             }
         };
         if let Some(reason) = stopped {
-            // Awaited here rather than left to the guard, which can only spawn its kill: this
-            // call is returning a refusal and the child it launched is reaped before it does.
+            // No kill here, unlike the check before the child was installed. There the stop had
+            // found `control: None` and killed nothing, so this call owed the teardown. Here the
+            // stop took an active turn that already carried the control and has ended that child
+            // itself — and `ProcessControl::kill` documents that the library asks once. The guard
+            // is disarmed for the same reason.
             abandoned.disarm();
-            let _ = control.kill(reason).await;
             return Err(if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {

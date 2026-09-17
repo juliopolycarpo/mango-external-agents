@@ -143,6 +143,7 @@ pub struct FakeClaudeCli {
     spawn_gate: Mutex<Option<SpawnGate>>,
     /// Whether each killed child's `--mcp-config` file was still on disk when it was killed.
     config_at_kill: Arc<Mutex<Vec<bool>>>,
+    kill_requests: Arc<Mutex<usize>>,
 }
 
 impl Default for FakeClaudeCli {
@@ -165,6 +166,7 @@ impl FakeClaudeCli {
             stderr: Mutex::new(Vec::new()),
             spawn_gate: Mutex::new(None),
             config_at_kill: Arc::new(Mutex::new(Vec::new())),
+            kill_requests: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -243,6 +245,18 @@ impl FakeClaudeCli {
     /// the moment of the kill because the ordering is the whole claim.
     pub fn mcp_config_at_kill(&self) -> Vec<bool> {
         lock(&self.config_at_kill).clone()
+    }
+
+    /// How many times the library asked a turn child to end, including asks a child had already
+    /// ended for. Turn children only: they are the ones a `--mcp-config` names.
+    ///
+    /// Deliberately different from [`mcp_config_at_kill`](Self::mcp_config_at_kill), which records
+    /// one entry per kill that had something to do: `ProcessControl::kill` documents that "the
+    /// library asks once", and a second ask is a contract break even where the launcher happens to
+    /// absorb it. Counting the asks is the only way a fake can see that, because absorbing them is
+    /// exactly what the real `TokioChild` does.
+    pub fn kill_requests(&self) -> usize {
+        *lock(&self.kill_requests)
     }
 
     /// Whether every child this launcher handed out has ended.
@@ -327,6 +341,7 @@ impl ProcessLauncher for FakeClaudeCli {
             changed: Notify::new(),
             mcp_config,
             config_at_kill: Arc::clone(&self.config_at_kill),
+            kill_requests: Arc::clone(&self.kill_requests),
         });
         lock(&self.children).push(Arc::clone(&child));
 
@@ -352,6 +367,7 @@ struct Child {
     changed: Notify,
     mcp_config: Option<PathBuf>,
     config_at_kill: Arc<Mutex<Vec<bool>>>,
+    kill_requests: Arc<Mutex<usize>>,
 }
 
 impl Child {
@@ -388,6 +404,12 @@ impl ProcessControl for Child {
 
     /// 128 + SIGTERM, which is what the vendor documents for a `claude -p` run stopped that way.
     async fn kill(&self, _reason: CancelReason) -> Result<()> {
+        // Counted before the early return: the ask itself is what the trait bounds. Only for a
+        // turn child, which is the one a `--mcp-config` identifies; the version and help probes
+        // are ended by their own code paths and would otherwise be counted here too.
+        if self.mcp_config.is_some() {
+            *lock(&self.kill_requests) += 1;
+        }
         // A child that already ended is not killed again. `TokioChild` escalates once and the
         // second caller waits on the first caller's outcome without signalling anything, so a fake
         // that recorded a second observation here would be inventing a kill the real launcher

@@ -1111,6 +1111,77 @@ mod mcp_passthrough {
         assert_eq!(written["mcpServers"]["docs"]["env"]["DOCS_TOKEN"], "s3cret");
     }
 
+    /// The guard reaps a child nobody else owns. When a `cancel` already took the turn it also
+    /// killed that child, so a guard firing afterwards would hand a host's launcher a second
+    /// teardown for the same process — `ProcessControl::kill` carries no idempotence promise.
+    #[test]
+    fn a_stop_that_already_reaped_the_child_is_not_asked_to_reap_it_twice() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_help(HELP_2_1_270)
+                    .with_turn(Run::stalling::<[String; 0], String>([])),
+            );
+            let scratch =
+                std::env::temp_dir().join(format!("mea-twice-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            // Boxed rather than dropped by the timeout, so the stop lands first and the guard
+            // runs second — the ordering where the turn is no longer the guard's to reap.
+            let mut start =
+                Box::pin(session.start_turn(TurnRequest::new("turn-1", "start something long")));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), start.as_mut())
+                    .await
+                    .is_err(),
+                "expected the turn to be parked on the occupied blocking pool"
+            );
+            session
+                .cancel(CancelReason::Requested)
+                .await
+                .expect("expected the cancel to be accepted");
+            drop(start);
+
+            drop(release_pool);
+            let _ = occupied.await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                launcher.kill_requests(),
+                1,
+                "expected the library to ask once, as ProcessControl::kill documents"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
     /// Nothing reaps a child on its own: the session implements no `Drop`, and a `ProcessControl`
     /// that is merely dropped is not killed. So a `start_turn` abandoned at the lease release must
     /// kill the child it launched itself, or the process outlives the host's interest in it until
@@ -1243,6 +1314,14 @@ mod mcp_passthrough {
             assert!(
                 matches!(error, Error::Cancelled { .. }),
                 "expected the recorded cancellation, received {error:?}"
+            );
+            // The cancel took the turn and killed its child. `ProcessControl::kill` is not
+            // documented idempotent, so the refusal must not ask a host's launcher to tear the
+            // same child down twice.
+            assert_eq!(
+                launcher.kill_requests(),
+                1,
+                "expected the library to ask once, as ProcessControl::kill documents"
             );
 
             let _ = std::fs::remove_dir_all(&scratch);
