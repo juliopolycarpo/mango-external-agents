@@ -182,6 +182,12 @@ frame anywhere in the public API.
 `TurnId` is **not an idempotency key**, and its documentation no longer says it is. Nothing in this
 library, and nothing in any vendor it drives, deduplicates on it.
 
+`AttemptId` is a **generation number**, not a name. Two of them have to be comparable —
+`OperationRef::is_superseded_by` is what stops a late result from an abandoned attempt overwriting
+the attempt that replaced it — and no ordering of opaque strings would be right: `attempt-10` sorts
+before `attempt-2` lexicographically, which is the first shape a host naming its attempts would
+reach for. A host that also wants an opaque handle per attempt keeps one beside this.
+
 What a host needs before retrying is `Error::dispatch()`:
 
 | Verdict             | Means                                       | Safe to replay       |
