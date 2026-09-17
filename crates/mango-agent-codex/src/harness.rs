@@ -28,7 +28,7 @@ use crate::protocol::requests::{
     ModelListResponse, ThreadResumeParams, ThreadStartParams, ThreadStartResponse, empty_params,
 };
 use crate::protocol::schema::MINIMUM_CODEX_VERSION;
-use crate::protocol::{PEER_NAME, method};
+use crate::protocol::{CODE_PREFIX, PEER_NAME, method};
 use crate::session::{CodexSession, Shared};
 
 /// Who owns the CLI this harness drives.
@@ -211,6 +211,7 @@ impl Harness for CodexHarness {
             transport.link,
             CodexSession::handler(Arc::clone(&shared)),
             ClientOptions::new(PEER_NAME)
+                .with_code_prefix(CODE_PREFIX)
                 // The app-server's own README: JSON-RPC 2.0 "with the `\"jsonrpc\":\"2.0\"` header
                 // omitted on the wire".
                 .without_version_header()
@@ -445,6 +446,7 @@ async fn probe_app_server(
         transport.link,
         Arc::new(Silent),
         ClientOptions::new(PEER_NAME)
+            .with_code_prefix(CODE_PREFIX)
             .without_version_header()
             .with_limits(host.limits()),
     );

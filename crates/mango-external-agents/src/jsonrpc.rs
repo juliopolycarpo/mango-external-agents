@@ -232,7 +232,18 @@ pub trait PeerHandler: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientOptions {
     /// The peer as a person would name it, such as `Codex app-server`.
+    ///
+    /// Host-authored text. It reaches a person through the host's own copy, never through an
+    /// [`Error`] this client returns.
     pub peer_name: String,
+    /// The vendor prefix of the [`ErrorCode`] minted when the peer answers with an error frame.
+    ///
+    /// `&'static str` is the provenance marker, the same one [`ErrorCode::from_static`] carries: a
+    /// prefix is written by the harness that compiles against this client, never derived from
+    /// [`peer_name`](ClientOptions::peer_name), which a host fills in and which may carry its own
+    /// text. A code is diagnostic — `Display` writes it — so what it may contain is decided here,
+    /// where it is made.
+    pub code_prefix: &'static str,
     /// Whether to write the `"jsonrpc": "2.0"` member.
     ///
     /// Not every dialect this library drives writes it, and a peer that validates strictly will
@@ -256,6 +267,7 @@ impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             peer_name: String::from("external agent"),
+            code_prefix: "peer",
             include_version_header: true,
             request_timeout: Duration::from_secs(120),
             max_in_flight_requests: 256,
@@ -271,6 +283,22 @@ impl ClientOptions {
             peer_name: peer_name.into(),
             ..Self::default()
         }
+    }
+
+    /// Prefixes this client's error codes with a vendor name the harness knows at compile time.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::ClientOptions;
+    ///
+    /// let options = ClientOptions::new("Codex app-server").with_code_prefix("codex");
+    /// assert_eq!(options.code_prefix, "codex");
+    /// ```
+    #[must_use]
+    pub fn with_code_prefix(mut self, code_prefix: &'static str) -> Self {
+        self.code_prefix = code_prefix;
+        self
     }
 
     /// Omits the `"jsonrpc"` member, for a dialect that does not write one.
@@ -529,7 +557,7 @@ impl Client {
         match tokio::time::timeout(timeout, waiting).await {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(failure))) => Err(Error::Vendor(failure.into_vendor_error(
-                ErrorCode::new(format!("{}-call-failed", self.state.slug())),
+                ErrorCode::new(format!("{}-call-failed", self.state.options.code_prefix)),
                 Some(id),
             ))),
             Ok(Err(_)) => Err(Error::Link {
@@ -723,17 +751,6 @@ impl ClientState {
         if let Some(answer) = self.pending.lock().await.remove(id) {
             let _ = answer.send(outcome);
         }
-    }
-
-    /// The peer's name as an error-code prefix.
-    fn slug(&self) -> String {
-        self.options
-            .peer_name
-            .to_lowercase()
-            .split_whitespace()
-            .next()
-            .unwrap_or("peer")
-            .to_owned()
     }
 }
 
@@ -1364,6 +1381,35 @@ mod tests {
             assert!(
                 !rendered.contains("peer-secret") && !rendered.contains("method-secret"),
                 "expected no caller-defined labels in diagnostics, received {rendered:?}"
+            );
+        }
+    }
+
+    /// A peer label is host-authored text, so the error code minted when the peer answers with an
+    /// error frame must come from the trusted prefix rather than from that label.
+    #[tokio::test]
+    async fn a_caller_defined_peer_label_does_not_become_an_error_code() {
+        let link = ScriptedLink::new();
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"refused"}}"#);
+        let client = Client::connect(
+            link.into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::new("tenant-secret"),
+        );
+
+        let error = client
+            .request::<_, Value>("ping", json!({}))
+            .await
+            .expect_err("expected the error frame to fail the call");
+
+        let Error::Vendor(vendor) = &error else {
+            panic!("expected a vendor error, received {error:?}");
+        };
+        assert_eq!(vendor.code.as_str(), "peer-call-failed");
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("tenant-secret"),
+                "expected no caller-defined label in diagnostics, received {rendered:?}"
             );
         }
     }
