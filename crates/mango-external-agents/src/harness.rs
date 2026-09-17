@@ -51,11 +51,24 @@ impl fmt::Display for HarnessKind {
 /// let kind = HarnessKind::Acp(AcpProfileId::new("cursor"));
 /// assert_eq!(kind.to_string(), "acp:cursor");
 /// ```
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct AcpProfileId(String);
+
+impl fmt::Debug for AcpProfileId {
+    /// Prints only a label-shaped id, as [`Display`](fmt::Display) does.
+    ///
+    /// A derived `Debug` would undo that bound wherever a host formats the id directly — a
+    /// `tracing` field, a `dbg!`, a derived `Debug` on anything holding one — and an assertion
+    /// made through [`Error`](crate::Error) would not notice, because its own `Debug` forwards to
+    /// its `Display`. The same pairing [`ErrorCode`](crate::ErrorCode) has, for the same reason.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AcpProfileId")
+            .field(&self.to_string())
+            .finish()
+    }
+}
 
 impl AcpProfileId {
     /// Names a profile.
@@ -534,6 +547,33 @@ mod tests {
         assert_eq!(
             HarnessKind::Acp(AcpProfileId::new("in-house")).to_string(),
             "acp:in-house"
+        );
+    }
+
+    /// `Error`'s `Debug` forwards to its `Display`, so an assertion made through an `Error` says
+    /// nothing about these types' own `Debug`. A host formatting the id or the kind directly —
+    /// `tracing` field, `dbg!`, a derived `Debug` on a struct that holds one — is the path that
+    /// has to be bounded too, the way `ErrorCode` bounds its own.
+    #[test]
+    fn debug_bounds_a_custom_profile_id_the_way_display_does() {
+        let leaky = AcpProfileId::new("tenant credential=profile-secret");
+
+        for rendered in [
+            format!("{leaky:?}"),
+            format!("{:?}", HarnessKind::Acp(leaky)),
+        ] {
+            assert!(
+                !rendered.contains("profile-secret"),
+                "expected Debug to bound the profile id, received {rendered:?}"
+            );
+        }
+
+        // A profile a host can read still reads the same through both.
+        let plain = AcpProfileId::new("in-house");
+        assert_eq!(plain.to_string(), "in-house");
+        assert!(
+            format!("{plain:?}").contains("in-house"),
+            "expected a label-shaped id to survive Debug"
         );
     }
 

@@ -296,8 +296,9 @@ covers the ancestors because Claude opens `--mcp-config` by pathname: the child 
 name again, so a handle this process holds cannot protect that walk. Both the path as the host
 wrote it and its canonical form are checked, because a symlink makes them two different chains: a
 shared directory holding a symlink into a private tree is on the walk the child performs even
-though canonicalisation resolves it away. A symlink component is judged by the directory holding
-it rather than by its own mode. The host remains responsible for ACLs and child mount mapping.
+though canonicalisation resolves it away. A symlink component is judged by its owner, not by its own
+`lrwxrwxrwx` mode; the directory that holds it is checked as its own ancestor, so a symlink a
+third party owns is refused however sticky that directory is. The host remains responsible for ACLs and child mount mapping.
 The harness creates one unique leaf below it with owner-only Unix permissions, or the host root's
 inherited Windows ACL, and removes that leaf when the session is closed or dropped. It never
 creates, changes or falls back outside the host root. A missing or unusable root refuses opening
