@@ -92,7 +92,7 @@ impl fmt::Debug for ErrorCode {
 }
 
 /// Whether a code reads as a label a log line can carry rather than as vendor text.
-fn is_label_shaped(code: &str) -> bool {
+pub(crate) fn is_label_shaped(code: &str) -> bool {
     !code.is_empty()
         && code.len() <= CODE_MAX_LENGTH
         && code.bytes().all(|byte| {
