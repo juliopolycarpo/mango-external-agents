@@ -31,9 +31,12 @@ Facts were read on 2026-09-12; re-verify against the vendor's current page befor
   pinned minimum version and the vendor's own login command are named because they are the
   library's own constants. A launch failure still reports its executable through
   `redact::program_name`, and a link failure never names its peer at all, because a WebSocket
-  transport puts the dialled URL there. `examples/mea` is
-  an unpublished smoke tool, not part of that guarantee: its own refusals name the paths and OS
-  messages its operator needs.
+  transport puts the dialled URL there. The guarantee is about carriers — types that hold a value
+  among others, where a derived `Debug` would print it as a side effect. `SessionId` and `TurnId`
+  are not carriers but the ids themselves: they are the host's own, minted by the host and printed
+  for it, and a host formatting a value it created is not a boundary this library stands on.
+  `examples/mea` is an unpublished smoke tool, not part of the guarantee either: its own refusals
+  name the paths and OS messages its operator needs.
 - **No telemetry, no listener, no downloaded binaries.**
 
 ## Claude Code (`mango-agent-claude`)

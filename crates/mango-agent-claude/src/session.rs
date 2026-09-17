@@ -233,7 +233,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // `stdio::open` returns below then has this reservation, rather than an empty slot, to
         // record its reason against.
         let end = Arc::new(TurnEnd::default());
-        let (previous, mcp_lease) = {
+        let (previous, mut mcp_lease) = {
             let Some(_lifecycle) = self.shared.lifecycle.begin_start() else {
                 return Err(Error::Closed { subject: "session" });
             };
@@ -246,7 +246,13 @@ impl mango_external_agents::Session for ClaudeSession {
             // The reservation and this clone share the same critical section. A close that wins
             // after it can release the session's reference, but this attempt still owns the file
             // until it has either installed or reaped the child it launches.
-            (previous, state.mcp_config.as_ref().map(Arc::clone))
+            (
+                previous,
+                // In a cancellation-safe owner for the same reason `open_session`'s artifact is:
+                // a caller that drops this future between here and the return reaches no explicit
+                // release, and a close that won the race leaves this clone the last reference.
+                crate::mcp::Prepared::new(state.mcp_config.as_ref().map(Arc::clone)),
+            )
         };
         end_turn(previous, CancelReason::Requested).await;
 
@@ -254,7 +260,7 @@ impl mango_external_agents::Session for ClaudeSession {
             let state = self.shared.lock();
             (state.native_session_id.clone(), state.established)
         };
-        let mcp_config = mcp_lease.as_ref().map(|file| file.argument().to_owned());
+        let mcp_config = mcp_lease.get().map(|file| file.argument().to_owned());
         let argv = match (TurnArgv {
             program: PROGRAM,
             mode,
@@ -282,7 +288,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 // A close that won the race already released the session's own reference, which
                 // makes this lease the last one and its drop the `remove_dir_all`. Off the worker,
                 // for the same reason the write is.
-                crate::mcp::release_off_worker(mcp_lease).await;
+                crate::mcp::release_off_worker(mcp_lease.take()).await;
                 return Err(error);
             }
         };
@@ -300,7 +306,7 @@ impl mango_external_agents::Session for ClaudeSession {
             // this call made above, and only if a stop has not already taken it.
             Err(error) => {
                 clear_active(&self.shared, &end);
-                crate::mcp::release_off_worker(mcp_lease).await;
+                crate::mcp::release_off_worker(mcp_lease.take()).await;
                 return Err(error);
             }
         };
@@ -353,7 +359,7 @@ impl mango_external_agents::Session for ClaudeSession {
             // After the kill, never before: the child read `--mcp-config` at startup. And off the
             // worker, because a close that won the race left this lease holding the last
             // reference, so this is where the `remove_dir_all` happens.
-            crate::mcp::release_off_worker(mcp_lease).await;
+            crate::mcp::release_off_worker(mcp_lease.take()).await;
             return Err(if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
@@ -376,7 +382,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // taken the session's reference between the lifecycle check above and this line, which
         // makes this the last one — and a `close` that found nothing to remove has already
         // answered. So it is released the same way every other path releases it.
-        crate::mcp::release_off_worker(mcp_lease).await;
+        crate::mcp::release_off_worker(mcp_lease.take()).await;
 
         Ok(TurnStream {
             // `claude --print` names no turn, so the handle is the host's own id: a value the host

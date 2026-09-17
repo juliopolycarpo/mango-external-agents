@@ -210,31 +210,40 @@ impl Drop for ConfigFile {
 
 /// A configuration artifact owned by a call that may be cancelled before it finishes.
 ///
-/// `open_session` writes the file, then awaits three child processes before the session can take
-/// it. A caller that drops that future in between drops the artifact on the async worker, and
-/// `ConfigFile`'s own `Drop` would run `remove_dir_all` there — the same stall the write, the
-/// close and the raced turn were all moved off. Cancellation is not a refusal: there is no error
-/// path to release on and nothing left to await, so the removal is handed off and left to finish.
-pub(crate) struct Prepared(Option<ConfigFile>);
+/// `open_session` writes the file and then awaits three child processes before the session can
+/// take it; `start_turn` holds a lease across a launcher and a spawn. A caller that drops either
+/// future in between drops the artifact on the async worker, and `ConfigFile`'s own `Drop` would
+/// run `remove_dir_all` there — the same stall the write, the close and the refusal paths were all
+/// moved off. Cancellation is not a refusal: there is no error path to release on and nothing left
+/// to await, so the removal is handed off and left to finish.
+///
+/// Generic because the two callers own different things: the open owns the [`ConfigFile`], the
+/// turn owns an `Arc` of it that a raced close can have made the last one.
+pub(crate) struct Prepared<T: Send + 'static>(Option<T>);
 
-impl Prepared {
-    /// Takes ownership of what an open just wrote, if it wrote anything.
-    pub(crate) fn new(file: Option<ConfigFile>) -> Self {
-        Self(file)
+impl<T: Send + 'static> Prepared<T> {
+    /// Takes ownership of what a call is holding, if it is holding anything.
+    pub(crate) fn new(value: Option<T>) -> Self {
+        Self(value)
+    }
+
+    /// What is held, for a caller that needs to read it without giving it up.
+    pub(crate) fn get(&self) -> Option<&T> {
+        self.0.as_ref()
     }
 
     /// Hands the artifact to whoever owns it next, leaving nothing for this value to remove.
-    pub(crate) fn take(&mut self) -> Option<ConfigFile> {
+    pub(crate) fn take(&mut self) -> Option<T> {
         self.0.take()
     }
 }
 
-impl Drop for Prepared {
+impl<T: Send + 'static> Drop for Prepared<T> {
     fn drop(&mut self) {
-        let Some(file) = self.0.take() else {
+        let Some(value) = self.0.take() else {
             return;
         };
-        release_on_drop(file);
+        release_on_drop(value);
     }
 }
 
