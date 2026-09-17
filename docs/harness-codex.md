@@ -45,6 +45,12 @@ on the wire)".
 | `turn/interrupt`                | `Session::cancel`                      |
 | `review/start`                  | `Session::start_review`                |
 
+Listing and account usage are session-scoped in this adapter: they use the open session's
+app-server connection. Its advertised `session_listing` and `account_usage` capabilities refer to
+the `Session` methods above. The separate `Harness::list_sessions` and `Harness::account_usage`
+services remain `Error::NotSupported`; this adapter does not launch a short-lived app-server for
+a picker before opening a conversation.
+
 `clientInfo.name` is always the host's own name, from `HostContext::client_info`. The README says
 this identifies the client to OpenAI's compliance logging platform, so writing anything else would
 be a misattribution rather than a nicety.

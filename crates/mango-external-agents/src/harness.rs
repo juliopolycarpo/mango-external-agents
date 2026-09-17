@@ -74,11 +74,13 @@ pub struct Capabilities {
     pub cancellation: bool,
     /// Same-turn steering, not a queued follow-up message.
     pub steering: bool,
-    /// The vendor's own sessions can be listed.
+    /// The vendor's own sessions can be listed through an open session.
+    /// This does not promise the optional harness-level listing service.
     pub session_listing: bool,
     /// The vendor runs a review of its own.
     pub native_review: bool,
-    /// Account-level plan quota can be read.
+    /// Account-level plan quota can be read through an open session.
+    /// This does not promise the optional harness-level account service.
     pub account_usage: bool,
     /// The vendor accepts MCP servers the host configured, passed through untouched.
     pub mcp_passthrough: bool,
@@ -438,13 +440,13 @@ impl SessionCapabilities {
 pub enum Capability {
     /// [`Session::steer`](crate::Session::steer).
     Steering,
-    /// [`Session::list_sessions`](crate::Session::list_sessions) and
-    /// [`Harness::list_sessions`].
+    /// [`Session::list_sessions`](crate::Session::list_sessions).
+    /// Also names refusals from the independently optional [`Harness::list_sessions`].
     SessionListing,
     /// [`Session::start_review`](crate::Session::start_review).
     NativeReview,
-    /// [`Session::refresh_account_usage`](crate::Session::refresh_account_usage) and
-    /// [`Harness::account_usage`].
+    /// [`Session::refresh_account_usage`](crate::Session::refresh_account_usage).
+    /// Also names refusals from the independently optional [`Harness::account_usage`].
     AccountUsage,
     /// [`OpenSession::resuming`](crate::OpenSession::resuming).
     Resume,
@@ -678,6 +680,7 @@ pub trait Harness: Send + Sync {
     /// What a host calls to populate a picker. Like [`Harness::discover`], it is the half that
     /// applies [`SessionPage::normalized`](crate::SessionPage::normalized), so a title or a
     /// workspace path a vendor wrote cannot reach a host's list unbounded.
+    /// A session-listing capability does not guarantee this separate harness-level service.
     ///
     /// # Errors
     ///
@@ -711,6 +714,7 @@ pub trait Harness: Send + Sync {
     ///
     /// Reported from a non-secret vendor surface, like everything else about an account here. The
     /// library still has no login of any kind.
+    /// A session account-usage capability does not guarantee this separate harness-level service.
     ///
     /// # Errors
     ///

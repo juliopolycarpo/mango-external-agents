@@ -227,10 +227,12 @@ vouches for one binary cannot vouch for whichever one that turns out to be.
 
 ## Listing and account readings without a conversation
 
-`Harness::list_sessions` and `Harness::account_usage` sit on the harness as well as the session, so
-a host drawing a picker does not have to open a conversation first. Both default to
-`Error::NotSupported` under their own capability. Neither reads a credential: account state is
-reported from a non-secret vendor surface or not at all.
+`Harness::list_sessions` and `Harness::account_usage` are optional services for a host that needs
+data before opening a conversation. Both default to `Error::NotSupported`, and the shipped
+harnesses keep those defaults. The listing/account capability flags describe the corresponding
+session methods, not these independent services: Codex currently requires an open `Session` for
+`thread/list` and account usage. Hosts must handle a harness-level refusal even when its session
+capability is advertised. Neither surface reads a credential.
 
 ## Protected types, justified individually
 

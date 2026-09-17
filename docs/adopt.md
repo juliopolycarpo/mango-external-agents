@@ -89,9 +89,10 @@ already logged into with the vendor's own CLI.
   `executable` it found is what the host passes back on `OpenSession::with_executable`: a resolved
   path belongs to one harness, so it rides on the request rather than on the context every harness
   shares.
-- `Harness::list_sessions` and `Harness::account_usage` answer **without** an open conversation, so
-  a picker can be drawn before anybody has started one. Both refuse as `Error::NotSupported` on a
-  harness that does not have them.
+- `Harness::list_sessions` and `Harness::account_usage` are optional services for reading without
+  an open conversation. Both default to `Error::NotSupported`; session capability flags do not
+  guarantee these separate services. The shipped harnesses retain those defaults. In Codex,
+  listing and account usage are available through an open `Session`, not through a pre-session picker.
 - `Harness::open_session` → a `Box<dyn Session>`. A host that has just probed can hand the answer
   back on `OpenSession::with_discovery(DiscoveryReceipt)` rather than paying for the probe twice;
   the receipt is checked for harness identity, executable identity and freshness, and then
