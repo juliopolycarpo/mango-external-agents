@@ -292,12 +292,15 @@ impl mango_external_agents::Session for ClaudeSession {
             // so there is no argv this harness could encode that un-sets one mid-session.
             mango_external_agents::configuration::refuse_unsupported_reset(patch)?;
         }
+        // Read from `requested`, not `accepted`: opening starts nothing, so the first turn has
+        // nothing accepted to inherit yet, and every later turn's `requested` already carries
+        // forward whatever the last explicit ask resolved to — see the update below.
         let current = self
             .shared
             .core_state
             .snapshot()
             .configuration
-            .accepted
+            .requested
             .clone();
         let configuration = requested_configuration
             .as_ref()
@@ -428,23 +431,27 @@ impl mango_external_agents::Session for ClaudeSession {
                     .as_ref()
                     .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
             {
-                if requested_configuration.is_some() {
-                    // `stdio::open` is the successful start boundary for the batch CLI: there is
-                    // no app-server response to acknowledge later. A following unconfigured turn
-                    // therefore repeats the flags the accepted process was launched with.
-                    //
-                    // Requested and accepted move together: this harness encodes exactly what was
-                    // asked once a mode resolves, so there is nothing for the two to disagree
-                    // about. Observed stays unknown — no documented Claude surface reports its own
-                    // settings back.
-                    self.shared
-                        .core_state
-                        .set_configuration(ConfigurationState::new(
-                            configuration.clone(),
-                            configuration.clone(),
-                            Configuration::unknown(),
-                        ));
-                }
+                // `stdio::open` is the successful start boundary for the batch CLI: there is no
+                // app-server response to acknowledge later, so a turn that spawned is a turn
+                // whose configuration — whatever it resolved to — just landed on argv. Accepted
+                // always moves to it. Requested moves too, but only when this turn asked for
+                // something explicitly: an unconfigured turn inheriting the last explicit choice
+                // is not itself a new request, and overwriting `requested` with its own inherited
+                // value would still be correct here but would erase the distinction for the next
+                // unconfigured turn to inherit from. Observed stays unknown — no documented Claude
+                // surface reports its own settings back.
+                let requested = if requested_configuration.is_some() {
+                    configuration.clone()
+                } else {
+                    current
+                };
+                self.shared
+                    .core_state
+                    .set_configuration(ConfigurationState::new(
+                        requested,
+                        configuration.clone(),
+                        Configuration::unknown(),
+                    ));
                 state.active = Some(ActiveTurn {
                     end: Arc::clone(&end),
                     control: Some(Arc::clone(&control)),
@@ -545,10 +552,21 @@ impl mango_external_agents::Session for ClaudeSession {
         // race it with anything the vendor says, so it is always the first thing on the stream —
         // including on a run whose own `system/init` never arrives.
         let native_turn_id = request.turn_id.as_str().to_owned();
-        sink.emit(EventKind::TurnStarted {
-            native_turn_id: native_turn_id.clone(),
-        })
-        .await?;
+        if let Err(error) = sink
+            .emit(EventKind::TurnStarted {
+                native_turn_id: native_turn_id.clone(),
+            })
+            .await
+        {
+            // The child is already running and installed in `state.active` by this point, so an
+            // id too strange for `EventKind::normalized` to keep — an id `TurnId::new` never
+            // validates — must not plant a live process nobody holds a handle to. Reaped the same
+            // way a stop landing in this window is.
+            clear_active(&self.shared, &end);
+            let _ = control.kill(CancelReason::Requested).await;
+            abandoned.disarm();
+            return Err(error);
+        }
         abandoned.disarm();
         tokio::spawn(pump(
             Arc::clone(&self.shared),

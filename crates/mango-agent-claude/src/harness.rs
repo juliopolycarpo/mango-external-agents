@@ -395,12 +395,13 @@ impl ClaudeHarness {
         let effective_transport = descriptor.resolve_transport(request.transport)?;
         let capabilities = survey.capabilities(models::advertises_catalog(survey.surface.as_ref()));
 
-        // Requested and accepted start identical: the harness commits to encoding exactly what
-        // was asked, verbatim, once a turn spawns — see `require_supported` above. Observed stays
-        // unknown, permanently: no documented Claude surface reports its own settings back.
+        // Requested only, not accepted: opening starts nothing — see this crate's own module
+        // documentation — so nothing has actually been encoded onto an argv yet. The first turn
+        // is what accepts it; see `ClaudeSession::start_turn`. Observed stays unknown,
+        // permanently: no documented Claude surface reports its own settings back.
         let configuration_state = ConfigurationState::new(
-            opening_configuration.clone(),
             opening_configuration,
+            Configuration::unknown(),
             Configuration::unknown(),
         );
 

@@ -590,6 +590,100 @@ mod a_turn {
         );
     }
 
+    /// The catalog the reducer read off `system/init` has to actually reach
+    /// [`SessionState`](mango_external_agents::SessionState), not just the `RunInit` the reducer's
+    /// own unit tests inspect — this is the wiring `apply_init` is for.
+    #[tokio::test]
+    async fn a_run_that_announces_commands_publishes_them_on_session_state() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(READ_TURN)));
+        let session = open(&launcher).await;
+        assert!(
+            session.snapshot().commands.is_empty(),
+            "expected no commands before any turn ran"
+        );
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "read note.txt"))
+            .await
+            .expect("expected a turn");
+        drain(&mut turn).await;
+
+        let snapshot = session.snapshot();
+        let names: Vec<&str> = snapshot
+            .commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"dataviz") && names.contains(&"code-review:code-review"),
+            "expected the announced catalog to reach session state, received {names:?}"
+        );
+    }
+
+    /// `TurnId::new` validates nothing, so a turn id too strange for `EventKind::normalized` to
+    /// keep is only refused once `EventKind::TurnStarted` fails to normalize — after the child is
+    /// already running. The child must be reaped, not left behind for a refusal nobody can act on.
+    #[tokio::test]
+    async fn refuses_a_turn_whose_id_cannot_be_kept_rather_than_leaving_the_child_running() {
+        // Stalling, not replaying: a turn that finishes on its own would still show
+        // `a_child_is_running() == false` on a codepath that never killed it, and prove nothing.
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let session = open(&launcher).await;
+
+        let error = session
+            .start_turn(TurnRequest::new("   ", "hello"))
+            .await
+            .expect_err("expected a whitespace-only turn id to be refused");
+        assert!(
+            matches!(
+                error,
+                Error::InvalidVendorValue {
+                    field: "native turn id",
+                    ..
+                }
+            ),
+            "received {error:?}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while launcher.a_child_is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the child spawned before the refusal to be reaped");
+    }
+
+    /// The turn-level twin of `opening_a_session::refuses_a_reset_request_before_a_turn_is_spawned`
+    /// — Claude has no reset semantics on either surface.
+    #[tokio::test]
+    async fn refuses_a_turn_level_reset_request_rather_than_spawning_with_it() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let session = open(&launcher).await;
+
+        let error =
+            session
+                .start_turn(TurnRequest::new("turn-1", "hello").with_configuration(
+                    ConfigurationPatch::new().model(ConfigurationChange::Reset),
+                ))
+                .await
+                .expect_err("expected a reset request to be refused");
+
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "received {error:?}"
+        );
+        assert!(
+            error.to_string().contains("reset"),
+            "expected the refusal to name the reset, received {error}"
+        );
+        assert!(
+            launcher.turn_argvs().is_empty(),
+            "expected no turn to be spawned"
+        );
+    }
+
     #[tokio::test]
     async fn writes_the_prompt_to_stdin_exactly_once_and_never_into_argv() {
         let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(READ_TURN)));
@@ -1938,6 +2032,11 @@ mod cancelling_and_closing {
             .close(CloseReason::Requested)
             .await
             .expect("expected a clean close");
+        assert_eq!(
+            session.snapshot().status,
+            mango_external_agents::SessionStatus::Closed,
+            "expected the snapshot to say so, not just the session's own refusal"
+        );
         session
             .close(CloseReason::Shutdown)
             .await
