@@ -14,10 +14,16 @@ use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::testing::conformance::{self, Outcome};
 use support::{FakeClaudeCli, READ_TURN, Run, host};
 
-/// A build that replays the captured turn, then holds a second turn open to be cancelled.
+/// A build that replays the captured turn twice, then holds a third turn open to be cancelled.
+///
+/// Three, not two: the suite's own `check_session_state` starts a turn to prove a session update
+/// reaches a subscriber, before `check_turn` starts the one it inspects and `check_cancelled_turn`
+/// starts the one it cancels. A queue with only two entries would starve `check_turn` of a
+/// completing transcript and hand it the stalling one meant for the cancellation check instead.
 fn scripted() -> Arc<FakeClaudeCli> {
     Arc::new(
         FakeClaudeCli::new()
+            .with_turn(Run::replaying(READ_TURN))
             .with_turn(Run::replaying(READ_TURN))
             .with_turn(Run::stalling(Vec::<String>::new())),
     )
