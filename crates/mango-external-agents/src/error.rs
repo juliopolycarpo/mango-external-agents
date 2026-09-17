@@ -181,6 +181,14 @@ impl std::error::Error for VendorError {}
 /// Everything that can go wrong between a host and a vendor CLI.
 #[non_exhaustive]
 pub enum Error {
+    /// A failure annotated where the operation's submission stage is known.
+    Operation {
+        /// How far this operation got before it failed.
+        dispatch: Dispatch,
+        /// The original typed failure, retained for inspection and diagnostics.
+        source: Box<Error>,
+    },
+
     /// The vendor answered with a failure of its own.
     Vendor(VendorError),
 
@@ -351,6 +359,7 @@ impl fmt::Display for Error {
     /// Formats failures for diagnostics without including raw vendor or host-provided payloads.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Operation { source, .. } => source.fmt(formatter),
             Self::Vendor(error) => error.fmt(formatter),
             Self::NotSupported { capability } => write!(
                 formatter,
@@ -425,6 +434,7 @@ impl fmt::Debug for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Operation { source, .. } => Some(source.as_ref()),
             Self::Vendor(error) => Some(error),
             _ => None,
         }
@@ -449,6 +459,7 @@ impl Error {
     /// wrong, or about a link that is already gone.
     pub fn retryable(&self) -> bool {
         match self {
+            Self::Operation { source, .. } => source.retryable(),
             Self::Vendor(error) => error.retryable,
             _ => false,
         }
@@ -470,7 +481,8 @@ impl Error {
     /// use mango_external_agents::{Capability, Dispatch, Error};
     ///
     /// assert_eq!(
-    ///     Error::not_supported(Capability::Steering).dispatch(),
+    ///     Error::not_supported(Capability::Steering)
+    ///         .with_dispatch(Dispatch::NotSubmitted).dispatch(),
     ///     Dispatch::NotSubmitted,
     /// );
     /// assert_eq!(
@@ -480,26 +492,43 @@ impl Error {
     /// ```
     pub fn dispatch(&self) -> Dispatch {
         match self {
-            // Refused by this library before anything was written to a vendor.
-            Self::NotSupported { .. }
-            | Self::UnsupportedTransport { .. }
-            | Self::VersionGate { .. }
-            | Self::AuthRequired { .. }
-            | Self::Launch { .. }
-            | Self::HostConfiguration { .. } => Dispatch::NotSubmitted,
-            // The vendor answered, which means it read the request. `InvalidVendorValue` belongs
-            // here and not above it: it is the refusal of a value *the vendor wrote*, so by the
-            // time it is raised the request has been read and whatever it asked for may already be
-            // running. Replaying it would start a second one.
-            Self::Vendor(_) | Self::Protocol { .. } | Self::InvalidVendorValue { .. } => {
-                Dispatch::Accepted
-            }
-            // Something broke around the request, and nothing here knows which side of it.
-            Self::Link { .. }
-            | Self::LimitExceeded { .. }
-            | Self::Timeout { .. }
-            | Self::Cancelled { .. }
-            | Self::Closed { .. } => Dispatch::AcceptanceUnknown,
+            Self::Operation { dispatch, .. } => *dispatch,
+            // The same error category can occur before or after submission. Only the caller
+            // at that boundary can establish certainty; an unannotated error proves neither.
+            _ => Dispatch::AcceptanceUnknown,
+        }
+    }
+
+    /// Records dispatch certainty at the boundary that knows it, retaining the typed cause.
+    ///
+    /// Replaces a previous annotation so wrapping through several layers does not build a chain.
+    ///
+    /// ```
+    /// use mango_external_agents::{Dispatch, Error};
+    /// let error = Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted);
+    /// assert!(error.dispatch().is_safe_to_replay());
+    /// assert!(matches!(error.cause(), Error::Closed { .. }));
+    /// ```
+    #[must_use]
+    pub fn with_dispatch(self, dispatch: Dispatch) -> Self {
+        let source = match self {
+            Self::Operation { source, .. } => source,
+            source => Box::new(source),
+        };
+        Self::Operation { dispatch, source }
+    }
+
+    /// The original failure without dispatch annotations, for typed matching.
+    ///
+    /// ```
+    /// use mango_external_agents::{Dispatch, Error};
+    /// let error = Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted);
+    /// assert!(matches!(error.cause(), Error::Closed { subject: "session" }));
+    /// ```
+    pub fn cause(&self) -> &Self {
+        match self {
+            Self::Operation { source, .. } => source.cause(),
+            cause => cause,
         }
     }
 }
@@ -564,7 +593,7 @@ mod tests {
     /// dispatch are different questions: a vendor can say "try again" about a request it definitely
     /// received, and a broken link says nothing about whether the request arrived.
     #[test]
-    fn every_failure_says_how_far_its_request_got() {
+    fn failure_categories_do_not_establish_the_operation_stage() {
         let not_submitted = [
             Error::not_supported(Capability::Steering),
             Error::VersionGate {
@@ -586,10 +615,10 @@ mod tests {
         for error in not_submitted {
             assert_eq!(
                 error.dispatch(),
-                Dispatch::NotSubmitted,
-                "expected {error:?} to be safe to replay"
+                Dispatch::AcceptanceUnknown,
+                "expected {error:?} to need an operation-stage annotation"
             );
-            assert!(error.dispatch().is_safe_to_replay());
+            assert!(!error.dispatch().is_safe_to_replay());
         }
 
         let accepted = [
@@ -611,8 +640,8 @@ mod tests {
         for error in accepted {
             assert_eq!(
                 error.dispatch(),
-                Dispatch::Accepted,
-                "expected {error:?} to mean the vendor read the request"
+                Dispatch::AcceptanceUnknown,
+                "expected {error:?} to need an operation-stage annotation"
             );
             assert!(!error.dispatch().is_safe_to_replay());
         }

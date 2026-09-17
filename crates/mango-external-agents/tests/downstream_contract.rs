@@ -552,11 +552,14 @@ fn structured_content_keeps_its_identity_through_serialization() {
 #[test]
 fn a_failure_states_how_far_its_request_got_without_promising_idempotency() {
     assert_eq!(
-        Error::not_supported(mango_external_agents::Capability::Steering).dispatch(),
+        Error::not_supported(mango_external_agents::Capability::Steering)
+            .with_dispatch(Dispatch::NotSubmitted)
+            .dispatch(),
         Dispatch::NotSubmitted
     );
     assert!(
         Error::not_supported(mango_external_agents::Capability::Steering)
+            .with_dispatch(Dispatch::NotSubmitted)
             .dispatch()
             .is_safe_to_replay()
     );

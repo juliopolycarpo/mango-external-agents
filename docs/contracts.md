@@ -191,7 +191,9 @@ the attempt that replaced it — and no ordering of opaque strings would be righ
 before `attempt-2` lexicographically, which is the first shape a host naming its attempts would
 reach for. A host that also wants an opaque handle per attempt keeps one beside this.
 
-What a host needs before retrying is `Error::dispatch()`:
+Before retrying, read `Error::dispatch()`. Harnesses attach it with `with_dispatch` where the
+operation fails. An unannotated error returns `AcceptanceUnknown`; its variant alone cannot tell
+whether work was submitted. `Error::cause()` exposes the original typed error for matching.
 
 | Verdict             | Means                                       | Safe to replay       |
 | ------------------- | ------------------------------------------- | -------------------- |
