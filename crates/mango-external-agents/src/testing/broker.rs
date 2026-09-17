@@ -103,26 +103,30 @@ impl Clock for FrozenClock {
 #[cfg(test)]
 mod tests {
     use super::{FrozenClock, RecordingBroker};
-    use crate::event::ActivityKind;
+    use crate::event::{ActivityKind, SessionId};
     use crate::host::Clock;
+    use crate::interaction::{Interaction, InteractionId, InteractionKind};
     use crate::permission::{
-        BrokerDecision, PermissionBroker, PermissionOption, PermissionOptionKind, PermissionRequest,
+        BrokerDecision, PermissionBroker, PermissionEffect, PermissionOption, PermissionRequest,
+        PermissionScope,
     };
     use std::time::{Duration, SystemTime};
 
     fn request() -> PermissionRequest {
-        PermissionRequest {
-            id: String::from("req-1"),
-            kind: ActivityKind::Command,
-            title: String::from("Run `ls`"),
-            detail: None,
-            options: vec![PermissionOption::new(
-                "yes",
-                PermissionOptionKind::AllowOnce,
-            )],
-            expires_at: SystemTime::UNIX_EPOCH,
-            truncated: false,
-        }
+        PermissionRequest::new(
+            Interaction::new(
+                InteractionId::new("req-1"),
+                InteractionKind::Permission,
+                SessionId::new("chat-1"),
+                SystemTime::UNIX_EPOCH,
+            ),
+            ActivityKind::Command,
+            "Run `ls`",
+            vec![
+                PermissionOption::new("yes", PermissionEffect::Allow)
+                    .with_scope(PermissionScope::Once),
+            ],
+        )
     }
 
     #[tokio::test]
@@ -134,7 +138,7 @@ mod tests {
         let decision = broker.decide(&request()).await;
         assert!(matches!(decision, BrokerDecision::Deny { .. }));
         assert_eq!(broker.requests().len(), 1);
-        assert_eq!(broker.requests()[0].id, "req-1");
+        assert_eq!(broker.requests()[0].id().as_str(), "req-1");
     }
 
     #[test]

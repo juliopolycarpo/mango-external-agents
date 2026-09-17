@@ -10,8 +10,12 @@
 //! user to run the vendor's own login command.
 
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
-use crate::harness::Capabilities;
+use crate::configuration::ConfigurationCatalog;
+use crate::error::{Error, Result};
+use crate::harness::{CapabilityCeiling, DiscoveredCapabilities, HarnessDescriptor};
+use crate::identity::HarnessId;
 use crate::normalize::{self, MODEL_CATALOG_MAX_ITEMS, REASONING_EFFORT_MAX_ITEMS, TextLimit};
 use crate::permission::{PermissionMatrix, UnsupportedReason};
 
@@ -27,15 +31,25 @@ pub struct Discovery {
     /// Whether somebody is signed in, as far as a non-secret surface can say.
     pub auth: AuthState,
     /// What this build actually supports, which may be narrower than the harness's ceiling.
-    pub capabilities: Capabilities,
+    pub capabilities: DiscoveredCapabilities,
     /// Which permission configurations this installed build can run.
     ///
     /// A probe may narrow the harness declaration for account or policy facts it learned. The
     /// provided [`Harness::discover`](crate::Harness::discover) method clamps it back to that
     /// declaration before a host receives it.
+    ///
+    /// This is the **declared** matrix narrowed by whatever the probe could learn without opening
+    /// a session. A cell an account or an administrator policy removes only at open time still
+    /// reads as supported here; the refusal arrives from
+    /// [`open_session`](crate::Harness::open_session).
     pub permission_matrix: PermissionMatrix,
     /// The models the vendor advertises, when it enumerates them.
     pub models: Vec<Model>,
+    /// Everything else the vendor lets a session be configured with, when it enumerates them.
+    ///
+    /// Empty is "the vendor does not publish its settings", which is a different statement from a
+    /// catalog whose rows are all unsupported.
+    pub configuration_catalog: ConfigurationCatalog,
 }
 
 impl Discovery {
@@ -46,11 +60,12 @@ impl Discovery {
             version: None,
             gate: GateVerdict::NotInstalled,
             auth: AuthState::Unknown,
-            capabilities: Capabilities::none(),
+            capabilities: DiscoveredCapabilities::none(),
             permission_matrix: PermissionMatrix::none(UnsupportedReason::Other(String::from(
                 "the agent executable is not installed",
             ))),
             models: Vec::new(),
+            configuration_catalog: ConfigurationCatalog::empty(),
         }
     }
 
@@ -82,6 +97,7 @@ impl Discovery {
                 .filter_map(Model::normalized)
                 .take(MODEL_CATALOG_MAX_ITEMS)
                 .collect(),
+            configuration_catalog: self.configuration_catalog.normalized(),
             ..self
         }
     }
@@ -90,12 +106,162 @@ impl Discovery {
     #[must_use]
     pub fn bounded_by(
         mut self,
-        capability_ceiling: &Capabilities,
+        capability_ceiling: &CapabilityCeiling,
         declared_permissions: &PermissionMatrix,
     ) -> Self {
         self.capabilities = self.capabilities.clamped_to(capability_ceiling);
         self.permission_matrix = self.permission_matrix.bounded_by(declared_permissions);
         self
+    }
+}
+
+/// How long a host-vouched discovery stays usable when nobody says otherwise.
+pub const DISCOVERY_RECEIPT_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// A discovery a host already ran, offered back so opening a session need not run it again.
+///
+/// Probing costs process launches — up to six for one Claude Code open — and a host that has just
+/// drawn a picker from a probe has the answer in its hand. This is the seam that lets it say so.
+///
+/// It is **not** a cache. Nothing in this library stores one, looks one up, or reuses one across
+/// calls: the receipt travels on the [`OpenSession`](crate::OpenSession) that uses it and is
+/// forgotten afterwards. Deciding how fresh an answer has to be stays the host's decision, which
+/// is the same reason [`Harness::probe`](crate::Harness::probe) may not memoise.
+///
+/// What it carries beyond the discovery itself is identity: which harness this was a probe *of*,
+/// which executable, and opaque fingerprints of the executable and the environment it was probed
+/// under. A host that upgraded the CLI between the probe and the open has a receipt that no longer
+/// describes the file about to be launched, and [`DiscoveryReceipt::verify_for`] says so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DiscoveryReceipt {
+    /// Which harness this was a probe of.
+    pub harness: HarnessId,
+    /// What the probe found.
+    pub discovery: Discovery,
+    /// An opaque fingerprint of the executable the host probed, when it computed one.
+    ///
+    /// The library never computes or interprets it: a host that hashes the binary, reads its
+    /// mtime, or records its package version all produce something this type can compare for
+    /// equality, which is all it needs to.
+    pub executable_fingerprint: Option<String>,
+    /// An opaque fingerprint of the environment the probe ran under, when the host computed one.
+    pub environment_fingerprint: Option<String>,
+    /// When the probe ran.
+    pub observed_at: SystemTime,
+    /// How long after `observed_at` this receipt may still be used.
+    pub max_age: Duration,
+}
+
+impl DiscoveryReceipt {
+    /// A receipt for a probe that ran at `observed_at`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Discovery, DiscoveryReceipt, HarnessId};
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let now = SystemTime::now();
+    /// let receipt = DiscoveryReceipt::new(HarnessId::claude(), Discovery::not_installed(), now);
+    /// assert!(receipt.is_fresh(now));
+    /// assert!(!receipt.is_fresh(now + Duration::from_secs(3_600)));
+    /// ```
+    pub fn new(harness: HarnessId, discovery: Discovery, observed_at: SystemTime) -> Self {
+        Self {
+            harness,
+            discovery,
+            executable_fingerprint: None,
+            environment_fingerprint: None,
+            observed_at,
+            max_age: DISCOVERY_RECEIPT_MAX_AGE,
+        }
+    }
+
+    /// Records the host's own fingerprint of the executable it probed.
+    #[must_use]
+    pub fn with_executable_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.executable_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Records the host's own fingerprint of the environment the probe ran under.
+    #[must_use]
+    pub fn with_environment_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.environment_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Sets how long this receipt may be used for.
+    #[must_use]
+    pub fn valid_for(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// How old this receipt is at `now`.
+    ///
+    /// A clock that went backwards reads as age zero rather than as a negative interval, because
+    /// the failure worth preventing is a receipt that *looks* fresh forever — and an unsigned
+    /// duration cannot express the other direction anyway.
+    pub fn age(&self, now: SystemTime) -> Duration {
+        now.duration_since(self.observed_at).unwrap_or_default()
+    }
+
+    /// Whether this receipt is still inside its own freshness window.
+    pub fn is_fresh(&self, now: SystemTime) -> bool {
+        self.age(now) <= self.max_age
+    }
+
+    /// Refuses a receipt that does not describe the session about to be opened.
+    ///
+    /// Applied by [`Harness::validate_open_session`](crate::Harness::validate_open_session), so a
+    /// harness that accepts receipts gets the identity and freshness checks without writing them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HostConfiguration`] naming which of the three did not match: the harness it was a
+    /// probe of, the executable the session will launch, or its age.
+    pub fn verify_for(
+        &self,
+        descriptor: &HarnessDescriptor,
+        now: SystemTime,
+        request: &crate::OpenSession,
+    ) -> Result<()> {
+        if &self.harness != descriptor.id() {
+            return Err(Error::HostConfiguration {
+                expected: "a discovery receipt for the harness being opened",
+                received: format!(
+                    "a receipt for {}, opening {}",
+                    self.harness, descriptor.identity.id
+                ),
+            });
+        }
+        if !self.is_fresh(now) {
+            return Err(Error::HostConfiguration {
+                expected: "a discovery receipt inside its own freshness window",
+                received: format!(
+                    "one {}s old, valid for {}s",
+                    self.age(now).as_secs(),
+                    self.max_age.as_secs()
+                ),
+            });
+        }
+        let requested = request.executable.get();
+        let probed = self.discovery.executable.as_ref();
+        match (requested, probed) {
+            (Some(requested), Some(probed)) if requested != probed => {
+                Err(Error::HostConfiguration {
+                    expected: "a discovery receipt for the executable being launched",
+                    received: format!(
+                        "a receipt for {}, launching {}",
+                        probed.display(),
+                        requested.display()
+                    ),
+                })
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -311,8 +477,12 @@ impl ReasoningEffort {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthMode, AuthState, Discovery, GateVerdict, Model, ReasoningEffort};
-    use crate::harness::Capabilities;
+    use super::{
+        AuthMode, AuthState, Discovery, DiscoveryReceipt, GateVerdict, Model, ReasoningEffort,
+    };
+    use crate::configuration::ConfigurationCatalog;
+    use crate::harness::DiscoveredCapabilities;
+    use crate::identity::HarnessId;
     use crate::permission::{PermissionMatrix, UnsupportedReason};
 
     fn usable() -> Discovery {
@@ -323,9 +493,10 @@ mod tests {
             auth: AuthState::LoggedIn {
                 mode: AuthMode::Subscription,
             },
-            capabilities: Capabilities::none(),
+            capabilities: DiscoveredCapabilities::none(),
             permission_matrix: PermissionMatrix::none(UnsupportedReason::NotOfferedByVendor),
             models: Vec::new(),
+            configuration_catalog: ConfigurationCatalog::empty(),
         }
     }
 
@@ -334,7 +505,7 @@ mod tests {
         let discovery = Discovery::not_installed();
         assert_eq!(discovery.gate, GateVerdict::NotInstalled);
         assert_eq!(discovery.auth, AuthState::Unknown);
-        assert_eq!(discovery.capabilities, Capabilities::none());
+        assert_eq!(discovery.capabilities, DiscoveredCapabilities::none());
         assert_eq!(discovery.permission_matrix.cells().len(), 6);
         assert!(
             discovery.permission_matrix.cells().iter().all(|cell| {
@@ -535,5 +706,102 @@ mod tests {
                 .map(|name| name.chars().count()),
             Some(256)
         );
+    }
+
+    fn descriptor() -> crate::harness::HarnessDescriptor {
+        crate::harness::HarnessDescriptor {
+            identity: crate::identity::HarnessIdentity::claude(),
+            vendor: crate::harness::VendorInfo {
+                company: "Anthropic",
+                terms_url: "https://www.anthropic.com/legal/consumer-terms",
+                privacy_url: "https://www.anthropic.com/legal/privacy",
+                skills_are_slash_commands: true,
+            },
+            capabilities: crate::harness::CapabilityCeiling::none(),
+            transports: &[crate::transport::TransportKind::Stdio],
+            vendor_environment_keys: &[],
+        }
+    }
+
+    /// A receipt is a seam, not a cache: it says which probe, of what, and when, and every one of
+    /// those is checked against the session about to be opened.
+    #[test]
+    fn a_fresh_receipt_for_the_same_harness_and_executable_is_accepted() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
+            .with_executable_fingerprint("sha256:abc")
+            .with_environment_fingerprint("env-1");
+
+        assert_eq!(receipt.age(now), std::time::Duration::ZERO);
+        assert!(receipt.is_fresh(now));
+        receipt
+            .verify_for(
+                &descriptor(),
+                now + std::time::Duration::from_secs(10),
+                &crate::OpenSession::new("chat-1").with_executable(
+                    crate::transport::ExecutablePath::resolved("/usr/local/bin/claude"),
+                ),
+            )
+            .expect("expected a fresh matching receipt to be accepted");
+    }
+
+    /// A host that upgraded the CLI between the probe and the open has a receipt that no longer
+    /// describes the file about to be launched.
+    #[test]
+    fn a_receipt_for_another_executable_is_refused_by_name() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let error = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
+            .verify_for(
+                &descriptor(),
+                now,
+                &crate::OpenSession::new("chat-1").with_executable(
+                    crate::transport::ExecutablePath::resolved("/opt/claude/bin/claude"),
+                ),
+            )
+            .expect_err("expected a refusal");
+        assert!(
+            error.to_string().contains("/opt/claude/bin/claude"),
+            "expected the executable being launched in the diagnostic, received {error}"
+        );
+    }
+
+    #[test]
+    fn a_receipt_for_another_harness_is_refused_by_name() {
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        let error = DiscoveryReceipt::new(HarnessId::codex(), usable(), now)
+            .verify_for(&descriptor(), now, &crate::OpenSession::new("chat-1"))
+            .expect_err("expected a refusal");
+        assert!(
+            error.to_string().contains("a receipt for codex"),
+            "expected both harness ids in the diagnostic, received {error}"
+        );
+    }
+
+    #[test]
+    fn a_stale_receipt_is_refused_with_its_own_age_and_window() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
+            .valid_for(std::time::Duration::from_secs(60));
+        let later = now + std::time::Duration::from_secs(61);
+
+        assert!(!receipt.is_fresh(later));
+        let error = receipt
+            .verify_for(&descriptor(), later, &crate::OpenSession::new("chat-1"))
+            .expect_err("expected a refusal");
+        assert!(
+            error.to_string().contains("61s old, valid for 60s"),
+            "expected the age and the window in the diagnostic, received {error}"
+        );
+    }
+
+    /// A clock that went backwards must not make a receipt look fresh forever.
+    #[test]
+    fn a_clock_that_went_backwards_reads_as_age_zero_rather_than_as_eternal_freshness() {
+        let observed = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), usable(), observed);
+        let earlier = std::time::SystemTime::UNIX_EPOCH;
+
+        assert_eq!(receipt.age(earlier), std::time::Duration::ZERO);
+        assert!(receipt.is_fresh(earlier));
     }
 }

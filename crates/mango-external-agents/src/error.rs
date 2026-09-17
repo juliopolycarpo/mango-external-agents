@@ -9,7 +9,9 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::Duration;
 
-use crate::harness::{Capability, HarnessKind};
+use crate::harness::Capability;
+use crate::identity::HarnessId;
+use crate::operation::Dispatch;
 use crate::redact;
 use crate::transport::TransportKind;
 
@@ -197,7 +199,7 @@ pub enum Error {
     /// without touching the machine.
     UnsupportedTransport {
         /// The harness that was asked.
-        harness: HarnessKind,
+        harness: HarnessId,
         /// The transport kind it does not speak.
         transport: TransportKind,
     },
@@ -451,6 +453,51 @@ impl Error {
             _ => false,
         }
     }
+
+    /// How far the request that produced this failure got.
+    ///
+    /// The question a bare `Result` cannot answer and a host has to before it retries: a refusal
+    /// this library raised before writing anything is safe to replay, and a link that broke after
+    /// the request went out is not. See [`Dispatch`] for why "probably did not arrive" is the
+    /// reading that runs a turn twice.
+    ///
+    /// This says nothing about whether the *vendor* deduplicates a replay. It does not, unless it
+    /// documents that it does, and no identity this library mints changes that.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Capability, Dispatch, Error};
+    ///
+    /// assert_eq!(
+    ///     Error::not_supported(Capability::Steering).dispatch(),
+    ///     Dispatch::NotSubmitted,
+    /// );
+    /// assert_eq!(
+    ///     Error::Closed { subject: "link" }.dispatch(),
+    ///     Dispatch::AcceptanceUnknown,
+    /// );
+    /// ```
+    pub fn dispatch(&self) -> Dispatch {
+        match self {
+            // Refused by this library before anything was written to a vendor.
+            Self::NotSupported { .. }
+            | Self::UnsupportedTransport { .. }
+            | Self::VersionGate { .. }
+            | Self::AuthRequired { .. }
+            | Self::Launch { .. }
+            | Self::HostConfiguration { .. }
+            | Self::InvalidVendorValue { .. } => Dispatch::NotSubmitted,
+            // The vendor answered, which means it read the request.
+            Self::Vendor(_) | Self::Protocol { .. } => Dispatch::Accepted,
+            // Something broke around the request, and nothing here knows which side of it.
+            Self::Link { .. }
+            | Self::LimitExceeded { .. }
+            | Self::Timeout { .. }
+            | Self::Cancelled { .. }
+            | Self::Closed { .. } => Dispatch::AcceptanceUnknown,
+        }
+    }
 }
 
 /// Whether a JSON-RPC code is worth a second attempt.
@@ -477,6 +524,7 @@ mod tests {
 
     use super::{CODE_MAX_LENGTH, Error, ErrorCode, VendorError, jsonrpc_code_is_retryable};
     use crate::harness::Capability;
+    use crate::operation::Dispatch;
 
     #[test]
     fn reserved_jsonrpc_codes_are_not_retryable() {
@@ -506,6 +554,81 @@ mod tests {
         );
         assert!(vendor.retryable());
         assert!(!Error::not_supported(Capability::Steering).retryable());
+    }
+
+    /// The three answers a host has to tell apart before it replays anything. Retryability and
+    /// dispatch are different questions: a vendor can say "try again" about a request it definitely
+    /// received, and a broken link says nothing about whether the request arrived.
+    #[test]
+    fn every_failure_says_how_far_its_request_got() {
+        let not_submitted = [
+            Error::not_supported(Capability::Steering),
+            Error::VersionGate {
+                found: String::from("1.0.0"),
+                minimum: String::from("2.0.0"),
+            },
+            Error::AuthRequired {
+                login_hint: String::from("claude login"),
+            },
+            Error::Launch {
+                program: String::from("claude"),
+                message: String::from("not found"),
+            },
+            Error::HostConfiguration {
+                expected: "a cwd",
+                received: String::from("none"),
+            },
+        ];
+        for error in not_submitted {
+            assert_eq!(
+                error.dispatch(),
+                Dispatch::NotSubmitted,
+                "expected {error:?} to be safe to replay"
+            );
+            assert!(error.dispatch().is_safe_to_replay());
+        }
+
+        let accepted = Error::Vendor(VendorError::new(
+            ErrorCode::from_static("codex-busy"),
+            "busy",
+        ));
+        assert_eq!(accepted.dispatch(), Dispatch::Accepted);
+        assert!(!accepted.dispatch().is_safe_to_replay());
+
+        let unknown = [
+            Error::Closed { subject: "link" },
+            Error::Timeout {
+                operation: String::from("turn/start"),
+                after: std::time::Duration::from_secs(1),
+            },
+            Error::Link {
+                peer: String::from("Codex app-server"),
+                message: String::from("broken pipe"),
+            },
+        ];
+        for error in unknown {
+            assert_eq!(
+                error.dispatch(),
+                Dispatch::AcceptanceUnknown,
+                "expected {error:?} to need reconciliation"
+            );
+            assert!(error.dispatch().needs_reconciliation());
+            assert!(!error.dispatch().is_safe_to_replay());
+        }
+    }
+
+    /// A vendor saying "retry" is not a vendor saying "this never happened".
+    #[test]
+    fn retryability_and_dispatch_certainty_are_different_questions() {
+        let retryable = Error::Vendor(
+            VendorError::new(ErrorCode::from_static("codex-busy"), "busy")
+                .with_vendor_code("-31000", true),
+        );
+        assert!(retryable.retryable());
+        assert!(
+            !retryable.dispatch().is_safe_to_replay(),
+            "expected a vendor-acknowledged failure not to read as never-dispatched"
+        );
     }
 
     #[test]

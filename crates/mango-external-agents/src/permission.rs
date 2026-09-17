@@ -15,6 +15,7 @@ use std::time::SystemTime;
 
 use crate::error::{Error, Result};
 use crate::event::ActivityKind;
+use crate::interaction::{Interaction, InteractionId};
 use crate::normalize::{self, APPROVAL_MAX_OPTIONS, TextLimit};
 
 /// What the agent is allowed to do. One of the two axes.
@@ -368,59 +369,171 @@ impl UnsupportedReason {
     }
 }
 
-/// What one approval option means, whoever the vendor is.
+/// What choosing an option does to the request in front of it.
 ///
-/// Without this a broker would be undecidable: "allow" has to become one of the vendor's own
-/// option ids, and the vendor's label is text in whatever language it chose. Every dialect the
-/// library drives supplies the distinction — Codex's approved/denied/abort, ACP's
-/// allow-once/reject-once and their always variants — so a harness maps it rather than guessing.
+/// One axis only. How *far* the choice reaches is [`PermissionScope`], and whether it rewrites a
+/// standing policy is [`PermissionOption::policy_changing`] — three separate facts, because
+/// "always" collapsed all three into one word and a host reading it could not tell an
+/// allow-for-this-turn from a rule written into the vendor's configuration file.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
-pub enum PermissionOptionKind {
-    /// Allow this one thing.
-    AllowOnce,
-    /// Allow this and anything like it for the rest of the session.
-    AllowAlways,
-    /// Refuse this one thing; the turn goes on.
-    RejectOnce,
-    /// Refuse this and anything like it for the rest of the session.
-    RejectAlways,
+pub enum PermissionEffect {
+    /// The agent may proceed.
+    Allow,
+    /// The agent may not; the turn goes on.
+    Reject,
     /// Something else the vendor offered, which only a person can weigh.
     Other,
 }
 
-impl PermissionOptionKind {
+impl PermissionEffect {
     /// Whether choosing this lets the agent proceed.
     pub const fn allows(self) -> bool {
-        matches!(self, Self::AllowOnce | Self::AllowAlways)
+        matches!(self, Self::Allow)
     }
 
     /// Whether choosing this refuses.
     pub const fn rejects(self) -> bool {
-        matches!(self, Self::RejectOnce | Self::RejectAlways)
+        matches!(self, Self::Reject)
+    }
+}
+
+impl fmt::Display for PermissionEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allow => "allow",
+            Self::Reject => "reject",
+            Self::Other => "other",
+        })
+    }
+}
+
+/// How far a choice reaches.
+///
+/// Ordered from narrowest to widest, and the order is load-bearing: every automatic preference in
+/// this module picks the smallest scope that does the job, because a wider grant is a decision
+/// about requests nobody has seen yet.
+///
+/// Reported only where the vendor actually exposes it. A harness that cannot tell a session-wide
+/// choice from a persistent one leaves the scope absent rather than guessing the narrower reading,
+/// which would understate what a person is about to agree to.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum PermissionScope {
+    /// This request and nothing else.
+    Once,
+    /// Anything like it for the rest of this turn.
+    Turn,
+    /// Anything like it for the rest of this session.
+    Session,
+    /// Anything like it from now on, including sessions nobody has opened yet.
+    Persistent,
+}
+
+impl PermissionScope {
+    /// Every scope, narrowest first.
+    pub const ALL: [Self; 4] = [Self::Once, Self::Turn, Self::Session, Self::Persistent];
+
+    /// Whether this choice outlives the request that prompted it.
+    pub const fn is_standing(self) -> bool {
+        !matches!(self, Self::Once)
+    }
+
+    /// Whether this choice outlives the session that prompted it.
+    pub const fn outlives_session(self) -> bool {
+        matches!(self, Self::Persistent)
+    }
+}
+
+impl fmt::Display for PermissionScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Once => "once",
+            Self::Turn => "this turn",
+            Self::Session => "this session",
+            Self::Persistent => "from now on",
+        })
+    }
+}
+
+/// What the vendor said about how risky a choice is.
+///
+/// Reported, never derived. A library that decided for itself which shell command is destructive
+/// would be wrong in both directions, and the direction that matters is the one where it labels a
+/// `rm -rf` safe.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum PermissionRisk {
+    /// The vendor did not say.
+    #[default]
+    Unspecified,
+    /// The vendor marked it as changing nothing that cannot be undone.
+    Reversible,
+    /// The vendor marked it destructive.
+    Destructive,
+}
+
+impl fmt::Display for PermissionRisk {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unspecified => "unspecified",
+            Self::Reversible => "reversible",
+            Self::Destructive => "destructive",
+        })
     }
 }
 
 /// One choice the vendor offered.
 ///
 /// The option set is passed through untouched: the library never adds, removes, reorders or
-/// renames a choice.
+/// renames a choice. What it does add is the three facts a policy needs in order to answer without
+/// reading a label written in a language it does not know — [`PermissionEffect`],
+/// [`PermissionScope`] and [`PermissionOption::policy_changing`].
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct PermissionOption {
     /// The vendor's own id, echoed back verbatim when this option is chosen.
     pub id: String,
-    /// What it means, so a policy can answer without reading a label.
-    pub kind: PermissionOptionKind,
+    /// What choosing it does.
+    pub effect: PermissionEffect,
+    /// How far it reaches, when the vendor exposes that.
+    ///
+    /// Absent means the vendor did not say. It does not mean [`PermissionScope::Once`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<PermissionScope>,
+    /// Whether choosing it writes a rule the vendor will apply to later requests on its own.
+    ///
+    /// Separate from [`PermissionScope`] because the two come apart: a vendor can offer a
+    /// session-wide allow that it forgets on exit, and a once-only allow that it records in a
+    /// settings file. A host showing "just this once" over the second one would be wrong.
+    #[serde(default)]
+    pub policy_changing: bool,
+    /// What the vendor said about the risk of choosing it.
+    #[serde(default)]
+    pub risk: PermissionRisk,
     /// The vendor's own label, when it supplied one. Rendered as plain text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Whether the vendor marked this choice destructive.
-    #[serde(default)]
-    pub destructive: bool,
 }
 
 impl fmt::Debug for PermissionOption {
@@ -428,21 +541,25 @@ impl fmt::Debug for PermissionOption {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PermissionOption")
-            .field("kind", &self.kind)
+            .field("effect", &self.effect)
+            .field("scope", &self.scope)
+            .field("policy_changing", &self.policy_changing)
             .field("has_label", &self.label.is_some())
-            .field("destructive", &self.destructive)
+            .field("risk", &self.risk)
             .finish()
     }
 }
 
 impl PermissionOption {
-    /// An option with no label.
-    pub fn new(id: impl Into<String>, kind: PermissionOptionKind) -> Self {
+    /// An option with no label, no declared scope and no declared risk.
+    pub fn new(id: impl Into<String>, effect: PermissionEffect) -> Self {
         Self {
             id: id.into(),
-            kind,
+            effect,
+            scope: None,
+            policy_changing: false,
+            risk: PermissionRisk::Unspecified,
             label: None,
-            destructive: false,
         }
     }
 
@@ -453,20 +570,88 @@ impl PermissionOption {
         self
     }
 
-    /// Marks the option destructive.
+    /// Records how far this choice reaches.
     #[must_use]
-    pub fn destructive(mut self) -> Self {
-        self.destructive = true;
+    pub fn with_scope(mut self, scope: PermissionScope) -> Self {
+        self.scope = Some(scope);
         self
+    }
+
+    /// Records what the vendor said about the risk.
+    #[must_use]
+    pub fn with_risk(mut self, risk: PermissionRisk) -> Self {
+        self.risk = risk;
+        self
+    }
+
+    /// Records that choosing this writes a standing rule.
+    #[must_use]
+    pub fn policy_changing(mut self) -> Self {
+        self.policy_changing = true;
+        self
+    }
+
+    /// Whether choosing this lets the agent proceed.
+    pub const fn allows(&self) -> bool {
+        self.effect.allows()
+    }
+
+    /// Whether choosing this refuses.
+    pub const fn rejects(&self) -> bool {
+        self.effect.rejects()
+    }
+
+    /// Whether the vendor marked it destructive.
+    pub const fn is_destructive(&self) -> bool {
+        matches!(self.risk, PermissionRisk::Destructive)
+    }
+
+    /// Whether choosing this decides anything beyond the request in front of it.
+    ///
+    /// True for a scope wider than [`PermissionScope::Once`] and for anything that writes a
+    /// standing rule. An option whose scope the vendor did not state is **not** treated as narrow:
+    /// an unstated reach is a reach nobody measured.
+    pub const fn is_standing(&self) -> bool {
+        if self.policy_changing {
+            return true;
+        }
+        match self.scope {
+            Some(scope) => scope.is_standing(),
+            None => false,
+        }
+    }
+
+    /// How wide this option is, for preferring the narrowest that does the job.
+    ///
+    /// An option with no stated scope sorts after every stated one: a policy choosing
+    /// automatically should reach for the choice whose reach is known.
+    fn breadth(&self) -> (u8, u8) {
+        let scope = match self.scope {
+            Some(PermissionScope::Once) => 0,
+            Some(PermissionScope::Turn) => 1,
+            Some(PermissionScope::Session) => 2,
+            Some(PermissionScope::Persistent) => 3,
+            None => 4,
+        };
+        (scope, u8::from(self.policy_changing))
     }
 }
 
 /// The vendor is asking whether it may do something.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct PermissionRequest {
-    /// The vendor's own id for this question, echoed back with the answer.
-    pub id: String,
+    /// The lifecycle fields: id, kind, session, turn, deadline, status.
+    ///
+    /// Shared with [`QuestionRequest`](crate::QuestionRequest) so a host holds one map of what it
+    /// is waiting on. [`InteractionKind::Permission`](crate::InteractionKind) is what marks this
+    /// one as the kind whose answer grants authority.
+    ///
+    /// The host and harness share the deadline it carries. Harnesses use the core's
+    /// [`ApprovalDeadline`](crate::approval::ApprovalDeadline) to bound broker deliberation and
+    /// host response time, resolving unanswered requests with [`DecisionSource::Expired`].
+    pub interaction: Interaction,
     /// What kind of thing is being asked about.
     pub kind: ActivityKind,
     /// A one-line summary of what it wants to do.
@@ -476,12 +661,6 @@ pub struct PermissionRequest {
     pub detail: Option<String>,
     /// The choices, exactly as the vendor offered them.
     pub options: Vec<PermissionOption>,
-    /// When this question stops being answerable.
-    ///
-    /// The host and harness share this deadline. Harnesses use the core's
-    /// [`ApprovalDeadline`](crate::approval::ApprovalDeadline) to bound broker deliberation and
-    /// host response time, resolving unanswered requests with [`DecisionSource::Expired`].
-    pub expires_at: SystemTime,
     /// True when any field above was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
@@ -496,17 +675,51 @@ impl fmt::Debug for PermissionRequest {
             .field("has_title", &!self.title.is_empty())
             .field("has_detail", &self.detail.is_some())
             .field("option_count", &self.options.len())
-            .field("expires_at", &self.expires_at)
+            .field("expires_at", &self.interaction.expires_at)
             .field("truncated", &self.truncated)
             .finish()
     }
 }
 
 impl PermissionRequest {
+    /// The vendor is asking about this, with these choices.
+    pub fn new(
+        interaction: Interaction,
+        kind: ActivityKind,
+        title: impl Into<String>,
+        options: Vec<PermissionOption>,
+    ) -> Self {
+        Self {
+            interaction,
+            kind,
+            title: title.into(),
+            detail: None,
+            options,
+            truncated: false,
+        }
+    }
+
+    /// Carries the specifics: the command, the diff, the server and tool.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// The vendor's own id for this question.
+    pub fn id(&self) -> &InteractionId {
+        &self.interaction.id
+    }
+
+    /// When this question stops being answerable.
+    pub fn expires_at(&self) -> SystemTime {
+        self.interaction.expires_at
+    }
+
     /// The answer that lets the vendor proceed.
     ///
-    /// Prefers the narrow choice: a one-time allow over a standing one, because a standing grant
-    /// is a decision about every future request and not just this one.
+    /// Prefers the narrowest reach: a one-time allow over a session-wide one over anything that
+    /// writes a standing rule, because a wider grant decides requests nobody has seen yet.
     ///
     /// The source is [`DecisionSource::User`], the common case for a host rendering a prompt; a
     /// policy answering on its own marks the response with
@@ -517,26 +730,18 @@ impl PermissionRequest {
     /// [`Error::Protocol`] when the vendor offered no option that allows. A host facing this has
     /// to ask a person, because there is nothing to answer with.
     pub fn allow(&self) -> Result<PermissionResponse> {
-        self.respond_with(
-            PermissionOptionKind::AllowOnce,
-            PermissionOptionKind::AllowAlways,
-            "an option that allows",
-        )
+        self.narrowest(PermissionEffect::Allow, "an option that allows")
     }
 
     /// The answer that refuses.
     ///
-    /// Prefers the narrow choice, for the same reason as [`PermissionRequest::allow`].
+    /// Prefers the narrowest reach, for the same reason as [`PermissionRequest::allow`].
     ///
     /// # Errors
     ///
     /// [`Error::Protocol`] when the vendor offered no option that refuses.
     pub fn deny(&self) -> Result<PermissionResponse> {
-        self.respond_with(
-            PermissionOptionKind::RejectOnce,
-            PermissionOptionKind::RejectAlways,
-            "an option that refuses",
-        )
+        self.narrowest(PermissionEffect::Reject, "an option that refuses")
     }
 
     /// The answer naming one of this request's own options.
@@ -546,8 +751,11 @@ impl PermissionRequest {
     /// [`Error::Protocol`] when `option_id` is not one of the options the vendor offered. A host
     /// cannot invent a choice: the vendor would refuse it, or worse, accept a different one.
     pub fn respond(&self, option_id: &str, source: DecisionSource) -> Result<PermissionResponse> {
-        if !self.options.iter().any(|option| option.id == option_id) {
-            return Err(Error::Protocol {
+        let chosen = self
+            .options
+            .iter()
+            .find(|option| option.id == option_id)
+            .ok_or_else(|| Error::Protocol {
                 // The count, never the ids: an option id is the vendor's own string, and
                 // `Display` writes this shape verbatim. A host that wants the ids reads
                 // `option_ids` off the request it already holds.
@@ -556,16 +764,15 @@ impl PermissionRequest {
                     self.option_ids().len()
                 ),
                 received: option_id.to_owned(),
-            });
-        }
-        Ok(PermissionResponse {
-            request_id: self.id.clone(),
-            option_id: option_id.to_owned(),
-            source,
-        })
+            })?;
+        Ok(self.answer(chosen, source))
     }
 
     /// This request with every vendor-supplied value bounded.
+    ///
+    /// Scope, risk and the policy-changing flag are carried through untouched: they are what a
+    /// host renders and audits, and normalisation that widened or dropped one would understate
+    /// what a person is agreeing to.
     ///
     /// # Errors
     ///
@@ -605,19 +812,17 @@ impl PermissionRequest {
             options_truncated |= label.as_ref().is_some_and(|label| label.truncated);
             options.push(PermissionOption {
                 id: normalize::opaque_id(&option.id, "approval option id")?,
-                kind: option.kind,
                 label: label.map(|label| label.text),
-                destructive: option.destructive,
+                ..option
             });
         }
 
         Ok(Self {
-            id: normalize::opaque_id(&self.id, "approval request id")?,
+            interaction: self.interaction.normalized()?,
             kind: self.kind,
             title: title.text,
             detail: detail.map(|detail| detail.text),
             options,
-            expires_at: self.expires_at,
             truncated: self.truncated || title.truncated || detail_truncated || options_truncated,
         })
     }
@@ -629,34 +834,34 @@ impl PermissionRequest {
             .collect()
     }
 
-    /// The narrow choice when the vendor offered one, the standing choice otherwise.
+    /// The narrowest option with this effect.
     ///
     /// A standing grant is a decision about every future request and not just this one, so it is
-    /// never preferred over a one-time answer that says exactly as much as it means.
-    fn respond_with(
-        &self,
-        narrow: PermissionOptionKind,
-        standing: PermissionOptionKind,
-        expected: &str,
-    ) -> Result<PermissionResponse> {
+    /// never preferred over an answer that says exactly as much as it means.
+    fn narrowest(&self, effect: PermissionEffect, expected: &str) -> Result<PermissionResponse> {
         let chosen = self
             .options
             .iter()
-            .find(|option| option.kind == narrow)
-            .or_else(|| self.options.iter().find(|option| option.kind == standing))
+            .filter(|option| option.effect == effect)
+            .min_by_key(|option| option.breadth())
             .ok_or_else(|| Error::Protocol {
                 expected: expected.to_owned(),
-                received: format!("{:?}", self.option_kinds()),
+                received: format!("{:?}", self.option_effects()),
             })?;
-        Ok(PermissionResponse {
-            request_id: self.id.clone(),
-            option_id: chosen.id.clone(),
-            source: DecisionSource::User,
-        })
+        Ok(self.answer(chosen, DecisionSource::User))
     }
 
-    fn option_kinds(&self) -> Vec<PermissionOptionKind> {
-        self.options.iter().map(|option| option.kind).collect()
+    /// The response naming one option, carrying the reach it was chosen with.
+    fn answer(&self, option: &PermissionOption, source: DecisionSource) -> PermissionResponse {
+        PermissionResponse {
+            interaction_id: self.interaction.id.clone(),
+            option_id: option.id.clone(),
+            source,
+        }
+    }
+
+    fn option_effects(&self) -> Vec<PermissionEffect> {
+        self.options.iter().map(|option| option.effect).collect()
     }
 }
 
@@ -680,9 +885,10 @@ pub enum DecisionSource {
 /// The answer to one approval.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct PermissionResponse {
     /// Which question this answers.
-    pub request_id: String,
+    pub interaction_id: InteractionId,
     /// Which of its options was chosen, by the vendor's own id.
     pub option_id: String,
     /// How the answer was reached.
@@ -703,9 +909,9 @@ impl fmt::Debug for PermissionResponse {
 
 impl PermissionResponse {
     /// Records that a person chose this option.
-    pub fn from_user(request_id: impl Into<String>, option_id: impl Into<String>) -> Self {
+    pub fn from_user(interaction_id: InteractionId, option_id: impl Into<String>) -> Self {
         Self {
-            request_id: request_id.into(),
+            interaction_id,
             option_id: option_id.into(),
             source: DecisionSource::User,
         }
@@ -723,11 +929,24 @@ impl PermissionResponse {
 }
 
 /// What was decided, once it was.
+///
+/// Carries the reach of the option that won, not just its id. A host's audit trail that recorded
+/// only "option `allow_always` was chosen" would have to ask the vendor what that meant, and the
+/// request it meant it about is gone by then.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ApprovalDecision {
     /// Which option won.
     pub option_id: String,
+    /// What it did.
+    pub effect: PermissionEffect,
+    /// How far it reached, when the vendor exposed that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<PermissionScope>,
+    /// Whether it wrote a rule the vendor will apply on its own from now on.
+    #[serde(default)]
+    pub policy_changing: bool,
     /// How it was reached.
     pub source: DecisionSource,
 }
@@ -740,6 +959,47 @@ impl fmt::Debug for ApprovalDecision {
             .field("has_option_id", &true)
             .field("source", &self.source)
             .finish()
+    }
+}
+
+impl ApprovalDecision {
+    /// What a chosen option decided.
+    ///
+    /// Built from the option rather than from its id, so the reach a host audits is the reach the
+    /// vendor declared and not one anybody re-derived from a label.
+    pub fn from_option(option: &PermissionOption, source: DecisionSource) -> Self {
+        Self {
+            option_id: option.id.clone(),
+            effect: option.effect,
+            scope: option.scope,
+            policy_changing: option.policy_changing,
+            source,
+        }
+    }
+
+    /// A decision about an option this harness could not describe any further.
+    ///
+    /// For the paths that resolve a request without anyone choosing — an expiry, a cancelled turn
+    /// — where there is no option to read a reach from.
+    pub fn unresolved(option_id: impl Into<String>, source: DecisionSource) -> Self {
+        Self {
+            option_id: option_id.into(),
+            effect: PermissionEffect::Other,
+            scope: None,
+            policy_changing: false,
+            source,
+        }
+    }
+
+    /// Whether this decision reaches past the request that prompted it.
+    pub const fn is_standing(&self) -> bool {
+        if self.policy_changing {
+            return true;
+        }
+        match self.scope {
+            Some(scope) => scope.is_standing(),
+            None => false,
+        }
     }
 }
 
@@ -802,12 +1062,14 @@ pub async fn broker_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalRouting, BrokerDecision, ConfigurationVerdict, DecisionSource, PermissionBroker,
-        PermissionLevel, PermissionMatrix, PermissionOption, PermissionOptionKind,
-        PermissionRequest, PermissionResponse, UnsupportedReason, broker_response,
+        ApprovalDecision, ApprovalRouting, BrokerDecision, ConfigurationVerdict, DecisionSource,
+        PermissionBroker, PermissionEffect, PermissionLevel, PermissionMatrix, PermissionOption,
+        PermissionRequest, PermissionResponse, PermissionRisk, PermissionScope, UnsupportedReason,
+        broker_response,
     };
     use crate::error::Error;
-    use crate::event::ActivityKind;
+    use crate::event::{ActivityKind, SessionId};
+    use crate::interaction::{Interaction, InteractionId, InteractionKind};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
@@ -824,15 +1086,17 @@ mod tests {
     }
 
     fn request(options: Vec<PermissionOption>) -> PermissionRequest {
-        PermissionRequest {
-            id: String::from("req-1"),
-            kind: ActivityKind::Command,
-            title: String::from("Run `rm -rf build`"),
-            detail: None,
+        PermissionRequest::new(
+            Interaction::new(
+                InteractionId::new("req-1"),
+                InteractionKind::Permission,
+                SessionId::new("chat-1"),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            ),
+            ActivityKind::Command,
+            "Run `rm -rf build`",
             options,
-            expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            truncated: false,
-        }
+        )
     }
 
     /// `Error::Protocol` writes its expected shape verbatim, so this one counts rather than lists.
@@ -843,8 +1107,10 @@ mod tests {
     #[test]
     fn an_unoffered_answer_counts_the_options_rather_than_naming_them() {
         let request = request(vec![
-            PermissionOption::new("option-id-secret", PermissionOptionKind::AllowOnce),
-            PermissionOption::new("other-id-secret", PermissionOptionKind::RejectOnce),
+            PermissionOption::new("option-id-secret", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once),
+            PermissionOption::new("other-id-secret", PermissionEffect::Reject)
+                .with_scope(PermissionScope::Once),
         ]);
 
         let error = request
@@ -866,19 +1132,26 @@ mod tests {
 
     #[test]
     fn question_and_answer_debug_omit_vendor_and_host_text() {
-        let question = PermissionRequest {
-            id: String::from("question-id-secret"),
-            kind: ActivityKind::Command,
-            title: String::from("question-title-secret"),
-            detail: Some(String::from("question-detail-secret")),
-            options: vec![
-                PermissionOption::new("option-id-secret", PermissionOptionKind::AllowOnce)
+        let question = PermissionRequest::new(
+            Interaction::new(
+                InteractionId::new("question-id-secret"),
+                InteractionKind::Permission,
+                SessionId::new("session-id-secret"),
+                SystemTime::UNIX_EPOCH,
+            ),
+            ActivityKind::Command,
+            "question-title-secret",
+            vec![
+                PermissionOption::new("option-id-secret", PermissionEffect::Allow)
+                    .with_scope(PermissionScope::Once)
                     .with_label("option-label-secret"),
             ],
-            expires_at: SystemTime::UNIX_EPOCH,
-            truncated: false,
-        };
-        let answer = PermissionResponse::from_user("question-id-secret", "option-id-secret");
+        )
+        .with_detail("question-detail-secret");
+        let answer = PermissionResponse::from_user(
+            InteractionId::new("question-id-secret"),
+            "option-id-secret",
+        );
         let decision = BrokerDecision::Deny {
             reason: String::from("broker-reason-secret"),
         };
@@ -906,10 +1179,13 @@ mod tests {
 
     fn four_options() -> Vec<PermissionOption> {
         vec![
-            PermissionOption::new("always", PermissionOptionKind::AllowAlways),
-            PermissionOption::new("once", PermissionOptionKind::AllowOnce),
-            PermissionOption::new("never", PermissionOptionKind::RejectAlways),
-            PermissionOption::new("no", PermissionOptionKind::RejectOnce),
+            PermissionOption::new("always", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Session),
+            PermissionOption::new("once", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once),
+            PermissionOption::new("never", PermissionEffect::Reject)
+                .with_scope(PermissionScope::Session),
+            PermissionOption::new("no", PermissionEffect::Reject).with_scope(PermissionScope::Once),
         ]
     }
 
@@ -1056,8 +1332,10 @@ mod tests {
     #[test]
     fn allow_falls_back_to_the_standing_choice_when_it_is_the_only_one() {
         let request = request(vec![
-            PermissionOption::new("always", PermissionOptionKind::AllowAlways),
-            PermissionOption::new("never", PermissionOptionKind::RejectAlways),
+            PermissionOption::new("always", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Session),
+            PermissionOption::new("never", PermissionEffect::Reject)
+                .with_scope(PermissionScope::Session),
         ]);
 
         assert_eq!(
@@ -1067,11 +1345,74 @@ mod tests {
         assert_eq!(request.deny().expect("expected a deny").option_id, "never");
     }
 
+    /// Four scopes, not two. A turn-wide allow is narrower than a session-wide one and wider than
+    /// a one-time one, and the old two-way "always" could not say either thing.
+    #[test]
+    fn the_narrowest_reach_wins_across_all_four_scopes() {
+        let request = request(vec![
+            PermissionOption::new("forever", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Persistent),
+            PermissionOption::new("session", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Session),
+            PermissionOption::new("turn", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Turn),
+        ]);
+
+        assert_eq!(
+            request.allow().expect("expected an allow").option_id,
+            "turn",
+            "expected the narrowest reach on offer"
+        );
+    }
+
+    /// A vendor can offer a session-wide allow it forgets on exit, and a once-only allow it writes
+    /// into a settings file. Preferring the one that writes nothing is the whole point of keeping
+    /// the two flags apart.
+    #[test]
+    fn a_choice_that_writes_a_standing_rule_loses_to_one_that_does_not() {
+        let request = request(vec![
+            PermissionOption::new("remember", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once)
+                .policy_changing(),
+            PermissionOption::new("just-now", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once),
+        ]);
+
+        assert_eq!(
+            request.allow().expect("expected an allow").option_id,
+            "just-now"
+        );
+    }
+
+    /// An unstated reach is a reach nobody measured, so it must not be read as the narrow one.
+    #[test]
+    fn an_option_with_no_stated_scope_is_not_preferred_over_a_stated_narrow_one() {
+        let request = request(vec![
+            PermissionOption::new("unknown", PermissionEffect::Allow),
+            PermissionOption::new("once", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once),
+        ]);
+
+        assert_eq!(
+            request.allow().expect("expected an allow").option_id,
+            "once"
+        );
+        assert!(
+            !PermissionOption::new("unknown", PermissionEffect::Allow).is_standing(),
+            "an unstated scope is not itself a standing grant"
+        );
+        assert!(
+            PermissionOption::new("session", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Session)
+                .is_standing()
+        );
+    }
+
     #[test]
     fn a_request_with_no_matching_option_refuses_to_invent_one() {
         let request = request(vec![PermissionOption::new(
             "tell-me-more",
-            PermissionOptionKind::Other,
+            PermissionEffect::Other,
         )]);
 
         let error = request
@@ -1109,9 +1450,7 @@ mod tests {
         assert!(request(Vec::new()).normalized().is_err());
 
         let many = (0..17)
-            .map(|index| {
-                PermissionOption::new(format!("option-{index}"), PermissionOptionKind::AllowOnce)
-            })
+            .map(|index| PermissionOption::new(format!("option-{index}"), PermissionEffect::Allow))
             .collect();
         assert!(request(many).normalized().is_err());
     }
@@ -1128,7 +1467,8 @@ mod tests {
 
         let many = (0..17)
             .map(|index| {
-                PermissionOption::new(format!("option-{index}"), PermissionOptionKind::AllowOnce)
+                PermissionOption::new(format!("option-{index}"), PermissionEffect::Allow)
+                    .with_scope(PermissionScope::Once)
             })
             .collect();
         let oversized = request(many).normalized().expect_err("expected a refusal");
@@ -1144,16 +1484,11 @@ mod tests {
 
     #[test]
     fn normalising_bounds_the_labels_and_refuses_an_unusable_option_id() {
-        let normalised = PermissionRequest {
-            title: "t".repeat(300),
-            options: vec![
-                PermissionOption::new("once", PermissionOptionKind::AllowOnce)
-                    .with_label("l".repeat(200)),
-            ],
-            ..request(four_options())
-        }
-        .normalized()
-        .expect("expected a bounded request");
+        let mut over_long = request(vec![
+            PermissionOption::new("once", PermissionEffect::Allow).with_label("l".repeat(200)),
+        ]);
+        over_long.title = "t".repeat(300);
+        let normalised = over_long.normalized().expect("expected a bounded request");
 
         assert_eq!(normalised.title.chars().count(), 256);
         assert_eq!(
@@ -1167,7 +1502,7 @@ mod tests {
 
         let error = request(vec![PermissionOption::new(
             "o".repeat(129),
-            PermissionOptionKind::AllowOnce,
+            PermissionEffect::Allow,
         )])
         .normalized()
         .expect_err("expected a refusal, received a request");
@@ -1183,23 +1518,76 @@ mod tests {
         );
     }
 
-    /// The flag a host renders as a warning on the choice that deletes something. It survives
-    /// normalising, because a bounded label on an unmarked option is a prompt that lost the one
-    /// thing it was trying to say.
+    /// Scope, risk and the policy-changing flag are what a host renders as the warning on a
+    /// choice. Normalising that widened or dropped one would understate what somebody is agreeing
+    /// to — the one direction in this whole module that must never happen.
     #[test]
-    fn a_destructive_choice_stays_marked_through_normalising() {
-        let marked = PermissionOption::new("wipe", PermissionOptionKind::AllowOnce).destructive();
-        assert!(marked.destructive);
-        assert!(!PermissionOption::new("ok", PermissionOptionKind::AllowOnce).destructive);
+    fn scope_risk_and_policy_effects_survive_normalising_without_widening() {
+        let marked = PermissionOption::new("wipe", PermissionEffect::Allow)
+            .with_scope(PermissionScope::Persistent)
+            .with_risk(PermissionRisk::Destructive)
+            .policy_changing()
+            .with_label("l".repeat(200));
+        assert!(marked.is_destructive());
 
         let normalised = request(vec![marked])
             .normalized()
             .expect("expected a bounded request");
-        assert!(
-            normalised.options[0].destructive,
-            "received {:?}",
-            normalised.options[0]
+        let option = &normalised.options[0];
+
+        assert_eq!(option.scope, Some(PermissionScope::Persistent));
+        assert_eq!(option.risk, PermissionRisk::Destructive);
+        assert!(option.policy_changing);
+        assert!(option.is_standing());
+        assert_eq!(
+            option.label.as_ref().map(|label| label.chars().count()),
+            Some(128),
+            "expected only the label to have been cut"
         );
+
+        let unmarked = PermissionOption::new("ok", PermissionEffect::Allow);
+        assert!(!unmarked.is_destructive());
+        assert_eq!(unmarked.risk, PermissionRisk::Unspecified);
+        assert!(!unmarked.policy_changing);
+    }
+
+    /// The request that prompted a decision is gone by the time anybody audits it, so the decision
+    /// has to carry what the chosen option meant rather than just its id.
+    #[test]
+    fn a_decision_records_the_reach_of_the_option_that_won() {
+        let option = PermissionOption::new("always", PermissionEffect::Allow)
+            .with_scope(PermissionScope::Session)
+            .policy_changing();
+        let decision = ApprovalDecision::from_option(&option, DecisionSource::User);
+
+        assert_eq!(decision.option_id, "always");
+        assert_eq!(decision.effect, PermissionEffect::Allow);
+        assert_eq!(decision.scope, Some(PermissionScope::Session));
+        assert!(decision.policy_changing);
+        assert!(decision.is_standing());
+
+        let expired = ApprovalDecision::unresolved("none", DecisionSource::Expired);
+        assert!(
+            !expired.is_standing(),
+            "expected a request nobody answered to grant nothing standing"
+        );
+    }
+
+    #[test]
+    fn the_scope_ladder_runs_narrowest_first() {
+        assert_eq!(
+            PermissionScope::ALL,
+            [
+                PermissionScope::Once,
+                PermissionScope::Turn,
+                PermissionScope::Session,
+                PermissionScope::Persistent,
+            ]
+        );
+        assert!(!PermissionScope::Once.is_standing());
+        assert!(PermissionScope::Turn.is_standing());
+        assert!(!PermissionScope::Session.outlives_session());
+        assert!(PermissionScope::Persistent.outlives_session());
     }
 
     #[tokio::test]
@@ -1271,7 +1659,7 @@ mod tests {
         });
         let unanswerable = request(vec![PermissionOption::new(
             "tell-me-more",
-            PermissionOptionKind::Other,
+            PermissionEffect::Other,
         )]);
 
         assert_eq!(broker_response(Some(&allow), &unanswerable).await, None);

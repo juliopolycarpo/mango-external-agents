@@ -9,13 +9,15 @@
 
 use std::time::Duration;
 
+use crate::configuration::ConfigurationPatch;
 use crate::error::Error;
 use crate::event::{AgentEvent, EventKind};
 use crate::harness::{Capability, Harness};
 use crate::host::HostContext;
+use crate::interaction::{InteractionId, QuestionResponse};
 use crate::session::{
-    Attachment, AttachmentKind, CancelReason, CloseReason, Configuration, OpenSession,
-    ReviewRequest, ReviewTarget, Session, SessionQuery, Steer, TurnRequest,
+    Attachment, AttachmentKind, CancelReason, CloseReason, OpenSession, ReviewRequest,
+    ReviewTarget, Session, SessionQuery, Steer, TurnRequest,
 };
 
 /// How one check went.
@@ -135,6 +137,7 @@ pub async fn run(harness: &dyn Harness, host: &HostContext, options: Options) ->
     };
 
     check_ids(session.as_ref(), &options, &mut report);
+    check_session_state(session.as_ref(), &options, &mut report).await;
     check_turn(session.as_ref(), &options, &mut report).await;
     check_cancelled_turn(session.as_ref(), &options, &mut report).await;
     check_optional_methods(session.as_ref(), &mut report).await;
@@ -326,7 +329,7 @@ fn approval_outcome(
             request
                 .options
                 .iter()
-                .map(|option| option.kind)
+                .map(|option| option.effect)
                 .collect::<Vec<_>>()
         )),
     }
@@ -394,7 +397,7 @@ async fn check_cancelled_turn(session: &dyn Session, options: &Options, report: 
 }
 
 async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
-    let capabilities = session.info().capabilities;
+    let capabilities = session.capabilities();
     let mut failures = Vec::new();
 
     if !capabilities.has(Capability::Steering) {
@@ -448,7 +451,7 @@ async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
     if !capabilities.has(Capability::InteractiveApprovals) {
         let outcome = session
             .respond(crate::permission::PermissionResponse::from_user(
-                "conformance-approval-unsupported",
+                InteractionId::new("conformance-approval-unsupported"),
                 "deny",
             ))
             .await;
@@ -463,7 +466,7 @@ async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
         let outcome = session
             .start_turn(
                 TurnRequest::new("conformance-configuration-unsupported", "say hello")
-                    .with_configuration(Configuration::default()),
+                    .with_configuration(ConfigurationPatch::new()),
             )
             .await
             .map(|_| ());
@@ -496,10 +499,104 @@ async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
         }
     }
 
+    if !capabilities.has(Capability::Questions) {
+        let outcome = session
+            .answer(QuestionResponse::new(
+                InteractionId::new("conformance-question-unsupported"),
+                Vec::new(),
+            ))
+            .await;
+        if !refuses_as_unsupported(&outcome, Capability::Questions) {
+            failures.push(String::from(
+                "expected questions to refuse as unsupported, received something else",
+            ));
+        }
+    }
+
+    if !capabilities.has(Capability::SessionConfiguration) {
+        let outcome = session
+            .configure(ConfigurationPatch::new())
+            .await
+            .map(|_| ());
+        if !refuses_as_unsupported(&outcome, Capability::SessionConfiguration) {
+            failures.push(String::from(
+                "expected mid-session configuration to refuse as unsupported, received something \
+                 else",
+            ));
+        }
+    }
+
     report.record(
         "an undeclared capability refuses rather than misbehaves",
         outcome_for(failures),
     );
+}
+
+/// Session state is readable before any turn has run, and a subscription cannot miss a change.
+///
+/// The check that would have caught the old shape: a harness carrying its session facts on the
+/// turn stream has nothing to answer here until somebody starts a turn.
+async fn check_session_state(session: &dyn Session, options: &Options, report: &mut Report) {
+    let snapshot = session.snapshot();
+    let mut failures = Vec::new();
+    if snapshot.ids.session_id.as_str() != options.session_id {
+        failures.push(format!(
+            "expected the snapshot to name session {:?}, received {:?}",
+            options.session_id,
+            snapshot.ids.session_id.as_str()
+        ));
+    }
+    if snapshot.transport.was_substituted() {
+        failures.push(format!(
+            "expected the effective transport to be the requested one, received {:?} for a request \
+             of {:?}",
+            snapshot.transport.effective, snapshot.transport.requested
+        ));
+    }
+    if !snapshot
+        .capabilities
+        .within(&crate::harness::DiscoveredCapabilities::all())
+    {
+        failures.push(String::from(
+            "expected session capabilities inside the whole table, received a claim beyond it",
+        ));
+    }
+    report.record(
+        "session state is readable before any turn",
+        outcome_for(failures),
+    );
+
+    // Subscribing is reading, so a change published afterwards cannot fall into a gap between the
+    // two. What this proves is that a harness publishes its state through `SessionState` at all:
+    // one that mutated a private field would leave the subscriber waiting forever.
+    let mut subscription = session.subscribe();
+    let before = subscription.current().revision;
+    let woke = tokio::time::timeout(options.turn_timeout, async {
+        session
+            .start_turn(TurnRequest::new(
+                "conformance-state-turn",
+                options.prompt.clone(),
+            ))
+            .await
+            .ok()?;
+        subscription.changed().await
+    })
+    .await;
+    let outcome = match woke {
+        Ok(Some(seen)) if seen.revision > before => Outcome::Passed,
+        Ok(Some(seen)) => Outcome::Failed(format!(
+            "expected a later revision than {before}, received {}",
+            seen.revision
+        )),
+        Ok(None) => Outcome::Skipped(String::from(
+            "this harness published no session change while a turn ran",
+        )),
+        Err(_) => Outcome::Skipped(String::from(
+            "this harness published no session change while a turn ran",
+        )),
+    };
+    report.record("a session update reaches a subscriber", outcome);
+    let _ = session.cancel(CancelReason::Requested).await;
 }
 
 async fn check_close(session: &dyn Session, report: &mut Report) {
@@ -528,7 +625,7 @@ fn refuses_as_unsupported<T>(outcome: &crate::error::Result<T>, capability: Capa
 /// that cannot fail: the loop never looks. An event already queued behind it is a turn that ended
 /// twice, or that kept talking afterwards, and it is exactly what a host would see.
 fn drain_queued(turn: &mut crate::stream::TurnStream, events: &mut Vec<AgentEvent>) {
-    while let Ok(event) = turn.events.try_recv() {
+    while let Ok(event) = turn.try_recv() {
         events.push(event);
     }
 }
@@ -550,10 +647,15 @@ fn terminal_outcome(events: &[AgentEvent]) -> Outcome {
 
 fn stamping_outcome(events: &[AgentEvent], turn_id: &str, session: &dyn Session) -> Outcome {
     let session_id = session.ids().session_id.clone();
+    let attempt = crate::operation::AttemptId::default();
     let mismatched: Vec<String> = events
         .iter()
-        .filter(|event| event.turn_id.as_str() != turn_id || event.session_id != session_id)
-        .map(|event| format!("{:?}/{:?}", event.session_id, event.turn_id))
+        .filter(|event| {
+            event.turn_id.as_str() != turn_id
+                || event.session_id != session_id
+                || event.attempt != attempt
+        })
+        .map(|event| event.operation().to_string())
         .collect();
     if mismatched.is_empty() {
         return Outcome::Passed;

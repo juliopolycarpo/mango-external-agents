@@ -6,14 +6,21 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::configuration::{ConfigurationOutcome, ConfigurationPatch};
+use crate::discovery::DiscoveryReceipt;
 use crate::error::{Error, Result};
 use crate::event::{AccountLimits, SessionId, TurnId};
-use crate::harness::{Capabilities, Capability};
+use crate::harness::{Capability, SessionCapabilities};
+use crate::interaction::QuestionResponse;
 use crate::normalize::{self, TextLimit};
-use crate::permission::{ApprovalRouting, PermissionLevel, PermissionResponse};
+use crate::operation::AttemptId;
+use crate::permission::PermissionResponse;
+use crate::state::{SessionSnapshot, SessionState, SessionSubscription};
 use crate::stream::{ReviewStream, TurnStream};
+use crate::transport::TransportKind;
 
 /// Why a turn was stopped.
 ///
@@ -102,7 +109,7 @@ impl fmt::Debug for SessionIds {
     ///
     /// The value [`Session::ids`] returns, so this is what a host reaches for with `dbg!` or
     /// embeds in a type of its own — a carrier, unlike [`SessionId`] itself, which is the id and
-    /// prints it. The vendor's handle is the vendor's, and [`Resume`] and [`SessionInfo`] already
+    /// prints it. The vendor's handle is the vendor's, and [`Resume`] and [`SessionSnapshot`]
     /// report it this way.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -110,92 +117,6 @@ impl fmt::Debug for SessionIds {
             .field("has_session_id", &true)
             .field("has_native_session_id", &!self.native_session_id.is_empty())
             .finish_non_exhaustive()
-    }
-}
-
-/// Settings a host may explicitly override without opening a new session.
-///
-/// An omitted permission axis reports no known library override; it never means read-only. Some
-/// vendor profiles are more granular than this shared pair, so the library does not guess a
-/// generic equivalent for captured native defaults.
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Configuration {
-    /// The vendor's own model id, when the host chose one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// The vendor's own reasoning-effort id, when the host chose one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-    /// What the agent may do, when the host explicitly chooses a permission level.
-    ///
-    /// Omitted preserves the last accepted host selection, or the vendor's configured default
-    /// before any selection; it is not a request for this library's restrictive profile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub level: Option<PermissionLevel>,
-    /// Who answers its prompts, when the host explicitly chooses a routing policy.
-    ///
-    /// Omitted preserves the last accepted host selection, or the vendor's configured default
-    /// before any selection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing: Option<ApprovalRouting>,
-}
-
-impl fmt::Debug for Configuration {
-    /// Records which host settings were selected without logging opaque vendor identifiers.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Configuration")
-            .field("has_model", &self.model.is_some())
-            .field("has_effort", &self.effort.is_some())
-            .field("level", &self.level)
-            .field("routing", &self.routing)
-            .finish()
-    }
-}
-
-impl Default for Configuration {
-    /// Leaves every vendor-controlled setting unspecified.
-    ///
-    /// The harness must not silently narrow or widen a person's existing vendor configuration.
-    /// An explicit host choice is represented by `Some` on the axis it controls.
-    fn default() -> Self {
-        Self {
-            model: None,
-            effort: None,
-            level: None,
-            routing: None,
-        }
-    }
-}
-
-impl Configuration {
-    /// Applies the fields a later request explicitly supplied, preserving every omission.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use mango_external_agents::{Configuration, PermissionLevel};
-    ///
-    /// let current = Configuration {
-    ///     level: Some(PermissionLevel::ReadOnly),
-    ///     ..Configuration::default()
-    /// };
-    /// let next = current.with_overrides(&Configuration {
-    ///     model: Some(String::from("fast")),
-    ///     ..Configuration::default()
-    /// });
-    /// assert_eq!(next.level, Some(PermissionLevel::ReadOnly));
-    /// assert_eq!(next.model.as_deref(), Some("fast"));
-    /// ```
-    #[must_use]
-    pub fn with_overrides(&self, overrides: &Self) -> Self {
-        Self {
-            model: overrides.model.clone().or_else(|| self.model.clone()),
-            effort: overrides.effort.clone().or_else(|| self.effort.clone()),
-            level: overrides.level.or(self.level),
-            routing: overrides.routing.or(self.routing),
-        }
     }
 }
 
@@ -207,7 +128,7 @@ pub enum ResumeMode {
     /// Fail if the vendor cannot resume this conversation.
     Strict,
     /// Start a new conversation instead, and say so in
-    /// [`SessionInfo::fallback_reason`].
+    /// [`SessionSnapshot::fallback_reason`](crate::SessionSnapshot::fallback_reason).
     Fallback,
 }
 
@@ -368,29 +289,44 @@ fn redacted_values(
 }
 
 /// What a host asks for when it opens a session.
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// Built rather than struct-literalled: this is the request surface most likely to grow, and a
+/// host that wrote `..Default::default()` would silently start defaulting whatever came next.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OpenSession {
     /// The host's own id for the session.
     pub session_id: SessionId,
-    /// What the agent may do, and which model.
-    pub configuration: Configuration,
+    /// The settings to open under, as a patch.
+    ///
+    /// A patch rather than a set of values, so "leave this to the vendor" and "remove whatever
+    /// override is configured" stop being the same omission. An empty patch opens the session on
+    /// the vendor's own configuration, untouched.
+    pub configuration: ConfigurationPatch,
+    /// Which carrier to run on, when the host has a preference.
+    ///
+    /// Absent takes the harness's own first choice. A kind the harness does not declare is refused
+    /// by [`validate_open_session`](crate::Harness::validate_open_session) rather than quietly
+    /// swapped for one it does.
+    pub transport: Option<TransportKind>,
     /// A vendor conversation to continue, when the host is continuing one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
     /// Where this harness's executable is, when the host resolved it.
     ///
     /// Per request, because a resolved path belongs to one harness. It is usually
     /// [`Discovery::executable`](crate::Discovery::executable) from the probe of the same harness
     /// this session is being opened on.
-    #[serde(default)]
     pub executable: crate::transport::ExecutablePath,
+    /// A probe the host already ran and is vouching for, so opening need not run it again.
+    ///
+    /// Checked for identity and freshness against this request, never stored: see
+    /// [`DiscoveryReceipt`].
+    pub discovery: Option<DiscoveryReceipt>,
     /// MCP servers the vendor should load for this session.
     ///
     /// Honoured only by a harness whose
     /// [`Capabilities::mcp_passthrough`](crate::Capabilities) is set; the rest refuse rather than
     /// accept a request they would silently drop.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
 }
 
@@ -417,15 +353,18 @@ impl OpenSession {
     /// use mango_external_agents::OpenSession;
     ///
     /// let request = OpenSession::new("chat-42");
-    /// assert_eq!(request.configuration.level, None);
+    /// assert!(request.configuration.is_empty());
     /// assert!(request.resume.is_none());
+    /// assert_eq!(request.transport, None);
     /// ```
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: SessionId::new(session_id),
-            configuration: Configuration::default(),
+            configuration: ConfigurationPatch::new(),
+            transport: None,
             resume: None,
             executable: crate::transport::ExecutablePath::default(),
+            discovery: None,
             mcp_servers: Vec::new(),
         }
     }
@@ -441,8 +380,22 @@ impl OpenSession {
 
     /// Runs under this explicit configuration instead of leaving settings to the vendor.
     #[must_use]
-    pub fn with_configuration(mut self, configuration: Configuration) -> Self {
+    pub fn with_configuration(mut self, configuration: ConfigurationPatch) -> Self {
         self.configuration = configuration;
+        self
+    }
+
+    /// Runs on this carrier rather than the harness's own first choice.
+    #[must_use]
+    pub fn over_transport(mut self, transport: TransportKind) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
+    /// Offers a probe the host already ran, so opening need not run it again.
+    #[must_use]
+    pub fn with_discovery(mut self, receipt: DiscoveryReceipt) -> Self {
+        self.discovery = Some(receipt);
         self
     }
 
@@ -471,85 +424,6 @@ impl OpenSession {
             mode,
         });
         self
-    }
-}
-
-/// What opening produced.
-///
-/// A snapshot of the answer `open_session` gave, not a live view. Read [`Session::ids`] for
-/// the current vendor handle and [`Session::configuration`] for the defaults later turns inherit.
-#[derive(Clone, PartialEq, Eq)]
-pub struct SessionInfo {
-    /// The two ids, as opening reported them.
-    ///
-    /// Read [`Session::ids`] instead for the handle to resume with; this field keeps the one
-    /// opening minted even after a vendor has chosen another.
-    pub ids: SessionIds,
-    /// Whether the vendor continued a conversation rather than starting one.
-    pub resumed: bool,
-    /// Why a requested resume did not happen, when one was asked for and did not.
-    pub fallback_reason: Option<String>,
-    /// The known settings at opening, including omissions that leave vendor defaults in force.
-    ///
-    /// `None` on a permission axis is unreported or inherited vendor policy, not a restrictive
-    /// setting. Use [`Session::configuration`] after explicit turn settings have been accepted.
-    pub effective_configuration: Configuration,
-    /// What this session can do, as this build of the CLI reports it.
-    pub capabilities: Capabilities,
-}
-
-/// Why a requested resume fell back to a fresh conversation, in terms a host can act on.
-///
-/// Built from the error's typed fields rather than from its diagnostic text. `Display` reports
-/// only metadata for anything a vendor filled in, so a reason copied from it says "vendor failure"
-/// and tells a host nothing it did not already know. Every harness that offers
-/// [`ResumeMode::Fallback`] fills [`SessionInfo::fallback_reason`] through this, so the sentence a
-/// host shows does not depend on which vendor produced it.
-///
-/// # Example
-///
-/// ```
-/// use mango_external_agents::{Capability, Error, resume_fallback_reason};
-///
-/// let reason = resume_fallback_reason("session/load", &Error::not_supported(Capability::Resume));
-/// assert_eq!(reason, "session/load needs resume, which this agent does not declare");
-/// ```
-pub fn resume_fallback_reason(operation: &str, error: &Error) -> String {
-    match error {
-        // The code prints only when it has a label's shape — `acp-request-failed`,
-        // `codex-call-failed` — and the `vendor-code` stand-in otherwise, so this sentence names
-        // which call refused without carrying a vendor's own words.
-        Error::Vendor(vendor) => format!(
-            "{operation} was refused by the vendor ({}, retryable {})",
-            vendor.code, vendor.retryable
-        ),
-        Error::NotSupported { capability } => {
-            format!("{operation} needs {capability}, which this agent does not declare")
-        }
-        Error::Timeout { after, .. } => format!("{operation} did not answer within {after:?}"),
-        Error::Protocol { .. } => {
-            format!("{operation} answered with a shape this harness does not read")
-        }
-        Error::Link { .. } => format!("{operation} lost the vendor link"),
-        Error::Closed { subject } => format!("{operation} found a closed {subject}"),
-        other => format!("{operation} failed: {other}"),
-    }
-}
-
-impl fmt::Debug for SessionInfo {
-    /// Records what opening decided without logging the ids or the vendor's fallback text.
-    ///
-    /// Kept rather than dropped: a host that wraps a `SessionInfo` and derives `Debug` for its own
-    /// type needs this trait to exist, and `dbg!(session.info())` is the first thing anybody
-    /// reaches for when a resume behaves unexpectedly.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SessionInfo")
-            .field("resumed", &self.resumed)
-            .field("has_fallback_reason", &self.fallback_reason.is_some())
-            .field("effective_configuration", &self.effective_configuration)
-            .field("capabilities", &self.capabilities)
-            .finish_non_exhaustive()
     }
 }
 
@@ -605,16 +479,33 @@ impl fmt::Debug for Attachment {
 }
 
 /// One turn's input.
+///
+/// Carries two of the three identities a turn has: the logical [`TurnId`] and the
+/// [`AttemptId`] of this particular dispatch. The third — the vendor's own handle — does not
+/// exist yet, and arrives on the [`TurnStream`] the vendor answers with.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TurnRequest {
-    /// The host's own id for this turn, which is also its idempotency key.
+    /// The host's own id for this logical turn.
+    ///
+    /// Stable across retries of the same turn: a retry that means "the same turn, again" reuses
+    /// it, and a retry that means "a new turn" mints a new one.
+    ///
+    /// **It is not an idempotency key.** Nothing in this library, and nothing in any vendor this
+    /// library drives, promises that a second dispatch under the same id is deduplicated. What it
+    /// does is let a host recognise its own work; whether re-sending is safe is
+    /// [`Dispatch`](crate::Dispatch)'s question.
     pub turn_id: TurnId,
+    /// Which dispatch of that turn this is.
+    pub attempt: AttemptId,
     /// What to say to the agent.
     pub input: String,
     /// Files travelling with it.
     pub attachments: Vec<Attachment>,
-    /// Explicit settings for this turn, when they differ from the session's inherited settings.
-    pub configuration: Option<Configuration>,
+    /// Explicit settings for this turn, when they differ from the session's own.
+    ///
+    /// A patch, so a turn can remove an override the session carries as well as set one.
+    pub configuration: Option<ConfigurationPatch>,
 }
 
 impl fmt::Debug for TurnRequest {
@@ -631,10 +522,10 @@ impl fmt::Debug for TurnRequest {
 }
 
 impl TurnRequest {
-    /// A turn that is only text.
+    /// A turn that is only text, on its first attempt.
     ///
     /// The turn id is the host's: the library does not mint ids, because an id a host cannot
-    /// reproduce is an id it cannot retry with.
+    /// reproduce is an id it cannot reconcile with.
     ///
     /// # Example
     ///
@@ -643,15 +534,34 @@ impl TurnRequest {
     ///
     /// let turn = TurnRequest::new("turn-1", "say hello");
     /// assert_eq!(turn.turn_id.as_str(), "turn-1");
+    /// assert_eq!(turn.attempt.as_str(), "attempt-1");
     /// assert!(turn.attachments.is_empty());
     /// ```
     pub fn new(turn_id: impl Into<String>, input: impl Into<String>) -> Self {
         Self {
             turn_id: TurnId::new(turn_id),
+            attempt: AttemptId::default(),
             input: input.into(),
             attachments: Vec::new(),
             configuration: None,
         }
+    }
+
+    /// Dispatches the same logical turn under a new attempt.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{AttemptId, TurnRequest};
+    ///
+    /// let retry = TurnRequest::new("turn-1", "say hello").as_attempt(AttemptId::new("attempt-2"));
+    /// assert_eq!(retry.turn_id.as_str(), "turn-1");
+    /// assert_eq!(retry.attempt.as_str(), "attempt-2");
+    /// ```
+    #[must_use]
+    pub fn as_attempt(mut self, attempt: AttemptId) -> Self {
+        self.attempt = attempt;
+        self
     }
 
     /// Carries these files with the turn.
@@ -661,10 +571,9 @@ impl TurnRequest {
         self
     }
 
-    /// Runs this turn under an explicit configuration and makes accepted settings the defaults for
-    /// later turns that omit one.
+    /// Runs this turn under an explicit configuration patch.
     #[must_use]
-    pub fn with_configuration(mut self, configuration: Configuration) -> Self {
+    pub fn with_configuration(mut self, configuration: ConfigurationPatch) -> Self {
         self.configuration = Some(configuration);
         self
     }
@@ -976,37 +885,49 @@ pub struct AccountUsage {
 /// vendor has and a host that calls the rest receives a typed refusal.
 #[async_trait::async_trait]
 pub trait Session: Send + Sync {
-    /// What opening this session produced.
-    fn info(&self) -> &SessionInfo;
-
-    /// The known overrides the next turn inherits when it supplies no override.
+    /// This session's live, observable state.
     ///
-    /// Harnesses whose vendor persists turn overrides return their last accepted settings. `None`
-    /// means that axis still has no library override; it is not a claim that the vendor is
-    /// read-only. The default is the opening snapshot.
+    /// The one method a harness must supply for the whole session-state surface: everything else
+    /// here reads from it. Holding a [`SessionState`] rather than a frozen struct is what lets a
+    /// vendor rename its own handle, announce a command catalog, or have its settings change
+    /// between turns without any of it having to arrive as a turn event.
+    fn state(&self) -> &SessionState;
+
+    /// Everything true about this session at this instant.
+    ///
+    /// A value, so two fields read off one snapshot were read at one instant.
     ///
     /// # Example
     ///
     /// ```no_run
-    /// # async fn example(session: &dyn mango_external_agents::Session) {
-    /// let configuration = session.configuration().await;
-    /// println!("next turn permission: {:?}", configuration.level);
+    /// # fn example(session: &dyn mango_external_agents::Session) {
+    /// let snapshot = session.snapshot();
+    /// println!("revision {} on {}", snapshot.revision, snapshot.transport.effective);
     /// # }
     /// ```
-    async fn configuration(&self) -> Configuration {
-        self.info().effective_configuration.clone()
+    fn snapshot(&self) -> Arc<SessionSnapshot> {
+        self.state().snapshot()
+    }
+
+    /// Watches this session's state change, with no window in which an update can be missed.
+    ///
+    /// See [`crate::state`] for why read-then-subscribe cannot lose an update here.
+    fn subscribe(&self) -> SessionSubscription {
+        self.state().subscribe()
     }
 
     /// The two ids this session answers to, as they stand now.
     ///
     /// Owned rather than borrowed, because this is the one answer a session is allowed to change
     /// after it is open: a vendor may mint its own handle and report a different one once a run
-    /// has started, and the value a host persists to resume with has to be that one. The default
-    /// is the snapshot [`SessionInfo`] carries, which is right for every vendor that keeps the
-    /// handle it was given; a harness whose vendor does not overrides this and reads its own live
-    /// state.
+    /// has started, and the value a host persists to resume with has to be that one.
     fn ids(&self) -> SessionIds {
-        self.info().ids.clone()
+        self.snapshot().ids.clone()
+    }
+
+    /// What this session can do, after whatever its handshake narrowed.
+    fn capabilities(&self) -> SessionCapabilities {
+        self.snapshot().capabilities
     }
 
     /// Refuses a call that this opened session did not advertise.
@@ -1018,7 +939,7 @@ pub trait Session: Send + Sync {
     ///
     /// [`Error::NotSupported`] when the session did not advertise `capability`.
     fn require_capability(&self, capability: Capability) -> Result<()> {
-        self.info().capabilities.require(capability)
+        self.capabilities().require(capability)
     }
 
     /// Refuses per-turn input that needs a capability the session did not advertise.
@@ -1052,10 +973,40 @@ pub trait Session: Send + Sync {
 
     /// Answers one approval.
     ///
+    /// An authorisation decision. [`Session::answer`] is the other half — a reply to a question,
+    /// which grants nothing — and the two are separate methods so a host cannot route one to the
+    /// other by accident.
+    ///
     /// # Errors
     ///
     /// Whatever the vendor or the link reported.
     async fn respond(&self, response: PermissionResponse) -> Result<()>;
+
+    /// Answers one round of questions.
+    ///
+    /// Information, not authorisation: nothing a host sends here lets the agent do anything it
+    /// could not already do. See [`Session::respond`] for the surface that authorises.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] unless the harness implements it.
+    async fn answer(&self, _response: QuestionResponse) -> Result<()> {
+        Err(Error::not_supported(Capability::Questions))
+    }
+
+    /// Changes this session's settings, outside any turn.
+    ///
+    /// Answers with what actually happened rather than a bare success: most vendors cannot set
+    /// several options atomically, so a patch can land in part. See
+    /// [`ConfigurationOutcome`](crate::ConfigurationOutcome) for what partial looks like and
+    /// [`Rollback`](crate::Rollback) for what became of the part that had already landed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] unless the harness implements it.
+    async fn configure(&self, _patch: ConfigurationPatch) -> Result<ConfigurationOutcome> {
+        Err(Error::not_supported(Capability::SessionConfiguration))
+    }
 
     /// Stops whatever turn is running.
     ///
@@ -1133,11 +1084,18 @@ pub trait Session: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attachment, AttachmentKind, CancelReason, CloseReason, Configuration, McpServer,
-        McpTransport, NativeSession, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
-        SessionPage, SessionQuery, TurnRequest,
+        Attachment, AttachmentKind, CancelReason, CloseReason, McpServer, McpTransport,
+        NativeSession, OpenSession, ResumeMode, Session, SessionIds, SessionPage, SessionQuery,
+        TurnRequest,
     };
-    use crate::permission::{ApprovalRouting, PermissionLevel};
+    use crate::configuration::{ConfigurationChange, ConfigurationPatch};
+    use crate::harness::SessionCapabilities;
+    use crate::identity::HarnessIdentity;
+    use crate::operation::AttemptId;
+    use crate::permission::PermissionLevel;
+    use crate::state::{SessionSnapshot, SessionState, TransportSelection};
+    use crate::transport::TransportKind;
+    use std::time::SystemTime;
 
     /// The helper both fallback sites depend on, across every arm a resume can fail through.
     ///
@@ -1385,62 +1343,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_configuration_leaves_permission_axes_unspecified() {
-        let configuration = Configuration::default();
-        assert_eq!(configuration.level, None);
-        assert_eq!(configuration.routing, None);
-        assert_eq!(configuration.model, None);
-    }
-
-    #[test]
-    fn omitted_permissions_are_not_serialized_as_library_defaults() {
-        let encoded = serde_json::to_value(Configuration::default())
-            .expect("expected a serializable configuration");
-        assert!(encoded.get("level").is_none(), "received {encoded}");
-        assert!(encoded.get("routing").is_none(), "received {encoded}");
-    }
-
-    #[test]
-    fn explicit_permissions_are_serialized_without_losing_their_choice() {
-        let configuration = Configuration {
-            level: Some(PermissionLevel::Default),
-            routing: Some(ApprovalRouting::User),
-            ..Configuration::default()
-        };
-        let encoded =
-            serde_json::to_value(&configuration).expect("expected a serializable configuration");
-        assert_eq!(encoded["level"], "default");
-        assert_eq!(encoded["routing"], "user");
-        assert_eq!(
-            serde_json::from_value::<Configuration>(encoded)
-                .expect("expected the explicit configuration to deserialize"),
-            configuration
-        );
-    }
-
-    #[test]
-    fn an_omitted_field_in_a_later_configuration_keeps_the_accepted_setting() {
-        let current = Configuration {
-            model: Some(String::from("deliberate")),
-            effort: Some(String::from("high")),
-            level: Some(PermissionLevel::Default),
-            routing: Some(ApprovalRouting::User),
-        };
-        let merged = current.with_overrides(&Configuration {
-            model: Some(String::from("fast")),
-            ..Configuration::default()
-        });
-        assert_eq!(merged.model.as_deref(), Some("fast"));
-        assert_eq!(merged.effort.as_deref(), Some("high"));
-        assert_eq!(merged.level, Some(PermissionLevel::Default));
-        assert_eq!(merged.routing, Some(ApprovalRouting::User));
-    }
-
-    #[test]
     fn opening_a_session_asks_for_nothing_a_host_did_not_choose() {
         let request = OpenSession::new("chat-42");
-        assert_eq!(request.configuration, Configuration::default());
+        assert!(request.configuration.is_empty());
         assert_eq!(request.resume, None);
+        assert_eq!(request.transport, None);
+        assert!(request.discovery.is_none());
 
         let resuming = OpenSession::new("chat-42").resuming("thread_9", ResumeMode::Fallback);
         assert_eq!(
@@ -1449,11 +1357,49 @@ mod tests {
         );
     }
 
+    /// An open request carries a patch, so a host can clear an override the vendor's own
+    /// configuration holds rather than only add one on top of it.
     #[test]
-    fn a_turn_carries_the_hosts_own_id_rather_than_one_the_library_minted() {
+    fn opening_under_an_explicit_patch_can_set_and_reset() {
+        let request = OpenSession::new("chat-1").with_configuration(
+            ConfigurationPatch::new()
+                .level(ConfigurationChange::Set(PermissionLevel::ReadOnly))
+                .model(ConfigurationChange::Reset),
+        );
+
+        assert_eq!(
+            request.configuration.level.set_value(),
+            Some(&PermissionLevel::ReadOnly)
+        );
+        assert!(request.configuration.model.is_reset());
+        assert!(request.configuration.asks_for_a_reset());
+    }
+
+    #[test]
+    fn a_requested_transport_is_recorded_on_the_request_that_asked_for_it() {
+        let request = OpenSession::new("chat-1").over_transport(TransportKind::WebSocket);
+        assert_eq!(request.transport, Some(TransportKind::WebSocket));
+    }
+
+    /// The doc comment used to call the turn id an idempotency key. Nothing in this library or in
+    /// any vendor it drives deduplicates on it, so a host reading that would have built recovery
+    /// on a promise nobody made.
+    #[test]
+    fn a_turn_carries_a_logical_id_and_an_attempt_that_are_not_the_same_thing() {
         let turn = TurnRequest::new("turn-7", "ship it");
         assert_eq!(turn.turn_id.as_str(), "turn-7");
+        assert_eq!(turn.attempt, AttemptId::default());
         assert_eq!(turn.configuration, None);
+
+        let retry = turn.clone().as_attempt(AttemptId::new("attempt-2"));
+        assert_eq!(
+            retry.turn_id, turn.turn_id,
+            "expected a retry to stay the same logical turn"
+        );
+        assert_ne!(
+            retry.attempt, turn.attempt,
+            "expected a retry to be a different attempt"
+        );
     }
 
     fn row(native_session_id: &str) -> NativeSession {
@@ -1619,25 +1565,31 @@ mod tests {
         assert_eq!(session.last_limit().await, Some(5));
     }
 
+    fn opening_state(native_session_id: &str) -> SessionState {
+        SessionState::new(
+            SessionSnapshot::opening(
+                SessionIds {
+                    session_id: crate::event::SessionId::new("chat-1"),
+                    native_session_id: String::from(native_session_id),
+                },
+                HarnessIdentity::claude(),
+                TransportSelection::new(None, TransportKind::Stdio),
+                SystemTime::UNIX_EPOCH,
+            )
+            .with_capabilities(SessionCapabilities::none()),
+        )
+    }
+
     /// A session that answers listings with nothing and remembers what it was asked for.
     struct RecordingListing {
-        info: SessionInfo,
+        state: SessionState,
         last_query: tokio::sync::Mutex<Option<super::SessionQuery>>,
     }
 
     impl Default for RecordingListing {
         fn default() -> Self {
             Self {
-                info: SessionInfo {
-                    ids: SessionIds {
-                        session_id: crate::event::SessionId::new("chat-1"),
-                        native_session_id: String::from("native-1"),
-                    },
-                    resumed: false,
-                    fallback_reason: None,
-                    effective_configuration: Configuration::default(),
-                    capabilities: crate::harness::Capabilities::none(),
-                },
+                state: opening_state("native-1"),
                 last_query: tokio::sync::Mutex::new(None),
             }
         }
@@ -1655,8 +1607,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl super::Session for RecordingListing {
-        fn info(&self) -> &SessionInfo {
-            &self.info
+        fn state(&self) -> &SessionState {
+            &self.state
         }
 
         async fn start_turn(&self, _request: TurnRequest) -> crate::Result<crate::TurnStream> {
@@ -1687,75 +1639,15 @@ mod tests {
         }
     }
 
-    /// A session whose vendor minted a handle of its own after the open had already answered.
-    ///
-    /// The shape Claude Code has: `--session-id` proposes one, and the run's own `system/init` is
-    /// free to report another, which is then the only handle a resume can use.
-    struct RenamedByTheVendor {
-        info: SessionInfo,
-        chosen: std::sync::Mutex<String>,
-    }
-
-    impl RenamedByTheVendor {
-        fn new(opened_with: &str, chosen: &str) -> Self {
-            Self {
-                info: SessionInfo {
-                    ids: SessionIds {
-                        session_id: crate::event::SessionId::new("chat-1"),
-                        native_session_id: String::from(opened_with),
-                    },
-                    resumed: false,
-                    fallback_reason: None,
-                    effective_configuration: Configuration::default(),
-                    capabilities: crate::harness::Capabilities::none(),
-                },
-                chosen: std::sync::Mutex::new(String::from(chosen)),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl super::Session for RenamedByTheVendor {
-        fn info(&self) -> &SessionInfo {
-            &self.info
-        }
-
-        fn ids(&self) -> SessionIds {
-            SessionIds {
-                native_session_id: self
-                    .chosen
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-                ..self.info.ids.clone()
-            }
-        }
-
-        async fn start_turn(&self, _request: TurnRequest) -> crate::Result<crate::TurnStream> {
-            Err(crate::Error::Closed { subject: "session" })
-        }
-
-        async fn respond(
-            &self,
-            _response: crate::permission::PermissionResponse,
-        ) -> crate::Result<()> {
-            Err(crate::Error::Closed { subject: "session" })
-        }
-
-        async fn cancel(&self, _reason: CancelReason) -> crate::Result<()> {
-            Ok(())
-        }
-
-        async fn close(&self, _reason: CloseReason) -> crate::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// The handle a host persists has to be the one a resume can actually use.
+    /// The handle a host persists has to be the one a resume can actually use, and a vendor may
+    /// mint its own after the open has already answered — the shape Claude Code has, where
+    /// `--session-id` proposes one and the run's own announcement is free to report another.
     #[test]
     fn reports_the_handle_the_vendor_chose_over_the_one_opening_minted() {
-        let session = RenamedByTheVendor::new("native-1", "native-2");
-        let ids = super::Session::ids(&session);
+        let session = RecordingListing::default();
+        session.state().set_native_session_id("native-2");
+
+        let ids = Session::ids(&session);
         assert_eq!(
             ids.native_session_id, "native-2",
             "expected the vendor's own handle, received {:?}",
@@ -1768,32 +1660,102 @@ mod tests {
         );
     }
 
-    /// `info()` stays the snapshot of what opening answered, which is what documents the change.
+    /// A vendor that keeps the handle it was given needs no override at all.
     #[test]
-    fn keeps_the_opening_snapshot_even_after_the_vendor_renamed_its_handle() {
-        let session = RenamedByTheVendor::new("native-1", "native-2");
-        assert_eq!(
-            super::Session::info(&session).ids.native_session_id,
-            "native-1"
-        );
-    }
-
-    /// Every vendor that keeps the handle it was given needs no override at all.
-    #[test]
-    fn defaults_to_the_opening_snapshot_for_a_vendor_that_keeps_its_handle() {
+    fn a_vendor_that_keeps_its_handle_reports_the_one_opening_minted() {
         let session = RecordingListing::default();
+        assert_eq!(Session::ids(&session).native_session_id, "native-1");
         assert_eq!(
-            super::Session::ids(&session),
-            super::Session::info(&session).ids
+            Session::snapshot(&session).revision,
+            crate::state::SessionRevision::INITIAL
         );
     }
 
+    /// A per-turn configuration needs a capability the session advertised; an image attachment
+    /// needs another. Both refuse by name rather than being dropped on the way to the vendor.
+    #[test]
+    fn per_turn_input_is_refused_by_name_when_the_session_never_advertised_it() {
+        use super::{Attachment, AttachmentKind};
+        use crate::harness::Capability;
+
+        let session = RecordingListing::default();
+
+        let error = Session::validate_turn_request(
+            &session,
+            &TurnRequest::new("turn-1", "hi")
+                .with_configuration(ConfigurationPatch::new().model(ConfigurationChange::Reset)),
+        )
+        .expect_err("expected a refusal");
+        assert!(
+            matches!(
+                error,
+                crate::Error::NotSupported {
+                    capability: Capability::Configuration
+                }
+            ),
+            "received {error:?}"
+        );
+
+        let error = Session::validate_turn_request(
+            &session,
+            &TurnRequest::new("turn-1", "hi").with_attachments(vec![Attachment {
+                id: String::from("a1"),
+                name: String::from("shot.png"),
+                mime_type: String::from("image/png"),
+                kind: AttachmentKind::Image,
+                bytes: Vec::new(),
+            }]),
+        )
+        .expect_err("expected a refusal");
+        assert!(
+            matches!(
+                error,
+                crate::Error::NotSupported {
+                    capability: Capability::Images
+                }
+            ),
+            "received {error:?}"
+        );
+    }
+
+    /// Answering a question is not authorising a tool, and mid-session configuration is a third
+    /// thing again. Each refuses under its own capability rather than one standing in for another.
     #[tokio::test]
-    async fn configuration_defaults_to_the_opening_snapshot() {
+    async fn the_interaction_surfaces_refuse_under_their_own_capabilities() {
+        use crate::harness::Capability;
+        use crate::interaction::{InteractionId, QuestionResponse};
+
         let session = RecordingListing::default();
-        assert_eq!(
-            session.configuration().await,
-            session.info().effective_configuration
+
+        let error = session
+            .answer(QuestionResponse::new(
+                InteractionId::new("ask-1"),
+                Vec::new(),
+            ))
+            .await
+            .expect_err("expected a refusal");
+        assert!(
+            matches!(
+                error,
+                crate::Error::NotSupported {
+                    capability: Capability::Questions
+                }
+            ),
+            "received {error:?}"
+        );
+
+        let error = session
+            .configure(ConfigurationPatch::new())
+            .await
+            .expect_err("expected a refusal");
+        assert!(
+            matches!(
+                error,
+                crate::Error::NotSupported {
+                    capability: Capability::SessionConfiguration
+                }
+            ),
+            "received {error:?}"
         );
     }
 

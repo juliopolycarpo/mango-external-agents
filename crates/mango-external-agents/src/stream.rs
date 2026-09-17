@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::error::{Error, Result, VendorError};
 use crate::event::{AgentEvent, EventKind, SessionId, TurnId};
 use crate::host::Clock;
+use crate::operation::{AttemptId, Dispatch, OperationRef};
 use crate::session::CancelReason;
 use std::sync::Arc;
 
@@ -24,22 +25,82 @@ use std::sync::Arc;
 /// multiplied together. A host that cares about the byte figure sets
 /// [`Limits::turn_channel_capacity`](crate::Limits) against its own line cap rather than reading
 /// the default as a memory guarantee.
+///
+/// The channel itself is **not** public. A host reads through [`TurnStream::recv`], which is all a
+/// host ever did with it — and keeping the receiver private is what leaves room for this type to
+/// own a turn's lifetime, or to carry a different budget, without that being a breaking change to
+/// everyone who had matched on an `mpsc::Receiver`.
 pub struct TurnStream {
-    /// The host's own id for this turn, echoed on every event.
-    pub turn_id: TurnId,
-    /// The vendor's handle for this turn, for the calls that name one.
-    pub native_turn_id: String,
-    /// The events themselves.
-    pub events: mpsc::Receiver<AgentEvent>,
+    turn_id: TurnId,
+    attempt: AttemptId,
+    native_turn_id: String,
+    dispatch: Dispatch,
+    events: mpsc::Receiver<AgentEvent>,
 }
 
 impl TurnStream {
-    /// The next event, or `None` once the turn is over.
+    /// The stream of an attempt the vendor accepted.
     ///
-    /// A convenience for `self.events.recv().await`, so a host that only reads never touches the
-    /// channel type.
+    /// [`Dispatch::Accepted`] is the only honest verdict here: the vendor answered with a handle,
+    /// so the work is running. A dispatch that did not get this far never produces a stream — it
+    /// produces an [`Error`], whose [`Error::dispatch`](crate::Error::dispatch) says how far it
+    /// got.
+    pub fn accepted(
+        turn_id: TurnId,
+        attempt: AttemptId,
+        native_turn_id: impl Into<String>,
+        events: mpsc::Receiver<AgentEvent>,
+    ) -> Self {
+        Self {
+            turn_id,
+            attempt,
+            native_turn_id: native_turn_id.into(),
+            dispatch: Dispatch::Accepted,
+            events,
+        }
+    }
+
+    /// The host's own id for this logical turn.
+    pub fn turn_id(&self) -> &TurnId {
+        &self.turn_id
+    }
+
+    /// Which dispatch of that turn this stream belongs to.
+    pub fn attempt(&self) -> &AttemptId {
+        &self.attempt
+    }
+
+    /// The vendor's handle for this turn, for the calls that name one.
+    pub fn native_turn_id(&self) -> &str {
+        &self.native_turn_id
+    }
+
+    /// How certain this attempt's arrival at the vendor is.
+    pub fn dispatch(&self) -> Dispatch {
+        self.dispatch
+    }
+
+    /// Which session, turn and attempt this stream belongs to.
+    pub fn operation(&self, session_id: SessionId) -> OperationRef {
+        OperationRef::new(session_id, self.turn_id.clone(), self.attempt.clone())
+    }
+
+    /// The next event, or `None` once the turn is over.
     pub async fn recv(&mut self) -> Option<AgentEvent> {
         self.events.recv().await
+    }
+
+    /// The next event if one is already waiting.
+    ///
+    /// For a caller that must not block — a conformance check draining what a turn left behind, a
+    /// host polling on its own schedule. `Err` means "nothing right now", which includes a stream
+    /// that has ended.
+    ///
+    /// # Errors
+    ///
+    /// [`tokio::sync::mpsc::error::TryRecvError`] when no event is waiting.
+    pub fn try_recv(&mut self) -> std::result::Result<AgentEvent, mpsc::error::TryRecvError> {
+        self.events.try_recv()
     }
 }
 
@@ -54,6 +115,7 @@ impl std::fmt::Debug for TurnStream {
             .debug_struct("TurnStream")
             .field("has_turn_id", &true)
             .field("has_native_turn_id", &!self.native_turn_id.is_empty())
+            .field("dispatch", &self.dispatch)
             .finish_non_exhaustive()
     }
 }
@@ -90,6 +152,7 @@ impl std::fmt::Debug for ReviewStream {
 pub struct EventSink {
     session_id: SessionId,
     turn_id: TurnId,
+    attempt: AttemptId,
     clock: Arc<dyn Clock>,
     sender: mpsc::Sender<AgentEvent>,
 }
@@ -110,9 +173,13 @@ impl EventSink {
     ///
     /// `capacity` is how many events may wait unread before [`EventSink::emit`] stops returning
     /// until the host reads one.
+    ///
+    /// The attempt is carried so every event this sink stamps names the dispatch it came from. A
+    /// sink built per attempt is what makes a late event from an abandoned one recognisable.
     pub fn new(
         session_id: SessionId,
         turn_id: TurnId,
+        attempt: AttemptId,
         clock: Arc<dyn Clock>,
         capacity: usize,
     ) -> (Self, mpsc::Receiver<AgentEvent>) {
@@ -121,6 +188,7 @@ impl EventSink {
             Self {
                 session_id,
                 turn_id,
+                attempt,
                 clock,
                 sender,
             },
@@ -228,6 +296,7 @@ impl EventSink {
         Ok(AgentEvent {
             session_id: self.session_id.clone(),
             turn_id: self.turn_id.clone(),
+            attempt: self.attempt.clone(),
             at: self.clock.now(),
             kind: kind.normalized()?,
         })
@@ -249,6 +318,20 @@ impl EventSink {
     pub fn turn_id(&self) -> &TurnId {
         &self.turn_id
     }
+
+    /// Which dispatch of that turn these events belong to.
+    pub fn attempt(&self) -> &AttemptId {
+        &self.attempt
+    }
+
+    /// Which session, turn and attempt these events belong to.
+    pub fn operation(&self) -> OperationRef {
+        OperationRef::new(
+            self.session_id.clone(),
+            self.turn_id.clone(),
+            self.attempt.clone(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +340,7 @@ mod tests {
     use crate::error::Error;
     use crate::event::{EventKind, SessionId, TurnId};
     use crate::host::{Clock, SystemClock};
+    use crate::operation::{AttemptId, Dispatch};
     use crate::session::CancelReason;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
@@ -279,6 +363,7 @@ mod tests {
         EventSink::new(
             SessionId::new("session-1"),
             TurnId::new("turn-1"),
+            AttemptId::new("attempt-1"),
             Arc::new(SystemClock),
             capacity,
         )
@@ -289,6 +374,7 @@ mod tests {
         let (sink, _events) = EventSink::new(
             SessionId::new("session-id-secret"),
             TurnId::new("turn-id-secret"),
+            AttemptId::new("attempt-id-secret"),
             Arc::new(SystemClock),
             1,
         );
@@ -312,13 +398,16 @@ mod tests {
         let (_sink, events) = EventSink::new(
             SessionId::new("session-1"),
             TurnId::new("turn-1"),
+            AttemptId::new("attempt-1"),
             Arc::new(SystemClock),
             1,
         );
         let review = crate::stream::ReviewStream {
             turn: TurnStream {
                 turn_id: TurnId::new("turn-id-secret"),
+                attempt: AttemptId::new("attempt-id-secret"),
                 native_turn_id: String::from("native-turn-id-secret"),
+                dispatch: Dispatch::Accepted,
                 events,
             },
             review_thread_id: String::from("review-thread-id-secret"),
@@ -343,11 +432,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stamps_every_event_with_its_session_turn_and_time() {
+    async fn stamps_every_event_with_its_session_turn_attempt_and_time() {
         let stamped = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let (sink, mut events) = EventSink::new(
             SessionId::new("session-1"),
             TurnId::new("turn-1"),
+            AttemptId::new("attempt-2"),
             Arc::new(FrozenClock(stamped)),
             4,
         );
@@ -361,7 +451,13 @@ mod tests {
         let event = events.recv().await.expect("expected an event");
         assert_eq!(event.session_id, SessionId::new("session-1"));
         assert_eq!(event.turn_id, TurnId::new("turn-1"));
+        assert_eq!(
+            event.attempt,
+            AttemptId::new("attempt-2"),
+            "expected the attempt on the event, so a late one from an abandoned dispatch is              recognisable"
+        );
         assert_eq!(event.at, stamped);
+        assert_eq!(event.operation(), sink.operation());
     }
 
     #[tokio::test]
@@ -388,9 +484,8 @@ mod tests {
         let (sink, _events) = sink(4);
 
         let error = sink
-            .emit(EventKind::SessionStarted {
-                native_session_id: String::from("  "),
-                resumed: false,
+            .emit(EventKind::TurnStarted {
+                native_turn_id: String::from("  "),
             })
             .await
             .expect_err("expected a refusal, received a send");
@@ -398,11 +493,11 @@ mod tests {
             matches!(
                 error,
                 Error::InvalidVendorValue {
-                    field: "native session id",
+                    field: "native turn id",
                     ..
                 }
             ),
-            "expected an invalid session id, received {error:?}"
+            "expected an invalid turn id, received {error:?}"
         );
     }
 
@@ -559,11 +654,14 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_turn_still_completes() {
         let (sink, events) = sink(4);
-        let mut turn = TurnStream {
-            turn_id: TurnId::new("turn-1"),
-            native_turn_id: String::from("native-1"),
+        let mut turn = TurnStream::accepted(
+            TurnId::new("turn-1"),
+            AttemptId::new("attempt-1"),
+            "native-1",
             events,
-        };
+        );
+        assert_eq!(turn.dispatch(), Dispatch::Accepted);
+        assert_eq!(turn.native_turn_id(), "native-1");
 
         sink.cancel(CancelReason::Requested)
             .await
