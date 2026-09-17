@@ -241,7 +241,7 @@ mod tests {
             matches!(
                 &error,
                 Error::HostConfiguration {
-                    expected: "a registered harness kind",
+                    expected: "a registered harness id",
                     received,
                 } if received.contains("claude")
             ),

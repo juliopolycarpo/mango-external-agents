@@ -970,7 +970,7 @@ mod tests {
     /// afterwards would still be printing the vendor's own string inside those bounds.
     #[test]
     fn a_result_subtype_nobody_documented_does_not_become_a_code() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         let events = reduce(
             &mut reducer,
             r#"{"type":"result","subtype":"sk-live-subtype-canary","is_error":true}"#,
@@ -997,7 +997,7 @@ mod tests {
             "error_max_budget_usd",
             "error_max_structured_output_retries",
         ] {
-            let mut reducer = TurnReducer::new(false);
+            let mut reducer = TurnReducer::new();
             let line = format!(r#"{{"type":"result","subtype":"{subtype}","is_error":true}}"#);
             let events = reduce(&mut reducer, &line);
             let EventKind::Error { error } = events.last().expect("expected a terminal") else {

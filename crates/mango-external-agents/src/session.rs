@@ -1187,7 +1187,8 @@ mod tests {
             HarnessIdentity::claude(),
             TransportSelection::new(None, TransportKind::Stdio),
             SystemTime::UNIX_EPOCH,
-        ).with_fallback_reason("fallback-text-secret");
+        )
+        .with_fallback_reason("fallback-text-secret");
 
         // `ids()` is the value a host reaches for on its own, so it carries the same claim.
         let rendered = format!("{info:?} {:?}", info.ids);
@@ -1307,9 +1308,11 @@ mod tests {
     #[test]
     fn nested_request_debug_omits_prompts_ids_and_host_configuration_values() {
         let request = OpenSession::new("session-id-secret")
-            .with_configuration(ConfigurationPatch::new()
-                .model(ConfigurationChange::Set(String::from("model-secret")))
-                .effort(ConfigurationChange::Set(String::from("effort-secret"))))
+            .with_configuration(
+                ConfigurationPatch::new()
+                    .model(ConfigurationChange::Set(String::from("model-secret")))
+                    .effort(ConfigurationChange::Set(String::from("effort-secret"))),
+            )
             .resuming("resume-id-secret", ResumeMode::Fallback)
             .with_mcp_servers(vec![McpServer::stdio("server-name-secret", "docs-mcp")]);
         let turn = TurnRequest::new("turn-id-secret", "prompt-secret").with_attachments(vec![

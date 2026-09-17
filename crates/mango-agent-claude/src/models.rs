@@ -283,14 +283,8 @@ mod tests {
     fn refuses_an_explicit_unsupported_value_instead_of_dropping_it() {
         let surface = CliSurface::parse(HELP_2_1_260);
         for configuration in [
-            Configuration {
-                model: Some(String::from("--dangerously-skip-permissions")),
-                ..Configuration::default()
-            },
-            Configuration {
-                effort: Some(String::from("ultra")),
-                ..Configuration::default()
-            },
+            Configuration::unknown().with_model("--dangerously-skip-permissions"),
+            Configuration::unknown().with_effort("ultra"),
         ] {
             let error = validate_configuration(&configuration, Some(&surface))
                 .expect_err("expected the explicit value to be refused");

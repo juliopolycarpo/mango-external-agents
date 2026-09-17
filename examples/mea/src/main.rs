@@ -407,8 +407,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        HarnessChoice, Options, acp_profile_ids, describe, discover_with, harness_lines, registry,
-        refusal, run,
+        HarnessChoice, Options, acp_profile_ids, describe, discover_with, harness_lines, refusal,
+        registry, run,
     };
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{

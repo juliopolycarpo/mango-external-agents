@@ -828,7 +828,7 @@ async fn check_close(session: &dyn Session, report: &mut Report) {
 fn refuses_as_unsupported<T>(outcome: &crate::error::Result<T>, capability: Capability) -> bool {
     matches!(
         outcome,
-        Err(Error::NotSupported { capability: found }) if *found == capability
+        Err(error) if matches!(error.cause(), Error::NotSupported { capability: found } if *found == capability)
     )
 }
 
