@@ -482,6 +482,23 @@ pub struct SessionInfo {
     pub capabilities: Capabilities,
 }
 
+impl fmt::Debug for SessionInfo {
+    /// Records what opening decided without logging the ids or the vendor's fallback text.
+    ///
+    /// Kept rather than dropped: a host that wraps a `SessionInfo` and derives `Debug` for its own
+    /// type needs this trait to exist, and `dbg!(session.info())` is the first thing anybody
+    /// reaches for when a resume behaves unexpectedly.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionInfo")
+            .field("resumed", &self.resumed)
+            .field("has_fallback_reason", &self.fallback_reason.is_some())
+            .field("effective_configuration", &self.effective_configuration)
+            .field("capabilities", &self.capabilities)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The largest attachment the vendor wire carries, and how many of them.
 pub const ATTACHMENT_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// How many attachments one turn may carry.
@@ -1020,6 +1037,33 @@ mod tests {
         SessionPage, TurnRequest,
     };
     use crate::permission::{ApprovalRouting, PermissionLevel};
+
+    /// `Debug` stays on the public snapshot, because a host wrapping it derives its own.
+    #[test]
+    fn session_info_debug_reports_metadata_without_ids_or_vendor_text() {
+        let info = SessionInfo {
+            ids: SessionIds {
+                session_id: crate::SessionId::new("chat-id-secret"),
+                native_session_id: String::from("native-id-secret"),
+            },
+            resumed: false,
+            fallback_reason: Some(String::from("fallback-text-secret")),
+            effective_configuration: Configuration::default(),
+            capabilities: crate::Capabilities::none(),
+        };
+
+        let rendered = format!("{info:?}");
+        for secret in ["chat-id-secret", "native-id-secret", "fallback-text-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no session payload in diagnostics, received {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("has_fallback_reason: true"),
+            "expected the fallback to be reported as present, received {rendered}"
+        );
+    }
 
     #[test]
     fn mcp_debug_keeps_values_and_positional_arguments_out_of_diagnostics() {
