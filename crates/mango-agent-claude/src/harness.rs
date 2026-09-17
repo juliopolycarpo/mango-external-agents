@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use mango_external_agents::{
     AuthState, Capabilities, CapabilityCeiling, Configuration, ConfigurationCatalog,
-    ConfigurationState, Discovery, Error, ExecutablePath, GateVerdict, Harness, HarnessDescriptor,
-    HarnessIdentity, HostContext, OpenSession, PermissionMatrix, Result, Session,
-    SessionCapabilities, SessionIds, SessionSnapshot, SessionState, TransportKind,
+    ConfigurationState, Discovery, Dispatch, Error, ExecutablePath, GateVerdict, Harness,
+    HarnessDescriptor, HarnessIdentity, HostContext, OpenSession, PermissionMatrix, Result,
+    Session, SessionCapabilities, SessionIds, SessionSnapshot, SessionState, TransportKind,
     TransportSelection,
 };
 
@@ -139,6 +139,73 @@ impl ClaudeHarness {
             version,
             refusal: None,
             authentication,
+            availability,
+            surface,
+        }
+    }
+
+    /// Reuses a host-vouched probe where its public record is sufficient, while re-reading the
+    /// help grammar this harness must parse to build safe argv.
+    async fn survey_for_open(
+        &self,
+        host: &HostContext,
+        executable: &ExecutablePath,
+        receipt: Option<&mango_external_agents::DiscoveryReceipt>,
+    ) -> Survey {
+        let Some(receipt) = receipt else {
+            return self.survey(host, executable).await;
+        };
+
+        let surface = probe::output(host, executable, &["--help"])
+            .await
+            .map(|help| CliSurface::parse(&help))
+            .filter(CliSurface::is_usable);
+        let version = receipt
+            .discovery
+            .version
+            .as_deref()
+            .and_then(version::parse);
+        let refusal = match receipt.discovery.gate {
+            GateVerdict::NotInstalled | GateVerdict::VersionTooOld { .. } => Some(String::new()),
+            GateVerdict::Usable | GateVerdict::Unknown => {
+                CliSurface::refusal(surface.as_ref(), version.as_ref())
+            }
+            _ => Some(String::new()),
+        };
+        let account_kind = match receipt.discovery.auth {
+            AuthState::LoggedIn {
+                mode: mango_external_agents::AuthMode::Subscription,
+            } => Some(crate::auth::AccountKind::Subscription),
+            AuthState::LoggedIn {
+                mode: mango_external_agents::AuthMode::ApiKey,
+            } => Some(crate::auth::AccountKind::ApiKey),
+            AuthState::LoggedIn {
+                mode: mango_external_agents::AuthMode::Other(_),
+            } => Some(crate::auth::AccountKind::CloudProvider),
+            AuthState::LoggedOut { .. } | AuthState::Unknown => None,
+            _ => None,
+        };
+        let availability = ModeAvailability {
+            account_kind,
+            auto_mode_disabled_by_policy: read_auto_mode_policy(host).await,
+            accepted_modes: surface
+                .as_ref()
+                .and_then(CliSurface::accepted_modes)
+                .cloned(),
+        };
+
+        Survey {
+            banner: receipt
+                .discovery
+                .version
+                .clone()
+                .or_else(|| Some(String::from("receipt"))),
+            version,
+            refusal,
+            authentication: Authentication {
+                state: receipt.discovery.auth.clone(),
+                kind: account_kind,
+            },
             availability,
             surface,
         }
@@ -276,11 +343,15 @@ impl Harness for ClaudeHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        self.validate_open_session(host, &request)?;
+        self.validate_open_session(host, &request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         // Claude's model and permission-mode flags are argv on a fresh child: there is no surface
         // to un-set one on an already-open session, so a reset is refused wherever a host could
         // ask for one rather than silently treated as "leave it alone".
-        mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)?;
+        mango_external_agents::configuration::refuse_unsupported_native(&request.configuration)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
         // This is a host authorization check, not a fact a vendor can answer. Prepare the file
         // before the first probe so a missing or inaccessible scratch location never starts a
@@ -299,7 +370,9 @@ impl Harness for ClaudeHarness {
             ConfigFile::write(&request.mcp_servers, scratch).await?
         });
         let executable = self.executable_for(&request);
-        let survey = self.survey(host, &executable).await;
+        let survey = self
+            .survey_for_open(host, &executable, request.discovery.as_ref())
+            .await;
 
         // Every refusal below owns the artifact written above, and removing it is a synchronous
         // `remove_dir_all` against the host's own scratch root. Gathered into one call so a failed
@@ -397,8 +470,8 @@ impl ClaudeHarness {
 
         // Requested only, not accepted: opening starts nothing — see this crate's own module
         // documentation — so nothing has actually been encoded onto an argv yet. The first turn
-        // is what accepts it; see `ClaudeSession::start_turn`. Observed stays unknown,
-        // permanently: no documented Claude surface reports its own settings back.
+        // is what accepts it; see `ClaudeSession::start_turn`. Observed starts unknown: a later
+        // `system/init` can report the model a live Claude process selected.
         let configuration_state = ConfigurationState::new(
             opening_configuration,
             Configuration::unknown(),

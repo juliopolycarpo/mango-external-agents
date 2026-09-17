@@ -8,9 +8,10 @@ use std::time::Duration;
 use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::{
     ApprovalRouting, AuthMode, AuthState, CancelReason, CloseReason, Configuration,
-    ConfigurationChange, ConfigurationPatch, Error, EventKind, ExecutablePath, GateVerdict,
-    Harness, InteractionId, Limits, LineLimits, OpenSession, PermissionLevel, PermissionResponse,
-    ResumeMode, Session, TurnRequest, TurnStream,
+    ConfigurationChange, ConfigurationOptionId, ConfigurationPatch, ConfigurationValue,
+    DiscoveryReceipt, Dispatch, Error, EventKind, ExecutablePath, GateVerdict, Harness, HarnessId,
+    HostContext, InteractionId, Limits, LineLimits, OpenSession, PermissionLevel,
+    PermissionResponse, ResumeMode, Session, TurnRequest, TurnStream,
 };
 use support::{
     FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, host, host_under,
@@ -261,6 +262,34 @@ mod opening_a_session {
     use super::*;
 
     #[tokio::test]
+    async fn a_fresh_receipt_reuses_the_version_and_auth_answers_but_rechecks_help() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        let before = launcher.launches().len();
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now());
+
+        harness
+            .open_session(&host, OpenSession::new("chat-1").with_discovery(receipt))
+            .await
+            .expect("expected the fresh receipt to open a session");
+
+        let launches = launcher.launches();
+        let reused = &launches[before..];
+        assert_eq!(
+            reused.len(),
+            1,
+            "expected only the help surface to be rechecked, received {reused:?}"
+        );
+        assert_eq!(
+            reused[0].argv[1..],
+            ["--help"],
+            "expected the exact argv surface to be refreshed"
+        );
+    }
+
+    #[tokio::test]
     async fn mints_a_uuid_the_cli_will_accept_without_starting_anything() {
         let launcher = Arc::new(FakeClaudeCli::new());
         let session = open(&launcher).await;
@@ -326,7 +355,7 @@ mod opening_a_session {
                 .map(drop)
                 .expect_err("expected the reference to be refused");
             assert!(
-                matches!(error, Error::HostConfiguration { .. }),
+                matches!(error.cause(), Error::HostConfiguration { .. }),
                 "expected a host-configuration refusal for {injected:?}, received {error:?}"
             );
             // The refusal names the shape, never the handle: a stored resume reference is the
@@ -354,7 +383,7 @@ mod opening_a_session {
             .expect_err("expected a refusal");
 
         assert!(
-            matches!(error, Error::AuthRequired { ref login_hint } if login_hint == "claude auth login"),
+            matches!(error.cause(), Error::AuthRequired { login_hint } if login_hint == "claude auth login"),
             "received {error:?}"
         );
         assert!(launcher.turn_argvs().is_empty());
@@ -375,7 +404,7 @@ mod opening_a_session {
             .expect_err("expected a refusal");
 
         assert!(
-            matches!(error, Error::VersionGate { ref minimum, .. } if minimum == "2.1.211"),
+            matches!(error.cause(), Error::VersionGate { minimum, .. } if minimum == "2.1.211"),
             "received {error:?}"
         );
     }
@@ -398,7 +427,7 @@ mod opening_a_session {
             .expect_err("expected a refusal");
 
         assert!(
-            matches!(error, Error::HostConfiguration { .. }),
+            matches!(error.cause(), Error::HostConfiguration { .. }),
             "received {error:?}"
         );
         assert!(launcher.turn_argvs().is_empty());
@@ -419,7 +448,7 @@ mod opening_a_session {
             .expect_err("expected a reset request to be refused");
 
         assert!(
-            matches!(error, Error::HostConfiguration { .. }),
+            matches!(error.cause(), Error::HostConfiguration { .. }),
             "received {error:?}"
         );
         assert!(
@@ -429,6 +458,31 @@ mod opening_a_session {
         assert!(
             launcher.turn_argvs().is_empty(),
             "expected no turn to be spawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_native_opening_axis_before_probing_or_spawning() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let request =
+            OpenSession::new("chat-1").with_configuration(ConfigurationPatch::new().native(
+                ConfigurationOptionId::new("web-search"),
+                ConfigurationChange::Set(ConfigurationValue::Boolean(true)),
+            ));
+        let error = ClaudeHarness::new()
+            .open_session(&host(Arc::clone(&launcher)), request)
+            .await
+            .map(drop)
+            .expect_err("expected an unsupported native axis to be refused");
+
+        assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+        assert!(
+            matches!(error.cause(), Error::Protocol { .. }),
+            "received {error:?}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected no probe or turn to spawn"
         );
     }
 
@@ -455,19 +509,32 @@ mod opening_a_session {
 mod a_turn {
     use super::*;
 
+    #[tokio::test]
+    async fn publishes_the_model_system_init_reports_as_observed_configuration() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(READ_TURN)));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "read note.txt"))
+            .await
+            .expect("expected a turn");
+        drain(&mut turn).await;
+
+        assert_eq!(
+            session.snapshot().configuration.observed.model.as_deref(),
+            Some("claude-sonnet-5"),
+            "expected the vendor-reported model to remain distinct from accepted argv settings"
+        );
+    }
+
     /// A configuration value reaches the child process argv. Reject it before reserving or
     /// starting a child, because dropping it would run under settings the host did not choose.
     #[tokio::test]
     async fn refuses_an_invalid_model_or_effort_before_starting_a_child() {
         let cases = [
-            Configuration {
-                model: Some(String::from("--dangerously-skip-permissions")),
-                ..Configuration::default()
-            },
-            Configuration {
-                effort: Some(String::from("ultra")),
-                ..Configuration::default()
-            },
+            ConfigurationPatch::new().model(ConfigurationChange::Set(String::from(
+                "--dangerously-skip-permissions",
+            ))),
+            ConfigurationPatch::new().effort(ConfigurationChange::Set(String::from("ultra"))),
         ];
 
         for configuration in cases {
@@ -482,7 +549,7 @@ mod a_turn {
                 .expect_err("expected an invalid explicit configuration to be refused");
 
             assert!(
-                matches!(error, Error::HostConfiguration { .. }),
+                matches!(error.cause(), Error::HostConfiguration { .. }),
                 "received {error:?}"
             );
             assert!(
@@ -637,7 +704,7 @@ mod a_turn {
             .expect_err("expected a whitespace-only turn id to be refused");
         assert!(
             matches!(
-                error,
+                error.cause(),
                 Error::InvalidVendorValue {
                     field: "native turn id",
                     ..
@@ -671,12 +738,37 @@ mod a_turn {
                 .expect_err("expected a reset request to be refused");
 
         assert!(
-            matches!(error, Error::HostConfiguration { .. }),
+            matches!(error.cause(), Error::HostConfiguration { .. }),
             "received {error:?}"
         );
         assert!(
             error.to_string().contains("reset"),
             "expected the refusal to name the reset, received {error}"
+        );
+        assert!(
+            launcher.turn_argvs().is_empty(),
+            "expected no turn to be spawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_native_turn_axis_before_spawning() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let session = open(&launcher).await;
+        let error = session
+            .start_turn(TurnRequest::new("turn-1", "hello").with_configuration(
+                ConfigurationPatch::new().native(
+                    ConfigurationOptionId::new("web-search"),
+                    ConfigurationChange::Set(ConfigurationValue::Boolean(true)),
+                ),
+            ))
+            .await
+            .expect_err("expected an unsupported native axis to be refused");
+
+        assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+        assert!(
+            matches!(error.cause(), Error::Protocol { .. }),
+            "received {error:?}"
         );
         assert!(
             launcher.turn_argvs().is_empty(),
@@ -1006,7 +1098,7 @@ mod a_turn {
 
         let outcome = starting.await.expect("expected the task to finish");
         assert!(
-            matches!(outcome, Err(Error::Closed { .. })),
+            matches!(outcome, Err(ref error) if matches!(error.cause(), Error::Closed { .. })),
             "expected the turn to be refused by the closed session, received {outcome:?}"
         );
         assert!(
@@ -1050,9 +1142,13 @@ mod a_turn {
         assert!(
             matches!(
                 outcome,
-                Err(Error::Cancelled {
-                    reason: CancelReason::Requested
-                })
+                Err(ref error)
+                    if matches!(
+                        error.cause(),
+                        Error::Cancelled {
+                            reason: CancelReason::Requested
+                        }
+                    )
             ),
             "expected the turn to be refused by the cancel that landed while it was starting, received {outcome:?}"
         );
@@ -1108,9 +1204,13 @@ mod a_turn {
         assert!(
             matches!(
                 first_outcome,
-                Err(Error::Cancelled {
-                    reason: CancelReason::Requested
-                })
+                Err(ref error)
+                    if matches!(
+                        error.cause(),
+                        Error::Cancelled {
+                            reason: CancelReason::Requested
+                        }
+                    )
             ),
             "expected the first turn to be refused as superseded, received {first_outcome:?}"
         );
@@ -1149,7 +1249,7 @@ mod a_turn {
             .expect_err("expected the attachment to be refused rather than silently dropped");
         assert!(
             matches!(
-                error,
+                error.cause(),
                 Error::NotSupported {
                     capability: mango_external_agents::Capability::Images
                 }
@@ -1172,7 +1272,7 @@ mod a_turn {
             .expect_err("expected a refusal");
         assert!(
             matches!(
-                error,
+                error.cause(),
                 Error::NotSupported {
                     capability: mango_external_agents::Capability::InteractiveApprovals
                 }
@@ -1277,11 +1377,11 @@ mod mcp_passthrough {
             let mut refused = Box::pin(
                 session.start_turn(
                     TurnRequest::new("turn-1", "raise the session's permissions")
-                        .with_configuration(Configuration {
-                            level: Some(PermissionLevel::Default),
-                            routing: Some(ApprovalRouting::User),
-                            ..Configuration::default()
-                        }),
+                        .with_configuration(
+                            ConfigurationPatch::new()
+                                .level(ConfigurationChange::Set(PermissionLevel::Default))
+                                .routing(ConfigurationChange::Set(ApprovalRouting::User)),
+                        ),
                 ),
             );
             assert!(
@@ -1302,7 +1402,7 @@ mod mcp_passthrough {
             );
 
             assert_eq!(
-                session.configuration().await.level,
+                session.snapshot().configuration.accepted.level,
                 None,
                 "expected a refused start to leave the session's own configuration alone"
             );
@@ -1525,7 +1625,7 @@ mod mcp_passthrough {
                 Err(error) => error,
             };
             assert!(
-                matches!(error, Error::Cancelled { .. }),
+                matches!(error.cause(), Error::Cancelled { .. }),
                 "expected the recorded cancellation, received {error:?}"
             );
             // The cancel took the turn and killed its child. `ProcessControl::kill` is not
@@ -1665,7 +1765,7 @@ mod mcp_passthrough {
             .expect_err("expected MCP setup without host scratch to be refused");
         assert!(
             matches!(
-                error,
+                error.cause(),
                 Error::HostConfiguration {
                     expected: "a host-owned scratch directory for MCP configuration",
                     ..
@@ -1705,7 +1805,7 @@ mod mcp_passthrough {
             .map(drop)
             .expect_err("expected a non-directory scratch path to be refused");
         assert!(
-            matches!(error, Error::HostConfiguration { .. }),
+            matches!(error.cause(), Error::HostConfiguration { .. }),
             "received {error:?}"
         );
         assert!(
@@ -1742,7 +1842,7 @@ mod mcp_passthrough {
             .expect_err("expected unsupported MCP passthrough to refuse opening");
         assert!(
             matches!(
-                error,
+                error.cause(),
                 Error::NotSupported {
                     capability: mango_external_agents::Capability::McpPassthrough
                 }
@@ -1856,7 +1956,7 @@ mod mcp_passthrough {
 
         let outcome = starting.await.expect("expected the start task to finish");
         assert!(
-            matches!(outcome, Err(Error::Closed { .. })),
+            matches!(outcome, Err(ref error) if matches!(error.cause(), Error::Closed { .. })),
             "expected the closed session to refuse the turn, received {outcome:?}"
         );
         assert_eq!(
@@ -1880,7 +1980,7 @@ mod mcp_passthrough {
             .expect_err("expected a refusal rather than a session without the servers");
         assert!(
             matches!(
-                error,
+                error.cause(),
                 Error::NotSupported {
                     capability: mango_external_agents::Capability::McpPassthrough
                 }
@@ -2046,7 +2146,10 @@ mod cancelling_and_closing {
             .start_turn(TurnRequest::new("turn-1", "too late"))
             .await
             .expect_err("expected a closed session to refuse a turn");
-        assert!(matches!(error, Error::Closed { .. }), "received {error:?}");
+        assert!(
+            matches!(error.cause(), Error::Closed { .. }),
+            "received {error:?}"
+        );
     }
 
     #[tokio::test]

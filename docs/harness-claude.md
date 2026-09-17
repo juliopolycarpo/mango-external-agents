@@ -82,8 +82,10 @@ claude --print
   is passed until the host selects permissions. Claude's single mode flag requires both axes on
   the first selection; subsequent partial updates inherit the other axis. Accepted settings persist
   in `Session::snapshot().configuration.accepted` and are repeated on later batch invocations.
-  They stay out of `observed`: a flag this harness put on a command line is a flag it encoded,
-  not a setting the vendor reported it is running under.
+  Permission settings stay out of `observed`: a flag this harness put on a command line is a flag
+  it encoded, not a setting the vendor reported it is running under. `system/init` does report a
+  model for a live run, so that one value is published in
+  `Session::snapshot().configuration.observed.model` ([headless.md](https://code.claude.com/docs/en/headless.md)).
 - **`--permission-prompts none`** accompanies an explicit permission mode only on a build that
   declares it (2.1.259+). It is
   pinning, not a fix: the vendor's current default is `host`, and this harness is not an answering
@@ -109,10 +111,10 @@ id, and each turn spawns, streams and reaps its own child.
   a host holds a resumable handle before any tokens are spent. The first turn passes
   `--session-id`; every later one passes `--resume`, using whatever handle the run's own
   `system/init` reported.
-- **`Session::ids()` is the handle in force; `Session::info()` is the opening snapshot.** A run may
-  report a `session_id` other than the one `--session-id` proposed, and from then on that is the
-  only handle `--resume` accepts — so it is the one a host persists. `info().ids` keeps the id
-  opening answered with, which is what makes the change legible rather than silent.
+- **`Session::ids()` and `Session::snapshot().ids` are the handle in force.** A run may report a
+  `session_id` other than the one `--session-id` proposed, and from then on that is the only handle
+  `--resume` accepts — so it is the one a host persists. The opening snapshot remains available to
+  the host that retained it when the session was opened.
 - **Resume is vetted for shape, never verified for existence.** Verifying that a conversation is
   still there would cost a process launch per open, and a wrong guess is recoverable: a session the
   vendor has forgotten fails at the first turn with the vendor's own message. `ResumeMode::Fallback`
@@ -250,6 +252,11 @@ This is a measured verdict, and the measurement is worth recording because it is
 Three probes, all documented, read-only and non-secret: `claude --version`, `claude --help` and
 `claude auth status` ("Show authentication status as JSON. Use `--text` for human-readable output.
 Exits with code 0 if logged in, 1 if not").
+
+An accepted `DiscoveryReceipt` reuses its version and authentication answers when opening a
+session, but re-runs `--help`. The receipt records normalized discovery facts, not the exact help
+grammar needed to decide current safe argv such as permission modes, effort levels and MCP support;
+inventing that grammar from a capability summary would risk passing an undeclared flag.
 
 `auth status` returns more personal data than any other vendor's status call — `email`, `orgId`,
 `orgName`, `projectsDirectory`, `subscriptionType`. **None of it leaves the parser.** Two facts do:

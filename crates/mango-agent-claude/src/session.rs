@@ -20,10 +20,10 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use mango_external_agents::{
-    CancelReason, CloseReason, Configuration, ConfigurationState, Error, ErrorCode, EventKind,
-    EventSink, ExecutablePath, HostContext, PermissionResponse, Result, SessionLifecycle,
-    SessionState as CoreSessionState, SessionStatus, StdioSpec, TurnRequest, TurnStream,
-    VendorError, event, transports::stdio,
+    CancelReason, CloseReason, Configuration, ConfigurationState, Dispatch, Error, ErrorCode,
+    EventKind, EventSink, ExecutablePath, HostContext, PermissionResponse, Result,
+    SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec, TurnRequest,
+    TurnStream, VendorError, event, transports::stdio,
 };
 use serde_json::json;
 
@@ -274,7 +274,8 @@ impl mango_external_agents::Session for ClaudeSession {
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
-        self.validate_turn_request(&request)?;
+        self.validate_turn_request(&request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         if !request.attachments.is_empty() {
             // Claude Code's stream-json input takes content blocks, but nothing here encodes one
             // and `Capabilities::images` is false. Refusing is the honest answer: silently
@@ -283,14 +284,18 @@ impl mango_external_agents::Session for ClaudeSession {
             return Err(Error::HostConfiguration {
                 expected: "a turn with no attachments, which this harness does not forward",
                 received: format!("{} attachments", request.attachments.len()),
-            });
+            }
+            .with_dispatch(Dispatch::NotSubmitted));
         }
 
         let requested_configuration = request.configuration.clone();
         if let Some(patch) = &requested_configuration {
             // Same rule as opening: a fresh child is the only place Claude's mode and model land,
             // so there is no argv this harness could encode that un-sets one mid-session.
-            mango_external_agents::configuration::refuse_unsupported_reset(patch)?;
+            mango_external_agents::configuration::refuse_unsupported_native(patch)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+            mango_external_agents::configuration::refuse_unsupported_reset(patch)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         }
         // Read from `requested`, not `accepted`: opening starts nothing, so the first turn has
         // nothing accepted to inherit yet, and every later turn's `requested` already carries
@@ -305,11 +310,15 @@ impl mango_external_agents::Session for ClaudeSession {
         let configuration = requested_configuration
             .as_ref()
             .map_or_else(|| current.clone(), |patch| current.patched(patch));
-        let mode = self.shared.resolve_mode(&configuration)?;
+        let mode = self
+            .shared
+            .resolve_mode(&configuration)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         // Configuration is caller-owned and becomes a value position after a Claude option.
         // Reject it before reserving a child: omitting an invalid explicit value would run the
         // turn under a setting the host did not select.
-        models::validate_configuration(&configuration, self.shared.surface.as_ref())?;
+        models::validate_configuration(&configuration, self.shared.surface.as_ref())
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
         // A host that starts a second turn has decided the first is over. Taken before anything is
         // spawned so the two cannot both hold a child, and the slot this turn claims is reserved
@@ -319,7 +328,9 @@ impl mango_external_agents::Session for ClaudeSession {
         let end = Arc::new(TurnEnd::default());
         let (previous, mut mcp_lease) = {
             let Some(_lifecycle) = self.shared.lifecycle.begin_start() else {
-                return Err(Error::Closed { subject: "session" });
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
             };
             let mut state = self.shared.lock();
             let previous = take_turn(&mut state, CancelReason::Requested);
@@ -380,7 +391,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 // makes this lease the last one and its drop the `remove_dir_all`. Off the worker,
                 // for the same reason the write is.
                 crate::mcp::release_off_worker(mcp_lease.take()).await;
-                return Err(error);
+                return Err(error.with_dispatch(Dispatch::NotSubmitted));
             }
         };
 
@@ -431,27 +442,6 @@ impl mango_external_agents::Session for ClaudeSession {
                     .as_ref()
                     .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
             {
-                // `stdio::open` is the successful start boundary for the batch CLI: there is no
-                // app-server response to acknowledge later, so a turn that spawned is a turn
-                // whose configuration — whatever it resolved to — just landed on argv. Accepted
-                // always moves to it. Requested moves too, but only when this turn asked for
-                // something explicitly: an unconfigured turn inheriting the last explicit choice
-                // is not itself a new request, and overwriting `requested` with its own inherited
-                // value would still be correct here but would erase the distinction for the next
-                // unconfigured turn to inherit from. Observed stays unknown — no documented Claude
-                // surface reports its own settings back.
-                let requested = if requested_configuration.is_some() {
-                    configuration.clone()
-                } else {
-                    current
-                };
-                self.shared
-                    .core_state
-                    .set_configuration(ConfigurationState::new(
-                        requested,
-                        configuration.clone(),
-                        Configuration::unknown(),
-                    ));
                 state.active = Some(ActiveTurn {
                     end: Arc::clone(&end),
                     control: Some(Arc::clone(&control)),
@@ -467,11 +457,12 @@ impl mango_external_agents::Session for ClaudeSession {
             // worker, because a close that won the race left this lease holding the last
             // reference, so this is where the `remove_dir_all` happens.
             crate::mcp::release_off_worker(mcp_lease.take()).await;
-            return Err(if self.shared.lifecycle.is_closed() {
+            return Err((if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
                 Error::Cancelled { reason }
-            });
+            })
+            .with_dispatch(Dispatch::Accepted));
         }
 
         // Before the pump, and this ordering is the whole point: the release parks on the blocking
@@ -503,7 +494,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // been handed out yet, so refusing here is still the honest answer.
         let stopped = {
             let lifecycle = self.shared.lifecycle.lock();
-            let mut state = self.shared.lock();
+            let state = self.shared.lock();
             if lifecycle.is_closed()
                 || !state
                     .active
@@ -520,15 +511,22 @@ impl mango_external_agents::Session for ClaudeSession {
                 // that had already written these defaults would hand a cancelled turn's model and
                 // permissions to the next turn that asked for nothing. This is the last point
                 // where the start can still fail, and no await follows it.
-                if requested_configuration.is_some() {
-                    self.shared
-                        .core_state
-                        .set_configuration(ConfigurationState::new(
-                            configuration.clone(),
-                            configuration.clone(),
-                            Configuration::unknown(),
-                        ));
-                }
+                // The successful CLI spawn does not settle this boundary by itself: releasing
+                // the MCP lease above awaits, so a close, cancel, or newer turn can still refuse
+                // this attempt. Only now is the argv configuration accepted. An unconfigured
+                // turn inherits accepted settings without replacing the last explicit request.
+                let requested = if requested_configuration.is_some() {
+                    configuration.clone()
+                } else {
+                    current
+                };
+                self.shared
+                    .core_state
+                    .set_configuration(ConfigurationState::new(
+                        requested,
+                        configuration.clone(),
+                        Configuration::unknown(),
+                    ));
                 None
             }
         };
@@ -539,11 +537,12 @@ impl mango_external_agents::Session for ClaudeSession {
             // itself — and `ProcessControl::kill` documents that the library asks once. The guard
             // is disarmed for the same reason.
             abandoned.disarm();
-            return Err(if self.shared.lifecycle.is_closed() {
+            return Err((if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
                 Error::Cancelled { reason }
-            });
+            })
+            .with_dispatch(Dispatch::Accepted));
         }
 
         // The pump owns the child from here, after the turn-start event is enqueued.
@@ -565,7 +564,7 @@ impl mango_external_agents::Session for ClaudeSession {
             clear_active(&self.shared, &end);
             let _ = control.kill(CancelReason::Requested).await;
             abandoned.disarm();
-            return Err(error);
+            return Err(error.with_dispatch(Dispatch::Accepted));
         }
         abandoned.disarm();
         tokio::spawn(pump(
@@ -815,6 +814,14 @@ fn apply_init(shared: &Shared, init: RunInit) {
             .set_commands(event::normalized_catalog(commands));
     }
 
+    if let Some(model) = init.model {
+        let configuration = shared.core_state.snapshot().configuration.clone();
+        let observed = configuration.observed.clone().with_model(model);
+        shared
+            .core_state
+            .set_configuration(configuration.with_observed(observed));
+    }
+
     let Some(session_id) = init.session_id else {
         return;
     };
@@ -877,7 +884,7 @@ fn no_result_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionState, TurnEnd, no_result_error, prompt_line};
+    use super::{Mutable, TurnEnd, no_result_error, prompt_line};
     use mango_external_agents::{CancelReason, ExitStatus};
 
     /// A session dropped rather than closed must hand its artifact to the blocking pool, not run
@@ -916,7 +923,7 @@ mod tests {
 
             // Field by field: `SessionState` implements `Drop` now, so struct-update syntax
             // cannot move the rest out of a default.
-            let mut state = SessionState::default();
+            let mut state = Mutable::default();
             state.mcp_config = Some(std::sync::Arc::new(file));
             drop(state);
 
