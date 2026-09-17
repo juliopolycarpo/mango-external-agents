@@ -156,7 +156,10 @@ fn document_for(servers: &[McpServer]) -> Result<Value> {
     for server in servers {
         let entry = entry_for(&server.transport).ok_or_else(|| Error::HostConfiguration {
             expected: "an MCP transport this harness maps onto --mcp-config",
-            received: format!("{:?} on server {:?}", server.transport, server.name),
+            // The kind, never the transport itself: `Stdio` carries `env` and `Http` carries
+            // `headers`, and both are where a host puts the credential its server authenticates
+            // with.
+            received: format!("an unmapped transport on server {:?}", server.name),
         })?;
         // The vendor's `mcpServers` is a map, so a repeated name can only keep one entry — and
         // `insert` would keep the last quietly. That is the same drop this module refuses an

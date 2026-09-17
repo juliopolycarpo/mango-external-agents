@@ -328,7 +328,7 @@ impl Harness for ClaudeHarness {
             Some(resume) if !argv::is_vendor_session_id(&resume.native_session_id) => {
                 return Err(Error::HostConfiguration {
                     expected: "a resume reference shaped like the UUID Claude Code mints",
-                    received: format!("{:?}", resume.native_session_id),
+                    received: argv::value_summary(&resume.native_session_id),
                 });
             }
             Some(resume) => resume.native_session_id.clone(),

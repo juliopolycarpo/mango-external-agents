@@ -328,6 +328,13 @@ mod opening_a_session {
                 matches!(error, Error::HostConfiguration { .. }),
                 "expected a host-configuration refusal for {injected:?}, received {error:?}"
             );
+            // The refusal names the shape, never the handle: a stored resume reference is the
+            // host's own opaque data, and this one is being reported precisely because nobody
+            // knows what is in it.
+            assert!(
+                !error.to_string().contains(injected),
+                "expected the rejected reference to stay out of the message, received {error}"
+            );
         }
         assert!(
             launcher.turn_argvs().is_empty(),

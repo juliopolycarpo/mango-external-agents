@@ -178,7 +178,7 @@ impl TurnArgv<'_> {
 }
 
 /// Summarises a rejected host value without exposing its contents through diagnostics.
-fn value_summary(value: &str) -> String {
+pub(crate) fn value_summary(value: &str) -> String {
     format!("{} code points", value.chars().count())
 }
 
