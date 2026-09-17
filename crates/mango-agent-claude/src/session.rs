@@ -76,6 +76,23 @@ struct SessionState {
     configuration: Configuration,
 }
 
+impl Drop for SessionState {
+    /// Hands the session's own artifact reference to the blocking pool, as every other path that
+    /// can drop the last one does.
+    ///
+    /// `ConfigFile`'s `Drop` removes the directory synchronously, deliberately: a value dropped
+    /// with no runtime has nothing to hand the call to. A session dropped rather than closed does
+    /// usually have one — the host drops its handle inside a task, or a finished pump releases the
+    /// last `Shared` on a worker — and that is where a `remove_dir_all` against a host's FUSE,
+    /// container or network mount would stall every other task on that thread. `close` has already
+    /// taken this by the time it runs, so the ordinary path costs nothing.
+    fn drop(&mut self) {
+        if let Some(config) = self.mcp_config.take() {
+            crate::mcp::release_on_drop(config);
+        }
+    }
+}
+
 /// What a session needs for its whole life, shared with the task each turn runs on.
 struct Shared {
     host: HostContext,
@@ -783,8 +800,81 @@ fn no_result_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{TurnEnd, no_result_error, prompt_line};
+    use super::{SessionState, TurnEnd, no_result_error, prompt_line};
     use mango_external_agents::{CancelReason, ExitStatus};
+
+    /// A session dropped rather than closed must hand its artifact to the blocking pool, not run
+    /// `remove_dir_all` on the thread that dropped it — a host root can be a FUSE or network mount.
+    ///
+    /// The pool is given one thread and that thread is occupied, so a handed-off removal cannot
+    /// have run yet when the assertion reads the directory. A removal done in place would already
+    /// be finished there, which is exactly the difference under test.
+    #[test]
+    fn a_session_dropped_without_a_close_removes_its_artifact_off_the_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        let scratch = std::env::temp_dir().join(format!("mea-drop-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).expect("expected a scratch root");
+
+        runtime.block_on(async {
+            let file = crate::mcp::ConfigFile::write(&servers(), &scratch)
+                .await
+                .expect("expected a written artifact")
+                .expect("expected servers to produce one");
+            let directory = file
+                .path()
+                .parent()
+                .expect("a file sits in a directory")
+                .to_path_buf();
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            // Field by field: `SessionState` implements `Drop` now, so struct-update syntax
+            // cannot move the rest out of a default.
+            let mut state = SessionState::default();
+            state.mcp_config = Some(std::sync::Arc::new(file));
+            drop(state);
+
+            assert!(
+                directory.exists(),
+                "expected the removal to be waiting on the occupied pool, received {directory:?} already gone"
+            );
+
+            drop(release_pool);
+            let _ = occupied.await;
+            for _ in 0..50 {
+                if !directory.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                !directory.exists(),
+                "expected the handed-off removal to finish, received {directory:?}"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    fn servers() -> Vec<mango_external_agents::McpServer> {
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Stdio {
+                command: String::from("docs-mcp"),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+            },
+        }]
+    }
 
     #[test]
     fn only_the_first_caller_to_stop_a_turn_records_the_reason() {

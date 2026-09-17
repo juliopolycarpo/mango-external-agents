@@ -36,10 +36,12 @@ Facts were read on 2026-09-12; re-verify against the vendor's current page befor
   are not carriers but the ids themselves: they are the host's own, minted by the host and printed
   for it, and a host formatting a value it created is not a boundary this library stands on.
   `ErrorCode` and `AcpProfileId` are the other side of that line: also host- or vendor-filled, but
-  written into sentences the library composes and a third party may read, so `Display` writes them
-  only when they have a label's shape — at most 48 bytes of `a-z`, `0-9`, `-` and `_` — and writes
-  `vendor-code` or `profile` when they do not. `as_str` stays the protocol field on both and is
-  never bounded.
+  written into sentences the library composes and a third party may read, so `Display` and `Debug`
+  both write them only when they have a label's shape — at most 48 bytes of `a-z`, `0-9`, `-` and `_` — and write
+  `vendor-code` or `profile` when they do not. `Debug` is named because it is the formatter a
+  derive would silently leave open, and because an assertion made through an `Error` cannot see
+  it: `Error`'s own `Debug` forwards to its `Display`. `as_str` stays the protocol field on both
+  and is never bounded.
   `examples/mea` is an unpublished smoke tool, not part of the guarantee either: its own refusals
   name the paths and OS messages its operator needs.
 - **No telemetry, no listener, no downloaded binaries.**

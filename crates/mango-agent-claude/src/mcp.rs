@@ -252,7 +252,7 @@ impl<T: Send + 'static> Drop for Prepared<T> {
 /// Fire and forget, because a `Drop` cannot await. A thread with no runtime — a host that built
 /// the session outside one, or a runtime already shutting down — drops it where it stands, which
 /// is what the value would have done anyway.
-fn release_on_drop<T: Send + 'static>(value: T) {
+pub(crate) fn release_on_drop<T: Send + 'static>(value: T) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn_blocking(move || drop(value));
