@@ -96,7 +96,7 @@ already running.
 | `tool_call`                                                          | `ActivityStarted`, plus `ActivityCompleted` when it already carries a terminal status |
 | `tool_call_update`                                                   | `ActivityUpdated`, or `ActivityCompleted` on `completed`/`failed`                     |
 | `plan`                                                               | `ActivityStarted`/`ActivityUpdated` under one synthetic call id                       |
-| `available_commands_update`                                          | `CommandsAvailable`, names bare                                                       |
+| `available_commands_update`                                          | session state, not a turn event — the snapshot's `commands`, names bare               |
 | `usage_update`                                                       | `ThreadUsage`, with `size` as the context window                                      |
 | `current_mode_update`, `config_option_update`, `session_info_update` | dropped — session state, not transcript                                               |
 
@@ -141,9 +141,10 @@ A level a profile cannot reach is refused at `open_session` and again at `start_
 downgraded: silently running a read-only request under "ask every time" would grant more freedom than
 anybody chose.
 
-An omitted permission axis leaves the vendor's configuration untouched. After a host makes an
+A patch axis left at `keep` leaves the vendor's configuration untouched. After a host makes an
 explicit selection, later turns inherit it until another accepted override replaces it.
-`Session::configuration()` reports that current selection. A rejected turn cannot change it.
+`Session::snapshot().configuration.accepted` reports that current selection. A rejected turn cannot
+change it.
 
 A per-turn level is compared to the session's **by mode**, and any pair whose mode differs from the one
 the session was opened under is refused in both directions. Narrowing looks harmless and is not: a turn
@@ -209,9 +210,10 @@ install locations without editing the profile or changing a user's `PATH`.
   `--version` is not an agent that stopped working.
 - Versions compare as dotted numbers of any length rather than as semver, because Cursor versions by
   date; a semver parser would call `2026.08.25-3e8eec8` unparseable and gate a build that works.
-- `Discovery::capabilities` is the harness **ceiling**, because what a build supports is only knowable
-  from `initialize`. What the agent actually advertised arrives on `SessionInfo::capabilities` after
-  `open_session`.
+- `Discovery::capabilities` is as wide as the harness **ceiling**, because what a build supports is
+  only knowable from `initialize`. What the agent actually advertised arrives as the session-effective
+  tier on `Session::snapshot().capabilities` after `open_session` — which is the case the three
+  capability tiers exist for.
 
 ## Client capabilities
 
@@ -320,7 +322,7 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 | `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                    |
 
 A resume against an agent that does not advertise `loadSession` is `Error::Protocol` under
-`ResumeMode::Strict`, and a fresh conversation with `SessionInfo::fallback_reason` set otherwise.
+`ResumeMode::Strict`, and a fresh conversation with `SessionSnapshot::fallback_reason` set otherwise.
 
 `NativeSession::updated_at` is left absent even when `session/list` returns one: it is an RFC 3339
 string on the wire and a `SystemTime` in the core, and a date crate for one optional picker field is not

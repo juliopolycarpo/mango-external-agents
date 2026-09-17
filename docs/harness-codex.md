@@ -68,7 +68,7 @@ can represent parent-child activity and approval ownership.
 One long-lived `codex app-server` per session. `thread/start` opens a conversation;
 `thread/resume` continues one, with `excludeTurns: true` — the vendor keeps the transcript it
 wrote, and this library never replays one into anybody's context. `ResumeMode::Fallback` starts a
-new thread and records why in `SessionInfo::fallback_reason`.
+new thread and records why in `SessionSnapshot::fallback_reason`.
 
 `turn/start` on a live turn is taken by the app-server as a **steer** — its own documentation says
 `turnTrigger` is "ignored when this request steers an already-active turn". A host that meant a new
@@ -112,7 +112,7 @@ completion; a stalled consumer never receives a cancellation marker without its 
 
 All six explicit (level, routing) pairs are supported. Omitted permission fields leave the user's
 Codex profile in control: the harness sends no sandbox, approval policy or reviewer override for
-an axis the host has never selected. `Configuration::default()` does not impose read-only mode.
+an axis the host has never selected. An empty `ConfigurationPatch` does not impose read-only mode.
 A selected level is two vendor settings that move together,
 because setting one without the other produces a configuration nobody chose:
 
@@ -139,9 +139,11 @@ excludes temporary directories. Full access is sent only from a host-selected co
 These fields use the pinned CLI's schema, which does not yet declare the newer `ReadOnlyAccess`
 fields shown in the current online documentation.
 
-Codex persists successful turn overrides. `Session::configuration()` reports the settings a later
-turn inherits; omitted fields retain the last host selection, or the user's Codex defaults if
-there has been no selection. `SessionInfo::effective_configuration` remains the opening snapshot.
+Codex persists successful turn overrides. `Session::snapshot().configuration` reports the settings
+a later turn inherits, split three ways: `requested` is what the host asked for, `accepted` is what
+this harness encoded onto `thread/start` and `turn/start`, and `observed` stays unknown because the
+app-server reports no surface saying what it is running under. A patch axis left at `keep` retains
+the last host selection, or the user's Codex defaults if there has been no selection.
 Native reviews inherit the same current settings. Hosts use the shared `Session` trait and need
 no Codex-specific permission state machine.
 

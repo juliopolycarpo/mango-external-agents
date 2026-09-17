@@ -81,7 +81,9 @@ claude --print
 - **Omitted permissions preserve the user's CLI profile.** No permission mode or prompt override
   is passed until the host selects permissions. Claude's single mode flag requires both axes on
   the first selection; subsequent partial updates inherit the other axis. Accepted settings persist
-  in `Session::configuration()` and are repeated on later batch invocations.
+  in `Session::snapshot().configuration.accepted` and are repeated on later batch invocations.
+  They stay out of `observed`: a flag this harness put on a command line is a flag it encoded,
+  not a setting the vendor reported it is running under.
 - **`--permission-prompts none`** accompanies an explicit permission mode only on a build that
   declares it (2.1.259+). It is
   pinning, not a fix: the vendor's current default is `host`, and this harness is not an answering
@@ -114,7 +116,7 @@ id, and each turn spawns, streams and reaps its own child.
 - **Resume is vetted for shape, never verified for existence.** Verifying that a conversation is
   still there would cost a process launch per open, and a wrong guess is recoverable: a session the
   vendor has forgotten fails at the first turn with the vendor's own message. `ResumeMode::Fallback`
-  therefore behaves exactly like `Strict`, and `SessionInfo::fallback_reason` is always `None` —
+  therefore behaves exactly like `Strict`, and `SessionSnapshot::fallback_reason` is always `None` —
   nothing was verified, so nothing fell back. Implementing a real fallback means retrying a failed
   first turn under a fresh id, and that waits for a stable signal to key off (today the only one is
   vendor prose).
