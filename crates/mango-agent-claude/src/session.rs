@@ -380,6 +380,39 @@ impl mango_external_agents::Session for ClaudeSession {
         // anyway.
         crate::mcp::release_off_worker(mcp_lease.take()).await;
 
+        // Re-checked for the same reason the guard above re-checks after `stdio::open`: the
+        // release is an await, so a `close`, a `cancel` or a second `start_turn` can have taken
+        // this turn while it was parked there. Such a stop records its reason and kills the child,
+        // and spawning the pump afterwards would write the prompt to a child somebody is killing
+        // and hand the caller a successful stream for a turn that is already over. No stream has
+        // been handed out yet, so refusing here is still the honest answer.
+        let stopped = {
+            let lifecycle = self.shared.lifecycle.lock();
+            let state = self.shared.lock();
+            if lifecycle.is_closed()
+                || !state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
+            {
+                // The stop that took the turn set the reason before taking it; the fallback covers
+                // a take that lost the `set` race, which is the same reason `take_turn` bails on.
+                Some(end.get().copied().unwrap_or(CancelReason::Requested))
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = stopped {
+            // The stop owns the control it took, but it only kills what was installed when it ran.
+            // This kill is the one that answers for the child this call launched.
+            let _ = control.kill(reason).await;
+            return Err(if self.shared.lifecycle.is_closed() {
+                Error::Closed { subject: "session" }
+            } else {
+                Error::Cancelled { reason }
+            });
+        }
+
         tokio::spawn(pump(
             Arc::clone(&self.shared),
             transport.link,
@@ -434,9 +467,11 @@ impl mango_external_agents::Session for ClaudeSession {
             (control, crate::mcp::Prepared::new(state.mcp_config.take()))
         };
         end_turn(control, CancelReason::from(reason)).await;
-        // The session releases its reference here. A start that is still awaiting a child retains
-        // its own `Arc` through the post-spawn lifecycle check, then kills that child before the
-        // final reference can remove the file. Off the lock, and off the async worker: removing
+        // The session releases its reference here. A start still awaiting a child holds its own
+        // `Arc` until it releases it just before its post-release ownership check, and that check
+        // sees this close and kills the child it launched. Either order is safe: whichever
+        // reference goes last removes the file, and the child it was written for is being killed
+        // by one of the two paths. Off the lock, and off the async worker: removing
         // the directory is a synchronous filesystem call against the host's own scratch root.
         // Reported rather than swallowed: this close promised the session's resources were
         // released, and the file holds the `env` and `headers` a host configured its servers with.

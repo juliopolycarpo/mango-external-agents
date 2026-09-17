@@ -1111,6 +1111,79 @@ mod mcp_passthrough {
         assert_eq!(written["mcpServers"]["docs"]["env"]["DOCS_TOKEN"], "s3cret");
     }
 
+    /// The release is an await, so a `cancel`, a `close` or a second `start_turn` can take this
+    /// turn while it is parked there. Resuming and spawning the pump anyway would hand back a
+    /// successful stream for a turn that was already stopped, and write its prompt to a child
+    /// somebody is killing.
+    ///
+    /// The returned result is the assertion that matters: whether the prompt reaches a dying child
+    /// depends on when the kill lands, but a stopped turn must never answer `Ok`.
+    #[test]
+    fn a_turn_stopped_while_its_lease_is_released_is_refused_rather_than_started() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+            let scratch =
+                std::env::temp_dir().join(format!("mea-stop-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            let start = session.start_turn(TurnRequest::new("turn-1", "read note.txt"));
+            tokio::pin!(start);
+            // The future is held rather than dropped, so it resumes after the stop lands.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), start.as_mut())
+                    .await
+                    .is_err(),
+                "expected the turn to be parked on the occupied blocking pool"
+            );
+
+            session
+                .cancel(CancelReason::Requested)
+                .await
+                .expect("expected the cancel to be accepted");
+
+            drop(release_pool);
+            let _ = occupied.await;
+
+            // `TurnStream` is not `Debug`, so the success arm is named rather than unwrapped.
+            let error = match start.await {
+                Ok(_) => panic!("expected a stopped turn to be refused, received a stream"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, Error::Cancelled { .. }),
+                "expected the recorded cancellation, received {error:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
     /// A host that times out or drops `start_turn` must not leave Claude working on a turn it will
     /// never read. The MCP release runs on the blocking pool, so it is an await the future can be
     /// dropped at — and anything spawned before it keeps running afterwards.
