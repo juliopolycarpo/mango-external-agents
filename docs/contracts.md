@@ -82,6 +82,9 @@ round: subscribing *is* reading. `SessionSubscription::current()` answers with t
 subscription was opened at, and `changed()` wakes for anything after it — there is no window
 because there are not two calls.
 
+`current()` keeps that captured picture until `changed()` consumes another one. It does not peek
+at a pending update and then deliver the same revision again through `changed()`.
+
 Every snapshot carries a `SessionRevision` that only increases. Updates coalesce, which is the
 right semantics for a picture of the present; the revision is what lets a consumer tell coalescing
 from stillness, and a persisted revision is what lets it tell a stale read from a current one.

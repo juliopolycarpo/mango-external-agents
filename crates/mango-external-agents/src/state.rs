@@ -359,9 +359,9 @@ impl SessionState {
     ///
     /// See the module documentation for why there is no read-then-subscribe window.
     pub fn subscribe(&self) -> SessionSubscription {
-        SessionSubscription {
-            receiver: self.sender.subscribe(),
-        }
+        let mut receiver = self.sender.subscribe();
+        let current = Arc::clone(&receiver.borrow_and_update());
+        SessionSubscription { receiver, current }
     }
 
     /// Applies a change and publishes the result, bumping the revision.
@@ -461,10 +461,11 @@ impl SessionState {
 #[derive(Clone)]
 pub struct SessionSubscription {
     receiver: watch::Receiver<Arc<SessionSnapshot>>,
+    current: Arc<SessionSnapshot>,
 }
 
 impl fmt::Debug for SessionSubscription {
-    /// Reports the latest session picture without formatting the watch receiver internals.
+    /// Reports the last observed picture without formatting the watch receiver internals.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionSubscription")
@@ -476,7 +477,7 @@ impl fmt::Debug for SessionSubscription {
 impl SessionSubscription {
     /// The picture as of this subscription's last wake-up, or of when it was opened.
     pub fn current(&self) -> Arc<SessionSnapshot> {
-        Arc::clone(&self.receiver.borrow())
+        Arc::clone(&self.current)
     }
 
     /// Waits for the next change and answers with it.
@@ -485,12 +486,35 @@ impl SessionSubscription {
     /// itself was dropped.
     pub async fn changed(&mut self) -> Option<Arc<SessionSnapshot>> {
         self.receiver.changed().await.ok()?;
-        Some(Arc::clone(&self.receiver.borrow_and_update()))
+        self.current = Arc::clone(&self.receiver.borrow_and_update());
+        Some(Arc::clone(&self.current))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn an_update_before_the_initial_read_is_delivered_only_once() {
+        let state = state();
+        let mut subscription = state.subscribe();
+        state.set_status(SessionStatus::Closing);
+        let initial = subscription.current();
+        let changed = subscription
+            .changed()
+            .await
+            .expect("expected the pending update");
+        assert!(
+            changed.revision > initial.revision,
+            "expected a newer revision after current; received the same update twice"
+        );
+        assert_eq!(subscription.current().revision, changed.revision);
+        drop(state);
+        assert!(
+            subscription.changed().await.is_none(),
+            "expected no duplicate update"
+        );
+    }
+
     use super::{
         SessionRevision, SessionSnapshot, SessionState, SessionStatus, SessionSubscription,
         TransportSelection,
