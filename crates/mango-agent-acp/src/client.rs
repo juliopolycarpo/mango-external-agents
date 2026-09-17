@@ -826,16 +826,18 @@ pub(crate) async fn drive(
     );
 
     let Ok(connection) = ready_rx.await else {
-        // The closure never ran, so the transport failed first. The child's own stderr is the only
-        // thing that can say why.
+        // The closure never ran, so the transport failed first. `Error::Link`'s summary is written
+        // verbatim by `Display`, so it says which of the three shapes this was and nothing the
+        // driver or the child put into words; the redacted stderr tail stays on `StderrTail`,
+        // where a host that wants it reads it.
         let message = match driver.await {
-            Ok(Err(error)) => error.to_string(),
-            Ok(Ok(())) => String::from("the connection closed before it opened"),
-            Err(error) => error.to_string(),
+            Ok(Err(_)) => "a transport that failed before the connection opened",
+            Ok(Ok(())) => "a connection that closed before it opened",
+            Err(_) => "a connection task that did not finish",
         };
         return Err(Error::Link {
             peer: String::from("ACP agent"),
-            message: with_stderr(&message, control.as_ref()),
+            message: String::from(message),
         });
     };
 
@@ -928,7 +930,7 @@ where
         if agent_client_protocol::is_incoming_transport_closed(&error) {
             return Error::Link {
                 peer: format!("ACP agent {}", profile.id),
-                message: with_stderr(&error.message, connection.control().as_ref()),
+                message: format!("a transport that closed under {method}"),
             };
         }
         crate::error::request_error(method, &error, &profile.login_text())

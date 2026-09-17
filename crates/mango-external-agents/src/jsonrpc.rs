@@ -534,7 +534,7 @@ impl Client {
             ))),
             Ok(Err(_)) => Err(Error::Link {
                 peer: self.state.options.peer_name.clone(),
-                message: format!("the peer went away before answering {method}"),
+                message: format!("a peer that went away before answering {method}"),
             }),
             Err(_) => {
                 self.state.pending.lock().await.remove(&id);

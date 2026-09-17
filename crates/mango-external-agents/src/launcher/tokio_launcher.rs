@@ -268,7 +268,8 @@ impl ByteSource for PipeSource {
             .await
             .map_err(|error| Error::Link {
                 peer: String::from("child stdout"),
-                message: error.to_string(),
+                // The kind, not the message: the same reason the spawn arm reports one.
+                message: format!("a read failure ({:?})", error.kind()),
             })?;
         if read == 0 {
             return Ok(None);
@@ -314,7 +315,8 @@ impl ByteSink for PipeSink {
 fn pipe_error(error: std::io::Error) -> Error {
     Error::Link {
         peer: String::from("child stdin"),
-        message: error.to_string(),
+        // The kind, not the message: the same reason the spawn arm reports one.
+        message: format!("a write failure ({:?})", error.kind()),
     }
 }
 

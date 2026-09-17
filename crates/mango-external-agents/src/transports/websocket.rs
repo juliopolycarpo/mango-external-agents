@@ -45,14 +45,14 @@ pub async fn dial(spec: &WsSpec, limits: LineLimits) -> Result<Link> {
         .url
         .as_str()
         .into_client_request()
-        .map_err(|error| link_error(spec, error))?;
+        .map_err(|error| link_error(spec, &error))?;
 
     if let Some(bearer) = &spec.bearer {
         let value =
             HeaderValue::from_str(&format!("Bearer {bearer}")).map_err(|_| Error::Link {
                 peer: peer_label(&spec.url),
                 // Never the value: a malformed credential is still a credential.
-                message: String::from("expected a bearer token usable as a header value"),
+                message: String::from("a bearer token unusable as a header value"),
             })?;
         request.headers_mut().insert("Authorization", value);
     }
@@ -64,7 +64,7 @@ pub async fn dial(spec: &WsSpec, limits: LineLimits) -> Result<Link> {
         .max_frame_size(Some(limits.max_line_bytes));
     let (socket, _) = connect_async_with_config(request, Some(config), false)
         .await
-        .map_err(|error| link_error(spec, error))?;
+        .map_err(|error| link_error(spec, &error))?;
     Ok(from_socket(socket, spec.url.clone(), limits))
 }
 
@@ -89,10 +89,33 @@ pub fn from_socket(socket: Socket, peer: String, limits: LineLimits) -> Link {
     )
 }
 
-fn link_error(spec: &WsSpec, error: impl std::fmt::Display) -> Error {
+fn link_error(spec: &WsSpec, error: &WsError) -> Error {
     Error::Link {
         peer: peer_label(&spec.url),
-        message: error.to_string(),
+        message: ws_reason(error),
+    }
+}
+
+/// A socket failure as a structured summary, from the variant rather than from its text.
+///
+/// `WsError`'s own `Display` repeats the URL it was dialling, and the URL is the host's — it can
+/// carry a password in its userinfo or a token in its query string. The variant is the half that
+/// says what to do about it, and an HTTP status and an [`std::io::ErrorKind`] are both bounded
+/// enumerations the peer cannot choose the shape of.
+fn ws_reason(error: &WsError) -> String {
+    match error {
+        WsError::ConnectionClosed => String::from("a closed connection"),
+        WsError::AlreadyClosed => String::from("a connection that was already closed"),
+        WsError::Io(io) => format!("a socket failure ({:?})", io.kind()),
+        WsError::Tls(_) => String::from("a TLS failure"),
+        WsError::Url(_) => String::from("a URL this transport cannot dial"),
+        WsError::Http(response) => format!("HTTP {}", response.status()),
+        WsError::HttpFormat(_) => String::from("a malformed HTTP response"),
+        WsError::Capacity(_) => String::from("a frame past this link's cap"),
+        WsError::Protocol(_) => String::from("a frame the WebSocket protocol does not allow"),
+        WsError::WriteBufferFull(_) => String::from("a full write buffer"),
+        WsError::Utf8(_) => String::from("a text frame that is not UTF-8"),
+        WsError::AttackAttempt => String::from("a handshake this transport refused"),
     }
 }
 
@@ -117,7 +140,7 @@ impl LinkSender for SocketSender {
             .await
             .map_err(|error| Error::Link {
                 peer: self.peer.clone(),
-                message: error.to_string(),
+                message: ws_reason(&error),
             })
     }
 
@@ -176,7 +199,7 @@ impl LinkReceiver for SocketReceiver {
                 Err(error) => {
                     return Err(Error::Link {
                         peer: self.peer.clone(),
-                        message: error.to_string(),
+                        message: ws_reason(&error),
                     });
                 }
             };
@@ -329,8 +352,10 @@ mod tests {
             "expected the raw endpoint data, received {error:?}"
         );
         assert!(
-            error.to_string().contains("vendor link failed"),
-            "expected a safe link diagnostic, received {error}"
+            error
+                .to_string()
+                .contains("a socket failure (ConnectionRefused)"),
+            "expected the io error kind rather than the dialled URL, received {error}"
         );
     }
 
@@ -405,8 +430,10 @@ mod tests {
             "expected the raw endpoint data, received {error:?}"
         );
         assert!(
-            error.to_string().contains("vendor link failed"),
-            "expected a safe link diagnostic, received {error}"
+            error
+                .to_string()
+                .contains("a socket failure (ConnectionRefused)"),
+            "expected the io error kind rather than the dialled URL, received {error}"
         );
     }
 

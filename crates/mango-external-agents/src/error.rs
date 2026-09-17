@@ -69,11 +69,10 @@ impl fmt::Display for ErrorCode {
     ///
     /// This bound is the second gate, not the first: what a code may contain is decided where it
     /// is made, by the harness that knows which of its inputs a vendor filled in. What is safe to
-    /// print is a short lowercase label:
-    /// at most 48 bytes of `a-z`, `0-9`, `-` and `_`. A code carrying a space, a
-    /// capital, a quote or more length than that is vendor prose wearing a code's field, and it
-    /// is reported as `vendor-code` instead. [`as_str`](ErrorCode::as_str) stays the protocol
-    /// field and is never bounded.
+    /// print is a short lowercase label — at most 48 bytes of `a-z`, `0-9`, `-` and `_`. A code
+    /// carrying a space, a capital, a quote or more length than that is vendor prose wearing a
+    /// code's field, and it is reported as `vendor-code` instead.
+    /// [`as_str`](ErrorCode::as_str) stays the protocol field and is never bounded.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if is_label_shaped(&self.0) {
             return formatter.write_str(&self.0);
@@ -252,8 +251,17 @@ pub enum Error {
     /// The byte link to the vendor failed, or was closed under a caller.
     Link {
         /// The peer as a user would name it, such as `Codex app-server`.
+        ///
+        /// Never printed, unlike [`Launch`](Self::Launch)'s program: a WebSocket transport puts
+        /// the dialled URL here, and a URL carries a query string a host may have put a token in.
         peer: String,
-        /// What went wrong.
+        /// A payload-free summary of what went wrong, written verbatim by
+        /// [`Display`](fmt::Display).
+        ///
+        /// The same invariant [`Launch`](Self::Launch)'s summary carries, held at the construction
+        /// sites rather than recovered afterwards: a structured value — an
+        /// [`std::io::ErrorKind`], an HTTP status, a method name, a static phrase — and never a
+        /// URL, a vendor message or a line the agent printed on stderr.
         message: String,
     },
 
@@ -360,11 +368,9 @@ impl fmt::Display for Error {
                 "expected to launch {}, received {message}",
                 redact::program_name(program)
             ),
-            Self::Link { message, .. } => write!(
-                formatter,
-                "the vendor link failed: {}",
-                safe_link_context(message)
-            ),
+            Self::Link { message, .. } => {
+                write!(formatter, "expected a live vendor link, received {message}")
+            }
             Self::LimitExceeded {
                 subject,
                 limit,
@@ -424,16 +430,6 @@ impl From<VendorError> for Error {
     fn from(error: VendorError) -> Self {
         Self::Vendor(error)
     }
-}
-
-fn safe_link_context(message: &str) -> &'static str {
-    if message.contains("EPIPE") {
-        return "EPIPE";
-    }
-    if message.contains("exited") {
-        return "peer exited";
-    }
-    "no safe detail"
 }
 
 impl Error {
@@ -609,6 +605,29 @@ mod tests {
             host_program.to_string(),
             "expected to launch custom executable, received a launcher failure (PermissionDenied)"
         );
+    }
+
+    /// A link failure that says only "no safe detail" cannot be acted on either.
+    ///
+    /// The summary is the library's own, built from a structured value at the construction site;
+    /// the peer is not, because a WebSocket transport puts the dialled URL there.
+    #[test]
+    fn link_diagnostics_keep_the_cause_and_omit_the_peer() {
+        let error = Error::Link {
+            peer: String::from("wss://svc:s3cr3t@agent.internal/ws"),
+            message: String::from("a socket failure (ConnectionRefused)"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "expected a live vendor link, received a socket failure (ConnectionRefused)"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("s3cr3t") && !rendered.contains("agent.internal"),
+                "expected the endpoint to stay out of the diagnostic, received {rendered}"
+            );
+        }
     }
 
     #[test]

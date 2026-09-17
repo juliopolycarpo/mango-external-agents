@@ -279,9 +279,12 @@ impl Session for AcpSession {
                     .connection()
                     .send_notification(CancelNotification::new(self.native_session_id.clone()))
                     .err()
-                    .map(|error| Error::Link {
+                    .map(|_| Error::Link {
                         peer: format!("ACP agent {}", self.profile.id),
-                        message: with_stderr(&error.message, self.connection.control().as_ref()),
+                        // The library's own summary: `Error::Link`'s is written verbatim, and the
+                        // agent's message and its stderr tail are both the agent's words. The
+                        // turn's own failure event still carries them.
+                        message: String::from("a link that could not carry session/cancel"),
                     }),
                 false => None,
             };
@@ -379,9 +382,9 @@ impl Session for AcpSession {
         self.connection
             .connection()
             .send_notification(CancelNotification::new(self.native_session_id.clone()))
-            .map_err(|error| Error::Link {
+            .map_err(|_| Error::Link {
                 peer: format!("ACP agent {}", self.profile.id),
-                message: with_stderr(&error.message, self.connection.control().as_ref()),
+                message: String::from("a link that could not carry session/cancel"),
             })
     }
 
