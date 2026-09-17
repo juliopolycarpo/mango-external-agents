@@ -1111,6 +1111,98 @@ mod mcp_passthrough {
         assert_eq!(written["mcpServers"]["docs"]["env"]["DOCS_TOKEN"], "s3cret");
     }
 
+    /// A configured turn commits its settings as the session's defaults when it starts, so a turn
+    /// refused after that commit must not leave them behind. Otherwise a cancelled `FullAccess`
+    /// start hands its permissions to the next turn that asked for nothing.
+    #[test]
+    fn a_turn_refused_after_its_lease_release_leaves_no_configuration_behind() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_help(HELP_2_1_270)
+                    .with_turn(Run::stalling::<[String; 0], String>([]))
+                    .with_turn(Run::replaying(READ_TURN)),
+            );
+            let scratch =
+                std::env::temp_dir().join(format!("mea-config-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            let mut refused = Box::pin(
+                session.start_turn(
+                    TurnRequest::new("turn-1", "raise the session's permissions")
+                        .with_configuration(Configuration {
+                            level: Some(PermissionLevel::Default),
+                            routing: Some(ApprovalRouting::User),
+                            ..Configuration::default()
+                        }),
+                ),
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), refused.as_mut())
+                    .await
+                    .is_err(),
+                "expected the configured turn to be parked on the occupied blocking pool"
+            );
+            session
+                .cancel(CancelReason::Requested)
+                .await
+                .expect("expected the cancel to be accepted");
+            drop(release_pool);
+            let _ = occupied.await;
+            assert!(
+                refused.await.is_err(),
+                "expected the cancelled turn to be refused"
+            );
+
+            assert_eq!(
+                session.configuration().await.level,
+                None,
+                "expected a refused start to leave the session's own configuration alone"
+            );
+
+            let mut next = session
+                .start_turn(TurnRequest::new("turn-2", "read note.txt"))
+                .await
+                .expect("expected the next turn to start");
+            drain(&mut next).await;
+
+            let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+            assert_eq!(
+                value_after(&argv, "--permission-mode"),
+                None,
+                "expected the unconfigured turn to inherit nothing from the refused one, received {argv:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
     /// The guard reaps a child nobody else owns. When a `cancel` already took the turn it also
     /// killed that child, so a guard firing afterwards would hand a host's launcher a second
     /// teardown for the same process — `ProcessControl::kill` carries no idempotence promise.

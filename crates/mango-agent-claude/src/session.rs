@@ -414,12 +414,6 @@ impl mango_external_agents::Session for ClaudeSession {
                     .as_ref()
                     .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
             {
-                if requested_configuration.is_some() {
-                    // `stdio::open` is the successful start boundary for the batch CLI: there is
-                    // no app-server response to acknowledge later. A following unconfigured turn
-                    // therefore repeats the flags the accepted process was launched with.
-                    state.configuration = configuration.clone();
-                }
                 state.active = Some(ActiveTurn {
                     end: Arc::clone(&end),
                     control: Some(Arc::clone(&control)),
@@ -471,7 +465,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // been handed out yet, so refusing here is still the honest answer.
         let stopped = {
             let lifecycle = self.shared.lifecycle.lock();
-            let state = self.shared.lock();
+            let mut state = self.shared.lock();
             if lifecycle.is_closed()
                 || !state
                     .active
@@ -482,6 +476,15 @@ impl mango_external_agents::Session for ClaudeSession {
                 // a take that lost the `set` race, which is the same reason `take_turn` bails on.
                 Some(end.get().copied().unwrap_or(CancelReason::Requested))
             } else {
+                // Committed here rather than where the child was installed. `stdio::open` is the
+                // successful start boundary for the batch CLI — there is no app-server response to
+                // acknowledge later — but a start can still be refused after it, and a refusal
+                // that had already written these defaults would hand a cancelled turn's model and
+                // permissions to the next turn that asked for nothing. This is the last point
+                // where the start can still fail, and no await follows it.
+                if requested_configuration.is_some() {
+                    state.configuration = configuration.clone();
+                }
                 None
             }
         };
