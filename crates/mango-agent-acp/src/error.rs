@@ -15,6 +15,7 @@
 
 use agent_client_protocol::schema::v1::ErrorCode as AcpErrorCode;
 use mango_external_agents::error::jsonrpc_code_is_retryable;
+use mango_external_agents::normalize::{TextLimit, bound_text};
 use mango_external_agents::{Error, ErrorCode, VendorError};
 
 /// One ACP failure as a vendor failure, correlated to the method that produced it.
@@ -41,7 +42,10 @@ pub fn vendor_error(method: &str, error: &agent_client_protocol::Error) -> Vendo
 /// One ACP failure as the core error a session method returns.
 ///
 /// `login_hint` is the profile's own, and is used only for the authentication code — every other
-/// code is the agent's business and reaches the host as a [`VendorError`].
+/// code is the agent's business and reaches the host as a [`VendorError`]. A custom profile's hint
+/// is host-authored text, not a library constant, so it is bounded the same way a vendor-observed
+/// one is in [`AuthState::normalized`](mango_external_agents::AuthState::normalized): stripped of
+/// control characters and cut to a label's length before it can reach a diagnostic.
 ///
 /// # Example
 ///
@@ -61,7 +65,7 @@ pub fn request_error(
 ) -> Error {
     if error.code == AcpErrorCode::AuthRequired {
         return Error::AuthRequired {
-            login_hint: login_hint.to_owned(),
+            login_hint: bound_text(login_hint, TextLimit::Title).text,
         };
     }
     Error::Vendor(vendor_error(method, error))
@@ -127,6 +131,20 @@ mod tests {
             panic!("expected AuthRequired, received {error:?}");
         };
         assert_eq!(login_hint, "agent login");
+    }
+
+    #[test]
+    fn a_custom_profiles_login_hint_is_bounded_like_any_other_label() {
+        let hostile = format!("run\u{7}\x1b[31m login {}", "x".repeat(4_000));
+        let error = request_error("session/new", &AcpError::auth_required(), &hostile);
+        let Error::AuthRequired { login_hint } = error else {
+            panic!("expected AuthRequired, received {error:?}");
+        };
+        assert!(
+            !login_hint.contains('\u{7}') && !login_hint.contains('\x1b'),
+            "received a login hint with unstripped control characters: {login_hint:?}"
+        );
+        assert_eq!(login_hint.chars().count(), 256);
     }
 
     #[test]
