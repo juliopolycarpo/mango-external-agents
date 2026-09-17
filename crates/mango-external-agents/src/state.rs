@@ -113,6 +113,11 @@ pub enum SessionStatus {
     Closed,
 }
 
+// The variant order *is* the lifecycle ladder, and the derived `Ord` above is what
+// `SessionState::set_status` compares against to refuse a status that walks it back. A variant
+// added anywhere but the end — or inserted before `Closing` — changes which transitions are
+// accepted, so a new one belongs at the position the session actually reaches it.
+
 impl SessionStatus {
     /// Whether a new turn would be accepted.
     pub const fn is_usable(self) -> bool {
@@ -374,7 +379,7 @@ impl SessionState {
     /// ```
     /// use mango_external_agents::{
     ///     Clock, HarnessIdentity, SessionId, SessionIds, SessionSnapshot, SessionState,
-    ///     SessionStatus, SystemClock, TransportKind, TransportSelection,
+    ///     SystemClock, TransportKind, TransportSelection,
     /// };
     ///
     /// let clock = std::sync::Arc::new(SystemClock);
@@ -392,10 +397,13 @@ impl SessionState {
     /// );
     ///
     /// let before = state.snapshot().revision;
-    /// state.update(|snapshot| snapshot.status = SessionStatus::Closing);
+    /// state.update(|snapshot| snapshot.resumed = true);
     /// assert!(state.snapshot().revision > before);
-    /// assert_eq!(state.snapshot().status, SessionStatus::Closing);
+    /// assert!(state.snapshot().resumed);
     /// ```
+    ///
+    /// Not the door for `status`: it writes the snapshot verbatim, so a status set through here
+    /// escapes the ladder [`set_status`](Self::set_status) enforces. Use that.
     pub fn update(&self, change: impl FnOnce(&mut SessionSnapshot)) {
         let now = self.clock.now();
         self.sender.send_modify(|current| {

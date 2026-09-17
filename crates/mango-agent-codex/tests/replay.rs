@@ -1547,6 +1547,61 @@ async fn host_shutdown_publishes_the_lifecycle_its_watcher_drove() {
     );
 }
 
+/// The `Closing` half of the same wind-down, which the terminal assertions cannot see: a
+/// subscription coalesces, so the two transitions are only distinguishable while the watcher is
+/// actually parked between them.
+///
+/// An unread turn under a one-slot channel is that park — the same lever
+/// `a_host_that_stops_reading_cannot_stop_the_session_from_closing` pulls. The channel is full the
+/// instant `start_turn` returns, so `cancel_active`'s terminal parks on it until `TERMINAL_GRACE`,
+/// and paused time does not advance to that grace while this task is awake.
+#[tokio::test(start_paused = true)]
+async fn the_watcher_publishes_closing_while_its_wind_down_is_still_parked() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("turn").as_process());
+    let cancel = mango_external_agents::CancelToken::new();
+    let (host, _) = with_launcher_limits_and_cancel(
+        launcher,
+        None,
+        mango_external_agents::Limits {
+            turn_channel_capacity: 1,
+            request_timeout: std::time::Duration::from_secs(5),
+            ..mango_external_agents::Limits::default()
+        },
+        cancel.clone(),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    // Held, never read: this is the host that walked away.
+    let _unread = session
+        .start_turn(TurnRequest::new("turn-1", "run echo mango"))
+        .await
+        .expect("expected a turn");
+    // Twice, so the pump gets the thread and then reaches its park inside the emit.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    cancel.cancel();
+
+    let closing = lifecycle
+        .changed()
+        .await
+        .expect("expected the watcher to publish a change");
+    assert_eq!(
+        closing.status,
+        SessionStatus::Closing,
+        "expected Closing to be visible while the wind-down is still parked"
+    );
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected the parked wind-down to still reach its terminal"
+    );
+}
+
 /// The other way the watcher runs: the app-server disappears on its own. `connection_terminated`
 /// stops new work and cancels `terminated`, and the lifecycle has to follow — a host left holding
 /// a `Ready` session over a dead connection learns it only from the next refusal.

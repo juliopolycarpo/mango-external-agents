@@ -235,6 +235,24 @@ async fn an_agent_that_dies_ends_the_published_lifecycle() {
     );
 }
 
+/// The other half of the watcher, and the one a clean EOF cannot reach: a session dropped instead
+/// of closed releases the dispatch loop's shutdown channel with the handle, so the loop ends with
+/// no EOF to report. Without the driver-done arm the lifecycle would stop at `Ready` there.
+#[tokio::test]
+async fn a_session_dropped_without_a_close_still_ends_its_lifecycle() {
+    let (session, _launcher) = open(FakeAcpAgent::new(), permissive()).await;
+    let mut lifecycle = session.subscribe();
+    assert_eq!(lifecycle.current().status, SessionStatus::Ready);
+
+    drop(session);
+
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected a dropped session to reach its terminal rather than stay Ready forever"
+    );
+}
+
 #[tokio::test]
 async fn a_turn_streams_the_agents_updates_and_ends_exactly_once() {
     let (session, _launcher) = open(FakeAcpAgent::new(), permissive()).await;
