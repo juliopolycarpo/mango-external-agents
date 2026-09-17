@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{
-    Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, ErrorCode, EventKind,
-    VendorError,
+    Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, ErrorCode,
+    EventKind, VendorError,
 };
 use serde_json::Value;
 
@@ -67,12 +67,21 @@ const TITLE_FIELDS: [&str; 7] = [
 ];
 
 /// What discovery and the session learn from the first record of a run.
+///
+/// Session-scoped facts, not turn events: [`SessionState`](mango_external_agents::SessionState) is
+/// where they belong now, and the turn loop folds this back onto it — see
+/// `session::apply_init`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunInit {
     /// The vendor's own session handle, which proves the conversation now exists on disk.
     pub session_id: Option<String>,
     /// The model the run resolved to.
     pub model: Option<String>,
+    /// The slash commands this run announced, when it announced any.
+    ///
+    /// `None` (rather than an empty vector) is "this run said nothing publishable" — see
+    /// [`commands::catalog`] for why that is not the same as an empty catalog.
+    pub commands: Option<Vec<Command>>,
 }
 
 /// What one record produced.
@@ -105,10 +114,8 @@ struct Delivered {
 }
 
 /// One run's records, reduced to neutral events.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TurnReducer {
-    resumed: bool,
-    session_started: bool,
     finished: bool,
     /// Tool calls this run has opened, in the order it opened them, so an unclosed call can be
     /// closed in a stable order.
@@ -137,8 +144,11 @@ pub struct TurnReducer {
 impl TurnReducer {
     /// A reducer for one run.
     ///
-    /// `resumed` is whether this run was launched against an existing conversation, which the
-    /// reducer reports rather than infers: only the caller knows whether it passed `--resume`.
+    /// Whether this run was launched against an existing conversation is no longer this type's
+    /// business: that is session state, reported through
+    /// [`SessionState::set_native_session_id`](mango_external_agents::SessionState::set_native_session_id)
+    /// and [`SessionSnapshot::resumed`](mango_external_agents::SessionSnapshot::resumed), which the
+    /// session already knows without asking a reducer that has not read a byte yet.
     ///
     /// # Example
     ///
@@ -146,15 +156,13 @@ impl TurnReducer {
     /// use mango_agent_claude::{protocol::StreamRecord, reducer::TurnReducer};
     /// use mango_external_agents::EventKind;
     ///
-    /// let mut reducer = TurnReducer::new(false);
+    /// let mut reducer = TurnReducer::new();
     /// let record = StreamRecord::parse(r#"{"type":"result","is_error":false}"#).expect("record");
     /// assert_eq!(reducer.reduce(&record).events, vec![EventKind::Completed]);
     /// assert!(reducer.finished());
     /// ```
-    pub fn new(resumed: bool) -> Self {
+    pub fn new() -> Self {
         Self {
-            resumed,
-            session_started: false,
             finished: false,
             open_activities: Vec::new(),
             nested_text: BTreeMap::new(),
@@ -238,33 +246,23 @@ impl TurnReducer {
         }
     }
 
+    /// The one record that names the vendor's own session handle and, when the build says so,
+    /// its slash-command catalog.
+    ///
+    /// Both are session state rather than turn events now — see [`RunInit`] — so nothing is
+    /// pushed onto the turn stream here. The catalog is read every time this record arrives
+    /// rather than once per session, because the CLI is spawned again for every turn and re-reads
+    /// its command directories each time; that is also why it is read even when the session id
+    /// was missing, rather than tied to a handle it does not need.
     fn reduce_init(&mut self, record: &StreamRecord) -> Reduction {
         let init = record.init();
         let run = RunInit {
             session_id: init.session_id().map(str::to_owned),
             model: init.model().map(str::to_owned),
+            commands: commands::catalog(&init),
         };
-
-        let mut events = Vec::new();
-        if !self.session_started
-            && let Some(session_id) = &run.session_id
-        {
-            self.session_started = true;
-            events.push(EventKind::SessionStarted {
-                native_session_id: session_id.clone(),
-                resumed: self.resumed,
-            });
-        }
-        // Announced per run rather than per session, because the CLI is spawned again for every
-        // turn and re-reads its command directories each time — which makes the catalog
-        // self-healing here in a way it is not for a long-lived session. Emitted even when the
-        // session id was missing: the catalog is useful on its own, and tying it to a handle it
-        // does not need would drop it for a run that only failed to name itself.
-        if let Some(commands) = commands::catalog(&init) {
-            events.push(EventKind::CommandsAvailable { commands });
-        }
         Reduction {
-            events,
+            events: Vec::new(),
             init: Some(run),
         }
     }
@@ -516,15 +514,13 @@ impl TurnReducer {
         self.open_activities.push(call_id.to_owned());
         Some(EventKind::ActivityStarted {
             call_id: call_id.to_owned(),
-            activity: Activity {
-                // Verbatim. `Read` is `Read`, and an MCP tool keeps its namespaced name: renaming
-                // another company's tools in a host's interface would misattribute the work.
-                name: name.to_owned(),
-                kind: activity_kind(name),
-                title: summarize_tool_input(block.input()),
-                detail: None,
-                truncated: false,
-            },
+            // Verbatim. `Read` is `Read`, and an MCP tool keeps its namespaced name: renaming
+            // another company's tools in a host's interface would misattribute the work.
+            activity: Activity::new(
+                name,
+                activity_kind(name),
+                summarize_tool_input(block.input()),
+            ),
         })
     }
 
@@ -848,14 +844,14 @@ mod tests {
 
     #[test]
     fn ignores_an_unknown_top_level_record_type() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         assert!(reduce(&mut reducer, r#"{"type":"rate_limit_event"}"#).is_empty());
         assert!(!reducer.finished());
     }
 
     #[test]
     fn ignores_a_system_subtype_with_no_neutral_event_behind_it() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         assert!(reduce(&mut reducer, r#"{"type":"system","subtype":"api_retry"}"#).is_empty());
         assert!(
             reduce(
@@ -866,35 +862,51 @@ mod tests {
         );
     }
 
+    /// The vendor's own session handle is session state, not a turn event — see [`RunInit`] and
+    /// the module documentation for [`crate::session`]. It arrives through
+    /// [`TurnReducer::reduce`]'s `init` half rather than as an
+    /// [`EventKind`] the turn stream carries.
     #[test]
-    fn reports_the_resume_state_it_was_opened_with_rather_than_inferring_one() {
-        for resumed in [false, true] {
-            let mut reducer = TurnReducer::new(resumed);
-            let events = reduce(
-                &mut reducer,
-                r#"{"type":"system","subtype":"init","session_id":"sess_1"}"#,
-            );
-            assert_eq!(
-                events,
-                vec![EventKind::SessionStarted {
-                    native_session_id: String::from("sess_1"),
-                    resumed,
-                }]
-            );
-        }
+    fn folds_the_vendors_session_handle_into_run_init_rather_than_a_turn_event() {
+        let mut reducer = TurnReducer::new();
+        let record =
+            StreamRecord::parse(r#"{"type":"system","subtype":"init","session_id":"sess_1"}"#)
+                .expect("expected a parseable record");
+        let reduction = reducer.reduce(&record);
+        assert!(
+            reduction.events.is_empty(),
+            "expected no turn event for a session-scoped fact, received {:?}",
+            reduction.events
+        );
+        assert_eq!(
+            reduction
+                .init
+                .expect("expected the run to describe itself")
+                .session_id,
+            Some(String::from("sess_1"))
+        );
     }
 
+    /// Unlike the old `SessionStarted` event, which only fired once, a repeated `init` is reported
+    /// every time it arrives: applying the same fact twice to
+    /// [`SessionState`](mango_external_agents::SessionState) is a no-op, so there is nothing this
+    /// type has to remember on the record's behalf any more.
     #[test]
-    fn opens_the_session_only_once_even_when_a_run_repeats_its_init() {
-        let mut reducer = TurnReducer::new(false);
-        let line = r#"{"type":"system","subtype":"init","session_id":"sess_1"}"#;
-        assert_eq!(reduce(&mut reducer, line).len(), 1);
-        assert!(reduce(&mut reducer, line).is_empty());
+    fn reports_a_repeated_init_again_rather_than_withholding_it() {
+        let mut reducer = TurnReducer::new();
+        let record =
+            StreamRecord::parse(r#"{"type":"system","subtype":"init","session_id":"sess_1"}"#)
+                .expect("expected a parseable record");
+        assert!(reducer.reduce(&record).init.is_some());
+        assert!(
+            reducer.reduce(&record).init.is_some(),
+            "expected the second init to still be reported"
+        );
     }
 
     #[test]
     fn stops_reducing_after_the_result() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         assert_eq!(
             reduce(&mut reducer, r#"{"type":"result","is_error":false}"#),
             vec![EventKind::Completed]
@@ -935,7 +947,7 @@ mod tests {
 
     #[test]
     fn reports_a_failed_result_as_a_structured_error() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         let events = reduce(
             &mut reducer,
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":529}"#,
@@ -1001,7 +1013,7 @@ mod tests {
 
     #[test]
     fn surfaces_the_error_arms_own_text_instead_of_the_generic_fallback() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         let events = reduce(
             &mut reducer,
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["Reached the turn limit.","Nothing was written."]}"#,
@@ -1018,7 +1030,7 @@ mod tests {
 
     #[test]
     fn names_the_vendors_own_terminal_reason_when_nothing_else_explains_the_failure() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         let events = reduce(
             &mut reducer,
             r#"{"type":"result","subtype":"error","is_error":true,"terminal_reason":"budget_exhausted"}"#,
@@ -1035,7 +1047,7 @@ mod tests {
 
     #[test]
     fn names_the_subtype_when_the_vendor_explained_nothing_at_all() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         let events = reduce(
             &mut reducer,
             r#"{"type":"result","subtype":"error","is_error":true}"#,

@@ -9,9 +9,11 @@
 use std::sync::Arc;
 
 use mango_external_agents::{
-    AuthState, Capabilities, Configuration, Discovery, Error, ExecutablePath, GateVerdict, Harness,
-    HarnessDescriptor, HarnessKind, HostContext, OpenSession, PermissionMatrix, Result, Session,
-    SessionIds, SessionInfo, TransportKind,
+    AuthState, Capabilities, CapabilityCeiling, Configuration, ConfigurationCatalog,
+    ConfigurationState, Discovery, Error, ExecutablePath, GateVerdict, Harness, HarnessDescriptor,
+    HarnessIdentity, HostContext, OpenSession, PermissionMatrix, Result, Session,
+    SessionCapabilities, SessionIds, SessionSnapshot, SessionState, TransportKind,
+    TransportSelection,
 };
 
 use crate::auth::{self, Authentication};
@@ -57,9 +59,9 @@ impl ClaudeHarness {
     pub fn new() -> Self {
         Self {
             descriptor: HarnessDescriptor {
-                kind: HarnessKind::Claude,
+                identity: HarnessIdentity::claude(),
                 vendor: VENDOR,
-                capabilities: CEILING,
+                capabilities: CapabilityCeiling::new(CEILING),
                 transports: &[TransportKind::Stdio],
                 vendor_environment_keys: VENDOR_ENVIRONMENT_KEYS,
             },
@@ -244,9 +246,13 @@ impl Harness for ClaudeHarness {
                     minimum: String::from(MINIMUM_VERSION),
                 },
                 auth: AuthState::Unknown,
-                capabilities: Capabilities::none(),
+                capabilities: Capabilities::none().into(),
                 permission_matrix: permissions::matrix(&survey.availability),
                 models: Vec::new(),
+                // Claude does not publish a settings catalog over any documented surface — see
+                // `docs/harness-claude.md`. Empty is the honest answer, distinct from a catalog
+                // whose rows are all unsupported.
+                configuration_catalog: ConfigurationCatalog::empty(),
             });
         }
 
@@ -258,9 +264,10 @@ impl Harness for ClaudeHarness {
             // read is not a reason to refuse a binary that answered every other question.
             gate: GateVerdict::Usable,
             auth: survey.authentication.state.clone(),
-            capabilities: survey.capabilities(models.is_some()),
+            capabilities: survey.capabilities(models.is_some()).into(),
             permission_matrix: permissions::matrix(&survey.availability),
             models: models.unwrap_or_default(),
+            configuration_catalog: ConfigurationCatalog::empty(),
         })
     }
 
@@ -270,6 +277,10 @@ impl Harness for ClaudeHarness {
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
         self.validate_open_session(&request)?;
+        // Claude's model and permission-mode flags are argv on a fresh child: there is no surface
+        // to un-set one on an already-open session, so a reset is refused wherever a host could
+        // ask for one rather than silently treated as "leave it alone".
+        mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)?;
 
         // This is a host authorization check, not a fact a vendor can answer. Prepare the file
         // before the first probe so a missing or inaccessible scratch location never starts a
@@ -294,7 +305,7 @@ impl Harness for ClaudeHarness {
         // `remove_dir_all` against the host's own scratch root. Gathered into one call so a failed
         // open has one error path, and that path hands the removal to the blocking pool for the
         // same reason the write runs there.
-        let opened = match Self::opened(request, survey) {
+        let opened = match Self::opened(request, survey, self.descriptor(), host.now()) {
             Ok(opened) => opened,
             Err(error) => {
                 crate::mcp::release_off_worker(mcp_config.take()).await;
@@ -305,7 +316,7 @@ impl Harness for ClaudeHarness {
         Ok(Box::new(ClaudeSession::new(
             host.clone(),
             executable,
-            opened.info,
+            opened.core_state,
             opened.availability,
             opened.surface,
             mcp_config.take(),
@@ -315,7 +326,7 @@ impl Harness for ClaudeHarness {
 
 /// What a passed open decided, before the session takes ownership of its MCP artifact.
 struct OpenedSession {
-    info: SessionInfo,
+    core_state: SessionState,
     availability: ModeAvailability,
     surface: Option<CliSurface>,
 }
@@ -326,7 +337,12 @@ impl ClaudeHarness {
     /// Separated from `open_session` so that call owns exactly one error path: the MCP artifact is
     /// already on disk by the time any of these run, and each refusal has to release it the same
     /// way.
-    fn opened(request: OpenSession, survey: Survey) -> Result<OpenedSession> {
+    fn opened(
+        request: OpenSession,
+        survey: Survey,
+        descriptor: &HarnessDescriptor,
+        observed_at: std::time::SystemTime,
+    ) -> Result<OpenedSession> {
         if !survey.installed() {
             return Err(Error::Launch {
                 program: String::from(probe::PROGRAM),
@@ -345,9 +361,9 @@ impl ClaudeHarness {
             });
         }
 
-        let configuration = request.configuration.clone();
-        require_supported(&configuration, &survey.availability)?;
-        models::validate_configuration(&configuration, survey.surface.as_ref())?;
+        let opening_configuration = request.configuration.requested();
+        require_supported(&opening_configuration, &survey.availability)?;
+        models::validate_configuration(&opening_configuration, survey.surface.as_ref())?;
 
         // Refused rather than dropped. A session that quietly ignored the servers a host
         // configured would run every turn without the tools somebody set up, and report success.
@@ -376,21 +392,40 @@ impl ClaudeHarness {
             None => uuid::Uuid::new_v4().to_string(),
         };
 
-        let info = SessionInfo {
-            ids: SessionIds {
+        let effective_transport = descriptor.resolve_transport(request.transport)?;
+        let capabilities = survey.capabilities(models::advertises_catalog(survey.surface.as_ref()));
+
+        // Requested and accepted start identical: the harness commits to encoding exactly what
+        // was asked, verbatim, once a turn spawns — see `require_supported` above. Observed stays
+        // unknown, permanently: no documented Claude surface reports its own settings back.
+        let configuration_state = ConfigurationState::new(
+            opening_configuration.clone(),
+            opening_configuration,
+            Configuration::unknown(),
+        );
+
+        let snapshot = SessionSnapshot::opening(
+            SessionIds {
                 session_id: request.session_id,
                 native_session_id,
             },
-            resumed,
-            fallback_reason: None,
-            effective_configuration: configuration,
-            capabilities: survey.capabilities(models::advertises_catalog(survey.surface.as_ref())),
+            HarnessIdentity::claude(),
+            TransportSelection::new(request.transport, effective_transport),
+            observed_at,
+        )
+        .with_capabilities(SessionCapabilities::new(capabilities))
+        .with_configuration(configuration_state)
+        .with_catalog(ConfigurationCatalog::empty());
+        let snapshot = if resumed {
+            snapshot.resumed()
+        } else {
+            snapshot
         };
 
         Ok(OpenedSession {
-            info,
-            availability: survey.availability,
-            surface: survey.surface,
+            core_state: SessionState::new(snapshot),
+            survey.availability,
+            survey.surface,
         })
     }
 }
@@ -403,7 +438,11 @@ impl ClaudeHarness {
 /// result, which is a queued follow-up rather than same-turn steering. `session_listing`: the
 /// vendor's own transcripts live under a path documented as subject to change, and parsing them
 /// would be reading another company's private format. `images`, `native_review` and
-/// `account_usage`: no surface observed.
+/// `account_usage`: no surface observed. `questions`: no documented surface distinguishes an
+/// information request from a permission prompt. `configuration_catalog`: no documented surface
+/// enumerates the vendor's own settings, only accepts flags this harness already knows about.
+/// `session_configuration`: every setting here is argv on a fresh child, so nothing can change on
+/// an already-open session.
 const fn probed_capabilities() -> Capabilities {
     Capabilities {
         structured_streaming: true,
@@ -415,11 +454,14 @@ const fn probed_capabilities() -> Capabilities {
         model_catalog: false,
         mcp_passthrough: false,
         interactive_approvals: false,
+        questions: false,
         images: false,
         steering: false,
         session_listing: false,
         native_review: false,
         account_usage: false,
+        configuration_catalog: false,
+        session_configuration: false,
     }
 }
 
@@ -450,10 +492,10 @@ async fn read_auto_mode_policy(host: &HostContext) -> bool {
 ///
 /// ```
 /// use mango_agent_claude::harness;
-/// use mango_external_agents::{HarnessKind, HarnessRegistry};
+/// use mango_external_agents::{HarnessId, HarnessRegistry};
 ///
 /// let registry = HarnessRegistry::new(vec![harness()]).expect("expected a registry");
-/// assert!(registry.get(&HarnessKind::Claude).is_some());
+/// assert!(registry.get(&HarnessId::claude()).is_some());
 /// ```
 pub fn harness() -> Arc<dyn Harness> {
     Arc::new(ClaudeHarness::new())
@@ -463,7 +505,7 @@ pub fn harness() -> Arc<dyn Harness> {
 mod tests {
     use super::{CEILING, ClaudeHarness, probed_capabilities, require_supported};
     use mango_external_agents::{
-        ApprovalRouting, Capabilities, Configuration, Error, Harness, HarnessKind, PermissionLevel,
+        ApprovalRouting, Capabilities, Configuration, Error, Harness, HarnessId, PermissionLevel,
         TransportKind,
     };
 
@@ -489,7 +531,7 @@ mod tests {
     fn declares_only_the_transport_this_dialect_rides() {
         let harness = ClaudeHarness::new();
         let descriptor = harness.descriptor();
-        assert_eq!(descriptor.kind, HarnessKind::Claude);
+        assert_eq!(descriptor.id(), &HarnessId::claude());
         assert_eq!(descriptor.transports, &[TransportKind::Stdio]);
 
         let error = descriptor
@@ -518,11 +560,9 @@ mod tests {
     #[test]
     fn a_configuration_no_probe_vetted_is_refused_before_anything_is_spawned() {
         let availability = crate::permissions::ModeAvailability::default();
-        let auto_review = Configuration {
-            level: Some(PermissionLevel::Default),
-            routing: Some(ApprovalRouting::AutoReview),
-            ..Configuration::default()
-        };
+        let auto_review = Configuration::unknown()
+            .with_level(PermissionLevel::Default)
+            .with_routing(ApprovalRouting::AutoReview);
         let error = require_supported(&auto_review, &availability)
             .expect_err("expected an unverified auto to be refused");
         assert!(
@@ -530,7 +570,7 @@ mod tests {
             "received {error:?}"
         );
 
-        require_supported(&Configuration::default(), &availability)
+        require_supported(&Configuration::unknown(), &availability)
             .expect("expected an omitted vendor-default configuration to need no probe verdict");
     }
 }

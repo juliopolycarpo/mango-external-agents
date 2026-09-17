@@ -25,8 +25,8 @@ struct Replay {
 }
 
 /// Replays a captured transcript through a reducer, exactly as the turn loop feeds it.
-fn replay(transcript: &str, resumed: bool) -> Replay {
-    let mut reducer = TurnReducer::new(resumed);
+fn replay(transcript: &str) -> Replay {
+    let mut reducer = TurnReducer::new();
     let mut events = Vec::new();
     let mut init = None;
     for line in transcript.lines() {
@@ -42,7 +42,7 @@ fn replay(transcript: &str, resumed: bool) -> Replay {
 
 /// A synthetic run, for the shapes a captured transcript does not happen to contain.
 fn reduce_lines(lines: &[&str]) -> Vec<EventKind> {
-    let mut reducer = TurnReducer::new(false);
+    let mut reducer = TurnReducer::new();
     lines
         .iter()
         .filter_map(|line| StreamRecord::parse(line))
@@ -85,13 +85,13 @@ fn reasoning_of(events: &[EventKind]) -> String {
         .collect()
 }
 
-fn commands_of(events: &[EventKind]) -> Vec<Command> {
-    events
-        .iter()
-        .find_map(|event| match event {
-            EventKind::CommandsAvailable { commands } => Some(commands.clone()),
-            _ => None,
-        })
+/// The commands the run's `init` announced — session state now, not a turn event. See
+/// [`RunInit::commands`].
+fn commands_of(replay: &Replay) -> Vec<Command> {
+    replay
+        .init
+        .as_ref()
+        .and_then(|init| init.commands.clone())
         .unwrap_or_default()
 }
 
@@ -127,25 +127,29 @@ fn names(commands: &[Command]) -> Vec<&str> {
 mod on_a_recorded_read_a_file_turn {
     use super::*;
 
+    /// The vendor's own session handle is session state, not a turn event: it does not appear in
+    /// `run.events` at all, only in `run.init` — see [`RunInit`].
     #[test]
-    fn opens_the_session_from_the_init_record() {
-        let run = replay(READ_TURN, false);
-        assert_eq!(
-            run.events.first(),
-            Some(&EventKind::SessionStarted {
-                native_session_id: String::from("b01414e7-4b4b-43a2-9109-a33e21664340"),
-                resumed: false,
-            })
+    fn reports_the_vendors_session_handle_through_init_rather_than_a_turn_event() {
+        let run = replay(READ_TURN);
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, EventKind::TurnStarted { .. })),
+            "expected the vendor's own session handle to carry no turn-started event of its own, received {:?}",
+            shape(&run.events)
         );
+        let init = run.init.expect("expected the run to describe itself");
         assert_eq!(
-            run.init.expect("expected the run to describe itself").model,
-            Some(String::from("claude-sonnet-5"))
+            init.session_id,
+            Some(String::from("b01414e7-4b4b-43a2-9109-a33e21664340"))
         );
+        assert_eq!(init.model, Some(String::from("claude-sonnet-5")));
     }
 
     #[test]
     fn publishes_the_names_whose_origin_the_record_states_when_the_exclusion_list_is_unreadable() {
-        let commands = commands_of(&replay(READ_TURN, false).events);
+        let commands = commands_of(&replay(READ_TURN));
         let published = names(&commands);
 
         assert!(
@@ -183,20 +187,8 @@ mod on_a_recorded_read_a_file_turn {
     }
 
     #[test]
-    fn reports_the_resume_state_it_was_opened_with_rather_than_inferring_one() {
-        let run = replay(READ_TURN, true);
-        assert_eq!(
-            run.events.first(),
-            Some(&EventKind::SessionStarted {
-                native_session_id: String::from("b01414e7-4b4b-43a2-9109-a33e21664340"),
-                resumed: true,
-            })
-        );
-    }
-
-    #[test]
     fn delivers_assistant_text_once_from_the_deltas_only() {
-        let events = replay(READ_TURN, false).events;
+        let events = replay(READ_TURN).events;
         assert_eq!(text_of(&events), "mango");
         assert_eq!(
             events
@@ -210,7 +202,7 @@ mod on_a_recorded_read_a_file_turn {
 
     #[test]
     fn emits_no_reasoning_when_the_vendor_withholds_the_thinking_text() {
-        let events = replay(READ_TURN, false).events;
+        let events = replay(READ_TURN).events;
         assert_eq!(
             reasoning_of(&events),
             "",
@@ -220,7 +212,7 @@ mod on_a_recorded_read_a_file_turn {
 
     #[test]
     fn announces_the_reasoning_phase_even_when_the_vendor_withholds_every_delta() {
-        let events = replay(READ_TURN, false).events;
+        let events = replay(READ_TURN).events;
         assert_eq!(
             events
                 .iter()
@@ -240,7 +232,7 @@ mod on_a_recorded_read_a_file_turn {
 
     #[test]
     fn labels_the_activity_with_claudes_own_tool_name_verbatim() {
-        let events = replay(READ_TURN, false).events;
+        let events = replay(READ_TURN).events;
         let (call_id, activity) = first_activity_started(&events);
         assert_eq!(call_id, "toolu_01LZJqPzShDSj9cPgL7PeD1v");
         assert_eq!(activity.name, "Read");
@@ -250,7 +242,7 @@ mod on_a_recorded_read_a_file_turn {
 
     #[test]
     fn closes_the_activity_when_its_tool_result_arrives() {
-        let events = replay(READ_TURN, false).events;
+        let events = replay(READ_TURN).events;
         let (call_id, result) = first_activity_completed(&events);
         assert_eq!(call_id, "toolu_01LZJqPzShDSj9cPgL7PeD1v");
         assert_eq!(result.status, ActivityStatus::Completed);
@@ -259,12 +251,10 @@ mod on_a_recorded_read_a_file_turn {
 
     #[test]
     fn ends_with_usage_and_a_completion() {
-        let events = replay(READ_TURN, false).events;
+        let events = replay(READ_TURN).events;
         assert_eq!(
             shape(&events),
             vec![
-                "session_started",
-                "commands_available",
                 "reasoning_started",
                 "reasoning_ended",
                 "activity_started",
@@ -288,7 +278,7 @@ mod on_a_recorded_read_a_file_turn {
     #[test]
     fn emits_no_approval_because_claude_never_offers_one_to_answer() {
         for transcript in [READ_TURN, DENIED_WRITE] {
-            let events = replay(transcript, false).events;
+            let events = replay(transcript).events;
             assert!(
                 !events.iter().any(|event| matches!(
                     event,
@@ -306,12 +296,10 @@ mod on_a_recorded_denied_write {
 
     #[test]
     fn reports_the_denial_as_a_failed_activity_not_as_a_pending_approval() {
-        let events = replay(DENIED_WRITE, false).events;
+        let events = replay(DENIED_WRITE).events;
         assert_eq!(
             shape(&events),
             vec![
-                "session_started",
-                "commands_available",
                 "reasoning_delta",
                 "activity_started",
                 "activity_completed",
@@ -325,7 +313,7 @@ mod on_a_recorded_denied_write {
 
     #[test]
     fn completes_the_turn_rather_than_failing_it() {
-        let events = replay(DENIED_WRITE, false).events;
+        let events = replay(DENIED_WRITE).events;
         assert_eq!(
             events.last(),
             Some(&EventKind::Completed),
@@ -335,7 +323,7 @@ mod on_a_recorded_denied_write {
 
     #[test]
     fn reports_the_denial_once_through_the_activity_that_was_refused() {
-        let events = replay(DENIED_WRITE, false).events;
+        let events = replay(DENIED_WRITE).events;
         assert_eq!(
             events
                 .iter()
@@ -348,7 +336,7 @@ mod on_a_recorded_denied_write {
 
     #[test]
     fn names_the_refused_tool_and_the_reason_in_the_activity_claude_reports() {
-        let events = replay(DENIED_WRITE, false).events;
+        let events = replay(DENIED_WRITE).events;
         let (_, activity) = first_activity_started(&events);
         assert_eq!(activity.name, "Write");
         assert_eq!(activity.kind, ActivityKind::FileChange);
@@ -366,7 +354,7 @@ mod on_a_recorded_denied_write {
 
     #[test]
     fn delivers_the_assistant_text_even_though_the_run_carried_no_partial_messages() {
-        let events = replay(DENIED_WRITE, false).events;
+        let events = replay(DENIED_WRITE).events;
         assert_eq!(
             text_of(&events),
             "I need permission to write the file. Please approve the request to write to `denied.txt` so I can create the file with the content \"hello\"."
@@ -375,7 +363,7 @@ mod on_a_recorded_denied_write {
 
     #[test]
     fn delivers_the_assistant_reasoning_even_though_the_run_carried_no_partial_messages() {
-        let events = replay(DENIED_WRITE, false).events;
+        let events = replay(DENIED_WRITE).events;
         let reasoning = reasoning_of(&events);
         assert!(
             reasoning.starts_with("The user is asking me to create a file named denied.txt"),
@@ -760,7 +748,7 @@ mod termination {
 
     #[test]
     fn closes_a_run_whose_process_died_without_a_result() {
-        let mut reducer = TurnReducer::new(false);
+        let mut reducer = TurnReducer::new();
         let opening = StreamRecord::parse(
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"sleep 600"}}]}}"#,
         )
