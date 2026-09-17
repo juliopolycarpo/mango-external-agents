@@ -144,7 +144,7 @@ pub async fn run(harness: &dyn Harness, host: &HostContext, options: Options) ->
     // is a cost the suite has no business imposing to observe something a turn already produces.
     let watching = check_session_state(session.as_ref(), &options, &mut report);
     check_turn(session.as_ref(), &options, &mut report).await;
-    check_session_update(watching, &options, &mut report).await;
+    check_session_update(session.as_ref(), watching, &options, &mut report).await;
     check_questions(session.as_ref(), &options, &mut report).await;
     check_cancelled_turn(session.as_ref(), &options, &mut report).await;
     check_optional_methods(session.as_ref(), &mut report).await;
@@ -757,50 +757,54 @@ struct WatchedSession {
     subscription: crate::state::SessionSubscription,
 }
 
-/// A session update published while a turn ran reached the subscriber that was already listening.
+/// Whatever a session published while a turn ran reached the subscriber that was listening.
 ///
-/// What this proves is that a harness publishes its state through
-/// [`SessionState`](crate::SessionState) at all: one that mutated a private field instead would
-/// leave this subscription waiting forever. The subscription was opened before the turn, and
-/// `watch` coalesces rather than drops, so a change published at any point during it is still
-/// waiting here.
+/// Deliberately conditional, and worth saying why. There is no way for a harness to tell a host
+/// about a session fact except through [`SessionState`](crate::SessionState) — `Session::snapshot`
+/// reads from it and nothing else — so "did it publish" and "did a subscriber hear" cannot come
+/// apart by accident. What this check is for is the case where they *have*: a harness holding more
+/// than one state, or replacing the one it handed out, publishes into something nobody is
+/// listening to, and the revision a host reads moves while the subscription stays silent.
 ///
-/// Skipped only when the turn it would have observed never started. A turn that ran and published
-/// nothing is a **failure**: reporting it as a skip would make the one check written to catch that
-/// harness unable to fail, because `Report::passed` ignores skips.
-async fn check_session_update(watching: WatchedSession, options: &Options, report: &mut Report) {
+/// A harness with nothing session-scoped to say during a turn is **skipped**, not failed. Codex
+/// announces no command catalog and its thread id is settled at open, so a plain turn changes
+/// nothing about the session — and failing it for that would be the suite requiring a vendor
+/// surface that does not exist.
+async fn check_session_update(
+    session: &dyn Session,
+    watching: WatchedSession,
+    options: &Options,
+    report: &mut Report,
+) {
     const NAME: &str = "a session update reaches a subscriber";
 
     let WatchedSession {
-        opened_at: before,
+        opened_at,
         mut subscription,
     } = watching;
-    if !report
-        .checks
-        .iter()
-        .any(|check| check.name == "a turn starts" && check.outcome == Outcome::Passed)
-    {
+    let published = session.snapshot().revision;
+    if published <= opened_at {
         report.record(
             NAME,
             Outcome::Skipped(String::from(
-                "no turn ran, so there was nothing for a session update to accompany",
+                "this harness published no session change while a turn ran",
             )),
         );
         return;
     }
 
     let outcome = match tokio::time::timeout(options.turn_timeout, subscription.changed()).await {
-        Ok(Some(seen)) if seen.revision > before => Outcome::Passed,
+        Ok(Some(seen)) if seen.revision >= published => Outcome::Passed,
         Ok(Some(seen)) => Outcome::Failed(format!(
-            "expected a later revision than {before}, received {}",
+            "expected the subscriber to reach revision {published}, received {}",
             seen.revision
         )),
         Ok(None) => Outcome::Failed(String::from(
             "expected a session update while a turn ran, received a dropped subscription",
         )),
         Err(_) => Outcome::Failed(format!(
-            "expected a session update within {:?} of a turn running, received none — a harness \
-             that mutates its own state instead of publishing through SessionState leaves every \
+            "expected the session change at revision {published} to reach a subscriber within \
+             {:?}, received none — a harness publishing into a state nobody holds leaves every \
              subscriber waiting",
             options.turn_timeout
         )),
@@ -927,11 +931,11 @@ mod tests {
         );
     }
 
-    /// The negative fixture for the session-state check. A harness that keeps its state to itself
-    /// leaves every subscriber waiting, and before this the suite reported that as a skip — which
-    /// `Report::passed` treats as green, making the one check written to catch it unable to fail.
+    /// A harness with nothing session-scoped to say during a turn is conformant, and the check
+    /// says so rather than failing it for a vendor surface it does not have. Codex is the real
+    /// case: no command catalog, and a thread id settled at open.
     #[tokio::test]
-    async fn a_harness_that_publishes_no_session_state_fails_the_subscription_check() {
+    async fn a_harness_that_publishes_nothing_during_a_turn_is_skipped_rather_than_failed() {
         let report = run(
             &FakeHarness::new().without_session_updates(),
             &host(),
@@ -943,19 +947,31 @@ mod tests {
         )
         .await;
 
-        let failures = report.failures();
-        assert!(
-            failures
-                .iter()
-                .any(|check| check.name == "a session update reaches a subscriber"),
-            "expected the subscription check to fail, received {failures:?}"
-        );
+        report.assert_passed();
         assert!(
             report
                 .skipped()
                 .iter()
-                .all(|check| check.name != "a session update reaches a subscriber"),
-            "expected the failure not to be reported as a skip"
+                .any(|check| check.name == "a session update reaches a subscriber"),
+            "expected the subscription check to be skipped, received {:?}",
+            report.skipped()
+        );
+    }
+
+    /// And a harness that does publish has it reach a subscriber, which is the half the skip above
+    /// cannot stand in for.
+    #[tokio::test]
+    async fn a_harness_that_publishes_during_a_turn_reaches_its_subscriber() {
+        let report = run(&FakeHarness::new(), &host(), Options::default()).await;
+
+        report.assert_passed();
+        assert!(
+            report.checks.iter().any(|check| {
+                check.name == "a session update reaches a subscriber"
+                    && check.outcome == Outcome::Passed
+            }),
+            "expected the subscription check to pass, received {:?}",
+            report.checks
         );
     }
 

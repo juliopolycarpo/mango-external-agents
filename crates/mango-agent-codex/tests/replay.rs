@@ -2383,14 +2383,15 @@ async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
 async fn the_harness_passes_the_cores_conformance_suite() {
     // The suite probes before it opens anything, and a probe spawns `codex --version` first.
     //
-    // `check_session_state` starts and cancels a turn of its own to prove `SessionState`
-    // publishes, ahead of the suite's own `check_turn` and `check_cancelled_turn` — three
-    // `turn/start` calls against one session. `permission-transitions` is the only recorded
-    // conversation with enough of them; `approval`'s single recorded turn is not.
+    // `approval` rather than a longer conversation: the suite watches for a session update on a
+    // subscription it opens before `check_turn` rather than starting a turn of its own, so it
+    // needs no more recorded turns than it did before session state existed — and this is the one
+    // recorded conversation where the vendor actually asks for an approval, which is the round
+    // trip the suite cannot prove anywhere else.
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(version_answer());
     launcher.push(Transcript::load("handshake").as_process());
-    launcher.push(Transcript::load("permission-transitions").as_process());
+    launcher.push(Transcript::load("approval").as_process());
     let (host, _) = with_launcher(launcher, None);
     let report = mango_external_agents::testing::conformance::run(
         &CodexHarness::new(),
@@ -2472,7 +2473,7 @@ async fn a_reset_requested_at_open_is_refused_rather_than_silently_dropped() {
         "expected a typed configuration refusal, received {error:?}"
     );
     assert!(
-        error.to_string().contains("remove an override"),
+        error.to_string().contains("remove the override on level"),
         "expected the refusal to name what was asked, received {error}"
     );
     assert_eq!(
@@ -2513,7 +2514,7 @@ async fn a_reset_requested_on_a_turn_is_refused_rather_than_silently_dropped() {
         "expected a typed configuration refusal, received {error:?}"
     );
     assert!(
-        error.to_string().contains("remove an override"),
+        error.to_string().contains("remove the override on routing"),
         "expected the refusal to name what was asked, received {error}"
     );
     assert_eq!(

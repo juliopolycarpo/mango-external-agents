@@ -209,7 +209,7 @@ impl Harness for CodexHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        self.validate_open_session(&request)?;
+        self.validate_open_session(host, &request)?;
         let effective_transport = self.descriptor().resolve_transport(request.transport)?;
         let executable = self.program_for(&request);
         let transport = stdio::open(
@@ -402,7 +402,10 @@ async fn open_thread(
         snapshot = snapshot.with_fallback_reason(reason);
     }
 
-    Ok((SessionState::new(snapshot), thread_id))
+    Ok((
+        SessionState::new(std::sync::Arc::clone(host.clock()), snapshot),
+        thread_id,
+    ))
 }
 
 async fn start_thread(

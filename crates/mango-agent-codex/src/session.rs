@@ -226,7 +226,7 @@ impl Shared {
             .map(|active| ActiveTurnRoute {
                 owner: Arc::clone(&active.owner),
                 turn_id: active.turn_id.clone(),
-                attempt: active.attempt.clone(),
+                attempt: active.attempt,
                 native_turn_id: active.native_turn_id.clone(),
             })
     }
@@ -303,7 +303,7 @@ struct ActiveTurnRoute {
 impl ActiveTurnRoute {
     /// The session, turn and attempt an approval raised on this route belongs to.
     fn operation(&self, session_id: SessionId) -> OperationRef {
-        OperationRef::new(session_id, self.turn_id.clone(), self.attempt.clone())
+        OperationRef::new(session_id, self.turn_id.clone(), self.attempt)
     }
 }
 
@@ -1222,7 +1222,7 @@ impl CodexSession {
         let (sink, events) = EventSink::new(
             self.shared.session_id.clone(),
             turn_id.clone(),
-            attempt.clone(),
+            attempt,
             Arc::clone(self.shared.host.clock()),
             self.shared.host.limits().turn_channel_capacity,
         );
@@ -1249,7 +1249,7 @@ impl CodexSession {
                 owner: Arc::clone(&owner),
                 sink: sink.clone(),
                 turn_id: turn_id.clone(),
-                attempt: attempt.clone(),
+                attempt,
                 native_turn_id: String::new(),
                 announced: false,
                 is_review: rpc_method == method::REVIEW_START,
@@ -1567,7 +1567,7 @@ impl Session for CodexSession {
                     ActiveTurnRoute {
                         owner: Arc::clone(&active.owner),
                         turn_id: active.turn_id.clone(),
-                        attempt: active.attempt.clone(),
+                        attempt: active.attempt,
                         native_turn_id: active.native_turn_id.clone(),
                     },
                     self.shared.thread_id().to_owned(),
@@ -1903,7 +1903,7 @@ mod tests {
         let (sink, events) = EventSink::new(
             mango_external_agents::SessionId::new("chat-1"),
             turn_id.clone(),
-            attempt.clone(),
+            attempt,
             Arc::clone(shared.host.clock()),
             8,
         );
@@ -1911,7 +1911,7 @@ mod tests {
             owner: Arc::new(()),
             sink,
             turn_id: turn_id.clone(),
-            attempt: attempt.clone(),
+            attempt: attempt,
             native_turn_id: native_turn_id.to_owned(),
             // This helper installs a turn already past the point `begin` would have announced it.
             announced: true,
