@@ -36,8 +36,18 @@ use crate::link::{Link, LinkSender};
 /// request `0` with `"0"` is a different id, so the peer never matches the answer to the question
 /// and blocks forever — which presents as a turn that renders an approval, accepts a click, and
 /// then simply never finishes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RequestId(Value);
+
+impl std::fmt::Debug for RequestId {
+    /// Reports the JSON id type without logging the peer-provided identifier.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestId")
+            .field("json_type", &json_value_type(&self.0))
+            .finish()
+    }
+}
 
 impl RequestId {
     /// Wraps an id as it arrived.
@@ -63,13 +73,18 @@ impl RequestId {
 }
 
 impl std::fmt::Display for RequestId {
+    /// Names the JSON type, never the id itself.
+    ///
+    /// A peer picks its own ids, so a string id is peer-controlled text that a host writing
+    /// `{id}` into a log would carry across a diagnostic boundary. Correlation happens through
+    /// [`key`](Self::key) and [`as_json`](Self::as_json), which stay exact.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.key())
+        write!(formatter, "a {} request id", json_value_type(&self.0))
     }
 }
 
 /// A JSON-RPC error body.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JsonRpcError {
     /// The peer's code.
     pub code: i64,
@@ -78,6 +93,18 @@ pub struct JsonRpcError {
     /// Whatever else the peer attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+impl std::fmt::Debug for JsonRpcError {
+    /// Reports error structure without logging peer-provided text or JSON payloads.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JsonRpcError")
+            .field("code", &self.code)
+            .field("message_bytes", &self.message.len())
+            .field("data_type", &self.data.as_ref().map(json_value_type))
+            .finish()
+    }
 }
 
 impl JsonRpcError {
@@ -92,7 +119,7 @@ impl JsonRpcError {
 }
 
 /// What a handler answers a peer's question with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ServerRequestOutcome {
     /// An answer.
     Answer(Value),
@@ -100,8 +127,21 @@ pub enum ServerRequestOutcome {
     Failure(JsonRpcError),
 }
 
+impl std::fmt::Debug for ServerRequestOutcome {
+    /// Reports reply shape without logging the peer answer or error payload.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Answer(value) => formatter
+                .debug_struct("Answer")
+                .field("result_type", &json_value_type(value))
+                .finish(),
+            Self::Failure(error) => formatter.debug_tuple("Failure").field(error).finish(),
+        }
+    }
+}
+
 /// Why the peer's read side stopped without this client closing it first.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PeerTermination {
     /// The peer closed its output.
     Exited,
@@ -114,16 +154,48 @@ pub enum PeerTermination {
     },
 }
 
+impl std::fmt::Debug for PeerTermination {
+    /// Reports why the peer stopped without logging its unstructured link failure.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited => formatter.write_str("Exited"),
+            Self::LinkFailed(error) => formatter
+                .debug_struct("LinkFailed")
+                .field("message_bytes", &error.len())
+                .finish(),
+            Self::NotificationBackpressure { limit } => formatter
+                .debug_struct("NotificationBackpressure")
+                .field("limit", limit)
+                .finish(),
+        }
+    }
+}
+
 impl std::fmt::Display for PeerTermination {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Exited => formatter.write_str("the peer exited"),
-            Self::LinkFailed(error) => write!(formatter, "the peer link failed: {error}"),
+            Self::LinkFailed(error) => write!(
+                formatter,
+                "the peer link failed with an unstructured error ({} bytes)",
+                error.len()
+            ),
             Self::NotificationBackpressure { limit } => write!(
                 formatter,
                 "the peer sent more messages than the client could retain while its handler was busy (limit {limit})"
             ),
         }
+    }
+}
+
+fn json_value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -160,7 +232,25 @@ pub trait PeerHandler: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientOptions {
     /// The peer as a person would name it, such as `Codex app-server`.
+    ///
+    /// Host-authored text. It reaches a person through the host's own copy, never through an
+    /// [`Error`] this client returns.
     pub peer_name: String,
+    /// The vendor prefix of the [`ErrorCode`] minted when the peer answers with an error frame.
+    ///
+    /// `&'static str` is the provenance marker, the same one [`ErrorCode::from_static`] carries: a
+    /// prefix is written by the harness that compiles against this client, never derived from
+    /// [`peer_name`](ClientOptions::peer_name), which a host fills in and which may carry its own
+    /// text. A code is diagnostic — `Display` writes it — so what it may contain is decided here,
+    /// where it is made.
+    ///
+    /// What the bound does not do is make a literal safe by itself. It rules out runtime data,
+    /// not a deliberate one: `env!("SOMETHING")` is also `&'static str`, and a lowercase label
+    /// passes the shape check `ErrorCode`'s `Display` applies. So this is the same obligation
+    /// [`ErrorCode::from_static`] places on every harness that names its own codes — write the
+    /// vendor's name, `codex` or `claude`, and nothing a person would not want in a log line.
+    /// Sealing it here without sealing that constructor would move the obligation, not remove it.
+    pub code_prefix: &'static str,
     /// Whether to write the `"jsonrpc": "2.0"` member.
     ///
     /// Not every dialect this library drives writes it, and a peer that validates strictly will
@@ -184,6 +274,7 @@ impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             peer_name: String::from("external agent"),
+            code_prefix: "peer",
             include_version_header: true,
             request_timeout: Duration::from_secs(120),
             max_in_flight_requests: 256,
@@ -199,6 +290,22 @@ impl ClientOptions {
             peer_name: peer_name.into(),
             ..Self::default()
         }
+    }
+
+    /// Prefixes this client's error codes with a vendor name the harness knows at compile time.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::ClientOptions;
+    ///
+    /// let options = ClientOptions::new("Codex app-server").with_code_prefix("codex");
+    /// assert_eq!(options.code_prefix, "codex");
+    /// ```
+    #[must_use]
+    pub fn with_code_prefix(mut self, code_prefix: &'static str) -> Self {
+        self.code_prefix = code_prefix;
+        self
     }
 
     /// Omits the `"jsonrpc"` member, for a dialect that does not write one.
@@ -346,7 +453,7 @@ impl Client {
     {
         let answer = self.call(method, params, timeout).await?;
         serde_json::from_value(answer).map_err(|error| Error::Protocol {
-            expected: format!("a result {method} could answer with"),
+            expected: String::from("a JSON-RPC result"),
             received: error.to_string(),
         })
     }
@@ -457,17 +564,17 @@ impl Client {
         match tokio::time::timeout(timeout, waiting).await {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(failure))) => Err(Error::Vendor(failure.into_vendor_error(
-                ErrorCode::new(format!("{}-call-failed", self.state.slug())),
+                ErrorCode::new(format!("{}-call-failed", self.state.options.code_prefix)),
                 Some(id),
             ))),
             Ok(Err(_)) => Err(Error::Link {
                 peer: self.state.options.peer_name.clone(),
-                message: format!("the peer went away before answering {method}"),
+                message: String::from("a peer that went away before answering a JSON-RPC request"),
             }),
             Err(_) => {
                 self.state.pending.lock().await.remove(&id);
                 Err(Error::Timeout {
-                    operation: format!("{} {method}", self.state.options.peer_name),
+                    operation: String::from("a JSON-RPC request"),
                     after: timeout,
                 })
             }
@@ -512,7 +619,7 @@ impl ClientState {
         frame.insert(String::from("method"), json!(method));
 
         let params = serde_json::to_value(params).map_err(|error| Error::Protocol {
-            expected: format!("serialisable params for {method}"),
+            expected: String::from("serialisable JSON-RPC params"),
             received: error.to_string(),
         })?;
         // A dialect that validates strictly refuses a `params: null` it never declared, so an
@@ -651,17 +758,6 @@ impl ClientState {
         if let Some(answer) = self.pending.lock().await.remove(id) {
             let _ = answer.send(outcome);
         }
-    }
-
-    /// The peer's name as an error-code prefix.
-    fn slug(&self) -> String {
-        self.options
-            .peer_name
-            .to_lowercase()
-            .split_whitespace()
-            .next()
-            .unwrap_or("peer")
-            .to_owned()
     }
 }
 
@@ -941,6 +1037,54 @@ mod tests {
         )
     }
 
+    /// `Display` is the spelling a host reaches for when it logs `{id}`, so it carries the same
+    /// guarantee `Debug` does. `key()` stays exact: it is how this side correlates the answer.
+    #[test]
+    fn displaying_a_request_id_names_its_type_rather_than_the_peers_value() {
+        let id = RequestId::new(json!("request-id-secret"));
+
+        assert_eq!(id.to_string(), "a string request id");
+        assert_eq!(id.key(), "request-id-secret");
+        assert_eq!(
+            RequestId::new(json!(7)).to_string(),
+            "a number request id",
+            "expected the numeric spelling to be named as such"
+        );
+    }
+
+    #[test]
+    fn jsonrpc_debug_omits_raw_peer_payloads() {
+        let id = RequestId::new(json!("request-id-secret"));
+        let failure = JsonRpcError {
+            code: -32001,
+            message: String::from("peer-message-secret"),
+            data: Some(json!({ "token": "peer-data-secret" })),
+        };
+        let answer = ServerRequestOutcome::Answer(json!({ "answer": "reply-secret" }));
+        let termination = PeerTermination::LinkFailed(String::from("link-detail-secret"));
+
+        for rendered in [
+            format!("{id:?}"),
+            format!("{id}"),
+            format!("{failure:?}"),
+            format!("{answer:?}"),
+            format!("{termination:?}"),
+        ] {
+            for secret in [
+                "request-id-secret",
+                "peer-message-secret",
+                "peer-data-secret",
+                "reply-secret",
+                "link-detail-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no peer payload in diagnostics, received {rendered}"
+                );
+            }
+        }
+    }
+
     /// A frame that cannot be built must not leave a waiter behind: the map is what `close` and a
     /// dying pump drain, so an orphan is failed later against a caller that gave up here.
     #[tokio::test]
@@ -1170,8 +1314,12 @@ mod tests {
             .expect("expected the task to finish")
             .expect_err("expected a failure, received an answer");
         assert!(
-            error.to_string().contains("exited"),
-            "expected the peer's exit, received {error}"
+            matches!(&error, Error::Vendor(vendor) if vendor.message.contains("exited")),
+            "expected the raw vendor failure to retain the exit detail, received {error:?}"
+        );
+        assert!(
+            error.to_string().contains("vendor failure"),
+            "expected a safe vendor diagnostic, received {error}"
         );
         assert!(client.is_closed());
     }
@@ -1214,6 +1362,63 @@ mod tests {
             matches!(error, Error::Timeout { .. }),
             "expected a timeout, received {error:?}"
         );
+    }
+
+    /// Client labels identify a peer to the caller but can be host-authored text, so they must not
+    /// cross a timeout diagnostic alongside the exact method sent on the wire.
+    #[tokio::test(start_paused = true)]
+    async fn caller_defined_peer_and_method_names_stay_out_of_timeout_diagnostics() {
+        let link = ScriptedLink::new();
+        let client = Client::connect(
+            link.into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::new("peer credential=peer-secret"),
+        );
+
+        let error = client
+            .request_with_timeout::<_, Value>(
+                "method credential=method-secret",
+                json!({}),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("expected a timeout, received an answer");
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("peer-secret") && !rendered.contains("method-secret"),
+                "expected no caller-defined labels in diagnostics, received {rendered:?}"
+            );
+        }
+    }
+
+    /// A peer label is host-authored text, so the error code minted when the peer answers with an
+    /// error frame must come from the trusted prefix rather than from that label.
+    #[tokio::test]
+    async fn a_caller_defined_peer_label_does_not_become_an_error_code() {
+        let link = ScriptedLink::new();
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"refused"}}"#);
+        let client = Client::connect(
+            link.into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::new("tenant-secret"),
+        );
+
+        let error = client
+            .request::<_, Value>("ping", json!({}))
+            .await
+            .expect_err("expected the error frame to fail the call");
+
+        let Error::Vendor(vendor) = &error else {
+            panic!("expected a vendor error, received {error:?}");
+        };
+        assert_eq!(vendor.code.as_str(), "peer-call-failed");
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("tenant-secret"),
+                "expected no caller-defined label in diagnostics, received {rendered:?}"
+            );
+        }
     }
 
     #[tokio::test]

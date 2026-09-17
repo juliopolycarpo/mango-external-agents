@@ -56,7 +56,7 @@ pub use session::{
     AccountUsage, Attachment, AttachmentKind, CancelReason, CloseReason, Configuration, McpServer,
     McpTransport, NativeSession, OpenSession, Resume, ResumeMode, ReviewRequest, ReviewTarget,
     Session, SessionIds, SessionInfo, SessionPage, SessionQuery, Steer, SteerOutcome,
-    SteerRejection, TurnRequest,
+    SteerRejection, TurnRequest, resume_fallback_reason,
 };
 pub use stream::{EventSink, ReviewStream, TurnStream};
 pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};

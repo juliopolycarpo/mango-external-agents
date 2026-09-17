@@ -270,13 +270,67 @@ impl Harness for ClaudeHarness {
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
         self.validate_open_session(&request)?;
+
+        // This is a host authorization check, not a fact a vendor can answer. Prepare the file
+        // before the first probe so a missing or inaccessible scratch location never starts a
+        // vendor process. The host owns the container or sandbox mapping that makes this path
+        // visible to the child. A later opening refusal drops this value and removes only its
+        // scoped artifact.
+        // Held in `Prepared` rather than as a bare value: three child processes are awaited before
+        // the session can take it, and a caller that cancels in between drops it on the worker.
+        let mut mcp_config = crate::mcp::Prepared::new(if request.mcp_servers.is_empty() {
+            None
+        } else {
+            let scratch = host.scratch().ok_or_else(|| Error::HostConfiguration {
+                expected: "a host-owned scratch directory for MCP configuration",
+                received: String::from("none"),
+            })?;
+            ConfigFile::write(&request.mcp_servers, scratch).await?
+        });
         let executable = self.executable_for(&request);
         let survey = self.survey(host, &executable).await;
 
+        // Every refusal below owns the artifact written above, and removing it is a synchronous
+        // `remove_dir_all` against the host's own scratch root. Gathered into one call so a failed
+        // open has one error path, and that path hands the removal to the blocking pool for the
+        // same reason the write runs there.
+        let opened = match Self::opened(request, survey) {
+            Ok(opened) => opened,
+            Err(error) => {
+                crate::mcp::release_off_worker(mcp_config.take()).await;
+                return Err(error);
+            }
+        };
+
+        Ok(Box::new(ClaudeSession::new(
+            host.clone(),
+            executable,
+            opened.info,
+            opened.availability,
+            opened.surface,
+            mcp_config.take(),
+        )))
+    }
+}
+
+/// What a passed open decided, before the session takes ownership of its MCP artifact.
+struct OpenedSession {
+    info: SessionInfo,
+    availability: ModeAvailability,
+    surface: Option<CliSurface>,
+}
+
+impl ClaudeHarness {
+    /// Every check between the probe and the session, in the order a refusal should reach a host.
+    ///
+    /// Separated from `open_session` so that call owns exactly one error path: the MCP artifact is
+    /// already on disk by the time any of these run, and each refusal has to release it the same
+    /// way.
+    fn opened(request: OpenSession, survey: Survey) -> Result<OpenedSession> {
         if !survey.installed() {
             return Err(Error::Launch {
                 program: String::from(probe::PROGRAM),
-                message: String::from("the Claude Code CLI did not report a version"),
+                message: String::from("a CLI that reported no version"),
             });
         }
         if survey.refusal.is_some() {
@@ -293,6 +347,7 @@ impl Harness for ClaudeHarness {
 
         let configuration = request.configuration.clone();
         require_supported(&configuration, &survey.availability)?;
+        models::validate_configuration(&configuration, survey.surface.as_ref())?;
 
         // Refused rather than dropped. A session that quietly ignored the servers a host
         // configured would run every turn without the tools somebody set up, and report success.
@@ -312,7 +367,7 @@ impl Harness for ClaudeHarness {
             Some(resume) if !argv::is_vendor_session_id(&resume.native_session_id) => {
                 return Err(Error::HostConfiguration {
                     expected: "a resume reference shaped like the UUID Claude Code mints",
-                    received: format!("{:?}", resume.native_session_id),
+                    received: argv::value_summary(&resume.native_session_id),
                 });
             }
             Some(resume) => resume.native_session_id.clone(),
@@ -320,10 +375,6 @@ impl Harness for ClaudeHarness {
             // than derived from the host's own session id, which has no shape requirement.
             None => uuid::Uuid::new_v4().to_string(),
         };
-
-        // The library has no scratch directory of its own to be given, so the file goes where the
-        // platform puts temporary files, in a directory of its own that only its owner can read.
-        let mcp_config = ConfigFile::write(&request.mcp_servers, &std::env::temp_dir()).await?;
 
         let info = SessionInfo {
             ids: SessionIds {
@@ -336,14 +387,11 @@ impl Harness for ClaudeHarness {
             capabilities: survey.capabilities(models::advertises_catalog(survey.surface.as_ref())),
         };
 
-        Ok(Box::new(ClaudeSession::new(
-            host.clone(),
-            executable,
+        Ok(OpenedSession {
             info,
-            survey.availability,
-            survey.surface,
-            mcp_config,
-        )))
+            availability: survey.availability,
+            surface: survey.surface,
+        })
     }
 }
 

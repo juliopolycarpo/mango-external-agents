@@ -97,6 +97,12 @@ pub const APPROVAL_MAX_OPTIONS: usize = 16;
 /// The longest filesystem path the library will carry for a vendor session.
 pub const MAX_PATH_LENGTH: usize = 4_096;
 
+/// The longest value the library accepts for one vendor command-line option.
+///
+/// This is a character limit because argv values are text rather than an encoded wire buffer.
+/// Individual vendor positions may impose a stricter shape or a shorter limit.
+pub const ARGV_VALUE_MAX_CODE_POINTS: usize = 128;
+
 /// Vendor text after bounding, and whether anything was removed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoundedText {
@@ -214,6 +220,40 @@ pub fn vendor_path(raw: &str) -> Option<String> {
     Some(sanitised.text)
 }
 
+/// Whether text can safely occupy a value position in a vendor argv array.
+///
+/// An argv array prevents a shell from interpreting its contents, but a value beginning with a
+/// dash can still be parsed as the next CLI option. Controls and bidirectional formatting are
+/// rejected because an argv value must be kept exactly as supplied; repairing it would change the
+/// selected vendor setting. Callers add the vendor's own grammar and report the rejected field.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::normalize::is_argv_value;
+///
+/// assert!(is_argv_value("claude-opus-5"));
+/// assert!(!is_argv_value("--dangerously-skip-permissions"));
+/// ```
+#[must_use]
+pub fn is_argv_value(raw: &str) -> bool {
+    is_argv_value_with_max(raw, ARGV_VALUE_MAX_CODE_POINTS)
+}
+
+/// Whether text can safely occupy a value position in a vendor argv array with this field's cap.
+///
+/// Use [`is_argv_value`] for ordinary options. Filesystem paths retain their own documented cap,
+/// so a harness may pass [`MAX_PATH_LENGTH`] here without shrinking a host-owned absolute path.
+#[must_use]
+pub fn is_argv_value_with_max(raw: &str, max_code_points: usize) -> bool {
+    !raw.is_empty()
+        && !raw.starts_with('-')
+        && raw.chars().count() <= max_code_points
+        && raw
+            .chars()
+            .all(|character| !character.is_control() && !is_strippable(character))
+}
+
 /// C0 and C1 controls except tab and newline, and every bidirectional formatting character.
 ///
 /// Expressed as code-point tests rather than as a character class: a regular expression made of
@@ -237,7 +277,10 @@ fn is_strippable(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextLimit, bound_text, opaque_id, sanitize_field, vendor_path};
+    use super::{
+        ARGV_VALUE_MAX_CODE_POINTS, MAX_PATH_LENGTH, TextLimit, bound_text, is_argv_value,
+        is_argv_value_with_max, opaque_id, sanitize_field, vendor_path,
+    };
     use crate::error::Error;
 
     #[test]
@@ -369,5 +412,38 @@ mod tests {
         assert_eq!(vendor_path(&"p".repeat(4_097)), None);
         assert_eq!(vendor_path("/home/\u{202e}ada"), None);
         assert_eq!(vendor_path(""), None);
+    }
+
+    #[test]
+    fn argv_values_are_exact_or_rejected_before_they_can_be_another_option() {
+        for accepted in [
+            "opus",
+            "publishers/anthropic/models/claude-opus-5",
+            "a value",
+        ] {
+            assert!(
+                is_argv_value(accepted),
+                "expected {accepted:?} to be usable"
+            );
+        }
+        for rejected in [
+            "",
+            "--dangerously-skip-permissions",
+            "-p",
+            "opus\tsonnet",
+            "opus\nsonnet",
+            "opus\u{1}sonnet",
+            "opus\u{202e}sonnet",
+        ] {
+            assert!(
+                !is_argv_value(rejected),
+                "expected {rejected:?} to be refused"
+            );
+        }
+        assert!(!is_argv_value(&"o".repeat(ARGV_VALUE_MAX_CODE_POINTS + 1)));
+        assert!(is_argv_value_with_max(
+            &format!("/{}", "p".repeat(ARGV_VALUE_MAX_CODE_POINTS)),
+            MAX_PATH_LENGTH
+        ));
     }
 }

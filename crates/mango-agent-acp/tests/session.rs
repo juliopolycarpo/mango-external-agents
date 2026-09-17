@@ -802,7 +802,12 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
             .await,
     );
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("bypassPermissions")),
+        matches!(&error, Error::Protocol { expected, .. } if expected.contains("the session's own level")),
+        "received {error:?}"
+    );
+    // The refusal names the relationship, not the agent's mode id.
+    assert!(
+        !error.to_string().contains("bypassPermissions"),
         "received {error:?}"
     );
 }
@@ -1230,6 +1235,114 @@ async fn a_handshake_the_agent_never_answers_ends_on_the_hosts_own_deadline() {
     assert_eq!(*after, Duration::from_secs(5));
 }
 
+/// A custom profile's id is host-authored text, so a timeout must describe the ACP operation without
+/// copying an identifier that could contain tenant data or credentials into diagnostics.
+#[tokio::test(start_paused = true)]
+async fn a_custom_profiles_id_stays_out_of_the_timeout_diagnostic() {
+    let hostile_id = format!(
+        "fake\u{7}\x1b[31m credential=profile-secret {}",
+        "x".repeat(4_000)
+    );
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeProcess::responding(|_| Vec::new()));
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            request_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+
+    let opened = tokio::time::timeout(
+        Duration::from_secs(600),
+        AcpHarness::new(Arc::new(AcpProfile::custom(
+            hostile_id,
+            ["fake-acp", "acp"],
+            VENDOR,
+        )))
+        .open_session(&host, OpenSession::new("chat-1")),
+    )
+    .await
+    .expect("expected the handshake to give up on its own deadline");
+
+    let error = refusal(opened);
+    let Error::Timeout { operation, .. } = &error else {
+        panic!("received {error:?}");
+    };
+    assert_eq!(operation, "initialize on an ACP agent");
+    assert!(
+        !operation.contains("profile-secret"),
+        "received a caller-owned profile id in diagnostics: {operation:?}"
+    );
+}
+
+/// Once the transport is ready, an agent can still exit under `initialize` or `session/new`. The
+/// opening call returns no control handle, so its redacted stderr must travel through the typed
+/// vendor failure before cleanup drops the handle.
+#[tokio::test]
+async fn an_agent_that_exits_after_connecting_keeps_its_stderr_on_the_open_failure() {
+    let close_stdout = mango_external_agents::CancelToken::new();
+    let close_after_initialize = close_stdout.clone();
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeProcess::responding(move |line| {
+            let message: serde_json::Value =
+                serde_json::from_str(line).expect("expected a JSON-RPC request");
+            let method = message["method"].as_str();
+            let id = message["id"].clone();
+            if method == Some("initialize") {
+                return vec![
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": 1,
+                            "agentInfo": { "name": "fake-acp", "version": "1.2.3" },
+                            "agentCapabilities": {
+                                "loadSession": true,
+                                "promptCapabilities": { "image": true, "embeddedContext": true },
+                                "sessionCapabilities": {},
+                            },
+                            "authMethods": [],
+                        },
+                    })
+                    .to_string(),
+                ];
+            }
+            if method == Some("session/new") {
+                close_after_initialize.cancel();
+            }
+            Vec::new()
+        })
+        .ending_stdout_when(close_stdout)
+        .with_stderr("invalid ACP configuration"),
+    );
+
+    let error = refusal(
+        AcpHarness::new(profile())
+            .open_session(&host(&launcher), OpenSession::new("chat-1"))
+            .await,
+    );
+    let Error::Vendor(vendor) = &error else {
+        panic!("expected a vendor failure, received {error:?}");
+    };
+    assert_eq!(vendor.code.as_str(), "acp-link-closed");
+    assert!(
+        vendor.message.contains("invalid ACP configuration"),
+        "expected the redacted stderr tail on the typed field, received {:?}",
+        vendor.message
+    );
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        assert!(
+            !rendered.contains("invalid ACP configuration"),
+            "expected the stderr tail to stay out of diagnostics, received {rendered:?}"
+        );
+    }
+}
+
 /// The same hole `open_session` refuses, one layer down. A turn asking for a level the profile cannot
 /// reach would otherwise set no mode, refuse no request, and run as `Default` while the host believed
 /// it had granted more.
@@ -1251,6 +1364,148 @@ async fn a_turn_asking_for_a_level_this_profile_cannot_reach_is_refused() {
         matches!(error, Error::HostConfiguration { .. }),
         "received {error:?}"
     );
+}
+
+/// A custom profile's id is host-authored text: the host names its own in-house agent, and that
+/// name may carry a tenant or a credential. Both pair refusals — `open_session`'s and the turn's —
+/// summarised it into a diagnostic the formatter writes verbatim.
+#[tokio::test]
+async fn a_custom_profile_id_stays_out_of_pair_refusals() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().process());
+    let harness = AcpHarness::new(Arc::new(AcpProfile::custom(
+        "tenant-secret",
+        ["fake-acp", "acp"],
+        VENDOR,
+    )));
+
+    // `Box<dyn Session>` is not `Debug`, so the success arm is named rather than unwrapped.
+    let refused_open = match harness
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(Configuration {
+                level: Some(PermissionLevel::FullAccess),
+                ..Configuration::default()
+            }),
+        )
+        .await
+    {
+        Ok(_) => panic!("expected an unsupported pair to be refused"),
+        Err(error) => error,
+    };
+
+    let session = harness
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-2").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let refused_turn = refusal(
+        session
+            .start_turn(
+                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
+                    level: Some(PermissionLevel::FullAccess),
+                    ..Configuration::default()
+                }),
+            )
+            .await,
+    );
+
+    for error in [&refused_open, &refused_turn] {
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "expected a host-configuration refusal, received {error:?}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("tenant-secret"),
+                "expected the profile id to stay out of diagnostics, received {rendered:?}"
+            );
+            assert!(
+                rendered.contains("FullAccess"),
+                "expected the refused level to survive the summary, received {rendered:?}"
+            );
+        }
+    }
+}
+
+/// A custom profile's mode ids are host-authored too, and `Error::Protocol` writes `expected`
+/// verbatim — it has no shape gate of its own, unlike the code and profile-id renderings. Both
+/// mode refusals named the id: the one for a mode the agent never advertised, and the one for a
+/// turn whose level would need a different mode than the session opened with.
+#[tokio::test]
+async fn a_custom_mode_id_stays_out_of_protocol_refusals() {
+    let profile = || {
+        Arc::new(
+            AcpProfile::custom("in-house", ["fake-acp", "acp"], VENDOR).with_modes(
+                SessionModeIds {
+                    read_only: None,
+                    default: Some("tenant credential=session-mode-secret"),
+                    full_access: Some("tenant credential=turn-mode-secret"),
+                },
+            ),
+        )
+    };
+
+    // The agent advertises neither id, so `session/new` is refused before a turn exists.
+    let unadvertised = FakeLauncher::new();
+    unadvertised.push(FakeAcpAgent::new().process());
+    let refused_open = match AcpHarness::new(profile())
+        .open_session(
+            &host(&unadvertised),
+            OpenSession::new("chat-1").with_configuration(Configuration {
+                level: Some(PermissionLevel::Default),
+                ..Configuration::default()
+            }),
+        )
+        .await
+    {
+        Ok(_) => panic!("expected an unadvertised mode to be refused"),
+        Err(error) => error,
+    };
+
+    // The agent advertises the session's mode, so the session opens and the turn is refused for
+    // wanting a level the session's own mode does not cover.
+    let advertised = FakeLauncher::new();
+    advertised.push(
+        FakeAcpAgent::new()
+            .with_modes(["tenant credential=session-mode-secret"])
+            .process(),
+    );
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&advertised),
+            OpenSession::new("chat-2").with_configuration(Configuration {
+                level: Some(PermissionLevel::Default),
+                ..Configuration::default()
+            }),
+        )
+        .await
+        .expect("expected a session");
+    let refused_turn = refusal(
+        session
+            .start_turn(
+                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
+                    level: Some(PermissionLevel::FullAccess),
+                    ..Configuration::default()
+                }),
+            )
+            .await,
+    );
+
+    for error in [&refused_open, &refused_turn] {
+        assert!(
+            matches!(error, Error::Protocol { .. }),
+            "expected a protocol refusal, received {error:?}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("secret"),
+                "expected the mode id to stay out of diagnostics, received {rendered:?}"
+            );
+        }
+    }
 }
 
 /// A launcher that records whether the library ended each child it handed out.
@@ -1378,9 +1633,11 @@ async fn a_mode_the_agent_never_advertised_is_refused_and_ends_the_child() {
     );
 
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("plan")),
+        matches!(&error, Error::Protocol { expected, .. } if expected.contains("the requested level")),
         "received {error:?}"
     );
+    // The refusal names the relationship, not the profile's mode id.
+    assert!(!error.to_string().contains("plan"), "received {error:?}");
     assert_eq!(
         launcher.kills(),
         1,

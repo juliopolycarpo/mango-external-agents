@@ -44,11 +44,16 @@ impl TurnStream {
 }
 
 impl std::fmt::Debug for TurnStream {
+    /// Reports that the handle routes a turn, not which one.
+    ///
+    /// This is the value a host actually logs. `turn_id` is the host's own, and `native_turn_id`
+    /// is the vendor's on ACP and Codex — the same two ids [`EventSink`]'s `Debug` already reports
+    /// as flags, reached through the handle instead of through the sink.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TurnStream")
-            .field("turn_id", &self.turn_id)
-            .field("native_turn_id", &self.native_turn_id)
+            .field("has_turn_id", &true)
+            .field("has_native_turn_id", &!self.native_turn_id.is_empty())
             .finish_non_exhaustive()
     }
 }
@@ -59,12 +64,22 @@ impl std::fmt::Debug for TurnStream {
 /// beyond its handle, whereas a review's response names a thread. A harness returns the vendor's
 /// value rather than echoing the session's, so a host can refuse a thread it is not subscribed to
 /// instead of streaming a review nobody would see.
-#[derive(Debug)]
 pub struct ReviewStream {
     /// The events, exactly as an ordinary turn's.
     pub turn: TurnStream,
     /// The thread the vendor ran the review on.
     pub review_thread_id: String,
+}
+
+impl std::fmt::Debug for ReviewStream {
+    /// Reports that the review names a thread, not which one: the id is the vendor's own.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReviewStream")
+            .field("turn", &self.turn)
+            .field("has_review_thread_id", &!self.review_thread_id.is_empty())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Where a harness's reducer puts what it read, and the only door into a [`TurnStream`].
@@ -83,8 +98,8 @@ impl std::fmt::Debug for EventSink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("EventSink")
-            .field("session_id", &self.session_id)
-            .field("turn_id", &self.turn_id)
+            .field("has_session_id", &true)
+            .field("has_turn_id", &true)
             .field("is_closed", &self.is_closed())
             .finish_non_exhaustive()
     }
@@ -267,6 +282,64 @@ mod tests {
             Arc::new(SystemClock),
             capacity,
         )
+    }
+
+    #[test]
+    fn event_sink_debug_omits_host_routing_ids() {
+        let (sink, _events) = EventSink::new(
+            SessionId::new("session-id-secret"),
+            TurnId::new("turn-id-secret"),
+            Arc::new(SystemClock),
+            1,
+        );
+
+        let rendered = format!("{sink:?}");
+        for secret in ["session-id-secret", "turn-id-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no host id in event sink diagnostics, received {rendered}"
+            );
+        }
+    }
+
+    /// The sink is what a harness holds; these two are what a host holds.
+    ///
+    /// `TurnStream` is the value returned from `start_turn`, so it is the one a host reaches for
+    /// with `dbg!` or embeds in a type of its own. `native_turn_id` is the vendor's on ACP and
+    /// Codex, and `review_thread_id` is the vendor's everywhere.
+    #[test]
+    fn stream_handle_debug_omits_the_ids_it_routes_on() {
+        let (_sink, events) = EventSink::new(
+            SessionId::new("session-1"),
+            TurnId::new("turn-1"),
+            Arc::new(SystemClock),
+            1,
+        );
+        let review = crate::stream::ReviewStream {
+            turn: TurnStream {
+                turn_id: TurnId::new("turn-id-secret"),
+                native_turn_id: String::from("native-turn-id-secret"),
+                events,
+            },
+            review_thread_id: String::from("review-thread-id-secret"),
+        };
+
+        for rendered in [format!("{:?}", review.turn), format!("{review:?}")] {
+            for secret in [
+                "turn-id-secret",
+                "native-turn-id-secret",
+                "review-thread-id-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no routing id in stream diagnostics, received {rendered}"
+                );
+            }
+        }
+        assert!(
+            format!("{review:?}").contains("has_review_thread_id: true"),
+            "expected the thread to be reported as present, received {review:?}"
+        );
     }
 
     #[tokio::test]

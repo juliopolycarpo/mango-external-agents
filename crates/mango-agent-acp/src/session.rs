@@ -136,7 +136,9 @@ impl AcpSession {
             if !crate::profile::matrix(&self.profile.modes).supports(level, routing) {
                 return Err(Error::HostConfiguration {
                     expected: "a (level, routing) pair this profile supports",
-                    received: format!("{level:?}/{routing:?} on {}", self.profile.id),
+                    // As in `AcpHarness::open_session`: the pair is the library's own vocabulary,
+                    // the profile id is the host's.
+                    received: format!("{level:?}/{routing:?}"),
                 });
             }
         }
@@ -157,9 +159,9 @@ impl AcpSession {
         let session_mode = session_level.and_then(|level| self.profile.modes.for_level(level));
         if configuration.level != session_level && wanted_mode != session_mode {
             return Err(Error::Protocol {
-                expected: format!(
-                    "a turn whose level runs under the session's own mode {:?}: ACP modes are set when the session opens",
-                    session_mode
+                // As in `AcpHarness::mode_for`: the relationship, never the mode id.
+                expected: String::from(
+                    "a turn whose level runs under the mode this profile maps the session's own level to: ACP modes are set when the session opens",
                 ),
                 received: format!(
                     "{:?}, which wants mode {wanted_mode:?}",
@@ -279,9 +281,12 @@ impl Session for AcpSession {
                     .connection()
                     .send_notification(CancelNotification::new(self.native_session_id.clone()))
                     .err()
-                    .map(|error| Error::Link {
+                    .map(|_| Error::Link {
                         peer: format!("ACP agent {}", self.profile.id),
-                        message: with_stderr(&error.message, self.connection.control().as_ref()),
+                        // The library's own summary: `Error::Link`'s is written verbatim, and the
+                        // agent's message and its stderr tail are both the agent's words. The
+                        // turn's own failure event still carries them.
+                        message: String::from("a link that could not carry session/cancel"),
                     }),
                 false => None,
             };
@@ -379,9 +384,9 @@ impl Session for AcpSession {
         self.connection
             .connection()
             .send_notification(CancelNotification::new(self.native_session_id.clone()))
-            .map_err(|error| Error::Link {
+            .map_err(|_| Error::Link {
                 peer: format!("ACP agent {}", self.profile.id),
-                message: with_stderr(&error.message, self.connection.control().as_ref()),
+                message: String::from("a link that could not carry session/cancel"),
             })
     }
 

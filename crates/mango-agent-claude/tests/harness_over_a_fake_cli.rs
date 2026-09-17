@@ -8,7 +8,7 @@ use std::time::Duration;
 use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::{
     ApprovalRouting, AuthMode, AuthState, CancelReason, CloseReason, Configuration, Error,
-    EventKind, ExecutablePath, GateVerdict, Harness, Limits, LineLimits, OpenSession,
+    EventKind, ExecutablePath, GateVerdict, Harness, HostContext, Limits, LineLimits, OpenSession,
     PermissionLevel, PermissionResponse, ResumeMode, Session, TurnRequest, TurnStream,
 };
 use support::{
@@ -328,6 +328,13 @@ mod opening_a_session {
                 matches!(error, Error::HostConfiguration { .. }),
                 "expected a host-configuration refusal for {injected:?}, received {error:?}"
             );
+            // The refusal names the shape, never the handle: a stored resume reference is the
+            // host's own opaque data, and this one is being reported precisely because nobody
+            // knows what is in it.
+            assert!(
+                !error.to_string().contains(injected),
+                "expected the rejected reference to stay out of the message, received {error}"
+            );
         }
         assert!(
             launcher.turn_argvs().is_empty(),
@@ -418,6 +425,44 @@ mod opening_a_session {
 
 mod a_turn {
     use super::*;
+
+    /// A configuration value reaches the child process argv. Reject it before reserving or
+    /// starting a child, because dropping it would run under settings the host did not choose.
+    #[tokio::test]
+    async fn refuses_an_invalid_model_or_effort_before_starting_a_child() {
+        let cases = [
+            Configuration {
+                model: Some(String::from("--dangerously-skip-permissions")),
+                ..Configuration::default()
+            },
+            Configuration {
+                effort: Some(String::from("ultra")),
+                ..Configuration::default()
+            },
+        ];
+
+        for configuration in cases {
+            let launcher = Arc::new(FakeClaudeCli::new());
+            let session = open(&launcher).await;
+            let error = session
+                .start_turn(
+                    TurnRequest::new("turn-1", "use the explicit settings")
+                        .with_configuration(configuration),
+                )
+                .await
+                .expect_err("expected an invalid explicit configuration to be refused");
+
+            assert!(
+                matches!(error, Error::HostConfiguration { .. }),
+                "received {error:?}"
+            );
+            assert!(
+                launcher.turn_argvs().is_empty(),
+                "expected no turn launch, received {:?}",
+                launcher.turn_argvs()
+            );
+        }
+    }
 
     /// An omitted pair must remain absent from argv, while a later accepted pair is repeated on
     /// turns that omit their own configuration.
@@ -1066,6 +1111,533 @@ mod mcp_passthrough {
         assert_eq!(written["mcpServers"]["docs"]["env"]["DOCS_TOKEN"], "s3cret");
     }
 
+    /// A configured turn commits its settings as the session's defaults when it starts, so a turn
+    /// refused after that commit must not leave them behind. Otherwise a cancelled `FullAccess`
+    /// start hands its permissions to the next turn that asked for nothing.
+    #[test]
+    fn a_turn_refused_after_its_lease_release_leaves_no_configuration_behind() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_help(HELP_2_1_270)
+                    .with_turn(Run::stalling::<[String; 0], String>([]))
+                    .with_turn(Run::replaying(READ_TURN)),
+            );
+            let scratch =
+                std::env::temp_dir().join(format!("mea-config-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            let mut refused = Box::pin(
+                session.start_turn(
+                    TurnRequest::new("turn-1", "raise the session's permissions")
+                        .with_configuration(Configuration {
+                            level: Some(PermissionLevel::Default),
+                            routing: Some(ApprovalRouting::User),
+                            ..Configuration::default()
+                        }),
+                ),
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), refused.as_mut())
+                    .await
+                    .is_err(),
+                "expected the configured turn to be parked on the occupied blocking pool"
+            );
+            session
+                .cancel(CancelReason::Requested)
+                .await
+                .expect("expected the cancel to be accepted");
+            drop(release_pool);
+            let _ = occupied.await;
+            assert!(
+                refused.await.is_err(),
+                "expected the cancelled turn to be refused"
+            );
+
+            assert_eq!(
+                session.configuration().await.level,
+                None,
+                "expected a refused start to leave the session's own configuration alone"
+            );
+
+            let mut next = session
+                .start_turn(TurnRequest::new("turn-2", "read note.txt"))
+                .await
+                .expect("expected the next turn to start");
+            drain(&mut next).await;
+
+            let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+            assert_eq!(
+                value_after(&argv, "--permission-mode"),
+                None,
+                "expected the unconfigured turn to inherit nothing from the refused one, received {argv:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
+    /// The guard reaps a child nobody else owns. When a `cancel` already took the turn it also
+    /// killed that child, so a guard firing afterwards would hand a host's launcher a second
+    /// teardown for the same process — `ProcessControl::kill` carries no idempotence promise.
+    #[test]
+    fn a_stop_that_already_reaped_the_child_is_not_asked_to_reap_it_twice() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_help(HELP_2_1_270)
+                    .with_turn(Run::stalling::<[String; 0], String>([])),
+            );
+            let scratch =
+                std::env::temp_dir().join(format!("mea-twice-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            // Boxed rather than dropped by the timeout, so the stop lands first and the guard
+            // runs second — the ordering where the turn is no longer the guard's to reap.
+            let mut start =
+                Box::pin(session.start_turn(TurnRequest::new("turn-1", "start something long")));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), start.as_mut())
+                    .await
+                    .is_err(),
+                "expected the turn to be parked on the occupied blocking pool"
+            );
+            session
+                .cancel(CancelReason::Requested)
+                .await
+                .expect("expected the cancel to be accepted");
+            drop(start);
+
+            drop(release_pool);
+            let _ = occupied.await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                launcher.kill_requests(),
+                1,
+                "expected the library to ask once, as ProcessControl::kill documents"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
+    /// Nothing reaps a child on its own: the session implements no `Drop`, and a `ProcessControl`
+    /// that is merely dropped is not killed. So a `start_turn` abandoned at the lease release must
+    /// kill the child it launched itself, or the process outlives the host's interest in it until
+    /// an explicit `close`, `cancel` or next `start_turn` — and a host that simply drops the
+    /// session never issues one.
+    #[test]
+    fn a_dropped_start_turn_reaps_the_child_it_launched() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_help(HELP_2_1_270)
+                    .with_turn(Run::stalling::<[String; 0], String>([])),
+            );
+            let scratch =
+                std::env::temp_dir().join(format!("mea-reap-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            let start = session.start_turn(TurnRequest::new("turn-1", "start something long"));
+            let abandoned = tokio::time::timeout(Duration::from_millis(250), start).await;
+            assert!(
+                abandoned.is_err(),
+                "expected the turn to be parked on the occupied blocking pool"
+            );
+
+            drop(release_pool);
+            let _ = occupied.await;
+            // The reap runs on a task, because `Drop` cannot await a kill.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                launcher.mcp_config_at_kill().len(),
+                1,
+                "expected the abandoned start to kill the child it launched"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
+    /// The release is an await, so a `cancel`, a `close` or a second `start_turn` can take this
+    /// turn while it is parked there. Resuming and spawning the pump anyway would hand back a
+    /// successful stream for a turn that was already stopped, and write its prompt to a child
+    /// somebody is killing.
+    ///
+    /// The returned result is the assertion that matters: whether the prompt reaches a dying child
+    /// depends on when the kill lands, but a stopped turn must never answer `Ok`.
+    #[test]
+    fn a_turn_stopped_while_its_lease_is_released_is_refused_rather_than_started() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+            let scratch =
+                std::env::temp_dir().join(format!("mea-stop-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            let start = session.start_turn(TurnRequest::new("turn-1", "read note.txt"));
+            tokio::pin!(start);
+            // The future is held rather than dropped, so it resumes after the stop lands.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), start.as_mut())
+                    .await
+                    .is_err(),
+                "expected the turn to be parked on the occupied blocking pool"
+            );
+
+            session
+                .cancel(CancelReason::Requested)
+                .await
+                .expect("expected the cancel to be accepted");
+
+            drop(release_pool);
+            let _ = occupied.await;
+
+            // `TurnStream` is not `Debug`, so the success arm is named rather than unwrapped.
+            let error = match start.await {
+                Ok(_) => panic!("expected a stopped turn to be refused, received a stream"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, Error::Cancelled { .. }),
+                "expected the recorded cancellation, received {error:?}"
+            );
+            // The cancel took the turn and killed its child. `ProcessControl::kill` is not
+            // documented idempotent, so the refusal must not ask a host's launcher to tear the
+            // same child down twice.
+            assert_eq!(
+                launcher.kill_requests(),
+                1,
+                "expected the library to ask once, as ProcessControl::kill documents"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
+    /// A host that times out or drops `start_turn` must not leave Claude working on a turn it will
+    /// never read. The MCP release runs on the blocking pool, so it is an await the future can be
+    /// dropped at — and anything spawned before it keeps running afterwards.
+    ///
+    /// The pool is given exactly one thread and that thread is occupied, so the release is
+    /// deterministically pending rather than "probably slow": the future parks there every run.
+    #[test]
+    fn a_dropped_start_turn_leaves_claude_no_prompt_to_work_on() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+            let scratch =
+                std::env::temp_dir().join(format!("mea-drop-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            // Take the pool's only thread and hold it, so the turn's release cannot complete.
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            let start = session.start_turn(TurnRequest::new("turn-1", "read note.txt"));
+            // Long enough for a pump, had one been spawned, to write its single prompt line.
+            let abandoned = tokio::time::timeout(Duration::from_millis(250), start).await;
+            assert!(
+                abandoned.is_err(),
+                "expected the turn to still be parked on the occupied blocking pool"
+            );
+
+            drop(release_pool);
+            let _ = occupied.await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let written = launcher.written();
+            assert!(
+                written.is_empty(),
+                "expected an abandoned start to send Claude nothing, received {written:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
+    #[tokio::test]
+    async fn passes_the_host_authorised_scratch_path_to_the_child_unchanged() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let scratch =
+            std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .scratch(&scratch)
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host with scratch storage");
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .expect("expected a session");
+        session
+            .start_turn(TurnRequest::new("turn-1", "hello"))
+            .await
+            .expect("expected a turn");
+
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let config = std::path::PathBuf::from(
+            value_after(&argv, "--mcp-config").expect("expected the config argument"),
+        );
+        assert!(
+            config.starts_with(&scratch),
+            "expected the child to receive an artifact below the host root"
+        );
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected cleanup");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn refuses_missing_host_scratch_before_running_a_vendor_probe() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host without scratch storage");
+
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected MCP setup without host scratch to be refused");
+        assert!(
+            matches!(
+                error,
+                Error::HostConfiguration {
+                    expected: "a host-owned scratch directory for MCP configuration",
+                    ..
+                }
+            ),
+            "received {error:?}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected scratch refusal before any vendor work, received {:?}",
+            launcher.launches()
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unusable_host_scratch_before_running_a_vendor_probe() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let root = std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("expected a dedicated test root");
+        let scratch_file = root.join("not-a-directory");
+        std::fs::write(&scratch_file, "host-owned file")
+            .expect("expected an unusable scratch path");
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .scratch(&scratch_file)
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host with a supplied scratch path");
+
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected a non-directory scratch path to be refused");
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "received {error:?}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected scratch refusal before any vendor work, received {:?}",
+            launcher.launches()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_removes_the_prepared_host_scratch_artifact() {
+        // This build does not advertise `--mcp-config`, so opening fails after the local artifact
+        // was prepared and the survey established the unsupported capability.
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let scratch =
+            std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .scratch(&scratch)
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host with scratch storage");
+
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected unsupported MCP passthrough to refuse opening");
+        assert!(
+            matches!(
+                error,
+                Error::NotSupported {
+                    capability: mango_external_agents::Capability::McpPassthrough
+                }
+            ),
+            "received {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch)
+                .expect("expected the host scratch root")
+                .count(),
+            0,
+            "expected a failed open to remove its prepared artifact"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     #[tokio::test]
     async fn the_file_leaves_with_the_session_that_wrote_it() {
         let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
@@ -1128,6 +1700,48 @@ mod mcp_passthrough {
             !path.exists(),
             "expected the close to still remove {}",
             path.display()
+        );
+    }
+
+    /// A launcher can still be creating a child when `close` takes the session's configuration.
+    /// The child reads `--mcp-config` at startup, so the start call keeps its own lease until it
+    /// observes the close, kills the child, and only then lets cleanup remove the file.
+    #[tokio::test]
+    async fn keeps_mcp_configuration_until_a_child_spawned_during_close_has_been_killed() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::stalling::<[String; 0], String>([])),
+        );
+        let gate = launcher.gate_turn_spawns();
+        let session: Arc<dyn Session> = Arc::from(open_with_servers(&launcher).await);
+
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "start something long"))
+                    .await
+                    .map(drop)
+            }
+        });
+
+        gate.wait_for_spawn().await;
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected a clean close");
+        gate.release();
+
+        let outcome = starting.await.expect("expected the start task to finish");
+        assert!(
+            matches!(outcome, Err(Error::Closed { .. })),
+            "expected the closed session to refuse the turn, received {outcome:?}"
+        );
+        assert_eq!(
+            launcher.mcp_config_at_kill(),
+            vec![true],
+            "expected the spawned child to keep its MCP configuration until it was killed"
         );
     }
 

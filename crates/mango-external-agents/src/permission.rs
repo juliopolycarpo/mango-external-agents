@@ -9,6 +9,7 @@
 //! one on a vendor's behalf: with no [`PermissionBroker`] every request reaches the host as an
 //! event, and with one the host's own policy decides.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -68,7 +69,7 @@ impl ApprovalRouting {
 ///
 /// A reason enum, never an i18n key: the library does not know the host's copy, and a host that
 /// received a key would be rendering a string this crate had chosen for it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum UnsupportedReason {
@@ -84,8 +85,21 @@ pub enum UnsupportedReason {
     Other(String),
 }
 
+impl fmt::Debug for UnsupportedReason {
+    /// Names the reason class without logging a harness-provided explanation.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotOfferedByVendor => "NotOfferedByVendor",
+            Self::RequiresAccountUpgrade => "RequiresAccountUpgrade",
+            Self::RequiresNewerVersion => "RequiresNewerVersion",
+            Self::UnattendedNotPermitted => "UnattendedNotPermitted",
+            Self::Other(_) => "Other",
+        })
+    }
+}
+
 /// One cell's verdict, as the harness that would run it sees the pair.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ConfigurationVerdict {
     /// The pair works, optionally under the vendor's own name for it.
     Supported {
@@ -99,6 +113,23 @@ pub enum ConfigurationVerdict {
         /// The vendor's id for this combination, when it has one anyway.
         vendor_id: Option<String>,
     },
+}
+
+impl fmt::Debug for ConfigurationVerdict {
+    /// Shows whether a vendor configuration was named without logging its opaque identifier.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Supported { vendor_id } => formatter
+                .debug_struct("Supported")
+                .field("has_vendor_id", &vendor_id.is_some())
+                .finish(),
+            Self::Unsupported { reason, vendor_id } => formatter
+                .debug_struct("Unsupported")
+                .field("reason", reason)
+                .field("has_vendor_id", &vendor_id.is_some())
+                .finish(),
+        }
+    }
 }
 
 impl ConfigurationVerdict {
@@ -117,7 +148,7 @@ impl ConfigurationVerdict {
 }
 
 /// One (level, routing) pair, as vetted by the harness that would run it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupportedConfiguration {
     /// What the agent may do.
@@ -134,6 +165,21 @@ pub struct SupportedConfiguration {
     pub vendor_id: Option<String>,
     /// True when choosing this lets the agent act without a person in the loop.
     pub unattended: bool,
+}
+
+impl fmt::Debug for SupportedConfiguration {
+    /// Shows permission support without logging a vendor-provided configuration identifier.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupportedConfiguration")
+            .field("level", &self.level)
+            .field("routing", &self.routing)
+            .field("supported", &self.supported)
+            .field("unsupported_reason", &self.unsupported_reason)
+            .field("has_vendor_id", &self.vendor_id.is_some())
+            .field("unattended", &self.unattended)
+            .finish()
+    }
 }
 
 /// The whole two-by-three product matrix, built once.
@@ -362,7 +408,7 @@ impl PermissionOptionKind {
 ///
 /// The option set is passed through untouched: the library never adds, removes, reorders or
 /// renames a choice.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionOption {
     /// The vendor's own id, echoed back verbatim when this option is chosen.
@@ -375,6 +421,18 @@ pub struct PermissionOption {
     /// Whether the vendor marked this choice destructive.
     #[serde(default)]
     pub destructive: bool,
+}
+
+impl fmt::Debug for PermissionOption {
+    /// Shows an option's policy-relevant shape without logging opaque ids or vendor copy.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionOption")
+            .field("kind", &self.kind)
+            .field("has_label", &self.label.is_some())
+            .field("destructive", &self.destructive)
+            .finish()
+    }
 }
 
 impl PermissionOption {
@@ -404,7 +462,7 @@ impl PermissionOption {
 }
 
 /// The vendor is asking whether it may do something.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionRequest {
     /// The vendor's own id for this question, echoed back with the answer.
@@ -427,6 +485,21 @@ pub struct PermissionRequest {
     /// True when any field above was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
+}
+
+impl fmt::Debug for PermissionRequest {
+    /// Reports a question's shape without logging its text, options, or opaque identifiers.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionRequest")
+            .field("kind", &self.kind)
+            .field("has_title", &!self.title.is_empty())
+            .field("has_detail", &self.detail.is_some())
+            .field("option_count", &self.options.len())
+            .field("expires_at", &self.expires_at)
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 impl PermissionRequest {
@@ -475,9 +548,12 @@ impl PermissionRequest {
     pub fn respond(&self, option_id: &str, source: DecisionSource) -> Result<PermissionResponse> {
         if !self.options.iter().any(|option| option.id == option_id) {
             return Err(Error::Protocol {
+                // The count, never the ids: an option id is the vendor's own string, and
+                // `Display` writes this shape verbatim. A host that wants the ids reads
+                // `option_ids` off the request it already holds.
                 expected: format!(
-                    "one of the options {:?} this request offered",
-                    self.option_ids()
+                    "one of the {} options this request offered",
+                    self.option_ids().len()
                 ),
                 received: option_id.to_owned(),
             });
@@ -494,14 +570,24 @@ impl PermissionRequest {
     /// # Errors
     ///
     /// [`Error::InvalidVendorValue`] when the request id or an option id does not survive
-    /// bounding, and [`Error::Protocol`] when the vendor offered no options or more than
-    /// [`APPROVAL_MAX_OPTIONS`] of them. A request nobody can render is refused on its own rather
-    /// than ending the turn it belongs to.
+    /// bounding, [`Error::Protocol`] when the vendor offered no options, and
+    /// [`Error::LimitExceeded`] when it offered more than [`APPROVAL_MAX_OPTIONS`]. A request
+    /// nobody can render is refused on its own rather than ending the turn it belongs to.
     pub fn normalized(self) -> Result<Self> {
-        if self.options.is_empty() || self.options.len() > APPROVAL_MAX_OPTIONS {
+        if self.options.is_empty() {
             return Err(Error::Protocol {
-                expected: format!("between 1 and {APPROVAL_MAX_OPTIONS} approval options"),
-                received: self.options.len().to_string(),
+                expected: String::from("at least one approval option"),
+                received: String::from("0"),
+            });
+        }
+        if self.options.len() > APPROVAL_MAX_OPTIONS {
+            // `LimitExceeded` rather than `Protocol`: its `received` is a count the library
+            // itself computed, not raw vendor text, so unlike `Protocol.received` it is safe to
+            // render and is what tells an operator how far over the cap the vendor went.
+            return Err(Error::LimitExceeded {
+                subject: "approval options offered",
+                limit: APPROVAL_MAX_OPTIONS,
+                received: self.options.len(),
             });
         }
 
@@ -592,7 +678,7 @@ pub enum DecisionSource {
 }
 
 /// The answer to one approval.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionResponse {
     /// Which question this answers.
@@ -601,6 +687,18 @@ pub struct PermissionResponse {
     pub option_id: String,
     /// How the answer was reached.
     pub source: DecisionSource,
+}
+
+impl fmt::Debug for PermissionResponse {
+    /// Shows how an approval was answered without logging opaque question or option ids.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionResponse")
+            .field("has_request_id", &true)
+            .field("has_option_id", &true)
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 impl PermissionResponse {
@@ -625,13 +723,24 @@ impl PermissionResponse {
 }
 
 /// What was decided, once it was.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalDecision {
     /// Which option won.
     pub option_id: String,
     /// How it was reached.
     pub source: DecisionSource,
+}
+
+impl fmt::Debug for ApprovalDecision {
+    /// Shows decision provenance without logging its opaque option id.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalDecision")
+            .field("has_option_id", &true)
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// A host policy that can answer approvals without asking a person.
@@ -647,7 +756,7 @@ pub trait PermissionBroker: Send + Sync {
 }
 
 /// A broker's answer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum BrokerDecision {
     /// Put it to the host; the event is emitted and the turn waits.
     Ask,
@@ -658,6 +767,17 @@ pub enum BrokerDecision {
         /// Why, for the host's own audit trail. Never sent to the vendor.
         reason: String,
     },
+}
+
+impl fmt::Debug for BrokerDecision {
+    /// Shows the broker decision without logging an audit reason supplied by the host.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Ask => "Ask",
+            Self::Allow => "Allow",
+            Self::Deny { .. } => "Deny",
+        })
+    }
 }
 
 /// What a broker decided, as an answer the vendor will accept.
@@ -684,7 +804,7 @@ mod tests {
     use super::{
         ApprovalRouting, BrokerDecision, ConfigurationVerdict, DecisionSource, PermissionBroker,
         PermissionLevel, PermissionMatrix, PermissionOption, PermissionOptionKind,
-        PermissionRequest, UnsupportedReason, broker_response,
+        PermissionRequest, PermissionResponse, UnsupportedReason, broker_response,
     };
     use crate::error::Error;
     use crate::event::ActivityKind;
@@ -712,6 +832,75 @@ mod tests {
             options,
             expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             truncated: false,
+        }
+    }
+
+    /// `Error::Protocol` writes its expected shape verbatim, so this one counts rather than lists.
+    ///
+    /// An option id is the vendor's own string. Naming the count still tells a host what it got
+    /// wrong — it answered with an id this request never offered — without putting the vendor's
+    /// vocabulary into a log line.
+    #[test]
+    fn an_unoffered_answer_counts_the_options_rather_than_naming_them() {
+        let request = request(vec![
+            PermissionOption::new("option-id-secret", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("other-id-secret", PermissionOptionKind::RejectOnce),
+        ]);
+
+        let error = request
+            .respond("answer-id-secret", DecisionSource::User)
+            .expect_err("expected an unoffered id to be refused");
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.contains("one of the 2 options this request offered"),
+            "expected the option count, received {rendered}"
+        );
+        for secret in ["option-id-secret", "other-id-secret", "answer-id-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no option id in the diagnostic, received {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn question_and_answer_debug_omit_vendor_and_host_text() {
+        let question = PermissionRequest {
+            id: String::from("question-id-secret"),
+            kind: ActivityKind::Command,
+            title: String::from("question-title-secret"),
+            detail: Some(String::from("question-detail-secret")),
+            options: vec![
+                PermissionOption::new("option-id-secret", PermissionOptionKind::AllowOnce)
+                    .with_label("option-label-secret"),
+            ],
+            expires_at: SystemTime::UNIX_EPOCH,
+            truncated: false,
+        };
+        let answer = PermissionResponse::from_user("question-id-secret", "option-id-secret");
+        let decision = BrokerDecision::Deny {
+            reason: String::from("broker-reason-secret"),
+        };
+
+        for rendered in [
+            format!("{question:?}"),
+            format!("{answer:?}"),
+            format!("{decision:?}"),
+        ] {
+            for secret in [
+                "question-id-secret",
+                "question-title-secret",
+                "question-detail-secret",
+                "option-id-secret",
+                "option-label-secret",
+                "broker-reason-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no question or answer payload, received {rendered}"
+                );
+            }
         }
     }
 
@@ -925,6 +1114,32 @@ mod tests {
             })
             .collect();
         assert!(request(many).normalized().is_err());
+    }
+
+    #[test]
+    fn an_empty_request_and_an_oversized_one_report_differently() {
+        let empty = request(Vec::new())
+            .normalized()
+            .expect_err("expected a refusal");
+        assert!(
+            matches!(empty, Error::Protocol { .. }),
+            "expected a protocol refusal, received {empty:?}"
+        );
+
+        let many = (0..17)
+            .map(|index| {
+                PermissionOption::new(format!("option-{index}"), PermissionOptionKind::AllowOnce)
+            })
+            .collect();
+        let oversized = request(many).normalized().expect_err("expected a refusal");
+        assert!(
+            matches!(oversized, Error::LimitExceeded { .. }),
+            "expected a limit refusal, received {oversized:?}"
+        );
+        assert_eq!(
+            oversized.to_string(),
+            "expected at most 16 approval options offered, received 17"
+        );
     }
 
     #[test]

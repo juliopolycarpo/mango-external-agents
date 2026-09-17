@@ -70,7 +70,7 @@ pub async fn open(
 
     let stdin = child.stdin.take().ok_or_else(|| Error::Launch {
         program: program.to_owned(),
-        message: String::from("expected a writable stdin, received none"),
+        message: String::from("a child without a writable stdin"),
     })?;
 
     Ok(StdioTransport {

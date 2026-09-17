@@ -127,7 +127,7 @@ id, and each turn spawns, streams and reaps its own child.
   verbatim, so there is a published shape to check rather than a guess to accommodate. A reference
   that is not one is refused at `open_session` with `Error::HostConfiguration`, and an `init`
   record that echoes back a handle of some other shape is not followed — the minted id stays in
-  force. Same rule, same reason, as `models::safe_model` for `--model`.
+  force. The same argument-position rule applies to an explicit `--model` value.
 
   <https://code.claude.com/docs/en/cli-reference.md>
 - **A second `start_turn` ends the first.** A host that starts one has decided the first is over.
@@ -276,18 +276,36 @@ this library never runs.
 description are the whole catalog. Nothing is marked default, deliberately: the help declares no
 default, and naming one would put `--model` on every argv and override whatever default the account
 is on. A build that advertises no aliases reports no catalog at all, which is not the same as an
-empty one.
+empty one. An explicit model must fit Claude's documented identifier shape and an argv value
+position; an invalid value is refused before a child starts rather than omitted.
 
-**Effort.** `--effort` is passed only for a level this build itself printed, and only when the host
-chose one — which is what keeps a stored per-chat setting from breaking a downgrade.
+**Effort.** `--effort` is passed only for the exact level this build itself printed, and only when
+the host chose one. An explicit level that is unavailable after a downgrade is refused before a
+child starts, so the turn never silently falls back to another effort.
 
 ## MCP passthrough
 
 `OpenSession::mcp_servers` is written to a `mcpServers` JSON document and passed as
 `--mcp-config <path>` ([mcp.md](https://code.claude.com/docs/en/mcp.md)). A file, never the
 inline-string form the flag also accepts: inline would put `env` and `headers` on a command line
-anybody can read. The file goes in a directory of its own with an unguessable name, both owner-only
-where the platform has permissions, and is removed when the session is closed or dropped.
+anybody can read. The host supplies an absolute scratch root that is visible at the same path to
+the launched child. On Unix, every directory on the root's path must be owned by the
+effective user or root, and a directory writable by group or other must be sticky, so no account
+can replace the unique session leaf — or any name above it — before Claude reads it. The check
+covers the ancestors because Claude opens `--mcp-config` by pathname: the child resolves every
+name again, so a handle this process holds cannot protect that walk. Both the path as the host
+wrote it and its canonical form are checked, because a symlink makes them two different chains: a
+shared directory holding a symlink into a private tree is on the walk the child performs even
+though canonicalisation resolves it away. A symlink component is judged by its owner, not by its own
+`lrwxrwxrwx` mode; the directory that holds it is checked as its own ancestor, so a symlink a
+third party owns is refused however sticky that directory is. The host remains responsible for ACLs and child mount mapping.
+The harness creates one unique leaf below it with owner-only Unix permissions, or the host root's
+inherited Windows ACL, and removes that leaf when the session is closed or dropped. It never
+creates, changes or falls back outside the host root. A missing or unusable root refuses opening
+before a Claude probe starts — including a root whose finished leaf path could not occupy a
+`--mcp-config` value, such as one holding a control character that every Unix filesystem accepts
+and the CLI's own parser does not. That check runs before the leaf is created, so a session never
+opens over a path whose every turn would fail.
 
 A build that does not declare `--mcp-config` returns
 `Error::NotSupported { capability: Capability::McpPassthrough }`; a transport kind this harness

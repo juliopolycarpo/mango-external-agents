@@ -28,6 +28,7 @@ use agent_client_protocol::schema::v1::{
 use mango_external_agents::permission::PermissionMatrix;
 use mango_external_agents::session::{
     Configuration, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
+    resume_fallback_reason,
 };
 use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
@@ -242,9 +243,11 @@ impl Harness for AcpHarness {
             // mistake must not go.
             return Err(Error::HostConfiguration {
                 expected: "a (level, routing) pair this profile supports",
+                // The pair, never the profile. A custom profile's id is host-authored text and
+                // may name a tenant; the host already knows which profile it handed this harness.
                 received: format!(
-                    "{:?}/{:?} on {}",
-                    request.configuration.level, request.configuration.routing, self.profile.id
+                    "{:?}/{:?}",
+                    request.configuration.level, request.configuration.routing
                 ),
             });
         }
@@ -456,8 +459,9 @@ impl AcpHarness {
             // Fallback: a fresh conversation, and the host is told why rather than left to notice
             // that its history disappeared.
             Err(error) => {
+                let reason = resume_fallback_reason("session/load", &error);
                 let mut opened = self.new_session(connection, host, cwd).await?;
-                opened.fallback_reason = Some(error.to_string());
+                opened.fallback_reason = Some(reason);
                 Ok(opened)
             }
         }
@@ -528,7 +532,12 @@ impl AcpHarness {
         });
         if !advertised {
             return Err(Error::Protocol {
-                expected: format!("an agent advertising the mode {wanted:?}"),
+                // The relationship, never the id: a mode id is this profile's own string, which
+                // `AcpProfile::custom` lets a host write, and `Error::Protocol` renders `expected`
+                // verbatim. The host holds the mode table it supplied and the level it asked for.
+                expected: String::from(
+                    "an agent advertising the mode this profile maps the requested level to",
+                ),
                 received: format!(
                     "{:?}",
                     modes.map(|state| state

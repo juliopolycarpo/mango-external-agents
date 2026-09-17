@@ -74,3 +74,6 @@ pub mod method {
 
 /// The peer as a person would name it, in errors and log lines.
 pub const PEER_NAME: &str = "Codex app-server";
+
+/// The vendor prefix this harness's JSON-RPC error codes carry, such as `codex-call-failed`.
+pub const CODE_PREFIX: &str = "codex";

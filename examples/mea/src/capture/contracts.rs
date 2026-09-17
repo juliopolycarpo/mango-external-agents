@@ -501,7 +501,9 @@ fn copy_generated_schema(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn command_name(argv: &[String]) -> String {
-    argv.join(" ")
+    argv.first()
+        .map(|program| mango_external_agents::redact::program_name(program))
+        .unwrap_or_else(|| String::from("capture command"))
 }
 
 #[cfg(test)]
@@ -514,7 +516,7 @@ mod tests {
         command_output, copy_generated_schema, normalize_acp_initialize, write_json,
     };
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
-    use mango_external_agents::{EnvSource, ExitStatus, HostContext};
+    use mango_external_agents::{EnvSource, Error, ExitStatus, HostContext};
     use serde_json::json;
 
     fn host(launcher: Arc<FakeLauncher>) -> HostContext {
@@ -585,7 +587,10 @@ mod tests {
         }))
         .expect_err("expected an absent protocol version to be refused");
 
-        assert!(error.to_string().contains("protocolVersion"), "{error}");
+        assert!(
+            matches!(&error, Error::Protocol { expected, .. } if expected.contains("protocolVersion")),
+            "expected the missing protocolVersion field, received {error:?}"
+        );
         assert!(!error.to_string().contains("private"), "{error}");
     }
 
@@ -686,7 +691,10 @@ mod tests {
         .await
         .expect_err("expected an empty probe to be refused");
 
-        assert!(error.to_string().contains("stdout"), "{error}");
+        assert!(
+            matches!(&error, Error::Protocol { expected, .. } if expected.contains("stdout")),
+            "expected empty stdout to be refused, received {error:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -705,7 +713,10 @@ mod tests {
             .expect("expected the capture task to finish")
             .expect_err("expected a silent ACP agent to time out");
 
-        assert!(error.to_string().contains("initialize"), "{error}");
+        assert!(
+            matches!(&error, Error::Timeout { operation, .. } if operation.contains("initialize")),
+            "expected initialize to time out, received {error:?}"
+        );
         assert_eq!(launcher.live_children(), 0, "expected timeout cleanup");
     }
 
@@ -736,10 +747,17 @@ mod tests {
     }
 
     #[test]
-    fn command_name_preserves_the_exact_argument_order() {
-        assert_eq!(
-            command_name(&[String::from("codex"), String::from("app-server")]),
-            "codex app-server"
+    fn command_name_keeps_capture_errors_free_of_arguments() {
+        let name = command_name(&[
+            String::from("/opt/vendor/codex"),
+            String::from("--api-key"),
+            String::from("capture-argv-secret"),
+        ]);
+
+        assert_eq!(name, "codex");
+        assert!(
+            !name.contains("capture-argv-secret"),
+            "expected no command argument in a capture diagnostic, received {name}"
         );
         assert_eq!(CONTRACT_TIMEOUT, std::time::Duration::from_secs(30));
     }

@@ -51,11 +51,24 @@ impl fmt::Display for HarnessKind {
 /// let kind = HarnessKind::Acp(AcpProfileId::new("cursor"));
 /// assert_eq!(kind.to_string(), "acp:cursor");
 /// ```
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct AcpProfileId(String);
+
+impl fmt::Debug for AcpProfileId {
+    /// Prints only a label-shaped id, as [`Display`](fmt::Display) does.
+    ///
+    /// A derived `Debug` would undo that bound wherever a host formats the id directly — a
+    /// `tracing` field, a `dbg!`, a derived `Debug` on anything holding one — and an assertion
+    /// made through [`Error`](crate::Error) would not notice, because its own `Debug` forwards to
+    /// its `Display`. The same pairing [`ErrorCode`](crate::ErrorCode) has, for the same reason.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AcpProfileId")
+            .field(&self.to_string())
+            .finish()
+    }
+}
 
 impl AcpProfileId {
     /// Names a profile.
@@ -70,8 +83,20 @@ impl AcpProfileId {
 }
 
 impl fmt::Display for AcpProfileId {
+    /// Writes the id when it has a label's shape, and `profile` when it does not.
+    ///
+    /// The same split [`ErrorCode`](crate::ErrorCode) carries, for the same reason: every built-in
+    /// profile is this crate's own word, but [`AcpProfile::custom`] takes whatever a host names its
+    /// in-house agent, and `Display` is what a diagnostic writes — `Error::UnsupportedTransport`
+    /// interpolates the whole [`HarnessKind`], and the registry names a kind in its refusals.
+    /// [`as_str`](AcpProfileId::as_str) stays the protocol field and is never bounded.
+    ///
+    /// [`AcpProfile::custom`]: https://docs.rs/mango-agent-acp
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        if crate::error::is_label_shaped(&self.0) {
+            return formatter.write_str(&self.0);
+        }
+        formatter.write_str("profile")
     }
 }
 
@@ -496,6 +521,61 @@ mod tests {
     };
     use crate::Error;
     use crate::transport::TransportKind;
+
+    /// A custom profile id is host-authored text. `as_str` is the protocol field and keeps it, and
+    /// `Display` is what a diagnostic writes — including `Error::UnsupportedTransport`, which
+    /// interpolates the whole `HarnessKind`.
+    #[test]
+    fn a_custom_profile_id_that_is_not_a_label_is_not_written_into_diagnostics() {
+        let leaky = AcpProfileId::new("tenant credential=profile-secret");
+        assert_eq!(leaky.as_str(), "tenant credential=profile-secret");
+        assert_eq!(leaky.to_string(), "profile");
+        assert_eq!(HarnessKind::Acp(leaky.clone()).to_string(), "acp:profile");
+
+        let error = Error::UnsupportedTransport {
+            harness: HarnessKind::Acp(leaky),
+            transport: TransportKind::Stdio,
+        };
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("profile-secret"),
+                "expected the profile id to stay out of diagnostics, received {rendered:?}"
+            );
+        }
+
+        // A profile a host can read in a log line still reads the same.
+        assert_eq!(
+            HarnessKind::Acp(AcpProfileId::new("in-house")).to_string(),
+            "acp:in-house"
+        );
+    }
+
+    /// `Error`'s `Debug` forwards to its `Display`, so an assertion made through an `Error` says
+    /// nothing about these types' own `Debug`. A host formatting the id or the kind directly —
+    /// `tracing` field, `dbg!`, a derived `Debug` on a struct that holds one — is the path that
+    /// has to be bounded too, the way `ErrorCode` bounds its own.
+    #[test]
+    fn debug_bounds_a_custom_profile_id_the_way_display_does() {
+        let leaky = AcpProfileId::new("tenant credential=profile-secret");
+
+        for rendered in [
+            format!("{leaky:?}"),
+            format!("{:?}", HarnessKind::Acp(leaky)),
+        ] {
+            assert!(
+                !rendered.contains("profile-secret"),
+                "expected Debug to bound the profile id, received {rendered:?}"
+            );
+        }
+
+        // A profile a host can read still reads the same through both.
+        let plain = AcpProfileId::new("in-house");
+        assert_eq!(plain.to_string(), "in-house");
+        assert!(
+            format!("{plain:?}").contains("in-house"),
+            "expected a label-shaped id to survive Debug"
+        );
+    }
 
     /// A harness that reports what a vendor said and bounds none of it, which is what a harness
     /// author writes when the bounding is somebody else's job to remember.

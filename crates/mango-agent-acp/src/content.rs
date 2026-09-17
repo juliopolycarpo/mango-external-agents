@@ -23,17 +23,23 @@ use mango_external_agents::{Attachment, AttachmentKind, Error, Result};
 ///
 /// # Errors
 ///
-/// [`Error::Protocol`] when the turn carries more than [`TURN_MAX_ATTACHMENTS`] files, an attachment
-/// over [`ATTACHMENT_MAX_BYTES`], or a kind this agent's `promptCapabilities` did not advertise.
+/// [`Error::LimitExceeded`] when the turn carries more than [`TURN_MAX_ATTACHMENTS`] files or an
+/// attachment over [`ATTACHMENT_MAX_BYTES`] — both caps are the library's own, and both numbers
+/// are named — and [`Error::Protocol`] for a kind this agent's `promptCapabilities` did not
+/// advertise.
 pub fn prompt(
     input: &str,
     attachments: &[Attachment],
     capabilities: &PromptCapabilities,
 ) -> Result<Vec<ContentBlock>> {
+    // A cap, not a shape: both numbers are the library's own, and `LimitExceeded` is the variant
+    // that names them. `Protocol` would have hidden the count behind "invalid vendor data", and
+    // the Codex harness already refuses the same two caps this way.
     if attachments.len() > TURN_MAX_ATTACHMENTS {
-        return Err(Error::Protocol {
-            expected: format!("at most {TURN_MAX_ATTACHMENTS} attachments"),
-            received: attachments.len().to_string(),
+        return Err(Error::LimitExceeded {
+            subject: "attachments on one turn",
+            limit: TURN_MAX_ATTACHMENTS,
+            received: attachments.len(),
         });
     }
     let mut blocks = Vec::with_capacity(attachments.len() + 1);
@@ -46,9 +52,12 @@ pub fn prompt(
 
 fn block(attachment: &Attachment, capabilities: &PromptCapabilities) -> Result<ContentBlock> {
     if attachment.bytes.len() > ATTACHMENT_MAX_BYTES {
-        return Err(Error::Protocol {
-            expected: format!("an attachment of at most {ATTACHMENT_MAX_BYTES} bytes"),
-            received: format!("{:?} at {} bytes", attachment.name, attachment.bytes.len()),
+        // Without the name: it is whatever the host called the file, and both numbers say more
+        // about the refusal than it does.
+        return Err(Error::LimitExceeded {
+            subject: "bytes in one attachment",
+            limit: ATTACHMENT_MAX_BYTES,
+            received: attachment.bytes.len(),
         });
     }
     match attachment.kind {
@@ -231,6 +240,7 @@ mod tests {
         );
     }
 
+    /// A cap refusal names both numbers, and `Display` is where an operator reads them.
     #[test]
     fn more_attachments_than_one_turn_carries_are_refused() {
         let many: Vec<Attachment> = (0..=TURN_MAX_ATTACHMENTS)
@@ -238,24 +248,35 @@ mod tests {
             .collect();
         let error = prompt("look", &many, &everything())
             .expect_err("expected a refusal, received a prompt");
-        assert!(
-            matches!(&error, Error::Protocol { expected, .. } if expected.contains("attachments")),
-            "received {error:?}"
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "expected at most {TURN_MAX_ATTACHMENTS} attachments on one turn, received {}",
+                many.len()
+            )
         );
     }
 
+    /// The two sizes, and not the name the host gave the file.
     #[test]
     fn an_oversized_attachment_is_refused_with_its_own_size() {
-        let big = attachment(
-            AttachmentKind::Text,
-            vec![b'x'; mango_external_agents::session::ATTACHMENT_MAX_BYTES + 1],
-        );
+        let max = mango_external_agents::session::ATTACHMENT_MAX_BYTES;
+        let big = attachment(AttachmentKind::Text, vec![b'x'; max + 1]);
         let error = prompt("look", &[big], &everything())
             .expect_err("expected a refusal, received a prompt");
-        let Error::Protocol { received, .. } = &error else {
-            panic!("received {error:?}");
-        };
-        assert!(received.contains("notes.txt"), "received {received:?}");
+
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered,
+            format!(
+                "expected at most {max} bytes in one attachment, received {}",
+                max + 1
+            )
+        );
+        assert!(
+            !rendered.contains("notes.txt"),
+            "expected the host's own file name to stay out, received {rendered}"
+        );
     }
 
     #[test]

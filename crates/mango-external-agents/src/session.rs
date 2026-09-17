@@ -88,7 +88,7 @@ impl From<CloseReason> for CancelReason {
 }
 
 /// The two ids one session answers to.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionIds {
     /// The host's own id, which the host minted and can rely on.
@@ -97,12 +97,28 @@ pub struct SessionIds {
     pub native_session_id: String,
 }
 
+impl fmt::Debug for SessionIds {
+    /// Reports that the session answers to both, not what either one is.
+    ///
+    /// The value [`Session::ids`] returns, so this is what a host reaches for with `dbg!` or
+    /// embeds in a type of its own — a carrier, unlike [`SessionId`] itself, which is the id and
+    /// prints it. The vendor's handle is the vendor's, and [`Resume`] and [`SessionInfo`] already
+    /// report it this way.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionIds")
+            .field("has_session_id", &true)
+            .field("has_native_session_id", &!self.native_session_id.is_empty())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Settings a host may explicitly override without opening a new session.
 ///
 /// An omitted permission axis reports no known library override; it never means read-only. Some
 /// vendor profiles are more granular than this shared pair, so the library does not guess a
 /// generic equivalent for captured native defaults.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Configuration {
     /// The vendor's own model id, when the host chose one.
@@ -123,6 +139,19 @@ pub struct Configuration {
     /// before any selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<ApprovalRouting>,
+}
+
+impl fmt::Debug for Configuration {
+    /// Records which host settings were selected without logging opaque vendor identifiers.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Configuration")
+            .field("has_model", &self.model.is_some())
+            .field("has_effort", &self.effort.is_some())
+            .field("level", &self.level)
+            .field("routing", &self.routing)
+            .finish()
+    }
 }
 
 impl Default for Configuration {
@@ -183,7 +212,7 @@ pub enum ResumeMode {
 }
 
 /// A vendor conversation to continue.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Resume {
     /// The vendor's own handle for it.
@@ -192,18 +221,40 @@ pub struct Resume {
     pub mode: ResumeMode,
 }
 
+impl fmt::Debug for Resume {
+    /// Shows the resume policy without exposing the opaque handle supplied to a vendor.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Resume")
+            .field("has_native_session_id", &true)
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
 /// One MCP server a host configured, for a vendor that accepts them.
 ///
 /// Passed through untouched: the library never inspects a server, never connects to one and never
 /// puts a vendor's MCP tools into a host's own tool registry. It maps this shape onto whatever the
 /// vendor's dialect spells it as and stops there.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServer {
     /// The name the vendor lists this server under.
     pub name: String,
     /// How the vendor reaches it.
     pub transport: McpTransport,
+}
+
+impl fmt::Debug for McpServer {
+    /// Avoids logging the host's arbitrary server name while retaining transport metadata.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpServer")
+            .field("has_name", &!self.name.is_empty())
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 impl McpServer {
@@ -284,20 +335,20 @@ impl fmt::Debug for McpTransport {
     /// every type above this one derives `Debug` from it — so a `tracing::debug!(?request)` of an
     /// open that configured MCP, or the crate's `received {value:?}` assertion idiom, would print
     /// the token in the clear. Values go, names stay: a host debugging a server it misconfigured
-    /// still has to see which variable and which header. The URL and the command line go through
-    /// the same redaction a stderr tail does, for the `https://user:password@host` form and for an
-    /// argument written as an assignment.
+    /// still has to see which variable and which header. URLs are omitted because they can carry
+    /// arbitrary credentials in a query, while commands retain only their basename and argument
+    /// count.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stdio { command, args, env } => formatter
                 .debug_struct("Stdio")
-                .field("command", &crate::redact::stderr_text(command))
-                .field("args", &redacted_arguments(args))
+                .field("command", &crate::redact::program_name(command))
+                .field("argument_count", &args.len())
                 .field("env", &redacted_values(env))
                 .finish(),
-            Self::Http { url, headers } => formatter
+            Self::Http { headers, .. } => formatter
                 .debug_struct("Http")
-                .field("url", &crate::redact::stderr_text(url))
+                .field("endpoint_configured", &true)
                 .field("headers", &redacted_values(headers))
                 .finish(),
             // No wildcard arm: `#[non_exhaustive]` does not apply inside the defining crate, so a
@@ -316,16 +367,8 @@ fn redacted_values(
         .collect()
 }
 
-/// Each argument through the stderr redaction, which catches the `--api-key=…` shape.
-fn redacted_arguments(arguments: &[String]) -> Vec<String> {
-    arguments
-        .iter()
-        .map(|argument| crate::redact::stderr_text(argument))
-        .collect()
-}
-
 /// What a host asks for when it opens a session.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenSession {
     /// The host's own id for the session.
@@ -349,6 +392,20 @@ pub struct OpenSession {
     /// accept a request they would silently drop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
+}
+
+impl fmt::Debug for OpenSession {
+    /// Shows open-session shape without logging opaque ids or host-supplied configuration.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenSession")
+            .field("has_session_id", &true)
+            .field("configuration", &self.configuration)
+            .field("resume", &self.resume)
+            .field("executable", &self.executable)
+            .field("mcp_server_count", &self.mcp_servers.len())
+            .finish()
+    }
 }
 
 impl OpenSession {
@@ -421,7 +478,7 @@ impl OpenSession {
 ///
 /// A snapshot of the answer `open_session` gave, not a live view. Read [`Session::ids`] for
 /// the current vendor handle and [`Session::configuration`] for the defaults later turns inherit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     /// The two ids, as opening reported them.
     ///
@@ -439,6 +496,61 @@ pub struct SessionInfo {
     pub effective_configuration: Configuration,
     /// What this session can do, as this build of the CLI reports it.
     pub capabilities: Capabilities,
+}
+
+/// Why a requested resume fell back to a fresh conversation, in terms a host can act on.
+///
+/// Built from the error's typed fields rather than from its diagnostic text. `Display` reports
+/// only metadata for anything a vendor filled in, so a reason copied from it says "vendor failure"
+/// and tells a host nothing it did not already know. Every harness that offers
+/// [`ResumeMode::Fallback`] fills [`SessionInfo::fallback_reason`] through this, so the sentence a
+/// host shows does not depend on which vendor produced it.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::{Capability, Error, resume_fallback_reason};
+///
+/// let reason = resume_fallback_reason("session/load", &Error::not_supported(Capability::Resume));
+/// assert_eq!(reason, "session/load needs resume, which this agent does not declare");
+/// ```
+pub fn resume_fallback_reason(operation: &str, error: &Error) -> String {
+    match error {
+        // The code prints only when it has a label's shape — `acp-request-failed`,
+        // `codex-call-failed` — and the `vendor-code` stand-in otherwise, so this sentence names
+        // which call refused without carrying a vendor's own words.
+        Error::Vendor(vendor) => format!(
+            "{operation} was refused by the vendor ({}, retryable {})",
+            vendor.code, vendor.retryable
+        ),
+        Error::NotSupported { capability } => {
+            format!("{operation} needs {capability}, which this agent does not declare")
+        }
+        Error::Timeout { after, .. } => format!("{operation} did not answer within {after:?}"),
+        Error::Protocol { .. } => {
+            format!("{operation} answered with a shape this harness does not read")
+        }
+        Error::Link { .. } => format!("{operation} lost the vendor link"),
+        Error::Closed { subject } => format!("{operation} found a closed {subject}"),
+        other => format!("{operation} failed: {other}"),
+    }
+}
+
+impl fmt::Debug for SessionInfo {
+    /// Records what opening decided without logging the ids or the vendor's fallback text.
+    ///
+    /// Kept rather than dropped: a host that wraps a `SessionInfo` and derives `Debug` for its own
+    /// type needs this trait to exist, and `dbg!(session.info())` is the first thing anybody
+    /// reaches for when a resume behaves unexpectedly.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionInfo")
+            .field("resumed", &self.resumed)
+            .field("has_fallback_reason", &self.fallback_reason.is_some())
+            .field("effective_configuration", &self.effective_configuration)
+            .field("capabilities", &self.capabilities)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The largest attachment the vendor wire carries, and how many of them.
@@ -467,7 +579,7 @@ pub enum AttachmentKind {
 ///
 /// Bytes rather than base64: a harness encodes for its own dialect, and a host that already has
 /// the bytes should not have to encode them for a wire it cannot see.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Attachment {
     /// The host's own id for it.
     pub id: String,
@@ -481,8 +593,19 @@ pub struct Attachment {
     pub bytes: Vec<u8>,
 }
 
+impl fmt::Debug for Attachment {
+    /// Reports attachment metadata without logging the host's names, ids, or bytes.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Attachment")
+            .field("kind", &self.kind)
+            .field("byte_count", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// One turn's input.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TurnRequest {
     /// The host's own id for this turn, which is also its idempotency key.
     pub turn_id: TurnId,
@@ -492,6 +615,19 @@ pub struct TurnRequest {
     pub attachments: Vec<Attachment>,
     /// Explicit settings for this turn, when they differ from the session's inherited settings.
     pub configuration: Option<Configuration>,
+}
+
+impl fmt::Debug for TurnRequest {
+    /// Shows a turn's shape without logging its prompt or attachment contents.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnRequest")
+            .field("has_turn_id", &true)
+            .field("input_bytes", &self.input.len())
+            .field("attachment_count", &self.attachments.len())
+            .field("configuration", &self.configuration)
+            .finish()
+    }
 }
 
 impl TurnRequest {
@@ -535,7 +671,7 @@ impl TurnRequest {
 }
 
 /// More input for a turn that is already running.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Steer {
     /// The turn to steer.
     pub turn_id: TurnId,
@@ -543,6 +679,18 @@ pub struct Steer {
     pub native_turn_id: String,
     /// What to add.
     pub input: String,
+}
+
+impl fmt::Debug for Steer {
+    /// Shows a steer without logging its prompt or opaque vendor identifiers.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Steer")
+            .field("has_turn_id", &true)
+            .field("has_native_turn_id", &true)
+            .field("input_bytes", &self.input.len())
+            .finish()
+    }
 }
 
 /// Whether a steer landed.
@@ -574,7 +722,7 @@ pub enum SteerRejection {
 /// What a vendor-native review is pointed at.
 ///
 /// Harnesses may reject targets their vendor does not support.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum ReviewTarget {
@@ -600,13 +748,28 @@ pub enum ReviewTarget {
     },
 }
 
+impl fmt::Debug for ReviewTarget {
+    /// Identifies the review mode without logging host-provided revisions or instructions.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UncommittedChanges => formatter.write_str("UncommittedChanges"),
+            Self::BaseBranch { .. } => formatter.write_str("BaseBranch { configured: true }"),
+            Self::Commit { title, .. } => formatter
+                .debug_struct("Commit")
+                .field("has_title", &title.is_some())
+                .finish(),
+            Self::Custom { .. } => formatter.write_str("Custom { configured: true }"),
+        }
+    }
+}
+
 /// Start a vendor-native review on an open session.
 ///
 /// A review is a turn that happens to be a review: it is deduplicated, ordered, cancelled and
 /// persisted by the same machinery, so it carries a turn id like any other. It runs under the
 /// permissions the session already has — reconfiguring mid-review would be a way around a choice
 /// somebody already made.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReviewRequest {
     /// The host's own id for this turn.
     pub turn_id: TurnId,
@@ -614,11 +777,22 @@ pub struct ReviewRequest {
     pub target: ReviewTarget,
 }
 
+impl fmt::Debug for ReviewRequest {
+    /// Shows a review request without logging its opaque turn id.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReviewRequest")
+            .field("has_turn_id", &true)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
 /// How many sessions one page may carry.
 pub const SESSION_PAGE_LIMIT: usize = 50;
 
 /// Which of a vendor's own sessions to list.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SessionQuery {
     /// Where to continue from, from a previous page.
     pub cursor: Option<String>,
@@ -655,7 +829,7 @@ impl SessionQuery {
 ///
 /// A pointer, not an import: nothing here carries transcript content. Adopting a session records
 /// which vendor conversation a chat continues, and the vendor keeps the history it wrote.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSession {
     /// The vendor's own handle.
@@ -675,7 +849,7 @@ pub struct NativeSession {
 }
 
 /// One page of a vendor's own sessions.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SessionPage {
     /// The rows.
     pub sessions: Vec<NativeSession>,
@@ -691,6 +865,51 @@ pub struct SessionPage {
     /// A vendor given a bounded [`SessionQuery`] never trips this. Seeing it set means the vendor
     /// returned more than it was asked for.
     pub truncated: bool,
+}
+
+impl fmt::Debug for SessionQuery {
+    /// Records the shape of the request without the cursor or the directory it names.
+    ///
+    /// A vendor cursor is an opaque token and a workspace path is host-provided, so both are
+    /// reported as present rather than written.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionQuery")
+            .field("has_cursor", &self.cursor.is_some())
+            .field("limit", &self.limit)
+            .field("has_workspace_path", &self.workspace_path.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for NativeSession {
+    /// Records that a row exists without logging the conversation it points at.
+    ///
+    /// The id, the title, the preview and the working directory are the vendor's own record of
+    /// what somebody talked about and where — a title is often the first thing they typed — so a
+    /// host that logs a listing logs how many rows it received and what each one carries, not what
+    /// any of them say. The fields are public and a host that needs them reads them.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeSession")
+            .field("has_title", &self.title.is_some())
+            .field("has_preview", &self.preview.is_some())
+            .field("has_workspace_path", &self.workspace_path.is_some())
+            .field("updated_at", &self.updated_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for SessionPage {
+    /// Records what the page holds without the rows or the vendor's cursor.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionPage")
+            .field("session_count", &self.sessions.len())
+            .field("has_next_cursor", &self.next_cursor.is_some())
+            .field("truncated", &self.truncated)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionPage {
@@ -852,7 +1071,9 @@ pub trait Session: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Whatever the vendor or the link reported.
+    /// Whatever the vendor or the link reported, and whatever a resource this session owns failed
+    /// to release. The session is closed either way — a refusal here says what was left behind,
+    /// not that the close should be tried again.
     async fn close(&self, reason: CloseReason) -> Result<()>;
 
     /// Adds to a turn that is already running.
@@ -912,24 +1133,150 @@ pub trait Session: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReason, CloseReason, Configuration, McpServer, McpTransport, NativeSession,
-        OpenSession, ResumeMode, Session, SessionIds, SessionInfo, SessionPage, TurnRequest,
+        Attachment, AttachmentKind, CancelReason, CloseReason, Configuration, McpServer,
+        McpTransport, NativeSession, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
+        SessionPage, SessionQuery, TurnRequest,
     };
     use crate::permission::{ApprovalRouting, PermissionLevel};
 
-    /// `env` and `headers` are the one place a host puts its own credential on this surface.
+    /// The helper both fallback sites depend on, across every arm a resume can fail through.
     ///
-    /// A derived `Debug` prints both maps in the clear, and every type above this one derives from
-    /// it — so a `tracing::debug!(?request)` of an open that configured MCP, or the crate's own
-    /// `received {value:?}` assertion idiom, would put the token in a log. This is the same
-    /// reasoning `WsSpec` is hand-written for.
+    /// Only the vendor arm is reachable from a harness test with a recorded transcript, so the
+    /// rest are pinned here: a reason that silently degraded to "thread/resume failed" would be
+    /// invisible until a host asked why its history disappeared.
     #[test]
-    fn never_prints_a_credential_a_host_put_on_an_mcp_server() {
+    fn a_resume_fallback_reason_explains_every_way_a_load_can_fail() {
+        use crate::error::{Error, ErrorCode, VendorError};
+        use std::time::Duration;
+
+        let cases = [
+            (
+                Error::Vendor(
+                    VendorError::new(ErrorCode::from_static("acp-request-failed"), "expired")
+                        .with_vendor_code("thread_gone", true),
+                ),
+                "session/load was refused by the vendor (acp-request-failed, retryable true)",
+            ),
+            (
+                Error::Timeout {
+                    operation: String::from("session/load"),
+                    after: Duration::from_secs(30),
+                },
+                "session/load did not answer within 30s",
+            ),
+            (
+                Error::Protocol {
+                    expected: String::from("a loaded session"),
+                    received: String::from("payload-secret"),
+                },
+                "session/load answered with a shape this harness does not read",
+            ),
+            (
+                Error::Link {
+                    peer: String::from("agent"),
+                    message: String::from("link-secret"),
+                },
+                "session/load lost the vendor link",
+            ),
+            (
+                Error::Closed { subject: "link" },
+                "session/load found a closed link",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                crate::resume_fallback_reason("session/load", &error),
+                expected
+            );
+        }
+    }
+
+    /// `Debug` stays on the public snapshot, because a host wrapping it derives its own.
+    #[test]
+    fn session_info_debug_reports_metadata_without_ids_or_vendor_text() {
+        let info = SessionInfo {
+            ids: SessionIds {
+                session_id: crate::SessionId::new("chat-id-secret"),
+                native_session_id: String::from("native-id-secret"),
+            },
+            resumed: false,
+            fallback_reason: Some(String::from("fallback-text-secret")),
+            effective_configuration: Configuration::default(),
+            capabilities: crate::Capabilities::none(),
+        };
+
+        // `ids()` is the value a host reaches for on its own, so it carries the same claim.
+        let rendered = format!("{info:?} {:?}", info.ids);
+        for secret in ["chat-id-secret", "native-id-secret", "fallback-text-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no session payload in diagnostics, received {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("has_native_session_id: true"),
+            "expected the vendor handle to be reported as present, received {rendered}"
+        );
+        assert!(
+            rendered.contains("has_fallback_reason: true"),
+            "expected the fallback to be reported as present, received {rendered}"
+        );
+    }
+
+    /// The listing surface carries more of a conversation than anything else the library returns.
+    ///
+    /// A title is usually the first thing somebody typed, a preview is the conversation itself, and
+    /// a workspace path names the machine and often the person. `list_sessions` is the one call
+    /// that hands a host a page of them, so a host that logs its result must log a shape.
+    #[test]
+    fn session_listing_debug_reports_shape_without_titles_previews_or_paths() {
+        let query = SessionQuery {
+            cursor: Some(String::from("cursor-secret")),
+            limit: Some(10),
+            workspace_path: Some(std::path::PathBuf::from("/home/person-secret/work")),
+        };
+        let page = SessionPage {
+            sessions: vec![NativeSession {
+                native_session_id: String::from("native-id-secret"),
+                title: Some(String::from("title-secret")),
+                preview: Some(String::from("preview-secret")),
+                workspace_path: Some(String::from("/home/person-secret/work")),
+                updated_at: None,
+            }],
+            next_cursor: Some(String::from("next-cursor-secret")),
+            truncated: true,
+        };
+
+        let rendered = format!("{query:?} {page:?} {:?}", page.sessions[0]);
+        for secret in [
+            "cursor-secret",
+            "next-cursor-secret",
+            "person-secret",
+            "native-id-secret",
+            "title-secret",
+            "preview-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no listing payload in diagnostics, received {rendered}"
+            );
+        }
+        for metadata in ["has_cursor: true", "session_count: 1", "truncated: true"] {
+            assert!(
+                rendered.contains(metadata),
+                "expected {metadata} to survive, received {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_debug_keeps_values_and_positional_arguments_out_of_diagnostics() {
         let stdio = McpServer {
             name: String::from("docs"),
             transport: McpTransport::Stdio {
                 command: String::from("docs-mcp"),
-                args: vec![String::from("--api-key=sk-live-args")],
+                args: vec![String::from("--api-key"), String::from("sk-live-args")],
                 env: [(String::from("API_KEY"), String::from("sk-live-env"))]
                     .into_iter()
                     .collect(),
@@ -938,7 +1285,7 @@ mod tests {
         let http = McpServer {
             name: String::from("search"),
             transport: McpTransport::Http {
-                url: String::from("https://user:sk-live-url@search.example/mcp"),
+                url: String::from("https://user:sk-live-url@search.example/mcp?key=query-secret"),
                 headers: [(
                     String::from("Authorization"),
                     String::from("Bearer sk-live-header"),
@@ -947,33 +1294,71 @@ mod tests {
                 .collect(),
             },
         };
-        let request = OpenSession::new("chat-1").with_mcp_servers(vec![stdio, http]);
-        let printed = format!("{request:?}");
+        let printed = format!("{stdio:?}\n{http:?}");
 
         for secret in [
             "sk-live-env",
             "sk-live-header",
             "sk-live-url",
             "sk-live-args",
+            "query-secret",
         ] {
             assert!(
                 !printed.contains(secret),
                 "expected {secret:?} to be redacted, received {printed}"
             );
         }
-        // Redacted, not erased: a host debugging a misconfigured server still needs to see which
-        // server, which variable and which header.
         for kept in [
-            "docs",
-            "docs-mcp",
+            "custom executable",
             "API_KEY",
             "Authorization",
-            "search.example",
+            "argument_count: 2",
         ] {
             assert!(
                 printed.contains(kept),
                 "expected {kept:?} to survive redaction, received {printed}"
             );
+        }
+    }
+
+    #[test]
+    fn nested_request_debug_omits_prompts_ids_and_host_configuration_values() {
+        let request = OpenSession::new("session-id-secret")
+            .with_configuration(Configuration {
+                model: Some(String::from("model-secret")),
+                effort: Some(String::from("effort-secret")),
+                ..Configuration::default()
+            })
+            .resuming("resume-id-secret", ResumeMode::Fallback)
+            .with_mcp_servers(vec![McpServer::stdio("server-name-secret", "docs-mcp")]);
+        let turn = TurnRequest::new("turn-id-secret", "prompt-secret").with_attachments(vec![
+            Attachment {
+                id: String::from("attachment-id-secret"),
+                name: String::from("attachment-name-secret"),
+                mime_type: String::from("text/plain"),
+                kind: AttachmentKind::Text,
+                bytes: b"attachment-bytes-secret".to_vec(),
+            },
+        ]);
+
+        for printed in [format!("{request:?}"), format!("{turn:?}")] {
+            for secret in [
+                "session-id-secret",
+                "model-secret",
+                "effort-secret",
+                "resume-id-secret",
+                "server-name-secret",
+                "turn-id-secret",
+                "prompt-secret",
+                "attachment-id-secret",
+                "attachment-name-secret",
+                "attachment-bytes-secret",
+            ] {
+                assert!(
+                    !printed.contains(secret),
+                    "expected no request payload in debug output, received {printed}"
+                );
+            }
         }
     }
 

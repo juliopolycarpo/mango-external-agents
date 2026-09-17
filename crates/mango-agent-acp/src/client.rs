@@ -536,14 +536,11 @@ impl SessionState {
                 .any(|option| option.id == response.option_id)
             {
                 return Err(Error::Protocol {
+                    // The count, never the ids: an option id is the agent's own string, and
+                    // `Display` writes this shape verbatim.
                     expected: format!(
-                        "one of the offered approval option ids: {:?}",
-                        pending
-                            .question
-                            .options
-                            .iter()
-                            .map(|option| &option.id)
-                            .collect::<Vec<_>>()
+                        "one of the {} approval option ids this question offered",
+                        pending.question.options.len()
                     ),
                     received: response.option_id.clone(),
                 });
@@ -788,9 +785,16 @@ impl std::fmt::Debug for ConnectionHandle {
 ///
 /// # Errors
 ///
-/// [`Error::Link`] when the connection ended before it produced a handle, carrying the child's
-/// stderr tail — which is what an agent that printed a usage message and exited looks like from
-/// here.
+/// [`Error::Vendor`] when the connection ended before it produced a handle, under
+/// `acp-link-closed`, carrying which of the three shapes it was and the child's redacted stderr
+/// tail — which is what an agent that printed a usage message and exited looks like from here.
+///
+/// A [`VendorError`] rather than an [`Error::Link`], because the tail has to reach a host and this
+/// is the only path where it cannot reach one any other way: no `Session` and no
+/// [`ProcessControl`] are returned, so [`StderrTail`](mango_external_agents::StderrTail) is out of
+/// reach. `VendorError::message` is the field that exists for vendor text a host reads and
+/// `Display` never writes, which is exactly the shape this needs; `Error::Link`'s summary is
+/// written verbatim and could not carry it.
 pub(crate) async fn drive(
     launched: LaunchedAgent,
     state: Arc<SessionState>,
@@ -829,17 +833,20 @@ pub(crate) async fn drive(
     );
 
     let Ok(connection) = ready_rx.await else {
-        // The closure never ran, so the transport failed first. The child's own stderr is the only
-        // thing that can say why.
-        let message = match driver.await {
-            Ok(Err(error)) => error.to_string(),
-            Ok(Ok(())) => String::from("the connection closed before it opened"),
-            Err(error) => error.to_string(),
+        // The closure never ran, so the transport failed first. Nothing is returned from this
+        // path — no session, no control handle — so the child's stderr has nowhere else to go, and
+        // an agent that exited printing a usage message has said the only useful thing there is.
+        // `VendorError::message` is the field for exactly that: vendor text a host reads and
+        // `Display` never writes.
+        let shape = match driver.await {
+            Ok(Err(_)) => "a transport that failed before the connection opened",
+            Ok(Ok(())) => "a connection that closed before it opened",
+            Err(_) => "a connection task that did not finish",
         };
-        return Err(Error::Link {
-            peer: String::from("ACP agent"),
-            message: with_stderr(&message, control.as_ref()),
-        });
+        return Err(Error::Vendor(link_failure(with_stderr(
+            shape,
+            control.as_ref(),
+        ))));
     };
 
     Ok(ConnectionHandle {
@@ -905,9 +912,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 ///
 /// # Errors
 ///
-/// [`Error::Timeout`] when the deadline passed, [`Error::Link`] when the transport went away — with
-/// the child's own stderr, which is the only thing that can explain an agent that exited mid-call —
-/// and otherwise whatever [`request_error`](crate::error::request_error) made of the agent's answer.
+/// [`Error::Timeout`] when the deadline passed, [`Error::Vendor`] with the child's redacted stderr
+/// when the transport closed, and otherwise whatever [`request_error`](crate::error::request_error)
+/// made of the agent's answer. An opening call returns no session or control handle, so this is the
+/// only path that preserves the tail for a host to inspect.
 pub(crate) async fn send<Request>(
     connection: &ConnectionHandle,
     profile: &crate::profile::AcpProfile,
@@ -923,16 +931,16 @@ where
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
         return Err(Error::Timeout {
-            operation: format!("{method} on ACP agent {}", profile.id),
+            operation: format!("{method} on an ACP agent"),
             after: timeout,
         });
     };
     answered.map_err(|error| {
         if agent_client_protocol::is_incoming_transport_closed(&error) {
-            return Error::Link {
-                peer: format!("ACP agent {}", profile.id),
-                message: with_stderr(&error.message, connection.control().as_ref()),
-            };
+            return Error::Vendor(link_failure(with_stderr(
+                &format!("a transport that closed under {method}"),
+                connection.control().as_ref(),
+            )));
         }
         crate::error::request_error(method, &error, &profile.login_text())
     })
@@ -987,6 +995,60 @@ mod tests {
             1,
         );
         sink
+    }
+
+    /// An agent that exits before the connection opens has said its only useful thing on stderr.
+    ///
+    /// Nothing is returned from that path — no session and no `ProcessControl` — so `StderrTail`
+    /// is out of reach and the tail has to travel on the error. `VendorError::message` is the
+    /// field for vendor text a host reads and `Display` never writes, which is why this path
+    /// answers with one instead of an `Error::Link` whose summary is written verbatim.
+    #[test]
+    fn an_agent_that_never_opened_carries_its_stderr_where_a_host_can_read_it() {
+        use mango_external_agents::{CancelReason, ExitStatus, ProcessControl, Result};
+
+        /// A control that only ever reports a tail.
+        struct ExitedAgent;
+
+        #[async_trait::async_trait]
+        impl ProcessControl for ExitedAgent {
+            fn pid(&self) -> Option<u32> {
+                None
+            }
+
+            fn stderr_tail(&self) -> String {
+                String::from("error: unknown flag --acp")
+            }
+
+            async fn wait(&self) -> Result<ExitStatus> {
+                Ok(ExitStatus::default())
+            }
+
+            async fn kill(&self, _reason: CancelReason) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = mango_external_agents::Error::Vendor(super::link_failure(super::with_stderr(
+            "a connection that closed before it opened",
+            &ExitedAgent,
+        )));
+
+        let mango_external_agents::Error::Vendor(vendor) = &error else {
+            panic!("expected a vendor failure, received {error:?}");
+        };
+        assert_eq!(vendor.code.as_str(), "acp-link-closed");
+        assert!(
+            vendor.message.contains("unknown flag --acp"),
+            "expected the agent's own stderr on the field a host reads, received {}",
+            vendor.message
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("unknown flag"),
+                "expected the tail to stay off the diagnostic, received {rendered}"
+            );
+        }
     }
 
     /// The cancellation reason belongs to the prompt that was cancelled, even when another prompt

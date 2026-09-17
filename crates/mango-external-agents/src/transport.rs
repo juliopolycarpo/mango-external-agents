@@ -73,7 +73,7 @@ impl TransportSpec {
 /// that keeps a host's own secret out of a vendor child — and both are set by the library from
 /// [`HostContext`](crate::HostContext) at spawn time. Omitting them here means a harness cannot
 /// write a value that silently does nothing, and cannot appear to inject one that matters.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StdioSpec {
     /// The program and its arguments. The first element is the executable.
     pub argv: Vec<String>,
@@ -97,6 +97,17 @@ impl StdioSpec {
     }
 }
 
+impl fmt::Debug for StdioSpec {
+    /// Shows which executable will run without exposing potentially credential-bearing arguments.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StdioSpec")
+            .field("program", &self.program().map(crate::redact::program_name))
+            .field("argument_count", &self.argv.len().saturating_sub(1))
+            .finish()
+    }
+}
+
 /// A WebSocket endpoint to dial.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WsSpec {
@@ -115,13 +126,14 @@ impl fmt::Debug for WsSpec {
     ///
     /// A derived `Debug` prints the bearer in the clear, and `TransportSpec` derives its own from
     /// this one — so a `tracing::debug!(?spec)`, or the `received {spec:?}` idiom the crate's own
-    /// assertions use, would put the token in a log. The URL goes through the same redaction a
-    /// stderr tail does, for the `wss://user:password@host` form.
+    /// assertions use, would put the token in a log. The endpoint is omitted entirely because
+    /// query parameters and nonstandard credential forms are unstructured host input.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WsSpec")
-            .field("url", &crate::redact::stderr_text(&self.url))
-            .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
+            .field("endpoint_configured", &true)
+            .field("secure", &self.url.starts_with("wss://"))
+            .field("has_bearer", &self.bearer.is_some())
             .finish()
     }
 }
@@ -152,7 +164,7 @@ pub enum AcpSpec {
     /// An HTTP endpoint the host configured.
     ///
     /// A URL, and a URL is a place a credential hides: `https://svc:password@agent.internal` is
-    /// what a host configures when the endpoint is behind basic auth. It is redacted in
+    /// what a host configures when the endpoint is behind basic auth. It is omitted from
     /// [`Debug`] for the same reason [`WsSpec`]'s is.
     Http(String),
 }
@@ -166,10 +178,7 @@ impl fmt::Debug for AcpSpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ChildPipes(spec) => formatter.debug_tuple("ChildPipes").field(spec).finish(),
-            Self::Http(url) => formatter
-                .debug_tuple("Http")
-                .field(&crate::redact::stderr_text(url))
-                .finish(),
+            Self::Http(_) => formatter.debug_tuple("Http").field(&"configured").finish(),
         }
     }
 }
@@ -182,7 +191,7 @@ impl fmt::Debug for AcpSpec {
 /// Carried on [`OpenSession`](crate::OpenSession) rather than on the host, because a path is
 /// resolved for one harness: a host that resolved Claude and then opened a Codex session through
 /// the same context would otherwise have spawned the Claude binary with Codex's arguments.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct ExecutablePath(Option<PathBuf>);
 
@@ -215,6 +224,16 @@ impl ExecutablePath {
             Some(path) => path.to_string_lossy().into_owned(),
             None => program,
         }
+    }
+}
+
+impl fmt::Debug for ExecutablePath {
+    /// Reports whether a host resolved an executable without exposing its host-owned path.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ExecutablePath")
+            .field(&self.0.is_some())
+            .finish()
     }
 }
 
@@ -264,6 +283,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nested_transport_debug_omits_credentials_in_arguments_paths_and_urls() {
+        let stdio = TransportSpec::Stdio(StdioSpec::new([
+            "/opt/vendor/codex",
+            "--api-key",
+            "stdio-argv-secret",
+        ]));
+        let executable = ExecutablePath::resolved("/private/path/executable-secret");
+        let websocket = TransportSpec::WebSocket(
+            WsSpec::new("wss://agent.internal/acp?key=websocket-query-secret")
+                .with_bearer("websocket-bearer-secret"),
+        );
+
+        for rendered in [
+            format!("{stdio:?}"),
+            format!("{executable:?}"),
+            format!("{websocket:?}"),
+        ] {
+            for secret in [
+                "stdio-argv-secret",
+                "executable-secret",
+                "websocket-query-secret",
+                "websocket-bearer-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no credential in transport debug, received {rendered}"
+                );
+            }
+        }
+    }
+
     /// The ACP HTTP arm is a URL like the WebSocket one, so it leaks the same password through the
     /// same `{spec:?}` idiom unless it is redacted the same way.
     #[test]
@@ -276,8 +327,8 @@ mod tests {
             "expected no url password, received {rendered}"
         );
         assert!(
-            rendered.contains("agent.internal"),
-            "expected the endpoint to stay legible, received {rendered}"
+            rendered.contains("configured"),
+            "expected endpoint metadata, received {rendered}"
         );
 
         // `TransportSpec` derives its own `Debug` from this one, so the same must hold there.

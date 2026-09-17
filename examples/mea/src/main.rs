@@ -58,6 +58,10 @@ fn host(cwd: Option<&std::path::Path>) -> Result<HostContext, String> {
                 std::env::current_dir().map_err(|error| format!("no working directory: {error}"))?
             }
         })
+        // Unix validation accepts the platform temporary root only when its root ownership and
+        // sticky bit protect session leaves. Product hosts choose their own authorised,
+        // child-visible scratch root instead.
+        .scratch(std::env::temp_dir())
         .environment(EnvSource::from_process())
         .client_info("mea", env!("CARGO_PKG_VERSION"))
         .build()
@@ -300,7 +304,7 @@ async fn turn(options: &Options) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
 
-    let discovery = harness.discover(&host).await.map_err(|e| e.to_string())?;
+    let discovery = harness.discover(&host).await.map_err(|e| refusal(&e))?;
     if let AuthState::LoggedOut { login_hint } = &discovery.auth {
         return Err(format!("not signed in; run `{login_hint}`"));
     }
@@ -316,10 +320,12 @@ async fn turn(options: &Options) -> Result<(), String> {
         request = request.with_executable(ExecutablePath::resolved(executable.clone()));
     }
 
+    // A gate refusal reaches an operator here rather than through `discovery.gate`: Codex names
+    // its build in the app-server handshake, which happens inside `open_session`.
     let session = harness
         .open_session(&host, request)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| refusal(&e))?;
     eprintln!("session: {}", session.ids().native_session_id);
 
     turn::run_with_format(
@@ -358,6 +364,26 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
 
 /// A session id nobody has to be able to reproduce.
 ///
+/// Flattens a library refusal for an operator, naming what `Display` deliberately bounds.
+///
+/// The library keeps a vendor-reported version out of its own diagnostics: a build whose banner
+/// nothing could parse falls back to the line the CLI printed, so `Display` reports that line's
+/// size and leaves the text on the typed field. `mea` is an unpublished smoke tool running on the
+/// operator's own machine rather than a diagnostic boundary — `docs/compliance.md` says so — and
+/// "which version is installed" is usually the whole reason they ran it.
+///
+/// `mea turn --kind claude` against an old CLI prints
+/// `expected version 2.1.211 or newer, received 2.1.9` instead of `… a vendor-reported version
+/// (5 bytes)`.
+fn refusal(error: &mango_external_agents::Error) -> String {
+    match error {
+        mango_external_agents::Error::VersionGate { found, minimum } => {
+            format!("expected version {minimum} or newer, received {found}")
+        }
+        other => other.to_string(),
+    }
+}
+
 /// `mea` is not a host that retries, so the only requirement is that two runs do not collide.
 fn uuid_like() -> u128 {
     std::time::SystemTime::now()
@@ -371,13 +397,47 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{Options, acp_profile_ids, describe, discover_with, harness_kinds, registry, run};
+    use super::{
+        Options, acp_profile_ids, describe, discover_with, harness_kinds, refusal, registry, run,
+    };
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{
         AcpProfileId, Capabilities, ConfigurationVerdict, Discovery, EnvSource, Error, GateVerdict,
         Harness, HarnessDescriptor, HarnessKind, HarnessRegistry, HostContext, OpenSession,
         PermissionLevel, PermissionMatrix, Result, Session, TransportKind, VendorInfo,
     };
+
+    /// The one field `mea` reads off the typed error rather than out of its diagnostic.
+    ///
+    /// A gate reaches `mea turn` through `open_session`, not through `discovery.gate`, and the
+    /// library's own formatter reports the vendor-reported version as a byte count. An operator
+    /// running a smoke turn against an old CLI needs the number.
+    #[test]
+    fn a_version_gate_names_the_version_the_cli_reported() {
+        let gate = Error::VersionGate {
+            found: String::from("2.1.9"),
+            minimum: String::from("2.1.211"),
+        };
+        assert_eq!(
+            refusal(&gate),
+            "expected version 2.1.211 or newer, received 2.1.9"
+        );
+    }
+
+    /// Everything else keeps the library's own bounded sentence.
+    #[test]
+    fn any_other_refusal_is_flattened_as_the_library_wrote_it() {
+        let protocol = Error::Protocol {
+            expected: String::from("a loaded session"),
+            received: String::from("payload-secret"),
+        };
+        assert_eq!(refusal(&protocol), protocol.to_string());
+        assert!(
+            !refusal(&protocol).contains("payload-secret"),
+            "expected the vendor payload to stay out, received {}",
+            refusal(&protocol)
+        );
+    }
 
     /// A probe-only harness that records dispatch without running a vendor CLI.
     struct CountingDiscoveryHarness {

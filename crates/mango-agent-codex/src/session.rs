@@ -1278,7 +1278,7 @@ impl CodexSession {
         for attachment in &request.attachments {
             if attachment.bytes.len() > ATTACHMENT_MAX_BYTES {
                 return Err(Error::LimitExceeded {
-                    subject: "one attachment",
+                    subject: "bytes in one attachment",
                     limit: ATTACHMENT_MAX_BYTES,
                     received: attachment.bytes.len(),
                 });
@@ -2316,7 +2316,7 @@ mod tests {
         assert!(matches!(
             super::CodexSession::input_for(&oversized),
             Err(mango_external_agents::Error::LimitExceeded {
-                subject: "one attachment",
+                subject: "bytes in one attachment",
                 ..
             })
         ));

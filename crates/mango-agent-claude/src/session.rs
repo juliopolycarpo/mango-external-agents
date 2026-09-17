@@ -29,6 +29,7 @@ use serde_json::json;
 use crate::argv::TurnArgv;
 use crate::cli_surface::CliSurface;
 use crate::mcp::ConfigFile;
+use crate::models;
 use crate::permissions::{self, ModeAvailability};
 use crate::pinned::{SIGTERM_EXIT_CODE, STREAM_IDLE_TIMEOUT, VENDOR_ENVIRONMENT_KEYS};
 use crate::probe::PROGRAM;
@@ -67,12 +68,29 @@ struct SessionState {
     active: Option<ActiveTurn>,
     /// The `--mcp-config` file every turn loads, when the host configured servers.
     ///
-    /// Held here rather than on [`Shared`] so that closing the session takes it out and drops it,
-    /// which is what removes it from disk. A session that is dropped without being closed removes
-    /// it too, when this state goes.
-    mcp_config: Option<ConfigFile>,
+    /// Held here rather than on [`Shared`] so closing releases the session's owner. An in-flight
+    /// start holds a second owner until it installs or reaps its child, then the final owner removes
+    /// the file. A session dropped without being closed releases this state too.
+    mcp_config: Option<Arc<ConfigFile>>,
     /// The settings a turn without an override inherits.
     configuration: Configuration,
+}
+
+impl Drop for SessionState {
+    /// Hands the session's own artifact reference to the blocking pool, as every other path that
+    /// can drop the last one does.
+    ///
+    /// `ConfigFile`'s `Drop` removes the directory synchronously, deliberately: a value dropped
+    /// with no runtime has nothing to hand the call to. A session dropped rather than closed does
+    /// usually have one — the host drops its handle inside a task, or a finished pump releases the
+    /// last `Shared` on a worker — and that is where a `remove_dir_all` against a host's FUSE,
+    /// container or network mount would stall every other task on that thread. `close` has already
+    /// taken this by the time it runs, so the ordinary path costs nothing.
+    fn drop(&mut self) {
+        if let Some(config) = self.mcp_config.take() {
+            crate::mcp::release_on_drop(config);
+        }
+    }
 }
 
 /// What a session needs for its whole life, shared with the task each turn runs on.
@@ -120,7 +138,7 @@ impl ClaudeSession {
             native_session_id: info.ids.native_session_id.clone(),
             established: info.resumed,
             active: None,
-            mcp_config,
+            mcp_config: mcp_config.map(Arc::new),
             configuration: info.effective_configuration.clone(),
         };
         Self {
@@ -162,6 +180,64 @@ fn take_turn(
         return None;
     }
     active.control
+}
+
+/// Kills the child a `start_turn` launched if that call never hands back its stream.
+///
+/// The awaits between installing a child and returning its stream are the problem this exists
+/// for. A caller that times out or drops `start_turn` at one of them leaves a started child that
+/// nothing else is watching: no pump has been spawned to reap it, this crate implements no `Drop`
+/// for a session, and a [`ProcessControl`](mango_external_agents::ProcessControl) that is merely
+/// dropped is not killed — the launcher sets no kill-on-drop. Without this the process would
+/// outlive the host's interest in it until an explicit `close`, `cancel` or next `start_turn`, and
+/// a host that simply drops the session issues none of the three.
+///
+/// Disarmed once the pump owns the child, which is the moment something else is responsible for it.
+struct AbandonedStart {
+    shared: Arc<Shared>,
+    end: Arc<TurnEnd>,
+    armed: bool,
+}
+
+impl AbandonedStart {
+    /// Hands responsibility for the child to whoever comes next.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbandonedStart {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The take decides the kill. `ProcessControl::kill` documents that the library asks once,
+        // so a stop that already took this turn owns its teardown and must not be asked again;
+        // taking it out under the lock is also what stops a later close or start from finding an
+        // active turn pointing at a child being reaped here.
+        let taken = {
+            let mut state = self.shared.lock();
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.end, &self.end))
+            {
+                take_turn(&mut state, CancelReason::Requested)
+            } else {
+                None
+            }
+        };
+        let Some(control) = taken else {
+            return;
+        };
+        // `kill` is async and a `Drop` is not, so the reap runs on a task of its own. Off a
+        // runtime there is nothing to spawn onto and nothing left that could await a child.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = control.kill(CancelReason::Requested).await;
+            });
+        }
+    }
 }
 
 /// Ends a child taken by [`take_turn`], if it had one yet. The pump writes the events.
@@ -221,6 +297,10 @@ impl mango_external_agents::Session for ClaudeSession {
                 })
         };
         let mode = self.shared.resolve_mode(&configuration)?;
+        // Configuration is caller-owned and becomes a value position after a Claude option.
+        // Reject it before reserving a child: omitting an invalid explicit value would run the
+        // turn under a setting the host did not select.
+        models::validate_configuration(&configuration, self.shared.surface.as_ref())?;
 
         // A host that starts a second turn has decided the first is over. Taken before anything is
         // spawned so the two cannot both hold a child, and the slot this turn claims is reserved
@@ -228,7 +308,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // `stdio::open` returns below then has this reservation, rather than an empty slot, to
         // record its reason against.
         let end = Arc::new(TurnEnd::default());
-        let previous = {
+        let (previous, mut mcp_lease) = {
             let Some(_lifecycle) = self.shared.lifecycle.begin_start() else {
                 return Err(Error::Closed { subject: "session" });
             };
@@ -238,22 +318,25 @@ impl mango_external_agents::Session for ClaudeSession {
                 end: Arc::clone(&end),
                 control: None,
             });
-            previous
+            // The reservation and this clone share the same critical section. A close that wins
+            // after it can release the session's reference, but this attempt still owns the file
+            // until it has either installed or reaped the child it launches.
+            (
+                previous,
+                // In a cancellation-safe owner for the same reason `open_session`'s artifact is:
+                // a caller that drops this future between here and the return reaches no explicit
+                // release, and a close that won the race leaves this clone the last reference.
+                crate::mcp::Prepared::new(state.mcp_config.as_ref().map(Arc::clone)),
+            )
         };
         end_turn(previous, CancelReason::Requested).await;
 
-        let (native_session_id, established, mcp_config) = {
+        let (native_session_id, established) = {
             let state = self.shared.lock();
-            (
-                state.native_session_id.clone(),
-                state.established,
-                state
-                    .mcp_config
-                    .as_ref()
-                    .map(|file| file.argument().to_owned()),
-            )
+            (state.native_session_id.clone(), state.established)
         };
-        let argv = TurnArgv {
+        let mcp_config = mcp_lease.get().map(|file| file.argument().to_owned());
+        let argv = match (TurnArgv {
             program: PROGRAM,
             mode,
             native_session_id: &native_session_id,
@@ -271,8 +354,19 @@ impl mango_external_agents::Session for ClaudeSession {
                 .as_ref()
                 .is_some_and(CliSurface::declares_permission_prompts),
             mcp_config: mcp_config.as_deref(),
-        }
-        .build();
+        })
+        .build()
+        {
+            Ok(argv) => argv,
+            Err(error) => {
+                clear_active(&self.shared, &end);
+                // A close that won the race already released the session's own reference, which
+                // makes this lease the last one and its drop the `remove_dir_all`. Off the worker,
+                // for the same reason the write is.
+                crate::mcp::release_off_worker(mcp_lease.take()).await;
+                return Err(error);
+            }
+        };
 
         let transport = match stdio::open(
             &self.shared.host,
@@ -287,10 +381,15 @@ impl mango_external_agents::Session for ClaudeSession {
             // this call made above, and only if a stop has not already taken it.
             Err(error) => {
                 clear_active(&self.shared, &end);
+                crate::mcp::release_off_worker(mcp_lease.take()).await;
                 return Err(error);
             }
         };
 
+        // The lease is still held past `stdio::open`, deliberately: `close` may have taken the
+        // session's `Arc` while the launcher awaited, but it cannot remove the file until this
+        // call either installs the child or kills the stopped child below. Installing hands the
+        // artifact back to the session, and this clone is then the cheap one to drop.
         let limits = *self.shared.host.limits();
         let (sink, events) = EventSink::new(
             self.shared.info.ids.session_id.clone(),
@@ -315,12 +414,6 @@ impl mango_external_agents::Session for ClaudeSession {
                     .as_ref()
                     .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
             {
-                if requested_configuration.is_some() {
-                    // `stdio::open` is the successful start boundary for the batch CLI: there is
-                    // no app-server response to acknowledge later. A following unconfigured turn
-                    // therefore repeats the flags the accepted process was launched with.
-                    state.configuration = configuration.clone();
-                }
                 state.active = Some(ActiveTurn {
                     end: Arc::clone(&end),
                     control: Some(Arc::clone(&control)),
@@ -332,6 +425,10 @@ impl mango_external_agents::Session for ClaudeSession {
         };
         if let Some(reason) = stopped {
             let _ = control.kill(reason).await;
+            // After the kill, never before: the child read `--mcp-config` at startup. And off the
+            // worker, because a close that won the race left this lease holding the last
+            // reference, so this is where the `remove_dir_all` happens.
+            crate::mcp::release_off_worker(mcp_lease.take()).await;
             return Err(if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
@@ -339,6 +436,74 @@ impl mango_external_agents::Session for ClaudeSession {
             });
         }
 
+        // Before the pump, and this ordering is the whole point: the release parks on the blocking
+        // pool, so it is an await a caller that times out or drops `start_turn` can be cancelled
+        // at. A pump spawned above it would already hold the prompt and the process, and would
+        // send that prompt and let Claude run tools before noticing the receiver this future drops
+        // with — work performed for a turn nobody will ever read. Releasing first leaves nothing
+        // detached: from the spawn below to the return there is no await, so the window is gone.
+        //
+        // Nothing about the file's lifetime moves with it. The lease is an `Arc` clone the session
+        // also holds, so this is usually a cheap decrement; it removes the artifact only when a
+        // `close` already took the session's reference, and that `close` is killing the child
+        // anyway.
+        // Armed before the release below, which is the await this call can be abandoned at now
+        // that the child is installed. Disarmed where the pump takes the child over.
+        let mut abandoned = AbandonedStart {
+            shared: Arc::clone(&self.shared),
+            end: Arc::clone(&end),
+            armed: true,
+        };
+
+        crate::mcp::release_off_worker(mcp_lease.take()).await;
+
+        // Re-checked for the same reason the guard above re-checks after `stdio::open`: the
+        // release is an await, so a `close`, a `cancel` or a second `start_turn` can have taken
+        // this turn while it was parked there. Such a stop records its reason and kills the child,
+        // and spawning the pump afterwards would write the prompt to a child somebody is killing
+        // and hand the caller a successful stream for a turn that is already over. No stream has
+        // been handed out yet, so refusing here is still the honest answer.
+        let stopped = {
+            let lifecycle = self.shared.lifecycle.lock();
+            let mut state = self.shared.lock();
+            if lifecycle.is_closed()
+                || !state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(&active.end, &end))
+            {
+                // The stop that took the turn set the reason before taking it; the fallback covers
+                // a take that lost the `set` race, which is the same reason `take_turn` bails on.
+                Some(end.get().copied().unwrap_or(CancelReason::Requested))
+            } else {
+                // Committed here rather than where the child was installed. `stdio::open` is the
+                // successful start boundary for the batch CLI — there is no app-server response to
+                // acknowledge later — but a start can still be refused after it, and a refusal
+                // that had already written these defaults would hand a cancelled turn's model and
+                // permissions to the next turn that asked for nothing. This is the last point
+                // where the start can still fail, and no await follows it.
+                if requested_configuration.is_some() {
+                    state.configuration = configuration.clone();
+                }
+                None
+            }
+        };
+        if let Some(reason) = stopped {
+            // No kill here, unlike the check before the child was installed. There the stop had
+            // found `control: None` and killed nothing, so this call owed the teardown. Here the
+            // stop took an active turn that already carried the control and has ended that child
+            // itself — and `ProcessControl::kill` documents that the library asks once. The guard
+            // is disarmed for the same reason.
+            abandoned.disarm();
+            return Err(if self.shared.lifecycle.is_closed() {
+                Error::Closed { subject: "session" }
+            } else {
+                Error::Cancelled { reason }
+            });
+        }
+
+        // The pump owns the child from here, and there is no await between this and the return.
+        abandoned.disarm();
         tokio::spawn(pump(
             Arc::clone(&self.shared),
             transport.link,
@@ -378,24 +543,30 @@ impl mango_external_agents::Session for ClaudeSession {
     async fn close(&self, reason: CloseReason) -> Result<()> {
         // Idempotent: a close racing a cancel, or two closes from different tasks, must not fail
         // the second caller. Both takes happen under the guard; nothing slow happens under it.
-        let (control, mcp_config) = {
+        let (control, mut mcp_config) = {
             let mut lifecycle = self.shared.lifecycle.lock();
             if !lifecycle.close() {
                 return Ok(());
             }
             let mut state = self.shared.lock();
             let control = take_turn(&mut state, CancelReason::from(reason));
-            (control, state.mcp_config.take())
+            // In the same cancellation-safe owner the open and the turn use: the kill below is a
+            // `ProcessControl` call that can take as long as the host's escalation grace, and a
+            // caller that gives up on the close in that window would otherwise drop this on the
+            // async worker. There is no second chance at it either — the lifecycle is already
+            // closed, so a following close returns before reaching here.
+            (control, crate::mcp::Prepared::new(state.mcp_config.take()))
         };
         end_turn(control, CancelReason::from(reason)).await;
-        // The configuration file leaves with the session that wrote it — but only once the child
-        // launched with `--mcp-config` pointing at it is dead. `Drop` unlinks the directory, and
-        // unlinking it first would leave a child that is still starting reading a configuration
-        // that is no longer there: a turn running without the servers somebody set up, rather than
-        // a turn that stopped. Off the lock as well, because a stalled unlink under that guard
-        // blocks every other method on this session.
-        drop(mcp_config);
-        Ok(())
+        // The session releases its reference here. A start still awaiting a child holds its own
+        // `Arc` until it releases it just before its post-release ownership check, and that check
+        // sees this close and kills the child it launched. Either order is safe: whichever
+        // reference goes last removes the file, and the child it was written for is being killed
+        // by one of the two paths. Off the lock, and off the async worker: removing
+        // the directory is a synchronous filesystem call against the host's own scratch root.
+        // Reported rather than swallowed: this close promised the session's resources were
+        // released, and the file holds the `env` and `headers` a host configured its servers with.
+        crate::mcp::remove_on_close(mcp_config.take()).await
     }
 }
 
@@ -632,8 +803,81 @@ fn no_result_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{TurnEnd, no_result_error, prompt_line};
+    use super::{SessionState, TurnEnd, no_result_error, prompt_line};
     use mango_external_agents::{CancelReason, ExitStatus};
+
+    /// A session dropped rather than closed must hand its artifact to the blocking pool, not run
+    /// `remove_dir_all` on the thread that dropped it — a host root can be a FUSE or network mount.
+    ///
+    /// The pool is given one thread and that thread is occupied, so a handed-off removal cannot
+    /// have run yet when the assertion reads the directory. A removal done in place would already
+    /// be finished there, which is exactly the difference under test.
+    #[test]
+    fn a_session_dropped_without_a_close_removes_its_artifact_off_the_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        let scratch = std::env::temp_dir().join(format!("mea-drop-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).expect("expected a scratch root");
+
+        runtime.block_on(async {
+            let file = crate::mcp::ConfigFile::write(&servers(), &scratch)
+                .await
+                .expect("expected a written artifact")
+                .expect("expected servers to produce one");
+            let directory = file
+                .path()
+                .parent()
+                .expect("a file sits in a directory")
+                .to_path_buf();
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            // Field by field: `SessionState` implements `Drop` now, so struct-update syntax
+            // cannot move the rest out of a default.
+            let mut state = SessionState::default();
+            state.mcp_config = Some(std::sync::Arc::new(file));
+            drop(state);
+
+            assert!(
+                directory.exists(),
+                "expected the removal to be waiting on the occupied pool, received {directory:?} already gone"
+            );
+
+            drop(release_pool);
+            let _ = occupied.await;
+            for _ in 0..50 {
+                if !directory.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                !directory.exists(),
+                "expected the handed-off removal to finish, received {directory:?}"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    fn servers() -> Vec<mango_external_agents::McpServer> {
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Stdio {
+                command: String::from("docs-mcp"),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+            },
+        }]
+    }
 
     #[test]
     fn only_the_first_caller_to_stop_a_turn_records_the_reason() {
@@ -711,7 +955,7 @@ mod tests {
     fn a_link_failure_is_reported_as_one_rather_than_as_a_missing_result() {
         let error = no_result_error(
             Some(mango_external_agents::Error::LimitExceeded {
-                subject: "one vendor output line",
+                subject: "bytes of one vendor output line",
                 limit: 1024,
                 received: 2048,
             }),

@@ -1,8 +1,9 @@
 //! What the host provides, and what the library is allowed to assume.
 //!
 //! [`HostContext`] is the whole of it: a launcher, a directory the host already authorised, the
-//! environment it is willing to pass on, who the host says it is, a clock, a cancellation token
-//! and the caps it wants the library to read vendors under.
+//! environment it is willing to pass on, an optional scratch directory for artifacts that must be
+//! visible to a child, who the host says it is, a clock, a cancellation token and the caps it
+//! wants the library to read vendors under.
 //!
 //! There is no credential field here, and there never will be: the library reuses whatever the
 //! user already logged into with the vendor's own CLI, reports that state without reading it, and
@@ -31,13 +32,23 @@ use crate::process::{DEFAULT_STDERR_TAIL_BYTES, LineLimits, ProcessLauncher};
 ///
 /// Codex's `clientInfo` and ACP's `initialize` both carry it. It is the host's own name, never the
 /// library's: a vendor reading its logs should see which product launched it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientInfo {
     /// The host product's name.
     pub name: String,
     /// The host product's version.
     pub version: String,
+}
+
+impl std::fmt::Debug for ClientInfo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientInfo")
+            .field("name_bytes", &self.name.len())
+            .field("version_bytes", &self.version.len())
+            .finish()
+    }
 }
 
 impl ClientInfo {
@@ -221,6 +232,7 @@ impl Limits {
 pub struct HostContext {
     launcher: Arc<dyn ProcessLauncher>,
     cwd: PathBuf,
+    scratch: Option<PathBuf>,
     environment: EnvSource,
     client_info: ClientInfo,
     clock: Arc<dyn Clock>,
@@ -233,7 +245,7 @@ impl std::fmt::Debug for HostContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HostContext")
-            .field("cwd", &self.cwd)
+            .field("scratch_configured", &self.scratch.is_some())
             .field("client_info", &self.client_info)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
@@ -254,6 +266,15 @@ impl HostContext {
     /// The directory the host authorised. The library never widens it.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// The host-owned directory available for scoped artifacts a child must read.
+    ///
+    /// The host creates and authorises this directory, including any sandbox or container mapping
+    /// that makes it visible to the child. A harness that needs it refuses its operation when this
+    /// is `None`; it never falls back to a process-global temporary directory.
+    pub fn scratch(&self) -> Option<&Path> {
+        self.scratch.as_deref()
     }
 
     /// The environment the host is willing to pass on, before the allowlist.
@@ -310,6 +331,7 @@ impl HostContext {
 pub struct HostContextBuilder {
     launcher: Option<Arc<dyn ProcessLauncher>>,
     cwd: Option<PathBuf>,
+    scratch: Option<PathBuf>,
     environment: Option<EnvSource>,
     client_info: Option<ClientInfo>,
     clock: Option<Arc<dyn Clock>>,
@@ -330,6 +352,17 @@ impl HostContextBuilder {
     #[must_use]
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// A host-owned directory for scoped artifacts a child must read.
+    ///
+    /// The directory remains optional because most harness operations only need the authorised
+    /// working directory. A harness that needs scratch storage refuses the request if this is not
+    /// set, instead of selecting a wider process-global location.
+    #[must_use]
+    pub fn scratch(mut self, scratch: impl Into<PathBuf>) -> Self {
+        self.scratch = Some(scratch.into());
         self
     }
 
@@ -405,6 +438,7 @@ impl HostContextBuilder {
         Ok(HostContext {
             launcher,
             cwd,
+            scratch: self.scratch,
             environment: self.environment.unwrap_or_default(),
             client_info,
             clock: self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
@@ -431,7 +465,7 @@ mod tests {
         async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
             Err(Error::Launch {
                 program: spec.program().unwrap_or_default().to_owned(),
-                message: String::from("this launcher spawns nothing"),
+                message: String::from("a launcher that spawns nothing"),
             })
         }
     }
@@ -536,6 +570,32 @@ mod tests {
         let child = context().child_environment(&["VENDOR_CONFIG"]);
         assert_eq!(child.get("PATH").map(String::as_str), Some("/bin"));
         assert_eq!(child.get("CONNECTOR_SECRET"), None);
+    }
+
+    #[test]
+    fn scratch_is_opt_in_and_its_path_stays_out_of_debug_output() {
+        let unset = context();
+        assert_eq!(unset.scratch(), None);
+
+        let configured = HostContext::builder()
+            .launcher(Arc::new(RefusingLauncher))
+            .cwd("/workspace/customer-secret")
+            .scratch("/scratch/customer-secret")
+            .client_info("client-secret-canary", "version-secret-canary")
+            .build()
+            .expect("expected a context with scratch storage");
+        assert_eq!(
+            configured.scratch(),
+            Some(std::path::Path::new("/scratch/customer-secret"))
+        );
+
+        let rendered = format!("{configured:?}");
+        assert!(rendered.contains("scratch_configured: true"));
+        assert!(
+            !rendered.contains("customer-secret") && !rendered.contains("secret-canary"),
+            "expected host configuration to stay out of debug output, received {rendered}"
+        );
+        assert!(!format!("{:?}", configured.client_info()).contains("secret-canary"));
     }
 
     #[test]

@@ -155,6 +155,13 @@ impl TokioLauncher {
 #[async_trait::async_trait]
 impl ProcessLauncher for TokioLauncher {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        // A host may construct LaunchSpec directly. Normalize once before both native spawning
+        // and PowerShell fallback inspect the environment; Windows treats key casing as equal.
+        #[cfg(windows)]
+        let spec = LaunchSpec {
+            env: crate::env::windows_effective_environment(&spec.env),
+            ..spec
+        };
         let Some(program) = spec.program() else {
             return Err(Error::HostConfiguration {
                 expected: "an argv naming a program",
@@ -178,15 +185,18 @@ impl ProcessLauncher for TokioLauncher {
             };
             configured_command(&fallback, &fallback.argv[0]).spawn()
         });
+        // The kind rather than the message: `io::Error`'s own text can name the path the operating
+        // system was given, which is host-provided, while the kind is a bounded enum and is the
+        // half an operator acts on — an absent executable is a different fix from a refused one.
         let mut child = launched.map_err(|error| Error::Launch {
             program: program.to_owned(),
-            message: error.to_string(),
+            message: format!("a launcher failure ({:?})", error.kind()),
         })?;
 
         let pid = child.id();
         let stdout = child.stdout.take().ok_or_else(|| Error::Launch {
             program: program.to_owned(),
-            message: String::from("expected a readable stdout, received none"),
+            message: String::from("a child without a readable stdout"),
         })?;
         let stdin = child.stdin.take();
         let stderr_pipe = child.stderr.take();
@@ -258,7 +268,8 @@ impl ByteSource for PipeSource {
             .await
             .map_err(|error| Error::Link {
                 peer: String::from("child stdout"),
-                message: error.to_string(),
+                // The kind, not the message: the same reason the spawn arm reports one.
+                message: format!("a read failure ({:?})", error.kind()),
             })?;
         if read == 0 {
             return Ok(None);
@@ -304,7 +315,8 @@ impl ByteSink for PipeSink {
 fn pipe_error(error: std::io::Error) -> Error {
     Error::Link {
         peer: String::from("child stdin"),
-        message: error.to_string(),
+        // The kind, not the message: the same reason the spawn arm reports one.
+        message: format!("a write failure ({:?})", error.kind()),
     }
 }
 
@@ -373,7 +385,7 @@ impl ProcessControl for TokioChild {
             } else {
                 Err(Error::Launch {
                     program: String::from("<unknown>"),
-                    message: String::from("expected a process id to end, received none"),
+                    message: String::from("a running child with no process id to end"),
                 })
             };
         };
@@ -390,7 +402,7 @@ impl ProcessControl for TokioChild {
                 Err(Error::Launch {
                     program: format!("process group {pid}"),
                     message: format!(
-                        "expected the escalation already running to end the tree, received a live process after {waited:?}"
+                        "a live process after {waited:?}, with an escalation already running"
                     ),
                 })
             };
@@ -562,7 +574,7 @@ async fn end_process_tree(
     }
     Err(Error::Launch {
         program: format!("process group {pid}"),
-        message: format!("expected the group to end within {grace:?}, received a live member"),
+        message: format!("a live group member after {grace:?}"),
     })
 }
 
@@ -597,11 +609,12 @@ async fn end_process_tree(
     Err(Error::Launch {
         program: format!("process tree {pid}"),
         message: match ran {
-            Ok(Ok(status)) => format!(
-                "expected taskkill to end the tree, received exit status {status} and a live process"
-            ),
-            Ok(Err(error)) => format!("expected taskkill to run, received {error}"),
-            Err(_) => format!("expected taskkill to answer within {grace:?}, received nothing"),
+            Ok(Ok(status)) => {
+                format!("a live process after taskkill exited with status {status}")
+            }
+            // The kind, not the message: see the spawn arm above.
+            Ok(Err(error)) => format!("a taskkill that would not run ({:?})", error.kind()),
+            Err(_) => format!("no answer from taskkill within {grace:?}"),
         },
     })
 }
@@ -896,6 +909,40 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("remove fixture directory");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_lookup_and_child_see_the_same_windows_path_value() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("mea-path-casing-{nonce}"));
+        std::fs::create_dir(&directory).expect("fixture directory");
+        std::fs::write(directory.join("mea-casing.ps1"), "Write-Output $env:Path\n")
+            .expect("fixture script");
+
+        let mut spec = fixture("lines");
+        spec.argv = vec![String::from("mea-casing")];
+        spec.env.insert(
+            String::from("PATH"),
+            directory.to_string_lossy().into_owned(),
+        );
+        spec.env
+            .insert(String::from("Path"), String::from(r"C:\wrong"));
+
+        let child = TokioLauncher::new()
+            .spawn(spec)
+            .await
+            .expect("lookup must use the same PATH as process creation");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        assert_eq!(
+            lines.next_line().await.expect("child PATH"),
+            Some(directory.to_string_lossy().into_owned())
+        );
+        assert!(child.control.wait().await.expect("exit status").success());
+        std::fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
     #[tokio::test]
     async fn a_child_receives_the_allowlist_and_nothing_else() {
         // A host whose own environment carries a secret next to the keys a child legitimately
@@ -1070,6 +1117,17 @@ mod tests {
         assert!(
             matches!(error, crate::Error::Launch { .. }),
             "expected a launch failure, received {error:?}"
+        );
+        // The kind is what an operator acts on, and it is the only part of an `io::Error` that
+        // cannot carry the path the operating system was handed.
+        let rendered = error.to_string();
+        assert!(
+            rendered.ends_with("received a launcher failure (NotFound)"),
+            "expected the io error kind, received {rendered}"
+        );
+        assert!(
+            !rendered.contains("mea-no-such-program"),
+            "expected the requested program to stay out of the diagnostic, received {rendered}"
         );
     }
 

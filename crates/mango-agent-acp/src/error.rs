@@ -41,7 +41,9 @@ pub fn vendor_error(method: &str, error: &agent_client_protocol::Error) -> Vendo
 /// One ACP failure as the core error a session method returns.
 ///
 /// `login_hint` is the profile's own, and is used only for the authentication code — every other
-/// code is the agent's business and reaches the host as a [`VendorError`].
+/// code is the agent's business and reaches the host as a [`VendorError`]. The hint remains exact
+/// for the host UI; [`std::fmt::Display`] deliberately does not render it because a custom profile
+/// can supply caller-owned text.
 ///
 /// # Example
 ///
@@ -127,6 +129,28 @@ mod tests {
             panic!("expected AuthRequired, received {error:?}");
         };
         assert_eq!(login_hint, "agent login");
+    }
+
+    #[test]
+    fn a_custom_profiles_login_hint_stays_typed_but_out_of_diagnostics() {
+        let hostile = format!(
+            "run\u{7}\x1b[31m login credential=profile-secret {}",
+            "x".repeat(4_000)
+        );
+        let error = request_error("session/new", &AcpError::auth_required(), &hostile);
+        let Error::AuthRequired { login_hint } = &error else {
+            panic!("expected AuthRequired, received {error:?}");
+        };
+        assert!(
+            login_hint == &hostile,
+            "expected the host UI to receive its exact hint, received {login_hint:?}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("profile-secret"),
+                "expected no caller-owned login hint in diagnostics, received {rendered:?}"
+            );
+        }
     }
 
     #[test]

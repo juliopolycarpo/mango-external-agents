@@ -16,12 +16,9 @@
 //! change. With no default, an unchosen model resolves to nothing, no flag is passed, and the
 //! vendor decides.
 
-use mango_external_agents::{Model, ReasoningEffort};
+use mango_external_agents::{Configuration, Error, Model, ReasoningEffort, Result, normalize};
 
 use crate::cli_surface::CliSurface;
-
-/// How long a model identifier may be before it stops being one.
-const MODEL_MAX_CHARS: usize = 128;
 
 /// The catalog this build advertises, or nothing when it advertises none.
 ///
@@ -84,9 +81,48 @@ pub fn advertises_catalog(surface: Option<&CliSurface>) -> bool {
     })
 }
 
+/// Refuses explicit model and effort settings that this turn cannot put on argv exactly.
+///
+/// The parsed surface is per installed CLI build, so effort membership is checked against it rather
+/// than asking the child to start and then quietly dropping an option it did not declare.
+pub fn validate_configuration(
+    configuration: &Configuration,
+    surface: Option<&CliSurface>,
+) -> Result<()> {
+    if let Some(model) = configuration.model.as_deref() {
+        validate_model(model)?;
+    }
+    if let Some(effort) = configuration.effort.as_deref() {
+        validate_effort(effort, surface.and_then(CliSurface::effort_levels))?;
+    }
+    Ok(())
+}
+
+/// Refuses a model identifier that cannot safely occupy Claude's `--model` value position.
+pub fn validate_model(model: &str) -> Result<()> {
+    if model_accepted(model) {
+        return Ok(());
+    }
+    Err(Error::HostConfiguration {
+        expected: "a non-empty Claude model identifier that can occupy a --model value",
+        received: value_summary(model),
+    })
+}
+
+/// Refuses an effort that this build did not explicitly advertise.
+pub fn validate_effort(effort: &str, accepted: Option<&[String]>) -> Result<()> {
+    if effort_accepted(Some(effort), accepted) {
+        return Ok(());
+    }
+    Err(Error::HostConfiguration {
+        expected: "a Claude --effort value this build advertises",
+        received: value_summary(effort),
+    })
+}
+
 /// Whether this build declared the effort level a configuration asked for.
 ///
-/// Membership in the parsed list is the whole guard, and it is stricter than [`safe_model`]'s
+/// Membership in the parsed list is the whole guard, and it is stricter than [`model_accepted`]'s
 /// because it can be: the vendor publishes the complete list, so there is no need to accept a shape
 /// and hope. A build that declared no levels therefore never sees the flag, which is what keeps a
 /// stored per-chat effort from breaking a downgrade.
@@ -94,7 +130,7 @@ pub fn effort_accepted(effort: Option<&str>, accepted: Option<&[String]>) -> boo
     let (Some(effort), Some(accepted)) = (effort, accepted) else {
         return false;
     };
-    accepted.iter().any(|level| level == effort)
+    normalize::is_argv_value(effort) && accepted.iter().any(|level| level == effort)
 }
 
 /// A model identifier, as a shape rather than as a promise.
@@ -105,22 +141,21 @@ pub fn effort_accepted(effort: Option<&str>, accepted: Option<&[String]>) -> boo
 /// flag rather than as `--model`'s value, which is how a stored configuration could put
 /// `--dangerously-skip-permissions` on the command line.
 ///
-/// An unrecognised value is dropped rather than refused: the vendor's own default is a working
-/// turn, and failing a send over a model string is a worse answer than ignoring one.
+/// The caller refuses an unrecognised value rather than dropping it. An explicit host choice that
+/// disappears from argv would start a turn under a model the host did not choose.
 ///
 /// # Example
 ///
 /// ```
-/// use mango_agent_claude::models::safe_model;
+/// use mango_agent_claude::models::model_accepted;
 ///
-/// assert_eq!(safe_model(Some("claude-opus-5")), Some("claude-opus-5"));
-/// assert_eq!(safe_model(Some("--dangerously-skip-permissions")), None);
-/// assert_eq!(safe_model(Some("opus sonnet")), None);
+/// assert!(model_accepted("claude-opus-5"));
+/// assert!(!model_accepted("--dangerously-skip-permissions"));
+/// assert!(!model_accepted("opus sonnet"));
 /// ```
-pub fn safe_model(model: Option<&str>) -> Option<&str> {
-    let model = model?;
-    if model.is_empty() || model.chars().count() > MODEL_MAX_CHARS {
-        return None;
+pub fn model_accepted(model: &str) -> bool {
+    if !normalize::is_argv_value(model) {
+        return false;
     }
     let mut characters = model.chars();
     let starts_well = characters
@@ -129,13 +164,19 @@ pub fn safe_model(model: Option<&str>) -> Option<&str> {
     let rest_is_safe = characters.all(|character| {
         character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '@' | '/' | '-')
     });
-    (starts_well && rest_is_safe).then_some(model)
+    starts_well && rest_is_safe
+}
+
+/// Summarises a rejected host value without persisting or rendering its contents.
+fn value_summary(value: &str) -> String {
+    format!("{} code points", value.chars().count())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{catalog, effort_accepted, safe_model};
+    use super::{catalog, effort_accepted, model_accepted, validate_configuration};
     use crate::cli_surface::CliSurface;
+    use mango_external_agents::{Configuration, Error};
 
     const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
     const HELP_2_1_260: &str = include_str!("../../../fixtures/claude/help/2.1.260.txt");
@@ -210,10 +251,9 @@ mod tests {
             "opus --print",
             "opus\nsonnet",
         ] {
-            assert_eq!(
-                safe_model(Some(injected)),
-                None,
-                "expected {injected:?} to be dropped rather than passed on"
+            assert!(
+                !model_accepted(injected),
+                "expected {injected:?} to be refused rather than passed on"
             );
         }
     }
@@ -227,15 +267,37 @@ mod tests {
             "anthropic.claude-opus-5-v1:0",
             "publishers/anthropic/models/claude-opus-5",
         ] {
-            assert_eq!(safe_model(Some(accepted)), Some(accepted));
+            assert!(model_accepted(accepted));
         }
     }
 
     #[test]
     fn drops_an_absurdly_long_value_rather_than_passing_it_on() {
         let long = "o".repeat(129);
-        assert_eq!(safe_model(Some(&long)), None);
+        assert!(!model_accepted(&long));
         let at_the_limit = "o".repeat(128);
-        assert_eq!(safe_model(Some(&at_the_limit)), Some(at_the_limit.as_str()));
+        assert!(model_accepted(&at_the_limit));
+    }
+
+    #[test]
+    fn refuses_an_explicit_unsupported_value_instead_of_dropping_it() {
+        let surface = CliSurface::parse(HELP_2_1_260);
+        for configuration in [
+            Configuration {
+                model: Some(String::from("--dangerously-skip-permissions")),
+                ..Configuration::default()
+            },
+            Configuration {
+                effort: Some(String::from("ultra")),
+                ..Configuration::default()
+            },
+        ] {
+            let error = validate_configuration(&configuration, Some(&surface))
+                .expect_err("expected the explicit value to be refused");
+            assert!(
+                matches!(error, Error::HostConfiguration { ref received, .. } if !received.contains("dangerously") && !received.contains("ultra")),
+                "received {error:?}"
+            );
+        }
     }
 }
