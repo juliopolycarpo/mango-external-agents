@@ -614,7 +614,11 @@ pub trait Harness: Send + Sync {
     /// harness does not accept, or
     /// [`Error::HostConfiguration`](crate::Error::HostConfiguration) with the supplied server count
     /// when host-supplied MCP servers are unsupported.
-    fn validate_open_session(&self, request: &crate::OpenSession) -> crate::Result<()> {
+    fn validate_open_session(
+        &self,
+        host: &crate::HostContext,
+        request: &crate::OpenSession,
+    ) -> crate::Result<()> {
         self.descriptor().resolve_transport(request.transport)?;
         if request
             .resume
@@ -635,7 +639,11 @@ pub trait Harness: Send + Sync {
             });
         }
         if let Some(receipt) = &request.discovery {
-            receipt.verify_for(self.descriptor(), host_now(), request)?;
+            // The host's clock, not the process's: a receipt's freshness is a wall-clock question,
+            // and reading `SystemTime::now()` here would be this crate going behind the host's
+            // back for the one value it was handed a `Clock` to supply — and would put a
+            // freshness test beyond the reach of `FrozenClock`.
+            receipt.verify_for(self.descriptor(), host.now(), request)?;
         }
         Ok(())
     }
@@ -713,17 +721,6 @@ pub trait Harness: Send + Sync {
     ) -> crate::Result<crate::session::AccountUsage> {
         Err(crate::Error::not_supported(Capability::AccountUsage))
     }
-}
-
-/// The instant a descriptor-level check reads.
-///
-/// `validate_open_session` has no [`HostContext`](crate::HostContext) to read a
-/// [`Clock`](crate::Clock) from, and giving it one would change a signature three harnesses
-/// implement for the sake of one freshness comparison. The system clock is the right source here
-/// anyway: a discovery receipt's freshness is wall-clock by definition, because the thing it is
-/// vouching for is a file on disk that somebody may have replaced.
-fn host_now() -> std::time::SystemTime {
-    std::time::SystemTime::now()
 }
 
 #[cfg(test)]
@@ -953,6 +950,15 @@ mod tests {
         );
     }
 
+    fn test_host() -> crate::HostContext {
+        crate::HostContext::builder()
+            .launcher(std::sync::Arc::new(crate::testing::FakeLauncher::new()))
+            .cwd(std::env::temp_dir())
+            .client_info("test", "0.0.0")
+            .build()
+            .expect("expected a host")
+    }
+
     #[test]
     fn fallback_resume_reaches_a_harness_that_does_not_declare_resume() {
         let harness = UnboundedProbe::new();
@@ -960,7 +966,7 @@ mod tests {
             crate::OpenSession::new("chat-1").resuming("native-1", crate::ResumeMode::Fallback);
 
         harness
-            .validate_open_session(&request)
+            .validate_open_session(&test_host(), &request)
             .expect("expected fallback resume to reach the harness implementation");
     }
 
@@ -972,11 +978,50 @@ mod tests {
             crate::McpServer::stdio("two", "second-mcp"),
         ]);
         let error = harness
-            .validate_open_session(&request)
+            .validate_open_session(&test_host(), &request)
             .expect_err("unsupported MCP servers");
         assert!(
             error.to_string().contains("received MCP server count 2"),
             "expected the rejected MCP server count in the diagnostic, received {error}"
+        );
+    }
+
+    /// The freshness comparison reads the host's clock, so a host that froze time can write a test
+    /// about a stale receipt without waiting for wall-clock seconds to pass.
+    #[test]
+    fn a_receipt_is_aged_against_the_hosts_own_clock() {
+        use crate::testing::FrozenClock;
+        use std::time::Duration;
+
+        let clock = std::sync::Arc::new(FrozenClock::default());
+        let host = crate::HostContext::builder()
+            .launcher(std::sync::Arc::new(crate::testing::FakeLauncher::new()))
+            .cwd(std::env::temp_dir())
+            .client_info("test", "0.0.0")
+            .clock(clock.clone())
+            .build()
+            .expect("expected a host");
+
+        let receipt = crate::DiscoveryReceipt::new(
+            crate::HarnessId::claude(),
+            crate::Discovery::not_installed(),
+            host.now(),
+        )
+        .valid_for(Duration::from_secs(60));
+        let request = crate::OpenSession::new("chat-1").with_discovery(receipt);
+        let harness = UnboundedProbe::new();
+
+        harness
+            .validate_open_session(&host, &request)
+            .expect("expected a fresh receipt to be accepted");
+
+        clock.advance(Duration::from_secs(61));
+        let error = harness
+            .validate_open_session(&host, &request)
+            .expect_err("expected a receipt past its window to be refused");
+        assert!(
+            error.to_string().contains("61s old, valid for 60s"),
+            "expected the age and the window in the diagnostic, received {error}"
         );
     }
 

@@ -25,6 +25,16 @@ use crate::error::{Error, Result};
 /// a filename a host derives from it.
 pub const IDENTIFIER_MAX_LENGTH: usize = 64;
 
+/// The prefix a generic Agent Client Protocol harness registers its profiles under.
+const ACP_PREFIX: &str = "acp:";
+
+/// The longest a profile id may be.
+///
+/// Shorter than the rest by exactly the `acp:` prefix, so [`HarnessId::acp`] can compose the two
+/// halves without either a fallible signature or a length nobody checked. A profile that only
+/// fitted until it was prefixed would be a validated value producing an unvalidated one.
+pub const PROFILE_ID_MAX_LENGTH: usize = IDENTIFIER_MAX_LENGTH - ACP_PREFIX.len();
+
 /// Whether one character may appear in an identifier.
 ///
 /// ASCII lowercase, digits, and the four separators the existing ids already use. Deliberately
@@ -45,8 +55,8 @@ const fn is_separator(character: char) -> bool {
 ///
 /// The rules are the same for every identifier in this module, so a host that learns them once
 /// knows them for all three.
-fn validate(raw: &str, subject: &'static str) -> Result<String> {
-    let expected = "1 to 64 characters of ASCII lowercase, digits, `-`, `_`, `.` or `:`, \
+fn validate(raw: &str, subject: &'static str, max_length: usize) -> Result<String> {
+    let expected = "ASCII lowercase, digits, `-`, `_`, `.` or `:`, within the identifier length, \
                     not beginning or ending with a separator and with no separator repeated";
     let refuse = |received: String| {
         Err(Error::HostConfiguration {
@@ -58,9 +68,9 @@ fn validate(raw: &str, subject: &'static str) -> Result<String> {
     if raw.is_empty() {
         return refuse(String::from("was empty"));
     }
-    if raw.chars().count() > IDENTIFIER_MAX_LENGTH {
+    if raw.chars().count() > max_length {
         return refuse(format!(
-            "was {} characters, over the {IDENTIFIER_MAX_LENGTH} allowed",
+            "was {} characters, over the {max_length} allowed",
             raw.chars().count()
         ));
     }
@@ -88,7 +98,7 @@ fn validate(raw: &str, subject: &'static str) -> Result<String> {
 /// A macro would hide three near-identical newtypes behind a name nobody can grep for, so the
 /// three are written out. What they share is [`validate`].
 macro_rules! identifier {
-    ($name:ident, $subject:literal, $doc:literal) => {
+    ($name:ident, $subject:literal, $max:expr, $doc:literal) => {
         #[doc = $doc]
         ///
         /// Validated on construction and serialized as the bare string it was built from, so a
@@ -106,7 +116,7 @@ macro_rules! identifier {
             ///
             /// [`Error::HostConfiguration`] naming the offending value and the shape expected.
             pub fn new(raw: impl AsRef<str>) -> Result<Self> {
-                validate(raw.as_ref(), $subject).map(Self)
+                validate(raw.as_ref(), $subject, $max).map(Self)
             }
 
             /// The identifier as written.
@@ -146,6 +156,7 @@ macro_rules! identifier {
 identifier!(
     HarnessId,
     "harness id",
+    IDENTIFIER_MAX_LENGTH,
     r#"The name a harness is registered and dispatched under.
 
 The one identifier a host persists next to a conversation, so its spelling is a compatibility
@@ -166,6 +177,7 @@ assert!(HarnessId::new("My Harness").is_err());
 identifier!(
     ProtocolFamily,
     "protocol family",
+    IDENTIFIER_MAX_LENGTH,
     r#"The wire dialect a harness speaks.
 
 Several harness ids may share one: every ACP agent speaks [`ProtocolFamily::acp`] whatever its
@@ -185,6 +197,7 @@ assert_eq!(ProtocolFamily::acp().as_str(), "agent-client-protocol");
 identifier!(
     ProfileId,
     "profile id",
+    PROFILE_ID_MAX_LENGTH,
     r#"Which execution profile inside a protocol family.
 
 A profile is the argv and the quirks of one agent — `cursor`, `opencode`, `gemini`, `goose` — or
@@ -239,10 +252,12 @@ impl HarnessId {
     /// The id one ACP profile registers under, which is `acp:` and the profile.
     ///
     /// Composed here rather than at each call site so every ACP harness spells it the same way,
-    /// and so the composition stays valid: both halves already passed [`HarnessId::new`]'s rules,
-    /// and `:` is the separator between them.
+    /// and infallible because the composition cannot fail: a [`ProfileId`] already passed every
+    /// rule, `:` is a separator neither half can begin or end with, and [`PROFILE_ID_MAX_LENGTH`]
+    /// is the whole ceiling minus this prefix — so the result is always a value
+    /// [`HarnessId::new`] would have accepted.
     pub fn acp(profile: &ProfileId) -> Self {
-        Self::trusted(format!("acp:{profile}"))
+        Self::trusted(format!("{ACP_PREFIX}{profile}"))
     }
 }
 
@@ -446,6 +461,28 @@ mod tests {
         assert!(
             error.to_string().contains("was 65 characters"),
             "expected the received length in the refusal, received {error}"
+        );
+    }
+
+    /// `HarnessId::acp` is infallible, so the only way it could produce a value construction
+    /// would have refused is a profile that fitted until it was prefixed. The profile ceiling is
+    /// the whole ceiling minus `acp:` precisely so that cannot happen — and this is the boundary.
+    #[test]
+    fn the_longest_allowed_profile_still_composes_into_an_id_construction_would_accept() {
+        use super::{IDENTIFIER_MAX_LENGTH, PROFILE_ID_MAX_LENGTH};
+
+        let longest = ProfileId::new("p".repeat(PROFILE_ID_MAX_LENGTH))
+            .expect("expected the longest profile to be accepted");
+        let composed = HarnessId::acp(&longest);
+
+        assert_eq!(composed.as_str().chars().count(), IDENTIFIER_MAX_LENGTH);
+        assert_eq!(
+            HarnessId::new(composed.as_str()).expect("expected the composed id to re-validate"),
+            composed
+        );
+        assert!(
+            ProfileId::new("p".repeat(PROFILE_ID_MAX_LENGTH + 1)).is_err(),
+            "expected a profile one character too long to be refused before it could be prefixed"
         );
     }
 

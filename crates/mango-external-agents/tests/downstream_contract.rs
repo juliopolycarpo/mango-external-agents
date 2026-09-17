@@ -31,9 +31,9 @@ use mango_external_agents::{
     HarnessDescriptor, HarnessId, HarnessIdentity, HarnessRegistry, Interaction, InteractionId,
     InteractionKind, McpServer, OpenSession, OperationRef, PermissionEffect, PermissionLevel,
     PermissionOption, PermissionRequest, PermissionRisk, PermissionScope, PlanStep, PlanStepStatus,
-    ProfileId, ProtocolFamily, Question, QuestionForm, QuestionId, QuestionOption, QuestionOptionId,
-    QuestionRequest, QuestionResponse, Session, SessionCapabilities, SessionId, SessionIds,
-    SessionRevision, SessionSnapshot, SessionState, SessionStatus, TransportKind,
+    ProfileId, ProtocolFamily, Question, QuestionForm, QuestionId, QuestionOption,
+    QuestionOptionId, QuestionRequest, QuestionResponse, Session, SessionCapabilities, SessionId,
+    SessionIds, SessionRevision, SessionSnapshot, SessionState, SessionStatus, TransportKind,
     TransportSelection, TurnId, TurnRequest, VendorInfo,
 };
 
@@ -201,7 +201,9 @@ fn a_harness_this_crate_never_heard_of_registers_and_dispatches_by_its_own_id() 
     let collision = HarnessRegistry::new(vec![harness.clone(), harness])
         .expect_err("expected a duplicate registration to be refused");
     assert!(
-        collision.to_string().contains("acme-agent registered twice"),
+        collision
+            .to_string()
+            .contains("acme-agent registered twice"),
         "expected the colliding id in the diagnostic, received {collision}"
     );
 }
@@ -319,7 +321,9 @@ fn every_protected_request_type_is_constructible_through_its_builders() {
                 FileChange::new("src/lib.rs", FileChangeKind::Modified).with_line_counts(10, 2),
             ],
         })
-        .with_extensions(Extensions::new().with("sandbox", ExtensionValue::text("workspace-write")));
+        .with_extensions(
+            Extensions::new().with("sandbox", ExtensionValue::text("workspace-write")),
+        );
     assert_eq!(activity.subagent_id.as_deref(), Some("explorer"));
 
     let permission = PermissionRequest::new(
@@ -373,7 +377,9 @@ fn configuration_round_trips_without_collapsing_keep_set_and_reset() {
 
     let state = ConfigurationState::new(
         Configuration::unknown().with_model("acme-large"),
-        Configuration::unknown().with_model("acme-large").with_effort("high"),
+        Configuration::unknown()
+            .with_model("acme-large")
+            .with_effort("high"),
         Configuration::unknown().with_model("acme-large-20260101"),
     );
     assert_eq!(
@@ -413,7 +419,9 @@ fn a_configuration_catalog_survives_serialization_with_its_vendor_shape_intact()
         serde_json::from_value(encoded).expect("expected the catalog back");
     assert_eq!(round_tripped, catalog);
     assert_eq!(
-        round_tripped.in_category(&ConfigurationCategory::Model).len(),
+        round_tripped
+            .in_category(&ConfigurationCategory::Model)
+            .len(),
         1,
         "expected the known row to stay usable next to the unknown category"
     );
@@ -549,7 +557,11 @@ fn a_failure_states_how_far_its_request_got_without_promising_idempotency() {
         Error::Closed { subject: "link" }.dispatch(),
         Dispatch::AcceptanceUnknown
     );
-    assert!(Error::Closed { subject: "link" }.dispatch().needs_reconciliation());
+    assert!(
+        Error::Closed { subject: "link" }
+            .dispatch()
+            .needs_reconciliation()
+    );
 
     // The same logical turn, two attempts: the host can tell one from the other, and can tell that
     // the later one supersedes the earlier.
@@ -577,14 +589,13 @@ async fn a_downstream_session_publishes_state_with_no_turn_running() {
     let mut subscription = session.subscribe();
     let opened_at = subscription.current().revision;
 
-    session
-        .state()
-        .set_commands(vec![Command::new("review").with_description("Reviews the diff")]);
-    session
-        .state()
-        .set_configuration(ConfigurationState::unknown().with_observed(
-            Configuration::unknown().with_model("acme-large"),
-        ));
+    session.state().set_commands(vec![
+        Command::new("review").with_description("Reviews the diff"),
+    ]);
+    session.state().set_configuration(
+        ConfigurationState::unknown()
+            .with_observed(Configuration::unknown().with_model("acme-large")),
+    );
     session.state().set_status(SessionStatus::Closing);
 
     let seen = subscription
@@ -688,14 +699,16 @@ mod with_a_host {
     }
 
     /// A capability a harness never declared is refused before anything is spawned.
-    #[test]
-    fn an_undeclared_capability_is_refused_at_the_request_that_asks_for_it() {
+    #[tokio::test]
+    async fn an_undeclared_capability_is_refused_at_the_request_that_asks_for_it() {
         use mango_external_agents::{McpServer, OpenSession, ResumeMode};
 
         let harness = AcmeHarness::new();
+        let host = host();
 
         let error = harness
             .validate_open_session(
+                &host,
                 &OpenSession::new("chat-1").resuming("acme-1", ResumeMode::Strict),
             )
             .expect_err("expected strict resume to be refused");
@@ -711,6 +724,7 @@ mod with_a_host {
 
         let error = harness
             .validate_open_session(
+                &host,
                 &OpenSession::new("chat-1")
                     .with_mcp_servers(vec![McpServer::stdio("docs", "docs-mcp")]),
             )

@@ -199,7 +199,7 @@ impl Harness for FakeHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        self.validate_open_session(&request)?;
+        self.validate_open_session(host, &request)?;
         let transport = self.descriptor.resolve_transport(request.transport)?;
         let resumed = request.resume.is_some();
         let native_session_id = request.resume.as_ref().map_or_else(

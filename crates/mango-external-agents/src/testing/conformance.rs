@@ -14,7 +14,9 @@ use crate::error::Error;
 use crate::event::{AgentEvent, EventKind};
 use crate::harness::{Capability, Harness};
 use crate::host::HostContext;
-use crate::interaction::{InteractionId, QuestionResponse};
+use crate::interaction::{
+    Answer, AnswerValue, InteractionId, QuestionForm, QuestionRequest, QuestionResponse,
+};
 use crate::session::{
     Attachment, AttachmentKind, CancelReason, CloseReason, OpenSession, ReviewRequest,
     ReviewTarget, Session, SessionQuery, Steer, TurnRequest,
@@ -139,6 +141,7 @@ pub async fn run(harness: &dyn Harness, host: &HostContext, options: Options) ->
     check_ids(session.as_ref(), &options, &mut report);
     check_session_state(session.as_ref(), &options, &mut report).await;
     check_turn(session.as_ref(), &options, &mut report).await;
+    check_questions(session.as_ref(), &options, &mut report).await;
     check_cancelled_turn(session.as_ref(), &options, &mut report).await;
     check_optional_methods(session.as_ref(), &mut report).await;
     check_close(session.as_ref(), &mut report).await;
@@ -255,6 +258,12 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
     let collected = tokio::time::timeout(options.turn_timeout, async {
         while let Some(event) = turn.recv().await {
             let terminal = event.is_terminal();
+            // A turn can stop at either kind of ask, and a turn nobody unblocks never reaches a
+            // terminal — so this check would report "no terminal" about a harness that was
+            // waiting, politely, for an answer it was never sent.
+            if let EventKind::QuestionAsked { request } = &event.kind {
+                decline_or_cancel(session, request).await;
+            }
             if let EventKind::ApprovalRequested { request } = &event.kind
                 && answered.is_none()
             {
@@ -303,6 +312,57 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
         "every event names its session and turn",
         stamping_outcome(&events, "conformance-turn-1", session),
     );
+}
+
+/// The least this suite can say to one round of questions.
+///
+/// Declined wherever declining is allowed. A required question cannot be declined, so it is
+/// answered with the vendor's own first choice, or with an obviously synthetic string.
+///
+/// Answering here is not the exception to "approvals are brokered, never auto-answered" that it
+/// might look like. That rule is about **authority**, and a question grants none by construction —
+/// [`InteractionKind::grants_authority`](crate::InteractionKind::grants_authority) is false for
+/// every one of these. The suite already types a prompt at the agent; saying "the first option" to
+/// a question it then asks authorises nothing further, and the alternative is a check that can
+/// never pass against any harness that marks a question required.
+fn minimal_answers(request: &QuestionRequest) -> QuestionResponse {
+    QuestionResponse::new(
+        request.interaction.id.clone(),
+        request
+            .questions
+            .iter()
+            .map(|question| {
+                let value = match (&question.form, question.required) {
+                    (_, false) => AnswerValue::Declined,
+                    (QuestionForm::Choice { options, .. }, true) => {
+                        options.first().map_or(AnswerValue::Declined, |option| {
+                            AnswerValue::chosen(option.id.clone())
+                        })
+                    }
+                    (QuestionForm::FreeText { .. }, true) => {
+                        AnswerValue::text("conformance-suite-placeholder")
+                    }
+                    // No catch-all: `QuestionForm` is non-exhaustive to everyone else, but in
+                    // here a new arm is a compile error, which is right. Deciding what this suite
+                    // says to a new kind of question is part of adding one.
+                };
+                Answer::new(question.id.clone(), value)
+            })
+            .collect(),
+    )
+}
+
+/// Answers a question minimally, or cancels the turn when even that is refused.
+///
+/// Either way the turn reaches a terminal, which is what the checks around this are about: a turn
+/// nobody unblocks never ends, and reporting "no terminal" about a harness that was waiting
+/// politely for an answer it was never sent would be a check failing for the suite's own reason.
+async fn decline_or_cancel(session: &dyn Session, request: &QuestionRequest) {
+    let response = minimal_answers(request);
+    if request.validate(&response).is_ok() && session.answer(response).await.is_ok() {
+        return;
+    }
+    let _ = session.cancel(CancelReason::Requested).await;
 }
 
 /// Whether the approval round-trip held, given the question asked and what answering it returned.
@@ -532,6 +592,111 @@ async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
     );
 }
 
+/// A harness that advertises questions round-trips one with the vendor's own ids.
+///
+/// The positive case, which the refusal check in [`check_optional_methods`] cannot stand in for: a
+/// harness that declared [`Capability::Questions`] and then cannot take an answer is exactly the
+/// harness whose turn never terminates. Skipped rather than passed when the harness declares the
+/// capability but this turn asked nothing — a skip says more than a green tick.
+async fn check_questions(session: &dyn Session, options: &Options, report: &mut Report) {
+    const NAME: &str = "a question round-trips with the vendor's own ids";
+
+    if !session.capabilities().has(Capability::Questions) {
+        report.record(
+            NAME,
+            Outcome::Skipped(String::from("this harness does not declare questions")),
+        );
+        return;
+    }
+
+    let mut turn = match session
+        .start_turn(TurnRequest::new(
+            "conformance-question-turn",
+            options.prompt.clone(),
+        ))
+        .await
+    {
+        Ok(turn) => turn,
+        Err(error) => {
+            report.record(
+                NAME,
+                Outcome::Skipped(format!(
+                    "a turn for the question could not be started: {error}"
+                )),
+            );
+            return;
+        }
+    };
+
+    let mut asked = None;
+    let collected = tokio::time::timeout(options.turn_timeout, async {
+        while let Some(event) = turn.recv().await {
+            let terminal = event.is_terminal();
+            match event.kind {
+                EventKind::QuestionAsked { request } => {
+                    asked = Some(request);
+                    break;
+                }
+                // A turn that stopped at an approval is a turn that is not going to ask a
+                // question, and it will wait for an answer forever. Refuse it — never grant —
+                // and stop, rather than spending this check's whole budget on a stream that has
+                // already said what it is doing.
+                EventKind::ApprovalRequested { request } => {
+                    if let Ok(response) = request.deny() {
+                        let _ = session.respond(response).await;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+            if terminal {
+                break;
+            }
+        }
+    })
+    .await;
+
+    let Some(request) = asked else {
+        let reason = if collected.is_err() {
+            format!("no question arrived within {:?}", options.turn_timeout)
+        } else {
+            String::from("this harness asked no question on this turn")
+        };
+        report.record(NAME, Outcome::Skipped(reason));
+        let _ = session.cancel(CancelReason::Requested).await;
+        return;
+    };
+
+    let mut failures = Vec::new();
+    if request.interaction.kind.grants_authority() {
+        failures.push(String::from(
+            "expected a question to grant no authority, received one marked as a permission",
+        ));
+    }
+
+    let response = minimal_answers(&request);
+    // A shape this suite cannot answer at all is a well-formed refusal rather than a broken
+    // round-trip, so it is reported as a skip rather than as a failure of the harness.
+    if let Err(error) = request.validate(&response) {
+        report.record(
+            NAME,
+            Outcome::Skipped(format!(
+                "this harness asked something the suite may not answer for a person: {error}"
+            )),
+        );
+        let _ = session.cancel(CancelReason::Requested).await;
+        return;
+    }
+    if let Err(error) = session.answer(response).await {
+        failures.push(format!(
+            "expected the answers to be accepted, received {error}"
+        ));
+    }
+
+    report.record(NAME, outcome_for(failures));
+    let _ = session.cancel(CancelReason::Requested).await;
+}
+
 /// Session state is readable before any turn has run, and a subscription cannot miss a change.
 ///
 /// The check that would have caught the old shape: a harness carrying its session facts on the
@@ -715,6 +880,44 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "an approval can be answered"),
             "expected the approval check to be skipped, received {skipped:?}"
+        );
+    }
+
+    /// The positive question case. A harness that declares `Questions` and then cannot take an
+    /// answer is the harness whose turn never terminates, and the refusal check cannot see that:
+    /// it only ever asks harnesses that declared nothing.
+    #[tokio::test]
+    async fn a_harness_that_asks_a_question_round_trips_one() {
+        let report = run(
+            &FakeHarness::new().asking_a_question(),
+            &host(),
+            Options::default(),
+        )
+        .await;
+
+        report.assert_passed();
+        assert!(
+            report.checks.iter().any(|check| {
+                check.name == "a question round-trips with the vendor's own ids"
+                    && check.outcome == Outcome::Passed
+            }),
+            "expected the question check to pass, received {:?}",
+            report.checks
+        );
+    }
+
+    /// A harness whose turns stop at an approval instead must not spend the check's whole budget
+    /// waiting for a question that is never coming — it says so and moves on.
+    #[tokio::test]
+    async fn a_harness_that_asks_for_approval_instead_skips_the_question_check_promptly() {
+        let report = run(&FakeHarness::new(), &host(), Options::default()).await;
+
+        let skipped = report.skipped();
+        assert!(
+            skipped
+                .iter()
+                .any(|check| check.name == "a question round-trips with the vendor's own ids"),
+            "expected the question check to be skipped, received {skipped:?}"
         );
     }
 
