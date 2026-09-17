@@ -89,10 +89,13 @@ impl ConfigFile {
         if servers.is_empty() {
             return Ok(None);
         }
-        if let Some(unusable) = servers.iter().find(|server| !server.is_usable()) {
+        // The position, never the name. A server name is host-provided text — a tenant, a customer,
+        // a URL with a credential in it — and `HostConfiguration`'s summary is written verbatim by
+        // `Display`, so the index is what identifies the entry without carrying it.
+        if let Some(index) = servers.iter().position(|server| !server.is_usable()) {
             return Err(Error::HostConfiguration {
                 expected: "every MCP server to name itself and its command or url",
-                received: format!("{:?}", unusable.name),
+                received: format!("an MCP server at index {index} missing one of them"),
             });
         }
 
@@ -181,13 +184,13 @@ impl Drop for ConfigFile {
 /// configured.
 fn document_for(servers: &[McpServer]) -> Result<Value> {
     let mut configured = Map::new();
-    for server in servers {
+    for (index, server) in servers.iter().enumerate() {
         let entry = entry_for(&server.transport).ok_or_else(|| Error::HostConfiguration {
             expected: "an MCP transport this harness maps onto --mcp-config",
-            // The kind, never the transport itself: `Stdio` carries `env` and `Http` carries
+            // Neither the transport nor the name: `Stdio` carries `env` and `Http` carries
             // `headers`, and both are where a host puts the credential its server authenticates
-            // with.
-            received: format!("an unmapped transport on server {:?}", server.name),
+            // with, while the name is host-provided text of its own.
+            received: format!("an unmapped transport on the server at index {index}"),
         })?;
         // The vendor's `mcpServers` is a map, so a repeated name can only keep one entry — and
         // `insert` would keep the last quietly. That is the same drop this module refuses an
@@ -201,7 +204,7 @@ fn document_for(servers: &[McpServer]) -> Result<Value> {
                 .count();
             return Err(Error::HostConfiguration {
                 expected: "one MCP server per name, because the vendor lists them in a map",
-                received: format!("{count} servers named {:?}", server.name),
+                received: format!("{count} servers sharing the name at index {index}"),
             });
         }
     }
@@ -410,6 +413,60 @@ mod tests {
             !error.to_string().contains("s3cret"),
             "expected the collision's mapped value to stay out of the message, received {error}"
         );
+    }
+
+    /// A server name is host text, and `HostConfiguration` is the one summary `Display` writes out.
+    ///
+    /// The name is whatever the host called the server: a tenant, a customer, a URL somebody pasted
+    /// with a credential still in it. Every refusal on this path identifies the entry by position.
+    #[test]
+    fn no_configuration_refusal_names_the_server_a_host_configured() {
+        const CANARY: &str = "tenant-secret-canary";
+
+        // Named, but with neither a command nor a url.
+        let unusable = vec![McpServer {
+            name: String::from(CANARY),
+            transport: McpTransport::Stdio {
+                command: String::new(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+        }];
+        // Two entries the vendor's map cannot hold at once.
+        let collision = vec![
+            McpServer::stdio(CANARY, "docs-mcp"),
+            McpServer::stdio(CANARY, "other-docs-mcp"),
+        ];
+
+        let refusals = [
+            ConfigFile::write_with(&unusable, Path::new("/tmp/mea-mcp"), &FailingWriter)
+                .expect_err("expected an unusable server to be refused"),
+            document_for(&collision).expect_err("expected the collision to be refused"),
+        ];
+
+        for error in refusals {
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(CANARY),
+                "expected the server name to stay out of the diagnostic, received {rendered}"
+            );
+            assert!(
+                rendered.contains("index"),
+                "expected the entry to be identified by position, received {rendered}"
+            );
+        }
+    }
+
+    /// A writer that fails if anything reaches the disk, so a refusal test cannot write one.
+    struct FailingWriter;
+
+    impl FileWriter for FailingWriter {
+        fn write_new(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            panic!(
+                "expected no write, received one of {} bytes to {path:?}",
+                contents.len()
+            )
+        }
     }
 
     #[test]
