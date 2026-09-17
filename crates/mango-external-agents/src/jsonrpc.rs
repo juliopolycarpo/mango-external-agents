@@ -243,6 +243,13 @@ pub struct ClientOptions {
     /// [`peer_name`](ClientOptions::peer_name), which a host fills in and which may carry its own
     /// text. A code is diagnostic — `Display` writes it — so what it may contain is decided here,
     /// where it is made.
+    ///
+    /// What the bound does not do is make a literal safe by itself. It rules out runtime data,
+    /// not a deliberate one: `env!("SOMETHING")` is also `&'static str`, and a lowercase label
+    /// passes the shape check `ErrorCode`'s `Display` applies. So this is the same obligation
+    /// [`ErrorCode::from_static`] places on every harness that names its own codes — write the
+    /// vendor's name, `codex` or `claude`, and nothing a person would not want in a log line.
+    /// Sealing it here without sealing that constructor would move the obligation, not remove it.
     pub code_prefix: &'static str,
     /// Whether to write the `"jsonrpc": "2.0"` member.
     ///
