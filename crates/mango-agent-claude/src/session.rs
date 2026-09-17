@@ -279,6 +279,10 @@ impl mango_external_agents::Session for ClaudeSession {
             Ok(argv) => argv,
             Err(error) => {
                 clear_active(&self.shared, &end);
+                // A close that won the race already released the session's own reference, which
+                // makes this lease the last one and its drop the `remove_dir_all`. Off the worker,
+                // for the same reason the write is.
+                crate::mcp::release_off_worker(mcp_lease).await;
                 return Err(error);
             }
         };
@@ -296,15 +300,15 @@ impl mango_external_agents::Session for ClaudeSession {
             // this call made above, and only if a stop has not already taken it.
             Err(error) => {
                 clear_active(&self.shared, &end);
+                crate::mcp::release_off_worker(mcp_lease).await;
                 return Err(error);
             }
         };
 
-        // This move after `stdio::open` makes the ownership boundary explicit. `close` may have
-        // taken the session's `Arc` while the launcher awaited, but it cannot remove the file until
-        // this call either installs the child or kills the stopped child below.
-        let _mcp_lease = mcp_lease;
-
+        // The lease is still held past `stdio::open`, deliberately: `close` may have taken the
+        // session's `Arc` while the launcher awaited, but it cannot remove the file until this
+        // call either installs the child or kills the stopped child below. Installing hands the
+        // artifact back to the session, and this clone is then the cheap one to drop.
         let limits = *self.shared.host.limits();
         let (sink, events) = EventSink::new(
             self.shared.info.ids.session_id.clone(),
@@ -346,6 +350,10 @@ impl mango_external_agents::Session for ClaudeSession {
         };
         if let Some(reason) = stopped {
             let _ = control.kill(reason).await;
+            // After the kill, never before: the child read `--mcp-config` at startup. And off the
+            // worker, because a close that won the race left this lease holding the last
+            // reference, so this is where the `remove_dir_all` happens.
+            crate::mcp::release_off_worker(mcp_lease).await;
             return Err(if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
@@ -406,7 +414,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // its own `Arc` through the post-spawn lifecycle check, then kills that child before the
         // final reference can remove the file. Off the lock, and off the async worker: removing
         // the directory is a synchronous filesystem call against the host's own scratch root.
-        crate::mcp::remove_off_worker(mcp_config).await;
+        crate::mcp::release_off_worker(mcp_config).await;
         Ok(())
     }
 }

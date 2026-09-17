@@ -176,7 +176,7 @@ impl Drop for ConfigFile {
     ///
     /// Synchronous, deliberately: a value dropped without a close has no runtime to hand the call
     /// to, and by the time the last session drops the runtime may already be shutting down. A
-    /// close that does have one goes through `remove_off_worker` instead.
+    /// close that does have one goes through `release_off_worker` instead.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
     }
@@ -191,15 +191,12 @@ impl Drop for ConfigFile {
 ///
 /// Awaited rather than detached: a close that returned before the artifact was gone would be a
 /// close that did not clean up.
-pub(crate) async fn remove_off_worker(file: Option<std::sync::Arc<ConfigFile>>) {
-    release_off_worker(file).await;
-}
-
-/// Drops a value on the blocking pool, so whatever its `Drop` does is not done on a worker.
 ///
-/// Generic so a test can hand it a value whose `Drop` reports which thread ran it; `ConfigFile`'s
-/// own `Drop` has nothing to report but the directory being gone.
-async fn release_off_worker<T: Send + 'static>(value: Option<T>) {
+/// Generic over what is being released because the owner differs by path: an open that fails
+/// holds the [`ConfigFile`] itself, a session holds an `Arc` of it, and a turn holds a lease that
+/// is the last `Arc` whenever a close raced it. Every one of them can be the reference whose drop
+/// unlinks the directory.
+pub(crate) async fn release_off_worker<T: Send + 'static>(value: Option<T>) {
     let Some(value) = value else {
         return;
     };
@@ -705,7 +702,7 @@ mod tests {
             .expect("a file sits in a directory")
             .to_path_buf();
 
-        super::remove_off_worker(Some(file)).await;
+        super::release_off_worker(Some(file)).await;
 
         assert!(
             !directory.exists(),

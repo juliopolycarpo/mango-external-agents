@@ -288,6 +288,43 @@ impl Harness for ClaudeHarness {
         let executable = self.executable_for(&request);
         let survey = self.survey(host, &executable).await;
 
+        // Every refusal below owns the artifact written above, and removing it is a synchronous
+        // `remove_dir_all` against the host's own scratch root. Gathered into one call so a failed
+        // open has one error path, and that path hands the removal to the blocking pool for the
+        // same reason the write runs there.
+        let opened = match Self::opened(request, survey) {
+            Ok(opened) => opened,
+            Err(error) => {
+                crate::mcp::release_off_worker(mcp_config).await;
+                return Err(error);
+            }
+        };
+
+        Ok(Box::new(ClaudeSession::new(
+            host.clone(),
+            executable,
+            opened.info,
+            opened.availability,
+            opened.surface,
+            mcp_config,
+        )))
+    }
+}
+
+/// What a passed open decided, before the session takes ownership of its MCP artifact.
+struct OpenedSession {
+    info: SessionInfo,
+    availability: ModeAvailability,
+    surface: Option<CliSurface>,
+}
+
+impl ClaudeHarness {
+    /// Every check between the probe and the session, in the order a refusal should reach a host.
+    ///
+    /// Separated from `open_session` so that call owns exactly one error path: the MCP artifact is
+    /// already on disk by the time any of these run, and each refusal has to release it the same
+    /// way.
+    fn opened(request: OpenSession, survey: Survey) -> Result<OpenedSession> {
         if !survey.installed() {
             return Err(Error::Launch {
                 program: String::from(probe::PROGRAM),
@@ -348,14 +385,11 @@ impl Harness for ClaudeHarness {
             capabilities: survey.capabilities(models::advertises_catalog(survey.surface.as_ref())),
         };
 
-        Ok(Box::new(ClaudeSession::new(
-            host.clone(),
-            executable,
+        Ok(OpenedSession {
             info,
-            survey.availability,
-            survey.surface,
-            mcp_config,
-        )))
+            availability: survey.availability,
+            surface: survey.surface,
+        })
     }
 }
 
