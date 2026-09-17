@@ -270,6 +270,21 @@ impl Harness for ClaudeHarness {
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
         self.validate_open_session(&request)?;
+
+        // This is a host authorization check, not a fact a vendor can answer. Prepare the file
+        // before the first probe so a missing or inaccessible scratch location never starts a
+        // vendor process. The host owns the container or sandbox mapping that makes this path
+        // visible to the child. A later opening refusal drops this value and removes only its
+        // scoped artifact.
+        let mcp_config = if request.mcp_servers.is_empty() {
+            None
+        } else {
+            let scratch = host.scratch().ok_or_else(|| Error::HostConfiguration {
+                expected: "a host-owned scratch directory for MCP configuration",
+                received: String::from("none"),
+            })?;
+            ConfigFile::write(&request.mcp_servers, scratch).await?
+        };
         let executable = self.executable_for(&request);
         let survey = self.survey(host, &executable).await;
 
@@ -293,6 +308,7 @@ impl Harness for ClaudeHarness {
 
         let configuration = request.configuration.clone();
         require_supported(&configuration, &survey.availability)?;
+        models::validate_configuration(&configuration, survey.surface.as_ref())?;
 
         // Refused rather than dropped. A session that quietly ignored the servers a host
         // configured would run every turn without the tools somebody set up, and report success.
@@ -320,10 +336,6 @@ impl Harness for ClaudeHarness {
             // than derived from the host's own session id, which has no shape requirement.
             None => uuid::Uuid::new_v4().to_string(),
         };
-
-        // The library has no scratch directory of its own to be given, so the file goes where the
-        // platform puts temporary files, in a directory of its own that only its owner can read.
-        let mcp_config = ConfigFile::write(&request.mcp_servers, &std::env::temp_dir()).await?;
 
         let info = SessionInfo {
             ids: SessionIds {

@@ -9,42 +9,49 @@
 //! whole server list — headers and environment included — on a command line that is world-readable
 //! in `ps` on every platform this runs on.
 //!
-//! The file is written into a directory of its own, named unguessably and created with owner-only
-//! permissions where the platform has them, because an `env` entry is exactly where a host puts its
-//! own server's API key. It is removed when the session that wrote it is closed or dropped.
+//! The host supplies the scratch root that the launched child can read. The file is written into a
+//! directory of its own below that root, named unguessably and created with owner-only permissions
+//! on Unix. On Windows it inherits the host root's ACL. It is removed when the session that wrote
+//! it is closed or dropped.
 //!
 //! <https://code.claude.com/docs/en/mcp.md>
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mango_external_agents::{Error, McpServer, McpTransport, Result};
 use serde_json::{Map, Value, json};
 
 trait FileWriter {
-    async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
+    fn write_new(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
 }
 
 struct TokioFileWriter;
 
 impl FileWriter for TokioFileWriter {
-    async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
-        tokio::fs::write(path, contents).await
+    fn write_new(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        write_private_file(path, contents)
     }
 }
-
-/// The directory every session's configuration is written under.
-const PARENT_DIRECTORY: &str = "mango-external-agents";
 
 /// The name of the file inside each session's own directory.
 const FILE_NAME: &str = "mcp-servers.json";
 
 /// One session's `--mcp-config` file, removed when it is dropped.
-#[derive(Debug)]
 pub struct ConfigFile {
     directory: PathBuf,
     /// The file's path, as the string `--mcp-config` takes. UTF-8 was already proven when this was
     /// written, so [`path`](Self::path) can hand it back as a [`Path`] without a second check.
     argument: String,
+}
+
+impl std::fmt::Debug for ConfigFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigFile")
+            .field("artifact_owned", &true)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigFile {
@@ -53,7 +60,8 @@ impl ConfigFile {
     /// # Errors
     ///
     /// [`Error::HostConfiguration`] when a server is missing the name or the endpoint the vendor
-    /// needs, and [`Error::Launch`] when the file could not be written. Both refuse the session:
+    /// needs, and [`Error::HostConfiguration`] when the supplied scratch directory cannot hold the
+    /// file. Both refuse the session:
     /// starting one that silently dropped a server the host asked for would run turns without the
     /// tools somebody configured.
     pub async fn write(servers: &[McpServer], scratch: &Path) -> Result<Option<Self>> {
@@ -79,21 +87,20 @@ impl ConfigFile {
         // so a host misconfiguration never leaves an unguessable, owner-only directory behind for
         // nobody to clean up.
         let document = document_for(servers)?;
+        validate_scratch(scratch)?;
 
-        let directory = scratch
-            .join(PARENT_DIRECTORY)
-            .join(uuid::Uuid::new_v4().to_string());
+        let directory = scratch.join(uuid::Uuid::new_v4().to_string());
         let path = directory.join(FILE_NAME);
         // `--mcp-config` takes one argument, and an argument is a string. A path that is not UTF-8
         // would have to be rendered lossily, and a lossy path names a different file.
         let Some(argument) = path.to_str().map(str::to_owned) else {
             return Err(Error::HostConfiguration {
                 expected: "a scratch directory whose path is valid UTF-8",
-                received: path.to_string_lossy().into_owned(),
+                received: String::from("a non-UTF-8 path"),
             });
         };
 
-        create_private_directory(&directory).await?;
+        create_private_directory(&directory)?;
         // Owned from the moment the directory exists, so every failure below returns through this
         // value's `Drop` instead of leaving an unguessable, owner-only directory — with the
         // credential-carrying file inside it — behind for nobody to clean up.
@@ -101,19 +108,18 @@ impl ConfigFile {
             directory,
             argument,
         };
-        file.populate(&document, writer).await?;
+        file.populate(&document, writer)?;
         Ok(Some(file))
     }
 
     /// Writes the document into the directory this value already owns.
-    async fn populate(&self, document: &Value, writer: &impl FileWriter) -> Result<()> {
+    fn populate(&self, document: &Value, writer: &impl FileWriter) -> Result<()> {
         let path = self.path();
         let contents = document.to_string();
         writer
-            .write(path, contents.as_bytes())
-            .await
-            .map_err(|error| launch_failure("write an MCP configuration", path, &error))?;
-        restrict_to_owner(path, 0o600).await
+            .write_new(path, contents.as_bytes())
+            .map_err(|error| scratch_failure("write the MCP configuration", &error))?;
+        Ok(())
     }
 
     /// The path `--mcp-config` is given.
@@ -201,54 +207,119 @@ fn entry_for(transport: &McpTransport) -> Option<Value> {
     })
 }
 
-/// Creates the session's own directory, owner-only where the platform says what that means.
+/// Creates a new owner-only session directory directly under the host-owned scratch root.
 ///
-/// `create_dir_all` for the parent, which several sessions share, and a plain `create_dir` for the
-/// leaf: a leaf that already exists is a name somebody else chose, and the name is a fresh UUID.
-///
-/// The shared parent is restricted too, and that is not tidiness. The platform's temporary
-/// directory is world-writable on every Unix, so on a multi-user host the parent is a name another
-/// account can create first — and whoever owns the parent can rename the leaf out from under a
-/// session and leave a directory of their own in its place, which is a `--mcp-config` an attacker
-/// wrote and a server the vendor would then spawn. A `chmod` of a directory this user does not own
-/// fails with `EPERM`, so that case refuses the session instead of running it.
-async fn create_private_directory(directory: &Path) -> Result<()> {
-    if let Some(parent) = directory.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| launch_failure("create a scratch directory", parent, &error))?;
-        restrict_to_owner(parent, 0o700).await?;
-    }
-    tokio::fs::create_dir(directory)
-        .await
-        .map_err(|error| launch_failure("create a scratch directory", directory, &error))?;
-    restrict_to_owner(directory, 0o700).await
-}
-
-/// Takes group and other off a path, on the platforms that have them.
-///
-/// A no-op on Windows, where the temporary directory is already per-user and the mode bits mean
-/// nothing. Stated rather than silently skipped, because "the permissions were set" is a claim the
-/// module's own docs make. `mode` comes from the caller rather than a read-then-branch on the
-/// path's own metadata: every caller already knows whether it just created a directory or a file.
+/// The root already exists and belongs to the host. This code never creates or changes it, because
+/// doing either would follow a host-owned path the library was never authorised to mutate. The
+/// UUID makes independent sessions distinct and `create` refuses a collision instead of reusing a
+/// path somebody else supplied.
 #[cfg(unix)]
-async fn restrict_to_owner(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn create_private_directory(directory: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
 
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .await
-        .map_err(|error| launch_failure("restrict the permissions of", path, &error))
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .create(directory)
+        .map_err(|error| scratch_failure("create an owner-only session directory", &error))
 }
 
+/// Windows inherits the directory ACL from the host-owned scratch root. The host supplies that
+/// root because only it knows the account, container mount or sandbox ACL the child shares.
 #[cfg(not(unix))]
-async fn restrict_to_owner(_path: &Path, _mode: u32) -> Result<()> {
+fn create_private_directory(directory: &Path) -> Result<()> {
+    std::fs::create_dir(directory)
+        .map_err(|error| scratch_failure("create a session directory", &error))
+}
+
+/// Creates one private MCP file without replacing an existing path.
+#[cfg(unix)]
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)
+}
+
+/// Windows inherits the file ACL from its private session directory and fails if the filename is
+/// already present. That keeps the host's ACL policy intact while preserving no-overwrite semantics.
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(contents)
+}
+
+fn validate_scratch(scratch: &Path) -> Result<()> {
+    if !scratch.is_absolute() {
+        return Err(Error::HostConfiguration {
+            expected: "an absolute UTF-8 scratch directory visible to the Claude child",
+            received: String::from("a relative path"),
+        });
+    }
+    if scratch.to_str().is_none() {
+        return Err(Error::HostConfiguration {
+            expected: "an absolute UTF-8 scratch directory visible to the Claude child",
+            received: String::from("a non-UTF-8 path"),
+        });
+    }
+    let metadata = std::fs::metadata(scratch)
+        .map_err(|error| scratch_failure("read the scratch directory", &error))?;
+    if !metadata.is_dir() {
+        return Err(Error::HostConfiguration {
+            expected: "an existing directory visible to the Claude child",
+            received: String::from("a non-directory path"),
+        });
+    }
+
+    #[cfg(unix)]
+    validate_unix_scratch_root(&metadata)?;
+
     Ok(())
 }
 
-fn launch_failure(what: &str, path: &Path, error: &std::io::Error) -> Error {
-    Error::Launch {
-        program: String::from(crate::probe::PROGRAM),
-        message: format!("expected to {what} {}, received: {error}", path.display()),
+/// Refuses a root whose owner could replace a session leaf before Claude opens it.
+///
+/// A private root is safe. A shared root also is safe only with the sticky bit: it prevents an
+/// unrelated directory user from renaming the leaf this process owns. Root-owned sticky roots
+/// cover the platform temporary directory without trusting a non-root third party to retain the
+/// configuration the host asked Claude to load.
+#[cfg(unix)]
+fn validate_unix_scratch_root(metadata: &std::fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mode = metadata.mode();
+    let owner = metadata.uid();
+    let effective = nix::unistd::Uid::effective().as_raw();
+    if safe_unix_scratch_root(mode, owner, effective) {
+        return Ok(());
+    }
+
+    Err(Error::HostConfiguration {
+        expected: "a scratch directory owned by this user or root, and private or sticky when group- or other-writable",
+        received: String::from("an unsafe Unix scratch directory"),
+    })
+}
+
+/// Whether Unix directory ownership and mode prevent a third party from replacing a session leaf.
+#[cfg(unix)]
+fn safe_unix_scratch_root(mode: u32, owner: u32, effective: u32) -> bool {
+    let owner_is_trusted = owner == effective || owner == 0;
+    let shared_for_rename = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    owner_is_trusted && (!shared_for_rename || sticky)
+}
+
+fn scratch_failure(what: &str, error: &std::io::Error) -> Error {
+    Error::HostConfiguration {
+        expected: "a writable host-owned scratch directory for MCP configuration",
+        received: format!("could not {what}: {:?}", error.kind()),
     }
 }
 
@@ -256,7 +327,9 @@ fn launch_failure(what: &str, path: &Path, error: &std::io::Error) -> Error {
 mod tests {
     use std::path::Path;
 
-    use super::{ConfigFile, FileWriter, PARENT_DIRECTORY, document_for};
+    #[cfg(unix)]
+    use super::safe_unix_scratch_root;
+    use super::{ConfigFile, FILE_NAME, FileWriter, document_for, write_private_file};
     use mango_external_agents::{McpServer, McpTransport};
     use serde_json::json;
 
@@ -290,16 +363,21 @@ mod tests {
         servers.push(McpServer::stdio("docs", "other-docs-mcp"));
 
         let error = document_for(&servers).expect_err("expected the collision to be refused");
-        let message = error.to_string();
         assert!(
-            message.contains("docs") && message.contains('2'),
-            "expected the colliding name and how many asked for it, received {message}"
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration {
+                    expected: "one MCP server per name, because the vendor lists them in a map",
+                    ..
+                }
+            ),
+            "expected the collision refusal, received {error:?}"
         );
         // `servers()`'s first `docs` entry carries `DOCS_TOKEN=s3cret`. Naming the collision is
         // enough to diagnose it; the credential the first entry mapped to is not.
         assert!(
-            !message.contains("s3cret"),
-            "expected the collision's mapped value to stay out of the message, received {message}"
+            !error.to_string().contains("s3cret"),
+            "expected the collision's mapped value to stay out of the message, received {error}"
         );
     }
 
@@ -332,6 +410,35 @@ mod tests {
             document["mcpServers"]["bare"],
             json!({ "command": "bare-mcp" })
         );
+    }
+
+    #[tokio::test]
+    async fn refuses_relative_or_non_directory_scratch_without_writing_anything() {
+        let relative = ConfigFile::write(&servers(), Path::new("relative-scratch"))
+            .await
+            .expect_err("expected relative scratch to be refused");
+        assert!(
+            matches!(
+                relative,
+                mango_external_agents::Error::HostConfiguration { .. }
+            ),
+            "received {relative:?}"
+        );
+
+        let scratch = tempdir();
+        let file = scratch.join("not-a-directory");
+        std::fs::write(&file, "host file").expect("expected a host file");
+        let non_directory = ConfigFile::write(&servers(), &file)
+            .await
+            .expect_err("expected a non-directory scratch path to be refused");
+        assert!(
+            matches!(
+                non_directory,
+                mango_external_agents::Error::HostConfiguration { .. }
+            ),
+            "received {non_directory:?}"
+        );
+        let _ = std::fs::remove_dir_all(scratch);
     }
 
     #[tokio::test]
@@ -382,7 +489,7 @@ mod tests {
             "received {error:?}"
         );
 
-        let left_behind = std::fs::read_dir(scratch.join(PARENT_DIRECTORY))
+        let left_behind = std::fs::read_dir(&scratch)
             .map(|entries| entries.count())
             .unwrap_or(0);
         assert_eq!(
@@ -427,6 +534,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    #[tokio::test]
+    async fn formatting_a_config_file_does_not_reveal_its_scratch_path() {
+        let scratch = tempdir().join("customer-secret");
+        std::fs::create_dir(&scratch).expect("expected a host-owned scratch directory");
+        let file = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected a file")
+            .expect("expected servers to produce one");
+
+        let rendered = format!("{file:?}");
+        assert!(
+            !rendered.contains("present"),
+            "expected Debug to report stable ownership metadata without probing the filesystem, received {rendered}"
+        );
+        assert!(
+            !rendered.contains("customer-secret"),
+            "expected scratch path to stay out of debug output, received {rendered}"
+        );
+        drop(file);
+        let _ =
+            std::fs::remove_dir_all(scratch.parent().expect("expected the dedicated test root"));
+    }
+
+    #[tokio::test]
+    async fn simultaneous_sessions_use_distinct_artifacts_and_clean_up_only_their_own() {
+        let scratch = tempdir();
+        let first = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected the first file")
+            .expect("expected servers to produce one");
+        let second = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected the second file")
+            .expect("expected servers to produce one");
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+
+        assert_ne!(
+            first_path, second_path,
+            "expected isolated session artifacts"
+        );
+        drop(first);
+        assert!(
+            second_path.exists(),
+            "expected one session cleanup to preserve {}",
+            second_path.display()
+        );
+        drop(second);
+        assert!(
+            !first_path.exists() && !second_path.exists(),
+            "expected both session artifacts to be removed"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_private_file_write_never_replaces_an_existing_file() {
+        let scratch = tempdir();
+        let path = scratch.join(FILE_NAME);
+        std::fs::write(&path, "host-owned contents").expect("expected an existing host file");
+
+        let error = write_private_file(&path, b"replacement")
+            .expect_err("expected the existing path to be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("expected the host file to remain"),
+            "host-owned contents"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// The failure that only becomes reachable once the directory exists.
     ///
     /// Everything before `create_private_directory` refuses without touching the disk, so the only
@@ -441,7 +619,7 @@ mod tests {
         struct FailingFileWriter;
 
         impl FileWriter for FailingFileWriter {
-            async fn write(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            fn write_new(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "injected write refusal",
@@ -454,15 +632,24 @@ mod tests {
             .await
             .expect_err("expected the write to be refused");
         assert!(
-            matches!(error, mango_external_agents::Error::Launch { .. }),
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration { .. }
+            ),
             "received {error:?}"
         );
         assert!(
-            error.to_string().contains("injected write refusal"),
-            "expected the injected post-directory failure, received {error}"
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration {
+                    expected: "a writable host-owned scratch directory for MCP configuration",
+                    ..
+                }
+            ),
+            "expected the injected post-directory failure, received {error:?}"
         );
 
-        let left_behind = std::fs::read_dir(scratch.join(PARENT_DIRECTORY))
+        let left_behind = std::fs::read_dir(&scratch)
             .map(|entries| entries.count())
             .unwrap_or(0);
         assert_eq!(
@@ -472,35 +659,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// The shared parent is the one name in a world-writable temporary directory an attacker can
-    /// create first, and whoever owns it can swap the leaf a session is about to be launched with.
+    /// A shared, non-sticky Unix root lets another account rename a session leaf before Claude
+    /// opens the configuration file. Refuse it without creating anything below the host root.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_shared_parent_is_owner_only_too() {
+    async fn refuses_a_non_sticky_shared_scratch_root_without_creating_a_leaf() {
         use std::os::unix::fs::PermissionsExt;
 
         let scratch = tempdir();
-        let parent = scratch.join(PARENT_DIRECTORY);
-        std::fs::create_dir_all(&parent).expect("expected the parent");
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
-            .expect("expected a world-writable parent");
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o777))
+            .expect("expected a non-sticky shared root");
 
-        let file = ConfigFile::write(&servers(), &scratch)
+        let error = ConfigFile::write(&servers(), &scratch)
             .await
-            .expect("expected a file")
-            .expect("expected servers to produce one");
-
-        let mode = std::fs::metadata(&parent)
-            .expect("expected metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "expected the shared parent to be taken off group and other"
+            .expect_err("expected a non-sticky shared root to be refused");
+        assert!(
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration {
+                    expected: "a scratch directory owned by this user or root, and private or sticky when group- or other-writable",
+                    ..
+                }
+            ),
+            "expected an explicit scratch-root refusal, received {error:?}"
         );
-        drop(file);
+
+        assert_eq!(
+            std::fs::read_dir(&scratch)
+                .expect("expected the host scratch root")
+                .count(),
+            0,
+            "expected the refusal to leave no session leaf beneath the host root"
+        );
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .expect("expected cleanup permissions");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_scratch_root_safety_requires_a_trusted_owner_and_sticky_shared_mode() {
+        assert!(safe_unix_scratch_root(0o700, 1000, 1000));
+        assert!(safe_unix_scratch_root(0o1777, 0, 1000));
+        assert!(!safe_unix_scratch_root(0o777, 1000, 1000));
+        assert!(!safe_unix_scratch_root(0o1777, 1001, 1000));
     }
 
     /// A directory of this test's own, so a run never touches another's.

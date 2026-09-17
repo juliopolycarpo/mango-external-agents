@@ -58,6 +58,10 @@ fn host(cwd: Option<&std::path::Path>) -> Result<HostContext, String> {
                 std::env::current_dir().map_err(|error| format!("no working directory: {error}"))?
             }
         })
+        // Unix validation accepts the platform temporary root only when its root ownership and
+        // sticky bit protect session leaves. Product hosts choose their own authorised,
+        // child-visible scratch root instead.
+        .scratch(std::env::temp_dir())
         .environment(EnvSource::from_process())
         .client_info("mea", env!("CARGO_PKG_VERSION"))
         .build()

@@ -460,6 +460,7 @@ pub fn host_under(launcher: Arc<dyn ProcessLauncher>, limits: Limits) -> HostCon
     HostContext::builder()
         .launcher(launcher)
         .cwd(std::env::temp_dir())
+        .scratch(std::env::temp_dir())
         .environment(EnvSource::from_pairs([
             ("PATH", "/usr/bin"),
             ("CLAUDE_CONFIG_DIR", "/home/ada/.claude"),

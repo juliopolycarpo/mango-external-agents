@@ -12,6 +12,7 @@ All of it through one `HostContext`, built once and shared by every session:
 let host = HostContext::builder()
     .launcher(Arc::new(TokioLauncher::new().with_limits(&limits)))  // or the host's own
     .cwd(authorised_directory)                  // already authorised, never widened
+    .scratch(child_visible_scratch_directory)   // optional, required for artifacts such as Claude MCP config
     .environment(EnvSource::from_process())     // the source; the allowlist does the filtering
     .client_info("my-host", env!("CARGO_PKG_VERSION"))
     .broker(Arc::new(MyPolicy))                 // optional
@@ -34,22 +35,33 @@ let host = HostContext::builder()
 2. **An authorised working directory.** `HostContext::cwd` is a directory the host already
    authorised. The library never widens it and never chooses one.
 
-3. **An environment source.** The library builds the positive allowlist — `BASE_ENVIRONMENT_KEYS`,
+3. **Scratch storage when a harness needs an artifact the child reads.** `HostContext::scratch`
+   is an absolute, host-created directory. The host owns its ACL, ancestors and any container or
+   sandbox mount that makes the same path visible to the child. On Unix, Claude accepts a root
+   owned by the effective user or root; if group or other may write it, it must have the sticky bit
+   (`/tmp` normally does). On Windows, its ACL must authorize only the intended child identities.
+   The library creates and removes only a unique leaf beneath it. It never falls back to a
+   process-global temporary directory. Claude requires this for `--mcp-config`; a host that does
+   not use MCP can leave it unset.
+
+4. **An environment source.** The library builds the positive allowlist — `BASE_ENVIRONMENT_KEYS`,
    every `LC_*`, and the harness's own `vendor_environment_keys` — from what the host passes.
    Nothing else reaches the child. There is deliberately no map of values a caller can supply, so
    no request can smuggle a host credential into a vendor process.
+   On Windows, duplicate environment names that differ only by case are canonicalized once with
+   the first lexical spelling winning. Hosts should avoid conflicting `PATH` and `Path` values.
 
-4. **Client identity.** `ClientInfo { name, version }`, sent to vendors that ask for it (Codex's
+5. **Client identity.** `ClientInfo { name, version }`, sent to vendors that ask for it (Codex's
    `clientInfo`, ACP's `initialize`). It is the host's own name: a vendor reading its logs should
    see which product launched it.
 
-5. **Optionally, a `PermissionBroker`.** By default every `ApprovalRequested` event reaches the
+6. **Optionally, a `PermissionBroker`.** By default every `ApprovalRequested` event reaches the
    host, which answers through `Session::respond`. A host with a policy implements the broker and
    returns `Allow`, `Deny { reason }` or `Ask`. A decision that cannot be applied to a particular
    question — the vendor offered no option matching it — becomes a question for a person rather
    than a failed turn.
 
-6. **A cancellation token, a clock and the caps**, all with defaults: `CancelToken` for shutdown,
+7. **A cancellation token, a clock and the caps**, all with defaults: `CancelToken` for shutdown,
    `Clock` for the instant an event is stamped with, and `Limits` for the turn channel's capacity
    (1,024 events), the line and buffer caps, the stderr tail, the request timeout, the approval
    timeout and the kill grace. Request timeouts bound individual protocol calls; approval timeouts
@@ -155,8 +167,9 @@ cannot run on your fixture is reported as skipped rather than passed.
 The runtime is the host. Its session supervisor owns a map from the application's session id to
 `Box<dyn Session>`. Opening a session follows this sequence:
 
-1. Resolve the user's workspace through the runtime's authorization policy. Build `HostContext`
-   with that directory, the runtime's environment snapshot and its own client name and version.
+1. Resolve the user's workspace and child-visible scratch directory through the runtime's
+   authorization policy. Build `HostContext` with those paths, the runtime's environment snapshot
+   and its own client name and version.
 2. Adapt the runtime's process supervisor to `ProcessLauncher`. Forward `LaunchSpec.argv`, `cwd`
    and the already filtered `env` unchanged. Return its stdin, stdout, exit and kill handles through
    `ManagedProcess`. Keep process groups and Windows job objects in this adapter.

@@ -8,7 +8,7 @@ use std::time::Duration;
 use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::{
     ApprovalRouting, AuthMode, AuthState, CancelReason, CloseReason, Configuration, Error,
-    EventKind, ExecutablePath, GateVerdict, Harness, Limits, LineLimits, OpenSession,
+    EventKind, ExecutablePath, GateVerdict, Harness, HostContext, Limits, LineLimits, OpenSession,
     PermissionLevel, PermissionResponse, ResumeMode, Session, TurnRequest, TurnStream,
 };
 use support::{
@@ -418,6 +418,44 @@ mod opening_a_session {
 
 mod a_turn {
     use super::*;
+
+    /// A configuration value reaches the child process argv. Reject it before reserving or
+    /// starting a child, because dropping it would run under settings the host did not choose.
+    #[tokio::test]
+    async fn refuses_an_invalid_model_or_effort_before_starting_a_child() {
+        let cases = [
+            Configuration {
+                model: Some(String::from("--dangerously-skip-permissions")),
+                ..Configuration::default()
+            },
+            Configuration {
+                effort: Some(String::from("ultra")),
+                ..Configuration::default()
+            },
+        ];
+
+        for configuration in cases {
+            let launcher = Arc::new(FakeClaudeCli::new());
+            let session = open(&launcher).await;
+            let error = session
+                .start_turn(
+                    TurnRequest::new("turn-1", "use the explicit settings")
+                        .with_configuration(configuration),
+                )
+                .await
+                .expect_err("expected an invalid explicit configuration to be refused");
+
+            assert!(
+                matches!(error, Error::HostConfiguration { .. }),
+                "received {error:?}"
+            );
+            assert!(
+                launcher.turn_argvs().is_empty(),
+                "expected no turn launch, received {:?}",
+                launcher.turn_argvs()
+            );
+        }
+    }
 
     /// An omitted pair must remain absent from argv, while a later accepted pair is repeated on
     /// turns that omit their own configuration.
@@ -1067,6 +1105,161 @@ mod mcp_passthrough {
     }
 
     #[tokio::test]
+    async fn passes_the_host_authorised_scratch_path_to_the_child_unchanged() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let scratch =
+            std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .scratch(&scratch)
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host with scratch storage");
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .expect("expected a session");
+        session
+            .start_turn(TurnRequest::new("turn-1", "hello"))
+            .await
+            .expect("expected a turn");
+
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let config = std::path::PathBuf::from(
+            value_after(&argv, "--mcp-config").expect("expected the config argument"),
+        );
+        assert!(
+            config.starts_with(&scratch),
+            "expected the child to receive an artifact below the host root"
+        );
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected cleanup");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn refuses_missing_host_scratch_before_running_a_vendor_probe() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host without scratch storage");
+
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected MCP setup without host scratch to be refused");
+        assert!(
+            matches!(
+                error,
+                Error::HostConfiguration {
+                    expected: "a host-owned scratch directory for MCP configuration",
+                    ..
+                }
+            ),
+            "received {error:?}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected scratch refusal before any vendor work, received {:?}",
+            launcher.launches()
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unusable_host_scratch_before_running_a_vendor_probe() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let root = std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("expected a dedicated test root");
+        let scratch_file = root.join("not-a-directory");
+        std::fs::write(&scratch_file, "host-owned file")
+            .expect("expected an unusable scratch path");
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .scratch(&scratch_file)
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host with a supplied scratch path");
+
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected a non-directory scratch path to be refused");
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "received {error:?}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected scratch refusal before any vendor work, received {:?}",
+            launcher.launches()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_removes_the_prepared_host_scratch_artifact() {
+        // This build does not advertise `--mcp-config`, so opening fails after the local artifact
+        // was prepared and the survey established the unsupported capability.
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let scratch =
+            std::env::temp_dir().join(format!("mea-host-scratch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(std::env::temp_dir())
+            .scratch(&scratch)
+            .client_info("mea-tests", "0.0.0")
+            .build()
+            .expect("expected a host with scratch storage");
+
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_mcp_servers(servers()),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected unsupported MCP passthrough to refuse opening");
+        assert!(
+            matches!(
+                error,
+                Error::NotSupported {
+                    capability: mango_external_agents::Capability::McpPassthrough
+                }
+            ),
+            "received {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch)
+                .expect("expected the host scratch root")
+                .count(),
+            0,
+            "expected a failed open to remove its prepared artifact"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
     async fn the_file_leaves_with_the_session_that_wrote_it() {
         let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
         let session = open_with_servers(&launcher).await;
@@ -1128,6 +1321,48 @@ mod mcp_passthrough {
             !path.exists(),
             "expected the close to still remove {}",
             path.display()
+        );
+    }
+
+    /// A launcher can still be creating a child when `close` takes the session's configuration.
+    /// The child reads `--mcp-config` at startup, so the start call keeps its own lease until it
+    /// observes the close, kills the child, and only then lets cleanup remove the file.
+    #[tokio::test]
+    async fn keeps_mcp_configuration_until_a_child_spawned_during_close_has_been_killed() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::stalling::<[String; 0], String>([])),
+        );
+        let gate = launcher.gate_turn_spawns();
+        let session: Arc<dyn Session> = Arc::from(open_with_servers(&launcher).await);
+
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "start something long"))
+                    .await
+                    .map(drop)
+            }
+        });
+
+        gate.wait_for_spawn().await;
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected a clean close");
+        gate.release();
+
+        let outcome = starting.await.expect("expected the start task to finish");
+        assert!(
+            matches!(outcome, Err(Error::Closed { .. })),
+            "expected the closed session to refuse the turn, received {outcome:?}"
+        );
+        assert_eq!(
+            launcher.mcp_config_at_kill(),
+            vec![true],
+            "expected the spawned child to keep its MCP configuration until it was killed"
         );
     }
 

@@ -8,11 +8,13 @@
 //!
 //! <https://code.claude.com/docs/en/headless.md>
 
+use mango_external_agents::{Error, Result};
+
 use crate::models;
 use crate::permissions::CliMode;
 
 /// Everything the argv depends on, gathered so the builder decides nothing on its own.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TurnArgv<'a> {
     /// The program name. The host's launcher resolves it, or
     /// [`ExecutablePath`](mango_external_agents::ExecutablePath) replaces it at spawn time.
@@ -37,6 +39,32 @@ pub struct TurnArgv<'a> {
     pub mcp_config: Option<&'a str>,
 }
 
+impl std::fmt::Debug for TurnArgv<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnArgv")
+            .field("program_present", &!self.program.is_empty())
+            .field("mode", &self.mode)
+            .field(
+                "native_session_id_present",
+                &!self.native_session_id.is_empty(),
+            )
+            .field("established", &self.established)
+            .field("model_present", &self.model.is_some())
+            .field("effort_present", &self.effort.is_some())
+            .field(
+                "accepted_effort_count",
+                &self.accepted_efforts.map_or(0, <[String]>::len),
+            )
+            .field(
+                "declares_permission_prompts",
+                &self.declares_permission_prompts,
+            )
+            .field("mcp_config_present", &self.mcp_config.is_some())
+            .finish()
+    }
+}
+
 impl TurnArgv<'_> {
     /// The turn's command line.
     ///
@@ -57,13 +85,39 @@ impl TurnArgv<'_> {
     ///     declares_permission_prompts: false,
     ///     mcp_config: None,
     /// }
-    /// .build();
+    /// .build()
+    /// .expect("expected valid argv");
     ///
     /// assert_eq!(argv[0], "claude");
     /// assert!(argv.contains(&String::from("--session-id")));
     /// assert!(!argv.contains(&String::from("--resume")));
     /// ```
-    pub fn build(&self) -> Vec<String> {
+    pub fn build(&self) -> Result<Vec<String>> {
+        if !is_vendor_session_id(self.native_session_id) {
+            return Err(Error::HostConfiguration {
+                expected: "a Claude session id shaped like the UUID the CLI mints",
+                received: value_summary(self.native_session_id),
+            });
+        }
+        if let Some(model) = self.model {
+            models::validate_model(model)?;
+        }
+        if let Some(effort) = self.effort {
+            models::validate_effort(effort, self.accepted_efforts)?;
+        }
+        if let Some(mcp_config) = self.mcp_config
+            && (!std::path::Path::new(mcp_config).is_absolute()
+                || !mango_external_agents::normalize::is_argv_value_with_max(
+                    mcp_config,
+                    mango_external_agents::normalize::MAX_PATH_LENGTH,
+                ))
+        {
+            return Err(Error::HostConfiguration {
+                expected: "an absolute MCP configuration path that can occupy a --mcp-config value",
+                received: value_summary(mcp_config),
+            });
+        }
+
         let mut argv: Vec<String> = [
             self.program,
             "--print",
@@ -110,24 +164,27 @@ impl TurnArgv<'_> {
             String::from(self.native_session_id),
         ]);
 
-        if let Some(model) = models::safe_model(self.model) {
+        if let Some(model) = self.model {
             argv.extend([String::from("--model"), String::from(model)]);
         }
-        if let Some(effort) = self.effort
-            && models::effort_accepted(Some(effort), self.accepted_efforts)
-        {
+        if let Some(effort) = self.effort {
             argv.extend([String::from("--effort"), String::from(effort)]);
         }
         if let Some(mcp_config) = self.mcp_config {
             argv.extend([String::from("--mcp-config"), String::from(mcp_config)]);
         }
-        argv
+        Ok(argv)
     }
+}
+
+/// Summarises a rejected host value without exposing its contents through diagnostics.
+fn value_summary(value: &str) -> String {
+    format!("{} code points", value.chars().count())
 }
 
 /// Whether a vendor session handle is one this harness may put on a command line.
 ///
-/// The same argument the [`safe_model`](crate::models::safe_model) guard makes, for the other
+/// The same argument-position safety rule [`model_accepted`](crate::models::model_accepted) uses,
 /// caller-owned value that reaches argv. Two sources feed `--session-id` and `--resume` and
 /// neither is this harness's own: a host's
 /// [`Resume::native_session_id`](mango_external_agents::Resume), and the id a run echoes back in
@@ -137,7 +194,7 @@ impl TurnArgv<'_> {
 /// stored resume reference could put `--dangerously-skip-permissions` on the command line.
 ///
 /// A UUID is the whole shape, rather than the looser "could not become a flag" rule
-/// [`safe_model`](crate::models::safe_model) settles for: the vendor documents `--session-id` as
+/// [`model_accepted`](crate::models::model_accepted) settles for: the vendor documents `--session-id` as
 /// taking one and echoes it back verbatim, so there is a published shape to check against instead
 /// of a guess to accommodate.
 ///
@@ -196,7 +253,8 @@ mod tests {
             model: Some("opus"),
             ..base()
         }
-        .build();
+        .build()
+        .expect("expected valid argv");
         assert!(
             argv.iter().all(|argument| !argument.contains(' ')),
             "expected no prose on the command line, received {argv:?}"
@@ -205,7 +263,7 @@ mod tests {
 
     #[test]
     fn asks_for_the_flags_token_level_deltas_need() {
-        let argv = base().build();
+        let argv = base().build().expect("expected valid argv");
         for required in [
             "--print",
             "--verbose",
@@ -223,7 +281,7 @@ mod tests {
 
     #[test]
     fn mints_the_session_on_the_first_turn_and_resumes_it_afterwards() {
-        let first = base().build();
+        let first = base().build().expect("expected valid argv");
         assert_eq!(value_after(&first, "--session-id"), Some(SESSION));
         assert!(!first.contains(&String::from("--resume")));
 
@@ -231,14 +289,15 @@ mod tests {
             established: true,
             ..base()
         }
-        .build();
+        .build()
+        .expect("expected valid argv");
         assert_eq!(value_after(&later, "--resume"), Some(SESSION));
         assert!(!later.contains(&String::from("--session-id")));
     }
 
     #[test]
     fn passes_manual_on_the_command_line_while_default_is_what_is_persisted() {
-        let argv = base().build();
+        let argv = base().build().expect("expected valid argv");
         assert_eq!(value_after(&argv, "--permission-mode"), Some("manual"));
         assert_eq!(CliMode::Manual.canonical(), "default");
     }
@@ -250,7 +309,8 @@ mod tests {
             declares_permission_prompts: true,
             ..base()
         }
-        .build();
+        .build()
+        .expect("expected valid argv");
         assert_eq!(value_after(&argv, "--permission-mode"), None);
         assert_eq!(value_after(&argv, "--permission-prompts"), None);
     }
@@ -266,7 +326,8 @@ mod tests {
                 mode: Some(mode),
                 ..base()
             }
-            .build();
+            .build()
+            .expect("expected valid argv");
             assert_eq!(value_after(&argv, "--permission-mode"), Some(expected));
         }
     }
@@ -285,7 +346,8 @@ mod tests {
                 mode: Some(mode),
                 ..base()
             }
-            .build();
+            .build()
+            .expect("expected valid argv");
             assert!(
                 argv.iter()
                     .all(|argument| !argument.contains("skip-permissions")),
@@ -296,29 +358,33 @@ mod tests {
 
     #[test]
     fn forwards_a_model_only_when_one_was_chosen() {
-        assert_eq!(value_after(&base().build(), "--model"), None);
+        assert_eq!(
+            value_after(&base().build().expect("expected valid argv"), "--model"),
+            None
+        );
         let chosen = TurnArgv {
             model: Some("opus"),
             ..base()
         }
-        .build();
+        .build()
+        .expect("expected valid argv");
         assert_eq!(value_after(&chosen, "--model"), Some("opus"));
     }
 
     #[test]
-    fn never_lets_a_model_value_become_another_flag() {
-        let argv = TurnArgv {
+    fn refuses_a_model_value_that_could_become_another_flag() {
+        let error = TurnArgv {
             model: Some("--dangerously-skip-permissions"),
             ..base()
         }
-        .build();
+        .build()
+        .expect_err("expected an injected model to be refused");
         assert!(
-            !argv.contains(&String::from("--model")),
-            "expected an unusable model to be dropped with its flag, received {argv:?}"
-        );
-        assert!(
-            argv.iter()
-                .all(|argument| !argument.contains("skip-permissions"))
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration { .. }
+            ),
+            "received {error:?}"
         );
     }
 
@@ -330,36 +396,45 @@ mod tests {
             accepted_efforts: Some(&levels),
             ..base()
         }
-        .build();
+        .build()
+        .expect("expected valid argv");
         assert_eq!(value_after(&argv, "--effort"), Some("high"));
     }
 
     #[test]
-    fn drops_an_effort_level_this_build_did_not_declare() {
+    fn refuses_an_effort_level_this_build_did_not_declare() {
         let levels = ["low", "high"].map(String::from);
-        let argv = TurnArgv {
+        let error = TurnArgv {
             effort: Some("ultra"),
             accepted_efforts: Some(&levels),
             ..base()
         }
-        .build();
+        .build()
+        .expect_err("expected an undeclared effort to be refused");
         assert!(
-            !argv.contains(&String::from("--effort")),
-            "received {argv:?}"
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration { .. }
+            ),
+            "received {error:?}"
         );
     }
 
     #[test]
-    fn passes_no_effort_at_all_to_a_build_that_declared_none() {
-        let argv = TurnArgv {
+    fn refuses_an_effort_when_the_build_declared_none() {
+        let error = TurnArgv {
             effort: Some("high"),
             accepted_efforts: None,
             ..base()
         }
-        .build();
+        .build()
+        .expect_err("expected an undeclared effort to be refused");
         assert!(
-            !argv.contains(&String::from("--effort")),
-            "received {argv:?}"
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration { .. }
+            ),
+            "received {error:?}"
         );
     }
 
@@ -369,7 +444,8 @@ mod tests {
             declares_permission_prompts: true,
             ..base()
         }
-        .build();
+        .build()
+        .expect("expected valid argv");
         assert_eq!(value_after(&argv, "--permission-prompts"), Some("none"));
     }
 
@@ -379,7 +455,8 @@ mod tests {
             declares_permission_prompts: true,
             ..base()
         }
-        .build();
+        .build()
+        .expect("expected valid argv");
         assert!(
             !argv.contains(&String::from("host")),
             "expected `host` never to be passed, received {argv:?}"
@@ -388,7 +465,7 @@ mod tests {
 
     #[test]
     fn omits_the_flag_on_a_build_that_does_not_declare_it() {
-        let argv = base().build();
+        let argv = base().build().expect("expected valid argv");
         assert!(
             !argv.contains(&String::from("--permission-prompts")),
             "received {argv:?}"
@@ -401,17 +478,19 @@ mod tests {
         // a model was chosen (REQUIRED_FLAGS's own documented exception) — so no single build()
         // carries every required flag; a flag counts if any of these plausible turns passes it.
         let turns = [
-            base().build(),
+            base().build().expect("expected valid argv"),
             TurnArgv {
                 established: true,
                 ..base()
             }
-            .build(),
+            .build()
+            .expect("expected valid argv"),
             TurnArgv {
                 model: Some("opus"),
                 ..base()
             }
-            .build(),
+            .build()
+            .expect("expected valid argv"),
         ];
         for &flag in crate::cli_surface::REQUIRED_FLAGS {
             assert!(
@@ -424,16 +503,91 @@ mod tests {
 
     #[test]
     fn loads_the_hosts_mcp_servers_only_when_there_are_some() {
-        assert_eq!(value_after(&base().build(), "--mcp-config"), None);
+        assert_eq!(
+            value_after(
+                &base().build().expect("expected valid argv"),
+                "--mcp-config"
+            ),
+            None
+        );
+        let path = std::env::temp_dir().join("mea").join("servers.json");
+        let path = path.to_str().expect("expected a native UTF-8 fixture path");
         let argv = TurnArgv {
-            mcp_config: Some("/tmp/mea/servers.json"),
+            mcp_config: Some(path),
             ..base()
         }
-        .build();
-        assert_eq!(
-            value_after(&argv, "--mcp-config"),
-            Some("/tmp/mea/servers.json")
+        .build()
+        .expect("expected valid argv");
+        assert_eq!(value_after(&argv, "--mcp-config"), Some(path));
+    }
+
+    #[test]
+    fn preserves_an_absolute_mcp_path_that_is_longer_than_an_ordinary_option_value() {
+        let path = std::env::temp_dir().join("m".repeat(128));
+        let path = path.to_str().expect("expected a native UTF-8 fixture path");
+        assert!(path.chars().count() > 128);
+        let argv = TurnArgv {
+            mcp_config: Some(path),
+            ..base()
+        }
+        .build()
+        .expect("expected an absolute path under the path cap to be usable");
+        assert_eq!(value_after(&argv, "--mcp-config"), Some(path));
+    }
+
+    #[test]
+    fn refuses_direct_argv_values_that_could_change_the_invocation() {
+        for argv in [
+            TurnArgv {
+                native_session_id: "--dangerously-skip-permissions",
+                ..base()
+            },
+            TurnArgv {
+                mcp_config: Some("relative-config.json"),
+                ..base()
+            },
+            TurnArgv {
+                mcp_config: Some("--dangerously-skip-permissions"),
+                ..base()
+            },
+        ] {
+            let error = argv
+                .build()
+                .expect_err("expected an unsafe direct argv value to be refused");
+            assert!(
+                matches!(
+                    error,
+                    mango_external_agents::Error::HostConfiguration { .. }
+                ),
+                "received {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_reports_argv_shape_without_caller_owned_values() {
+        let debug = format!(
+            "{:?}",
+            TurnArgv {
+                native_session_id: "native-session-secret",
+                model: Some("model-secret"),
+                effort: Some("effort-secret"),
+                mcp_config: Some("/tmp/mcp-secret.json"),
+                ..base()
+            }
         );
+        for secret in [
+            "native-session-secret",
+            "model-secret",
+            "effort-secret",
+            "/tmp/mcp-secret.json",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "expected debug output to omit {secret:?}, received {debug:?}"
+            );
+        }
+        assert!(debug.contains("model_present: true"), "received {debug:?}");
     }
 
     #[test]

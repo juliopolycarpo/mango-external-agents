@@ -29,6 +29,7 @@ use serde_json::json;
 use crate::argv::TurnArgv;
 use crate::cli_surface::CliSurface;
 use crate::mcp::ConfigFile;
+use crate::models;
 use crate::permissions::{self, ModeAvailability};
 use crate::pinned::{SIGTERM_EXIT_CODE, STREAM_IDLE_TIMEOUT, VENDOR_ENVIRONMENT_KEYS};
 use crate::probe::PROGRAM;
@@ -67,10 +68,10 @@ struct SessionState {
     active: Option<ActiveTurn>,
     /// The `--mcp-config` file every turn loads, when the host configured servers.
     ///
-    /// Held here rather than on [`Shared`] so that closing the session takes it out and drops it,
-    /// which is what removes it from disk. A session that is dropped without being closed removes
-    /// it too, when this state goes.
-    mcp_config: Option<ConfigFile>,
+    /// Held here rather than on [`Shared`] so closing releases the session's owner. An in-flight
+    /// start holds a second owner until it installs or reaps its child, then the final owner removes
+    /// the file. A session dropped without being closed releases this state too.
+    mcp_config: Option<Arc<ConfigFile>>,
     /// The settings a turn without an override inherits.
     configuration: Configuration,
 }
@@ -120,7 +121,7 @@ impl ClaudeSession {
             native_session_id: info.ids.native_session_id.clone(),
             established: info.resumed,
             active: None,
-            mcp_config,
+            mcp_config: mcp_config.map(Arc::new),
             configuration: info.effective_configuration.clone(),
         };
         Self {
@@ -221,6 +222,10 @@ impl mango_external_agents::Session for ClaudeSession {
                 })
         };
         let mode = self.shared.resolve_mode(&configuration)?;
+        // Configuration is caller-owned and becomes a value position after a Claude option.
+        // Reject it before reserving a child: omitting an invalid explicit value would run the
+        // turn under a setting the host did not select.
+        models::validate_configuration(&configuration, self.shared.surface.as_ref())?;
 
         // A host that starts a second turn has decided the first is over. Taken before anything is
         // spawned so the two cannot both hold a child, and the slot this turn claims is reserved
@@ -228,7 +233,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // `stdio::open` returns below then has this reservation, rather than an empty slot, to
         // record its reason against.
         let end = Arc::new(TurnEnd::default());
-        let previous = {
+        let (previous, mcp_lease) = {
             let Some(_lifecycle) = self.shared.lifecycle.begin_start() else {
                 return Err(Error::Closed { subject: "session" });
             };
@@ -238,22 +243,19 @@ impl mango_external_agents::Session for ClaudeSession {
                 end: Arc::clone(&end),
                 control: None,
             });
-            previous
+            // The reservation and this clone share the same critical section. A close that wins
+            // after it can release the session's reference, but this attempt still owns the file
+            // until it has either installed or reaped the child it launches.
+            (previous, state.mcp_config.as_ref().map(Arc::clone))
         };
         end_turn(previous, CancelReason::Requested).await;
 
-        let (native_session_id, established, mcp_config) = {
+        let (native_session_id, established) = {
             let state = self.shared.lock();
-            (
-                state.native_session_id.clone(),
-                state.established,
-                state
-                    .mcp_config
-                    .as_ref()
-                    .map(|file| file.argument().to_owned()),
-            )
+            (state.native_session_id.clone(), state.established)
         };
-        let argv = TurnArgv {
+        let mcp_config = mcp_lease.as_ref().map(|file| file.argument().to_owned());
+        let argv = match (TurnArgv {
             program: PROGRAM,
             mode,
             native_session_id: &native_session_id,
@@ -271,8 +273,15 @@ impl mango_external_agents::Session for ClaudeSession {
                 .as_ref()
                 .is_some_and(CliSurface::declares_permission_prompts),
             mcp_config: mcp_config.as_deref(),
-        }
-        .build();
+        })
+        .build()
+        {
+            Ok(argv) => argv,
+            Err(error) => {
+                clear_active(&self.shared, &end);
+                return Err(error);
+            }
+        };
 
         let transport = match stdio::open(
             &self.shared.host,
@@ -290,6 +299,11 @@ impl mango_external_agents::Session for ClaudeSession {
                 return Err(error);
             }
         };
+
+        // This move after `stdio::open` makes the ownership boundary explicit. `close` may have
+        // taken the session's `Arc` while the launcher awaited, but it cannot remove the file until
+        // this call either installs the child or kills the stopped child below.
+        let _mcp_lease = mcp_lease;
 
         let limits = *self.shared.host.limits();
         let (sink, events) = EventSink::new(
@@ -388,12 +402,9 @@ impl mango_external_agents::Session for ClaudeSession {
             (control, state.mcp_config.take())
         };
         end_turn(control, CancelReason::from(reason)).await;
-        // The configuration file leaves with the session that wrote it — but only once the child
-        // launched with `--mcp-config` pointing at it is dead. `Drop` unlinks the directory, and
-        // unlinking it first would leave a child that is still starting reading a configuration
-        // that is no longer there: a turn running without the servers somebody set up, rather than
-        // a turn that stopped. Off the lock as well, because a stalled unlink under that guard
-        // blocks every other method on this session.
+        // The session releases its reference here. A start that is still awaiting a child retains
+        // its own `Arc` through the post-spawn lifecycle check, then kills that child before the
+        // final reference can remove the file. Off the lock as well, because cleanup can block.
         drop(mcp_config);
         Ok(())
     }
