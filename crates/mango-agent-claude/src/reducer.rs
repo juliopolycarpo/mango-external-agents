@@ -749,8 +749,13 @@ fn result_error(record: &StreamRecord) -> Option<VendorError> {
         text.to_owned()
     } else if let Some(reason) = terminal_reason {
         format!("Claude Code ended the turn: {reason}.")
-    } else {
+    } else if NAMED_RESULT_SUBTYPES.contains(&subtype) {
         format!("Claude Code ended the turn with \"{subtype}\".")
+    } else {
+        // The record explained nothing and its subtype is one this file does not name, so there is
+        // nothing left that the library wrote. Quoting the subtype here would put it back into the
+        // text a host shows, which is the same field the code was just kept out of.
+        String::from("Claude Code ended the turn without explaining why.")
     };
 
     let error = VendorError::new(result_code(subtype), message);
@@ -763,11 +768,18 @@ fn result_error(record: &StreamRecord) -> Option<VendorError> {
     }
 }
 
-/// The result subtypes this harness will name in a code of its own.
+/// The result subtypes this harness will name, in a code and in a sentence it writes itself.
 ///
-/// Every terminal `subtype` the vendor documents for a failed `--print` run, plus the bare `error`
-/// a record with no subtype falls back to.
-const NAMED_RESULT_SUBTYPES: &[&str] = &["error", "error_during_execution", "error_max_turns"];
+/// Every terminal `subtype` observed on a failed `--print` run — the four that carry their
+/// explanation in `errors` rather than in `result`, as [`ResultRecord::error_texts`] documents —
+/// plus the bare `error` a record with no subtype falls back to.
+const NAMED_RESULT_SUBTYPES: &[&str] = &[
+    "error",
+    "error_during_execution",
+    "error_max_turns",
+    "error_max_budget_usd",
+    "error_max_structured_output_retries",
+];
 
 /// The harness's code for a failed result, from a subtype it recognises.
 ///
@@ -956,6 +968,35 @@ mod tests {
         };
         assert_eq!(error.code.as_str(), "claude-error");
         assert_eq!(error.code.to_string(), "claude-error");
+        // The fallback sentence is the library's own, so it must not put the subtype back.
+        assert!(
+            !error.message.contains("sk-live-subtype-canary"),
+            "expected the subtype to stay out of the message, received {}",
+            error.message
+        );
+    }
+
+    /// The four subtypes that carry their explanation in `errors` are all named, not just two.
+    #[test]
+    fn every_documented_error_subtype_keeps_its_own_code() {
+        for subtype in [
+            "error_during_execution",
+            "error_max_turns",
+            "error_max_budget_usd",
+            "error_max_structured_output_retries",
+        ] {
+            let mut reducer = TurnReducer::new(false);
+            let line = format!(r#"{{"type":"result","subtype":"{subtype}","is_error":true}}"#);
+            let events = reduce(&mut reducer, &line);
+            let EventKind::Error { error } = events.last().expect("expected a terminal") else {
+                panic!("expected an error, received {events:?}");
+            };
+            assert_eq!(
+                error.code.as_str(),
+                format!("claude-{subtype}"),
+                "expected {subtype} to keep its own code"
+            );
+        }
     }
 
     #[test]
