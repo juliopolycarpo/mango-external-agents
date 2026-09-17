@@ -165,6 +165,60 @@ fn take_turn(
     active.control
 }
 
+/// Kills the child a `start_turn` launched if that call never hands back its stream.
+///
+/// The awaits between installing a child and returning its stream are the problem this exists
+/// for. A caller that times out or drops `start_turn` at one of them leaves a started child that
+/// nothing else is watching: no pump has been spawned to reap it, this crate implements no `Drop`
+/// for a session, and a [`ProcessControl`](mango_external_agents::ProcessControl) that is merely
+/// dropped is not killed — the launcher sets no kill-on-drop. Without this the process would
+/// outlive the host's interest in it until an explicit `close`, `cancel` or next `start_turn`, and
+/// a host that simply drops the session issues none of the three.
+///
+/// Disarmed once the pump owns the child, which is the moment something else is responsible for it.
+struct AbandonedStart {
+    shared: Arc<Shared>,
+    end: Arc<TurnEnd>,
+    control: Arc<dyn mango_external_agents::ProcessControl>,
+    armed: bool,
+}
+
+impl AbandonedStart {
+    /// Hands responsibility for the child to whoever comes next.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbandonedStart {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Out of the session under the lock, so a later close or start finds no active turn
+        // pointing at a child this is reaping. Only if it is still ours: a stop that already took
+        // it owns what it took.
+        {
+            let mut state = self.shared.lock();
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.end, &self.end))
+            {
+                let _ = take_turn(&mut state, CancelReason::Requested);
+            }
+        }
+        // `kill` is async and a `Drop` is not, so the reap runs on a task of its own. Off a
+        // runtime there is nothing to spawn onto and nothing left that could await a child.
+        let control = Arc::clone(&self.control);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = control.kill(CancelReason::Requested).await;
+            });
+        }
+    }
+}
+
 /// Ends a child taken by [`take_turn`], if it had one yet. The pump writes the events.
 async fn end_turn(
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
@@ -378,6 +432,15 @@ impl mango_external_agents::Session for ClaudeSession {
         // also holds, so this is usually a cheap decrement; it removes the artifact only when a
         // `close` already took the session's reference, and that `close` is killing the child
         // anyway.
+        // Armed before the release below, which is the await this call can be abandoned at now
+        // that the child is installed. Disarmed where the pump takes the child over.
+        let mut abandoned = AbandonedStart {
+            shared: Arc::clone(&self.shared),
+            end: Arc::clone(&end),
+            control: Arc::clone(&control),
+            armed: true,
+        };
+
         crate::mcp::release_off_worker(mcp_lease.take()).await;
 
         // Re-checked for the same reason the guard above re-checks after `stdio::open`: the
@@ -403,8 +466,9 @@ impl mango_external_agents::Session for ClaudeSession {
             }
         };
         if let Some(reason) = stopped {
-            // The stop owns the control it took, but it only kills what was installed when it ran.
-            // This kill is the one that answers for the child this call launched.
+            // Awaited here rather than left to the guard, which can only spawn its kill: this
+            // call is returning a refusal and the child it launched is reaped before it does.
+            abandoned.disarm();
             let _ = control.kill(reason).await;
             return Err(if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
@@ -413,6 +477,8 @@ impl mango_external_agents::Session for ClaudeSession {
             });
         }
 
+        // The pump owns the child from here, and there is no await between this and the return.
+        abandoned.disarm();
         tokio::spawn(pump(
             Arc::clone(&self.shared),
             transport.link,

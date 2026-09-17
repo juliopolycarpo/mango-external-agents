@@ -1111,6 +1111,71 @@ mod mcp_passthrough {
         assert_eq!(written["mcpServers"]["docs"]["env"]["DOCS_TOKEN"], "s3cret");
     }
 
+    /// Nothing reaps a child on its own: the session implements no `Drop`, and a `ProcessControl`
+    /// that is merely dropped is not killed. So a `start_turn` abandoned at the lease release must
+    /// kill the child it launched itself, or the process outlives the host's interest in it until
+    /// an explicit `close`, `cancel` or next `start_turn` — and a host that simply drops the
+    /// session never issues one.
+    #[test]
+    fn a_dropped_start_turn_reaps_the_child_it_launched() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_help(HELP_2_1_270)
+                    .with_turn(Run::stalling::<[String; 0], String>([])),
+            );
+            let scratch =
+                std::env::temp_dir().join(format!("mea-reap-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session");
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+
+            let start = session.start_turn(TurnRequest::new("turn-1", "start something long"));
+            let abandoned = tokio::time::timeout(Duration::from_millis(250), start).await;
+            assert!(
+                abandoned.is_err(),
+                "expected the turn to be parked on the occupied blocking pool"
+            );
+
+            drop(release_pool);
+            let _ = occupied.await;
+            // The reap runs on a task, because `Drop` cannot await a kill.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                launcher.mcp_config_at_kill().len(),
+                1,
+                "expected the abandoned start to kill the child it launched"
+            );
+
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
     /// The release is an await, so a `cancel`, a `close` or a second `start_turn` can take this
     /// turn while it is parked there. Resuming and spawning the pump anyway would hand back a
     /// successful stream for a turn that was already stopped, and write its prompt to a child
