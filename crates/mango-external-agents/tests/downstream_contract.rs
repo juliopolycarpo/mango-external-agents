@@ -650,8 +650,10 @@ fn a_discovery_receipt_states_its_own_identity_and_freshness() {
         )
         .expect_err("expected a receipt for another harness to be refused");
     assert!(
-        error.to_string().contains("a receipt for claude"),
-        "expected both harness ids in the diagnostic, received {error}"
+        error
+            .to_string()
+            .contains("a receipt for a different harness"),
+        "expected the mismatch without payloads in the diagnostic, received {error}"
     );
 }
 
