@@ -490,14 +490,7 @@ fn safe_unix_scratch_path(path: &Path, effective: u32) -> Result<bool> {
     for ancestor in path.ancestors() {
         let metadata = std::fs::symlink_metadata(ancestor)
             .map_err(|error| scratch_failure("read a scratch directory ancestor", &error))?;
-        // A symlink's own mode is `lrwxrwxrwx` on every Unix worth naming and means nothing: what
-        // a symlink permits is decided by its target, and whether the link itself can be swapped
-        // is decided by the directory holding it, which is the next ancestor this loop reads.
-        // Judging it by its own bits would refuse `/var` on macOS and prove nothing anywhere.
-        if metadata.is_symlink() {
-            continue;
-        }
-        chain.push((metadata.mode(), metadata.uid()));
+        chain.push((metadata.is_symlink(), metadata.mode(), metadata.uid()));
     }
 
     Ok(safe_unix_scratch_chain(&chain, effective))
@@ -514,13 +507,28 @@ fn unsafe_scratch_chain() -> Error {
 
 /// Whether no link of a scratch chain can be replaced by a third party.
 ///
-/// Each entry is `(mode, owner)`, from the leaf outwards. One replaceable ancestor is enough to
-/// replace everything below it, so this is an `all`, not a check of the leaf with context.
+/// Each entry is `(is_symlink, mode, owner)`, from the leaf outwards. One replaceable ancestor is
+/// enough to replace everything below it, so this is an `all`, not a check of the leaf with context.
 #[cfg(unix)]
-fn safe_unix_scratch_chain(chain: &[(u32, u32)], effective: u32) -> bool {
-    chain
-        .iter()
-        .all(|&(mode, owner)| safe_unix_scratch_root(mode, owner, effective))
+fn safe_unix_scratch_chain(chain: &[(bool, u32, u32)], effective: u32) -> bool {
+    chain.iter().all(|&(is_symlink, mode, owner)| {
+        safe_unix_scratch_component(is_symlink, mode, owner, effective)
+    })
+}
+
+/// Whether one component of a scratch path is beyond a third party's reach.
+///
+/// A symlink is judged by its owner alone. Its own mode is `lrwxrwxrwx` on every Unix worth
+/// naming and grants nothing, so reading those bits would refuse `/var` on macOS for no reason.
+/// Its owner is not decoration: the sticky bit that makes a shared parent acceptable is precisely
+/// the rule that still lets an entry's own owner replace it, so a symlink another user owns under
+/// `/tmp` is one they can retarget after this check and before Claude follows it.
+#[cfg(unix)]
+fn safe_unix_scratch_component(is_symlink: bool, mode: u32, owner: u32, effective: u32) -> bool {
+    if is_symlink {
+        return owner == effective || owner == 0;
+    }
+    safe_unix_scratch_root(mode, owner, effective)
 }
 
 /// Whether Unix directory ownership and mode prevent a third party from replacing a session leaf.
@@ -544,7 +552,7 @@ mod tests {
     use std::path::Path;
 
     #[cfg(unix)]
-    use super::{safe_unix_scratch_chain, safe_unix_scratch_root};
+    use super::{safe_unix_scratch_chain, safe_unix_scratch_component, safe_unix_scratch_root};
 
     /// The refusal both scratch-chain tests match, kept in one place so a reworded invariant
     /// fails them rather than silently matching a different `HostConfiguration`.
@@ -1329,16 +1337,44 @@ mod tests {
     #[test]
     fn one_replaceable_ancestor_condemns_the_whole_scratch_chain() {
         // Leaf outwards: a private root, a shared sticky parent, a root-owned grandparent.
-        let safe = [(0o700, 1000), (0o1777, 0), (0o755, 0)];
+        let safe = [(false, 0o700, 1000), (false, 0o1777, 0), (false, 0o755, 0)];
         assert!(safe_unix_scratch_chain(&safe, 1000));
 
         let mut replaceable_parent = safe;
-        replaceable_parent[1] = (0o777, 1000);
+        replaceable_parent[1] = (false, 0o777, 1000);
         assert!(!safe_unix_scratch_chain(&replaceable_parent, 1000));
 
         let mut foreign_grandparent = safe;
-        foreign_grandparent[2] = (0o1777, 1001);
+        foreign_grandparent[2] = (false, 0o1777, 1001);
         assert!(!safe_unix_scratch_chain(&foreign_grandparent, 1000));
+    }
+
+    /// Sticky is what lets an entry's own owner replace it, so a symlink another user owns under
+    /// `/tmp` is retargetable however trustworthy `/tmp` itself is. A symlink is judged by owner
+    /// and never by its own `lrwxrwxrwx` mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_judged_by_its_owner_and_not_by_its_own_mode() {
+        assert!(safe_unix_scratch_component(true, 0o777, 1000, 1000));
+        assert!(safe_unix_scratch_component(true, 0o777, 0, 1000));
+        assert!(!safe_unix_scratch_component(true, 0o777, 1001, 1000));
+
+        // The same bits on a real directory are refused: a directory grants what its mode says.
+        assert!(!safe_unix_scratch_component(false, 0o777, 1000, 1000));
+    }
+
+    /// A foreign-owned symlink under a root-owned sticky directory is the `/tmp` case: every
+    /// non-symlink link of the chain is impeccable and the path is still retargetable.
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_symlink_under_a_sticky_parent_condemns_the_chain() {
+        let chain = [
+            (false, 0o700, 1000),
+            (true, 0o777, 1001),
+            (false, 0o1777, 0),
+            (false, 0o755, 0),
+        ];
+        assert!(!safe_unix_scratch_chain(&chain, 1000));
     }
 
     #[cfg(unix)]
