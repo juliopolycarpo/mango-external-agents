@@ -56,16 +56,35 @@ pub fn program_name(raw: &str) -> String {
 
 const REDACTED: &str = "[REDACTED]";
 
+/// Every program a harness in this workspace launches on its own account.
+///
+/// The two first-party CLIs, then the `argv[0]` of each built-in ACP profile in
+/// `mango-agent-acp`. A profile whose executable is missing here is reported as
+/// `custom executable`, which is the only thing a launch failure has left to say about which
+/// agent it was — `Error::Launch` keeps its launcher message off the diagnostic. The ACP crate
+/// holds the list to this one in
+/// `every_builtin_profile_is_named_rather_than_redacted_in_a_diagnostic`, so adding a profile
+/// without adding its program fails there rather than degrading in a log.
+const KNOWN_PROGRAMS: &[&str] = &[
+    "claude",
+    "codex",
+    "cursor-agent",
+    "grok",
+    "opencode",
+    "gemini",
+    "copilot",
+    "goose",
+    "codex-acp",
+    "claude-agent-acp",
+];
+
 fn is_known_program(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let bare = lower
         .strip_suffix(".exe")
         .or_else(|| lower.strip_suffix(".ps1"))
         .unwrap_or(&lower);
-    matches!(
-        bare,
-        "claude" | "codex" | "cursor-agent" | "grok" | "opencode"
-    )
+    KNOWN_PROGRAMS.contains(&bare)
 }
 
 /// `authorization : bearer <token>`, however it was spaced and cased.
@@ -348,6 +367,27 @@ mod tests {
             program_name("/private/bin/token=secret"),
             "custom executable"
         );
+    }
+
+    /// The ACP adapters a launch failure could otherwise only call `custom executable`.
+    ///
+    /// `Error::Launch` keeps its launcher message out of the diagnostic, so this name is the only
+    /// remaining statement of which agent failed to start.
+    #[test]
+    fn program_name_keeps_every_built_in_acp_executable() {
+        for program in [
+            "gemini",
+            "copilot",
+            "goose",
+            "codex-acp",
+            "claude-agent-acp",
+        ] {
+            assert_eq!(
+                program_name(&format!("/private/bin/{program}")),
+                program,
+                "expected {program} to be named, received a redacted stand-in"
+            );
+        }
     }
 
     #[test]

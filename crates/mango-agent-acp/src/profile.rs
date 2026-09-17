@@ -573,6 +573,28 @@ mod tests {
         }
     }
 
+    /// Holds core's safe-program list to the profiles this crate actually launches.
+    ///
+    /// A launch failure reports `redact::program_name` and nothing else — `Error::Launch` keeps
+    /// the launcher's own message off the diagnostic — so a profile core does not know reads as
+    /// `custom executable` and the operator cannot tell which agent failed to start. Adding a
+    /// profile without adding its program fails here rather than degrading silently in a log.
+    #[test]
+    fn every_builtin_profile_is_named_rather_than_redacted_in_a_diagnostic() {
+        for profile in builtin_profiles() {
+            let program = profile
+                .argv
+                .first()
+                .expect("a built-in profile has an argv");
+            assert_eq!(
+                mango_external_agents::redact::program_name(program),
+                *program,
+                "expected {} to name itself in a diagnostic, received a redacted stand-in",
+                profile.id
+            );
+        }
+    }
+
     #[test]
     fn profile_ids_are_distinct() {
         let mut ids: Vec<String> = builtin_profiles()
