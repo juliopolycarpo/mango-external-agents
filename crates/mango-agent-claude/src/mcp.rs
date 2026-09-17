@@ -40,6 +40,8 @@ const FILE_NAME: &str = "mcp-servers.json";
 /// One session's `--mcp-config` file, removed when it is dropped.
 pub struct ConfigFile {
     directory: PathBuf,
+    /// Set by [`remove`](Self::remove), so `Drop` does not try the same removal again.
+    removed: bool,
     /// The file's path, as the string `--mcp-config` takes. UTF-8 was already proven when this was
     /// written, so [`path`](Self::path) can hand it back as a [`Path`] without a second check.
     argument: String,
@@ -144,6 +146,7 @@ impl ConfigFile {
         // credential-carrying file inside it — behind for nobody to clean up.
         let file = Self {
             directory,
+            removed: false,
             argument,
         };
         file.populate(&document, writer)?;
@@ -169,6 +172,25 @@ impl ConfigFile {
     pub fn argument(&self) -> &str {
         &self.argument
     }
+
+    /// Removes the artifact, and says whether it went.
+    ///
+    /// `Drop` is best-effort because it has nowhere to report to. A close does: it promised the
+    /// session's resources were released, and this file holds the `env` and `headers` a host
+    /// configured its MCP servers with. A scratch mount that went away, or whose permissions
+    /// changed under the session, leaves that on disk — which is the one thing a host has to hear
+    /// about even though it cannot be fixed from here.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HostConfiguration`] when the removal failed, naming the I/O error kind.
+    fn remove(mut self) -> Result<()> {
+        self.removed = true;
+        std::fs::remove_dir_all(&self.directory).map_err(|error| Error::HostConfiguration {
+            expected: "a scratch directory the session can remove when it closes",
+            received: format!("a removal failure ({:?})", error.kind()),
+        })
+    }
 }
 
 impl Drop for ConfigFile {
@@ -176,9 +198,12 @@ impl Drop for ConfigFile {
     ///
     /// Synchronous, deliberately: a value dropped without a close has no runtime to hand the call
     /// to, and by the time the last session drops the runtime may already be shutting down. A
-    /// close that does have one goes through `release_off_worker` instead, and a call that was
+    /// close that does have one goes through `remove_on_close` instead, and a call that was
     /// cancelled mid-open through `Prepared`.
     fn drop(&mut self) {
+        if self.removed {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
@@ -225,6 +250,30 @@ fn release_on_drop<T: Send + 'static>(value: T) {
         }
         Err(_) => drop(value),
     }
+}
+
+/// Removes a session's artifact as its close, reporting a removal that did not happen.
+///
+/// Only the last reference removes anything: a start still holding its lease removes the file when
+/// it finishes, and this close has nothing to report about it.
+///
+/// # Errors
+///
+/// [`Error::HostConfiguration`] when the removal failed, or when the blocking pool could not run
+/// it. The session is closed either way — this says what was left on disk.
+pub(crate) async fn remove_on_close(file: Option<std::sync::Arc<ConfigFile>>) -> Result<()> {
+    let Some(file) = file else {
+        return Ok(());
+    };
+    let Some(file) = std::sync::Arc::into_inner(file) else {
+        return Ok(());
+    };
+    tokio::task::spawn_blocking(move || file.remove())
+        .await
+        .map_err(|_| Error::HostConfiguration {
+            expected: "a blocking pool that can remove the MCP configuration",
+            received: String::from("a blocking task that did not finish"),
+        })?
 }
 
 /// Releases a configuration artifact without running the host's filesystem on the async worker.
@@ -782,6 +831,68 @@ mod tests {
             !directory.exists(),
             "expected the artifact to be gone, received {directory:?}"
         );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A close that could not remove the artifact says so: the file holds host-configured secrets.
+    #[tokio::test]
+    async fn a_close_reports_a_removal_that_did_not_happen() {
+        use std::sync::Arc;
+
+        let scratch = tempdir();
+        let file = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected a file")
+            .expect("expected servers to produce one");
+        // Removing the directory out from under the session is what a scratch mount that went away
+        // looks like from here.
+        let directory = file
+            .path()
+            .parent()
+            .expect("a file sits in a directory")
+            .to_path_buf();
+        std::fs::remove_dir_all(&directory)
+            .expect("expected the scratch directory to be removable");
+
+        let error = super::remove_on_close(Some(Arc::new(file)))
+            .await
+            .expect_err("expected the close to report the removal it could not do");
+        assert!(
+            error.to_string().contains("NotFound"),
+            "expected the io error kind, received {error}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A start still holding its lease removes the file itself, so the close has nothing to report.
+    #[tokio::test]
+    async fn a_close_that_is_not_the_last_reference_reports_nothing() {
+        use std::sync::Arc;
+
+        let scratch = tempdir();
+        let file = Arc::new(
+            ConfigFile::write(&servers(), &scratch)
+                .await
+                .expect("expected a file")
+                .expect("expected servers to produce one"),
+        );
+        let lease = Arc::clone(&file);
+        let directory = file
+            .path()
+            .parent()
+            .expect("a file sits in a directory")
+            .to_path_buf();
+
+        super::remove_on_close(Some(file))
+            .await
+            .expect("expected a close holding a lease out to report nothing");
+        assert!(
+            directory.exists(),
+            "expected the lease to keep the artifact, received {directory:?}"
+        );
+
+        super::release_off_worker(Some(lease)).await;
+        assert!(!directory.exists(), "expected the lease to remove it");
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

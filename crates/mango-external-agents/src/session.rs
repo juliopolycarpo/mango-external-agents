@@ -1055,7 +1055,9 @@ pub trait Session: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Whatever the vendor or the link reported.
+    /// Whatever the vendor or the link reported, and whatever a resource this session owns failed
+    /// to release. The session is closed either way — a refusal here says what was left behind,
+    /// not that the close should be tried again.
     async fn close(&self, reason: CloseReason) -> Result<()>;
 
     /// Adds to a turn that is already running.

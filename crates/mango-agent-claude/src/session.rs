@@ -414,8 +414,9 @@ impl mango_external_agents::Session for ClaudeSession {
         // its own `Arc` through the post-spawn lifecycle check, then kills that child before the
         // final reference can remove the file. Off the lock, and off the async worker: removing
         // the directory is a synchronous filesystem call against the host's own scratch root.
-        crate::mcp::release_off_worker(mcp_config).await;
-        Ok(())
+        // Reported rather than swallowed: this close promised the session's resources were
+        // released, and the file holds the `env` and `headers` a host configured its servers with.
+        crate::mcp::remove_on_close(mcp_config).await
     }
 }
 
