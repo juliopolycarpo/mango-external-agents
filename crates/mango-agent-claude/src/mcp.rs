@@ -112,6 +112,21 @@ impl ConfigFile {
                 received: String::from("a non-UTF-8 path"),
             });
         };
+        // The same predicate `TurnArgv::build` applies to `--mcp-config`, against the finished
+        // path rather than the root, because the leaf directory and the file name are part of what
+        // the cap measures. Checked before the directory exists: a scratch root the CLI cannot be
+        // handed — one holding a newline, say, which every Unix filesystem accepts — would
+        // otherwise open a session, write the credential-bearing artifact, and fail every turn it
+        // is asked for.
+        if !mango_external_agents::normalize::is_argv_value_with_max(
+            &argument,
+            mango_external_agents::normalize::MAX_PATH_LENGTH,
+        ) {
+            return Err(Error::HostConfiguration {
+                expected: "a scratch path that can occupy a --mcp-config value",
+                received: crate::argv::value_summary(&argument),
+            });
+        }
 
         create_private_directory(&directory)?;
         // Owned from the moment the directory exists, so every failure below returns through this
@@ -455,6 +470,41 @@ mod tests {
             "received {non_directory:?}"
         );
         let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// A path every Unix filesystem accepts and `--mcp-config` cannot carry.
+    ///
+    /// `TurnArgv::build` refuses a control character in an argv value, so a session opened over
+    /// this root would write the credential-bearing artifact, return successfully, and then fail
+    /// every turn it was asked for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_a_scratch_path_the_turn_argv_could_not_carry() {
+        let root = tempdir();
+        let scratch = root.join("holds\na newline");
+        std::fs::create_dir(&scratch).expect("expected a host-owned scratch directory");
+
+        let error = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect_err("expected an unusable scratch path to be refused");
+        assert!(
+            matches!(
+                error,
+                mango_external_agents::Error::HostConfiguration {
+                    expected: "a scratch path that can occupy a --mcp-config value",
+                    ..
+                }
+            ),
+            "expected the argv-value refusal, received {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch)
+                .expect("expected the host scratch root")
+                .count(),
+            0,
+            "expected no artifact beneath a scratch root the CLI cannot be handed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Opening a session must not run the host's filesystem on the async worker.

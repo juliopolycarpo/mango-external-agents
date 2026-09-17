@@ -295,7 +295,10 @@ Claude reads it. The host remains responsible for safe ancestors, ACLs, and chil
 The harness creates one unique leaf below it with owner-only Unix permissions, or the host root's
 inherited Windows ACL, and removes that leaf when the session is closed or dropped. It never
 creates, changes or falls back outside the host root. A missing or unusable root refuses opening
-before a Claude probe starts.
+before a Claude probe starts — including a root whose finished leaf path could not occupy a
+`--mcp-config` value, such as one holding a control character that every Unix filesystem accepts
+and the CLI's own parser does not. That check runs before the leaf is created, so a session never
+opens over a path whose every turn would fail.
 
 A build that does not declare `--mcp-config` returns
 `Error::NotSupported { capability: Capability::McpPassthrough }`; a transport kind this harness

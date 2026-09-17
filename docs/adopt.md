@@ -40,9 +40,10 @@ let host = HostContext::builder()
    sandbox mount that makes the same path visible to the child. On Unix, Claude accepts a root
    owned by the effective user or root; if group or other may write it, it must have the sticky bit
    (`/tmp` normally does). On Windows, its ACL must authorize only the intended child identities.
-   The library creates and removes only a unique leaf beneath it. It never falls back to a
-   process-global temporary directory. Claude requires this for `--mcp-config`; a host that does
-   not use MCP can leave it unset.
+   The library creates and removes only a unique leaf beneath it, and the whole leaf path must be
+   one the vendor's own command line can carry. It never falls back to a process-global temporary
+   directory. Claude requires this for `--mcp-config`; a host that does not use MCP can leave it
+   unset.
 
 4. **An environment source.** The library builds the positive allowlist — `BASE_ENVIRONMENT_KEYS`,
    every `LC_*`, and the harness's own `vendor_environment_keys` — from what the host passes.
