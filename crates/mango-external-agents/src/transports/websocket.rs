@@ -319,14 +319,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dial_to_nowhere_names_the_endpoint_rather_than_panicking() {
+    async fn a_dial_to_nowhere_retains_the_endpoint_as_data_without_panicking() {
         // Port 1 is reserved and nothing is listening on it.
         let error = dial(&WsSpec::new("ws://127.0.0.1:1"), LineLimits::default())
             .await
             .expect_err("expected a refusal, received a link");
         assert!(
-            error.to_string().contains("127.0.0.1:1"),
-            "expected the endpoint to be named, received {error}"
+            matches!(&error, crate::Error::Link { peer, .. } if peer.contains("127.0.0.1:1")),
+            "expected the raw endpoint data, received {error:?}"
+        );
+        assert!(
+            error.to_string().contains("vendor link failed"),
+            "expected a safe link diagnostic, received {error}"
         );
     }
 
@@ -369,8 +373,8 @@ mod tests {
             "expected no url password, received {rendered}"
         );
         assert!(
-            rendered.contains("agent.internal"),
-            "expected the endpoint to stay legible, received {rendered}"
+            rendered.contains("endpoint_configured: true") && rendered.contains("secure: true"),
+            "expected safe endpoint metadata, received {rendered}"
         );
 
         // `TransportSpec` derives its own `Debug` from this one, so the same must hold there.
@@ -397,8 +401,12 @@ mod tests {
             "expected no url password, received {error}"
         );
         assert!(
-            error.to_string().contains("127.0.0.1:1"),
-            "expected the endpoint to be named, received {error}"
+            matches!(&error, crate::Error::Link { peer, .. } if peer.contains("127.0.0.1:1")),
+            "expected the raw endpoint data, received {error:?}"
+        );
+        assert!(
+            error.to_string().contains("vendor link failed"),
+            "expected a safe link diagnostic, received {error}"
         );
     }
 

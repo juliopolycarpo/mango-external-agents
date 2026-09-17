@@ -83,8 +83,8 @@ impl std::fmt::Debug for EventSink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("EventSink")
-            .field("session_id", &self.session_id)
-            .field("turn_id", &self.turn_id)
+            .field("has_session_id", &true)
+            .field("has_turn_id", &true)
             .field("is_closed", &self.is_closed())
             .finish_non_exhaustive()
     }
@@ -267,6 +267,24 @@ mod tests {
             Arc::new(SystemClock),
             capacity,
         )
+    }
+
+    #[test]
+    fn event_sink_debug_omits_host_routing_ids() {
+        let (sink, _events) = EventSink::new(
+            SessionId::new("session-id-secret"),
+            TurnId::new("turn-id-secret"),
+            Arc::new(SystemClock),
+            1,
+        );
+
+        let rendered = format!("{sink:?}");
+        for secret in ["session-id-secret", "turn-id-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no host id in event sink diagnostics, received {rendered}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ use crate::session::CancelReason;
 /// environment is the positive allowlist built from the host's [`EnvSource`](crate::EnvSource)
 /// and the harness's documented keys. A launcher that overwrote either would be widening an
 /// authorisation the library was given, not granted.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
     /// The program and its arguments. The first element is the executable.
     pub argv: Vec<String>,
@@ -45,6 +45,21 @@ impl LaunchSpec {
     /// The executable, when the argv is not empty.
     pub fn program(&self) -> Option<&str> {
         self.argv.first().map(String::as_str)
+    }
+}
+
+impl std::fmt::Debug for LaunchSpec {
+    /// Shows the launch shape without exposing host-provided arguments, paths, or environment
+    /// values. Callers that need those values already own the spec they constructed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LaunchSpec")
+            .field("program", &self.program().map(redact::program_name))
+            .field("argument_count", &self.argv.len().saturating_sub(1))
+            .field("environment_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("stdin", &self.stdin)
+            .field("hide_window", &self.hide_window)
+            .finish()
     }
 }
 
@@ -129,7 +144,7 @@ pub trait ProcessLauncher: Send + Sync {
 ///
 /// Shared between the launcher filling it and the control handle reading it. The unredacted bytes
 /// never leave this type.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StderrTail {
     buffer: Arc<Mutex<Vec<u8>>>,
     max_bytes: usize,
@@ -193,6 +208,18 @@ impl StderrTail {
     pub fn read(&self) -> String {
         let buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
         redact::stderr_text(&String::from_utf8_lossy(&buffer))
+    }
+}
+
+impl std::fmt::Debug for StderrTail {
+    /// Reports capacity and occupancy without turning retained stderr into a byte-array dump.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        formatter
+            .debug_struct("StderrTail")
+            .field("max_bytes", &self.max_bytes)
+            .field("buffered_bytes", &buffer.len())
+            .finish()
     }
 }
 
@@ -322,7 +349,9 @@ impl LineStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{ByteSource, Error, LineLimits, LineStream, Result, StderrTail};
+    use super::{ByteSource, Error, LaunchSpec, LineLimits, LineStream, Result, StderrTail};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     /// A source that hands out exactly the chunks a test scripted, in order.
     struct ScriptedSource {
@@ -346,6 +375,85 @@ mod tests {
         async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
             Ok(self.chunks.pop())
         }
+    }
+
+    #[test]
+    fn launch_spec_debug_keeps_credential_values_out_of_diagnostics() {
+        let spec = LaunchSpec {
+            argv: vec![
+                String::from("vendor"),
+                String::from("--api-key"),
+                String::from("argv-secret"),
+                String::from("--endpoint=https://user:url-secret@agent.internal"),
+            ],
+            cwd: PathBuf::from("/workspace"),
+            env: BTreeMap::from([(String::from("VENDOR_API_KEY"), String::from("env-secret"))]),
+            stdin: true,
+            hide_window: false,
+        };
+
+        let rendered = format!("{spec:?}");
+        for secret in ["argv-secret", "url-secret", "env-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no credential in the launch diagnostic, received {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("custom executable"),
+            "expected a safe program summary, received {rendered}"
+        );
+        assert!(
+            rendered.contains("VENDOR_API_KEY"),
+            "expected the environment key, received {rendered}"
+        );
+    }
+
+    #[test]
+    fn stderr_tail_debug_never_dumps_its_raw_buffer() {
+        let tail = StderrTail::with_capacity(1024);
+        tail.push(b"Authorization: Bearer raw-buffer-secret");
+
+        let rendered = format!("{tail:?}");
+        assert!(
+            !rendered.contains("raw-buffer-secret"),
+            "expected no raw stderr bytes, received {rendered}"
+        );
+        assert!(
+            !rendered.contains("buffer:"),
+            "expected no raw stderr buffer dump, received {rendered}"
+        );
+        assert!(
+            rendered.contains("max_bytes: 1024"),
+            "expected capacity context, received {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_stderr_tail_redacts_multiline_credentials_across_chunks() {
+        let tail = StderrTail::with_capacity(1024);
+        tail.push(b"request failed\nAuthorization: Bea");
+        tail.push(b"rer chunked-bearer-secret\nredis://app:chunked-");
+        tail.push(b"url-secret@db.internal/main\n");
+
+        let rendered = tail.read();
+        for secret in ["chunked-bearer-secret", "chunked-url-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no credential in the stderr tail, received {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("Authorization: Bearer [REDACTED]")
+                && rendered.contains("redis://app:[REDACTED]@db.internal/main"),
+            "expected redacted multiline context, received {rendered}"
+        );
+
+        let debug = format!("{tail:?}");
+        assert!(
+            !debug.contains("chunked-bearer-secret") && !debug.contains("chunked-url-secret"),
+            "expected no raw chunks in debug output, received {debug}"
+        );
     }
 
     fn stream<const N: usize>(chunks: [&str; N], limits: LineLimits) -> LineStream {

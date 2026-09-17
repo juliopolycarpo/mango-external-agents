@@ -189,8 +189,18 @@ mod tests {
             panic!("expected a refusal, received a harness");
         };
         assert!(
-            error.to_string().contains("claude"),
-            "expected the message to name what is registered, received {error}"
+            matches!(
+                &error,
+                Error::HostConfiguration {
+                    expected: "a registered harness kind",
+                    received,
+                } if received.contains("claude")
+            ),
+            "expected the raw configuration data to name what is registered, received {error:?}"
+        );
+        assert!(
+            error.to_string().contains("invalid host configuration"),
+            "expected a safe host diagnostic, received {error}"
         );
     }
 

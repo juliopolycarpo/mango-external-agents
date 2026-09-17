@@ -29,7 +29,44 @@ pub fn stderr_text(raw: &str) -> String {
     redact_url_passwords(&assignments)
 }
 
+/// A safe executable summary from a host-owned path.
+///
+/// A diagnostic can name known vendor programs, but an arbitrary executable basename is
+/// host-provided text that can carry a secret. Both slash forms are accepted so a Windows path
+/// stays safe when formatted on another platform. Unknown names report `custom executable`.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::redact;
+///
+/// assert_eq!(redact::program_name("/private/bin/codex"), "codex");
+/// assert_eq!(
+///     redact::program_name("/private/bin/customer-secret-canary"),
+///     "custom executable"
+/// );
+/// ```
+pub fn program_name(raw: &str) -> String {
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    if is_known_program(name) {
+        return name.to_owned();
+    }
+    String::from("custom executable")
+}
+
 const REDACTED: &str = "[REDACTED]";
+
+fn is_known_program(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let bare = lower
+        .strip_suffix(".exe")
+        .or_else(|| lower.strip_suffix(".ps1"))
+        .unwrap_or(&lower);
+    matches!(
+        bare,
+        "claude" | "codex" | "cursor-agent" | "grok" | "opencode"
+    )
+}
 
 /// `authorization : bearer <token>`, however it was spaced and cased.
 ///
@@ -271,7 +308,7 @@ fn is_unsafe_to_render(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::stderr_text;
+    use super::{program_name, stderr_text};
 
     /// The fixture a vendor child writes in the port's own process test.
     const FIXTURE: &str =
@@ -296,6 +333,20 @@ mod tests {
         assert_eq!(
             redacted,
             "Authorization: Bearer [REDACTED] API_KEY=[REDACTED] redis://app:[REDACTED]@db/main"
+        );
+    }
+
+    #[test]
+    fn program_name_keeps_known_vendors_and_omits_arbitrary_basenames() {
+        assert_eq!(program_name("/private/bin/codex"), "codex");
+        assert_eq!(program_name(r"C:\\private\\bin\\CLAUDE.EXE"), "CLAUDE.EXE");
+        assert_eq!(
+            program_name("/private/bin/customer-secret-canary"),
+            "custom executable"
+        );
+        assert_eq!(
+            program_name("/private/bin/token=secret"),
+            "custom executable"
         );
     }
 
@@ -405,6 +456,27 @@ mod tests {
         assert_eq!(
             stderr_text("authorization:basic\tdXNlcjpodW50ZXIy"),
             "authorization:basic [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redacts_multiline_credentials_after_stderr_arrives_in_chunks() {
+        let tail = concat!(
+            "request failed\nAuthorization:\n",
+            "  Bearer multiline-secret\n",
+            "retry at https://user:url-secret@agent.internal"
+        );
+        let redacted = stderr_text(tail);
+
+        for secret in ["multiline-secret", "url-secret"] {
+            assert!(
+                !redacted.contains(secret),
+                "expected no credential from chunked stderr, received {redacted:?}"
+            );
+        }
+        assert!(
+            redacted.contains("request failed"),
+            "expected safe diagnostic context, received {redacted:?}"
         );
     }
 

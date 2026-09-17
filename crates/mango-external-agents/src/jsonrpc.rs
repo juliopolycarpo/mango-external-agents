@@ -36,8 +36,18 @@ use crate::link::{Link, LinkSender};
 /// request `0` with `"0"` is a different id, so the peer never matches the answer to the question
 /// and blocks forever — which presents as a turn that renders an approval, accepts a click, and
 /// then simply never finishes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RequestId(Value);
+
+impl std::fmt::Debug for RequestId {
+    /// Reports the JSON id type without logging the peer-provided identifier.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestId")
+            .field("json_type", &json_value_type(&self.0))
+            .finish()
+    }
+}
 
 impl RequestId {
     /// Wraps an id as it arrived.
@@ -69,7 +79,7 @@ impl std::fmt::Display for RequestId {
 }
 
 /// A JSON-RPC error body.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JsonRpcError {
     /// The peer's code.
     pub code: i64,
@@ -78,6 +88,18 @@ pub struct JsonRpcError {
     /// Whatever else the peer attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+impl std::fmt::Debug for JsonRpcError {
+    /// Reports error structure without logging peer-provided text or JSON payloads.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JsonRpcError")
+            .field("code", &self.code)
+            .field("message_bytes", &self.message.len())
+            .field("data_type", &self.data.as_ref().map(json_value_type))
+            .finish()
+    }
 }
 
 impl JsonRpcError {
@@ -92,7 +114,7 @@ impl JsonRpcError {
 }
 
 /// What a handler answers a peer's question with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ServerRequestOutcome {
     /// An answer.
     Answer(Value),
@@ -100,8 +122,21 @@ pub enum ServerRequestOutcome {
     Failure(JsonRpcError),
 }
 
+impl std::fmt::Debug for ServerRequestOutcome {
+    /// Reports reply shape without logging the peer answer or error payload.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Answer(value) => formatter
+                .debug_struct("Answer")
+                .field("result_type", &json_value_type(value))
+                .finish(),
+            Self::Failure(error) => formatter.debug_tuple("Failure").field(error).finish(),
+        }
+    }
+}
+
 /// Why the peer's read side stopped without this client closing it first.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PeerTermination {
     /// The peer closed its output.
     Exited,
@@ -114,16 +149,48 @@ pub enum PeerTermination {
     },
 }
 
+impl std::fmt::Debug for PeerTermination {
+    /// Reports why the peer stopped without logging its unstructured link failure.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited => formatter.write_str("Exited"),
+            Self::LinkFailed(error) => formatter
+                .debug_struct("LinkFailed")
+                .field("message_bytes", &error.len())
+                .finish(),
+            Self::NotificationBackpressure { limit } => formatter
+                .debug_struct("NotificationBackpressure")
+                .field("limit", limit)
+                .finish(),
+        }
+    }
+}
+
 impl std::fmt::Display for PeerTermination {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Exited => formatter.write_str("the peer exited"),
-            Self::LinkFailed(error) => write!(formatter, "the peer link failed: {error}"),
+            Self::LinkFailed(error) => write!(
+                formatter,
+                "the peer link failed with an unstructured error ({} bytes)",
+                error.len()
+            ),
             Self::NotificationBackpressure { limit } => write!(
                 formatter,
                 "the peer sent more messages than the client could retain while its handler was busy (limit {limit})"
             ),
         }
+    }
+}
+
+fn json_value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -941,6 +1008,38 @@ mod tests {
         )
     }
 
+    #[test]
+    fn jsonrpc_debug_omits_raw_peer_payloads() {
+        let id = RequestId::new(json!("request-id-secret"));
+        let failure = JsonRpcError {
+            code: -32001,
+            message: String::from("peer-message-secret"),
+            data: Some(json!({ "token": "peer-data-secret" })),
+        };
+        let answer = ServerRequestOutcome::Answer(json!({ "answer": "reply-secret" }));
+        let termination = PeerTermination::LinkFailed(String::from("link-detail-secret"));
+
+        for rendered in [
+            format!("{id:?}"),
+            format!("{failure:?}"),
+            format!("{answer:?}"),
+            format!("{termination:?}"),
+        ] {
+            for secret in [
+                "request-id-secret",
+                "peer-message-secret",
+                "peer-data-secret",
+                "reply-secret",
+                "link-detail-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no peer payload in diagnostics, received {rendered}"
+                );
+            }
+        }
+    }
+
     /// A frame that cannot be built must not leave a waiter behind: the map is what `close` and a
     /// dying pump drain, so an orphan is failed later against a caller that gave up here.
     #[tokio::test]
@@ -1170,8 +1269,12 @@ mod tests {
             .expect("expected the task to finish")
             .expect_err("expected a failure, received an answer");
         assert!(
-            error.to_string().contains("exited"),
-            "expected the peer's exit, received {error}"
+            matches!(&error, Error::Vendor(vendor) if vendor.message.contains("exited")),
+            "expected the raw vendor failure to retain the exit detail, received {error:?}"
+        );
+        assert!(
+            error.to_string().contains("vendor failure"),
+            "expected a safe vendor diagnostic, received {error}"
         );
         assert!(client.is_closed());
     }

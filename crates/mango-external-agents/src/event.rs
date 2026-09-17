@@ -75,7 +75,7 @@ impl fmt::Display for TurnId {
 }
 
 /// One normalised event, stamped with where and when it happened.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEvent {
     /// The session this belongs to.
@@ -86,6 +86,19 @@ pub struct AgentEvent {
     pub at: SystemTime,
     /// What happened.
     pub kind: EventKind,
+}
+
+impl fmt::Debug for AgentEvent {
+    /// Shows event routing metadata without logging host or vendor identifiers.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentEvent")
+            .field("has_session_id", &true)
+            .field("has_turn_id", &true)
+            .field("at", &self.at)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 impl AgentEvent {
@@ -100,7 +113,7 @@ impl AgentEvent {
 }
 
 /// What happened, in the vocabulary every harness normalises onto.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventKind {
@@ -207,6 +220,75 @@ pub enum EventKind {
     },
 }
 
+impl fmt::Debug for EventKind {
+    /// Formats event shape without replaying prompts, answers, or vendor payloads into logs.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SessionStarted { resumed, .. } => formatter
+                .debug_struct("SessionStarted")
+                .field("resumed", resumed)
+                .finish(),
+            Self::CommandsAvailable { commands } => formatter
+                .debug_struct("CommandsAvailable")
+                .field("command_count", &commands.len())
+                .finish(),
+            Self::TextDelta { text } => formatter
+                .debug_struct("TextDelta")
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::ReasoningStarted => formatter.write_str("ReasoningStarted"),
+            Self::ReasoningDelta { text } => formatter
+                .debug_struct("ReasoningDelta")
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::ReasoningEnded => formatter.write_str("ReasoningEnded"),
+            Self::ActivityStarted { activity, .. } => formatter
+                .debug_struct("ActivityStarted")
+                .field("activity_kind", &activity.kind)
+                .finish(),
+            Self::ActivityUpdated { update, .. } => formatter
+                .debug_struct("ActivityUpdated")
+                .field("has_title", &update.title.is_some())
+                .field("has_detail", &update.detail.is_some())
+                .finish(),
+            Self::ActivityCompleted { result, .. } => formatter
+                .debug_struct("ActivityCompleted")
+                .field("status", &result.status)
+                .field("has_detail", &result.detail.is_some())
+                .finish(),
+            Self::ApprovalRequested { request } => formatter
+                .debug_struct("ApprovalRequested")
+                .field("request", request)
+                .finish(),
+            Self::ApprovalResolved { decision, .. } => formatter
+                .debug_struct("ApprovalResolved")
+                .field("decision", decision)
+                .finish(),
+            Self::Usage { usage } => formatter
+                .debug_struct("Usage")
+                .field("usage", usage)
+                .finish(),
+            Self::ThreadUsage { usage } => formatter
+                .debug_struct("ThreadUsage")
+                .field("usage", usage)
+                .finish(),
+            Self::AccountLimits { limits } => formatter
+                .debug_struct("AccountLimits")
+                .field("window_count", &limits.windows.len())
+                .finish(),
+            Self::Cancelled { reason } => formatter
+                .debug_struct("Cancelled")
+                .field("reason", reason)
+                .finish(),
+            Self::Completed => formatter.write_str("Completed"),
+            Self::Error { error } => formatter
+                .debug_struct("Error")
+                .field("error", error)
+                .finish(),
+        }
+    }
+}
+
 impl EventKind {
     /// This event with every vendor-supplied value bounded.
     ///
@@ -284,7 +366,7 @@ impl EventKind {
 /// knows what it actually loaded: user commands from disk, plugin commands a marketplace added,
 /// and the skills a build exposes under the same prefix. A list rebuilt from a directory scan
 /// would confidently offer commands the running binary never read.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Command {
     /// Invoked as `/name`. The vendor's own spelling, never re-slugged.
@@ -292,6 +374,17 @@ pub struct Command {
     /// One line of help, when the vendor wrote one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+impl fmt::Debug for Command {
+    /// Reports command availability without logging vendor-provided command text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Command")
+            .field("has_name", &!self.name.is_empty())
+            .field("has_description", &self.description.is_some())
+            .finish()
+    }
 }
 
 /// A neutral bucket for what a vendor is doing, small enough that every vendor maps onto it.
@@ -327,7 +420,7 @@ pub enum ActivityKind {
 }
 
 /// What the vendor is doing, as something to render.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Activity {
     /// The vendor's own tool name, verbatim.
@@ -345,6 +438,20 @@ pub struct Activity {
     /// True when any field above was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
+}
+
+impl fmt::Debug for Activity {
+    /// Reports activity shape without logging vendor-provided labels or detail.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Activity")
+            .field("has_name", &!self.name.is_empty())
+            .field("kind", &self.kind)
+            .field("has_title", &!self.title.is_empty())
+            .field("has_detail", &self.detail.is_some())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 impl Activity {
@@ -371,7 +478,7 @@ impl Activity {
 }
 
 /// What changed about a running activity.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityUpdate {
     /// A new summary, when it changed.
@@ -383,6 +490,18 @@ pub struct ActivityUpdate {
     /// True when any field above was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
+}
+
+impl fmt::Debug for ActivityUpdate {
+    /// Reports update shape without logging changed vendor text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivityUpdate")
+            .field("has_title", &self.title.is_some())
+            .field("has_detail", &self.detail.is_some())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 impl ActivityUpdate {
@@ -422,7 +541,7 @@ pub enum ActivityStatus {
 }
 
 /// An activity's outcome.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityResult {
     /// How it ended.
@@ -433,6 +552,18 @@ pub struct ActivityResult {
     /// True when the detail was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
+}
+
+impl fmt::Debug for ActivityResult {
+    /// Reports result status without logging vendor-provided detail.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivityResult")
+            .field("status", &self.status)
+            .field("has_detail", &self.detail.is_some())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 impl ActivityResult {
@@ -500,7 +631,7 @@ pub struct ThreadUsage {
 }
 
 /// One metered window, as the vendor models it.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimitWindow {
     /// The vendor's own label for this window. Passed through, never translated.
@@ -516,10 +647,23 @@ pub struct RateLimitWindow {
     pub resets_at: Option<SystemTime>,
 }
 
+impl fmt::Debug for RateLimitWindow {
+    /// Reports quota measurements without logging the vendor's window label.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RateLimitWindow")
+            .field("has_label", &self.label.is_some())
+            .field("used_percent", &self.used_percent)
+            .field("window_duration_minutes", &self.window_duration_minutes)
+            .field("resets_at", &self.resets_at)
+            .finish()
+    }
+}
+
 /// Account-level plan quota.
 ///
 /// A stale snapshot renders as unknown, never as zero, which is why `observed_at` travels with it.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLimits {
     /// Every metered window the vendor reported, in its own order.
@@ -529,6 +673,18 @@ pub struct AccountLimits {
     pub plan_type: Option<String>,
     /// When this snapshot was read.
     pub observed_at: SystemTime,
+}
+
+impl fmt::Debug for AccountLimits {
+    /// Reports quota snapshot shape without logging plan or window labels.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountLimits")
+            .field("window_count", &self.windows.len())
+            .field("has_plan_type", &self.plan_type.is_some())
+            .field("observed_at", &self.observed_at)
+            .finish()
+    }
 }
 
 impl AccountLimits {
@@ -650,7 +806,8 @@ fn normalize_error(error: VendorError) -> VendorError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, EventKind,
+        AccountLimits, Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
+        Command, EventKind, RateLimitWindow,
     };
     use crate::error::{Error, ErrorCode, VendorError};
 
@@ -670,6 +827,107 @@ mod tests {
         match kind.normalized().expect("expected a catalog") {
             EventKind::CommandsAvailable { commands } => commands,
             other => panic!("expected a catalog, received {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_debug_omits_vendor_text_and_error_payloads() {
+        let events = [
+            EventKind::TextDelta {
+                text: String::from("assistant-text-secret"),
+            },
+            EventKind::ReasoningDelta {
+                text: String::from("reasoning-text-secret"),
+            },
+            EventKind::CommandsAvailable {
+                commands: vec![Command {
+                    name: String::from("command-name-secret"),
+                    description: Some(String::from("command-description-secret")),
+                }],
+            },
+            EventKind::Error {
+                error: VendorError::new(
+                    ErrorCode::from_static("vendor-error"),
+                    "vendor-error-message-secret",
+                ),
+            },
+        ];
+
+        for event in events {
+            let rendered = format!("{event:?}");
+            for secret in [
+                "assistant-text-secret",
+                "reasoning-text-secret",
+                "command-name-secret",
+                "command-description-secret",
+                "vendor-error-message-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no event payload in debug output, received {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_event_payload_debug_omits_vendor_text() {
+        let command = Command {
+            name: String::from("command-name-secret"),
+            description: Some(String::from("command-description-secret")),
+        };
+        let activity = Activity {
+            name: String::from("activity-name-secret"),
+            kind: ActivityKind::Command,
+            title: String::from("activity-title-secret"),
+            detail: Some(String::from("activity-detail-secret")),
+            truncated: false,
+        };
+        let update = ActivityUpdate {
+            title: Some(String::from("update-title-secret")),
+            detail: Some(String::from("update-detail-secret")),
+            truncated: false,
+        };
+        let result = ActivityResult {
+            status: ActivityStatus::Failed,
+            detail: Some(String::from("result-detail-secret")),
+            truncated: false,
+        };
+        let window = RateLimitWindow {
+            label: Some(String::from("window-label-secret")),
+            ..RateLimitWindow::default()
+        };
+        let limits = AccountLimits {
+            windows: vec![window.clone()],
+            plan_type: Some(String::from("plan-type-secret")),
+            observed_at: std::time::SystemTime::UNIX_EPOCH,
+        };
+
+        for rendered in [
+            format!("{command:?}"),
+            format!("{activity:?}"),
+            format!("{update:?}"),
+            format!("{result:?}"),
+            format!("{window:?}"),
+            format!("{limits:?}"),
+        ] {
+            for secret in [
+                "command-name-secret",
+                "command-description-secret",
+                "activity-name-secret",
+                "activity-title-secret",
+                "activity-detail-secret",
+                "update-title-secret",
+                "update-detail-secret",
+                "result-detail-secret",
+                "window-label-secret",
+                "plan-type-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no vendor payload in direct event diagnostics, received {rendered}"
+                );
+            }
         }
     }
 

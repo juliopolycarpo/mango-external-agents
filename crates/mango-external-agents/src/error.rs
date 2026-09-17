@@ -10,6 +10,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::harness::{Capability, HarnessKind};
+use crate::redact;
 use crate::transport::TransportKind;
 
 /// The result of every fallible call in this crate.
@@ -29,9 +30,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// const MISSING: ErrorCode = ErrorCode::from_static("codex-session-missing");
 /// assert_eq!(MISSING.as_str(), "codex-session-missing");
 /// ```
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct ErrorCode(Cow<'static, str>);
 
@@ -54,17 +53,31 @@ impl ErrorCode {
 
 impl fmt::Display for ErrorCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        match &self.0 {
+            Cow::Borrowed(code) => formatter.write_str(code),
+            Cow::Owned(_) => formatter.write_str("vendor-code"),
+        }
+    }
+}
+
+impl fmt::Debug for ErrorCode {
+    /// Prints only static harness codes; vendor-provided codes remain data, not diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ErrorCode")
+            .field(&self.to_string())
+            .finish()
     }
 }
 
 /// A failure a vendor reported, with its own structure intact.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VendorError {
     /// The harness's own code for this failure.
     pub code: ErrorCode,
-    /// The vendor's message, bounded and stripped of control characters.
+    /// The vendor's message as payload data. Event normalization bounds and strips it before a
+    /// harness emits it; diagnostic formatting reports only metadata.
     pub message: String,
     /// The id of the request that failed, when the dialect correlates one.
     pub request_id: Option<String>,
@@ -113,25 +126,36 @@ impl VendorError {
 
 impl fmt::Display for VendorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.code, self.message)
+        write!(formatter, "{}: vendor failure", self.code)
+    }
+}
+
+impl fmt::Debug for VendorError {
+    /// Formats vendor text for logs without exposing its unstructured payload.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VendorError")
+            .field("code", &self.code)
+            .field("message_bytes", &self.message.len())
+            .field("has_request_id", &self.request_id.is_some())
+            .field("has_vendor_code", &self.vendor_code.is_some())
+            .field("retryable", &self.retryable)
+            .finish()
     }
 }
 
 impl std::error::Error for VendorError {}
 
 /// Everything that can go wrong between a host and a vendor CLI.
-#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The vendor answered with a failure of its own.
-    #[error("{0}")]
-    Vendor(#[from] VendorError),
+    Vendor(VendorError),
 
     /// An optional method this harness does not implement.
     ///
     /// Every optional method on [`Session`](crate::Session) defaults to this, so a host that calls
     /// one on a harness that cannot do it receives a typed refusal rather than a panic.
-    #[error("expected a harness that supports {capability}, received one that does not")]
     NotSupported {
         /// The capability the caller asked for.
         capability: Capability,
@@ -141,7 +165,6 @@ pub enum Error {
     ///
     /// Refused before anything is spawned: the pair is a fact about the two kinds, knowable
     /// without touching the machine.
-    #[error("expected a transport {harness} supports, received {transport}")]
     UnsupportedTransport {
         /// The harness that was asked.
         harness: HarnessKind,
@@ -150,7 +173,6 @@ pub enum Error {
     },
 
     /// The installed CLI is older than the harness's pinned floor.
-    #[error("expected version {minimum} or newer, received {found}")]
     VersionGate {
         /// The version the CLI reported.
         found: String,
@@ -162,16 +184,12 @@ pub enum Error {
     ///
     /// `login_hint` is the vendor's own command as text, for the host to show. The library never
     /// runs it: it does not handle logins, and it never reads or forwards a credential.
-    #[error(
-        "expected a signed-in CLI, received a signed-out one; the vendor's own command is `{login_hint}`"
-    )]
     AuthRequired {
         /// The vendor's login command, verbatim, for the host to display.
         login_hint: String,
     },
 
     /// The CLI could not be found, or could not be started.
-    #[error("expected to launch {program}, received: {message}")]
     Launch {
         /// The executable the launcher was asked for.
         program: String,
@@ -180,7 +198,6 @@ pub enum Error {
     },
 
     /// The byte link to the vendor failed, or was closed under a caller.
-    #[error("the {peer} link failed: {message}")]
     Link {
         /// The peer as a user would name it, such as `Codex app-server`.
         peer: String,
@@ -191,7 +208,6 @@ pub enum Error {
     /// A line or a buffer passed the cap the library reads vendors under.
     ///
     /// A vendor that prints a 100 MB line is a bug, not a request to allocate 100 MB.
-    #[error("expected at most {limit} bytes of {subject}, received {received}")]
     LimitExceeded {
         /// What was being read, such as `one stdout line`.
         subject: &'static str,
@@ -205,7 +221,6 @@ pub enum Error {
     ///
     /// Truncating a label is safe; truncating an opaque id that is later echoed to the vendor
     /// would silently point at a different object.
-    #[error("expected a usable {field}, received {received:?}")]
     InvalidVendorValue {
         /// Which field the vendor filled in, such as `native session id`.
         field: &'static str,
@@ -214,7 +229,6 @@ pub enum Error {
     },
 
     /// A vendor frame did not have the shape its dialect promises.
-    #[error("expected {expected}, received {received}")]
     Protocol {
         /// The shape the dialect documents.
         expected: String,
@@ -223,7 +237,6 @@ pub enum Error {
     },
 
     /// A call did not answer inside its deadline.
-    #[error("expected {operation} to answer within {after:?}, received nothing")]
     Timeout {
         /// The call that stalled, such as a JSON-RPC method name.
         operation: String,
@@ -232,27 +245,135 @@ pub enum Error {
     },
 
     /// The caller's cancellation token fired, or the turn was cancelled under it.
-    #[error("cancelled: {reason}")]
     Cancelled {
         /// Why it stopped.
         reason: crate::session::CancelReason,
     },
 
     /// The session or the link is closed and cannot serve this call.
-    #[error("expected an open {subject}, received a closed one")]
     Closed {
         /// What was closed, such as `session` or `link`.
         subject: &'static str,
     },
 
     /// The host's configuration was incomplete or contradictory.
-    #[error("expected {expected}, received {received}")]
     HostConfiguration {
         /// What the library needed.
         expected: &'static str,
         /// What it was given.
         received: String,
     },
+}
+
+impl fmt::Display for Error {
+    /// Formats failures for diagnostics without including raw vendor or host-provided payloads.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vendor(error) => error.fmt(formatter),
+            Self::NotSupported { capability } => write!(
+                formatter,
+                "expected a harness that supports {capability}, received one that does not"
+            ),
+            Self::UnsupportedTransport { harness, transport } => write!(
+                formatter,
+                "expected a transport {harness} supports, received {transport}"
+            ),
+            Self::VersionGate { minimum, found } => write!(
+                formatter,
+                "expected a configured minimum version, received a vendor-reported version ({} and {} bytes)",
+                minimum.len(),
+                found.len()
+            ),
+            Self::AuthRequired { .. } => formatter.write_str(
+                "expected a signed-in CLI, received a signed-out one; the vendor login command is available on the error",
+            ),
+            Self::Launch { program, .. } => write!(
+                formatter,
+                "expected to launch {}, received a launcher failure",
+                redact::program_name(program)
+            ),
+            Self::Link { message, .. } => write!(
+                formatter,
+                "the vendor link failed: {}",
+                safe_link_context(message)
+            ),
+            Self::LimitExceeded {
+                subject,
+                limit,
+                received,
+            } => write!(
+                formatter,
+                "expected at most {limit} bytes of {subject}, received {received}"
+            ),
+            Self::InvalidVendorValue { field, .. } => {
+                write!(formatter, "expected a usable {field}, received invalid vendor data")
+            }
+            Self::Protocol { expected, .. } => write!(
+                formatter,
+                "expected a protocol response shape ({} bytes), received invalid vendor data",
+                expected.len()
+            ),
+            Self::Timeout { operation, after } => write!(
+                formatter,
+                "expected an operation ({} bytes) to answer within {after:?}, received nothing",
+                operation.len()
+            ),
+            Self::Cancelled { reason } => write!(formatter, "cancelled: {reason}"),
+            Self::Closed { subject } => {
+                write!(formatter, "expected an open {subject}, received a closed one")
+            }
+            Self::HostConfiguration { expected, received } => write!(
+                formatter,
+                "expected {expected}, received {}",
+                safe_host_configuration(received)
+            ),
+        }
+    }
+}
+
+impl fmt::Debug for Error {
+    /// Delegates debug formatting to the log-safe display form.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("Error")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Vendor(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<VendorError> for Error {
+    fn from(error: VendorError) -> Self {
+        Self::Vendor(error)
+    }
+}
+
+fn safe_host_configuration(received: &str) -> String {
+    let Some(count) = received.strip_prefix("MCP server count ") else {
+        return String::from("invalid host configuration");
+    };
+    if count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return format!("MCP server count {count}");
+    }
+    String::from("invalid host configuration")
+}
+
+fn safe_link_context(message: &str) -> &'static str {
+    if message.contains("EPIPE") {
+        return "EPIPE";
+    }
+    if message.contains("exited") {
+        return "peer exited";
+    }
+    "no safe detail"
 }
 
 impl Error {
@@ -334,7 +455,45 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            r#"expected a usable native session id, received "   ""#
+            "expected a usable native session id, received invalid vendor data"
         );
+    }
+
+    #[test]
+    fn protocol_diagnostics_omit_vendor_text_and_expected_shape_contents() {
+        let error = Error::Protocol {
+            expected: String::from("a captured vendor response diagnostic-secret"),
+            received: String::from("Authorization: Bearer diagnostic-secret"),
+        };
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("diagnostic-secret"),
+                "expected redacted error diagnostic, received {rendered}"
+            );
+            assert!(
+                rendered.contains("protocol response shape (44 bytes)"),
+                "expected useful shape metadata, received {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_error_diagnostics_redact_vendor_messages() {
+        let error = VendorError::new(
+            ErrorCode::from_static("vendor-failed"),
+            "vendor-message-secret",
+        );
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("vendor-message-secret"),
+                "expected redacted vendor diagnostic, received {rendered}"
+            );
+            assert!(
+                rendered.contains("vendor-failed"),
+                "expected the vendor code, received {rendered}"
+            );
+        }
     }
 }

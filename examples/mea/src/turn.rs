@@ -330,8 +330,9 @@ mod tests {
         .expect_err("expected the scripted start failure");
 
         assert!(
-            error.to_string().contains("the scripted start failure"),
-            "expected the start error, received {error}"
+            matches!(&error, Error::Protocol { expected, received }
+                if expected == "a turn to start" && received == "the scripted start failure"),
+            "expected the typed start error, received {error:?}"
         );
         assert!(
             session.closed.load(Ordering::Acquire),

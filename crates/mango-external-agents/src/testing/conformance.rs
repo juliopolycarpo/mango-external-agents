@@ -641,8 +641,8 @@ mod tests {
             );
         };
         assert!(
-            message.contains("would not take the answer"),
-            "expected the harness's own refusal in the message, received {message:?}"
+            message.contains("vendor failure"),
+            "expected a safe vendor failure diagnostic, received {message:?}"
         );
     }
 

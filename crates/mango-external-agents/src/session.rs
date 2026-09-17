@@ -102,7 +102,7 @@ pub struct SessionIds {
 /// An omitted permission axis reports no known library override; it never means read-only. Some
 /// vendor profiles are more granular than this shared pair, so the library does not guess a
 /// generic equivalent for captured native defaults.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Configuration {
     /// The vendor's own model id, when the host chose one.
@@ -123,6 +123,19 @@ pub struct Configuration {
     /// before any selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<ApprovalRouting>,
+}
+
+impl fmt::Debug for Configuration {
+    /// Records which host settings were selected without logging opaque vendor identifiers.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Configuration")
+            .field("has_model", &self.model.is_some())
+            .field("has_effort", &self.effort.is_some())
+            .field("level", &self.level)
+            .field("routing", &self.routing)
+            .finish()
+    }
 }
 
 impl Default for Configuration {
@@ -183,7 +196,7 @@ pub enum ResumeMode {
 }
 
 /// A vendor conversation to continue.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Resume {
     /// The vendor's own handle for it.
@@ -192,18 +205,40 @@ pub struct Resume {
     pub mode: ResumeMode,
 }
 
+impl fmt::Debug for Resume {
+    /// Shows the resume policy without exposing the opaque handle supplied to a vendor.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Resume")
+            .field("has_native_session_id", &true)
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
 /// One MCP server a host configured, for a vendor that accepts them.
 ///
 /// Passed through untouched: the library never inspects a server, never connects to one and never
 /// puts a vendor's MCP tools into a host's own tool registry. It maps this shape onto whatever the
 /// vendor's dialect spells it as and stops there.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServer {
     /// The name the vendor lists this server under.
     pub name: String,
     /// How the vendor reaches it.
     pub transport: McpTransport,
+}
+
+impl fmt::Debug for McpServer {
+    /// Avoids logging the host's arbitrary server name while retaining transport metadata.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpServer")
+            .field("has_name", &!self.name.is_empty())
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 impl McpServer {
@@ -284,20 +319,20 @@ impl fmt::Debug for McpTransport {
     /// every type above this one derives `Debug` from it — so a `tracing::debug!(?request)` of an
     /// open that configured MCP, or the crate's `received {value:?}` assertion idiom, would print
     /// the token in the clear. Values go, names stay: a host debugging a server it misconfigured
-    /// still has to see which variable and which header. The URL and the command line go through
-    /// the same redaction a stderr tail does, for the `https://user:password@host` form and for an
-    /// argument written as an assignment.
+    /// still has to see which variable and which header. URLs are omitted because they can carry
+    /// arbitrary credentials in a query, while commands retain only their basename and argument
+    /// count.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stdio { command, args, env } => formatter
                 .debug_struct("Stdio")
-                .field("command", &crate::redact::stderr_text(command))
-                .field("args", &redacted_arguments(args))
+                .field("command", &crate::redact::program_name(command))
+                .field("argument_count", &args.len())
                 .field("env", &redacted_values(env))
                 .finish(),
-            Self::Http { url, headers } => formatter
+            Self::Http { headers, .. } => formatter
                 .debug_struct("Http")
-                .field("url", &crate::redact::stderr_text(url))
+                .field("endpoint_configured", &true)
                 .field("headers", &redacted_values(headers))
                 .finish(),
             // No wildcard arm: `#[non_exhaustive]` does not apply inside the defining crate, so a
@@ -316,16 +351,8 @@ fn redacted_values(
         .collect()
 }
 
-/// Each argument through the stderr redaction, which catches the `--api-key=…` shape.
-fn redacted_arguments(arguments: &[String]) -> Vec<String> {
-    arguments
-        .iter()
-        .map(|argument| crate::redact::stderr_text(argument))
-        .collect()
-}
-
 /// What a host asks for when it opens a session.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenSession {
     /// The host's own id for the session.
@@ -349,6 +376,20 @@ pub struct OpenSession {
     /// accept a request they would silently drop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
+}
+
+impl fmt::Debug for OpenSession {
+    /// Shows open-session shape without logging opaque ids or host-supplied configuration.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenSession")
+            .field("has_session_id", &true)
+            .field("configuration", &self.configuration)
+            .field("resume", &self.resume)
+            .field("executable", &self.executable)
+            .field("mcp_server_count", &self.mcp_servers.len())
+            .finish()
+    }
 }
 
 impl OpenSession {
@@ -421,7 +462,7 @@ impl OpenSession {
 ///
 /// A snapshot of the answer `open_session` gave, not a live view. Read [`Session::ids`] for
 /// the current vendor handle and [`Session::configuration`] for the defaults later turns inherit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     /// The two ids, as opening reported them.
     ///
@@ -467,7 +508,7 @@ pub enum AttachmentKind {
 ///
 /// Bytes rather than base64: a harness encodes for its own dialect, and a host that already has
 /// the bytes should not have to encode them for a wire it cannot see.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Attachment {
     /// The host's own id for it.
     pub id: String,
@@ -481,8 +522,19 @@ pub struct Attachment {
     pub bytes: Vec<u8>,
 }
 
+impl fmt::Debug for Attachment {
+    /// Reports attachment metadata without logging the host's names, ids, or bytes.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Attachment")
+            .field("kind", &self.kind)
+            .field("byte_count", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// One turn's input.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TurnRequest {
     /// The host's own id for this turn, which is also its idempotency key.
     pub turn_id: TurnId,
@@ -492,6 +544,19 @@ pub struct TurnRequest {
     pub attachments: Vec<Attachment>,
     /// Explicit settings for this turn, when they differ from the session's inherited settings.
     pub configuration: Option<Configuration>,
+}
+
+impl fmt::Debug for TurnRequest {
+    /// Shows a turn's shape without logging its prompt or attachment contents.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnRequest")
+            .field("has_turn_id", &true)
+            .field("input_bytes", &self.input.len())
+            .field("attachment_count", &self.attachments.len())
+            .field("configuration", &self.configuration)
+            .finish()
+    }
 }
 
 impl TurnRequest {
@@ -535,7 +600,7 @@ impl TurnRequest {
 }
 
 /// More input for a turn that is already running.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Steer {
     /// The turn to steer.
     pub turn_id: TurnId,
@@ -543,6 +608,18 @@ pub struct Steer {
     pub native_turn_id: String,
     /// What to add.
     pub input: String,
+}
+
+impl fmt::Debug for Steer {
+    /// Shows a steer without logging its prompt or opaque vendor identifiers.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Steer")
+            .field("has_turn_id", &true)
+            .field("has_native_turn_id", &true)
+            .field("input_bytes", &self.input.len())
+            .finish()
+    }
 }
 
 /// Whether a steer landed.
@@ -574,7 +651,7 @@ pub enum SteerRejection {
 /// What a vendor-native review is pointed at.
 ///
 /// Harnesses may reject targets their vendor does not support.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum ReviewTarget {
@@ -600,18 +677,44 @@ pub enum ReviewTarget {
     },
 }
 
+impl fmt::Debug for ReviewTarget {
+    /// Identifies the review mode without logging host-provided revisions or instructions.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UncommittedChanges => formatter.write_str("UncommittedChanges"),
+            Self::BaseBranch { .. } => formatter.write_str("BaseBranch { configured: true }"),
+            Self::Commit { title, .. } => formatter
+                .debug_struct("Commit")
+                .field("has_title", &title.is_some())
+                .finish(),
+            Self::Custom { .. } => formatter.write_str("Custom { configured: true }"),
+        }
+    }
+}
+
 /// Start a vendor-native review on an open session.
 ///
 /// A review is a turn that happens to be a review: it is deduplicated, ordered, cancelled and
 /// persisted by the same machinery, so it carries a turn id like any other. It runs under the
 /// permissions the session already has — reconfiguring mid-review would be a way around a choice
 /// somebody already made.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReviewRequest {
     /// The host's own id for this turn.
     pub turn_id: TurnId,
     /// What to review.
     pub target: ReviewTarget,
+}
+
+impl fmt::Debug for ReviewRequest {
+    /// Shows a review request without logging its opaque turn id.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReviewRequest")
+            .field("has_turn_id", &true)
+            .field("target", &self.target)
+            .finish()
+    }
 }
 
 /// How many sessions one page may carry.
@@ -912,24 +1015,19 @@ pub trait Session: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReason, CloseReason, Configuration, McpServer, McpTransport, NativeSession,
-        OpenSession, ResumeMode, Session, SessionIds, SessionInfo, SessionPage, TurnRequest,
+        Attachment, AttachmentKind, CancelReason, CloseReason, Configuration, McpServer,
+        McpTransport, NativeSession, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
+        SessionPage, TurnRequest,
     };
     use crate::permission::{ApprovalRouting, PermissionLevel};
 
-    /// `env` and `headers` are the one place a host puts its own credential on this surface.
-    ///
-    /// A derived `Debug` prints both maps in the clear, and every type above this one derives from
-    /// it — so a `tracing::debug!(?request)` of an open that configured MCP, or the crate's own
-    /// `received {value:?}` assertion idiom, would put the token in a log. This is the same
-    /// reasoning `WsSpec` is hand-written for.
     #[test]
-    fn never_prints_a_credential_a_host_put_on_an_mcp_server() {
+    fn mcp_debug_keeps_values_and_positional_arguments_out_of_diagnostics() {
         let stdio = McpServer {
             name: String::from("docs"),
             transport: McpTransport::Stdio {
                 command: String::from("docs-mcp"),
-                args: vec![String::from("--api-key=sk-live-args")],
+                args: vec![String::from("--api-key"), String::from("sk-live-args")],
                 env: [(String::from("API_KEY"), String::from("sk-live-env"))]
                     .into_iter()
                     .collect(),
@@ -938,7 +1036,7 @@ mod tests {
         let http = McpServer {
             name: String::from("search"),
             transport: McpTransport::Http {
-                url: String::from("https://user:sk-live-url@search.example/mcp"),
+                url: String::from("https://user:sk-live-url@search.example/mcp?key=query-secret"),
                 headers: [(
                     String::from("Authorization"),
                     String::from("Bearer sk-live-header"),
@@ -947,33 +1045,71 @@ mod tests {
                 .collect(),
             },
         };
-        let request = OpenSession::new("chat-1").with_mcp_servers(vec![stdio, http]);
-        let printed = format!("{request:?}");
+        let printed = format!("{stdio:?}\n{http:?}");
 
         for secret in [
             "sk-live-env",
             "sk-live-header",
             "sk-live-url",
             "sk-live-args",
+            "query-secret",
         ] {
             assert!(
                 !printed.contains(secret),
                 "expected {secret:?} to be redacted, received {printed}"
             );
         }
-        // Redacted, not erased: a host debugging a misconfigured server still needs to see which
-        // server, which variable and which header.
         for kept in [
-            "docs",
-            "docs-mcp",
+            "custom executable",
             "API_KEY",
             "Authorization",
-            "search.example",
+            "argument_count: 2",
         ] {
             assert!(
                 printed.contains(kept),
                 "expected {kept:?} to survive redaction, received {printed}"
             );
+        }
+    }
+
+    #[test]
+    fn nested_request_debug_omits_prompts_ids_and_host_configuration_values() {
+        let request = OpenSession::new("session-id-secret")
+            .with_configuration(Configuration {
+                model: Some(String::from("model-secret")),
+                effort: Some(String::from("effort-secret")),
+                ..Configuration::default()
+            })
+            .resuming("resume-id-secret", ResumeMode::Fallback)
+            .with_mcp_servers(vec![McpServer::stdio("server-name-secret", "docs-mcp")]);
+        let turn = TurnRequest::new("turn-id-secret", "prompt-secret").with_attachments(vec![
+            Attachment {
+                id: String::from("attachment-id-secret"),
+                name: String::from("attachment-name-secret"),
+                mime_type: String::from("text/plain"),
+                kind: AttachmentKind::Text,
+                bytes: b"attachment-bytes-secret".to_vec(),
+            },
+        ]);
+
+        for printed in [format!("{request:?}"), format!("{turn:?}")] {
+            for secret in [
+                "session-id-secret",
+                "model-secret",
+                "effort-secret",
+                "resume-id-secret",
+                "server-name-secret",
+                "turn-id-secret",
+                "prompt-secret",
+                "attachment-id-secret",
+                "attachment-name-secret",
+                "attachment-bytes-secret",
+            ] {
+                assert!(
+                    !printed.contains(secret),
+                    "expected no request payload in debug output, received {printed}"
+                );
+            }
         }
     }
 
