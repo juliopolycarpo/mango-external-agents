@@ -570,14 +570,24 @@ impl PermissionRequest {
     /// # Errors
     ///
     /// [`Error::InvalidVendorValue`] when the request id or an option id does not survive
-    /// bounding, and [`Error::Protocol`] when the vendor offered no options or more than
-    /// [`APPROVAL_MAX_OPTIONS`] of them. A request nobody can render is refused on its own rather
-    /// than ending the turn it belongs to.
+    /// bounding, [`Error::Protocol`] when the vendor offered no options, and
+    /// [`Error::LimitExceeded`] when it offered more than [`APPROVAL_MAX_OPTIONS`]. A request
+    /// nobody can render is refused on its own rather than ending the turn it belongs to.
     pub fn normalized(self) -> Result<Self> {
-        if self.options.is_empty() || self.options.len() > APPROVAL_MAX_OPTIONS {
+        if self.options.is_empty() {
             return Err(Error::Protocol {
-                expected: format!("between 1 and {APPROVAL_MAX_OPTIONS} approval options"),
-                received: self.options.len().to_string(),
+                expected: String::from("at least one approval option"),
+                received: String::from("0"),
+            });
+        }
+        if self.options.len() > APPROVAL_MAX_OPTIONS {
+            // `LimitExceeded` rather than `Protocol`: its `received` is a count the library
+            // itself computed, not raw vendor text, so unlike `Protocol.received` it is safe to
+            // render and is what tells an operator how far over the cap the vendor went.
+            return Err(Error::LimitExceeded {
+                subject: "approval options offered",
+                limit: APPROVAL_MAX_OPTIONS,
+                received: self.options.len(),
             });
         }
 
@@ -1104,6 +1114,32 @@ mod tests {
             })
             .collect();
         assert!(request(many).normalized().is_err());
+    }
+
+    #[test]
+    fn an_empty_request_and_an_oversized_one_report_differently() {
+        let empty = request(Vec::new())
+            .normalized()
+            .expect_err("expected a refusal");
+        assert!(
+            matches!(empty, Error::Protocol { .. }),
+            "expected a protocol refusal, received {empty:?}"
+        );
+
+        let many = (0..17)
+            .map(|index| {
+                PermissionOption::new(format!("option-{index}"), PermissionOptionKind::AllowOnce)
+            })
+            .collect();
+        let oversized = request(many).normalized().expect_err("expected a refusal");
+        assert!(
+            matches!(oversized, Error::LimitExceeded { .. }),
+            "expected a limit refusal, received {oversized:?}"
+        );
+        assert_eq!(
+            oversized.to_string(),
+            "expected at most 16 approval options offered, received 17"
+        );
     }
 
     #[test]
