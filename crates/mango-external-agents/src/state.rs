@@ -444,8 +444,14 @@ impl SessionState {
     }
 
     /// Records where the session is in its life.
+    ///
+    /// Monotonic along `Ready` → `Closing` → `Closed`: a status at or behind the one already
+    /// published is ignored. A session never reopens, and two things can wind one down — an
+    /// explicit `close` and a harness watcher that saw the vendor connection die — so without this
+    /// the loser of that race publishes `Closing` after `Closed` and a host watching the
+    /// subscription sees the lifecycle run backwards.
     pub fn set_status(&self, status: SessionStatus) {
-        if self.snapshot().status == status {
+        if status <= self.snapshot().status {
             return;
         }
         self.update(|snapshot| snapshot.status = status);
@@ -696,6 +702,25 @@ mod tests {
             subscription.changed().await.is_none(),
             "expected the subscription to end with the session"
         );
+    }
+
+    /// An explicit `close` and a harness watcher that saw the connection die both wind a session
+    /// down, and either can get there first. The loser must not walk the status back.
+    #[test]
+    fn a_published_status_never_walks_back_down_the_ladder() {
+        let closed = state();
+        closed.set_status(SessionStatus::Closed);
+        closed.set_status(SessionStatus::Closing);
+        assert_eq!(closed.snapshot().status, SessionStatus::Closed);
+        closed.set_status(SessionStatus::Ready);
+        assert_eq!(closed.snapshot().status, SessionStatus::Closed);
+
+        let closing = state();
+        closing.set_status(SessionStatus::Closing);
+        closing.set_status(SessionStatus::Ready);
+        assert_eq!(closing.snapshot().status, SessionStatus::Closing);
+        closing.set_status(SessionStatus::Closed);
+        assert_eq!(closing.snapshot().status, SessionStatus::Closed);
     }
 
     #[test]
