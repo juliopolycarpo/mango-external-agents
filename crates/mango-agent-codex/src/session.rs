@@ -1911,7 +1911,7 @@ mod tests {
             owner: Arc::new(()),
             sink,
             turn_id: turn_id.clone(),
-            attempt: attempt,
+            attempt,
             native_turn_id: native_turn_id.to_owned(),
             // This helper installs a turn already past the point `begin` would have announced it.
             announced: true,
