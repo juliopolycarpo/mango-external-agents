@@ -22,12 +22,19 @@ use mango_external_agents::{
 };
 use options::HarnessChoice;
 
-/// Every harness kind the binary links, in registry order.
-fn harness_kinds() -> [&'static str; 3] {
+/// Every harness this binary links, as the line the banner prints for it.
+///
+/// The two native harnesses print the id they register under. The ACP crate publishes no single
+/// id — one harness drives one agent, so every id names a profile too — so it prints its protocol
+/// family, and the banner's own `ACP profiles:` line enumerates the rest.
+fn harness_lines() -> [String; 3] {
     [
-        mango_agent_claude::HARNESS_KIND,
-        mango_agent_codex::HARNESS_KIND,
-        mango_agent_acp::HARNESS_KIND,
+        mango_agent_claude::harness_id().to_string(),
+        mango_agent_codex::harness_id().to_string(),
+        format!(
+            "{} (one id per profile)",
+            mango_agent_acp::protocol_family()
+        ),
     ]
 }
 
@@ -115,8 +122,8 @@ fn print_banner() {
         env!("CARGO_PKG_VERSION"),
         mango_external_agents::VERSION
     );
-    for kind in harness_kinds() {
-        println!("harness: {kind}");
+    for line in harness_lines() {
+        println!("harness: {line}");
     }
     println!(
         "usage: mea discover|doctor [--harness claude|codex|acp:<profile>] [--json] [--cwd DIR]"
@@ -400,7 +407,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        HarnessChoice, Options, acp_profile_ids, describe, discover_with, harness_kinds, registry,
+        HarnessChoice, Options, acp_profile_ids, describe, discover_with, harness_lines, registry,
         refusal, run,
     };
     use mango_external_agents::testing::FakeLauncher;
@@ -504,17 +511,30 @@ mod tests {
             .expect("expected a fake host context")
     }
 
+    /// The banner names each linked harness once, and the two that publish an id publish one the
+    /// registry actually answers to — which a bare string constant could not promise.
     #[test]
-    fn harness_kinds_are_distinct() {
-        let kinds = harness_kinds();
-        let mut sorted = kinds.to_vec();
+    fn the_banner_names_each_linked_harness_once() {
+        let lines = harness_lines();
+        let mut sorted = lines.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(
             sorted.len(),
-            kinds.len(),
-            "expected 3 distinct kinds, received {kinds:?}"
+            lines.len(),
+            "expected 3 distinct lines, received {lines:?}"
         );
+
+        let registry = registry();
+        for id in [
+            mango_agent_claude::harness_id(),
+            mango_agent_codex::harness_id(),
+        ] {
+            assert!(
+                registry.get(&id).is_some(),
+                "expected the published id {id} to be one the registry answers to"
+            );
+        }
     }
 
     #[test]
