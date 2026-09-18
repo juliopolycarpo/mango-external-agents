@@ -29,6 +29,105 @@ pub struct FakeProcess {
     exit: ExitStatus,
     responder: Option<Responder>,
     end_stdout_when: Option<CancelToken>,
+    announcer: Option<Announcer>,
+}
+
+/// A handle that makes a fake child speak without being written to first.
+///
+/// A responder only answers: it says something because the library asked. The peers this library
+/// drives also announce on their own initiative, and a whole class of behaviour — what a session
+/// does about traffic that arrives while it is waiting — cannot be reached by answering alone.
+/// Lines announced before the child is launched are held and delivered when it starts.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::testing::{Announcer, FakeLauncher, FakeProcess};
+///
+/// let announcer = Announcer::new();
+/// let launcher = FakeLauncher::new();
+/// launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(announcer.clone()));
+/// announcer.announce(r#"{"method":"rateLimits","params":{}}"#);
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct Announcer {
+    state: Arc<AnnouncerState>,
+}
+
+#[derive(Default)]
+struct AnnouncerState {
+    /// The child to speak through, once one has been launched.
+    child: Mutex<Option<Arc<ChildState>>>,
+    /// What was announced before that, in order.
+    pending: Mutex<Vec<String>>,
+}
+
+impl std::fmt::Debug for AnnouncerState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnnouncerState")
+            .field(
+                "attached",
+                &self
+                    .child
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some(),
+            )
+            .field(
+                "pending",
+                &self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+            )
+            .finish()
+    }
+}
+
+impl Announcer {
+    /// A handle attached to no child yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Puts one line on the child's stdout, as a peer announcing something would.
+    pub fn announce(&self, line: impl Into<String>) {
+        let line = line.into();
+        let child = self
+            .state
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(child) = child else {
+            self.state
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(line);
+            return;
+        };
+        child.announce([line]);
+    }
+
+    fn attach(&self, child: &Arc<ChildState>) {
+        *self
+            .state
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(child));
+        let pending = std::mem::take(
+            &mut *self
+                .state
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        child.announce(pending);
+    }
 }
 
 impl std::fmt::Debug for FakeProcess {
@@ -85,6 +184,13 @@ impl FakeProcess {
     #[must_use]
     pub fn ending_stdout_when(mut self, signal: CancelToken) -> Self {
         self.end_stdout_when = Some(signal);
+        self
+    }
+
+    /// Lets `announcer` put lines on this child's stdout at any point in its life.
+    #[must_use]
+    pub fn announcing(mut self, announcer: Announcer) -> Self {
+        self.announcer = Some(announcer);
         self
     }
 
@@ -255,6 +361,9 @@ impl ProcessLauncher for FakeLauncher {
             live_children: Arc::clone(&self.state.live_children),
             changed: Notify::new(),
         });
+        if let Some(announcer) = &process.announcer {
+            announcer.attach(&child);
+        }
 
         Ok(ManagedProcess {
             stdout: Box::new(FakeStdout {
@@ -297,6 +406,15 @@ impl ChildState {
 
     fn is_ended(&self) -> bool {
         *self.ended.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queues lines the child writes without having been asked for them.
+    fn announce<I: IntoIterator<Item = String>>(&self, lines: I) {
+        self.stdout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(lines);
+        self.changed.notify_waiters();
     }
 }
 
@@ -399,7 +517,7 @@ impl ByteSink for FakeStdin {
 
 #[cfg(test)]
 mod tests {
-    use super::{FakeLauncher, FakeProcess};
+    use super::{Announcer, FakeLauncher, FakeProcess};
     use crate::error::Error;
     use crate::host::CancelToken;
     use crate::process::{LaunchSpec, LineLimits, LineStream, ProcessLauncher};
@@ -414,6 +532,38 @@ mod tests {
             stdin: true,
             hide_window: true,
         }
+    }
+
+    /// A responder only speaks when spoken to. The peers this library drives also announce, and a
+    /// session's behaviour while it is waiting cannot be reached by answering alone — so an
+    /// announcement made before the child was launched has to survive until it is.
+    #[tokio::test]
+    async fn an_announcer_speaks_for_a_child_before_and_after_it_is_launched() {
+        let announcer = Announcer::new();
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(announcer.clone()));
+        announcer.announce("{\"method\":\"queued/before/launch\"}");
+
+        let child = launcher
+            .spawn(spec(&["codex", "app-server"]))
+            .await
+            .expect("expected a child");
+        announcer.announce("{\"method\":\"announced/while/running\"}");
+
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        assert_eq!(
+            lines.next_line().await.expect("expected a queued line"),
+            Some(String::from("{\"method\":\"queued/before/launch\"}"))
+        );
+        assert_eq!(
+            lines.next_line().await.expect("expected a live line"),
+            Some(String::from("{\"method\":\"announced/while/running\"}"))
+        );
+        assert!(
+            launcher.written().is_empty(),
+            "expected an announcement to need no question first, received {:?}",
+            launcher.written()
+        );
     }
 
     #[tokio::test]

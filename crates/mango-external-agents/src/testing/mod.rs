@@ -17,5 +17,5 @@ mod link;
 
 pub use broker::{FrozenClock, RecordingBroker};
 pub use harness::FakeHarness;
-pub use launcher::{FakeLauncher, FakeProcess};
+pub use launcher::{Announcer, FakeLauncher, FakeProcess};
 pub use link::ScriptedLink;

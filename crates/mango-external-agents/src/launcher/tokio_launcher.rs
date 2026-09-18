@@ -9,6 +9,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
 
+#[cfg(windows)]
+use process_wrap::tokio::{CommandWrap, CommandWrapper, CreationFlags, JobObject, KillOnDrop};
+#[cfg(windows)]
+use std::future::Future;
+#[cfg(windows)]
+use windows::Win32::System::Threading::{CREATE_NO_WINDOW, PROCESS_CREATION_FLAGS};
+
 use crate::error::{Error, Result};
 use crate::process::{
     ByteSink, ByteSource, DEFAULT_STDERR_TAIL_BYTES, ExitStatus, LaunchSpec, ManagedProcess,
@@ -35,28 +42,77 @@ fn configured_command(spec: &LaunchSpec, program: &str) -> Command {
 
     #[cfg(unix)]
     command.process_group(0);
-    #[cfg(windows)]
-    if spec.hide_window {
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
     command
 }
 
 /// How much of a child's output is read at once.
 const CHUNK_BYTES: usize = 16 * 1024;
 
-/// Windows `CREATE_NO_WINDOW`: an agent CLI is not something a user asked to see a console for.
+/// Creates a Job-owned child before any vendor code can run.
+///
+/// `JobObject` adds `CREATE_SUSPENDED`, then creates its inner Job and resumes the process. This
+/// wrapper attaches the still-suspended process to an outer Job first. Its safe membership query
+/// is the source of cleanup completion. A child that cannot be assigned never runs and is
+/// terminated by the wrapper's failure path.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+fn contained_command(
+    command: Command,
+    hide_window: bool,
+    containment_job: Arc<win32job::Job>,
+) -> CommandWrap {
+    let mut contained = CommandWrap::from(command);
+    let flags = if hide_window {
+        CREATE_NO_WINDOW
+    } else {
+        PROCESS_CREATION_FLAGS(0)
+    };
+    contained.wrap(CreationFlags(flags));
+    contained.wrap(KillOnDrop);
+    contained.wrap(AttachContainmentJob { containment_job });
+    contained.wrap(JobObject);
+    contained
+}
+
+/// Assigns the suspended process to the Job whose membership proves cleanup completed.
+#[cfg(windows)]
+#[derive(Debug)]
+struct AttachContainmentJob {
+    containment_job: Arc<win32job::Job>,
+}
+
+#[cfg(windows)]
+impl CommandWrapper for AttachContainmentJob {
+    fn post_spawn(
+        &mut self,
+        _command: &mut Command,
+        child: &mut tokio::process::Child,
+        _core: &CommandWrap,
+    ) -> std::io::Result<()> {
+        let Some(handle) = child.raw_handle() else {
+            let _ = child.start_kill();
+            return Err(std::io::Error::other(
+                "a suspended Windows child without a process handle",
+            ));
+        };
+        if let Err(error) = self.containment_job.assign_process(handle as isize) {
+            // `JobObject` asked Windows to keep this primary thread suspended. Assignment is the
+            // last fallible step before its safe resume path, so an error must reap that child
+            // rather than returning a suspended, uncontained process to the operating system.
+            let _ = child.start_kill();
+            return Err(std::io::Error::other(error));
+        }
+        Ok(())
+    }
+}
 
 /// The ordinary way to spawn a vendor CLI.
 ///
 /// On Unix a child leads its own process group, so escalation reaches everything it started rather
-/// than only the process the library can see. On Windows the tree is ended through `taskkill /T`,
-/// because a direct child handle does not imply ownership of its descendants there. Installed
-/// PowerShell entrypoints use `powershell.exe -File` after native executable resolution fails;
-/// script and interpreter paths come only from the supplied launch environment.
+/// than only the process the library can see. On Windows each child is suspended, attached to a
+/// private Job Object, and resumed only after that attachment succeeds. The Job owns descendants
+/// and is terminated and observed until empty before cleanup succeeds. Installed PowerShell
+/// entrypoints use `powershell.exe -File` after native executable resolution fails; script and
+/// interpreter paths come only from the supplied launch environment.
 ///
 /// Escalation asks before it insists: the caller closes stdin, then this sends the polite signal,
 /// waits out the grace, and only then insists. A vendor asked to stop writes its own state first,
@@ -169,10 +225,175 @@ impl ProcessLauncher for TokioLauncher {
             });
         };
 
-        let mut command = configured_command(&spec, program);
-        let launched = command.spawn();
+        #[cfg(not(windows))]
+        {
+            let mut child = configured_command(&spec, program)
+                .spawn()
+                .map_err(|error| launch_error(program, error))?;
+            let pid = child.id();
+            let stdout = child.stdout.take().ok_or_else(|| missing_stdout(program))?;
+            let stdin = child.stdin.take();
+            let stderr = start_stderr_reader(child.stderr.take(), self.stderr_tail_bytes);
+
+            // The child is owned by one reaper task, so every waiter reads the same answer and
+            // nothing races to `wait` on it twice.
+            let (exited, exit) = watch::channel(None);
+            tokio::spawn(async move {
+                let status = child.wait().await.ok().map(native_exit_status);
+                let _ = exited.send(Some(status.unwrap_or_default()));
+            });
+
+            Ok(managed_process(
+                stdout,
+                stdin,
+                TokioChild {
+                    pid,
+                    exit,
+                    stderr,
+                    kill_grace: self.kill_grace,
+                    killed: AtomicBool::new(false),
+                },
+            ))
+        }
+
         #[cfg(windows)]
-        let launched = launched.or_else(|error| {
+        {
+            let (mut child, containment_job) =
+                launch_windows(&spec, program).map_err(|error| launch_error(program, error))?;
+            let pid = child.id();
+            let stdout = child
+                .stdout()
+                .take()
+                .ok_or_else(|| missing_stdout(program))?;
+            let stdin = child.stdin().take();
+            let stderr = start_stderr_reader(child.stderr().take(), self.stderr_tail_bytes);
+
+            // The reaper retains the Job which was assigned while the process was suspended. It
+            // queries that Job until Windows reports no members, so a dropped kill future cannot
+            // cancel the cleanup it started or mistake a reaped leader for an empty tree.
+            let (leader_exited, exit) = watch::channel(None);
+            let (cleaned, cleanup) = watch::channel(None);
+            let (stop, stopping) = watch::channel(false);
+            let cleanup_error = Arc::new(std::sync::Mutex::new(None));
+            let reaper_error = Arc::clone(&cleanup_error);
+            tokio::spawn(async move {
+                match reap_windows_process_tree(child, containment_job, stopping, leader_exited)
+                    .await
+                {
+                    Ok(status) => {
+                        let _ = cleaned.send(Some(native_exit_status(status)));
+                    }
+                    Err(error) => {
+                        let mut recorded = reaper_error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *recorded = Some(format!(
+                            "a Windows Job cleanup failure ({:?})",
+                            error.kind()
+                        ));
+                    }
+                }
+            });
+
+            Ok(managed_process(
+                stdout,
+                stdin,
+                TokioChild {
+                    pid,
+                    exit,
+                    stderr,
+                    kill_grace: self.kill_grace,
+                    killed: AtomicBool::new(false),
+                    stop,
+                    cleanup,
+                    cleanup_error,
+                },
+            ))
+        }
+    }
+}
+
+/// Keeps native launch diagnostics bounded to a stable operating-system error kind.
+fn launch_error(program: &str, error: std::io::Error) -> Error {
+    Error::Launch {
+        program: program.to_owned(),
+        message: format!("a launcher failure ({:?})", error.kind()),
+    }
+}
+
+/// Reports the one pipe the launcher needs to read every child response.
+fn missing_stdout(program: &str) -> Error {
+    Error::Launch {
+        program: program.to_owned(),
+        message: String::from("a child without a readable stdout"),
+    }
+}
+
+/// Starts bounded stderr collection before the child is handed to its one reaper.
+fn start_stderr_reader(
+    stderr_pipe: Option<tokio::process::ChildStderr>,
+    capacity: usize,
+) -> StderrTail {
+    let stderr = StderrTail::with_capacity(capacity);
+    if let Some(mut pipe) = stderr_pipe {
+        let tail = stderr.clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0_u8; CHUNK_BYTES];
+            while let Ok(read) = pipe.read(&mut buffer).await {
+                if read == 0 {
+                    break;
+                }
+                tail.push(&buffer[..read]);
+            }
+        });
+    }
+    stderr
+}
+
+/// Assembles the three independently-owned process halves after native containment is established.
+fn managed_process(
+    stdout: ChildStdout,
+    stdin: Option<ChildStdin>,
+    control: TokioChild,
+) -> ManagedProcess {
+    ManagedProcess {
+        stdout: Box::new(PipeSource {
+            stdout,
+            buffer: vec![0_u8; CHUNK_BYTES],
+        }),
+        stdin: stdin
+            .map(|stdin| -> Box<dyn ByteSink> { Box::new(PipeSink { stdin: Some(stdin) }) }),
+        control: Arc::new(control),
+    }
+}
+
+/// Turns a platform exit result into the portable status retained by the process port.
+fn native_exit_status(status: std::process::ExitStatus) -> ExitStatus {
+    ExitStatus {
+        code: status.code(),
+        signal: signal_of(&status),
+    }
+}
+
+/// Spawns a Windows child in a Job before vendor code starts.
+#[cfg(windows)]
+fn launch_windows(
+    spec: &LaunchSpec,
+    program: &str,
+) -> std::io::Result<(
+    Box<dyn process_wrap::tokio::ChildWrapper>,
+    Arc<win32job::Job>,
+)> {
+    let outer_job = containment_job()?;
+    let mut command = contained_command(
+        configured_command(spec, program),
+        spec.hide_window,
+        Arc::clone(&outer_job),
+    );
+    command
+        .spawn()
+        .map(|child| (child, outer_job))
+        .or_else(|error| {
             let script = std::path::Path::new(program)
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -180,68 +401,28 @@ impl ProcessLauncher for TokioLauncher {
             if error.kind() != std::io::ErrorKind::NotFound && !script {
                 return Err(error);
             }
-            let Some(fallback) = super::powershell::fallback(&spec) else {
+            let Some(fallback) = super::powershell::fallback(spec) else {
                 return Err(error);
             };
-            configured_command(&fallback, &fallback.argv[0]).spawn()
-        });
-        // The kind rather than the message: `io::Error`'s own text can name the path the operating
-        // system was given, which is host-provided, while the kind is a bounded enum and is the
-        // half an operator acts on — an absent executable is a different fix from a refused one.
-        let mut child = launched.map_err(|error| Error::Launch {
-            program: program.to_owned(),
-            message: format!("a launcher failure ({:?})", error.kind()),
-        })?;
-
-        let pid = child.id();
-        let stdout = child.stdout.take().ok_or_else(|| Error::Launch {
-            program: program.to_owned(),
-            message: String::from("a child without a readable stdout"),
-        })?;
-        let stdin = child.stdin.take();
-        let stderr_pipe = child.stderr.take();
-
-        let stderr = StderrTail::with_capacity(self.stderr_tail_bytes);
-        if let Some(mut pipe) = stderr_pipe {
-            let tail = stderr.clone();
-            tokio::spawn(async move {
-                let mut buffer = vec![0_u8; CHUNK_BYTES];
-                while let Ok(read) = pipe.read(&mut buffer).await {
-                    if read == 0 {
-                        break;
-                    }
-                    tail.push(&buffer[..read]);
-                }
-            });
-        }
-
-        // The child is owned by one reaper task, so every waiter reads the same answer and nothing
-        // races to `wait` on it twice.
-        let (exited, exit) = watch::channel(None);
-        tokio::spawn(async move {
-            let status = child.wait().await.ok().map(|status| ExitStatus {
-                code: status.code(),
-                signal: signal_of(&status),
-            });
-            let _ = exited.send(Some(status.unwrap_or_default()));
-        });
-
-        Ok(ManagedProcess {
-            stdout: Box::new(PipeSource {
-                stdout,
-                buffer: vec![0_u8; CHUNK_BYTES],
-            }),
-            stdin: stdin
-                .map(|stdin| -> Box<dyn ByteSink> { Box::new(PipeSink { stdin: Some(stdin) }) }),
-            control: Arc::new(TokioChild {
-                pid,
-                exit,
-                stderr,
-                kill_grace: self.kill_grace,
-                killed: AtomicBool::new(false),
-            }),
+            let containment_job = containment_job()?;
+            let child = contained_command(
+                configured_command(&fallback, &fallback.argv[0]),
+                fallback.hide_window,
+                Arc::clone(&containment_job),
+            )
+            .spawn()?;
+            Ok((child, containment_job))
         })
-    }
+}
+
+/// Makes the outer Job which owns the full process tree and can be queried safely.
+#[cfg(windows)]
+fn containment_job() -> std::io::Result<Arc<win32job::Job>> {
+    let mut limits = win32job::ExtendedLimitInfo::new();
+    limits.limit_kill_on_job_close();
+    win32job::Job::create_with_limit_info(&limits)
+        .map(Arc::new)
+        .map_err(std::io::Error::other)
 }
 
 #[cfg(unix)]
@@ -326,32 +507,217 @@ struct TokioChild {
     stderr: StderrTail,
     kill_grace: Duration,
     killed: AtomicBool,
+    #[cfg(windows)]
+    stop: watch::Sender<bool>,
+    #[cfg(windows)]
+    cleanup: watch::Receiver<Option<ExitStatus>>,
+    #[cfg(windows)]
+    cleanup_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl TokioChild {
+    #[cfg(unix)]
     fn exited(&self) -> Option<ExitStatus> {
         *self.exit.borrow()
     }
+
+    #[cfg(windows)]
+    fn job_cleanup_error(&self) -> Error {
+        let message = self
+            .cleanup_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| String::from("the contained process tree ended without a result"));
+        Error::Launch {
+            program: String::from("Windows Job"),
+            message,
+        }
+    }
+
+    #[cfg(windows)]
+    fn job_timeout_error(&self, waited: Duration) -> Error {
+        let recorded = self
+            .cleanup_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Error::Launch {
+            program: String::from("Windows Job"),
+            message: recorded.unwrap_or_else(|| {
+                format!(
+                    "a contained process tree still had members after {waited:?}; expected an empty Job"
+                )
+            }),
+        }
+    }
 }
 
-/// Waits out the grace, and says whether the leader went away inside it.
+/// Waits out the grace, and says whether the reaper proved the contained Job empty.
 #[cfg(windows)]
-async fn leader_exits_within(
-    mut exit: watch::Receiver<Option<ExitStatus>>,
+async fn job_ends_within(
+    mut cleanup: watch::Receiver<Option<ExitStatus>>,
     grace: Duration,
-) -> bool {
-    tokio::time::timeout(grace, async {
+) -> JobEnd {
+    match tokio::time::timeout(grace, async {
         loop {
-            if exit.borrow_and_update().is_some() {
-                return;
+            if cleanup.borrow_and_update().is_some() {
+                return JobEnd::Empty;
             }
-            if exit.changed().await.is_err() {
-                return;
+            if cleanup.changed().await.is_err() {
+                return JobEnd::ReaperClosed;
             }
         }
     })
     .await
-    .is_ok()
+    {
+        Ok(end) => end,
+        Err(_) => JobEnd::TimedOut,
+    }
+}
+
+/// The result of observing the Job-cleanup reaper through its bounded completion channel.
+#[cfg(windows)]
+enum JobEnd {
+    /// The reaper observed the outer Job's membership list become empty.
+    Empty,
+    /// The reaper ended without producing a cleanup result.
+    ReaperClosed,
+    /// The Job still had a member after the caller's bound.
+    TimedOut,
+}
+
+/// Waits for a cancellation request without treating a dropped control owner as permission to leak.
+#[cfg(windows)]
+async fn stop_requested(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow_and_update() {
+            return;
+        }
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Reaps a Windows Job after either its leader finishes or cancellation is requested.
+///
+/// The raw Tokio child is used only to observe the leader. Its exit is published to `wait` while
+/// its descendants keep running. A stop request calls `JobObjectChild::start_kill`, then the outer
+/// Job's process list is polled until empty. That separate cleanup result keeps a leader which
+/// handed work to a helper from turning into a successful `kill` result.
+#[cfg(windows)]
+async fn reap_windows_process_tree(
+    mut child: Box<dyn process_wrap::tokio::ChildWrapper>,
+    containment_job: Arc<win32job::Job>,
+    mut stop: watch::Receiver<bool>,
+    leader_exited: watch::Sender<Option<ExitStatus>>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let leader = {
+        let leader_wait = child
+            // `contained_command` registers `CreationFlags`, `KillOnDrop`,
+            // `AttachContainmentJob`, and `JobObject`. The first three are command shims, so
+            // JobObject is the sole child wrapper and its safe `inner_mut` is the raw Tokio
+            // leader. Its completion-port wait is never used here.
+            .inner_mut()
+            .wait();
+        tokio::pin!(leader_wait);
+        tokio::select! {
+            status = &mut leader_wait => Some(status?),
+            () = stop_requested(&mut stop) => None,
+        }
+    };
+
+    let status = match leader {
+        Some(status) => {
+            // `wait` describes the original child. Its descendants remain available after this
+            // status until the host explicitly stops them or they finish naturally.
+            let _ = leader_exited.send(Some(native_exit_status(status)));
+            match wait_for_stop_or_empty_job(containment_job.as_ref(), &mut stop).await? {
+                JobWait::Empty => status,
+                JobWait::StopRequested => {
+                    child.start_kill()?;
+                    child.inner_mut().wait().await?
+                }
+            }
+        }
+        None => {
+            // Stop was requested before the leader exited. The inner Job was created while the
+            // child was suspended, so this reaches every contained descendant as one operation.
+            child.start_kill()?;
+            let status = child.inner_mut().wait().await?;
+            let _ = leader_exited.send(Some(native_exit_status(status)));
+            status
+        }
+    };
+    wait_for_empty_job(containment_job.as_ref(), || {
+        tokio::time::sleep(WINDOWS_JOB_POLL_INTERVAL)
+    })
+    .await?;
+    Ok(status)
+}
+
+/// The next Windows Job event that matters to a leader that has already exited.
+#[cfg(windows)]
+enum JobWait {
+    /// Every direct and nested member finished without host cancellation.
+    Empty,
+    /// The host requested cancellation, so the inner Job must be terminated.
+    StopRequested,
+}
+
+/// Preserves descendants after a normal leader exit until they finish or the host stops them.
+#[cfg(windows)]
+async fn wait_for_stop_or_empty_job<M>(
+    job: &M,
+    stop: &mut watch::Receiver<bool>,
+) -> std::io::Result<JobWait>
+where
+    M: JobMembership,
+{
+    loop {
+        if job.process_ids()?.is_empty() {
+            return Ok(JobWait::Empty);
+        }
+        tokio::select! {
+            () = stop_requested(stop) => return Ok(JobWait::StopRequested),
+            () = tokio::time::sleep(WINDOWS_JOB_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+/// How often Windows teardown asks the outer Job whether a contained process remains.
+#[cfg(windows)]
+const WINDOWS_JOB_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The safe view of every process in the outer containment Job.
+#[cfg(windows)]
+trait JobMembership {
+    /// Lists every process in this Job, including nested Jobs.
+    fn process_ids(&self) -> std::io::Result<Vec<usize>>;
+}
+
+#[cfg(windows)]
+impl JobMembership for win32job::Job {
+    fn process_ids(&self) -> std::io::Result<Vec<usize>> {
+        self.query_process_id_list().map_err(std::io::Error::other)
+    }
+}
+
+/// Waits until the outer Job reports no direct or nested process members.
+#[cfg(windows)]
+async fn wait_for_empty_job<M, F, Fut>(job: &M, mut pause: F) -> std::io::Result<()>
+where
+    M: JobMembership,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        if job.process_ids()?.is_empty() {
+            return Ok(());
+        }
+        pause().await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -371,43 +737,93 @@ impl ProcessControl for TokioChild {
                 return Ok(status);
             }
             if exit.changed().await.is_err() {
+                #[cfg(windows)]
+                return Err(self.job_cleanup_error());
+                #[cfg(not(windows))]
                 return Ok(ExitStatus::default());
             }
         }
     }
 
     async fn kill(&self, _reason: CancelReason) -> Result<()> {
-        let Some(pid) = self.pid else {
-            // A child that never had a pid never started; one whose pid is already gone was
-            // reaped before any handle asked, and there is nothing left to signal.
-            return if self.exited().is_some() {
-                Ok(())
-            } else {
-                Err(Error::Launch {
-                    program: String::from("<unknown>"),
-                    message: String::from("a running child with no process id to end"),
-                })
-            };
-        };
-        // Escalated once, even if several tasks ask: a second escalation would be signalling a
-        // group id the operating system may already have handed to somebody else. The second
-        // caller waits on the first caller's outcome rather than reporting a child that is still
-        // inside its grace as already gone — `Ok` from `kill` is what a host reads as "the
-        // workspace is free".
-        if self.killed.swap(true, Ordering::AcqRel) {
+        #[cfg(windows)]
+        {
+            // Claim the Job teardown once. The request crosses the channel before the await, so
+            // cancelling this future cannot leave its child tree running.
+            if !self.killed.swap(true, Ordering::AcqRel) {
+                self.stop.send_replace(true);
+            }
             let waited = self.kill_grace * 2;
-            return if tree_ends_within(pid, self.exit.clone(), waited).await {
-                Ok(())
-            } else {
-                Err(Error::Launch {
-                    program: format!("process group {pid}"),
-                    message: format!(
-                        "a live process after {waited:?}, with an escalation already running"
-                    ),
-                })
+            return match job_ends_within(self.cleanup.clone(), waited).await {
+                JobEnd::Empty => Ok(()),
+                JobEnd::ReaperClosed => Err(self.job_cleanup_error()),
+                JobEnd::TimedOut => Err(self.job_timeout_error(waited)),
             };
         }
-        end_process_tree(pid, self.kill_grace, self.exit.clone()).await
+
+        #[cfg(not(windows))]
+        {
+            let Some(pid) = self.pid else {
+                // A child that never had a pid never started; one whose pid is already gone was
+                // reaped before any handle asked, and there is nothing left to signal.
+                return if self.exited().is_some() {
+                    Ok(())
+                } else {
+                    Err(Error::Launch {
+                        program: String::from("<unknown>"),
+                        message: String::from("a running child with no process id to end"),
+                    })
+                };
+            };
+            // Escalated once, even if several tasks ask: a second escalation would be signalling a
+            // group id the operating system may already have handed to somebody else. The second
+            // caller waits on the first caller's outcome rather than reporting a child that is still
+            // inside its grace as already gone — `Ok` from `kill` is what a host reads as "the
+            // workspace is free".
+            if self.killed.swap(true, Ordering::AcqRel) {
+                let waited = self.kill_grace * 2;
+                return if tree_ends_within(pid, self.exit.clone(), waited).await {
+                    Ok(())
+                } else {
+                    Err(Error::Launch {
+                        program: format!("process group {pid}"),
+                        message: format!(
+                            "a live process after {waited:?}, with an escalation already running"
+                        ),
+                    })
+                };
+            }
+            // Dropping a caller's timeout must not cancel escalation after `killed` was claimed.
+            // The owned task retains the reaper observation until the tree is stopped or refused.
+            tokio::spawn(end_process_tree(pid, self.kill_grace, self.exit.clone()))
+                .await
+                .map_err(|_| Error::Launch {
+                    program: String::from("process group"),
+                    message: String::from("process-tree cleanup task did not finish"),
+                })?
+        }
+    }
+
+    async fn interrupt(&self, _reason: CancelReason) -> Result<crate::process::InterruptOutcome> {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{Signal, killpg};
+            if self.exited().is_some() || self.killed.load(Ordering::Acquire) {
+                return Ok(crate::process::InterruptOutcome::NotDelivered);
+            }
+            let Some(pid) = self.pid else {
+                return Ok(crate::process::InterruptOutcome::NotDelivered);
+            };
+            killpg(group_of(pid), Signal::SIGINT).map_err(|error| Error::Launch {
+                program: String::from("process group"),
+                message: format!("interrupt failed with OS error {error}"),
+            })?;
+            Ok(crate::process::InterruptOutcome::Delivered)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(crate::process::InterruptOutcome::Unsupported)
+        }
     }
 }
 
@@ -426,25 +842,35 @@ impl Drop for TokioChild {
         if self.killed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Some(pid) = self.pid else {
-            return;
-        };
-        let grace = self.kill_grace;
-        let exit = self.exit.clone();
-        match tokio::runtime::Handle::try_current() {
-            // The same escalation `kill` runs, rather than a sleep and a signal: it asks first,
-            // stops the moment nothing is left, and never signals a tree that is already gone.
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    let _ = end_process_tree(pid, grace, exit).await;
-                });
-            }
-            // Nothing left to wait a grace on, so there is nowhere to wait between asking and
-            // insisting. Still checked first: a tree that is already gone must not be signalled,
-            // because the number may name whatever the operating system handed it to next.
-            Err(_) => {
-                if !tree_is_gone(pid, &exit) {
-                    insist_tree_stops(pid);
+        #[cfg(windows)]
+        {
+            // The reaper owns the Job object. If its runtime is still live it receives this stop
+            // request; if the runtime has already gone away, `KillOnDrop` closes the Job handle
+            // and Windows terminates its remaining members.
+            self.stop.send_replace(true);
+        }
+        #[cfg(not(windows))]
+        {
+            let Some(pid) = self.pid else {
+                return;
+            };
+            let grace = self.kill_grace;
+            let exit = self.exit.clone();
+            match tokio::runtime::Handle::try_current() {
+                // The same escalation `kill` runs, rather than a sleep and a signal: it asks first,
+                // stops the moment nothing is left, and never signals a tree that is already gone.
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        let _ = end_process_tree(pid, grace, exit).await;
+                    });
+                }
+                // Nothing left to wait a grace on, so there is nowhere to wait between asking and
+                // insisting. Still checked first: a tree that is already gone must not be signalled,
+                // because the number may name whatever the operating system handed it to next.
+                Err(_) => {
+                    if !tree_is_gone(pid, &exit) {
+                        insist_tree_stops(pid);
+                    }
                 }
             }
         }
@@ -472,23 +898,6 @@ fn group_of(pid: u32) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX))
 }
 
-/// Ends a tree with the only step Windows has.
-///
-/// There is no polite call to make first: `taskkill` without `/F` posts `WM_CLOSE`, which a
-/// console program does not handle, so asking and insisting would be the same call.
-#[cfg(windows)]
-fn insist_tree_stops(pid: u32) {
-    use std::os::windows::process::CommandExt as _;
-
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
-}
-
 /// How often a tree is asked whether anything is left of it.
 #[cfg(unix)]
 const TREE_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -512,16 +921,6 @@ fn tree_is_gone(pid: u32, _exit: &watch::Receiver<Option<ExitStatus>>) -> bool {
     )
 }
 
-/// Whether the operating system still knows anything in this tree.
-///
-/// The leader's own exit, because Windows offers no cheap equivalent of a process group to ask.
-/// `taskkill /T` is what reaches the descendants; this is what says there is still something to
-/// run it against, and what stops a second run from naming a process id Windows has reissued.
-#[cfg(windows)]
-fn tree_is_gone(_pid: u32, exit: &watch::Receiver<Option<ExitStatus>>) -> bool {
-    exit.borrow().is_some()
-}
-
 /// Waits out the grace, and says whether the tree went away inside it.
 #[cfg(unix)]
 async fn tree_ends_within(
@@ -536,16 +935,6 @@ async fn tree_ends_within(
     })
     .await
     .is_ok()
-}
-
-/// Waits out the grace, and says whether the tree went away inside it.
-#[cfg(windows)]
-async fn tree_ends_within(
-    _pid: u32,
-    exit: watch::Receiver<Option<ExitStatus>>,
-    grace: Duration,
-) -> bool {
-    leader_exits_within(exit, grace).await
 }
 
 /// Asks a tree to stop, waits, and insists only on what is left.
@@ -575,47 +964,6 @@ async fn end_process_tree(
     Err(Error::Launch {
         program: format!("process group {pid}"),
         message: format!("a live group member after {grace:?}"),
-    })
-}
-
-/// Ends a tree with the one step Windows has.
-///
-/// A direct child handle does not imply ownership of descendants here, so the tree is ended
-/// through the system's own primitive rather than by killing what the library can see. There is no
-/// polite step to take first: `taskkill` without `/F` posts `WM_CLOSE`, which a console program
-/// does not handle.
-#[cfg(windows)]
-async fn end_process_tree(
-    pid: u32,
-    grace: Duration,
-    exit: watch::Receiver<Option<ExitStatus>>,
-) -> Result<()> {
-    if tree_is_gone(pid, &exit) {
-        return Ok(());
-    }
-
-    let mut taskkill = Command::new("taskkill");
-    taskkill
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW);
-
-    let ran = tokio::time::timeout(grace, taskkill.status()).await;
-    if tree_ends_within(pid, exit, grace).await {
-        return Ok(());
-    }
-    Err(Error::Launch {
-        program: format!("process tree {pid}"),
-        message: match ran {
-            Ok(Ok(status)) => {
-                format!("a live process after taskkill exited with status {status}")
-            }
-            // The kind, not the message: see the spawn arm above.
-            Ok(Err(error)) => format!("a taskkill that would not run ({:?})", error.kind()),
-            Err(_) => format!("no answer from taskkill within {grace:?}"),
-        },
     })
 }
 
@@ -667,6 +1015,14 @@ mod tests {
             "forever" => loop {
                 std::thread::sleep(Duration::from_secs(60));
             },
+            "interrupt-ready" => {
+                use std::io::Write as _;
+                println!("MEA-READY");
+                std::io::stdout().flush().expect("flush ready marker");
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
             // Spawns a helper of its own and exits — the shape a vendor CLI leaves behind when it
             // hands its work to a daemon. The helper inherits this stdout and this process group,
             // so the pipe the test holds outlives the process the launcher can see.
@@ -680,6 +1036,31 @@ mod tests {
                     .stdin(std::process::Stdio::null())
                     .spawn();
             }
+            // The Windows regression fixture makes the leader wait until the test has observed
+            // its helper. It then exits on the test's release file, leaving the helper holding
+            // stdout. That is the precise shape where checking the leader's exit used to skip
+            // `taskkill /T` and report an orphan as cleaned up.
+            #[cfg(windows)]
+            "leaves-a-helper" => {
+                let executable =
+                    std::env::current_exe().expect("expected the test binary's own path");
+                let marker = std::env::var("MEA_LAUNCHER_HELPER_MARKER")
+                    .expect("expected helper marker path");
+                let release = std::env::var("MEA_LAUNCHER_LEADER_RELEASE")
+                    .expect("expected leader release path");
+                let _ = std::process::Command::new(executable)
+                    .args(["launcher_fixture_child", "--nocapture", "--test-threads=1"])
+                    .env(FIXTURE_MODE, "survives-job-termination")
+                    .env("MEA_LAUNCHER_HELPER_MARKER", marker)
+                    .stdin(std::process::Stdio::null())
+                    .spawn();
+                while !std::path::Path::new(&release).exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                use std::io::Write as _;
+                println!("MEA-LEADER-EXITING");
+                std::io::stdout().flush().expect("flush leader exit marker");
+            }
             // Blocked rather than handled: installing a handler needs `unsafe`, which this crate
             // forbids. A blocked `SIGTERM` stays pending forever while `SIGKILL` still lands,
             // which is the only thing that reaches this helper.
@@ -688,6 +1069,22 @@ mod tests {
                 let mut blocked = nix::sys::signal::SigSet::empty();
                 blocked.add(nix::sys::signal::Signal::SIGTERM);
                 let _ = blocked.thread_block();
+                use std::io::Write as _;
+                println!("MEA-READY");
+                std::io::stdout().flush().expect("flush ready marker");
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            #[cfg(windows)]
+            "survives-job-termination" => {
+                let marker = std::env::var("MEA_LAUNCHER_HELPER_MARKER")
+                    .expect("expected helper marker path");
+                std::fs::write(marker, std::process::id().to_string())
+                    .expect("write helper process id");
+                use std::io::Write as _;
+                println!("MEA-HELPER-READY");
+                std::io::stdout().flush().expect("flush helper marker");
                 loop {
                     std::thread::sleep(Duration::from_secs(60));
                 }
@@ -742,6 +1139,100 @@ mod tests {
 
         assert_eq!(launcher.kill_grace(), Duration::from_secs(10));
         assert_eq!(launcher.stderr_tail_bytes(), 4_096);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_graceful_interrupt_is_sigint_and_is_reaped() {
+        let child = TokioLauncher::new()
+            .spawn(fixture("interrupt-ready"))
+            .await
+            .expect("child");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        while !lines
+            .next_line()
+            .await
+            .expect("ready output")
+            .expect("child must reach readiness")
+            .ends_with("MEA-READY")
+        {}
+        assert_eq!(
+            child
+                .control
+                .interrupt(CancelReason::Requested)
+                .await
+                .expect("interrupt"),
+            crate::InterruptOutcome::Delivered
+        );
+        let status = tokio::time::timeout(Duration::from_secs(5), child.control.wait())
+            .await
+            .expect("exit deadline")
+            .expect("reaped");
+        assert_eq!(status.signal, Some(2));
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("tree cleanup");
+        assert_eq!(
+            child
+                .control
+                .interrupt(CancelReason::Requested)
+                .await
+                .expect("observe stopped child"),
+            crate::InterruptOutcome::NotDelivered,
+            "an exited child cannot acknowledge a new graceful interrupt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_kill_future_does_not_abandon_escalation() {
+        // Inherit the mask before the child's libtest runtime creates any threads. Blocking
+        // only its fixture thread would leave its main thread able to receive process SIGTERM.
+        let original_mask = nix::sys::signal::SigSet::thread_get_mask().expect("signal mask");
+        let mut blocked = original_mask;
+        blocked.add(nix::sys::signal::Signal::SIGTERM);
+        blocked
+            .thread_set_mask()
+            .expect("block SIGTERM before spawn");
+        let spawned = TokioLauncher::new()
+            .with_kill_grace(Duration::from_millis(50))
+            .spawn(fixture("survives-sigterm"))
+            .await;
+        original_mask
+            .thread_set_mask()
+            .expect("restore test signal mask");
+        let child = spawned.expect("child");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        while !lines
+            .next_line()
+            .await
+            .expect("ready output")
+            .expect("child must reach readiness")
+            .ends_with("MEA-READY")
+        {}
+        let mut stopping = Box::pin(child.control.kill(CancelReason::Shutdown));
+        std::future::poll_fn(|cx| {
+            assert!(
+                stopping.as_mut().poll(cx).is_pending(),
+                "expected cleanup in progress"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(stopping);
+        let waited = tokio::time::timeout(Duration::from_secs(5), child.control.wait()).await;
+        if waited.is_err() {
+            let pid = child.control.pid().expect("owned child PID");
+            let _ =
+                nix::sys::signal::killpg(super::group_of(pid), nix::sys::signal::Signal::SIGKILL);
+            let _ = child.control.wait().await;
+        }
+        let status = waited
+            .expect("owned escalation must reap child")
+            .expect("reaped");
+        assert_eq!(status.signal, Some(9));
     }
 
     /// A handshake that fails after the spawn drops every handle to the child. The reaper owns it
@@ -847,10 +1338,361 @@ mod tests {
         );
     }
 
+    /// A Job keeps descendants contained after the leader has handed work off and exited.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn escalation_reaches_a_helper_that_outlived_the_child() {
+        let (child, mut fixture_files) = windows_helper_child().await;
+        let leader = child.control.pid().expect("leader process id");
+        let helper = fixture_files.await_helper().await;
+        assert!(
+            windows_process_is_running(helper),
+            "expected the helper to run before its leader exits"
+        );
+
+        let mut stdout = LineStream::new(child.stdout, LineLimits::default());
+        await_fixture_line(&mut stdout, "MEA-HELPER-READY").await;
+        fixture_files.release_leader();
+        await_fixture_line(&mut stdout, "MEA-LEADER-EXITING").await;
+        await_windows_process_exit(leader).await;
+        fixture_files.clear_leader();
+        let leader_status = child
+            .control
+            .wait()
+            .await
+            .expect("expected the exited leader's status");
+        assert!(
+            leader_status.success(),
+            "expected the fixture leader to exit successfully, received {leader_status:?}"
+        );
+        assert!(
+            windows_process_is_running(helper),
+            "expected helper process {helper} to remain until explicit Job cleanup"
+        );
+
+        // The old Windows implementation returned success here after the leader had exited,
+        // leaving the helper alive. A successful cleanup must prove the helper is gone before
+        // the pipe's longer EOF bound can make that failure less visible.
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("expected the contained Job to be ended");
+        assert!(
+            !windows_process_is_running(helper),
+            "expected successful Job cleanup to end helper process {helper}"
+        );
+        fixture_files.clear_helper();
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while stdout
+                .next_line()
+                .await
+                .expect("read helper output through pipe closure")
+                .is_some()
+            {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "expected the helper's end of the pipe to close, received an open pipe"
+        );
+    }
+
+    /// Dropping the control handle sends the same durable Job cleanup request as `kill`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dropping_the_last_handle_reaches_a_helper_the_child_left_behind() {
+        let (child, mut fixture_files) = windows_helper_child().await;
+        let leader = child.control.pid().expect("leader process id");
+        let helper = fixture_files.await_helper().await;
+        let mut stdout = LineStream::new(child.stdout, LineLimits::default());
+        await_fixture_line(&mut stdout, "MEA-HELPER-READY").await;
+
+        // The leader is still blocked on its release file here. This makes the control drop, not
+        // natural leader cleanup, the operation that must terminate both Job members.
+        drop(child.stdin);
+        drop(child.control);
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while stdout
+                .next_line()
+                .await
+                .expect("read helper output through pipe closure")
+                .is_some()
+            {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "expected the dropped control handle to close the helper pipe"
+        );
+        assert!(
+            !windows_process_is_running(helper),
+            "expected dropped control to end helper process {helper}"
+        );
+        await_windows_process_exit(leader).await;
+        fixture_files.clear_helper();
+        fixture_files.clear_leader();
+    }
+
+    /// The reaper owns Job termination after `kill` signals it, even if that future is abandoned.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dropping_the_kill_future_does_not_abandon_escalation() {
+        let child = TokioLauncher::new()
+            .with_kill_grace(Duration::from_millis(300))
+            .spawn(fixture("forever"))
+            .await
+            .expect("expected a child");
+        let pid = child.control.pid().expect("owned child PID");
+
+        let mut stopping = Box::pin(child.control.kill(CancelReason::Shutdown));
+        std::future::poll_fn(|cx| {
+            assert!(
+                stopping.as_mut().poll(cx).is_pending(),
+                "expected Job cleanup to continue in its reaper"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(stopping);
+
+        // `wait` reports the leader. A second `kill` observes the reaper's separate empty-Job
+        // completion, proving the cancelled future did not abandon the containment lifetime.
+        let cleaned = tokio::time::timeout(
+            Duration::from_secs(10),
+            child.control.kill(CancelReason::Shutdown),
+        )
+        .await;
+        if cleaned.is_err() {
+            stop_windows_process(pid);
+        }
+        cleaned
+            .expect("owned Job cleanup must finish after a cancelled kill future")
+            .expect("expected the Job to become empty");
+        let status = child
+            .control
+            .wait()
+            .await
+            .expect("expected a leader result after Job cleanup");
+        assert!(
+            !status.success(),
+            "expected terminated Job leader not to report success, received {status:?}"
+        );
+    }
+
     /// Whether the operating system still knows this process id.
     #[cfg(unix)]
     fn alive(pid: u32) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    }
+
+    /// Files and process identifiers used to make the Windows orphan fixture observable.
+    #[cfg(windows)]
+    struct WindowsHelperFixture {
+        directory: std::path::PathBuf,
+        marker: std::path::PathBuf,
+        release: std::path::PathBuf,
+        leader: Option<u32>,
+        helper: Option<u32>,
+        helper_observed: bool,
+    }
+
+    #[cfg(windows)]
+    impl WindowsHelperFixture {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!("mea-job-fixture-{nonce}"));
+            std::fs::create_dir(&directory).expect("create fixture directory");
+            Self {
+                marker: directory.join("helper.pid"),
+                release: directory.join("leader.release"),
+                directory,
+                leader: None,
+                helper: None,
+                helper_observed: false,
+            }
+        }
+
+        fn add_to(&self, spec: &mut LaunchSpec) {
+            spec.env.insert(
+                String::from("MEA_LAUNCHER_HELPER_MARKER"),
+                self.marker.to_string_lossy().into_owned(),
+            );
+            spec.env.insert(
+                String::from("MEA_LAUNCHER_LEADER_RELEASE"),
+                self.release.to_string_lossy().into_owned(),
+            );
+        }
+
+        async fn await_helper(&mut self) -> u32 {
+            let helper = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(pid) = std::fs::read_to_string(&self.marker)
+                        .ok()
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .parse()
+                    {
+                        return pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("expected helper process marker");
+            self.helper = Some(helper);
+            self.helper_observed = true;
+            helper
+        }
+
+        fn release_leader(&self) {
+            std::fs::write(&self.release, []).expect("release leader after helper started");
+        }
+
+        fn bind_leader(&mut self, leader: u32) {
+            self.leader = Some(leader);
+        }
+
+        fn clear_leader(&mut self) {
+            self.leader = None;
+        }
+
+        fn clear_helper(&mut self) {
+            self.helper = None;
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsHelperFixture {
+        fn drop(&mut self) {
+            if let Some(leader) = self.leader {
+                stop_windows_process(leader);
+            }
+            if let Some(helper) = self.helper {
+                stop_windows_process(helper);
+            } else if !self.helper_observed
+                && let Ok(pid) = std::fs::read_to_string(&self.marker)
+                    .ok()
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .parse()
+            {
+                stop_windows_process(pid);
+            }
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    /// Stops a fixture process even when an expected-red assertion aborts the test early.
+    #[cfg(windows)]
+    fn stop_windows_process(pid: u32) {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    /// Waits until the OS has retired the leader, independently of the launcher's cleanup view.
+    #[cfg(windows)]
+    async fn await_windows_process_exit(pid: u32) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while windows_process_is_running(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected leader process to exit");
+    }
+
+    /// Asks Windows whether this exact PID still names a process.
+    #[cfg(windows)]
+    fn windows_process_is_running(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("run tasklist");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    /// Replays outer Job snapshots without sleeping so the completion condition stays explicit.
+    #[cfg(windows)]
+    struct ScriptedJobMembership {
+        snapshots: std::sync::Mutex<std::collections::VecDeque<std::io::Result<Vec<usize>>>>,
+    }
+
+    #[cfg(windows)]
+    impl super::JobMembership for ScriptedJobMembership {
+        fn process_ids(&self) -> std::io::Result<Vec<usize>> {
+            self.snapshots
+                .lock()
+                .expect("scripted Job snapshots lock")
+                .pop_front()
+                .expect("a scripted Job snapshot for every query")
+        }
+    }
+
+    /// Reaping cannot publish after the leader leaves while a nested helper remains in the Job.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_windows_job_is_not_empty_until_its_member_list_is_empty() {
+        let job = ScriptedJobMembership {
+            snapshots: std::sync::Mutex::new(std::collections::VecDeque::from([
+                Ok(vec![101, 202]),
+                Ok(vec![202]),
+                Ok(Vec::new()),
+            ])),
+        };
+
+        super::wait_for_empty_job(&job, || std::future::ready(()))
+            .await
+            .expect("the final empty Job snapshot");
+        assert!(
+            job.snapshots
+                .lock()
+                .expect("scripted Job snapshots lock")
+                .is_empty(),
+            "expected the reaper to observe every non-empty Job snapshot"
+        );
+    }
+
+    /// Reads fixture lines until a synchronization marker arrives.
+    #[cfg(windows)]
+    async fn await_fixture_line(lines: &mut LineStream, marker: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .expect("read fixture output")
+                    .expect("fixture output before pipe closure");
+                if line.ends_with(marker) {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected fixture marker {marker}"));
+    }
+
+    /// Builds the leader-and-helper shape after its Job has been created by the launcher.
+    #[cfg(windows)]
+    async fn windows_helper_child() -> (crate::process::ManagedProcess, WindowsHelperFixture) {
+        let launcher = TokioLauncher::new().with_kill_grace(Duration::from_millis(300));
+        let mut fixture_files = WindowsHelperFixture::new();
+        let mut spec = fixture("leaves-a-helper");
+        fixture_files.add_to(&mut spec);
+        let child = launcher.spawn(spec).await.expect("expected a child");
+        let leader = child.control.pid().expect("leader process id");
+        fixture_files.bind_leader(leader);
+        (child, fixture_files)
     }
 
     /// Every line the fixture itself wrote, without the test harness's own chatter.

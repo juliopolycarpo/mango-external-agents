@@ -4,7 +4,7 @@ Drives the `claude` CLI a user already installed, through the headless surface A
 documents, over one child process per turn. It never logs in, never reads a credential and never
 downloads a binary.
 
-Facts below were read on 2026-09-13 against `claude` **2.1.270** and the vendor's own pages.
+Facts below were re-checked on 2026-09-17 against `claude` **2.1.270** and the vendor's own pages.
 Re-verify before relying on them; `mea capture --harness claude` regenerates the public contract
 under `fixtures/claude/contract/`.
 
@@ -78,6 +78,10 @@ claude --print
   the stream arrives in whole messages and nothing renders until each block is complete.
 - **The prompt is never in argv.** It is written as one `{"type":"user",…}` message on stdin, which
   is then closed. argv is world-readable in `ps` on every platform this runs on.
+- **Prompt input is bounded.** The write and stdin close share `Limits::request_timeout`. A dropped
+  stream, host shutdown, `Session::cancel` or `Session::close` stops the child through the turn's
+  one teardown owner instead of waiting for a blocked host sink. This follows Claude's documented
+  stream-json stdin input and EOF-driven prompt boundary ([headless.md](https://code.claude.com/docs/en/headless.md)).
 - **Omitted permissions preserve the user's CLI profile.** No permission mode or prompt override
   is passed until the host selects permissions. Claude's single mode flag requires both axes on
   the first selection; subsequent partial updates inherit the other axis. Accepted settings persist
@@ -134,7 +138,10 @@ id, and each turn spawns, streams and reaps its own child.
   force. The same argument-position rule applies to an explicit `--model` value.
 
   <https://code.claude.com/docs/en/cli-reference.md>
-- **A second `start_turn` ends the first.** A host that starts one has decided the first is over.
+- **A second `start_turn` is refused while one is active.** Admission claims the session's sole
+  active-turn slot before a child starts. A concurrent caller receives `Error::Busy` before any
+  second Claude invocation is launched; it must explicitly cancel the active turn and wait for
+  its terminal state before retrying.
 - **`start_turn` and `close` share the core lifecycle gate.** It covers the synchronous child
   reservation and teardown claim, then releases before every await. Close therefore either takes the
   reservation or makes the starting call reap the child it launched, rather than leaving a process
@@ -152,10 +159,20 @@ id, and each turn spawns, streams and reaps its own child.
 
 ## Cancellation, and what the vendor actually does
 
-`Session::cancel` records a reason, kills the child through the host's launcher, and the turn's
-pump writes `Cancelled { reason }` followed by `Completed`. Exit 143 is read as a clean stop rather
-than a failure: putting an error in the transcript for something the user asked for is worse than
-saying nothing.
+`Session::cancel` records a reason and asks the host launcher to interrupt the child first. The
+host supplies the OS-specific interrupt and containment policy. If the child does not exit during
+the host-configured grace period, the launcher escalates to process-tree termination and reaps it.
+The turn pump writes `Cancelled { reason }` followed by `Completed`; an unread transcript cannot
+block that control-plane cleanup. A cancel, close, host shutdown, dropped stream and native
+completion all join the same per-turn teardown. Exit 143 is read as a clean stop rather than a
+failure: putting an error in the transcript for something the user asked for is worse than saying
+nothing.
+
+Close waits for a pending launch and for native cleanup before reporting success. If native cleanup
+fails, it returns the error, keeps the session `Closing`, and preserves the MCP artifact in the
+host's scratch directory because the child may still read it. The host reclaims that artifact after
+independently establishing that no child remains. If native cleanup succeeds but artifact removal
+fails, the session is `Closed` and close reports the removal error.
 
 **The vendor's own turn is left unfinished.** This is a real asymmetry and it is the vendor's
 documented behaviour, not this harness's choice:
@@ -165,11 +182,11 @@ documented behaviour, not this harness's choice:
 > session, Claude Code continues the turn that SIGTERM left unfinished.
 > — [headless.md](https://code.claude.com/docs/en/headless.md)
 
-So a cancelled turn's work may resume on the *next* turn of the same session. SIGINT is what the
-vendor documents as ending a turn cleanly, and the library cannot ask for it: `ProcessControl::kill`
-is the host's port, and which signal "end it" means is the launcher's decision. A host that wants
-the vendor's clean-cancel semantics implements that in its own launcher. A core-owned way to ask
-for an interrupt rather than a kill is the obvious follow-up.
+After forced termination the harness marks the session nonresumable and refuses another turn with
+the recorded cancellation reason. It never silently mints a replacement native conversation for a
+strict session, and it never resumes the killed prompt. SIGINT is what the vendor documents as
+ending a turn cleanly. A launcher reports that graceful interruption separately from forced
+termination, which preserves the existing native continuation.
 
 Closing stdin is also what the vendor documents as cancelling a pending prompt, and this harness
 closes it immediately after the prompt — so a run that would otherwise wait for an answer nobody
@@ -358,15 +375,18 @@ catalog an earlier run published.
   reconstructing it would mean reading the email this harness deliberately drops.
 - **`--permission-prompts none`** is passed where the build declares it; the TypeScript adapter
   added this late and the reasoning is carried over intact.
-- The **idle timeout** (10 minutes of silence) lives here rather than in a supervisor above.
+- The **idle timeout** is host-configured and lives here rather than in a supervisor above, but the
+  harness floors it at `pinned::STREAM_IDLE_TIMEOUT` (ten minutes). A Claude tool call legitimately
+  runs for minutes with the vendor emitting nothing, so a shorter cap does not describe a stalled
+  child — it cuts a working turn. A host that wants a longer leash sets `Limits::idle_timeout`
+  above the floor and gets it.
 
 ## Known gaps
 
 - `GateVerdict::VersionTooOld` carries the version and the floor but has nowhere to name *which*
   flag went missing, so a build refused for a missing flag reports an upgrade rather than the
   specific cause. The fixture-backed surface test is what names it for a maintainer.
-- A real `ResumeMode::Fallback`, and a core-owned way to ask a launcher for an interrupt rather
-  than a kill, are both recorded above as follow-ups.
+- A real `ResumeMode::Fallback` is recorded above as a follow-up.
 
 Discovery exposes the account and build restrictions in `Discovery.permission_matrix`; the static
 `Harness::permission_matrix` is its upper bound. Hosts can use the probed matrix to disable

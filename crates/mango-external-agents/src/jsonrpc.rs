@@ -148,6 +148,11 @@ pub enum PeerTermination {
     /// Reading the peer failed.
     LinkFailed(String),
     /// Peer work filled the bounded handoff queue before the handler could consume it.
+    NotificationByteBackpressure {
+        /// The encoded byte budget for queued and in-flight peer callbacks.
+        limit: usize,
+    },
+    /// The event-count handoff budget was exhausted.
     NotificationBackpressure {
         /// The number of peer messages the client can retain while the handler is busy.
         limit: usize,
@@ -162,6 +167,10 @@ impl std::fmt::Debug for PeerTermination {
             Self::LinkFailed(error) => formatter
                 .debug_struct("LinkFailed")
                 .field("message_bytes", &error.len())
+                .finish(),
+            Self::NotificationByteBackpressure { limit } => formatter
+                .debug_struct("NotificationByteBackpressure")
+                .field("limit", limit)
                 .finish(),
             Self::NotificationBackpressure { limit } => formatter
                 .debug_struct("NotificationBackpressure")
@@ -179,6 +188,10 @@ impl std::fmt::Display for PeerTermination {
                 formatter,
                 "the peer link failed with an unstructured error ({} bytes)",
                 error.len()
+            ),
+            Self::NotificationByteBackpressure { limit } => write!(
+                formatter,
+                "the peer exceeded the queued callback payload budget ({limit} bytes)"
             ),
             Self::NotificationBackpressure { limit } => write!(
                 formatter,
@@ -268,6 +281,12 @@ pub struct ClientOptions {
     pub max_in_flight_requests: usize,
     /// How many peer messages that need the handler can wait while responses keep settling.
     pub max_pending_notifications: usize,
+    /// Maximum outbound RPCs awaiting a response.
+    pub max_pending_requests: usize,
+    /// Maximum encoded bytes held by queued or in-flight peer callbacks.
+    pub max_pending_bytes: usize,
+    /// Deadline for each shutdown stage and callback drain.
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for ClientOptions {
@@ -279,6 +298,9 @@ impl Default for ClientOptions {
             request_timeout: Duration::from_secs(120),
             max_in_flight_requests: 256,
             max_pending_notifications: 256,
+            max_pending_requests: 64,
+            max_pending_bytes: 8 * 1024 * 1024,
+            shutdown_timeout: Duration::from_millis(200),
         }
     }
 }
@@ -361,12 +383,14 @@ impl ClientOptions {
     #[must_use]
     pub fn with_limits(mut self, limits: &Limits) -> Self {
         self.request_timeout = limits.request_timeout;
+        self.max_pending_requests = limits.max_pending_requests;
+        self.max_in_flight_requests = limits.max_pending_requests;
+        self.max_pending_notifications = limits.turn_channel_capacity;
+        self.max_pending_bytes = limits.turn_buffer_bytes;
+        self.shutdown_timeout = limits.shutdown_timeout;
         self
     }
 }
-
-/// How long [`Client::close`] lets an answer already resolved write its frame.
-const IN_FLIGHT_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 /// A JSON-RPC client that also answers.
 pub struct Client {
@@ -377,6 +401,8 @@ pub struct Client {
 struct ClientState {
     sender: Mutex<Box<dyn LinkSender>>,
     pending: Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, JsonRpcError>>>>,
+    /// The connection's runtime also owns cleanup when a request is dropped on another thread.
+    runtime: tokio::runtime::Handle,
     options: ClientOptions,
     next_id: AtomicU64,
     closed: AtomicBool,
@@ -384,6 +410,30 @@ struct ClientState {
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
     notifications: StdMutex<Option<JoinHandle<()>>>,
+    peer_bytes: Arc<tokio::sync::Semaphore>,
+}
+
+/// Removes correlation state when a request future is dropped at any await.
+struct PendingCall {
+    state: Arc<ClientState>,
+    id: String,
+}
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.state.pending.try_lock() {
+            pending.remove(&self.id);
+            return;
+        }
+        // A host can drop this future outside the connection's runtime. Keep cleanup on the
+        // runtime that owns the pump rather than retaining an abandoned correlation until the
+        // next request or close. The host keeps that runtime alive through session shutdown.
+        let state = Arc::clone(&self.state);
+        let id = self.id.clone();
+        self.state.runtime.spawn(async move {
+            state.pending.lock().await.remove(&id);
+        });
+    }
 }
 
 impl Client {
@@ -394,15 +444,22 @@ impl Client {
     pub fn connect(link: Link, handler: Arc<dyn PeerHandler>, options: ClientOptions) -> Self {
         let (sender, receiver) = link.split();
         let notification_capacity = options.max_pending_notifications.max(1);
+        let peer_bytes = Arc::new(tokio::sync::Semaphore::new(
+            options
+                .max_pending_bytes
+                .min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
         let state = Arc::new(ClientState {
             sender: Mutex::new(sender),
             pending: Mutex::new(HashMap::new()),
+            runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             shutdown: CancelToken::new(),
             in_flight: StdMutex::new(JoinSet::new()),
             notifications: StdMutex::new(None),
+            peer_bytes,
         });
         let (notifications, notification_receiver) = mpsc::channel(notification_capacity);
         *state
@@ -451,7 +508,12 @@ impl Client {
         P: Serialize + Send,
         R: DeserializeOwned,
     {
-        let answer = self.call(method, params, timeout).await?;
+        let answer = tokio::time::timeout(timeout, self.call(method, params, timeout))
+            .await
+            .map_err(|_| Error::Timeout {
+                operation: String::from("a JSON-RPC request"),
+                after: timeout,
+            })??;
         serde_json::from_value(answer).map_err(|error| Error::Protocol {
             expected: String::from("a JSON-RPC result"),
             received: error.to_string(),
@@ -498,7 +560,15 @@ impl Client {
         // refusal, and it happens before the link is closed under them.
         self.state.drain_in_flight().await;
 
-        let closed = self.state.sender.lock().await.close().await;
+        let closed = tokio::time::timeout(self.state.options.shutdown_timeout, async {
+            self.state.sender.lock().await.close().await
+        })
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("JSON-RPC link shutdown"),
+            after: self.state.options.shutdown_timeout,
+        })
+        .and_then(std::convert::identity);
         if let Some(pump) = self.pump.lock().await.take() {
             // Taken down rather than waited out: the shutdown flag is only read between messages,
             // so a pump parked inside a handler — which is where a host that stopped reading its
@@ -550,8 +620,20 @@ impl Client {
             if self.state.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed { subject: "link" });
             }
+            pending.retain(|_, answer| !answer.is_closed());
+            if pending.len() >= self.state.options.max_pending_requests {
+                return Err(Error::LimitExceeded {
+                    subject: "pending JSON-RPC requests",
+                    limit: self.state.options.max_pending_requests,
+                    received: pending.len().saturating_add(1),
+                });
+            }
             pending.insert(id.clone(), answer);
         }
+        let _pending = PendingCall {
+            state: Arc::clone(&self.state),
+            id: id.clone(),
+        };
 
         if let Err(error) = self.state.write(frame).await {
             // The entry goes before the error leaves: nothing is waiting on this call — the
@@ -651,7 +733,7 @@ impl ClientState {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        let drained = tokio::time::timeout(IN_FLIGHT_DRAIN_GRACE, async {
+        let drained = tokio::time::timeout(self.options.shutdown_timeout, async {
             while in_flight.join_next().await.is_some() {}
         })
         .await;
@@ -694,7 +776,7 @@ impl ClientState {
         let Some(mut handle) = handle else {
             return;
         };
-        if tokio::time::timeout(IN_FLIGHT_DRAIN_GRACE, &mut handle)
+        if tokio::time::timeout(self.options.shutdown_timeout, &mut handle)
             .await
             .is_err()
         {
@@ -726,6 +808,7 @@ impl ClientState {
         method: String,
         params: Value,
         raw_id: Value,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> bool {
         let mut in_flight = state
             .in_flight
@@ -739,12 +822,22 @@ impl ClientState {
         }
         let owned = Arc::clone(state);
         let handler = Arc::clone(handler);
-        in_flight.spawn(async move { answer(&owned, &handler, method, params, raw_id).await });
+        in_flight.spawn(async move {
+            let _permit = permit;
+            answer(&owned, &handler, method, params, raw_id).await;
+        });
         true
     }
 
     async fn write(&self, frame: String) -> Result<()> {
-        self.sender.lock().await.send(frame).await
+        tokio::time::timeout(self.options.request_timeout, async {
+            self.sender.lock().await.send(frame).await
+        })
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("JSON-RPC frame write"),
+            after: self.options.request_timeout,
+        })?
     }
 
     async fn fail_pending(&self, failure: JsonRpcError) {
@@ -765,7 +858,7 @@ async fn pump(
     state: Arc<ClientState>,
     mut receiver: Box<dyn crate::link::LinkReceiver>,
     handler: Arc<dyn PeerHandler>,
-    notifications: mpsc::Sender<PeerWork>,
+    notifications: mpsc::Sender<BudgetedWork>,
 ) {
     loop {
         let message = tokio::select! {
@@ -776,7 +869,7 @@ async fn pump(
 
         match message {
             Ok(Some(message)) => {
-                if !dispatch(&state, &notifications, message).await {
+                if let Err(termination) = dispatch(&state, &notifications, message).await {
                     state.closed.store(true, Ordering::Release);
                     state
                         .fail_pending(JsonRpcError {
@@ -791,11 +884,7 @@ async fn pump(
                     state.stop_notifications().await;
                     state.shutdown.cancel();
                     state.drain_in_flight().await;
-                    handler
-                        .on_terminated(PeerTermination::NotificationBackpressure {
-                            limit: state.options.max_pending_notifications.max(1),
-                        })
-                        .await;
+                    handler.on_terminated(termination).await;
                     break;
                 }
             }
@@ -840,13 +929,13 @@ async fn pump(
 
 async fn dispatch(
     state: &Arc<ClientState>,
-    notifications: &mpsc::Sender<PeerWork>,
+    notifications: &mpsc::Sender<BudgetedWork>,
     message: String,
-) -> bool {
+) -> std::result::Result<(), PeerTermination> {
     // Not every line on a peer's output is a frame. Dropping an unparseable one keeps a stray
     // diagnostic from killing a live turn.
     let Ok(Value::Object(frame)) = serde_json::from_str::<Value>(&message) else {
-        return true;
+        return Ok(());
     };
 
     let id = frame.get("id").cloned();
@@ -856,41 +945,50 @@ async fn dispatch(
         .map(str::to_owned);
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
 
-    if let (Some(method), None) = (&method, &id) {
+    if let Some(method) = method {
+        let bytes = u32::try_from(message.len()).map_err(|_| {
+            PeerTermination::NotificationByteBackpressure {
+                limit: state.options.max_pending_bytes,
+            }
+        })?;
+        let permit = Arc::clone(&state.peer_bytes)
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| PeerTermination::NotificationByteBackpressure {
+                limit: state.options.max_pending_bytes,
+            })?;
+        let work = match id {
+            Some(id) => PeerWork::Request { method, params, id },
+            None => PeerWork::Notification { method, params },
+        };
         return notifications
-            .try_send(PeerWork::Notification {
-                method: method.clone(),
-                params,
+            .try_send(BudgetedWork {
+                work,
+                _permit: permit,
             })
-            .is_ok();
+            .map_err(|_| PeerTermination::NotificationBackpressure {
+                limit: state.options.max_pending_notifications.max(1),
+            });
     }
 
-    match (method, id) {
-        (Some(method), Some(id)) => {
-            // Requests share the ordered handoff with notifications. A request can still answer
-            // on its own task once it reaches the worker, but it must not overtake an earlier
-            // event whose handler has not run yet.
-            return notifications
-                .try_send(PeerWork::Request { method, params, id })
-                .is_ok();
-        }
-        (None, Some(id)) => {
-            let outcome = match frame.get("error") {
-                Some(error) => Err(
-                    serde_json::from_value(error.clone()).unwrap_or(JsonRpcError {
-                        code: -32603,
-                        message: error.to_string(),
-                        data: None,
-                    }),
-                ),
-                None => Ok(frame.get("result").cloned().unwrap_or(Value::Null)),
-            };
-            state.settle(&RequestId::new(id).key(), outcome).await;
-        }
-        (None, None) => {}
-        (Some(_), None) => unreachable!("notifications returned before this match"),
+    if let Some(id) = id {
+        let outcome = match frame.get("error") {
+            Some(error) => Err(
+                serde_json::from_value(error.clone()).unwrap_or(JsonRpcError {
+                    code: -32603,
+                    message: error.to_string(),
+                    data: None,
+                }),
+            ),
+            None => Ok(frame.get("result").cloned().unwrap_or(Value::Null)),
+        };
+        state.settle(&RequestId::new(id).key(), outcome).await;
     }
-    true
+    Ok(())
+}
+
+struct BudgetedWork {
+    work: PeerWork,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 enum PeerWork {
@@ -907,10 +1005,11 @@ enum PeerWork {
 
 async fn peer_work_pump(
     state: Arc<ClientState>,
-    mut notifications: mpsc::Receiver<PeerWork>,
+    mut notifications: mpsc::Receiver<BudgetedWork>,
     handler: Arc<dyn PeerHandler>,
 ) {
     while let Some(work) = notifications.recv().await {
+        let BudgetedWork { work, _permit } = work;
         match work {
             PeerWork::Notification { method, params } => {
                 handler.on_notification(method, params).await
@@ -919,7 +1018,8 @@ async fn peer_work_pump(
                 // A question that waits for a person must not stop later events after it has
                 // reached the head of the queue. Count the task before starting it so a peer
                 // cannot use request frames to create unbounded work.
-                if !ClientState::spawn_answer(&state, &handler, method, params, id.clone()) {
+                if !ClientState::spawn_answer(&state, &handler, method, params, id.clone(), _permit)
+                {
                     let refusal = JsonRpcError {
                         code: -32000,
                         message: format!(
@@ -1115,6 +1215,108 @@ mod tests {
             "expected nothing left waiting, received {waiting}"
         );
         assert!(link.sent().is_empty(), "received {:?}", link.sent());
+    }
+
+    #[tokio::test]
+    async fn abandoned_request_releases_its_pending_entry() {
+        let link = ScriptedLink::new();
+        let client = Arc::new(client(link.clone(), RecordingHandler::arc(None)));
+        let pending = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("work", json!({})).await })
+        };
+        link.wait_for_sent(1).await;
+        pending.abort();
+        assert!(pending.await.expect_err("aborted request").is_cancelled());
+        assert_eq!(
+            client.state.pending.lock().await.len(),
+            0,
+            "expected abandoned RPC to release its pending entry"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outgoing_requests_respect_the_host_pending_budget() {
+        let link = ScriptedLink::new();
+        let limits = crate::Limits {
+            max_pending_requests: 1,
+            ..crate::Limits::default()
+        };
+        let client = Arc::new(Client::connect(
+            link.clone().into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::new("peer").with_limits(&limits),
+        ));
+        let first = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("first", json!({})).await })
+        };
+        link.wait_for_sent(1).await;
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.request::<_, Value>("second", json!({})),
+        )
+        .await;
+        assert!(
+            matches!(second, Ok(Err(Error::LimitExceeded { .. }))),
+            "expected pending-budget refusal before submission, received {second:?}"
+        );
+        assert_eq!(link.sent().len(), 1);
+        first.abort();
+        let _ = first.await;
+    }
+
+    #[tokio::test]
+    async fn queued_peer_payloads_have_a_byte_budget_that_releases_with_the_work() {
+        let frame = String::from(r#"{"method":"delta","params":{"text":"payload"}}"#);
+        let options = ClientOptions {
+            max_pending_bytes: frame.len(),
+            ..ClientOptions::default()
+        };
+        let link = ScriptedLink::new();
+        let client = Client::connect(link.into_link(), RecordingHandler::arc(None), options);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        super::dispatch(&client.state, &sender, frame.clone())
+            .await
+            .expect("first payload");
+        let refused = super::dispatch(&client.state, &sender, frame.clone()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(super::PeerTermination::NotificationByteBackpressure { .. })
+            ),
+            "expected byte-pressure refusal even with free event slots, received {refused:?}"
+        );
+        // Responses still take the direct correlation path when callback payload storage is full.
+        super::dispatch(
+            &client.state,
+            &sender,
+            String::from(r#"{"id":"missing","result":{}}"#),
+        )
+        .await
+        .expect("response bypasses callback budget");
+        drop(receiver.recv().await.expect("queued work"));
+        super::dispatch(&client.state, &sender, frame)
+            .await
+            .expect("released bytes can be reused");
+        client.close().await.expect("close");
+    }
+
+    #[test]
+    fn host_limits_cover_rpc_requests_callbacks_and_shutdown() {
+        let limits = crate::Limits {
+            max_pending_requests: 3,
+            turn_buffer_bytes: 1234,
+            turn_channel_capacity: 7,
+            shutdown_timeout: Duration::from_secs(9),
+            ..crate::Limits::default()
+        };
+        let options = ClientOptions::default().with_limits(&limits);
+        assert_eq!(options.max_pending_requests, 3);
+        assert_eq!(options.max_in_flight_requests, 3);
+        assert_eq!(options.max_pending_notifications, 7);
+        assert_eq!(options.max_pending_bytes, 1234);
+        assert_eq!(options.shutdown_timeout, Duration::from_secs(9));
     }
 
     /// The window this closes is a preemption between `call` reading the closed flag and inserting
@@ -1741,5 +1943,54 @@ mod tests {
         );
 
         client.close().await.expect("expected a clean close");
+    }
+
+    /// A request future can be dropped somewhere no runtime is entered.
+    ///
+    /// A host that holds an in-flight `Client::request` in a struct, or that returns from
+    /// `block_on` still owning one, drops it on a plain thread. `PendingCall::drop` has to clean
+    /// its correlation entry from there without `tokio::spawn`, which panics off a runtime — and a
+    /// panic raised inside `Drop` during an unwind aborts the process.
+    #[tokio::test]
+    async fn dropping_a_request_off_a_runtime_cleans_up_without_panicking() {
+        let link = ScriptedLink::new();
+        let client = Client::connect(
+            link.clone().into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::default(),
+        );
+        let mut request = Box::pin(client.request::<_, Value>("test/held", json!({})));
+        std::future::poll_fn(|cx| {
+            assert!(
+                request.as_mut().poll(cx).is_pending(),
+                "expected the submitted request to wait for its peer"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        link.wait_for_sent(1).await;
+        let state = Arc::clone(&client.state);
+        // Held for the whole drop, so the guard's `try_lock` fails and it has to take the
+        // deferred path. Without this the fast path succeeds and the test proves nothing.
+        let held = state.pending.lock().await;
+        assert_eq!(held.len(), 1, "expected one submitted correlation entry");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || drop(request))
+                .join()
+                .expect("expected dropping a request off a runtime not to panic");
+        });
+        drop(held);
+        let cleaned = tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.pending.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            cleaned.is_ok(),
+            "expected abandoned request correlation to be removed without another call or close; received {} pending entries",
+            state.pending.lock().await.len()
+        );
     }
 }

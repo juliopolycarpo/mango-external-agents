@@ -151,21 +151,27 @@ impl CancelToken {
 /// The caps the library reads a vendor under.
 ///
 /// Every one of them exists because the vendor is a third-party process whose output is not the
-/// host's to trust: a slow reader must slow the vendor rather than grow memory, a long line must
-/// be refused rather than allocated, and a stalled call must end rather than hold a turn open.
+/// host's to trust: a stalled reader must trigger bounded pressure handling, a long line must
+/// be refused, and a stalled call must end rather than hold a turn open forever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// How many events one turn's channel holds before the vendor is made to wait.
-    ///
-    /// The whole point of a bound: a host that stops reading stops the vendor, instead of the
-    /// library buffering a runaway stream until the process dies.
+    /// How many payload events one turn holds before reporting overflow and stopping native work.
+    /// Interaction events have a separate count reserve within the shared byte budget.
     pub turn_channel_capacity: usize,
+    /// Maximum serialized payload bytes queued per turn, excluding its reserved terminal.
+    pub turn_buffer_bytes: usize,
+    /// Maximum in-flight protocol requests or approval callbacks per session.
+    pub max_pending_requests: usize,
     /// Line and buffer caps for framed transports.
     pub line: LineLimits,
     /// How much stderr is kept for diagnostics.
     pub stderr_tail_bytes: usize,
     /// How long one request waits for its answer before it is a failure.
     pub request_timeout: Duration,
+    /// Maximum time a turn may remain silent without an outstanding host interaction.
+    pub idle_timeout: Duration,
+    /// Maximum time allowed for a session shutdown stage.
+    pub shutdown_timeout: Duration,
     /// How long a vendor approval stays answerable before the harness refuses it.
     ///
     /// Separate from [`Self::request_timeout`]: a request deadline bounds a protocol call, while an
@@ -180,9 +186,13 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             turn_channel_capacity: 1_024,
+            turn_buffer_bytes: 8 * 1024 * 1024,
+            max_pending_requests: 64,
             line: LineLimits::default(),
             stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
             request_timeout: Duration::from_secs(120),
+            idle_timeout: Duration::from_secs(120),
+            shutdown_timeout: Duration::from_secs(5),
             approval_timeout: Duration::from_secs(30 * 60),
             kill_grace: Duration::from_secs(2),
         }

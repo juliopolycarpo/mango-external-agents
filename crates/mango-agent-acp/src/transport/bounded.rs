@@ -1,0 +1,207 @@
+//! Budget the official SDK's frame boundary before its unbounded actor channels can grow.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use agent_client_protocol::{Channel, ConnectTo, TransportFrame, role::Role};
+use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
+use mango_external_agents::Limits;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+use super::{IncomingLines, OutgoingLines};
+
+/// A host-framed ACP transport with bounded queued frame counts and serialized bytes.
+///
+/// Constructed by [`super::frame`]; pass `launched.transport` to the official client's
+/// `connect_with` method. Exceeding either budget fails the connection instead of waiting behind
+/// a stalled protocol actor or physical writer.
+pub struct BoundedTransport {
+    outgoing: OutgoingLines,
+    incoming: IncomingLines,
+    limits: Limits,
+}
+
+impl BoundedTransport {
+    pub(super) fn new(outgoing: OutgoingLines, incoming: IncomingLines, limits: Limits) -> Self {
+        Self {
+            outgoing,
+            incoming,
+            limits,
+        }
+    }
+
+    fn parts(
+        self,
+    ) -> (
+        Channel,
+        BoxFuture<'static, agent_client_protocol::Result<()>>,
+    ) {
+        let (transport, client) = Channel::duplex();
+        let Self {
+            incoming,
+            outgoing,
+            limits,
+        } = self;
+        let future = async move {
+            let (pending, writing) = mpsc::channel(limits.max_pending_requests.max(1));
+            let budget = Arc::new(Semaphore::new(
+                limits.turn_buffer_bytes.min(u32::MAX as usize),
+            ));
+            futures::try_join!(
+                read_frames(incoming, transport.tx, limits),
+                queue_output(transport.rx, pending, budget, limits),
+                write_frames(outgoing, writing),
+            )?;
+            Ok(())
+        }
+        .boxed();
+        (client, future)
+    }
+}
+
+impl<R: Role> ConnectTo<R> for BoundedTransport {
+    async fn connect_to(
+        mut self,
+        client: impl ConnectTo<R::Counterpart>,
+    ) -> agent_client_protocol::Result<()> {
+        let stop_input = mango_external_agents::CancelToken::new();
+        let input_stopped = stop_input.clone();
+        self.incoming = Box::pin(self.incoming.take_until(async move {
+            input_stopped.cancelled().await;
+        }));
+        let (channel, transport) = self.parts();
+        let close_output = channel.tx.clone();
+        let client = async move {
+            let result = client.connect_to(channel).await;
+            // Match the SDK carrier: a finished peer stops reading physical input while already
+            // accepted outgoing frames drain before the writer closes.
+            stop_input.cancel();
+            close_output.close_channel();
+            result
+        };
+        futures::try_join!(client, transport)?;
+        Ok(())
+    }
+
+    fn into_channel_and_future(
+        self,
+    ) -> (
+        Channel,
+        BoxFuture<'static, agent_client_protocol::Result<()>>,
+    ) {
+        self.parts()
+    }
+}
+
+/// Account for a single producer's queued frames using the SDK channel's current queue length.
+/// Sizes are removed only after the consumer has taken the corresponding frame; a concurrent
+/// dequeue can make this conservative but can never let extra bytes past the cap.
+async fn read_frames(
+    mut source: IncomingLines,
+    target: futures::channel::mpsc::UnboundedSender<TransportFrame>,
+    limits: Limits,
+) -> agent_client_protocol::Result<()> {
+    let mut sizes = VecDeque::new();
+    let mut bytes = 0_usize;
+    while let Some(line) = source.next().await {
+        let line = line.map_err(|_| failure("ACP framed input failed"))?;
+        let queued = target.len();
+        while sizes.len() > queued {
+            bytes -= sizes.pop_front().expect("queued frame size");
+        }
+        bytes = bytes.saturating_add(line.len());
+        if queued >= limits.max_pending_requests.max(1) || bytes > limits.turn_buffer_bytes {
+            return Err(failure(format!(
+                "ACP incoming frame queue exceeded its count or byte budget: received {} frames and {bytes} bytes; expected at most {} frames and {} bytes",
+                queued.saturating_add(1),
+                limits.max_pending_requests.max(1),
+                limits.turn_buffer_bytes,
+            )));
+        }
+        let frame = TransportFrame::parse_json(&line);
+        if let TransportFrame::Batch(batch) = &frame
+            && batch.len() > limits.max_pending_requests.max(1)
+        {
+            return Err(failure(format!(
+                "ACP batch exceeded the pending-message budget: received {} messages; expected at most {}",
+                batch.len(),
+                limits.max_pending_requests.max(1),
+            )));
+        }
+        sizes.push_back(line.len());
+        target
+            .unbounded_send(frame)
+            .map_err(|_| failure("ACP incoming frame receiver closed"))?;
+        // The SDK's unbounded send has no cooperative scheduling point. Give its protocol actor
+        // and our output budget a chance to run even when a source always returns ready chunks.
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+struct PendingFrame {
+    line: String,
+    _bytes: OwnedSemaphorePermit,
+}
+
+async fn queue_output(
+    mut frames: futures::channel::mpsc::UnboundedReceiver<TransportFrame>,
+    pending: mpsc::Sender<PendingFrame>,
+    budget: Arc<Semaphore>,
+    limits: Limits,
+) -> agent_client_protocol::Result<()> {
+    while let Some(frame) = frames.next().await {
+        let line = frame.to_json()?;
+        let byte_limit = limits.turn_buffer_bytes.min(u32::MAX as usize);
+        if line.len() > byte_limit {
+            return Err(failure(format!(
+                "ACP output frame exceeded the byte budget: received {} bytes; expected at most {byte_limit}",
+                line.len(),
+            )));
+        }
+        let size = u32::try_from(line.len()).expect("frame length fits the byte budget");
+        let bytes = Arc::clone(&budget)
+            .try_acquire_many_owned(size)
+            .map_err(|_| failure(format!(
+                "ACP outgoing frame queue exceeded the byte budget: received {} more bytes; expected at most {} available bytes",
+                line.len(), budget.available_permits(),
+            )))?;
+        pending
+            .try_send(PendingFrame {
+                line,
+                _bytes: bytes,
+            })
+            .map_err(|_| failure(format!(
+                "ACP outgoing frame queue exceeded the pending-message budget: received another frame; expected fewer than {} queued frames",
+                pending.max_capacity(),
+            )))?;
+    }
+    Ok(())
+}
+
+async fn write_frames(
+    mut output: OutgoingLines,
+    mut pending: mpsc::Receiver<PendingFrame>,
+) -> agent_client_protocol::Result<()> {
+    while let Some(frame) = pending.recv().await {
+        output
+            .send(frame.line)
+            .await
+            .map_err(|_| failure("ACP framed output failed"))?;
+        // Retain the byte permit through the physical write, including a stalled ByteSink.
+        drop(frame._bytes);
+    }
+    output
+        .close()
+        .await
+        .map_err(|_| failure("ACP framed output close failed"))
+}
+
+fn failure(message: impl Into<String>) -> agent_client_protocol::Error {
+    let mut error = agent_client_protocol::Error::internal_error();
+    error.message = message.into();
+    error
+}
+
+#[cfg(test)]
+mod tests;

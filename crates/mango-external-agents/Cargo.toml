@@ -22,12 +22,20 @@ stdio = []
 # A dialled WebSocket URL (tokio-tungstenite over ring).
 websocket = ["dep:futures-util", "dep:rustls", "dep:tokio-tungstenite", "tokio/net"]
 # A default ProcessLauncher on tokio::process for hosts without their own spawner.
-launcher-tokio = ["dep:nix", "tokio/io-util", "tokio/process"]
+launcher-tokio = [
+  "dep:nix",
+  "dep:process-wrap",
+  "dep:win32job",
+  "dep:windows",
+  "tokio/io-util",
+  "tokio/process",
+]
 # FakeLauncher, FakeHarness, ScriptedLink and the harness conformance cases.
 testing = []
 
 [dependencies]
 async-trait = "0.1.92"
+ring = { version = "0.17.14", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
@@ -42,6 +50,14 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 # the process-group signal goes through a safe binding rather than a raw `libc::kill`.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal"], optional = true }
+
+# Windows jobs provide containment that a child PID cannot: a process is suspended before the
+# outer Job owns it, and resumed only after the inner Job is ready. The outer Job's safe process
+# list proves it is empty, so a leader's exit cannot make a surviving helper look reaped.
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "10.0.0", default-features = false, features = ["creation-flags", "job-object", "kill-on-drop", "tokio1"], optional = true }
+win32job = { version = "2.0.3", default-features = false, optional = true }
+windows = { version = "0.62.2", default-features = false, features = ["Win32_System_Threading"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "test-util"] }

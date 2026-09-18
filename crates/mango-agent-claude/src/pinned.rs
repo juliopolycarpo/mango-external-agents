@@ -85,12 +85,32 @@ pub const SIGTERM_EXIT_CODE: i32 = 143;
 /// seconds is a probe that is not going to.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How long a turn's stream may go quiet before the turn is abandoned.
+/// The shortest silence this harness will read as a stalled stream, whatever the host asked for.
 ///
-/// Generous, because a single Claude tool call can legitimately run for minutes and the vendor
-/// emits nothing while it does. A host's own turn budget sits above this; what this bounds is a
-/// process that stopped writing without exiting, which no budget above would notice promptly.
+/// A floor rather than the value itself: [`Limits::idle_timeout`](mango_external_agents::Limits)
+/// is host policy and a host that wants a longer leash gets one. Below this the cap stops
+/// describing a stalled process and starts cutting working turns, because a single Claude tool
+/// call can legitimately run for minutes and the vendor emits nothing while it does. What the cap
+/// is for is a process that stopped writing without exiting, which the host's own turn budget
+/// sits above and would not notice promptly.
 pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How long this harness lets a turn's stream go quiet before abandoning the turn.
+///
+/// The host's [`Limits::idle_timeout`](mango_external_agents::Limits) raised to
+/// [`STREAM_IDLE_TIMEOUT`] when it sits below the vendor's own working silence.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_claude::pinned::{STREAM_IDLE_TIMEOUT, stream_idle_timeout};
+/// use mango_external_agents::Limits;
+///
+/// assert_eq!(stream_idle_timeout(&Limits::default()), STREAM_IDLE_TIMEOUT);
+/// ```
+pub fn stream_idle_timeout(limits: &mango_external_agents::Limits) -> Duration {
+    limits.idle_timeout.max(STREAM_IDLE_TIMEOUT)
+}
 
 /// Who owns the CLI, and the documents a host's disclosure links.
 pub const VENDOR: VendorInfo = VendorInfo {
@@ -148,8 +168,31 @@ pub fn managed_settings_path(os: &str, environment: &EnvSource) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{MINIMUM_VERSION, VENDOR, VENDOR_ENVIRONMENT_KEYS, managed_settings_path};
-    use mango_external_agents::EnvSource;
+    use super::{
+        MINIMUM_VERSION, STREAM_IDLE_TIMEOUT, VENDOR, VENDOR_ENVIRONMENT_KEYS,
+        managed_settings_path, stream_idle_timeout,
+    };
+    use mango_external_agents::{EnvSource, Limits};
+    use std::time::Duration;
+
+    #[test]
+    fn a_host_idle_cap_below_the_vendors_working_silence_is_raised_to_the_floor() {
+        let limits = Limits {
+            idle_timeout: Duration::from_secs(120),
+            ..Limits::default()
+        };
+        assert_eq!(stream_idle_timeout(&limits), STREAM_IDLE_TIMEOUT);
+    }
+
+    #[test]
+    fn a_host_that_wants_a_longer_leash_keeps_it() {
+        let wanted = STREAM_IDLE_TIMEOUT * 2;
+        let limits = Limits {
+            idle_timeout: wanted,
+            ..Limits::default()
+        };
+        assert_eq!(stream_idle_timeout(&limits), wanted);
+    }
 
     #[test]
     fn the_pinned_minimum_is_a_version_this_harness_can_compare() {

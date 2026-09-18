@@ -14,8 +14,8 @@ use mango_agent_acp::{AcpHarness, AcpProfile, SessionModeIds};
 use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, RecordingBroker};
 use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
-    Configuration, ConfigurationChange, ConfigurationPatch, DecisionSource, Error, EventKind,
-    Harness, HostContext, Limits, OpenSession, PermissionLevel, Session, SessionStatus,
+    Configuration, ConfigurationChange, ConfigurationPatch, DecisionSource, Dispatch, Error,
+    EventKind, Harness, HostContext, Limits, OpenSession, PermissionLevel, Session, SessionStatus,
     SessionSubscription, TurnRequest, TurnStream, VendorInfo,
 };
 
@@ -685,7 +685,8 @@ async fn cancellation_withdraws_a_permission_that_arrives_after_cancel() {
 }
 
 /// ACP v1 runs one `session/prompt` at a time: the response *is* the turn's end, so two prompts would
-/// race for one stream of updates with nothing on the wire to tell them apart.
+/// race for one stream of updates with nothing on the wire to tell them apart. The refusal is typed
+/// as busy, so a host can wait for the owned turn instead of treating active work as malformed input.
 #[tokio::test]
 async fn a_second_turn_is_refused_while_one_is_in_flight() {
     let (session, _launcher) = open(
@@ -703,9 +704,60 @@ async fn a_second_turn_is_refused_while_one_is_in_flight() {
         .await
         .expect_err("expected a refusal, received a second turn");
 
+    assert!(matches!(error.cause(), Error::Busy), "received {error:?}");
+}
+
+/// ACP queues a prompt locally but does not acknowledge that the peer received it.
+#[tokio::test]
+async fn an_accepted_acp_prompt_keeps_replay_safety_unknown() {
+    let (session, _launcher) =
+        open(FakeAcpAgent::new().never_finishing_turns(), permissive()).await;
+
+    let turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected a prompt stream");
+
+    assert_eq!(turn.dispatch(), Dispatch::AcceptanceUnknown);
+}
+
+/// Revocation between session setup and prompt admission must not queue native work.
+#[tokio::test]
+async fn a_revoked_host_cannot_admit_an_acp_prompt() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let cancel = CancelToken::new();
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .cancel(cancel.clone())
+        .build()
+        .expect("expected a host");
+    let session = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session before revocation");
+
+    cancel.cancel();
+    let error = refusal(session.start_turn(TurnRequest::new("turn-1", "one")).await);
     assert!(
-        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        matches!(
+            error.cause(),
+            Error::Cancelled {
+                reason: CancelReason::Shutdown
+            }
+        ),
         "received {error:?}"
+    );
+    assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("session/prompt")),
+        "revoked host must not queue a prompt, received {:?}",
+        launcher.written()
     );
 }
 
@@ -888,6 +940,139 @@ async fn session_listing_follows_what_the_agent_advertised() {
     assert_eq!(page.sessions[0].title.as_deref(), Some("Yesterday"));
 }
 
+/// A request the agent never answers remains in ACP's own pending-reply map after its future is
+/// dropped. The harness therefore has to close request admission and own cleanup on timeout rather
+/// than releasing a permit that would let another request accumulate behind the silent peer.
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_generic_request_closes_admission_and_reaps_the_silent_peer() {
+    let launcher = FakeLauncher::new();
+    launcher.push(SilentListingAgent::process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            request_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+    let session = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+
+    let timed_out = session
+        .list_sessions(Default::default())
+        .await
+        .expect_err("expected the silent list request to time out");
+    assert!(
+        matches!(timed_out.cause(), Error::Timeout { .. }),
+        "received {timed_out:?}"
+    );
+    let refused = session
+        .list_sessions(Default::default())
+        .await
+        .expect_err("timed-out request must close later generic admission");
+    assert!(
+        matches!(
+            refused.cause(),
+            Error::Closed {
+                subject: "ACP connection"
+            }
+        ),
+        "received {refused:?}"
+    );
+    assert_eq!(
+        launcher
+            .written()
+            .iter()
+            .filter(|line| line.contains("\"session/list\""))
+            .count(),
+        1,
+        "the closed admission must not queue a second silent request"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected owned shutdown to reap the silent peer");
+}
+
+/// A caller can abandon a generic request before its own deadline. ACP only queues a cancellation
+/// notification in that case, so the harness must still seal admission and let its owned teardown
+/// release the SDK's reply slot without waiting for another caller to close the session.
+#[tokio::test]
+async fn an_abandoned_generic_request_closes_admission_and_reaps_the_silent_peer() {
+    let launcher = FakeLauncher::new();
+    launcher.push(SilentListingAgent::process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            request_timeout: Duration::from_secs(30),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+    let opened = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+
+    let listing = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.list_sessions(Default::default()).await })
+    };
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"session/list\""))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the silent list request to enter ACP");
+    listing.abort();
+    let _ = listing.await;
+
+    let refused = session
+        .list_sessions(Default::default())
+        .await
+        .expect_err("abandonment must close later generic admission");
+    assert!(
+        matches!(
+            refused.cause(),
+            Error::Closed {
+                subject: "ACP connection"
+            }
+        ),
+        "received {refused:?}"
+    );
+    assert_eq!(
+        launcher
+            .written()
+            .iter()
+            .filter(|line| line.contains("\"session/list\""))
+            .count(),
+        1,
+        "the closed admission must not queue another silent request"
+    );
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected abandoned request cleanup to reap the silent peer");
+}
+
 /// Narrowing a turn below a mode-bearing session level looks harmless and is not. The agent stays in
 /// the mode `open_session` set, so it raises no permission request at all and the standing refusal has
 /// nothing to answer — the turn would run with full access while the harness reported `ReadOnly`.
@@ -935,8 +1120,9 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
 
 /// `close` must not drop a half-sent terminal. A timeout that abandoned the `emit` would send nothing —
 /// `mpsc::Sender::send` is cancel-safe — so a host that stopped reading and then closed would get a
-/// stream that just ends, with no `Cancelled` and no `Completed`, which the core's conformance rules
-/// refuse.
+/// stream that just ends, with no terminal, which the core's conformance rules refuse. Depending on
+/// whether close or the full transcript wins first, that terminal is either the existing overflow
+/// error or close's cancellation pair.
 #[tokio::test]
 async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() {
     let launcher = FakeLauncher::new();
@@ -964,7 +1150,7 @@ async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() 
         .await
         .expect("expected a turn");
 
-    // The channel holds one event and nobody has read it, so `close`'s terminal cannot be sent yet.
+    // The transcript budget is full. Its reserved terminal must still be observable after close.
     session
         .close(CloseReason::Shutdown)
         .await
@@ -981,13 +1167,145 @@ async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() 
         "expected exactly one terminal, received {events:?}"
     );
     assert!(
-        events.iter().any(|kind| matches!(
-            kind,
-            EventKind::Cancelled {
-                reason: CancelReason::Shutdown
-            }
-        )),
-        "expected the close's own reason, received {events:?}"
+        matches!(
+            events.last(),
+            Some(EventKind::Completed | EventKind::Error { .. })
+        ),
+        "expected the committed terminal to remain last, received {events:?}"
+    );
+}
+
+/// The close operation owns its shutdown and terminal work after it claims the lifecycle. Dropping
+/// the initiating future at a blocked process kill must not leave the session stuck in `Closing`.
+#[tokio::test]
+async fn a_dropped_close_finishes_cleanup_status_and_the_owned_turn() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let launcher = GatedLauncher::new(inner.clone(), false);
+    let opened = AcpHarness::new(profile())
+        .open_session(&gated_host(&launcher), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "keep working"))
+        .await
+        .expect("expected a turn");
+
+    let closing = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::Shutdown).await })
+    };
+    launcher.wait_for_kill().await;
+    closing.abort();
+    launcher.release();
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while session.snapshot().status != SessionStatus::Closed || inner.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the owned close task to finish after its caller was dropped");
+
+    let events = drain(&mut turn).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, EventKind::Completed | EventKind::Error { .. }))
+            .count(),
+        1,
+        "expected one terminal after the dropped close, received {events:?}"
+    );
+}
+
+/// A second close is a joiner, not a second cleanup attempt or an early success while the first
+/// close is still waiting for the host process control.
+#[tokio::test]
+async fn concurrent_closes_wait_for_and_share_one_cleanup_result() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let launcher = GatedLauncher::new(inner, false);
+    let opened = AcpHarness::new(profile())
+        .open_session(&gated_host(&launcher), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+
+    let first = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::Shutdown).await })
+    };
+    launcher.wait_for_kill().await;
+    let mut second = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::Requested).await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut second)
+            .await
+            .is_err(),
+        "a repeated close returned before the first cleanup completed"
+    );
+
+    launcher.release();
+    first
+        .await
+        .expect("expected first close task")
+        .expect("expected first close result");
+    second
+        .await
+        .expect("expected second close task")
+        .expect("expected second close result");
+    assert_eq!(session.snapshot().status, SessionStatus::Closed);
+}
+
+/// A failed process cleanup means the session remains stopping. Reporting `Closed` or allowing a
+/// later prompt would claim a child has gone away when the host said it did not.
+#[tokio::test]
+async fn a_failed_close_cleanup_returns_an_error_and_keeps_admission_closed() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let launcher = GatedLauncher::new(inner, true);
+    let opened = AcpHarness::new(profile())
+        .open_session(&gated_host(&launcher), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "keep working"))
+        .await
+        .expect("expected a turn");
+
+    let close = {
+        let launcher = launcher.clone();
+        let session = Arc::clone(&session);
+        let task = tokio::spawn(async move { session.close(CloseReason::Shutdown).await });
+        launcher.wait_for_kill().await;
+        launcher.release();
+        task.await.expect("expected close task")
+    };
+    assert!(
+        close.is_err(),
+        "expected failed process cleanup, received {close:?}"
+    );
+    assert_eq!(session.snapshot().status, SessionStatus::Closing);
+    let events = drain(&mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Error { .. })),
+        "expected failed cleanup to settle the owned turn, received {events:?}"
+    );
+    let refused = session
+        .start_turn(TurnRequest::new("turn-2", "must not run"))
+        .await
+        .expect_err("a stopping session must reject new work");
+    assert!(
+        matches!(refused.cause(), Error::Closed { subject: "session" }),
+        "received {refused:?}"
+    );
+    assert!(
+        session.close(CloseReason::Requested).await.is_err(),
+        "a repeated close must return the first cleanup failure"
     );
 }
 
@@ -1189,10 +1507,7 @@ async fn a_dropped_turn_stream_does_not_free_the_slot_while_the_prompt_is_in_fli
     }
 
     let error = refusal(session.start_turn(TurnRequest::new("turn-2", "two")).await);
-    assert!(
-        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
-        "received {error:?}"
-    );
+    assert!(matches!(error.cause(), Error::Busy), "received {error:?}");
 }
 
 /// A rejected concurrent turn has not run, so its overrides cannot become the defaults a later turn
@@ -1215,10 +1530,7 @@ async fn a_rejected_concurrent_turn_does_not_change_the_inherited_configuration(
             )
             .await,
     );
-    assert!(
-        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
-        "received {error:?}"
-    );
+    assert!(matches!(error.cause(), Error::Busy), "received {error:?}");
     assert_eq!(
         session.snapshot().configuration.accepted,
         Configuration::unknown().with_level(PermissionLevel::Default),
@@ -1654,6 +1966,126 @@ struct RecordingControl {
     killed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// A launcher whose process cleanup waits at a test-controlled gate.
+///
+/// Keeping the gate in `ProcessControl::kill` makes the test exercise the real ACP connection
+/// shutdown path, including the point at which a caller might drop its `close` future.
+#[derive(Clone)]
+struct GatedLauncher {
+    inner: FakeLauncher,
+    kill_started: CancelToken,
+    release_kill: CancelToken,
+    fail_kill: bool,
+}
+
+/// An ACP peer that completes setup but deliberately never answers `session/list`.
+struct SilentListingAgent;
+
+impl SilentListingAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(line) else {
+                return Vec::new();
+            };
+            let Some(id) = request.get("id") else {
+                return Vec::new();
+            };
+            let response = |result: serde_json::Value| {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
+            };
+            match request.get("method").and_then(serde_json::Value::as_str) {
+                Some("initialize") => vec![response(serde_json::json!({
+                    "protocolVersion": 1,
+                    "agentInfo": { "name": "silent-listing", "version": "1.0.0" },
+                    "agentCapabilities": {
+                        "loadSession": true,
+                        "promptCapabilities": { "image": false, "embeddedContext": false },
+                        "sessionCapabilities": { "list": {} }
+                    },
+                    "authMethods": []
+                }))],
+                Some("session/new") => vec![response(serde_json::json!({
+                    "sessionId": "sess_silent"
+                }))],
+                Some("session/list") => Vec::new(),
+                _ => Vec::new(),
+            }
+        })
+    }
+}
+
+impl GatedLauncher {
+    fn new(inner: FakeLauncher, fail_kill: bool) -> Self {
+        Self {
+            inner,
+            kill_started: CancelToken::new(),
+            release_kill: CancelToken::new(),
+            fail_kill,
+        }
+    }
+
+    async fn wait_for_kill(&self) {
+        self.kill_started.cancelled().await;
+    }
+
+    fn release(&self) {
+        self.release_kill.cancel();
+    }
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for GatedLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        let process = self.inner.spawn(spec).await?;
+        Ok(mango_external_agents::ManagedProcess {
+            control: Arc::new(GatedControl {
+                inner: process.control,
+                kill_started: self.kill_started.clone(),
+                release_kill: self.release_kill.clone(),
+                fail_kill: self.fail_kill,
+            }),
+            ..process
+        })
+    }
+}
+
+struct GatedControl {
+    inner: Arc<dyn mango_external_agents::ProcessControl>,
+    kill_started: CancelToken,
+    release_kill: CancelToken,
+    fail_kill: bool,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessControl for GatedControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<mango_external_agents::ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.kill_started.cancel();
+        self.release_kill.cancelled().await;
+        if self.fail_kill {
+            return Err(Error::Launch {
+                program: String::from("fake ACP agent"),
+                message: String::from("the test process refused termination"),
+            });
+        }
+        self.inner.kill(reason).await
+    }
+}
+
 #[async_trait::async_trait]
 impl mango_external_agents::ProcessControl for RecordingControl {
     fn pid(&self) -> Option<u32> {
@@ -1682,6 +2114,198 @@ fn recording_host(launcher: &KillRecordingLauncher) -> HostContext {
         .client_info("mea-tests", "0.1.0")
         .build()
         .expect("expected a host")
+}
+
+fn bounded_recording_host(launcher: &KillRecordingLauncher) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+fn gated_host(launcher: &GatedLauncher) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+/// A launcher whose pipe refuses just `session/cancel`, after the prompt was accepted.
+#[derive(Clone)]
+struct CancelFailingLauncher {
+    inner: FakeLauncher,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CancelFailingLauncher {
+    fn new(inner: FakeLauncher) -> Self {
+        Self {
+            inner,
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for CancelFailingLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        let mut process = self.inner.spawn(spec).await?;
+        if let Some(stdin) = process.stdin.take() {
+            process.stdin = Some(Box::new(CancelFailingSink {
+                inner: stdin,
+                attempts: Arc::clone(&self.attempts),
+            }));
+        }
+        Ok(process)
+    }
+}
+
+struct CancelFailingSink {
+    inner: Box<dyn mango_external_agents::ByteSink>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSink for CancelFailingSink {
+    async fn write_all(&mut self, bytes: &[u8]) -> mango_external_agents::Result<()> {
+        if bytes
+            .windows(b"session/cancel".len())
+            .any(|window| window == b"session/cancel")
+        {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            return Err(Error::Link {
+                peer: String::from("fake ACP agent"),
+                message: String::from("the test pipe rejected session/cancel"),
+            });
+        }
+        self.inner.write_all(bytes).await
+    }
+
+    async fn close(&mut self) -> mango_external_agents::Result<()> {
+        self.inner.close().await
+    }
+}
+
+fn cancel_failing_host(launcher: &CancelFailingLauncher) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+/// A prompt already submitted has an owned stream even if its subsequent cancel notification fails.
+#[tokio::test]
+async fn a_failed_cancel_after_prompt_acceptance_keeps_the_owned_terminal_stream() {
+    let inner = FakeLauncher::new();
+    inner.push(
+        FakeAcpAgent::new()
+            .asking_for_approval(Approval::Once)
+            .process(),
+    );
+    let launcher = CancelFailingLauncher::new(inner.clone());
+    let session = AcpHarness::new(profile())
+        .open_session(&cancel_failing_host(&launcher), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected an accepted prompt stream");
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("queueing a notification is asynchronous");
+    let events = drain(&mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the accepted stream to own the cancellation outcome, received {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::Cancelled {
+                reason: CancelReason::Requested
+            }
+        )),
+        "expected the host cancellation reason before the terminal, received {events:?}"
+    );
+    assert_eq!(
+        launcher.attempts(),
+        1,
+        "expected one failed cancellation write"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected session cleanup");
+    assert_eq!(
+        inner.live_children(),
+        0,
+        "expected bounded cleanup after cancellation failure"
+    );
+}
+
+/// Dropping the stream actively cancels the native turn, then reaps a peer that ignores cancellation.
+#[tokio::test]
+async fn a_dropped_stream_reaps_an_agent_that_ignores_native_cancellation() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let launcher = KillRecordingLauncher::new(inner.clone());
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &bounded_recording_host(&launcher),
+            OpenSession::new("chat-1"),
+        )
+        .await
+        .expect("expected a session");
+
+    let turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected a turn");
+    drop(turn);
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while inner.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected cancellation escalation to reap the agent");
+    assert!(
+        launcher.kills() >= 1,
+        "expected the host process control to terminate the ignoring agent"
+    );
 }
 
 /// A failed `open_session` must not leave an agent running with nothing driving it. The dispatch loop

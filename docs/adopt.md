@@ -32,6 +32,16 @@ let host = HostContext::builder()
 
    Hosts without a spawner of their own take `TokioLauncher` from the `launcher-tokio` feature.
 
+   **Implement `ProcessControl::interrupt` if you want cancellation to be recoverable.** It has a
+   default body returning `InterruptOutcome::Unsupported`, and `TokioLauncher` returns the same off
+   Unix, so a launcher that does not override it makes every `Session::cancel` a forced
+   termination. The Claude harness records a forced termination as nonresumable — the vendor
+   documents that resuming would continue the turn the kill left unfinished, so the harness refuses
+   instead — and from then on `start_turn` returns `Error::Cancelled` for the life of that session.
+   With a graceful interrupt the same cancel reports `StopOutcome::Interrupted` and the session
+   keeps its native continuation. On Unix this is `SIGINT` to the child's process group; on Windows
+   it is a console-specific port the host owns, which is why the library does not guess one.
+
 2. **An authorised working directory.** `HostContext::cwd` is a directory the host already
    authorised. The library never widens it and never chooses one.
 
@@ -69,9 +79,10 @@ let host = HostContext::builder()
 
 7. **A cancellation token, a clock and the caps**, all with defaults: `CancelToken` for shutdown,
    `Clock` for the instant an event is stamped with, and `Limits` for the turn channel's capacity
-   (1,024 events), the line and buffer caps, the stderr tail, the request timeout, the approval
-   timeout and the kill grace. Request timeouts bound individual protocol calls; approval timeouts
-   leave room for a person or host policy to decide. Harnesses read them back through
+   (1,024 payload events and 8 MiB), pending requests, line and buffer caps, stderr tail, request,
+   approval and idle timeouts, graceful interruption and shutdown deadlines. Request timeouts bound
+   individual protocol calls; approval timeouts leave room for a person or host policy to decide.
+   Harnesses read them back through
    `host.limits()`, and a host constructing `TokioLauncher` hands it the same ones with
    `TokioLauncher::with_limits`, so one setting governs a bound wherever it is enforced.
 
@@ -108,7 +119,9 @@ already logged into with the vendor's own CLI.
   reconfigured on an open session. Most vendors cannot set several options atomically, so the
   outcome says which axes landed, which were refused and why, and what became of the rest.
 - `Session::start_turn` → a `TurnStream`: a bounded channel of `AgentEvent` read through `recv()`.
-  A host that stops reading slows the vendor instead of growing the library's memory.
+  Overflow commits an explicit failure and stops native work. Terminal status remains observable
+  without draining the stream. Keep this owner in the supervisor across browser disconnects;
+  dropping it requests cancellation. See [turn ownership and recovery](lifecycle.md).
 - `AgentEvent { session_id, turn_id, attempt, at, kind }`. The `kind` is turn-scoped, always:
   turn started, text and reasoning deltas with their block markers, the activity lifecycle,
   approval requested and resolved, question asked and resolved, usage, thread usage, account
@@ -164,6 +177,9 @@ The `testing` feature ships fakes that spawn nothing:
   reached a vendor child.
 - `FakeHarness` emits the shape a real harness emits, including an approval that waits for an
   answer, so a host's event mapping can be written before any vendor CLI exists.
+- `Announcer` makes a `FakeProcess` speak without being written to first, which is what a peer that
+  announces on its own initiative does — and the only way to reach what a session does about traffic
+  that arrives while it is waiting.
 - `ScriptedLink` drives a protocol client with no process behind it.
 - `RecordingBroker` and `FrozenClock` turn a policy decision and an event's timestamp into values
   a test can assert on.
@@ -259,3 +275,13 @@ On Windows, `TokioLauncher` also resolves installed `.ps1` entrypoints when nati
 resolution fails. It searches only the supplied `PATH`, runs Windows PowerShell from the supplied
 `SystemRoot` with `-File`, and preserves arguments as data. This covers Cursor's official Windows
 launcher without requiring a host to create a wrapper or change execution policy.
+
+Before a Windows child runs, `TokioLauncher` starts it suspended and attaches it to an outer
+[Job Object](https://learn.microsoft.com/windows/win32/procthread/job-objects). It then creates
+the nested Job that terminates the tree. Windows reports the outer Job's direct and nested members
+through its process list, so cancellation waits until that list is empty, including when the
+original child already exited. `ProcessControl::wait` reports the original child independently, so
+contained helpers continue until they finish or the host calls `kill` or drops the control.
+Dropping a handle requests cleanup while the host runtime remains live; the Job's close policy
+terminates remaining members during runtime shutdown. A failed attachment terminates the suspended
+child and reports launch failure rather than returning an uncontained process.

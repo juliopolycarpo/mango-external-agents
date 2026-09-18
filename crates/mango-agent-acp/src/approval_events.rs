@@ -32,7 +32,7 @@ impl ApprovalEvents {
         Ok(())
     }
 
-    /// Delivery can wait for the host; registering an expiry and replying on the wire never does.
+    /// The sink admits a bounded control reserve, so delivery never waits for transcript capacity.
     pub(crate) async fn flush(&self, sink: &EventSink) -> Result<()> {
         let _delivery = self.delivery.lock().await;
         loop {
@@ -60,19 +60,23 @@ impl ApprovalEvents {
 #[cfg(test)]
 mod tests {
     use super::ApprovalEvents;
-    use mango_external_agents::{EventKind, EventSink, SystemClock};
-    use std::future::{Future, poll_fn};
+    use mango_external_agents::{EventKind, EventSink, Limits, SystemClock};
     use std::sync::Arc;
-    use std::task::Poll;
+    use std::time::Duration;
 
     #[tokio::test]
-    async fn an_interrupted_delivery_keeps_the_event_for_the_terminal_flush() {
-        let (sink, mut received) = EventSink::new(
+    async fn an_approval_progresses_when_transcript_capacity_is_full() {
+        let limits = Limits {
+            turn_channel_capacity: 1,
+            max_pending_requests: 1,
+            ..Limits::default()
+        };
+        let (sink, mut received) = EventSink::with_limits(
             mango_external_agents::SessionId::new("chat"),
             mango_external_agents::TurnId::new("turn"),
             mango_external_agents::AttemptId::default(),
             Arc::new(SystemClock),
-            1,
+            &limits,
         );
         sink.emit(EventKind::TextDelta {
             text: String::from("already buffered"),
@@ -80,25 +84,23 @@ mod tests {
         .await
         .expect("first event");
         let approvals = ApprovalEvents::default();
-        approvals.push(EventKind::TextDelta {
-            text: String::from("queued approval"),
+        approvals.push(EventKind::ApprovalResolved {
+            interaction_id: mango_external_agents::InteractionId::new("approval-1"),
+            decision: mango_external_agents::ApprovalDecision::unresolved(
+                "cancelled",
+                mango_external_agents::DecisionSource::Cancelled,
+            ),
         });
-        let mut interrupted = Box::pin(approvals.flush(&sink));
-        poll_fn(|cx| {
-            assert!(
-                interrupted.as_mut().poll(cx).is_pending(),
-                "expected full channel to park delivery"
-            );
-            Poll::Ready(())
-        })
-        .await;
-        drop(interrupted);
-        received.recv().await.expect("buffered event");
-        approvals.flush(&sink).await.expect("terminal flush");
-        let event = received
-            .try_recv()
-            .expect("expected interrupted approval to survive until terminal flush");
-        assert!(matches!(event.kind, EventKind::TextDelta { text } if text == "queued approval"));
+        tokio::time::timeout(Duration::from_millis(50), approvals.flush(&sink))
+            .await
+            .expect("approval delivery must use the control reserve")
+            .expect("approval delivery");
+        let transcript = received.recv().await.expect("buffered transcript");
+        let approval = received.recv().await.expect("reserved approval");
+        assert!(matches!(transcript.kind, EventKind::TextDelta { .. }));
+        assert!(
+            matches!(approval.kind, EventKind::ApprovalResolved { interaction_id, .. } if interaction_id.as_str() == "approval-1")
+        );
     }
 
     struct FakeResponse {

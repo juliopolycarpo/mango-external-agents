@@ -989,8 +989,11 @@ pub trait Session: Send + Sync {
 
     /// Starts a turn and returns its bounded event stream.
     ///
-    /// Awaited rather than synchronous because a vendor answers with the turn's own handle, which
-    /// the stream carries.
+    /// A genuinely active or stopping attempt causes a typed busy refusal. Completion releases
+    /// admission independently of transcript consumption. Accepted or uncertain work retains an
+    /// owned stream; inspect its dispatch certainty before considering a replay.
+    /// Dropping this future abandons its attempt. A host supervisor retains the returned stream
+    /// across browser disconnects; dropping the stream requests native cleanup.
     ///
     /// # Errors
     ///
@@ -1034,7 +1037,10 @@ pub trait Session: Send + Sync {
         Err(Error::not_supported(Capability::SessionConfiguration))
     }
 
-    /// Stops whatever turn is running.
+    /// Requests cancellation of the owned turn without granting pending approvals.
+    ///
+    /// Native cancellation acknowledgement, terminal commitment and process reaping are separate
+    /// stages. A stopping attempt continues to own admission until native work cannot conflict.
     ///
     /// # Errors
     ///

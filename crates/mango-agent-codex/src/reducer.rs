@@ -118,6 +118,42 @@ pub fn reduce(notification: &Notification, thread_id: &str, now: std::time::Syst
     }
 }
 
+/// Whether an announcement belongs to the turn this session is running right now.
+///
+/// The connection carries more than one conversation — a subagent's thread, a detached review's,
+/// another turn of this thread's — and account-level quota belongs to no conversation at all. This
+/// is the routing half of [`reduce_for_active_turn`] on its own, for the caller that has to decide
+/// whether a frame is progress before knowing whether it renders: an announcement can be this
+/// turn's and still reduce to [`Outcome::Ignore`], as `turn/started` and a retrying `error` both
+/// do.
+///
+/// For example, `routes_to_active_turn(&notification, thread_id, Some(native_turn_id))` is false
+/// for a `rateLimits` update, which names no thread.
+#[must_use]
+pub fn routes_to_active_turn(
+    notification: &Notification,
+    thread_id: &str,
+    active_native_turn_id: Option<&str>,
+) -> bool {
+    let Some(active_native_turn_id) = active_native_turn_id else {
+        return false;
+    };
+    notification.thread_id() == Some(thread_id)
+        && matches_active_turn(notification, active_native_turn_id)
+}
+
+/// Whether an announcement that names a turn names *this* one.
+///
+/// An empty active id means the start response has not answered yet, so nothing can be compared;
+/// a family excluded from [`Notification::requires_native_turn_match`] is never compared at all.
+fn matches_active_turn(notification: &Notification, active_native_turn_id: &str) -> bool {
+    active_native_turn_id.is_empty()
+        || !notification.requires_native_turn_match()
+        || notification
+            .turn_id()
+            .is_none_or(|turn_id| turn_id == active_native_turn_id)
+}
+
 /// Reduces an announcement after checking it against the current turn's native id.
 ///
 /// The start response is the authoritative id. `turn/started` deliberately bypasses this check,
@@ -133,12 +169,7 @@ pub fn reduce_for_active_turn(
     let Some(active_native_turn_id) = active_native_turn_id else {
         return Outcome::Ignore;
     };
-    if !active_native_turn_id.is_empty()
-        && notification.requires_native_turn_match()
-        && notification
-            .turn_id()
-            .is_some_and(|turn_id| turn_id != active_native_turn_id)
-    {
+    if !matches_active_turn(notification, active_native_turn_id) {
         return Outcome::Ignore;
     }
     reduce(notification, thread_id, now)
@@ -267,7 +298,7 @@ fn finish(status: Option<TurnStatus>, turn: &crate::protocol::requests::TurnHand
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, reduce};
+    use super::{Outcome, reduce, routes_to_active_turn};
     use crate::protocol::notifications::{Notification, method};
     use mango_external_agents::event::{ActivityKind, ActivityStatus, EventKind};
     use mango_external_agents::session::CancelReason;
@@ -282,6 +313,107 @@ mod tests {
 
     fn notification(family: &str, params: serde_json::Value) -> Notification {
         Notification::parse(family, params)
+    }
+
+    /// Idle accounting asks a narrower question than rendering does: not "what does this say",
+    /// but "is this turn still being worked on". Everything else on the connection has to answer
+    /// no, or a silent turn never reaches its deadline.
+    #[test]
+    fn another_conversations_announcement_is_not_this_turns_progress() {
+        assert!(
+            !routes_to_active_turn(
+                &notification(
+                    method::ITEM_STARTED,
+                    json!({"threadId": "someone-elses", "turnId": "u",
+                           "item": {"id": "i", "item_type": "agent_message"}}),
+                ),
+                THREAD,
+                Some("t"),
+            ),
+            "expected another thread's item to leave this turn's deadline alone"
+        );
+    }
+
+    #[test]
+    fn another_turn_of_this_conversation_is_not_this_turns_progress() {
+        assert!(
+            !routes_to_active_turn(
+                &notification(
+                    method::AGENT_MESSAGE_DELTA,
+                    json!({"threadId": THREAD, "turnId": "an-older-turn", "itemId": "i",
+                           "delta": "late"}),
+                ),
+                THREAD,
+                Some("t"),
+            ),
+            "expected a delayed frame for another turn to leave this turn's deadline alone"
+        );
+    }
+
+    /// Quota belongs to the account, so it names no conversation and can arrive while every
+    /// conversation on the connection is silent.
+    #[test]
+    fn an_account_quota_update_is_not_this_turns_progress() {
+        assert!(
+            !routes_to_active_turn(
+                &notification(
+                    method::ACCOUNT_RATE_LIMITS_UPDATED,
+                    json!({"rate_limits": {}}),
+                ),
+                THREAD,
+                Some("t"),
+            ),
+            "expected an account-level update to leave this turn's deadline alone"
+        );
+    }
+
+    /// The other half: a frame this turn owns counts even when it renders nothing. `turn/started`
+    /// and a retrying `error` both reduce to `Ignore`, and withholding the reset for them would
+    /// time out a turn that is working.
+    #[test]
+    fn a_frame_this_turn_owns_is_progress_even_when_it_renders_nothing() {
+        assert!(
+            routes_to_active_turn(
+                &notification(
+                    method::ERROR,
+                    json!({"threadId": THREAD, "turnId": "t", "message": "retrying",
+                           "willRetry": true}),
+                ),
+                THREAD,
+                Some("t"),
+            ),
+            "expected this turn's own retry report to count as progress"
+        );
+        assert!(
+            routes_to_active_turn(
+                &notification(
+                    method::TURN_STARTED,
+                    json!({"threadId": THREAD, "turn": {"id": "a-review-announces-another-id"}}),
+                ),
+                THREAD,
+                Some("t"),
+            ),
+            "expected turn/started, which is never matched on id, to count as progress"
+        );
+    }
+
+    /// Before the start response answers there is no id to compare, and a turn with no active
+    /// route has no deadline to reset.
+    #[test]
+    fn progress_needs_an_active_route_and_survives_an_unanswered_start() {
+        let started = notification(
+            method::ITEM_STARTED,
+            json!({"threadId": THREAD, "turnId": "whatever-the-server-chose",
+                   "item": {"id": "i", "item_type": "agent_message"}}),
+        );
+        assert!(
+            routes_to_active_turn(&started, THREAD, Some("")),
+            "expected an unanswered start to accept its own thread's frames"
+        );
+        assert!(
+            !routes_to_active_turn(&started, THREAD, None),
+            "expected no active route to have no deadline to reset"
+        );
     }
 
     /// A subagent's thread and a detached review's ride the same connection. Replaying their

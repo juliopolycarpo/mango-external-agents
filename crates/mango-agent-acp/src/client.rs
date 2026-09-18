@@ -15,14 +15,13 @@
 //! future is `Send`, so nothing here needs a `LocalSet` or a thread of its own, and a
 //! `ConnectionTo<Agent>` sits inside a `Session` trait object directly.
 //!
-//! # Why handlers hold the dispatch loop
+//! # Why handlers leave the dispatch loop promptly
 //!
-//! The loop runs one handler to completion before the next message, so a notification handler that
-//! awaits [`EventSink::emit`] on a full channel stops the agent being read — which is exactly the
-//! backpressure the core's bounded turn channel exists to apply. The permission handler is the
-//! opposite case: it must *not* wait for an answer, because the answer arrives through
-//! [`Session::respond`](mango_external_agents::Session::respond) on another task. It parks the
-//! agent's [`Responder`] in a map and returns, and answering is a synchronous send.
+//! The loop runs one handler to completion before the next message. [`EventSink::emit`] therefore
+//! only reserves bounded transcript capacity and returns; an overflow owns a terminal outcome
+//! instead of parking ACP dispatch behind a slow host. Permission callbacks likewise park their
+//! responder and move broker deliberation to a bounded task, because an answer may arrive through
+//! [`Session::respond`](mango_external_agents::Session::respond) on another task.
 //!
 //! No lock in this module is held across an await. [`Reducer`] is pure, so the events for one frame
 //! are computed under the guard and emitted after it drops.
@@ -46,6 +45,7 @@ use mango_external_agents::permission::{
 use mango_external_agents::session::CancelReason;
 use mango_external_agents::{
     Clock, Error, EventSink, HostContext, ProcessControl, Result, VendorError,
+    process::stop_process_with_limits,
 };
 
 use crate::approval_events::ApprovalEvents;
@@ -87,7 +87,27 @@ pub(crate) struct TurnHandle {
     /// task; resuming afterwards would put the rest of that frame's events *after* the terminal,
     /// which the core's conformance suite refuses. Checked before every emit.
     finished: Arc<AtomicBool>,
+    /// Wakes the prompt owner when native cancellation starts.
+    pub(crate) cancellation: mango_external_agents::CancelToken,
+    /// A notification error belongs to this generation, never a later prompt.
+    pub(crate) cancel_failure: Arc<Mutex<Option<String>>>,
     pub(crate) approvals: Arc<ApprovalEvents>,
+}
+
+/// Settles the questions a cancellation owes, however its own answer turns out.
+///
+/// The expiry path answers one question and notifies the agent, and either call can fail on a
+/// connection the peer has already dropped. Both are `?`, so the withdrawal cannot be the
+/// statement after them: the one case that needs it most is the one that never reaches it. As a
+/// guard it runs on the early return too, and the obligation survives a later edit that moves the
+/// lines around. There is no test behind this, and there cannot be one yet — the SDK only builds a
+/// `Responder` inside a live connection, so the failure it guards against needs a dead one.
+struct WithdrawOnDrop<'a>(&'a SessionState);
+
+impl Drop for WithdrawOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.withdraw_pending();
+    }
 }
 
 /// One agent request waiting for either the harness or the host to answer it.
@@ -109,7 +129,7 @@ struct PendingApproval {
 }
 
 impl PendingApproval {
-    /// Register only a question that is answerable or has already reached its deadline.
+    /// Registers the host-facing announcement once the question becomes answerable.
     fn announce(&mut self) {
         if self.announced {
             return;
@@ -272,12 +292,7 @@ impl SessionState {
     ) -> Result<TurnHandle> {
         let mut turn = self.lock_turn();
         if turn.is_some() {
-            return Err(Error::Protocol {
-                expected: String::from(
-                    "no turn in flight: ACP v1 runs one session/prompt at a time",
-                ),
-                received: String::from("a turn that has not ended"),
-            });
+            return Err(Error::Busy);
         }
         // A question belongs to a turn, and a turn that is starting has none. Anything still parked
         // here outlived the turn it was asked under and would otherwise be answerable during this one.
@@ -293,6 +308,8 @@ impl SessionState {
             level,
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
             finished: Arc::new(AtomicBool::new(false)),
+            cancellation: mango_external_agents::CancelToken::new(),
+            cancel_failure: Arc::new(Mutex::new(None)),
             approvals: Arc::new(ApprovalEvents::default()),
         };
         *turn = Some(handle.clone());
@@ -328,15 +345,15 @@ impl SessionState {
     /// cannot be parked after this drains and an already parked request cannot be allowed after this
     /// call starts. The first reason wins because it is the action a host initiated first.
     pub(crate) fn begin_cancellation(&self, reason: CancelReason) -> bool {
-        let turn = self.lock_turn();
-        if turn.is_none() {
+        let turn = self.lock_turn().clone();
+        let Some(turn) = turn else {
             return false;
-        }
+        };
         let mut cancelling = self.lock_cancel_reason();
         cancelling.get_or_insert(reason);
         let pending = self.take_pending_responders();
         drop(cancelling);
-        drop(turn);
+        turn.cancellation.cancel();
         for responder in pending {
             let _ = responder.respond(permission::cancelled());
         }
@@ -346,6 +363,14 @@ impl SessionState {
     /// Whether the current prompt has been cancelled before its wire request was sent.
     pub(crate) fn is_cancelling(&self) -> bool {
         self.lock_cancel_reason().is_some()
+    }
+
+    /// Records a failed cancellation write for the prompt owner to publish on its owned stream.
+    pub(crate) fn record_cancel_failure(&self, handle: &TurnHandle, message: impl Into<String>) {
+        *handle
+            .cancel_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(message.into());
     }
 
     /// The running turn, if there is one.
@@ -360,28 +385,21 @@ impl SessionState {
             .is_some_and(|current| current.generation == handle.generation)
     }
 
-    /// Ends whatever turn is running, whoever it belongs to.
-    ///
-    /// For `close`, which ends the session and therefore every turn in it.
-    pub(crate) fn end_turn(&self) -> Option<TurnHandle> {
-        self.lock_turn().take()
-    }
-
     /// Ends this turn, and only this turn.
     ///
     /// What a `session/prompt` task calls. Its own turn may already have been ended by a `close`, and
     /// a *later* turn may have started in the meantime — so an unconditional take would let a task
     /// that answered late end, and emit the terminal of, a conversation that is not its own.
-    pub(crate) fn end_turn_matching(
+    pub(crate) fn prepare_terminal_matching(
         &self,
         handle: &TurnHandle,
     ) -> Option<(TurnHandle, Option<CancelReason>, Vec<EventKind>)> {
         let (turn, reason, pending, closing) = {
-            let mut active = self.lock_turn();
+            let active = self.lock_turn();
             if active.as_ref()?.generation != handle.generation {
                 return None;
             }
-            let turn = active.take()?;
+            let turn = active.clone()?;
             // These are all owned by the current turn. Capture them before releasing the slot: a
             // newly started prompt clears the reducer and may park approvals of its own.
             let reason = self.lock_cancel_reason().take();
@@ -393,6 +411,17 @@ impl SessionState {
             let _ = responder.respond(permission::cancelled());
         }
         Some((turn, reason, closing))
+    }
+
+    /// Releases an already-terminal generation after its stream outcome is committed.
+    pub(crate) fn release_turn_matching(&self, handle: &TurnHandle) {
+        let mut active = self.lock_turn();
+        if active
+            .as_ref()
+            .is_some_and(|current| current.generation == handle.generation)
+        {
+            active.take();
+        }
     }
 
     /// The events and session facts one frame produces, computed under the guard because the
@@ -413,11 +442,6 @@ impl SessionState {
                 .core_state
                 .set_commands(mango_external_agents::event::normalized_catalog(commands)),
         }
-    }
-
-    /// The events that close out a turn: the other half of an open reasoning block.
-    pub(crate) fn finish_reducing(&self) -> Vec<EventKind> {
-        self.lock_reducer().finish()
     }
 
     /// Withdraws every question still waiting.
@@ -462,7 +486,13 @@ impl SessionState {
             pending.responder.respond(permission::cancelled())?;
             return Ok(false);
         }
-        self.lock_pending().insert(id, pending);
+        let mut parked = self.lock_pending();
+        if parked.len() >= self.limits.max_pending_requests {
+            drop(parked);
+            pending.responder.respond(permission::cancelled())?;
+            return Ok(false);
+        }
+        parked.insert(id, pending);
         Ok(true)
     }
 
@@ -515,7 +545,11 @@ impl SessionState {
         pending.announce();
         let Some(option_id) = pending.expiry_option.as_ref() else {
             cancelling.get_or_insert(CancelReason::Timeout);
-            self.withdraw_pending();
+            // Structural rather than ordered: both calls below leave through `?`, and a question
+            // stranded in the map holds a responder the agent is still waiting on and a slot
+            // against `max_pending_requests` for the rest of the session. A guard settles the
+            // debt on every exit, so no later rearrangement of these two lines can strand it.
+            let _debts = WithdrawOnDrop(self);
             let sent = pending.connection.send_notification(pending.cancel);
             pending.responder.respond(permission::cancelled())?;
             sent?;
@@ -528,6 +562,9 @@ impl SessionState {
     }
 
     /// Withdraws one pending request when its turn cannot continue.
+    ///
+    /// Sibling of [`SessionState::withdraw_pending`]; see `WithdrawOnDrop` for why the sweeping
+    /// form is reached from a guard rather than from a statement.
     pub(crate) fn withdraw_pending_by_id(&self, id: &str) -> agent_client_protocol::Result<()> {
         let pending = self.lock_pending().remove(id);
         match pending {
@@ -636,14 +673,12 @@ impl SessionState {
 
 /// One `session/update` notification, reduced and emitted.
 ///
-/// Never fails the handler, and — deliberately — never ends the turn. A host that dropped its
-/// `TurnStream` has closed the sink, not finished the `session/prompt` that is still in flight, so
-/// freeing the turn slot here would let a second prompt onto a wire that has no way to tell two turns
-/// apart, and would hand this turn's completion task a *later* turn's handle to terminate. The slot is
-/// the prompt's to release; a closed sink simply makes every later frame fail fast.
+/// Never fails the handler. A closed or overflowed sink wakes the prompt owner, which cancels native
+/// work before it releases this generation; freeing the slot here would let a second prompt onto a
+/// wire that has no way to tell two turns apart. The nonblocking sink makes later frames fail fast.
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
-    // Cloned out from under its lock before the first emit: a handler parked on a full channel must
-    // not be holding the lock that `cancel` and `close` need to unpark it.
+    // Cloned out from under its lock before the first emit, so cancellation and close can always
+    // claim their generation while a callback is reducing a frame.
     let Some(turn) = state.turn() else {
         return;
     };
@@ -654,8 +689,8 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
         state.apply_fact(fact);
     }
     for kind in events {
-        // Re-checked each time round: this handler can be parked on a full channel while `close`
-        // emits the terminal on another task, and resuming would put the rest of this frame after it.
+        // Re-checked each time round: close can commit the terminal after reduction, and no later
+        // event may follow it.
         if turn.is_finished() || turn.sink.emit(kind).await.is_err() {
             return;
         }
@@ -743,36 +778,45 @@ async fn on_request_permission(
 
     expire_pending(state, &turn, id.clone(), deadline, done);
 
-    // Decided before the host is told, so a policy the host already installed does not race the
-    // interface the host would otherwise render. The dispatch loop is held while the broker thinks,
-    // which is correct: the agent is waiting on this question either way.
-    //
-    // The level decides *whether* the broker is asked at all, and that is the whole point. A
-    // read-only session must never reach `broker_response`, because a policy answering `Allow` there
-    // becomes an allowing option id on the wire — so the one level that exists to grant nothing would
-    // grant. When a read-only session cannot refuse (the agent offered no refusing option) the answer
-    // is nobody's but a person's, which is what leaving `decided` empty arranges.
-    let decided = match turn.level {
-        Some(PermissionLevel::ReadOnly) => standing_refusal(&question),
-        Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => deadline
-            .run(broker_response(state.broker.as_ref(), &question))
-            .await
-            .flatten(),
-    };
-
-    state.announce_pending(&id, decided.is_none());
-    if turn.approvals.flush(&turn.sink).await.is_err() {
-        return state.withdraw_pending_by_id(&id);
-    }
-    if let Some(decision) = decided {
-        state.respond_pending(
-            &id,
-            permission::selected(&decision.option_id),
-            decision.source,
-        )?;
-        let _ = turn.approvals.flush(&turn.sink).await;
-    }
+    resolve_pending(Arc::clone(state), turn, id, question, deadline);
     Ok(())
+}
+
+/// Resolves one parked permission away from ACP's serialized dispatch loop.
+///
+/// The pending-map admission cap limits these tasks. `ApprovalDeadline::run` bounds policy work,
+/// so a broker that never decides cannot keep an orphan task after the request expires.
+fn resolve_pending(
+    state: Arc<SessionState>,
+    turn: TurnHandle,
+    id: String,
+    question: mango_external_agents::PermissionRequest,
+    deadline: ApprovalDeadline,
+) {
+    tokio::spawn(async move {
+        let decided = match turn.level {
+            Some(PermissionLevel::ReadOnly) => standing_refusal(&question),
+            Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => deadline
+                .run(broker_response(state.broker.as_ref(), &question))
+                .await
+                .flatten(),
+        };
+        if !state.announce_pending(&id, decided.is_none()) {
+            return;
+        }
+        if turn.approvals.flush(&turn.sink).await.is_err() {
+            let _ = state.withdraw_pending_by_id(&id);
+            return;
+        }
+        if let Some(decision) = decided {
+            let _ = state.respond_pending(
+                &id,
+                permission::selected(&decision.option_id),
+                decision.source,
+            );
+            let _ = turn.approvals.flush(&turn.sink).await;
+        }
+    });
 }
 
 /// Starts enforcement before broker deliberation or event backpressure can park the handler.
@@ -823,12 +867,104 @@ pub(crate) struct ConnectionHandle {
     control: Arc<dyn ProcessControl>,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>>,
+    /// Host-owned bounds for tearing down the dispatch loop and child process.
+    limits: mango_external_agents::Limits,
     /// Fires once the dispatch loop is over, whichever way it ended.
     ///
     /// Separate from `driver` because both are needed at once: `shutdown` takes the join handle to
     /// bound its own wind-down, and the session's lifecycle watcher has to observe the same event
     /// without competing for it.
     driver_done: mango_external_agents::CancelToken,
+    shutdown_started: AtomicBool,
+    shutdown_complete: mango_external_agents::CancelToken,
+    /// The one teardown outcome every close waiter observes. `Error` is intentionally reduced to
+    /// its diagnostic-safe summary here because the core error is not cloneable and a second close
+    /// must still report the first cleanup failure rather than inventing success.
+    shutdown_result: Mutex<Option<std::result::Result<(), String>>>,
+    /// Bounds non-turn ACP requests before they enter the SDK's unbounded pending-request queue.
+    /// A prompt has its own single-turn admission in `SessionState` and does not use this permit.
+    requests: RequestAdmission,
+}
+
+/// Admission in front of ACP's unbounded SDK request queue.
+struct RequestAdmission {
+    permits: tokio::sync::Semaphore,
+    limit: usize,
+    state: Mutex<RequestAdmissionState>,
+}
+
+#[derive(Default)]
+struct RequestAdmissionState {
+    closed: bool,
+}
+
+impl RequestAdmission {
+    fn new(limit: usize) -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(limit),
+            limit,
+            state: Mutex::new(RequestAdmissionState::default()),
+        }
+    }
+
+    fn submit<T>(&self, send: impl FnOnce() -> T) -> Result<(tokio::sync::SemaphorePermit<'_>, T)> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return Err(Error::Closed {
+                subject: "ACP connection",
+            });
+        }
+        let permit = self
+            .permits
+            .try_acquire()
+            .map_err(|_| Error::LimitExceeded {
+                subject: "outstanding ACP requests",
+                limit: self.limit,
+                received: self.limit.saturating_add(1),
+            })?;
+        let sent = send();
+        drop(state);
+        Ok((permit, sent))
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed = true;
+    }
+}
+
+/// Starts owned teardown if a generic request leaves ACP's pending-reply map without a response.
+struct RequestAbandonment {
+    connection: Arc<ConnectionHandle>,
+    armed: bool,
+}
+
+impl RequestAbandonment {
+    fn new(connection: Arc<ConnectionHandle>) -> Self {
+        Self {
+            connection,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestAbandonment {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // ACP 2.1 only sends a cancellation notification when a sent request is dropped; it keeps
+        // that request's reply slot until a response or EOF. Close admission synchronously, then
+        // let the connection's owned shutdown task force EOF and release the SDK's pending map.
+        self.connection
+            .begin_shutdown(mango_external_agents::CancelReason::Shutdown);
+    }
 }
 
 impl std::fmt::Debug for ConnectionHandle {
@@ -883,6 +1019,20 @@ pub(crate) async fn drive(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // All supported handlers are installed before connecting. The SDK's v1 default would
+        // retain unknown session messages for a future dynamic handler, without a queue cap.
+        .on_receive_dispatch(
+            async |message: agent_client_protocol::Dispatch, _cx| match message {
+                agent_client_protocol::Dispatch::Request(_, responder) => {
+                    responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+                }
+                agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                agent_client_protocol::Dispatch::Response(result, router) => {
+                    router.route_with_result(result)
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
         .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
             // The closure *is* the connection's lifetime, so it hands a clone out and parks.
             // Returning here shuts the dispatch loop down, which is why only `shutdown` does.
@@ -921,11 +1071,58 @@ pub(crate) async fn drive(
         control,
         shutdown: Mutex::new(Some(shutdown_tx)),
         driver: Mutex::new(Some(driver)),
+        limits: state.limits,
         driver_done,
+        shutdown_started: AtomicBool::new(false),
+        shutdown_complete: mango_external_agents::CancelToken::new(),
+        shutdown_result: Mutex::new(None),
+        requests: RequestAdmission::new(state.limits.max_pending_requests),
     })
 }
 
 impl ConnectionHandle {
+    /// Starts bounded shutdown in an owned task so dropping the initiating session future cannot
+    /// abandon the child. Later callers join the same completion signal.
+    pub(crate) fn begin_shutdown(self: &Arc<Self>, reason: mango_external_agents::CancelReason) {
+        // Serialised with `RequestAdmission::submit`, so no request can enter the SDK queue after
+        // a caller has begun teardown.
+        self.requests.close();
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let connection = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = connection
+                .shutdown(reason)
+                .await
+                .map_err(|error| error.to_string());
+            *connection
+                .shutdown_result
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(result);
+            connection.shutdown_complete.cancel();
+        });
+    }
+
+    /// Waits for the shutdown task started by [`Self::begin_shutdown`].
+    pub(crate) async fn wait_shutdown(&self) -> Result<()> {
+        self.shutdown_complete.cancelled().await;
+        let result = self
+            .shutdown_result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| {
+                Err(String::from(
+                    "the ACP shutdown task ended without an outcome",
+                ))
+            });
+        result.map_err(|message| {
+            Error::Vendor(link_failure(format!(
+                "ACP connection cleanup failed: {message}"
+            )))
+        })
+    }
     /// The connection, for a request a session method sends.
     ///
     /// Calls from a session method run outside the dispatch loop, which is the condition
@@ -955,7 +1152,7 @@ impl ConnectionHandle {
     /// Closing the connection first is what lets a well-behaved agent see its stdin end and exit on
     /// its own; the kill is the escalation for one that does not, and it is the launcher's own —
     /// this only asks, with the reason.
-    pub(crate) async fn shutdown(&self, reason: mango_external_agents::CancelReason) {
+    pub(crate) async fn shutdown(&self, reason: mango_external_agents::CancelReason) -> Result<()> {
         let signal = self
             .shutdown
             .lock()
@@ -969,16 +1166,26 @@ impl ConnectionHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(driver) = driver {
-            // Bounded: an agent that never releases the transport must not hold a close open.
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, driver).await;
+        if let Some(mut driver) = driver {
+            match tokio::time::timeout(self.limits.shutdown_timeout, &mut driver).await {
+                Ok(Ok(Ok(()))) => {}
+                // The transport commonly reports its own close as an error. The driver has still
+                // joined, and process cleanup is the fact that decides whether teardown succeeded.
+                Ok(Ok(Err(_)) | Err(_)) => {}
+                Err(_) => {
+                    driver.abort();
+                    let _ = driver.await;
+                    // The task has now joined. A successful bounded process cleanup below proves
+                    // the session is no longer live, so reporting an incomplete close would leave
+                    // the host permanently at `Closing` despite a reaped child.
+                }
+            }
         }
-        let _ = self.control.kill(reason).await;
+        let process = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
+        process?;
+        Ok(())
     }
 }
-
-/// How long the dispatch loop is given to wind down before the child is ended anyway.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Sends one request under the host's own deadline and maps whatever came back.
 ///
@@ -995,7 +1202,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// made of the agent's answer. An opening call returns no session or control handle, so this is the
 /// only path that preserves the tail for a host to inspect.
 pub(crate) async fn send<Request>(
-    connection: &ConnectionHandle,
+    connection: &Arc<ConnectionHandle>,
     profile: &crate::profile::AcpProfile,
     timeout: Duration,
     method: &'static str,
@@ -1005,7 +1212,13 @@ where
     Request: agent_client_protocol::JsonRpcRequest,
     Request::Response: Send,
 {
-    let sent = connection.connection().send_request(request);
+    // `ConnectionTo::send_request` enters ACP's own unbounded task queue immediately. Acquire
+    // before constructing that request so a host's pending-request budget remains an admission
+    // bound rather than merely a bound on responses we happened to await.
+    let (_permit, sent) = connection
+        .requests
+        .submit(|| connection.connection().send_request(request))?;
+    let mut abandonment = RequestAbandonment::new(Arc::clone(connection));
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
         return Err(Error::Timeout {
@@ -1013,6 +1226,7 @@ where
             after: timeout,
         });
     };
+    abandonment.disarm();
     answered.map_err(|error| {
         if agent_client_protocol::is_incoming_transport_closed(&error) {
             return Error::Vendor(link_failure(with_stderr(
@@ -1046,16 +1260,19 @@ pub(crate) fn link_failure(message: String) -> VendorError {
 }
 
 #[cfg(test)]
+mod connection_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{
-        AttemptId, Configuration, EventSink, HarnessIdentity, HostContext, SessionIds,
+        AttemptId, Configuration, Error, EventSink, HarnessIdentity, HostContext, SessionIds,
         SessionSnapshot, TransportKind, TransportSelection, TurnId,
     };
 
-    use super::{CancelReason, PermissionLevel, SessionId, SessionState};
+    use super::{CancelReason, PermissionLevel, RequestAdmission, SessionId, SessionState};
 
     /// A bare core session state, for the connection-level state under test to publish facts into.
     fn core_state() -> mango_external_agents::SessionState {
@@ -1165,8 +1382,9 @@ mod tests {
         assert!(state.begin_cancellation(CancelReason::ConsentRevoked));
 
         let (_, reason, _) = state
-            .end_turn_matching(&first)
+            .prepare_terminal_matching(&first)
             .expect("expected the first turn to still own the slot");
+        state.release_turn_matching(&first);
         state
             .begin_turn(sink(&host, "turn-2"), Some(PermissionLevel::Default))
             .expect("expected the second turn to acquire the released slot");
@@ -1182,11 +1400,55 @@ mod tests {
         let first = state
             .begin_turn(sink(&host, "turn-1"), Some(PermissionLevel::Default))
             .expect("expected the first turn");
-        state.end_turn();
+        state
+            .prepare_terminal_matching(&first)
+            .expect("expected the installed handle to end");
+        state.release_turn_matching(&first);
 
         assert!(
             !state.can_submit_prompt(&first),
             "an ended handle must not retain authority to submit a prompt"
+        );
+    }
+
+    /// A generic request must acquire admission before the ACP SDK can queue it, and releasing the
+    /// completed request's RAII permit must admit the next caller.
+    #[test]
+    fn generic_request_admission_is_bounded_and_releases_after_completion() {
+        let admission = RequestAdmission::new(1);
+        let first = admission
+            .submit(|| ())
+            .expect("expected the first request permit");
+        let refused = admission
+            .submit(|| ())
+            .expect_err("expected the second outstanding request to be refused");
+        assert!(
+            matches!(
+                refused,
+                Error::LimitExceeded {
+                    subject: "outstanding ACP requests",
+                    limit: 1,
+                    received: 2,
+                }
+            ),
+            "received {refused:?}"
+        );
+        drop(first.0);
+        let _next = admission
+            .submit(|| ())
+            .expect("expected the completed request to release admission");
+        admission.close();
+        let closed = admission
+            .submit(|| ())
+            .expect_err("expected closed admission to refuse before queuing");
+        assert!(
+            matches!(
+                closed,
+                Error::Closed {
+                    subject: "ACP connection"
+                }
+            ),
+            "received {closed:?}"
         );
     }
 }

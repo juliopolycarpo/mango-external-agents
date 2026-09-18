@@ -42,6 +42,8 @@ pub struct ConfigFile {
     directory: PathBuf,
     /// Set by [`remove`](Self::remove), so `Drop` does not try the same removal again.
     removed: bool,
+    /// A failed native stop leaves the artifact for the host to reclaim after proving exit.
+    preserve: std::sync::atomic::AtomicBool,
     /// The file's path, as the string `--mcp-config` takes. UTF-8 was already proven when this was
     /// written, so [`path`](Self::path) can hand it back as a [`Path`] without a second check.
     argument: String,
@@ -147,6 +149,7 @@ impl ConfigFile {
         let file = Self {
             directory,
             removed: false,
+            preserve: std::sync::atomic::AtomicBool::new(false),
             argument,
         };
         file.populate(&document, writer)?;
@@ -201,7 +204,7 @@ impl Drop for ConfigFile {
     /// close that does have one goes through `remove_on_close` instead, and a call that was
     /// cancelled mid-open through `Prepared`.
     fn drop(&mut self) {
-        if self.removed {
+        if self.removed || self.preserve.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         let _ = std::fs::remove_dir_all(&self.directory);
@@ -283,6 +286,21 @@ pub(crate) async fn remove_on_close(file: Option<std::sync::Arc<ConfigFile>>) ->
             expected: "a blocking pool that can remove the MCP configuration",
             received: String::from("a blocking task that did not finish"),
         })?
+}
+
+/// Keeps an MCP artifact on disk after native cleanup failed.
+///
+/// A still-running Claude child may read this file after a bounded process stop reports failure.
+/// Releasing the final `Arc` would remove it while that child is alive, so this disables automatic
+/// removal while releasing the in-memory lease. No bounded retry can prove the child stopped; the
+/// host receives the cleanup failure and can remove the preserved artifact only after it has
+/// independently established that no child remains.
+pub(crate) fn preserve_after_failed_native_cleanup(mut file: Prepared<std::sync::Arc<ConfigFile>>) {
+    let Some(file) = file.take() else {
+        return;
+    };
+    file.preserve
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Releases a configuration artifact without running the host's filesystem on the async worker.
@@ -1109,6 +1127,29 @@ mod tests {
         drop(file);
         let _ =
             std::fs::remove_dir_all(scratch.parent().expect("expected the dedicated test root"));
+    }
+
+    #[tokio::test]
+    async fn preserving_a_failed_cleanup_artifact_releases_its_memory() {
+        let scratch = tempdir();
+        let file = std::sync::Arc::new(
+            ConfigFile::write(&servers(), &scratch)
+                .await
+                .expect("file write")
+                .expect("configured servers"),
+        );
+        let path = file.path().to_path_buf();
+        let released = std::sync::Arc::downgrade(&file);
+        super::preserve_after_failed_native_cleanup(super::Prepared::new(Some(file)));
+        assert!(
+            released.upgrade().is_none(),
+            "expected preserved artifact to release its in-memory lease"
+        );
+        assert!(
+            path.exists(),
+            "expected artifact to remain available to the unreaped child"
+        );
+        std::fs::remove_dir_all(scratch).expect("test artifact cleanup");
     }
 
     #[tokio::test]

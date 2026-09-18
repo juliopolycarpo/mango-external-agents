@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use mango_external_agents::testing::FrozenClock;
 use mango_external_agents::{
-    ByteSink, ByteSource, CancelReason, EnvSource, ExitStatus, HostContext, LaunchSpec, Limits,
-    ManagedProcess, ProcessControl, ProcessLauncher, Result, StderrTail,
+    ByteSink, ByteSource, CancelReason, EnvSource, ExitStatus, HostContext, InterruptOutcome,
+    LaunchSpec, Limits, ManagedProcess, ProcessControl, ProcessLauncher, Result, StderrTail,
 };
 use tokio::sync::Notify;
 
@@ -141,9 +141,17 @@ pub struct FakeClaudeCli {
     stderr: Mutex<Vec<u8>>,
     /// Held closed while a test wants a turn's spawn to still be in flight.
     spawn_gate: Mutex<Option<SpawnGate>>,
+    /// Held closed while a test needs process termination to remain in flight.
+    stop_gate: Mutex<Option<SpawnGate>>,
+    /// Held closed while a test needs a prompt write to remain in flight.
+    input_write_gate: Mutex<Option<SpawnGate>>,
+    /// Held closed while a test needs stdin close to remain in flight.
+    input_close_gate: Mutex<Option<SpawnGate>>,
     /// Whether each killed child's `--mcp-config` file was still on disk when it was killed.
     config_at_kill: Arc<Mutex<Vec<bool>>>,
     kill_requests: Arc<Mutex<usize>>,
+    graceful_interrupts: Arc<Mutex<usize>>,
+    interrupt_supported: bool,
 }
 
 impl Default for FakeClaudeCli {
@@ -165,8 +173,13 @@ impl FakeClaudeCli {
             children: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
             spawn_gate: Mutex::new(None),
+            stop_gate: Mutex::new(None),
+            input_write_gate: Mutex::new(None),
+            input_close_gate: Mutex::new(None),
             config_at_kill: Arc::new(Mutex::new(Vec::new())),
             kill_requests: Arc::new(Mutex::new(0)),
+            graceful_interrupts: Arc::new(Mutex::new(0)),
+            interrupt_supported: false,
         }
     }
 
@@ -205,6 +218,13 @@ impl FakeClaudeCli {
         self
     }
 
+    /// Makes turn children acknowledge a graceful host interrupt before a kill is considered.
+    #[must_use]
+    pub fn with_graceful_interrupt(mut self) -> Self {
+        self.interrupt_supported = true;
+        self
+    }
+
     /// Every launch, in order.
     pub fn launches(&self) -> Vec<LaunchSpec> {
         lock(&self.launches).clone()
@@ -238,6 +258,39 @@ impl FakeClaudeCli {
         gate
     }
 
+    /// Holds the next turn's forced termination until the returned gate releases it.
+    #[must_use]
+    pub fn gate_turn_stops(&self) -> SpawnGate {
+        let gate = SpawnGate {
+            arrived: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *lock(&self.stop_gate) = Some(gate.clone());
+        gate
+    }
+
+    /// Holds the next turn's prompt write until the returned gate releases it.
+    #[must_use]
+    pub fn gate_turn_input_writes(&self) -> SpawnGate {
+        let gate = SpawnGate {
+            arrived: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *lock(&self.input_write_gate) = Some(gate.clone());
+        gate
+    }
+
+    /// Holds the next turn's stdin close until the returned gate releases it.
+    #[must_use]
+    pub fn gate_turn_input_closes(&self) -> SpawnGate {
+        let gate = SpawnGate {
+            arrived: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *lock(&self.input_close_gate) = Some(gate.clone());
+        gate
+    }
+
     /// For each child that was killed, whether its `--mcp-config` file still existed then.
     ///
     /// A child is launched with `--mcp-config <path>` and reads it at startup, so unlinking that
@@ -259,6 +312,11 @@ impl FakeClaudeCli {
         *lock(&self.kill_requests)
     }
 
+    /// How many turn children the harness asked to stop gracefully.
+    pub fn graceful_interrupts(&self) -> usize {
+        *lock(&self.graceful_interrupts)
+    }
+
     /// Whether every child this launcher handed out has ended.
     pub fn all_children_ended(&self) -> bool {
         lock(&self.children).iter().all(|child| child.is_finished())
@@ -267,6 +325,42 @@ impl FakeClaudeCli {
     /// Whether any child is still running.
     pub fn a_child_is_running(&self) -> bool {
         !self.all_children_ended()
+    }
+
+    /// Ends live turn children as the host after a test has proved the library stopped asking.
+    ///
+    /// A failed bounded stop means the host still owns an unfinished process. Tests use this only
+    /// to release fixture state after asserting that the harness made its one allowed stop ask.
+    pub fn end_turns_for_host_cleanup(&self) {
+        let children = lock(&self.children).clone();
+        for child in children
+            .into_iter()
+            .filter(|child| child.is_turn && !child.is_finished())
+        {
+            child.end(ExitStatus {
+                code: Some(143),
+                signal: None,
+            });
+        }
+    }
+
+    /// Makes the newest live turn child print one more line after it has gone quiet.
+    ///
+    /// A [`Run`] says everything it is going to say before a test can arrange anything around it,
+    /// which leaves one ordering out of reach: the vendor's own `result` arriving *after* a stop
+    /// already owns the turn. That window is where the harness has to decide whether it still owes
+    /// the launcher a teardown ask, so a fake that cannot reach it cannot hold that decision.
+    pub fn announce_to_turn(&self, line: impl Into<String>) {
+        let child = lock(&self.children)
+            .iter()
+            .rev()
+            .find(|child| child.is_turn && !child.is_finished())
+            .map(Arc::clone);
+        let Some(child) = child else {
+            return;
+        };
+        lock(&child.pending).push_back(line.into());
+        child.changed.notify_waiters();
     }
 
     fn run_for(&self, argv: &[String]) -> (Run, Vec<u8>) {
@@ -309,14 +403,20 @@ fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl ProcessLauncher for FakeClaudeCli {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
         let (run, stderr_bytes) = self.run_for(&spec.argv);
-        let gate = (!is_probe(&spec.argv))
-            .then(|| lock(&self.spawn_gate).clone())
-            .flatten();
+        let is_turn = !is_probe(&spec.argv);
+        let gate = is_turn.then(|| lock(&self.spawn_gate).clone()).flatten();
         if let Some(gate) = gate {
             gate.arrived.notify_one();
             gate.release.notified().await;
         }
         let mcp_config = value_after(&spec.argv, "--mcp-config").map(PathBuf::from);
+        let stop_gate = is_turn.then(|| lock(&self.stop_gate).clone()).flatten();
+        let input_write_gate = is_turn
+            .then(|| lock(&self.input_write_gate).clone())
+            .flatten();
+        let input_close_gate = is_turn
+            .then(|| lock(&self.input_close_gate).clone())
+            .flatten();
         lock(&self.launches).push(spec);
 
         let stderr = StderrTail::default();
@@ -342,6 +442,10 @@ impl ProcessLauncher for FakeClaudeCli {
             mcp_config,
             config_at_kill: Arc::clone(&self.config_at_kill),
             kill_requests: Arc::clone(&self.kill_requests),
+            graceful_interrupts: Arc::clone(&self.graceful_interrupts),
+            interrupt_supported: self.interrupt_supported,
+            is_turn,
+            stop_gate,
         });
         lock(&self.children).push(Arc::clone(&child));
 
@@ -352,6 +456,8 @@ impl ProcessLauncher for FakeClaudeCli {
             stdin: Some(Box::new(FakeStdin {
                 child: Arc::clone(&child),
                 partial: Vec::new(),
+                input_write_gate,
+                input_close_gate,
             })),
             control: child,
         })
@@ -368,6 +474,10 @@ struct Child {
     mcp_config: Option<PathBuf>,
     config_at_kill: Arc<Mutex<Vec<bool>>>,
     kill_requests: Arc<Mutex<usize>>,
+    graceful_interrupts: Arc<Mutex<usize>>,
+    interrupt_supported: bool,
+    is_turn: bool,
+    stop_gate: Option<SpawnGate>,
 }
 
 impl Child {
@@ -402,13 +512,32 @@ impl ProcessControl for Child {
         }
     }
 
+    async fn interrupt(&self, _reason: CancelReason) -> Result<InterruptOutcome> {
+        if !self.interrupt_supported {
+            return Ok(InterruptOutcome::Unsupported);
+        }
+        if self.is_turn {
+            *lock(&self.graceful_interrupts) += 1;
+        }
+        if !self.is_finished() {
+            self.end(ExitStatus {
+                code: Some(130),
+                signal: None,
+            });
+        }
+        Ok(InterruptOutcome::Delivered)
+    }
+
     /// 128 + SIGTERM, which is what the vendor documents for a `claude -p` run stopped that way.
     async fn kill(&self, _reason: CancelReason) -> Result<()> {
-        // Counted before the early return: the ask itself is what the trait bounds. Only for a
-        // turn child, which is the one a `--mcp-config` identifies; the version and help probes
-        // are ended by their own code paths and would otherwise be counted here too.
-        if self.mcp_config.is_some() {
+        // Counted before the early return: the ask itself is what the trait bounds. Version and
+        // help probes are ended by their own code paths, so only turn children contribute.
+        if self.is_turn {
             *lock(&self.kill_requests) += 1;
+        }
+        if let Some(gate) = &self.stop_gate {
+            gate.arrived.notify_one();
+            gate.release.notified().await;
         }
         // A child that already ended is not killed again. `TokioChild` escalates once and the
         // second caller waits on the first caller's outcome without signalling anything, so a fake
@@ -452,11 +581,17 @@ impl ByteSource for FakeStdout {
 struct FakeStdin {
     child: Arc<Child>,
     partial: Vec<u8>,
+    input_write_gate: Option<SpawnGate>,
+    input_close_gate: Option<SpawnGate>,
 }
 
 #[async_trait::async_trait]
 impl ByteSink for FakeStdin {
     async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(gate) = &self.input_write_gate {
+            gate.arrived.notify_one();
+            gate.release.notified().await;
+        }
         self.partial.extend_from_slice(bytes);
         while let Some(newline) = self.partial.iter().position(|byte| *byte == b'\n') {
             let record: Vec<u8> = self.partial.drain(..=newline).collect();
@@ -470,6 +605,10 @@ impl ByteSink for FakeStdin {
     /// `claude --print` reads stdin to EOF and only then starts working, so a fake that ended here
     /// could never model a turn that is still running when a host cancels it.
     async fn close(&mut self) -> Result<()> {
+        if let Some(gate) = &self.input_close_gate {
+            gate.arrived.notify_one();
+            gate.release.notified().await;
+        }
         Ok(())
     }
 }
