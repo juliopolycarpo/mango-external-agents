@@ -1133,16 +1133,61 @@ async fn a_native_interrupt_in_progress_keeps_admission_owned() {
         "expected a typed busy refusal while native cancellation is in progress, received {error:?}"
     );
 
-    assert!(
-        matches!(
-            cancellation
-                .await
-                .expect("expected cancellation task to finish")
-                .expect_err("expected the silent native turn to time out")
-                .cause(),
-            mango_external_agents::Error::Timeout { .. }
-        ),
-        "expected cancellation to escalate after its terminal deadline"
+    cancellation
+        .await
+        .expect("expected cancellation task to finish")
+        .expect("expected bounded escalation to reap the silent native turn");
+}
+
+/// An unrecoverable terminal cannot merely fail its stream: the poisoned connection owns a
+/// native child until its shutdown watcher reaps it.
+#[tokio::test]
+async fn an_unroutable_malformed_terminal_reaps_the_poisoned_session() {
+    let transcript = Transcript::load("interrupt");
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        (method == Some("turn/start")).then(|| {
+            vec![
+                serde_json::json!({
+                    "id": id,
+                    "result": {"turn": {"id": "malformed-turn"}},
+                })
+                .to_string(),
+                serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {"unexpected": true},
+                })
+                .to_string(),
+            ]
+        })
+    }));
+    let (host, launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected a turn before its malformed terminal");
+
+    let event = turn
+        .recv()
+        .await
+        .expect("expected malformed terminal to fail the stream");
+    assert!(matches!(event.kind, EventKind::Error { .. }));
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected a poisoned session to finish its owned teardown"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected a malformed terminal to reap the app-server rather than only fail its stream"
     );
 }
 

@@ -280,6 +280,21 @@ impl Shared {
             })
     }
 
+    /// Whether an approval can still be admitted for this owned native turn.
+    ///
+    /// This check shares the turn lock with `cancel_owner`, so once cancellation is latched a
+    /// late server request cannot enter the host approval path.
+    async fn approval_route_is_admissible(&self, route: &ActiveTurnRoute) -> bool {
+        if self.is_shutting_down() || self.host.cancel().is_cancelled() {
+            return false;
+        }
+        self.turn.lock().await.as_ref().is_some_and(|active| {
+            !active.finishing
+                && active.cancel_reason.is_none()
+                && Arc::ptr_eq(&active.owner, &route.owner)
+        })
+    }
+
     /// Whether the start attempt identified by `route` still owns the active turn slot.
     async fn owns_active_turn(&self, route: &ActiveTurnRoute) -> bool {
         self.turn
@@ -416,6 +431,8 @@ struct ActiveTurn {
     abandonment_watcher: Option<tokio::task::JoinHandle<()>>,
     /// Stops a native turn that remains inactive past the host's configured deadline.
     idle_watcher: Option<tokio::task::JoinHandle<()>>,
+    /// Owns one durable native-stop worker across every cancellation caller.
+    stop: Arc<StopState>,
     /// A terminal is being committed. Admission remains held until it is visible to the host.
     finishing: bool,
 }
@@ -425,6 +442,27 @@ struct TerminalClaim {
     owner: Arc<()>,
     sink: EventSink,
     cancel_reason: Option<CancelReason>,
+}
+
+/// Completion state for one detached native-stop worker.
+struct StopState {
+    started: AtomicBool,
+    complete: AtomicBool,
+    failed: AtomicBool,
+    vendor_failure: Mutex<Option<VendorError>>,
+    done: Notify,
+}
+
+impl StopState {
+    fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            complete: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            vendor_failure: Mutex::new(None),
+            done: Notify::new(),
+        }
+    }
 }
 
 /// Cleans up admission when the caller drops `start_turn` before it can return a stream owner.
@@ -667,23 +705,6 @@ impl Shared {
             (None, None) => claim.sink.complete().await,
         };
         self.release_terminal(&claim.owner).await;
-    }
-
-    /// Ends the running turn, if there is one.
-    async fn finish(&self, outcome: Outcome) {
-        let Outcome::Finish {
-            events,
-            cancelled,
-            failure,
-        } = outcome
-        else {
-            return;
-        };
-        let Some(claim) = self.claim_terminal(None).await else {
-            return;
-        };
-        self.commit_terminal(claim, events, cancelled, failure)
-            .await;
     }
 
     /// Ends the stream that still belongs to this start attempt.
@@ -977,19 +998,7 @@ impl PeerHandler for CodexHandler {
                     .await;
             }
             Outcome::Poison { failure } => {
-                if !self.shared.stop_new_work() {
-                    return;
-                }
-                self.shared
-                    .release_pending_for(None, DecisionSource::Cancelled)
-                    .await;
-                self.shared
-                    .finish(Outcome::Finish {
-                        events: Vec::new(),
-                        cancelled: None,
-                        failure: Some(failure),
-                    })
-                    .await;
+                self.shared.poison(failure).await;
             }
             Outcome::Ignore => {}
         }
@@ -1034,6 +1043,15 @@ impl PeerHandler for CodexHandler {
                 data: None,
             });
         };
+        if !self.shared.approval_route_is_admissible(&route).await {
+            return ServerRequestOutcome::Failure(JsonRpcError {
+                code: -32602,
+                message: String::from(
+                    "expected an active turn accepting approvals, received a stopped turn",
+                ),
+                data: None,
+            });
+        }
         let Some(request_turn_id) = request.turn_id().filter(|turn_id| !turn_id.is_empty()) else {
             return ServerRequestOutcome::Failure(JsonRpcError {
                 code: -32602,
@@ -1117,6 +1135,9 @@ impl CodexHandler {
     ) -> Option<ApprovalDecisionValue> {
         let request = pending.request.clone();
         let request_id = request.id().clone();
+        if !self.shared.approval_route_is_admissible(&route).await {
+            return Some(pending.refusal());
+        }
         // Translate the request's original wall-clock deadline once. Every later await must share
         // it, otherwise a full event channel or a slow broker would restart the host's timer. `now`
         // is the same read `to_request` stamped `expires_at` from, not a fresh one: a second host
@@ -1157,6 +1178,26 @@ impl CodexHandler {
                     answer,
                 },
             );
+        }
+        // `cancel_owner` latches cancellation under the turn lock before draining pending
+        // questions. Re-check after registration so a request that raced that drain cannot be
+        // left behind to a fast broker that would otherwise grant it.
+        if !self.shared.approval_route_is_admissible(&route).await {
+            let removed = self.shared.pending.lock().await.remove(&request_id);
+            if removed
+                .as_ref()
+                .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
+            {
+                let decision = pending.refusal();
+                self.resolved(
+                    &route,
+                    &request_id,
+                    ApprovalDecision::unresolved(decision.option_id(), DecisionSource::Cancelled),
+                )
+                .await;
+            }
+            self.shared.signal_idle_change();
+            return Some(pending.refusal());
         }
         self.shared.signal_idle_change();
 
@@ -1266,13 +1307,20 @@ impl CodexHandler {
                     let decision = pending
                         .decision_for(&response.option_id)
                         .unwrap_or_else(|| pending.refusal());
-                    let applied_option_id = decision.option_id();
-                    let audited = match pending.option(applied_option_id) {
-                        Some(option) => ApprovalDecision::from_option(option, response.source),
-                        None => ApprovalDecision::unresolved(applied_option_id, response.source),
-                    };
-                    self.resolved(&route, &request_id, audited).await;
-                    return Some(decision);
+                    let option_id = decision.option_id().to_owned();
+                    return self
+                        .settle_answer(
+                            Answer::Chosen {
+                                decision,
+                                option_id,
+                                source: response.source,
+                                reported: false,
+                            },
+                            &pending,
+                            &route,
+                            &request_id,
+                        )
+                        .await;
                 }
             }
         }
@@ -1339,6 +1387,21 @@ impl CodexHandler {
                 source,
                 reported,
             } => {
+                if !self.shared.approval_route_is_admissible(route).await {
+                    let refusal = pending.refusal();
+                    if !reported {
+                        self.resolved(
+                            route,
+                            request_id,
+                            ApprovalDecision::unresolved(
+                                refusal.option_id(),
+                                DecisionSource::Cancelled,
+                            ),
+                        )
+                        .await;
+                    }
+                    return Some(refusal);
+                }
                 if !reported {
                     // A real choice: reported with the reach and risk of the option that won,
                     // when this harness offered one by that id.
@@ -1447,7 +1510,7 @@ impl CodexSession {
         state: SessionState,
         owner: Arc<()>,
     ) {
-        Self::stop_owner(
+        let _ = Self::request_owner_stop(
             shared,
             client,
             control,
@@ -1458,6 +1521,75 @@ impl CodexSession {
         .await;
     }
 
+    /// Claims the one durable stop worker for this owner before any interrupt await begins.
+    async fn request_owner_stop(
+        shared: Arc<Shared>,
+        client: Arc<Client>,
+        control: Arc<dyn ProcessControl>,
+        state: SessionState,
+        owner: Arc<()>,
+        reason: CancelReason,
+    ) -> Arc<StopState> {
+        let stop = {
+            let turn = shared.turn.lock().await;
+            turn.as_ref()
+                .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &owner))
+                .map(|active| Arc::clone(&active.stop))
+        };
+        let Some(stop) = stop else {
+            return Arc::new(StopState {
+                started: AtomicBool::new(true),
+                complete: AtomicBool::new(true),
+                failed: AtomicBool::new(false),
+                vendor_failure: Mutex::new(None),
+                done: Notify::new(),
+            });
+        };
+        if stop
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let worker_stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                match Self::stop_owner(shared, client, control, state, owner, reason).await {
+                    Ok(()) => {}
+                    Err(Error::Vendor(error)) => {
+                        *worker_stop.vendor_failure.lock().await = Some(error);
+                        worker_stop.failed.store(true, Ordering::Release);
+                    }
+                    Err(_) => {
+                        worker_stop.failed.store(true, Ordering::Release);
+                    }
+                }
+                worker_stop.complete.store(true, Ordering::Release);
+                worker_stop.done.notify_waiters();
+            });
+        }
+        stop
+    }
+
+    /// Waits for a durable native-stop worker without owning its lifetime.
+    async fn wait_for_stop(stop: &StopState) -> Result<()> {
+        loop {
+            let done = stop.done.notified();
+            if stop.complete.load(Ordering::Acquire) {
+                return if stop.failed.load(Ordering::Acquire) {
+                    if let Some(error) = stop.vendor_failure.lock().await.clone() {
+                        return Err(Error::Vendor(error));
+                    }
+                    Err(Error::Link {
+                        peer: String::from("Codex app-server"),
+                        message: String::from("bounded native turn cancellation did not complete"),
+                    })
+                } else {
+                    Ok(())
+                };
+            }
+            done.await;
+        }
+    }
+
     /// Cancels one owned native turn and escalates only when its terminal does not arrive.
     async fn stop_owner(
         shared: Arc<Shared>,
@@ -1466,23 +1598,36 @@ impl CodexSession {
         state: SessionState,
         owner: Arc<()>,
         reason: CancelReason,
-    ) {
+    ) -> Result<()> {
         if !shared.owner_is_active(&owner).await {
-            return;
+            return Ok(());
         }
         let limits = *shared.host.limits();
-        let _ = tokio::time::timeout(
+        let interrupted = tokio::time::timeout(
             limits.kill_grace,
             shared.cancel_owner(&client, Some(&owner), reason),
         )
         .await;
+        match interrupted {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
+                let _ = Self::wait_for_shutdown(&shared).await;
+                return Err(error);
+            }
+            Err(_) => {
+                Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
+                return Self::wait_for_shutdown(&shared).await;
+            }
+        }
         if tokio::time::timeout(limits.shutdown_timeout, shared.wait_for_turn_end(&owner))
             .await
             .is_ok()
         {
-            return;
+            return Ok(());
         }
-        Self::request_shutdown(shared, client, control, state, reason);
+        Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
+        Self::wait_for_shutdown(&shared).await
     }
 
     /// Closes the connection and reaps its child after native cancellation did not settle it.
@@ -1636,17 +1781,15 @@ impl CodexSession {
                     if shared.owner_is_active(&owner).await
                         && !shared.approval_is_pending_for(&owner).await
                     {
-                        tokio::spawn(async move {
-                            Self::stop_owner(
-                                shared,
-                                client,
-                                control,
-                                state,
-                                owner,
-                                CancelReason::Timeout,
-                            )
-                            .await;
-                        });
+                        let _ = Self::request_owner_stop(
+                            shared,
+                            client,
+                            control,
+                            state,
+                            owner,
+                            CancelReason::Timeout,
+                        )
+                        .await;
                     }
                     return;
                 }
@@ -1778,6 +1921,7 @@ impl CodexSession {
                 cancel_reason: None,
                 abandonment_watcher: None,
                 idle_watcher: None,
+                stop: Arc::new(StopState::new()),
                 finishing: false,
             });
         }
@@ -2126,65 +2270,24 @@ impl Session for CodexSession {
     }
 
     async fn cancel(&self, reason: CancelReason) -> Result<()> {
-        let grace = self.shared.host.limits().kill_grace;
         let Some(route) = self.shared.active_turn_route().await else {
             return Ok(());
         };
         let pending_start = route.native_turn_id.is_empty();
         let owner = route.owner;
-        let cancellation = tokio::time::timeout(
-            grace,
-            self.shared.cancel_owner(&self.client, Some(&owner), reason),
-        )
-        .await;
-        match cancellation {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                Self::request_shutdown(
-                    Arc::clone(&self.shared),
-                    Arc::clone(&self.client),
-                    Arc::clone(&self.control),
-                    self.state.clone(),
-                    reason,
-                );
-                return Err(error);
-            }
-            Err(_) => {
-                Self::request_shutdown(
-                    Arc::clone(&self.shared),
-                    Arc::clone(&self.client),
-                    Arc::clone(&self.control),
-                    self.state.clone(),
-                    reason,
-                );
-                return Err(Error::Timeout {
-                    operation: String::from("Codex native turn interruption"),
-                    after: grace,
-                });
-            }
-        }
-        if pending_start {
-            return Ok(());
-        }
-        let timeout = self.shared.host.limits().shutdown_timeout;
-        if tokio::time::timeout(timeout, self.shared.wait_for_turn_end(&owner))
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        Self::request_shutdown(
+        let stop = Self::request_owner_stop(
             Arc::clone(&self.shared),
             Arc::clone(&self.client),
             Arc::clone(&self.control),
             self.state.clone(),
+            owner,
             reason,
-        );
-        Self::wait_for_shutdown(&self.shared).await?;
-        Err(Error::Timeout {
-            operation: String::from("Codex native turn completion after interruption"),
-            after: timeout,
-        })
+        )
+        .await;
+        if pending_start {
+            return Ok(());
+        }
+        Self::wait_for_stop(&stop).await
     }
 
     async fn close(&self, reason: CloseReason) -> Result<()> {
@@ -2413,7 +2516,9 @@ mod tests {
     use mango_external_agents::stream::EventSink;
     use mango_external_agents::testing::FakeLauncher;
 
-    use super::{ActiveTurn, CodexHandler, Shared, base64, data_url, supports_image_mime_type};
+    use super::{
+        ActiveTurn, CodexHandler, Shared, StopState, base64, data_url, supports_image_mime_type,
+    };
     use crate::reducer::Outcome;
     use mango_external_agents::jsonrpc::PeerHandler;
 
@@ -2495,6 +2600,7 @@ mod tests {
             cancel_reason: None,
             abandonment_watcher: None,
             idle_watcher: None,
+            stop: Arc::new(StopState::new()),
             finishing: false,
         });
         (
@@ -2880,6 +2986,48 @@ mod tests {
         assert!(
             shared.pending.lock().await.is_empty(),
             "expected a stale approval not to register a host-visible prompt"
+        );
+    }
+
+    /// A request that arrives after cancellation is latched cannot enter a broker that might
+    /// automatically allow it; its JSON-RPC outcome is a refusal and no host prompt is retained.
+    #[tokio::test]
+    async fn a_late_approval_after_cancellation_is_refused_before_broker_admission() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+        shared
+            .turn
+            .lock()
+            .await
+            .as_mut()
+            .expect("expected an active turn")
+            .cancel_reason = Some(mango_external_agents::CancelReason::Requested);
+
+        let outcome = handler
+            .on_request(
+                String::from("item/commandExecution/requestApproval"),
+                serde_json::json!({
+                    "threadId": "thread-1", "turnId": "vendor-turn-1", "itemId": "item-1",
+                    "command": "pwd"
+                }),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                outcome,
+                mango_external_agents::jsonrpc::ServerRequestOutcome::Failure(_)
+            ),
+            "expected late approval to be refused instead of allowed, received {outcome:?}"
+        );
+        assert!(
+            shared.pending.lock().await.is_empty(),
+            "expected a cancelled owner not to retain a broker-visible approval"
         );
     }
 
