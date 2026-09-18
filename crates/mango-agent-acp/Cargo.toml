@@ -34,7 +34,7 @@ agent-client-protocol = { version = "2.1.0", default-features = false }
 async-trait = "0.1.92"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 # `Sink`/`Stream` adapters between the core's `ManagedProcess` halves and the official crate's
-# `Lines` transport. No executor: the host owns the runtime.
+# bounded `Channel` transport. No executor: the host owns the runtime.
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
 mango-external-agents.workspace = true
 # The fake agent composes the v1 wire as JSON rather than as Rust values, so a schema reshape shows

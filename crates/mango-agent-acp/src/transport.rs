@@ -1,4 +1,4 @@
-//! The `acp` transport: a host-owned child process, framed as the official crate's [`Lines`].
+//! The `acp` transport: a host-owned child process, framed at the official SDK's channel boundary.
 //!
 //! The official `agent-client-protocol` crate ships two carriers of its own — `AcpAgent`, which
 //! spawns the agent itself, and `Stdio`, which takes over this process's own stdio. Neither is
@@ -6,20 +6,19 @@
 //! [`ProcessLauncher`](mango_external_agents::ProcessLauncher) and the library only ever receives
 //! the pipes.
 //!
-//! What it receives them as is why this module builds [`Lines`] rather than the crate's
-//! `ByteStreams`: a [`ManagedProcess`] hands over a [`ByteSource`](mango_external_agents::ByteSource)
-//! of chunks and a [`ByteSink`],
-//! not a `futures::io::AsyncRead`, so there is nothing for `tokio_util::compat` to convert.
-//! `Lines` wants a `Stream<Item = io::Result<String>>` and a `Sink<String>`, which is exactly what
-//! the core's own [`LineStream`] and [`ByteSink`] are — so the framing, and the cap it reads the
-//! vendor under, stay the library's. `ByteStreams` would have framed the pipe itself, with no cap
-//! at all.
+//! [`ManagedProcess`] supplies a [`ByteSource`](mango_external_agents::ByteSource) and [`ByteSink`].
+//! [`LineStream`] frames them under the host's line limits. [`BoundedTransport`] additionally caps
+//! queued frame counts and bytes at the official SDK's [`agent_client_protocol::Channel`] boundary;
+//! its stock line adapter has unbounded actor queues. The official SDK still parses and routes the
+//! wire protocol. Pressure fails the connection so native cleanup can progress independently of a
+//! stalled physical writer or protocol handler.
 //!
 //! The `Http` arm of [`AcpSpec`] is not implemented in 0.1. See the crate docs for why.
 
 use std::pin::Pin;
 
-use agent_client_protocol::Lines;
+mod bounded;
+pub use bounded::BoundedTransport;
 use futures::stream::BoxStream;
 use mango_external_agents::process::{ByteSink, LineStream};
 use mango_external_agents::{AcpSpec, Error, HostContext, LaunchSpec, ManagedProcess, Result};
@@ -38,8 +37,8 @@ type IncomingLines = BoxStream<'static, std::io::Result<String>>;
 /// diagnostic, and its [`kill`](mango_external_agents::ProcessControl::kill) is what ends an agent
 /// that ignored a closed stdin.
 pub struct LaunchedAgent {
-    /// The line transport to hand the official client builder.
-    pub transport: Lines<OutgoingLines, IncomingLines>,
+    /// The bounded frame transport to hand the official client builder.
+    pub transport: BoundedTransport,
     /// The child's lifetime and diagnostics.
     pub control: std::sync::Arc<dyn mango_external_agents::ProcessControl>,
 }
@@ -133,7 +132,7 @@ pub fn frame(process: ManagedProcess, host: &HostContext) -> Result<LaunchedAgen
     let outgoing: OutgoingLines = Box::pin(outgoing_lines(stdin));
 
     Ok(LaunchedAgent {
-        transport: Lines::new(outgoing, incoming),
+        transport: BoundedTransport::new(outgoing, incoming, *host.limits()),
         control,
     })
 }

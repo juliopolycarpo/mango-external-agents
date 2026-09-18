@@ -38,10 +38,15 @@ down would mean sending v1 messages to an agent that answered something else.
 agent and the library receives the pipes; the SDK's own `AcpAgent` and `Stdio` carriers are unusable
 here because the first spawns the agent itself and the second takes over this process's stdio.
 
-The pipes are framed as the SDK's `Lines`, over the core's own `LineStream` and `ByteSink`. That keeps
-framing — and the host's `Limits::line` caps — the library's. The SDK's `ByteStreams` would have framed
-the pipe itself with no cap, and it wants a `futures::io::AsyncRead` that the launcher port
-deliberately does not expose.
+The core's `LineStream` and `ByteSink` frame the pipes under `Limits::line`. `BoundedTransport`
+passes frames through the SDK's [`Channel` interface](https://docs.rs/agent-client-protocol/2.1.0/agent_client_protocol/struct.Channel.html),
+leaving JSON-RPC parsing and routing to the official SDK. It caps queued frame counts at
+`max_pending_requests` and serialized bytes at `turn_buffer_bytes` in each direction. Output bytes
+remain charged through the physical write. Batch sizes have the same pending-message cap. Queue
+pressure fails the connection explicitly and triggers native cleanup.
+
+The SDK's `Lines` carrier uses unbounded internal queues; its `ByteStreams` carrier also frames input
+without the host's line cap. Neither provides the budgets this harness requires.
 
 `AcpSpec::Http` exists in the core and is **not implemented**: `agent-client-protocol-http` 2.1.0 pulls
 `aws-lc-rs` through `reqwest` 0.13's `rustls` feature and through `async-tungstenite`'s
@@ -66,6 +71,10 @@ Handlers leave the dispatch loop promptly:
 - A `session/request_permission` handler must not wait for an answer, because the answer arrives
   through `Session::respond` on another task. It parks the agent's responder and returns; broker
   deliberation is a separately bounded callback, capped by `Limits::max_pending_requests`.
+
+The typed handlers are installed before connecting. A final SDK handler consumes unsupported
+notifications and answers unsupported requests with `Method not found`; it does not retain them
+for a future dynamic session handler. Responses continue through the SDK's correlation router.
 
 Every request except `session/prompt` is bounded by `Limits::request_timeout` and fails with
 `Error::Timeout` naming the method. The prompt is a turn and may take as long as the agent needs.

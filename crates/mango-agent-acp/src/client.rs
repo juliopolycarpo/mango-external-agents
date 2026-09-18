@@ -940,6 +940,20 @@ pub(crate) async fn drive(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // All supported handlers are installed before connecting. The SDK's v1 default would
+        // retain unknown session messages for a future dynamic handler, without a queue cap.
+        .on_receive_dispatch(
+            async |message: agent_client_protocol::Dispatch, _cx| match message {
+                agent_client_protocol::Dispatch::Request(_, responder) => {
+                    responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+                }
+                agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                agent_client_protocol::Dispatch::Response(result, router) => {
+                    router.route_with_result(result)
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
         .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
             // The closure *is* the connection's lifetime, so it hands a clone out and parks.
             // Returning here shuts the dispatch loop down, which is why only `shutdown` does.
@@ -1164,6 +1178,9 @@ pub(crate) fn link_failure(message: String) -> VendorError {
         message,
     )
 }
+
+#[cfg(test)]
+mod unsupported_tests;
 
 #[cfg(test)]
 mod tests {

@@ -66,6 +66,11 @@ correlation continues on its own path until closure. Request deadlines include w
 dropping a request removes its pending correlation entry. Approval deadlines remain separate from
 request and idle deadlines.
 
+ACP also bounds its SDK frame boundary by `max_pending_requests` queued frames and
+`turn_buffer_bytes` serialized bytes in each direction. Output byte accounting includes the active
+physical write, and an oversized batch or queue fails the connection. Generic outgoing ACP
+requests reserve admission before entering the SDK queue.
+
 Framed transports also enforce `Limits::line`, and stderr has its own bounded tail. These are
 per-stream and per-connection budgets, not a total host-memory limit. The host caps the number of
 sessions, retained completed streams, attachments and source buffers it supplies through its
