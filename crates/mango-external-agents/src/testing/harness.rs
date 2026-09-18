@@ -282,6 +282,30 @@ struct PendingTurn {
     sink: EventSink,
     approval: Option<PermissionRequest>,
     question: Option<QuestionRequest>,
+    /// The activity this turn announced and has not closed.
+    ///
+    /// Held so a cancel and a close can end it. A fake that leaves one running teaches every
+    /// harness written against it that a turn may end owing a spinner nobody will stop, which is
+    /// what the conformance suite's structure check exists to refuse.
+    open_activity: Option<String>,
+}
+
+/// Ends the activity a stopped turn announced, before its terminal goes out.
+///
+/// `Cancelled` rather than `Failed`: nothing went wrong with the call, the turn it belonged to
+/// stopped. A best-effort emit — the sink may already be closed by a racing terminal, and the
+/// terminal is the event that matters.
+async fn close_open_activity(turn: &PendingTurn) {
+    let Some(call_id) = turn.open_activity.clone() else {
+        return;
+    };
+    let _ = turn
+        .sink
+        .emit(EventKind::ActivityCompleted {
+            call_id,
+            result: ActivityResult::new(ActivityStatus::Cancelled),
+        })
+        .await;
 }
 
 fn approval_request(
@@ -587,6 +611,7 @@ impl Session for FakeSession {
                 sink: sink.clone(),
                 approval: None,
                 question: Some(question.clone()),
+                open_activity: None,
             });
             // No broker is consulted: a question authorises nothing, so a permission policy has no
             // standing to answer one.
@@ -615,6 +640,7 @@ impl Session for FakeSession {
             sink: sink.clone(),
             approval: Some(request_for_approval.clone()),
             question: None,
+            open_activity: Some(String::from("call-1")),
         });
         drop(pending);
 
@@ -684,6 +710,7 @@ impl Session for FakeSession {
         let Some(turn) = pending.take() else {
             return Ok(());
         };
+        close_open_activity(&turn).await;
         turn.sink.cancel(reason).await
     }
 
@@ -694,6 +721,7 @@ impl Session for FakeSession {
         // Terminal commitment is immediate and remains inside the admission critical section.
         if let Some(turn) = pending.take() {
             // A close ends whatever was running, for the same reason.
+            close_open_activity(&turn).await;
             let _ = turn.sink.cancel(CancelReason::Shutdown).await;
         }
         Ok(())
