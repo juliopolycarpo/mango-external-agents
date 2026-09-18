@@ -94,10 +94,6 @@ pub(crate) struct TurnHandle {
     pub(crate) approvals: Arc<ApprovalEvents>,
 }
 
-/// One agent request waiting for either the harness or the host to answer it.
-///
-/// A request remains harness-owned while a standing refusal or broker decision is in progress. Only
-/// an undecided request becomes host-answerable, immediately before its event is emitted.
 /// Settles the questions a cancellation owes, however its own answer turns out.
 ///
 /// The expiry path answers one question and notifies the agent, and either call can fail on a
@@ -114,6 +110,10 @@ impl Drop for WithdrawOnDrop<'_> {
     }
 }
 
+/// One agent request waiting for either the harness or the host to answer it.
+///
+/// A request remains harness-owned while a standing refusal or broker decision is in progress. Only
+/// an undecided request becomes host-answerable, immediately before its event is emitted.
 struct PendingApproval {
     responder: Responder<RequestPermissionResponse>,
     host_answerable: bool,
