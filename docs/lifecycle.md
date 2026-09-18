@@ -70,6 +70,11 @@ The first terminal wins; later events are refused. Vendor failure fields are nor
 the terminal or its observable status retains them. Host session and turn IDs remain exact, so
 hosts must bound those identifiers too.
 
+Structured content is bounded before it is queued, and a diff's file contents share one budget of
+their own (`DIFF_MAX_CONTENT_LENGTH`) — otherwise 256 per-file ceilings multiply out to megabytes in
+a single event against that same 8 MiB. A file past the budget keeps its row and loses its bodies,
+and `truncated` says so. See [`contracts.md`](contracts.md).
+
 Exceeding a count or byte budget returns `LimitExceeded` and commits a `stream-overflow` failure.
 Already queued events remain readable, followed by that failure. The driver stops native work.
 An overflow means the transcript is incomplete; it never means execution succeeded. Hosts should
