@@ -104,10 +104,12 @@ already logged into with the vendor's own CLI.
   an open conversation. Both default to `Error::NotSupported`; session capability flags do not
   guarantee these separate services. The shipped harnesses retain those defaults. In Codex,
   listing and account usage are available through an open `Session`, not through a pre-session picker.
-- `Harness::open_session` → a `Box<dyn Session>`. A host that has just probed can hand the answer
-  back on `OpenSession::with_discovery(DiscoveryReceipt)` rather than paying for the probe twice;
-  the receipt is checked for harness identity, executable identity and freshness, and then
-  forgotten. It is not a cache and nothing in the library stores one.
+- `Harness::open_session` → a `Box<dyn Session>`. A host that has just probed can bind that result
+  to one `OpenSession` after it remeasures the executable, allowlisted child environment and every
+  account or managed-policy fact that narrowed discovery. `bind_to_open` records the full harness
+  identity, effective transport, authorised workspace and launch-relevant request fields. Opening
+  rejects missing or changed evidence, then forgets the receipt. It is not a cache and nothing in
+  the library stores one.
 - `Session::snapshot()` → a `SessionSnapshot`: the two ids, the harness identity, the transport
   selection, the lifecycle status, this session's capabilities, the configuration state, the
   configuration catalog, the slash commands, and whether the vendor resumed. It is a value, so two

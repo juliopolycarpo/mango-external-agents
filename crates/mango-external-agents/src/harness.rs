@@ -645,7 +645,7 @@ pub trait Harness: Send + Sync {
             // and reading `SystemTime::now()` here would be this crate going behind the host's
             // back for the one value it was handed a `Clock` to supply — and would put a
             // freshness test beyond the reach of `FrozenClock`.
-            receipt.verify_for(self.descriptor(), host.now(), request)?;
+            receipt.verify_for(self.descriptor(), host, request)?;
         }
         Ok(())
     }
@@ -1006,14 +1006,28 @@ mod tests {
             .build()
             .expect("expected a host");
 
+        let harness = UnboundedProbe::new();
+        let request = crate::OpenSession::new("chat-1");
         let receipt = crate::DiscoveryReceipt::new(
             crate::HarnessId::claude(),
             crate::Discovery::not_installed(),
             host.now(),
         )
+        .with_executable_fingerprint("executable-1")
+        .with_environment_fingerprint("environment-1")
+        .with_authorization_fingerprint("authorization-1")
+        .bind_to_open(
+            harness.descriptor(),
+            &host,
+            &request,
+            crate::DiscoveryReceiptMeasurements::new()
+                .with_executable_fingerprint("executable-1")
+                .with_environment_fingerprint("environment-1")
+                .with_authorization_fingerprint("authorization-1"),
+        )
+        .expect("expected matching receipt evidence")
         .valid_for(Duration::from_secs(60));
-        let request = crate::OpenSession::new("chat-1").with_discovery(receipt);
-        let harness = UnboundedProbe::new();
+        let request = request.with_discovery(receipt);
 
         harness
             .validate_open_session(&host, &request)

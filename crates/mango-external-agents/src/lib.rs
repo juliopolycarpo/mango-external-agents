@@ -39,7 +39,8 @@ pub use configuration::{
 };
 pub use content::{ActivityContent, FileChange, FileChangeKind, PlanStep, PlanStepStatus};
 pub use discovery::{
-    AuthMode, AuthState, Discovery, DiscoveryReceipt, GateVerdict, Model, ReasoningEffort,
+    AuthMode, AuthState, Discovery, DiscoveryReceipt, DiscoveryReceiptMeasurements, GateVerdict,
+    Model, ReasoningEffort,
 };
 pub use env::EnvSource;
 pub use error::{Error, ErrorCode, Result, VendorError};

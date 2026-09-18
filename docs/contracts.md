@@ -215,17 +215,23 @@ See [turn ownership and recovery](lifecycle.md) for admission, abandonment and m
 
 ## Discovery receipts are a seam, not a cache
 
-`Harness::probe` may not memoise — how fresh an answer has to be is the host's decision. A host
-that has just drawn a picker from a probe already has the answer, so `DiscoveryReceipt` lets it say
-so: it travels on the `OpenSession` that uses it, is checked for harness identity, executable
-identity and freshness, and is then forgotten. Nothing in this library stores one or looks one up,
-and there is no process-global cache.
+`Harness::probe` may not memoise. The host decides freshness. A host that has just filled a picker
+from discovery can pass a `DiscoveryReceipt` on the `OpenSession` that uses it, then the library
+forgets it. Nothing in the library stores one or looks one up, and there is no process-global
+cache.
 
-The executable and environment fingerprints are opaque and host-computed, and `verify_for`
-deliberately does **not** check them: measuring what the executable looks like *now* is something
-only the host can do. A host that wants the check measures again at open time and calls
-`DiscoveryReceipt::describes`, which compares the two for equality and never interprets either — so
-a host that hashes the binary, reads its mtime or records a package version all work.
+Before attaching the receipt, the host calls `bind_to_open` with fresh opaque measurements of the
+resolved executable, the actual allowlisted child environment, and every account or managed-policy
+fact that narrowed discovery. A recorded fingerprint without a fresh measurement is a refusal. The
+binding also records the full harness identity, selected effective transport, authorised workspace,
+and configuration, resume and MCP request fields. Opening compares all of them. A changed account
+or policy fingerprint therefore cannot make cached permission cells wider than the current host
+authorization.
+
+The library only compares fingerprints. It does not hash a binary, read an environment value or
+interpret an account policy. A host can use a binary hash, file metadata or a package version for
+the executable fingerprint. Receipt bindings and measurements do not implement serialization, and
+their debug output and errors report only whether evidence was present or changed.
 
 A receipt for a resolved executable also refuses a request that names none. The launcher would
 resolve the program name off `PATH`, which may answer with a different file, and a receipt that
