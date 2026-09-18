@@ -78,6 +78,10 @@ claude --print
   the stream arrives in whole messages and nothing renders until each block is complete.
 - **The prompt is never in argv.** It is written as one `{"type":"user",…}` message on stdin, which
   is then closed. argv is world-readable in `ps` on every platform this runs on.
+- **Prompt input is bounded.** The write and stdin close share `Limits::request_timeout`. A dropped
+  stream, host shutdown, `Session::cancel` or `Session::close` stops the child through the turn's
+  one teardown owner instead of waiting for a blocked host sink. This follows Claude's documented
+  stream-json stdin input and EOF-driven prompt boundary ([headless.md](https://code.claude.com/docs/en/headless.md)).
 - **Omitted permissions preserve the user's CLI profile.** No permission mode or prompt override
   is passed until the host selects permissions. Claude's single mode flag requires both axes on
   the first selection; subsequent partial updates inherit the other axis. Accepted settings persist
@@ -159,8 +163,10 @@ id, and each turn spawns, streams and reaps its own child.
 host supplies the OS-specific interrupt and containment policy. If the child does not exit during
 the host-configured grace period, the launcher escalates to process-tree termination and reaps it.
 The turn pump writes `Cancelled { reason }` followed by `Completed`; an unread transcript cannot
-block that control-plane cleanup. Exit 143 is read as a clean stop rather than a failure: putting
-an error in the transcript for something the user asked for is worse than saying nothing.
+block that control-plane cleanup. A cancel, close, host shutdown, dropped stream and native
+completion all join the same per-turn teardown. Exit 143 is read as a clean stop rather than a
+failure: putting an error in the transcript for something the user asked for is worse than saying
+nothing.
 
 Close waits for a pending launch and for native cleanup before reporting success. If native cleanup
 fails, it returns the error, keeps the session `Closing`, and preserves the MCP artifact in the

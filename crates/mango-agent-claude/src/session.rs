@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use mango_external_agents::process::stop_process_with_limits;
 use mango_external_agents::{
-    CancelReason, CloseReason, Configuration, ConfigurationState, Dispatch, Error, ErrorCode,
-    EventKind, EventSink, ExecutablePath, HostContext, PermissionResponse, Result,
+    CancelReason, CancelToken, CloseReason, Configuration, ConfigurationState, Dispatch, Error,
+    ErrorCode, EventKind, EventSink, ExecutablePath, HostContext, PermissionResponse, Result,
     SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec, StopOutcome,
     TurnRequest, TurnStream, VendorError, event, transports::stdio,
 };
@@ -54,6 +54,8 @@ type TurnEnd = OnceLock<CancelReason>;
 /// reason, even though there is nothing yet to kill.
 struct ActiveTurn {
     end: Arc<TurnEnd>,
+    /// Wakes a pump blocked on vendor input after a session-level stop records its reason.
+    stop: CancelToken,
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
     /// Set only after native work has been reaped. A stopping owner stays admitted until the
     /// pump commits its terminal outcome (or its receiver is abandoned).
@@ -68,14 +70,16 @@ struct Teardown {
     result: Mutex<Option<std::result::Result<(), Arc<Error>>>>,
     done: tokio::sync::Notify,
     worker_started: AtomicBool,
+    taint_continuation: bool,
 }
 
 impl Teardown {
-    fn new() -> Self {
+    fn new(taint_continuation: bool) -> Self {
         Self {
             result: Mutex::new(None),
             done: tokio::sync::Notify::new(),
             worker_started: AtomicBool::new(false),
+            taint_continuation,
         }
     }
 
@@ -180,6 +184,16 @@ fn copy_error(error: &Error) -> Error {
 struct TakenTurn {
     end: Arc<TurnEnd>,
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+}
+
+/// The one outcome of atomically claiming a stop under the attempt owner lock.
+enum StopClaim {
+    PendingStart,
+    New {
+        teardown: Arc<Teardown>,
+        taken: TakenTurn,
+    },
+    Existing(Option<Arc<Teardown>>),
 }
 
 /// The synchronous part of a close transition, before its durable worker starts.
@@ -317,16 +331,73 @@ impl ClaudeSession {
     /// `Session` method that held this lock across an await would deadlock the moment the turn
     /// channel filled, which is exactly when a host is least able to do anything about it.
     async fn stop_active_turn(&self, reason: CancelReason) -> Result<()> {
-        let taken = request_stop(&mut self.shared.lock(), reason);
-        let Some(taken) = taken else {
-            return wait_existing_teardown(&self.shared).await;
-        };
+        let claim = claim_stop(&mut self.shared.lock(), None, reason);
+        await_stop_claim(&self.shared, claim, reason, false).await
+    }
+}
+
+/// Records a stop reason and installs its shared teardown without a second caller seeing a gap.
+fn claim_stop(
+    state: &mut Mutable,
+    expected_end: Option<&Arc<TurnEnd>>,
+    reason: CancelReason,
+) -> StopClaim {
+    if !state.active.as_ref().is_some_and(|active| {
+        expected_end.is_none_or(|expected| Arc::ptr_eq(&active.end, expected))
+    }) {
+        return StopClaim::Existing(None);
+    }
+    let existing_teardown = state
+        .active
+        .as_ref()
+        .and_then(|active| active.teardown.as_ref())
+        .cloned();
+    let Some(taken) = request_stop(state, reason) else {
+        return StopClaim::Existing(
+            state
+                .active
+                .as_ref()
+                .and_then(|active| active.teardown.as_ref())
+                .cloned(),
+        );
+    };
+    if taken.control.is_none() {
         // A reservation with no control has no native process yet. Its start guard owns the child
         // if one arrives; claiming it stopped here would free or taint the wrong lifecycle.
-        if taken.control.is_none() {
-            return Ok(());
+        state
+            .active
+            .as_mut()
+            .filter(|active| Arc::ptr_eq(&active.end, &taken.end))
+            .map(|active| turn_teardown(active, true))
+            .expect("expected the pending stop claim to retain its active Claude turn");
+        return StopClaim::PendingStart;
+    }
+    if let Some(teardown) = existing_teardown {
+        return StopClaim::Existing(Some(teardown));
+    }
+    let teardown = state
+        .active
+        .as_mut()
+        .filter(|active| Arc::ptr_eq(&active.end, &taken.end))
+        .map(|active| turn_teardown(active, true))
+        .expect("expected the stop claim to retain its active Claude turn");
+    StopClaim::New { teardown, taken }
+}
+
+/// Starts the owner selected by [`claim_stop`] and waits for its retained outcome.
+async fn await_stop_claim(
+    shared: &Arc<Shared>,
+    claim: StopClaim,
+    reason: CancelReason,
+    settled: bool,
+) -> Result<()> {
+    match claim {
+        StopClaim::PendingStart | StopClaim::Existing(None) => Ok(()),
+        StopClaim::Existing(Some(teardown)) => teardown.wait().await,
+        StopClaim::New { teardown, taken } => {
+            start_teardown(shared, &teardown, taken, reason, settled);
+            teardown.wait().await
         }
-        await_durable_stop(Arc::clone(&self.shared), taken, reason, false).await
     }
 }
 
@@ -343,49 +414,52 @@ async fn await_durable_stop(
     // clears the owner, all without this caller's reason ever reaching the `OnceLock` first. A turn
     // already reaped and settled has no native work left to bound and no outcome to publish, which
     // is the state the caller asked for.
-    let Some(teardown) = install_teardown(&shared, &taken.end) else {
+    let Some(teardown) = install_teardown(&shared, &taken.end, true) else {
         return Ok(());
     };
+    let end = Arc::clone(&taken.end);
     start_teardown(&shared, &teardown, taken, reason, settled);
-    teardown.wait().await
+    let outcome = teardown.wait().await;
+    // This path runs before a `TurnStream` exists. The worker that first claimed the child can
+    // have been a concurrent `cancel` and therefore recorded `settled: false`; the abandoned
+    // start is still responsible for releasing that no-stream owner after it observes the
+    // retained result. A failed reap keeps `stopped` false, so `settle_owner` records no false
+    // completion and leaves admission closed for the live child.
+    if settled {
+        settle_owner(&shared, &end);
+    }
+    outcome
 }
 
 /// Names the one teardown a turn publishes, or nothing when its slot is already gone.
-fn install_teardown(shared: &Shared, end: &TurnEnd) -> Option<Arc<Teardown>> {
-    install_teardown_locked(&mut shared.lock(), end)
+fn install_teardown(
+    shared: &Shared,
+    end: &TurnEnd,
+    taint_continuation: bool,
+) -> Option<Arc<Teardown>> {
+    install_teardown_locked(&mut shared.lock(), end, taint_continuation)
 }
 
-fn install_teardown_locked(state: &mut Mutable, end: &TurnEnd) -> Option<Arc<Teardown>> {
+fn install_teardown_locked(
+    state: &mut Mutable,
+    end: &TurnEnd,
+    taint_continuation: bool,
+) -> Option<Arc<Teardown>> {
     let active = state
         .active
         .as_mut()
         .filter(|a| std::ptr::eq(a.end.as_ref(), end))?;
-    Some(turn_teardown(active))
+    Some(turn_teardown(active, taint_continuation))
 }
 
 /// The teardown an active turn publishes, created on the first caller that asks for it.
-fn turn_teardown(active: &mut ActiveTurn) -> Arc<Teardown> {
+fn turn_teardown(active: &mut ActiveTurn, taint_continuation: bool) -> Arc<Teardown> {
     Arc::clone(
         active
             .teardown
-            .get_or_insert_with(|| Arc::new(Teardown::new())),
+            .get_or_insert_with(|| Arc::new(Teardown::new(taint_continuation))),
     )
 }
-async fn wait_existing_teardown(shared: &Shared) -> Result<()> {
-    let teardown = {
-        let state = shared.lock();
-        state
-            .active
-            .as_ref()
-            .and_then(|a| a.teardown.as_ref())
-            .cloned()
-    };
-    match teardown {
-        Some(t) => t.wait().await,
-        None => Ok(()),
-    }
-}
-
 /// Detaches a stop before a caller reaches its first await. One owner can start the native work;
 /// every other caller waits on its retained outcome.
 fn start_teardown(
@@ -407,6 +481,7 @@ fn start_teardown(
             taken,
             reason,
             settled,
+            teardown_for_worker.taint_continuation,
         )
         .await;
     });
@@ -419,49 +494,19 @@ async fn run_teardown(
     taken: TakenTurn,
     reason: CancelReason,
     settled: bool,
+    taint_continuation: bool,
 ) {
     let outcome = end_turn(taken.control, reason, shared.host.limits()).await;
     if let Ok(outcome) = outcome {
         record_stop(
             shared,
             &taken.end,
-            !matches!(outcome, Some(StopOutcome::Interrupted)),
+            taint_continuation && !matches!(outcome, Some(StopOutcome::Interrupted)),
             reason,
             settled,
         );
     }
     teardown.finish(outcome.map(drop));
-}
-
-/// Starts an already-installed close teardown when a start that was pending at close finally
-/// receives its child. The worker survives the start caller that happens to observe it.
-fn start_late_teardown(
-    shared: &Arc<Shared>,
-    end: &Arc<TurnEnd>,
-    control: Arc<dyn mango_external_agents::ProcessControl>,
-    reason: CancelReason,
-    settled: bool,
-) -> Option<Arc<Teardown>> {
-    let teardown = {
-        let state = shared.lock();
-        state
-            .active
-            .as_ref()
-            .filter(|active| Arc::ptr_eq(&active.end, end))
-            .and_then(|active| active.teardown.as_ref())
-            .cloned()
-    }?;
-    start_teardown(
-        shared,
-        &teardown,
-        TakenTurn {
-            end: Arc::clone(end),
-            control: Some(control),
-        },
-        reason,
-        settled,
-    );
-    Some(teardown)
 }
 
 /// Releases a close waiting on a launcher that failed before it returned a child. No native work
@@ -517,14 +562,37 @@ impl Drop for ClaudeSession {
     /// leave a running child alive precisely when no host session can cancel it. The synchronous
     /// claim ensures a pump that is already completing cannot be stopped twice.
     fn drop(&mut self) {
-        let taken = {
+        let claim = {
             let mut state = self.shared.lock();
-            request_stop(&mut state, CancelReason::Shutdown).or_else(|| active_turn(&state))
+            let Some(taken) = request_stop(&mut state, CancelReason::Shutdown) else {
+                return;
+            };
+            // Publish the same retained teardown while the stop reason is claimed. A pending
+            // launch has no child to stop yet; its `AbandonedStart` owner starts this teardown
+            // once the launcher returns, while any later cancellation waits on it.
+            let Some(teardown) = state
+                .active
+                .as_mut()
+                .filter(|active| Arc::ptr_eq(&active.end, &taken.end))
+                .map(|active| turn_teardown(active, true))
+            else {
+                return;
+            };
+            if taken.control.is_none() {
+                return;
+            }
+            Some((teardown, taken))
         };
-        let Some(taken) = taken else {
+        let Some((teardown, taken)) = claim else {
             return;
         };
-        spawn_teardown(&self.shared, taken, CancelReason::Shutdown);
+        start_teardown(
+            &self.shared,
+            &teardown,
+            taken,
+            CancelReason::Shutdown,
+            false,
+        );
     }
 }
 
@@ -539,15 +607,17 @@ fn request_stop(state: &mut Mutable, reason: CancelReason) -> Option<TakenTurn> 
     if active.end.set(reason).is_err() {
         return None;
     }
+    active.stop.cancel();
     Some(TakenTurn {
         end: Arc::clone(&active.end),
         control: active.control.as_ref().map(Arc::clone),
     })
 }
 
-/// Clones the stopping owner so a close or final drop can finish cleanup begun by a caller that
-/// abandoned its cancellation future. `stop_process_with_limits` is idempotent at the process
-/// boundary; this never clears ownership itself.
+/// Clones the stopping owner so close can attach to the teardown a caller already claimed.
+///
+/// The shared [`Teardown`] is the one process-stop owner. This helper only supplies the control
+/// it needs; it never grants a second caller permission to ask the launcher again.
 fn active_turn(state: &Mutable) -> Option<TakenTurn> {
     let active = state.active.as_ref()?;
     Some(TakenTurn {
@@ -560,11 +630,10 @@ fn active_turn(state: &Mutable) -> Option<TakenTurn> {
 ///
 /// The awaits between installing a child and returning its stream are the problem this exists
 /// for. A caller that times out or drops `start_turn` at one of them leaves a started child that
-/// nothing else is watching: no pump has been spawned to reap it, this crate implements no `Drop`
-/// for a session, and a [`ProcessControl`](mango_external_agents::ProcessControl) that is merely
-/// dropped is not killed — the launcher sets no kill-on-drop. Without this the process would
-/// outlive the host's interest in it until an explicit `close`, `cancel` or next `start_turn`, and
-/// a host that simply drops the session issues none of the three.
+/// no pump owns yet. A [`ProcessControl`](mango_external_agents::ProcessControl) that is merely
+/// dropped is not killed — the launcher sets no kill-on-drop — so this guard joins the session's
+/// shared teardown or starts it itself. Session drop records the same teardown, and a late child
+/// becomes the guard's owned input to that one cleanup worker.
 ///
 /// Disarmed once the pump owns the child, which is the moment something else is responsible for it.
 struct AbandonedStart {
@@ -610,24 +679,43 @@ impl Drop for AbandonedStart {
         let spawn = self.spawn.take();
         let owned_control = self.control.take();
         let taken = {
-            let state = self.shared.lock();
-            let active = state
+            let mut state = self.shared.lock();
+            if !state
                 .active
                 .as_ref()
-                .filter(|active| Arc::ptr_eq(&active.end, &self.end));
-            active.and_then(|active| {
-                let reason = active.end.get().copied().unwrap_or(CancelReason::Requested);
-                let newly_stopped = active.end.set(reason).is_ok();
-                // A pending launcher task is always this guard's responsibility, even when
-                // `cancel` or `close` already recorded the reason while it was spawning. Once
-                // the launcher handed us a child, an existing stop owns that process and must
-                // not receive a second signal from this drop path.
-                (spawn.is_some() || owned_control.is_some() && !active.stopped || newly_stopped)
-                    .then(|| TakenTurn {
+                .is_some_and(|active| Arc::ptr_eq(&active.end, &self.end))
+            {
+                return;
+            }
+            let reason = state
+                .active
+                .as_ref()
+                .and_then(|active| active.end.get().copied())
+                .unwrap_or(CancelReason::Requested);
+            let newly_stopped = request_stop(&mut state, reason).is_some();
+            state
+                .active
+                .as_mut()
+                .filter(|active| Arc::ptr_eq(&active.end, &self.end))
+                .and_then(|active| {
+                    // A pending launcher task is always this guard's responsibility, even when
+                    // `cancel` or `close` already recorded the reason while it was spawning.
+                    // Once the launcher handed us a child, an existing stop owns that process and
+                    // must not receive a second signal from this drop path.
+                    if !(spawn.is_some()
+                        || owned_control.is_some() && !active.stopped
+                        || newly_stopped)
+                    {
+                        return None;
+                    }
+                    // This owner may not have a child yet, but a later cancel must wait on the
+                    // same teardown once that child arrives.
+                    turn_teardown(active, true);
+                    Some(TakenTurn {
                         end: Arc::clone(&active.end),
                         control: active.control.as_ref().map(Arc::clone),
                     })
-            })
+                })
         };
         let Some(taken) = taken else {
             return;
@@ -645,26 +733,22 @@ impl Drop for AbandonedStart {
             };
             let Some(control) = control else {
                 finish_unstarted_teardown(&shared, &taken.end);
+                forget_reservation(&shared, &taken.end);
                 crate::mcp::release_off_worker(lease).await;
                 return;
             };
-            if start_late_teardown(&shared, &taken.end, Arc::clone(&control), reason, true)
-                .is_some()
-            {
-                crate::mcp::release_off_worker(lease).await;
-                return;
-            }
-            let outcome = end_turn(Some(control), reason, shared.host.limits()).await;
+            let outcome = await_durable_stop(
+                Arc::clone(&shared),
+                TakenTurn {
+                    end: Arc::clone(&taken.end),
+                    control: Some(control),
+                },
+                reason,
+                true,
+            )
+            .await;
             crate::mcp::release_off_worker(lease).await;
-            if let Ok(outcome) = outcome {
-                record_stop(
-                    &shared,
-                    &taken.end,
-                    !matches!(outcome, Some(StopOutcome::Interrupted)),
-                    reason,
-                    true,
-                );
-            }
+            let _ = outcome;
         });
     }
 }
@@ -738,30 +822,6 @@ fn settle_owner_locked(state: &mut Mutable, end: &Arc<TurnEnd>) {
         })
     {
         state.active = None;
-    }
-}
-
-/// Schedules a stop from a synchronous ownership-release path.
-fn spawn_teardown(shared: &Arc<Shared>, taken: TakenTurn, reason: CancelReason) {
-    let limits = *shared.host.limits();
-    if let Some(runtime) = shared
-        .runtime
-        .as_ref()
-        .cloned()
-        .or_else(|| tokio::runtime::Handle::try_current().ok())
-    {
-        let shared = Arc::clone(shared);
-        runtime.spawn(async move {
-            if let Ok(outcome) = end_turn(taken.control, reason, &limits).await {
-                record_stop(
-                    &shared,
-                    &taken.end,
-                    !matches!(outcome, Some(StopOutcome::Interrupted)),
-                    reason,
-                    false,
-                );
-            }
-        });
     }
 }
 
@@ -849,6 +909,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // nevertheless reserved before spawning, so a stop landing while `stdio::open` is
         // pending has a reason to record against rather than an empty window to race through.
         let end = Arc::new(TurnEnd::default());
+        let stop = CancelToken::new();
         let mut mcp_lease = {
             let Some(_lifecycle) = self.shared.lifecycle.begin_start() else {
                 return Err(
@@ -870,6 +931,7 @@ impl mango_external_agents::Session for ClaudeSession {
             }
             state.active = Some(ActiveTurn {
                 end: Arc::clone(&end),
+                stop: stop.clone(),
                 control: None,
                 stopped: false,
                 settled: false,
@@ -1001,6 +1063,7 @@ impl mango_external_agents::Session for ClaudeSession {
             {
                 state.active = Some(ActiveTurn {
                     end: Arc::clone(&end),
+                    stop: stop.clone(),
                     control: Some(Arc::clone(&control)),
                     stopped: false,
                     settled: false,
@@ -1012,41 +1075,23 @@ impl mango_external_agents::Session for ClaudeSession {
             }
         };
         if let Some(reason) = stopped {
-            if let Some(teardown) =
-                start_late_teardown(&self.shared, &end, Arc::clone(&control), reason, true)
-            {
-                // The close worker owns the session lease until this detached native stop reports
-                // success. These start-local clones can leave now without exposing the file to a
-                // child that is still in the stop gate.
-                crate::mcp::release_off_worker(mcp_lease.take()).await;
-                crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
-                teardown
-                    .wait()
-                    .await
-                    .map_err(|error| error.with_dispatch(Dispatch::Accepted))?;
-                abandoned.disarm();
-                return Err((if self.shared.lifecycle.is_closed() {
-                    Error::Closed { subject: "session" }
-                } else {
-                    Error::Cancelled { reason }
-                })
-                .with_dispatch(Dispatch::Accepted));
-            }
-            let outcome =
-                stop_process_with_limits(control.as_ref(), reason, self.shared.host.limits()).await;
+            let outcome = await_durable_stop(
+                Arc::clone(&self.shared),
+                TakenTurn {
+                    end: Arc::clone(&end),
+                    control: Some(Arc::clone(&control)),
+                },
+                reason,
+                true,
+            )
+            .await;
             // After the kill, never before: the child read `--mcp-config` at startup. And off the
             // worker, because a close that won the race left this lease holding the last
             // reference, so this is where the `remove_dir_all` happens.
             crate::mcp::release_off_worker(mcp_lease.take()).await;
             crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
-            let outcome = outcome.map_err(|error| error.with_dispatch(Dispatch::Accepted))?;
-            record_stop(
-                &self.shared,
-                &end,
-                matches!(outcome, StopOutcome::Terminated),
-                reason,
-                true,
-            );
+            outcome.map_err(|error| error.with_dispatch(Dispatch::Accepted))?;
+            abandoned.disarm();
             return Err((if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
@@ -1148,15 +1193,12 @@ impl mango_external_agents::Session for ClaudeSession {
             // id too strange for `EventKind::normalized` to keep — an id `TurnId::new` never
             // validates — must not plant a live process nobody holds a handle to. Reaped the same
             // way a stop landing in this window is.
-            let stopped = stop_process_with_limits(
-                control.as_ref(),
-                CancelReason::Requested,
-                self.shared.host.limits(),
-            )
-            .await;
-            if stopped.is_ok() {
-                record_stop(&self.shared, &end, true, CancelReason::Requested, true);
-            }
+            let claim = claim_stop(&mut self.shared.lock(), Some(&end), CancelReason::Requested);
+            let _ = await_stop_claim(&self.shared, claim, CancelReason::Requested, true).await;
+            // A concurrent cancellation may have started the retained worker with
+            // `settled: false`. This start failed before a stream existed, so it must finish the
+            // no-stream side of the ownership transition after that worker completes.
+            settle_owner(&self.shared, &end);
             abandoned.disarm();
             return Err(error.with_dispatch(Dispatch::Accepted));
         }
@@ -1168,6 +1210,7 @@ impl mango_external_agents::Session for ClaudeSession {
             control,
             sink,
             end,
+            stop,
             request.input,
         ));
 
@@ -1206,8 +1249,11 @@ impl mango_external_agents::Session for ClaudeSession {
                 let mut state = self.shared.lock();
                 let taken = request_stop(&mut state, CancelReason::from(reason))
                     .or_else(|| active_turn(&state));
-                let active = state.active.as_mut().map(turn_teardown);
-                let close = Arc::new(Teardown::new());
+                let active = state
+                    .active
+                    .as_mut()
+                    .map(|active| turn_teardown(active, true));
+                let close = Arc::new(Teardown::new(true));
                 state.close_teardown = Some(Arc::clone(&close));
                 CloseClaim::New {
                     close,
@@ -1260,6 +1306,94 @@ impl Shared {
     }
 }
 
+/// Claims this pump's active attempt and waits for the one durable native stop it publishes.
+async fn stop_pump(shared: &Arc<Shared>, end: &Arc<TurnEnd>, reason: CancelReason, settled: bool) {
+    let claim = claim_stop(&mut shared.lock(), Some(end), reason);
+    let _ = await_stop_claim(shared, claim, reason, settled).await;
+}
+
+/// Publishes the native-result cleanup before exposing its terminal event to a racing cancellation.
+fn start_terminal_teardown(
+    shared: &Arc<Shared>,
+    end: &Arc<TurnEnd>,
+    control: &Arc<dyn mango_external_agents::ProcessControl>,
+    native_finished: bool,
+) -> Option<Arc<Teardown>> {
+    let reason = end.get().copied().unwrap_or(CancelReason::Shutdown);
+    let taken = TakenTurn {
+        end: Arc::clone(end),
+        control: Some(Arc::clone(control)),
+    };
+    let teardown = install_teardown(shared, end, !native_finished)?;
+    start_teardown(shared, &teardown, taken, reason, false);
+    Some(teardown)
+}
+
+/// Reaps a turn that reached its terminal transition without an earlier stop owner.
+async fn reap_terminal_turn(
+    shared: &Arc<Shared>,
+    end: &Arc<TurnEnd>,
+    control: &Arc<dyn mango_external_agents::ProcessControl>,
+    native_finished: bool,
+) {
+    let Some(teardown) = start_terminal_teardown(shared, end, control, native_finished) else {
+        return;
+    };
+    let _ = teardown.wait().await;
+}
+
+enum PromptIo {
+    Complete(Result<()>),
+    StreamClosed,
+    HostCancelled,
+    TurnStopped,
+}
+
+async fn await_prompt_io<F>(
+    operation: F,
+    operation_name: &'static str,
+    sink: &EventSink,
+    host_cancel: &CancelToken,
+    turn_stop: &CancelToken,
+    timeout: Duration,
+) -> PromptIo
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::select! {
+        biased;
+        () = sink.closed() => PromptIo::StreamClosed,
+        () = host_cancel.cancelled() => PromptIo::HostCancelled,
+        () = turn_stop.cancelled() => PromptIo::TurnStopped,
+        outcome = tokio::time::timeout(timeout, operation) => {
+            PromptIo::Complete(match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => Err(Error::Timeout {
+                    operation: String::from(operation_name),
+                    after: timeout,
+                }),
+            })
+        }
+    }
+}
+
+/// Commits the prompt outcome and marks its stream settled after prompt I/O stops.
+///
+/// A cancellation terminal can precede native reaping; the active owner remains admitted until
+/// the shared teardown records that its child stopped.
+async fn finish_prompt_io(
+    shared: &Arc<Shared>,
+    reducer: &mut TurnReducer,
+    sink: &EventSink,
+    end: &Arc<TurnEnd>,
+    control: &Arc<dyn mango_external_agents::ProcessControl>,
+    failure: Option<Error>,
+    exit_grace: Duration,
+) {
+    finish(shared, reducer, sink, end, control, failure, exit_grace).await;
+    settle_owner(shared, end);
+}
+
 /// One turn, from the prompt to the terminal event.
 ///
 /// The only thing in this harness that emits.
@@ -1269,6 +1403,7 @@ async fn pump(
     control: Arc<dyn mango_external_agents::ProcessControl>,
     sink: EventSink,
     end: Arc<TurnEnd>,
+    stop: CancelToken,
     input: String,
 ) {
     let mut reducer = TurnReducer::new();
@@ -1280,60 +1415,87 @@ async fn pump(
     let idle_timeout = crate::pinned::stream_idle_timeout(shared.host.limits());
     let (mut sender, mut receiver) = link.split();
 
+    let cancel_token = shared.host.cancel().clone();
     // One message, then end of input. A second message would run as its own turn with its own
     // result, which is a queued follow-up rather than steering — see `Capabilities::steering`.
     // Ending the input is also what the vendor documents as cancelling a pending prompt, so a run
-    // that would have waited for an answer nobody can give stops waiting.
-    let written = sender.send(prompt_line(&input)).await;
-    let closed = sender.close().await;
-    if let Err(error) = written.and(closed) {
-        finish(
-            &shared,
-            &mut reducer,
-            &sink,
-            &end,
-            &control,
-            Some(error),
-            exit_grace,
-        )
-        .await;
-        settle_owner(&shared, &end);
-        return;
+    // that would have waited for an answer nobody can give stops waiting. A host-provided sink can
+    // still stall either operation, so the pair shares one host request deadline and the three
+    // cancellation paths that own this attempt.
+    let prompt = await_prompt_io(
+        async {
+            sender.send(prompt_line(&input)).await?;
+            sender.close().await
+        },
+        "Claude prompt input",
+        &sink,
+        &cancel_token,
+        &stop,
+        shared.host.limits().request_timeout,
+    )
+    .await;
+    match prompt {
+        PromptIo::Complete(Ok(())) => {}
+        PromptIo::Complete(Err(error)) => {
+            finish_prompt_io(
+                &shared,
+                &mut reducer,
+                &sink,
+                &end,
+                &control,
+                Some(error),
+                exit_grace,
+            )
+            .await;
+            return;
+        }
+        PromptIo::StreamClosed => {
+            stop_pump(&shared, &end, CancelReason::Requested, true).await;
+            settle_owner(&shared, &end);
+            return;
+        }
+        PromptIo::HostCancelled => {
+            stop_pump(&shared, &end, CancelReason::Shutdown, false).await;
+            finish_prompt_io(
+                &shared,
+                &mut reducer,
+                &sink,
+                &end,
+                &control,
+                None,
+                exit_grace,
+            )
+            .await;
+            return;
+        }
+        PromptIo::TurnStopped => {
+            finish_prompt_io(
+                &shared,
+                &mut reducer,
+                &sink,
+                &end,
+                &control,
+                None,
+                exit_grace,
+            )
+            .await;
+            return;
+        }
     }
 
-    let cancel_token = shared.host.cancel().clone();
     let mut failure = None;
     loop {
         let line = tokio::select! {
             () = sink.closed() => {
-                if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Requested)
-                    && let Ok(outcome) = end_turn(taken.control, CancelReason::Requested, shared.host.limits()).await
-                {
-                    record_stop(
-                        &shared,
-                        &taken.end,
-                        !matches!(outcome, Some(StopOutcome::Interrupted)),
-                        CancelReason::Requested,
-                        true,
-                    );
-                }
+                stop_pump(&shared, &end, CancelReason::Requested, true).await;
                 settle_owner(&shared, &end);
                 return;
             }
             () = cancel_token.cancelled() => {
-                if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Shutdown)
-                    && let Ok(outcome) = end_turn(taken.control, CancelReason::Shutdown, shared.host.limits()).await
-                {
-                    record_stop(
-                        &shared,
-                        &taken.end,
-                        !matches!(outcome, Some(StopOutcome::Interrupted)),
-                        CancelReason::Shutdown,
-                        false,
-                    );
-                }
+                stop_pump(&shared, &end, CancelReason::Shutdown, false).await;
                 break;
             }
+            () = stop.cancelled() => break,
             received = tokio::time::timeout(idle_timeout, receiver.recv()) => received,
         };
         let line = match line {
@@ -1359,25 +1521,20 @@ async fn pump(
         if let Some(init) = reduction.init {
             apply_init(&shared, &end, init);
         }
+        let native_finished = reducer.finished();
+        if native_finished {
+            // `sink.emit` awaits, so a cancellation can claim the owner while this result event
+            // is crossing the host boundary. Publishing the native finish first makes the shared
+            // teardown retain its resumable continuation policy; the later cancellation joins it.
+            let _ = start_terminal_teardown(&shared, &end, &control, true);
+        }
         for event in reduction.events {
             match sink.emit(event).await {
                 Ok(()) => {}
                 // The host dropped the stream. There is nobody to tell, and a turn nobody is
                 // reading is a turn to stop feeding.
                 Err(Error::Closed { .. }) => {
-                    if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Requested)
-                        && let Ok(outcome) =
-                            end_turn(taken.control, CancelReason::Requested, shared.host.limits())
-                                .await
-                    {
-                        record_stop(
-                            &shared,
-                            &taken.end,
-                            !matches!(outcome, Some(StopOutcome::Interrupted)),
-                            CancelReason::Requested,
-                            true,
-                        );
-                    }
+                    stop_pump(&shared, &end, CancelReason::Requested, true).await;
                     settle_owner(&shared, &end);
                     return;
                 }
@@ -1385,26 +1542,14 @@ async fn pump(
                 // No later vendor frame may follow that terminal, and a process whose output the
                 // stream rejected must not keep working for an absent consumer.
                 Err(_) if sink.is_terminal() => {
-                    if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Requested)
-                        && let Ok(outcome) =
-                            end_turn(taken.control, CancelReason::Requested, shared.host.limits())
-                                .await
-                    {
-                        record_stop(
-                            &shared,
-                            &taken.end,
-                            !matches!(outcome, Some(StopOutcome::Interrupted)),
-                            CancelReason::Requested,
-                            true,
-                        );
-                    }
+                    stop_pump(&shared, &end, CancelReason::Requested, true).await;
                     settle_owner(&shared, &end);
                     return;
                 }
                 Err(_) => {}
             }
         }
-        if reducer.finished() {
+        if native_finished {
             break;
         }
     }
@@ -1424,10 +1569,10 @@ async fn pump(
 
 /// Writes the turn's terminal event, whichever way it ended, and reaps the child.
 async fn finish(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     reducer: &mut TurnReducer,
     sink: &EventSink,
-    end: &TurnEnd,
+    end: &Arc<TurnEnd>,
     control: &Arc<dyn mango_external_agents::ProcessControl>,
     failure: Option<Error>,
     exit_grace: Duration,
@@ -1471,18 +1616,8 @@ async fn finish(
     // and a launcher that refuses the second ask reports a failed teardown to the caller whose stop
     // actually succeeded. A native result or a broken stream has no such owner, and those are the
     // only two shapes that still need the post-terminal process-tree reap here.
-    if end.get().is_none()
-        && stop_process_with_limits(
-            control.as_ref(),
-            CancelReason::Shutdown,
-            shared.host.limits(),
-        )
-        .await
-        .is_ok()
-    {
-        // A terminal without Claude's own `result` leaves the native conversation at an
-        // unknown point. Do not resume it merely because the harness contained the process.
-        record_stop(shared, end, !native_finished, CancelReason::Shutdown, false);
+    if end.get().is_none() {
+        reap_terminal_turn(shared, end, control, native_finished).await;
     }
 }
 
@@ -1496,23 +1631,6 @@ fn forget_reservation(shared: &Shared, end: &Arc<TurnEnd>) {
     {
         state.active = None;
     }
-}
-
-/// Takes this exact attempt for teardown, leaving a newer attempt untouched.
-fn take_matching_turn(
-    shared: &Shared,
-    end: &Arc<TurnEnd>,
-    reason: CancelReason,
-) -> Option<TakenTurn> {
-    let mut state = shared.lock();
-    if !state
-        .active
-        .as_ref()
-        .is_some_and(|active| Arc::ptr_eq(&active.end, end))
-    {
-        return None;
-    }
-    request_stop(&mut state, reason)
 }
 
 /// Folds a run's `system/init` back into the session.
@@ -1622,10 +1740,10 @@ fn no_result_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveTurn, Mutable, TurnEnd, install_teardown_locked, no_result_error, prompt_line,
-        record_stop_locked, request_stop, settle_owner_locked,
+        ActiveTurn, Mutable, StopClaim, TurnEnd, claim_stop, install_teardown_locked,
+        no_result_error, prompt_line, record_stop_locked, request_stop, settle_owner_locked,
     };
-    use mango_external_agents::{CancelReason, ExitStatus};
+    use mango_external_agents::{CancelReason, CancelToken, ExitStatus};
     use std::sync::Arc;
 
     /// `cancel` takes the turn under one guard and names its teardown under the next, and the pump
@@ -1639,6 +1757,7 @@ mod tests {
         let mut state = Mutable::default();
         state.active = Some(ActiveTurn {
             end: Arc::clone(&end),
+            stop: CancelToken::new(),
             control: None,
             stopped: false,
             settled: false,
@@ -1658,8 +1777,41 @@ mod tests {
         );
 
         assert!(
-            install_teardown_locked(&mut state, &taken.end).is_none(),
+            install_teardown_locked(&mut state, &taken.end, true).is_none(),
             "expected a settled slot to report no teardown owner, received an installed teardown"
+        );
+    }
+
+    /// Once another task can observe a stop reason, it must also be able to wait for the teardown
+    /// that will own a child returned after this pending spawn. Publishing the reason first and
+    /// the teardown later lets a concurrent second cancellation return while that child is live.
+    #[test]
+    fn claiming_a_pending_stop_publishes_its_teardown_with_the_reason() {
+        let end = Arc::new(TurnEnd::new());
+        let mut state = Mutable::default();
+        state.active = Some(ActiveTurn {
+            end: Arc::clone(&end),
+            stop: CancelToken::new(),
+            control: None,
+            stopped: false,
+            settled: false,
+            teardown: None,
+        });
+
+        let claim = claim_stop(&mut state, None, CancelReason::Requested);
+
+        assert!(
+            matches!(claim, StopClaim::PendingStart),
+            "expected a pending spawn stop claim, received a child-owning claim"
+        );
+        let active = state
+            .active
+            .as_ref()
+            .expect("expected the pending reservation to remain until its launcher resolves");
+        assert_eq!(active.end.get().copied(), Some(CancelReason::Requested));
+        assert!(
+            active.teardown.is_some(),
+            "expected the stop reason and retained teardown to publish under one owner lock"
         );
     }
 

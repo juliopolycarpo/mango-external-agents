@@ -3,6 +3,7 @@
 mod support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mango_agent_claude::ClaudeHarness;
@@ -10,12 +11,13 @@ use mango_external_agents::{
     ApprovalRouting, AuthMode, AuthState, CancelReason, CancelToken, CloseReason, Configuration,
     ConfigurationChange, ConfigurationOptionId, ConfigurationPatch, ConfigurationValue,
     DiscoveryReceipt, Dispatch, Error, EventKind, ExecutablePath, GateVerdict, Harness, HarnessId,
-    HostContext, InteractionId, Limits, LineLimits, OpenSession, PermissionLevel,
-    PermissionResponse, ResumeMode, Session, SessionStatus, TurnRequest, TurnStream,
+    HostContext, InteractionId, LaunchSpec, Limits, LineLimits, ManagedProcess, OpenSession,
+    PermissionLevel, PermissionResponse, ProcessLauncher, Result, ResumeMode, Session,
+    SessionStatus, TurnRequest, TurnStream,
 };
 use support::{
-    FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, host, host_under,
-    value_after,
+    FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, SpawnGate, host,
+    host_under, value_after,
 };
 
 /// A session several tasks can hold, for the tests that race two of its methods.
@@ -46,6 +48,50 @@ async fn open(launcher: &Arc<FakeClaudeCli>) -> Box<dyn Session> {
         .open_session(&host, OpenSession::new("chat-1"))
         .await
         .expect("expected a session")
+}
+
+struct FailingTurnLauncher {
+    inner: FakeClaudeCli,
+    first_turn: AtomicBool,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl FailingTurnLauncher {
+    fn new() -> Self {
+        Self {
+            inner: FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])),
+            first_turn: AtomicBool::new(true),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_for_first_turn(&self) {
+        self.arrived.notified().await;
+    }
+
+    fn release_first_turn(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for FailingTurnLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        if !spec.argv.iter().any(|argument| argument == "--print") {
+            return self.inner.spawn(spec).await;
+        }
+        if self.first_turn.swap(false, Ordering::AcqRel) {
+            self.arrived.notify_one();
+            self.release.notified().await;
+            return Err(Error::Launch {
+                program: String::from("claude"),
+                message: String::from("injected turn launch failure"),
+            });
+        }
+        self.inner.spawn(spec).await
+    }
 }
 
 mod discovery {
@@ -1342,12 +1388,76 @@ mod a_turn {
         gate.release();
 
         tokio::time::timeout(Duration::from_secs(5), async {
-            while launcher.a_child_is_running() {
+            while launcher.turn_argvs().len() != 1
+                || launcher.kill_requests() != 1
+                || launcher.a_child_is_running()
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("expected the abandoned spawn owner to reap its late child");
+        .expect("expected the abandoned spawn owner to launch and reap its late child");
+        assert_eq!(
+            launcher.turn_argvs().len(),
+            1,
+            "expected the abandoned launch to return exactly one child"
+        );
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected the abandoned launch owner to issue one child reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_failed_start_releases_its_reservation_for_a_retry() {
+        let launcher = Arc::new(FailingTurnLauncher::new());
+        let host = host_under(launcher.clone(), Limits::default());
+        let session: Arc<dyn Session> = Arc::from(
+            ClaudeHarness::new()
+                .open_session(&host, OpenSession::new("chat-1"))
+                .await
+                .expect("expected a session"),
+        );
+
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hold"))
+                    .await
+                    .map(drop)
+            }
+        });
+        launcher.wait_for_first_turn().await;
+        starting.abort();
+        let _ = starting.await;
+        launcher.release_first_turn();
+
+        let retry = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match session
+                    .start_turn(TurnRequest::new("turn-2", "retry after launch failure"))
+                    .await
+                {
+                    Ok(turn) => break turn,
+                    Err(error) if matches!(error.cause(), Error::Busy) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => {
+                        panic!("expected the failed reservation to release, received {error:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected a retry to enter after the abandoned launch failed");
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected the retried turn to close");
+        drop(retry);
     }
 
     #[tokio::test]
@@ -1725,11 +1835,117 @@ mod mcp_passthrough {
         });
     }
 
-    /// Nothing reaps a child on its own: the session implements no `Drop`, and a `ProcessControl`
-    /// that is merely dropped is not killed. So a `start_turn` abandoned at the lease release must
-    /// kill the child it launched itself, or the process outlives the host's interest in it until
-    /// an explicit `close`, `cancel` or next `start_turn` — and a host that simply drops the
-    /// session never issues one.
+    /// A cancellation can own a child while `start_turn` is still waiting to release the MCP
+    /// lease. Dropping that start then joins the retained cancellation result; it also has to
+    /// settle the no-stream owner, or the finished child leaves the session permanently busy.
+    #[test]
+    fn dropping_a_start_joins_and_settles_a_cancellation_that_already_owns_its_child() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("expected a runtime whose blocking pool this test owns");
+
+        runtime.block_on(async {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_help(HELP_2_1_270)
+                    .with_graceful_interrupt()
+                    .with_turn(Run::stalling::<[String; 0], String>([]))
+                    .with_turn(Run::replaying(READ_TURN)),
+            );
+            let stop = launcher.gate_turn_stops();
+            let scratch =
+                std::env::temp_dir().join(format!("mea-settle-scratch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&scratch).expect("expected a dedicated scratch root");
+            let host = HostContext::builder()
+                .launcher(launcher.clone())
+                .cwd(std::env::temp_dir())
+                .scratch(&scratch)
+                .client_info("mea-tests", "0.0.0")
+                .build()
+                .expect("expected a host with scratch storage");
+            let session: Arc<dyn Session> = Arc::from(
+                ClaudeHarness::new()
+                    .open_session(
+                        &host,
+                        OpenSession::new("chat-1").with_mcp_servers(servers()),
+                    )
+                    .await
+                    .expect("expected a session"),
+            );
+
+            let (release_pool, pool_held) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.recv();
+            });
+            let starting = tokio::spawn({
+                let session = Arc::clone(&session);
+                async move {
+                    session
+                        .start_turn(TurnRequest::new("turn-1", "hold"))
+                        .await
+                        .map(drop)
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while launcher.turn_argvs().len() != 1 || !launcher.a_child_is_running() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("expected the start to install a child before its blocked lease release");
+
+            let cancelling = tokio::spawn({
+                let session = Arc::clone(&session);
+                async move { session.cancel(CancelReason::Requested).await }
+            });
+            stop.wait_for_spawn().await;
+            starting.abort();
+            let _ = starting.await;
+            drop(release_pool);
+            occupied
+                .await
+                .expect("expected the blocking task to finish");
+            stop.release();
+            cancelling
+                .await
+                .expect("expected cancellation to return")
+                .expect("expected the cancellation-owned teardown to finish");
+
+            let mut retry = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match session
+                        .start_turn(TurnRequest::new("turn-2", "resume after cleanup"))
+                        .await
+                    {
+                        Ok(turn) => break turn,
+                        Err(error) if matches!(error.cause(), Error::Busy) => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => panic!(
+                            "expected the abandoned start to settle admission, received {error:?}"
+                        ),
+                    }
+                }
+            })
+            .await
+            .expect("expected the settled cancellation owner to release admission");
+            drain(&mut retry).await;
+            stop.wait_for_spawn().await;
+            stop.release();
+            session
+                .close(CloseReason::Requested)
+                .await
+                .expect("expected a clean close after the retry");
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
+    /// Session drop records the shared teardown, but a `ProcessControl` that is merely dropped is
+    /// not killed. So a `start_turn` abandoned at the lease release must join that teardown or
+    /// start it with the child it launched, or the process outlives the host's interest in it.
     #[test]
     fn a_dropped_start_turn_reaps_the_child_it_launched() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -2239,8 +2455,10 @@ mod mcp_passthrough {
             let session = Arc::clone(&session);
             async move { session.close(CloseReason::Requested).await }
         });
-        stop.wait_for_spawn().await;
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_secs(5), stop.wait_for_spawn())
+            .await
+            .expect("expected close to issue its one bounded process-stop request");
+        tokio::time::advance(Duration::from_secs(2)).await;
 
         let error = closing
             .await
@@ -2259,16 +2477,23 @@ mod mcp_passthrough {
         stop.release();
         drop(turn);
         drop(session);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while launcher.a_child_is_running() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("expected the dropped session to finish its later native stop");
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected the failed close and session drop to share one stop request"
+        );
         assert!(
             path.exists(),
             "expected the preserved artifact to outlive the failed close after session drop"
+        );
+        assert!(
+            launcher.a_child_is_running(),
+            "expected a timed-out host-owned child to remain live until host cleanup"
+        );
+        launcher.end_turns_for_host_cleanup();
+        assert!(
+            launcher.all_children_ended(),
+            "expected explicit fake host cleanup to end the retained child"
         );
         let _ = std::fs::remove_dir_all(
             path.parent()
@@ -2365,6 +2590,251 @@ mod mcp_passthrough {
 mod cancelling_and_closing {
     use super::*;
 
+    async fn wait_for_gate(gate: &SpawnGate, expectation: &'static str) {
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_for_spawn())
+            .await
+            .expect(expectation);
+    }
+
+    async fn drain_blocked_prompt(
+        turn: &mut TurnStream,
+        expectation: &'static str,
+    ) -> Vec<EventKind> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = turn.recv().await {
+                let terminal = event.is_terminal();
+                events.push(event.kind);
+                if terminal {
+                    break;
+                }
+            }
+            events
+        })
+        .await
+        .expect(expectation)
+    }
+
+    async fn wait_for_reap(launcher: &FakeClaudeCli) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while launcher.a_child_is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the turn child to be reaped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_write_honors_the_hosts_request_deadline() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let write = launcher.gate_turn_input_writes();
+        let host = host_under(
+            launcher.clone(),
+            Limits {
+                request_timeout: Duration::from_secs(1),
+                ..Limits::default()
+            },
+        );
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        wait_for_gate(
+            &write,
+            "expected the blocked prompt write to begin before its deadline",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        for _ in 0..10 {
+            if launcher.kill_requests() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected the request deadline to stop the blocked prompt write"
+        );
+        let events = drain_blocked_prompt(
+            &mut turn,
+            "expected the request deadline to commit a terminal prompt error",
+        )
+        .await;
+        assert!(
+            events.iter().any(|event| {
+                matches!(event, EventKind::Error { error } if error.message.contains("Claude prompt input"))
+            }),
+            "expected the prompt deadline to reach the stream, received {events:?}"
+        );
+        wait_for_reap(&launcher).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stream_interrupts_a_blocked_prompt_write() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let write = launcher.gate_turn_input_writes();
+        let stop = launcher.gate_turn_stops();
+        let session = open(&launcher).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        wait_for_gate(
+            &write,
+            "expected the blocked prompt write before stream abandonment",
+        )
+        .await;
+        drop(turn);
+        wait_for_gate(
+            &stop,
+            "expected stream abandonment to request a stop while stdin stayed blocked",
+        )
+        .await;
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected stream abandonment to claim one prompt teardown"
+        );
+        stop.release();
+        wait_for_reap(&launcher).await;
+    }
+
+    #[tokio::test]
+    async fn host_shutdown_interrupts_a_blocked_prompt_close() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let close = launcher.gate_turn_input_closes();
+        let stop = launcher.gate_turn_stops();
+        let host = host_under(launcher.clone(), Limits::default());
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        wait_for_gate(
+            &close,
+            "expected the blocked prompt close before host shutdown",
+        )
+        .await;
+        host.cancel().cancel();
+        wait_for_gate(
+            &stop,
+            "expected host shutdown to request a stop while stdin close stayed blocked",
+        )
+        .await;
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected host shutdown to claim one prompt teardown"
+        );
+        stop.release();
+        wait_for_reap(&launcher).await;
+        drop(turn);
+    }
+
+    #[tokio::test]
+    async fn a_session_cancel_interrupts_a_blocked_prompt_write() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let write = launcher.gate_turn_input_writes();
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        wait_for_gate(
+            &write,
+            "expected the blocked prompt write before session cancellation",
+        )
+        .await;
+        let cancelling = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.cancel(CancelReason::Requested).await }
+        });
+        wait_for_gate(
+            &stop,
+            "expected session cancellation to request a stop while stdin stayed blocked",
+        )
+        .await;
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected session cancellation to claim one prompt teardown"
+        );
+        stop.release();
+        cancelling
+            .await
+            .expect("expected cancellation task to finish")
+            .expect("expected cancellation to finish its teardown");
+        let events = drain_blocked_prompt(
+            &mut turn,
+            "expected session cancellation to commit a terminal cancellation",
+        )
+        .await;
+        assert!(
+            events.contains(&EventKind::Cancelled {
+                reason: CancelReason::Requested
+            }),
+            "expected blocked prompt cancellation to reach the stream, received {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_interrupts_a_blocked_prompt_write() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let write = launcher.gate_turn_input_writes();
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        wait_for_gate(
+            &write,
+            "expected the blocked prompt write before session close",
+        )
+        .await;
+        let closing = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.close(CloseReason::Requested).await }
+        });
+        wait_for_gate(
+            &stop,
+            "expected session close to request a stop while stdin stayed blocked",
+        )
+        .await;
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected close to claim one prompt teardown"
+        );
+        stop.release();
+        closing
+            .await
+            .expect("expected close task to finish")
+            .expect("expected close to finish its teardown");
+        wait_for_reap(&launcher).await;
+        drop(turn);
+    }
+
     #[tokio::test]
     async fn cancellation_uses_a_supported_graceful_interrupt_before_escalating() {
         let launcher = Arc::new(
@@ -2449,6 +2919,140 @@ mod cancelling_and_closing {
             .await
             .expect("expected the cancel task to finish")
             .expect("expected the cancel to report the stop it owns");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_waits_for_the_teardown_started_by_a_native_result() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::stalling::<[String; 0], String>([]))
+                .with_turn(Run::replaying(READ_TURN)),
+        );
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        launcher.announce_to_turn(r#"{"type":"result","is_error":false}"#);
+        stop.wait_for_spawn().await;
+        let cancelling = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.cancel(CancelReason::Requested).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stop.wait_for_spawn())
+                .await
+                .is_err(),
+            "expected the native terminal teardown to remain the only process stop owner"
+        );
+        assert!(
+            !cancelling.is_finished(),
+            "expected a later cancel to wait for the native teardown"
+        );
+
+        stop.release();
+        cancelling
+            .await
+            .expect("expected cancellation task to finish")
+            .expect("expected cancellation to observe the native teardown");
+        let events = drain(&mut turn).await;
+        assert!(
+            events.contains(&EventKind::Completed),
+            "expected the native result to remain terminal, received {events:?}"
+        );
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected native completion and cancel to share one teardown"
+        );
+        let mut resumed = session
+            .start_turn(TurnRequest::new("turn-2", "resume after native completion"))
+            .await
+            .expect("expected the native result owner to preserve continuation");
+        drain(&mut resumed).await;
+        stop.wait_for_spawn().await;
+        stop.release();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_joins_an_inflight_cancel_teardown() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let cancelling = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.cancel(CancelReason::Requested).await }
+        });
+        stop.wait_for_spawn().await;
+        cancelling.abort();
+        let _ = cancelling.await;
+        drop(session);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stop.wait_for_spawn())
+                .await
+                .is_err(),
+            "expected session drop to join the in-flight teardown instead of stopping twice"
+        );
+
+        stop.release();
+        wait_for_reap(&launcher).await;
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected session drop and cancellation to share one teardown"
+        );
+        drop(turn);
+    }
+
+    #[tokio::test]
+    async fn a_second_cancel_waits_for_the_first_claimed_teardown() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let first = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.cancel(CancelReason::Requested).await }
+        });
+        stop.wait_for_spawn().await;
+        let second = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.cancel(CancelReason::Requested).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "expected the second cancel to wait for the claimed teardown"
+        );
+
+        stop.release();
+        first
+            .await
+            .expect("expected first cancellation task to finish")
+            .expect("expected first cancellation to finish its teardown");
+        second
+            .await
+            .expect("expected second cancellation task to finish")
+            .expect("expected second cancellation to observe the first teardown");
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected both cancellations to share one teardown"
+        );
+        drop(turn);
     }
 
     #[tokio::test]
