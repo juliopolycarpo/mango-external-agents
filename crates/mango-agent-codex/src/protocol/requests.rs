@@ -6,6 +6,7 @@
 //! here is written speculatively, and an absent option is an absent member rather than a `null`.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -131,7 +132,7 @@ pub enum ApprovalsReviewer {
 }
 
 /// Opening a conversation.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartParams {
     /// The directory the host authorised.
@@ -153,8 +154,23 @@ pub struct ThreadStartParams {
     pub config: Option<BTreeMap<String, serde_json::Value>>,
 }
 
+impl fmt::Debug for ThreadStartParams {
+    /// Shows request metadata without exposing host-supplied MCP configuration values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadStartParams")
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("approval_policy", &self.approval_policy)
+            .field("sandbox", &self.sandbox)
+            .field("approvals_reviewer", &self.approvals_reviewer)
+            .field("has_config", &self.config.is_some())
+            .finish()
+    }
+}
+
 /// Continuing one.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadResumeParams {
     /// The vendor's own handle for the conversation.
@@ -178,6 +194,23 @@ pub struct ThreadResumeParams {
     pub config: Option<BTreeMap<String, serde_json::Value>>,
     /// Metadata only: the transcript is the vendor's, and this harness never replays one.
     pub exclude_turns: bool,
+}
+
+impl fmt::Debug for ThreadResumeParams {
+    /// Shows request metadata without exposing host-supplied MCP configuration values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadResumeParams")
+            .field("thread_id", &self.thread_id)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("approval_policy", &self.approval_policy)
+            .field("sandbox", &self.sandbox)
+            .field("approvals_reviewer", &self.approvals_reviewer)
+            .field("has_config", &self.config.is_some())
+            .field("exclude_turns", &self.exclude_turns)
+            .finish()
+    }
 }
 
 /// Reads native metadata without loading transcript turns into the response.
@@ -598,9 +631,11 @@ pub fn empty_params() -> BTreeMap<String, serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         Account, AccountReadResponse, AskForApproval, ClientInfo, InitializeParams, SandboxMode,
-        ThreadStartParams, TurnStartParams, TurnStatus, UserInput,
+        ThreadResumeParams, ThreadStartParams, TurnStartParams, TurnStatus, UserInput,
     };
 
     /// The handshake writes the host's own name and nothing it was not given.
@@ -649,6 +684,38 @@ mod tests {
             frame.get("approvalsReviewer").is_none(),
             "expected no reviewer member, received {frame}"
         );
+    }
+
+    /// Per-thread MCP configuration can hold credentials, so diagnostics retain only its presence.
+    #[test]
+    fn thread_parameters_debug_redacts_mcp_values() {
+        let config = BTreeMap::from([(
+            String::from("mcp_servers"),
+            serde_json::json!({
+                "docs": {"env": {"DOCS_TOKEN": "stdio-env-secret"}},
+                "remote": {"http_headers": {"Authorization": "http-header-secret"}},
+            }),
+        )]);
+        let start = ThreadStartParams {
+            cwd: String::from("/workspace"),
+            config: Some(config.clone()),
+            ..ThreadStartParams::default()
+        };
+        let resume = ThreadResumeParams {
+            thread_id: String::from("thread-1"),
+            cwd: String::from("/workspace"),
+            config: Some(config),
+            ..ThreadResumeParams::default()
+        };
+
+        for rendered in [format!("{start:?}"), format!("{resume:?}")] {
+            for secret in ["stdio-env-secret", "http-header-secret"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected {secret:?} to stay out of diagnostics, received {rendered}"
+                );
+            }
+        }
     }
 
     /// Upstream spells this one member snake_case among camelCase siblings. Matching its spelling
