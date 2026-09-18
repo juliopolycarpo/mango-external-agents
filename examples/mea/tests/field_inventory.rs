@@ -12,15 +12,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The repository root, from this crate's own manifest.
+///
+/// Not canonicalised, and the segments are joined one at a time. On Windows `canonicalize` returns
+/// a `\\?\` verbatim path, and Win32 does not normalise a forward slash underneath one — so a
+/// `join("docs/vendor-fields.md")` on a canonicalised root fails to open a file that is plainly
+/// there. A relative `../..` opens everywhere.
 fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("expected the repository root above examples/mea")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
 fn inventory() -> String {
-    let path = repository_root().join("docs/vendor-fields.md");
+    let path = repository_root().join("docs").join("vendor-fields.md");
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("expected to read {}, received {error}", path.display()))
 }
