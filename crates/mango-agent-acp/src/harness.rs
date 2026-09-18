@@ -523,8 +523,7 @@ impl Harness for AcpHarness {
         let watched = connection.connection().clone();
         let driver_done = connection.driver_done().clone();
         let watched_connection = Arc::downgrade(&connection);
-        let orphan = Arc::clone(connection.control());
-        let cleanup_limits = *host.limits();
+        let child_reaper = connection.child_reaper();
         let closing_state = session_state.clone();
 
         let catalog = opened
@@ -594,10 +593,10 @@ impl Harness for AcpHarness {
         // Both signals, because neither covers the other: a clean EOF closes the incoming half and
         // leaves the loop running, and a failed transport ends the loop without a clean EOF.
         //
-        // The task holds a connection clone and the child's control rather than the handle, so it
+        // The task holds a connection clone and the child's shared reaper rather than the handle, so it
         // cannot outlive what it is watching: a session dropped without a close releases the loop's
         // shutdown channel with the handle, the loop winds down, and this wakes and ends. A
-        // `ProcessControl` holds no connection, so keeping one here cannot keep the loop alive; the
+        // `ChildReaper` holds no connection, so keeping one here cannot keep the loop alive; the
         // session's own `SessionState` would, through a parked question's connection clone, which
         // is why the pending questions a teardown owes are not settled from here.
         //
@@ -621,17 +620,12 @@ impl Harness for AcpHarness {
                 // Dropping the last session handle releases the ACP closure before this watcher
                 // wakes, so no `ConnectionHandle` remains to own the host process control. The
                 // watcher then becomes the last owner and applies the same bounded cleanup.
-                mango_external_agents::process::stop_process_with_limits(
-                    orphan.as_ref(),
-                    mango_external_agents::CancelReason::Shutdown,
-                    &cleanup_limits,
-                )
-                .await
-                .map(|_| ())
+                child_reaper.reap(mango_external_agents::CancelReason::Shutdown).await
             };
             if cleanup.is_ok() {
                 closing_state.set_status(mango_external_agents::SessionStatus::Closed);
             }
+
         });
         Ok(Box::new(session))
     }

@@ -1018,8 +1018,8 @@ fn standing_refusal(
 pub(crate) struct ConnectionHandle {
     connection: ConnectionTo<Agent>,
     control: Arc<dyn ProcessControl>,
-    /// Ensures every shutdown path asks the child to end at most once.
-    child_killed: AtomicBool,
+    /// The one owner shared with lifecycle watchers that may also need to reap the child.
+    child_reaper: ChildReaper,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>>,
     /// Host-owned bounds for tearing down the dispatch loop and child process.
@@ -1119,6 +1119,58 @@ impl Drop for RequestAbandonment {
         // let the connection's owned shutdown task force EOF and release the SDK's pending map.
         self.connection
             .begin_shutdown(mango_external_agents::CancelReason::Shutdown);
+    }
+}
+
+/// Reaps one child once without letting cancellation abandon its launched kill task.
+#[derive(Clone)]
+pub(crate) struct ChildReaper {
+    control: Arc<dyn ProcessControl>,
+    claimed: Arc<AtomicBool>,
+    limits: Limits,
+    result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
+    done: mango_external_agents::CancelToken,
+}
+
+impl ChildReaper {
+    fn new(control: Arc<dyn ProcessControl>, limits: Limits) -> Self {
+        Self {
+            control,
+            limits,
+            result: Arc::new(Mutex::new(None)),
+            claimed: Arc::new(AtomicBool::new(false)),
+            done: mango_external_agents::CancelToken::new(),
+        }
+    }
+
+    /// Starts bounded cleanup that outlives a caller cancelled while awaiting it.
+    pub(crate) async fn reap(&self, reason: mango_external_agents::CancelReason) -> Result<()> {
+        if !self.claimed.swap(true, Ordering::AcqRel) {
+            let control = Arc::clone(&self.control);
+            let done = self.done.clone();
+            let limits = self.limits;
+            let result = Arc::clone(&self.result);
+            tokio::spawn(async move {
+                let _complete = ReapCompletion(done);
+                let outcome = stop_process_with_limits(control.as_ref(), reason, &limits).await;
+                *result.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(outcome.map(|_| ()).map_err(|error| error.to_string()));
+            });
+        }
+        self.done.cancelled().await;
+        self.result.lock().unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| Err(String::from("ACP child cleanup ended without an outcome")))
+            .map_err(|message| Error::Vendor(link_failure(message)))
+    }
+}
+
+/// Signals every competing reaper even if an injected process control panics.
+struct ReapCompletion(mango_external_agents::CancelToken);
+
+impl Drop for ReapCompletion {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -1318,10 +1370,12 @@ pub(crate) async fn drive(
         ))));
     };
 
+    let control = child.disarm();
+    let child_reaper = ChildReaper::new(Arc::clone(&control), state.limits);
     Ok(ConnectionHandle {
         connection,
-        control: child.disarm(),
-        child_killed: AtomicBool::new(false),
+        control,
+        child_reaper,
         shutdown: Mutex::new(Some(shutdown_tx)),
         driver: Mutex::new(Some(driver)),
         limits: state.limits,
@@ -1390,6 +1444,11 @@ impl ConnectionHandle {
         &self.control
     }
 
+    /// The shared owner a watcher can use without retaining a connection clone.
+    pub(crate) fn child_reaper(&self) -> ChildReaper {
+        self.child_reaper.clone()
+    }
+
     /// Fires once the dispatch loop is over, whichever way it ended.
     ///
     /// Not the same event as [`ConnectionTo::incoming_closed`]: a clean EOF closes the incoming
@@ -1434,9 +1493,7 @@ impl ConnectionHandle {
                 }
             }
         }
-        let process = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
-        process?;
-        Ok(())
+        self.child_reaper.reap(reason).await
 
     }
 }
@@ -1552,8 +1609,8 @@ mod connection_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
@@ -1572,6 +1629,49 @@ mod tests {
     struct CountingProcessControl {
         inner: Arc<dyn ProcessControl>,
         kills: Arc<AtomicUsize>,
+    }
+
+    /// A named process control whose kill waits until the test releases it.
+    struct HeldKillProcessControl {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        completed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for HeldKillProcessControl {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            Ok(ExitStatus::default())
+        }
+
+        async fn kill(&self, _reason: CancelReason) -> Result<()> {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            self.completed.store(true, Ordering::Release);
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -1817,5 +1917,36 @@ mod tests {
             1,
             "expected the pre-drive guard to claim cleanup exactly once"
         );
+    }
+
+    /// Cancelling a shutdown waiter cannot cancel the child kill it already submitted.
+    #[tokio::test]
+    async fn a_cancelled_reaper_wait_keeps_the_submitted_kill_running() {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let held = Arc::new(HeldKillProcessControl {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+            completed: AtomicBool::new(false),
+        });
+        let control: Arc<dyn ProcessControl> = held.clone();
+        let reaper = super::ChildReaper::new(control, mango_external_agents::Limits::default());
+        let task = tokio::spawn({
+            let reaper = reaper.clone();
+            async move { reaper.reap(CancelReason::Shutdown).await }
+        });
+        entered.await.expect("expected the kill task to start");
+        task.abort();
+        let _ = task.await;
+        release
+            .send(())
+            .expect("expected the held kill to remain owned");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !held.completed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the detached kill to complete after its waiter was cancelled");
     }
 }

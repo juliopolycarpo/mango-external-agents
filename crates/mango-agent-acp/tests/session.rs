@@ -1467,6 +1467,39 @@ async fn completed_harness_listing_kills_its_short_lived_child_once() {
     );
 }
 
+/// Ordinary close and the connection watcher share one claim on the injected child.
+#[tokio::test]
+async fn closing_a_session_and_its_watcher_kills_the_child_once() {
+    let launcher = CapturingLauncher::default();
+    launcher.push(FakeAcpAgent::new().process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .build()
+        .expect("expected a host");
+    let session = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("close-once"))
+        .await
+        .expect("expected a session");
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+    tokio::time::timeout(Duration::from_secs(4), launcher.child().wait())
+        .await
+        .expect("expected close to reap its child")
+        .expect("expected child cleanup to succeed");
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        launcher.kill_count(),
+        1,
+        "expected close and watcher to make one process-control kill request"
+    );
+}
+
 /// Rows outside the host workspace and malformed timestamps never reach a picker as local sessions.
 #[tokio::test]
 async fn listing_filters_foreign_rows_and_keeps_only_valid_updated_at() {
