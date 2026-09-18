@@ -26,6 +26,7 @@ fn row(report: &DiscoveryReport) -> Value {
             GateVerdict::Usable => "usable",
             GateVerdict::NotInstalled => "not-installed",
             GateVerdict::VersionTooOld { .. } => "version-too-old",
+            GateVerdict::MissingRequiredSurface { .. } => "missing-required-surface",
             _ => "unknown",
         },
         "gateDetail": format!("{:?}", discovery.gate),
@@ -49,7 +50,9 @@ fn account(discovery: &Discovery) -> (&'static str, Option<&str>) {
 fn installed(discovery: &Discovery) -> Option<bool> {
     match discovery.gate {
         GateVerdict::NotInstalled => Some(false),
-        GateVerdict::Usable | GateVerdict::VersionTooOld { .. } => Some(true),
+        GateVerdict::Usable
+        | GateVerdict::VersionTooOld { .. }
+        | GateVerdict::MissingRequiredSurface { .. } => Some(true),
         _ if discovery.executable.is_some() || discovery.version.is_some() => Some(true),
         _ => None,
     }
@@ -127,5 +130,22 @@ mod tests {
         assert!(text(&report).contains("probe failed"));
         assert_eq!(row(&report)["installed"], Value::Null);
         assert_eq!(row(&report)["auth"], "unknown");
+    }
+
+    #[test]
+    fn a_missing_required_surface_is_an_installed_but_gated_cli() {
+        let report = DiscoveryReport {
+            kind: HarnessId::claude(),
+            result: Ok(Discovery {
+                gate: GateVerdict::MissingRequiredSurface {
+                    expected: "a required launch flag",
+                    received: "the flag was absent from help",
+                },
+                ..Discovery::not_installed()
+            }),
+        };
+        let output = json(&[report]);
+        assert_eq!(output[0]["gate"], "missing-required-surface");
+        assert_eq!(output[0]["installed"], true);
     }
 }

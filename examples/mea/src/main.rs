@@ -153,6 +153,9 @@ fn describe(discovery: &mango_external_agents::Discovery) -> String {
         GateVerdict::VersionTooOld { found, minimum } => {
             format!("gated      {found} is older than {minimum}")
         }
+        GateVerdict::MissingRequiredSurface { expected, received } => {
+            format!("gated      expected {expected}; received {received}")
+        }
         GateVerdict::Usable => match &discovery.version {
             Some(version) => format!("installed  {version}"),
             None => String::from("installed"),
@@ -752,5 +755,20 @@ mod tests {
             ..Discovery::not_installed()
         };
         assert!(describe(&unknown).starts_with("unknown"));
+    }
+
+    #[test]
+    fn a_missing_required_surface_reports_a_known_gate() {
+        let discovery = Discovery {
+            gate: GateVerdict::MissingRequiredSurface {
+                expected: "a required launch flag",
+                received: "the flag was absent from help",
+            },
+            ..Discovery::not_installed()
+        };
+        assert_eq!(
+            describe(&discovery),
+            "gated      expected a required launch flag; received the flag was absent from help"
+        );
     }
 }
