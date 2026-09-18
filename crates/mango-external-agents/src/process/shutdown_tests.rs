@@ -36,7 +36,7 @@ impl ProcessControl for ControlledProcess {
 }
 
 #[tokio::test(start_paused = true)]
-async fn graceful_exit_is_reaped_without_termination() {
+async fn graceful_leader_exit_still_cleans_up_its_process_tree() {
     let process = ControlledProcess {
         interrupt: InterruptOutcome::Delivered,
         exit_on_interrupt: true,
@@ -49,7 +49,7 @@ async fn graceful_exit_is_reaped_without_termination() {
             .expect("stop"),
         StopOutcome::Interrupted
     );
-    assert_eq!(process.kills.load(Ordering::Acquire), 0);
+    assert_eq!(process.kills.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -88,4 +88,27 @@ async fn unsupported_interrupt_uses_explicit_termination() {
     );
     assert_eq!(start.elapsed(), Duration::ZERO);
     assert_eq!(process.kills.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn host_limits_supply_the_interrupt_deadline() {
+    let process = ControlledProcess {
+        interrupt: InterruptOutcome::Delivered,
+        exit_on_interrupt: false,
+        exits: CancelToken::new(),
+        kills: AtomicUsize::new(0),
+    };
+    let limits = crate::Limits {
+        kill_grace: Duration::from_secs(7),
+        shutdown_timeout: Duration::from_secs(13),
+        ..crate::Limits::default()
+    };
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        stop_process_with_limits(&process, CancelReason::Shutdown, &limits)
+            .await
+            .expect("stop"),
+        StopOutcome::Terminated
+    );
+    assert_eq!(start.elapsed(), limits.kill_grace);
 }

@@ -165,25 +165,47 @@ pub async fn stop_process(
     reason: CancelReason,
     grace: std::time::Duration,
 ) -> Result<StopOutcome> {
+    stop_process_bounded(control, reason, grace, grace.saturating_mul(3)).await
+}
+
+/// Uses the host's distinct graceful-interrupt and shutdown-stage deadlines.
+///
+/// For example, a harness calls `stop_process_with_limits(control, reason, host.limits())`.
+/// Tree cleanup runs even after the leader exits because its helpers may still hold the workspace.
+pub async fn stop_process_with_limits(
+    control: &dyn ProcessControl,
+    reason: CancelReason,
+    limits: &crate::Limits,
+) -> Result<StopOutcome> {
+    stop_process_bounded(control, reason, limits.kill_grace, limits.shutdown_timeout).await
+}
+
+async fn stop_process_bounded(
+    control: &dyn ProcessControl,
+    reason: CancelReason,
+    grace: std::time::Duration,
+    shutdown: std::time::Duration,
+) -> Result<StopOutcome> {
     let interrupt = tokio::time::timeout(grace, control.interrupt(reason)).await;
-    if matches!(interrupt, Ok(Ok(InterruptOutcome::Delivered)))
-        && matches!(tokio::time::timeout(grace, control.wait()).await, Ok(Ok(_)))
-    {
-        return Ok(StopOutcome::Interrupted);
-    }
-    tokio::time::timeout(grace, control.kill(reason))
+    let interrupted = matches!(interrupt, Ok(Ok(InterruptOutcome::Delivered)))
+        && matches!(tokio::time::timeout(grace, control.wait()).await, Ok(Ok(_)));
+    tokio::time::timeout(shutdown, control.kill(reason))
         .await
         .map_err(|_| Error::Timeout {
             operation: String::from("process-tree termination"),
-            after: grace,
+            after: shutdown,
         })??;
-    tokio::time::timeout(grace, control.wait())
+    tokio::time::timeout(shutdown, control.wait())
         .await
         .map_err(|_| Error::Timeout {
             operation: String::from("process reaping"),
-            after: grace,
+            after: shutdown,
         })??;
-    Ok(StopOutcome::Terminated)
+    Ok(if interrupted {
+        StopOutcome::Interrupted
+    } else {
+        StopOutcome::Terminated
+    })
 }
 
 /// How a child ended.

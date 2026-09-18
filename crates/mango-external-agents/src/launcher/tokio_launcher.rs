@@ -407,7 +407,14 @@ impl ProcessControl for TokioChild {
                 })
             };
         }
-        end_process_tree(pid, self.kill_grace, self.exit.clone()).await
+        // Dropping a caller's timeout must not cancel escalation after `killed` was claimed.
+        // The owned task retains the reaper observation until the tree is stopped or refused.
+        tokio::spawn(end_process_tree(pid, self.kill_grace, self.exit.clone()))
+            .await
+            .map_err(|_| Error::Launch {
+                program: String::from("process group"),
+                message: String::from("process-tree cleanup task did not finish"),
+            })?
     }
 
     async fn interrupt(&self, _reason: CancelReason) -> Result<crate::process::InterruptOutcome> {
