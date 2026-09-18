@@ -866,18 +866,26 @@ fn terminal_outcome(events: &[AgentEvent]) -> Outcome {
     Outcome::Passed
 }
 
-/// Whether every activity and reasoning phase the turn opened reached an end before its terminal.
+/// Whether every structure the turn opened reached an end before its terminal.
 ///
-/// The failure this catches is a host rendering a spinner nobody will ever stop. An activity is a
-/// control with a running state, and a reasoning phase is a block a host keeps open until it is
-/// told otherwise, so a turn that ends owing either leaves a reloaded transcript permanently
-/// mid-work. Every terminal path owes them equally — a completion, a cancel and an error are all
-/// the end of the turn, which is why the cancelled turn is held to this too.
+/// The failure this catches is a host rendering something nobody will ever stop: an activity is a
+/// control with a running state, a reasoning phase is a block a host keeps open until told
+/// otherwise, and an approval or a question is a **dialog somebody is looking at**. A turn that
+/// ends owing any of them leaves a reloaded transcript permanently mid-work, or a prompt with no
+/// buttons that do anything. Every terminal path owes them equally — a completion, a cancel and an
+/// error are all the end of the turn, which is why the cancelled turn is held to this too.
 ///
-/// An update or a completion for a call nobody started is the same defect from the other side: the
-/// host has nothing to apply it to, so it either invents a row or drops the frame.
+/// An activity update or completion for a call nobody started is the same defect from the other
+/// side: the host has nothing to apply it to, so it either invents a row or drops the frame.
+///
+/// Interactions are checked in **one** direction only. A resolution for an ask a host never saw is
+/// deliberate in more than one harness — a question this library refuses on the host's behalf is
+/// resolved without ever being asked, so that a host has an auditable record of a refusal it was
+/// right not to be shown. There is no dialog to leave open in that case, which is what this check
+/// is about.
 fn structure_outcome(events: &[AgentEvent]) -> Outcome {
     let mut open: Vec<&str> = Vec::new();
+    let mut waiting: Vec<&str> = Vec::new();
     let mut reasoning_open = false;
     let mut failures = Vec::new();
     for event in events {
@@ -905,6 +913,16 @@ fn structure_outcome(events: &[AgentEvent]) -> Outcome {
                     }
                 }
             }
+            EventKind::ApprovalRequested { request } => waiting.push(request.id().as_str()),
+            EventKind::QuestionAsked { request } => {
+                waiting.push(request.interaction.id.as_str());
+            }
+            EventKind::ApprovalResolved { interaction_id, .. }
+            | EventKind::QuestionResolved { interaction_id, .. } => {
+                if let Some(index) = waiting.iter().position(|id| *id == interaction_id.as_str()) {
+                    waiting.remove(index);
+                }
+            }
             EventKind::ReasoningStarted => {
                 if std::mem::replace(&mut reasoning_open, true) {
                     failures.push(String::from("a reasoning phase was started inside another"));
@@ -918,6 +936,11 @@ fn structure_outcome(events: &[AgentEvent]) -> Outcome {
     }
     if !open.is_empty() {
         failures.push(format!("the turn ended with {open:?} still running"));
+    }
+    if !waiting.is_empty() {
+        failures.push(format!(
+            "the turn ended with {waiting:?} still waiting for an answer"
+        ));
     }
     if reasoning_open {
         failures.push(String::from("the turn ended mid-reasoning"));
@@ -957,6 +980,7 @@ mod tests {
     use super::{Options, Outcome, run};
     use crate::event::EventKind;
     use crate::host::HostContext;
+    use crate::interaction::QuestionForm;
     use crate::testing::{FakeHarness, FakeLauncher};
     use std::sync::Arc;
 
@@ -1140,6 +1164,22 @@ mod tests {
             Outcome::Passed
         );
 
+        // A refusal resolves an ask the host was never shown, on purpose: it is the auditable
+        // record of a question this library declined to put to anybody. There is no dialog to
+        // leave open, so it is not a failure.
+        assert_eq!(
+            super::structure_outcome(&events(vec![
+                EventKind::QuestionResolved {
+                    interaction_id: crate::interaction::InteractionId::new("never-asked"),
+                    outcome: crate::interaction::QuestionOutcome::Refused {
+                        reason: crate::interaction::UnsupportedQuestion::ArbitraryForm,
+                    },
+                },
+                EventKind::Completed,
+            ])),
+            Outcome::Passed
+        );
+
         for (case, kinds) in [
             (
                 "an activity left running",
@@ -1162,6 +1202,27 @@ mod tests {
             (
                 "a turn that ended mid-reasoning",
                 vec![EventKind::ReasoningStarted, EventKind::Completed],
+            ),
+            (
+                "a question left waiting for an answer",
+                vec![
+                    EventKind::QuestionAsked {
+                        request: crate::interaction::QuestionRequest::new(
+                            crate::interaction::Interaction::new(
+                                crate::interaction::InteractionId::new("ask-1"),
+                                crate::interaction::InteractionKind::Question,
+                                crate::event::SessionId::new("session-1"),
+                                std::time::SystemTime::UNIX_EPOCH,
+                            ),
+                            vec![crate::interaction::Question::new(
+                                crate::interaction::QuestionId::new("branch"),
+                                "which branch?",
+                                QuestionForm::FreeText { placeholder: None },
+                            )],
+                        ),
+                    },
+                    EventKind::Completed,
+                ],
             ),
             (
                 "a reasoning phase that ended without starting",

@@ -290,22 +290,46 @@ struct PendingTurn {
     open_activity: Option<String>,
 }
 
-/// Ends the activity a stopped turn announced, before its terminal goes out.
+/// Ends everything a stopped turn left open, before its terminal goes out.
 ///
-/// `Cancelled` rather than `Failed`: nothing went wrong with the call, the turn it belonged to
-/// stopped. A best-effort emit — the sink may already be closed by a racing terminal, and the
-/// terminal is the event that matters.
-async fn close_open_activity(turn: &PendingTurn) {
-    let Some(call_id) = turn.open_activity.clone() else {
-        return;
-    };
-    let _ = turn
-        .sink
-        .emit(EventKind::ActivityCompleted {
-            call_id,
-            result: ActivityResult::new(ActivityStatus::Cancelled),
-        })
-        .await;
+/// The activity, and the interaction somebody is looking at. `Cancelled` in every case: nothing
+/// went wrong with the call or the ask, the turn they belonged to stopped. A fake that skips this
+/// teaches every harness written against it that a turn may end owing a spinner nobody will stop
+/// or a dialog with no button that does anything.
+///
+/// Best-effort emits — the sink may already be closed by a racing terminal, and the terminal is the
+/// event that matters.
+async fn close_open_interactions(turn: &PendingTurn) {
+    if let Some(call_id) = turn.open_activity.clone() {
+        let _ = turn
+            .sink
+            .emit(EventKind::ActivityCompleted {
+                call_id,
+                result: ActivityResult::new(ActivityStatus::Cancelled),
+            })
+            .await;
+    }
+    if let Some(question) = &turn.question {
+        let _ = turn
+            .sink
+            .emit(EventKind::QuestionResolved {
+                interaction_id: question.interaction.id.clone(),
+                outcome: QuestionOutcome::Cancelled,
+            })
+            .await;
+    }
+    if let Some(approval) = &turn.approval {
+        let _ = turn
+            .sink
+            .emit(EventKind::ApprovalResolved {
+                interaction_id: approval.id().clone(),
+                decision: ApprovalDecision::unresolved(
+                    "withdrawn",
+                    crate::permission::DecisionSource::Cancelled,
+                ),
+            })
+            .await;
+    }
 }
 
 fn approval_request(
@@ -710,7 +734,7 @@ impl Session for FakeSession {
         let Some(turn) = pending.take() else {
             return Ok(());
         };
-        close_open_activity(&turn).await;
+        close_open_interactions(&turn).await;
         turn.sink.cancel(reason).await
     }
 
@@ -721,7 +745,7 @@ impl Session for FakeSession {
         // Terminal commitment is immediate and remains inside the admission critical section.
         if let Some(turn) = pending.take() {
             // A close ends whatever was running, for the same reason.
-            close_open_activity(&turn).await;
+            close_open_interactions(&turn).await;
             let _ = turn.sink.cancel(CancelReason::Shutdown).await;
         }
         Ok(())
