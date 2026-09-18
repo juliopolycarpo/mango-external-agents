@@ -461,7 +461,7 @@ impl AcpHarness {
     /// The handshake and the session, as one fallible step the caller can tear down after.
     async fn handshake_and_open(
         &self,
-        connection: &client::ConnectionHandle,
+        connection: &Arc<client::ConnectionHandle>,
         host: &HostContext,
         request: &OpenSession,
     ) -> Result<(Handshake, Opened)> {
@@ -495,7 +495,7 @@ impl AcpHarness {
 
     async fn initialize(
         &self,
-        connection: &client::ConnectionHandle,
+        connection: &Arc<client::ConnectionHandle>,
         host: &HostContext,
     ) -> Result<Handshake> {
         let client = host.client_info();
@@ -530,7 +530,7 @@ impl AcpHarness {
 
     async fn open(
         &self,
-        connection: &client::ConnectionHandle,
+        connection: &Arc<client::ConnectionHandle>,
         host: &HostContext,
         request: &OpenSession,
         handshake: &Handshake,
@@ -584,7 +584,7 @@ impl AcpHarness {
 
     async fn new_session(
         &self,
-        connection: &client::ConnectionHandle,
+        connection: &Arc<client::ConnectionHandle>,
         host: &HostContext,
         cwd: std::path::PathBuf,
     ) -> Result<Opened> {
@@ -603,7 +603,7 @@ impl AcpHarness {
     /// Sends one handshake request under the host's deadline.
     async fn request<Request>(
         &self,
-        connection: &client::ConnectionHandle,
+        connection: &Arc<client::ConnectionHandle>,
         host: &HostContext,
         method: &'static str,
         request: Request,

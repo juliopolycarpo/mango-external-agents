@@ -770,7 +770,7 @@ async fn finish_close(
         let _ = tokio::time::timeout(
             limits.shutdown_timeout,
             client::send(
-                connection.as_ref(),
+                &connection,
                 profile.as_ref(),
                 limits.request_timeout,
                 "session/close",

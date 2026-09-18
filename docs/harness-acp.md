@@ -78,6 +78,10 @@ for a future dynamic session handler. Responses continue through the SDK's corre
 
 Every request except `session/prompt` is bounded by `Limits::request_timeout` and fails with
 `Error::Timeout` naming the method. The prompt is a turn and may take as long as the agent needs.
+Timing out or abandoning a generic request seals request admission and starts owned connection
+cleanup. The SDK retains unanswered requests until a response or connection teardown, so returning
+their permits while keeping the connection open would allow an unresponsive agent to defeat the
+pending-request budget.
 
 ## Turns
 

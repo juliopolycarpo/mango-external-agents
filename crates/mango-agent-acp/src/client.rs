@@ -867,6 +867,12 @@ pub(crate) struct ConnectionHandle {
 struct RequestAdmission {
     permits: tokio::sync::Semaphore,
     limit: usize,
+    state: Mutex<RequestAdmissionState>,
+}
+
+#[derive(Default)]
+struct RequestAdmissionState {
+    closed: bool,
 }
 
 impl RequestAdmission {
@@ -874,17 +880,67 @@ impl RequestAdmission {
         Self {
             permits: tokio::sync::Semaphore::new(limit),
             limit,
+            state: Mutex::new(RequestAdmissionState::default()),
         }
     }
 
-    fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
-        self.permits
+    fn submit<T>(&self, send: impl FnOnce() -> T) -> Result<(tokio::sync::SemaphorePermit<'_>, T)> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return Err(Error::Closed {
+                subject: "ACP connection",
+            });
+        }
+        let permit = self
+            .permits
             .try_acquire()
             .map_err(|_| Error::LimitExceeded {
                 subject: "outstanding ACP requests",
                 limit: self.limit,
                 received: self.limit.saturating_add(1),
-            })
+            })?;
+        let sent = send();
+        drop(state);
+        Ok((permit, sent))
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed = true;
+    }
+}
+
+/// Starts owned teardown if a generic request leaves ACP's pending-reply map without a response.
+struct RequestAbandonment {
+    connection: Arc<ConnectionHandle>,
+    armed: bool,
+}
+
+impl RequestAbandonment {
+    fn new(connection: Arc<ConnectionHandle>) -> Self {
+        Self {
+            connection,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestAbandonment {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // ACP 2.1 only sends a cancellation notification when a sent request is dropped; it keeps
+        // that request's reply slot until a response or EOF. Close admission synchronously, then
+        // let the connection's owned shutdown task force EOF and release the SDK's pending map.
+        self.connection
+            .begin_shutdown(mango_external_agents::CancelReason::Shutdown);
     }
 }
 
@@ -1005,6 +1061,9 @@ impl ConnectionHandle {
     /// Starts bounded shutdown in an owned task so dropping the initiating session future cannot
     /// abandon the child. Later callers join the same completion signal.
     pub(crate) fn begin_shutdown(self: &Arc<Self>, reason: mango_external_agents::CancelReason) {
+        // Serialised with `RequestAdmission::submit`, so no request can enter the SDK queue after
+        // a caller has begun teardown.
+        self.requests.close();
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1125,7 +1184,7 @@ impl ConnectionHandle {
 /// made of the agent's answer. An opening call returns no session or control handle, so this is the
 /// only path that preserves the tail for a host to inspect.
 pub(crate) async fn send<Request>(
-    connection: &ConnectionHandle,
+    connection: &Arc<ConnectionHandle>,
     profile: &crate::profile::AcpProfile,
     timeout: Duration,
     method: &'static str,
@@ -1138,8 +1197,10 @@ where
     // `ConnectionTo::send_request` enters ACP's own unbounded task queue immediately. Acquire
     // before constructing that request so a host's pending-request budget remains an admission
     // bound rather than merely a bound on responses we happened to await.
-    let _permit = connection.requests.acquire()?;
-    let sent = connection.connection().send_request(request);
+    let (_permit, sent) = connection
+        .requests
+        .submit(|| connection.connection().send_request(request))?;
+    let mut abandonment = RequestAbandonment::new(Arc::clone(connection));
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
         return Err(Error::Timeout {
@@ -1147,6 +1208,7 @@ where
             after: timeout,
         });
     };
+    abandonment.disarm();
     answered.map_err(|error| {
         if agent_client_protocol::is_incoming_transport_closed(&error) {
             return Error::Vendor(link_failure(with_stderr(
@@ -1337,10 +1399,10 @@ mod tests {
     fn generic_request_admission_is_bounded_and_releases_after_completion() {
         let admission = RequestAdmission::new(1);
         let first = admission
-            .acquire()
+            .submit(|| ())
             .expect("expected the first request permit");
         let refused = admission
-            .acquire()
+            .submit(|| ())
             .expect_err("expected the second outstanding request to be refused");
         assert!(
             matches!(
@@ -1353,9 +1415,22 @@ mod tests {
             ),
             "received {refused:?}"
         );
-        drop(first);
+        drop(first.0);
         let _next = admission
-            .acquire()
+            .submit(|| ())
             .expect("expected the completed request to release admission");
+        admission.close();
+        let closed = admission
+            .submit(|| ())
+            .expect_err("expected closed admission to refuse before queuing");
+        assert!(
+            matches!(
+                closed,
+                Error::Closed {
+                    subject: "ACP connection"
+                }
+            ),
+            "received {closed:?}"
+        );
     }
 }

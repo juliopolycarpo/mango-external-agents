@@ -940,6 +940,139 @@ async fn session_listing_follows_what_the_agent_advertised() {
     assert_eq!(page.sessions[0].title.as_deref(), Some("Yesterday"));
 }
 
+/// A request the agent never answers remains in ACP's own pending-reply map after its future is
+/// dropped. The harness therefore has to close request admission and own cleanup on timeout rather
+/// than releasing a permit that would let another request accumulate behind the silent peer.
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_generic_request_closes_admission_and_reaps_the_silent_peer() {
+    let launcher = FakeLauncher::new();
+    launcher.push(SilentListingAgent::process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            request_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+    let session = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+
+    let timed_out = session
+        .list_sessions(Default::default())
+        .await
+        .expect_err("expected the silent list request to time out");
+    assert!(
+        matches!(timed_out.cause(), Error::Timeout { .. }),
+        "received {timed_out:?}"
+    );
+    let refused = session
+        .list_sessions(Default::default())
+        .await
+        .expect_err("timed-out request must close later generic admission");
+    assert!(
+        matches!(
+            refused.cause(),
+            Error::Closed {
+                subject: "ACP connection"
+            }
+        ),
+        "received {refused:?}"
+    );
+    assert_eq!(
+        launcher
+            .written()
+            .iter()
+            .filter(|line| line.contains("\"session/list\""))
+            .count(),
+        1,
+        "the closed admission must not queue a second silent request"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected owned shutdown to reap the silent peer");
+}
+
+/// A caller can abandon a generic request before its own deadline. ACP only queues a cancellation
+/// notification in that case, so the harness must still seal admission and let its owned teardown
+/// release the SDK's reply slot without waiting for another caller to close the session.
+#[tokio::test]
+async fn an_abandoned_generic_request_closes_admission_and_reaps_the_silent_peer() {
+    let launcher = FakeLauncher::new();
+    launcher.push(SilentListingAgent::process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            request_timeout: Duration::from_secs(30),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+    let opened = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+
+    let listing = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.list_sessions(Default::default()).await })
+    };
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"session/list\""))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the silent list request to enter ACP");
+    listing.abort();
+    let _ = listing.await;
+
+    let refused = session
+        .list_sessions(Default::default())
+        .await
+        .expect_err("abandonment must close later generic admission");
+    assert!(
+        matches!(
+            refused.cause(),
+            Error::Closed {
+                subject: "ACP connection"
+            }
+        ),
+        "received {refused:?}"
+    );
+    assert_eq!(
+        launcher
+            .written()
+            .iter()
+            .filter(|line| line.contains("\"session/list\""))
+            .count(),
+        1,
+        "the closed admission must not queue another silent request"
+    );
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected abandoned request cleanup to reap the silent peer");
+}
+
 /// Narrowing a turn below a mode-bearing session level looks harmless and is not. The agent stays in
 /// the mode `open_session` set, so it raises no permission request at all and the standing refusal has
 /// nothing to answer — the turn would run with full access while the harness reported `ReadOnly`.
@@ -1843,6 +1976,42 @@ struct GatedLauncher {
     kill_started: CancelToken,
     release_kill: CancelToken,
     fail_kill: bool,
+}
+
+/// An ACP peer that completes setup but deliberately never answers `session/list`.
+struct SilentListingAgent;
+
+impl SilentListingAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(line) else {
+                return Vec::new();
+            };
+            let Some(id) = request.get("id") else {
+                return Vec::new();
+            };
+            let response = |result: serde_json::Value| {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
+            };
+            match request.get("method").and_then(serde_json::Value::as_str) {
+                Some("initialize") => vec![response(serde_json::json!({
+                    "protocolVersion": 1,
+                    "agentInfo": { "name": "silent-listing", "version": "1.0.0" },
+                    "agentCapabilities": {
+                        "loadSession": true,
+                        "promptCapabilities": { "image": false, "embeddedContext": false },
+                        "sessionCapabilities": { "list": {} }
+                    },
+                    "authMethods": []
+                }))],
+                Some("session/new") => vec![response(serde_json::json!({
+                    "sessionId": "sess_silent"
+                }))],
+                Some("session/list") => Vec::new(),
+                _ => Vec::new(),
+            }
+        })
+    }
 }
 
 impl GatedLauncher {
