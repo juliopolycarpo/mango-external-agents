@@ -422,9 +422,27 @@ protocol evidence, not a record of a model answer, command, tool result, review 
 The approval fixture records a **refusal**. A fixture that captured a grant would be a recording of
 this tool letting an agent out of its sandbox, checked into the repository.
 
+## Structured content
+
+What an item reports reaches a host as structure rather than as one more line of `detail`:
+
+| Item                                | `ActivityContent`                                                                  |
+| ----------------------------------- | ---------------------------------------------------------------------------------- |
+| `fileChange.changes[]`              | `Diff { files }`, one `FileChange` per change, `diff` as the unified diff          |
+| `commandExecution.aggregatedOutput` | `Output { text }`, beside the detail that also carries the exit code               |
+| `plan.text`                         | nothing — freeform at this pin, and splitting it into steps would invent structure |
+
+`FileChange::kind` stays **absent**: the pinned schema states no per-file kind, and reading one off
+the diff text would be the re-parsing the type exists to prevent. Every activity carries the item's
+own id in `item_id`. A subagent's thread id is not carried either — the vendored inventory is a
+flattened property union across all nineteen item families, so it cannot say which family owns
+`agentThreadId`, and no captured frame carries it.
+
 ## Known gaps
 
 - No websocket or unix-socket transport (see above).
+- A subagent item's thread id is unmappable: see above.
+- Claude-style plan structure has no counterpart; `plan` is freeform text at this pin.
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
