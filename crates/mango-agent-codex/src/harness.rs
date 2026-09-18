@@ -213,8 +213,12 @@ impl Harness for CodexHarness {
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         mango_external_agents::configuration::refuse_unsupported_native(&request.configuration)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
-        let mcp_config = crate::mcp::override_for(&request.mcp_servers)
+        // No driven surface drops a host override back to config.toml defaults.
+        mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        let mcp_config =
+            crate::configuration::thread_override(&request.configuration, &request.mcp_servers)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let effective_transport = self
             .descriptor()
             .resolve_transport(request.transport)
@@ -318,9 +322,6 @@ async fn open_thread(
         return Err(Error::AuthRequired { login_hint });
     }
 
-    // Codex has no "drop my override and fall back to config.toml" semantics on any surface this
-    // harness drives, so a patch asking for one is refused rather than reported as applied.
-    mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)?;
     let vendor = crate::permissions::overrides(&request.configuration);
     let cwd = host.cwd().to_string_lossy().into_owned();
     let requested_model = request.configuration.model.set_value().cloned();
@@ -371,12 +372,13 @@ async fn open_thread(
         native_session_id: thread_id.clone(),
     };
 
-    // What this harness really put on the wire. `thread/start` and `thread/resume` have no
-    // `effort` field at all, so a patch asking for one at open time is honestly left out here
-    // rather than claimed as encoded.
+    // What this harness really put on the wire, after the app-server accepted the thread.
     let mut accepted = Configuration::unknown();
     if let Some(model) = &requested_model {
         accepted = accepted.with_model(model.clone());
+    }
+    if let Some(effort) = request.configuration.effort.set_value() {
+        accepted = accepted.with_effort(effort.clone());
     }
     if let Some(level) = request.configuration.level.set_value() {
         accepted = accepted.with_level(*level);

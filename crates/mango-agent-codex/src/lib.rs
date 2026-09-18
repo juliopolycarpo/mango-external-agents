@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod approvals;
+mod configuration;
 pub mod discovery;
 pub mod harness;
 mod mcp;

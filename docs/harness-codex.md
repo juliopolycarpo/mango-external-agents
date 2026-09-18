@@ -180,6 +180,16 @@ selection.
 Native reviews inherit the same current settings. Hosts use the shared `Session` trait and need
 no Codex-specific permission state machine.
 
+An explicit opening effort uses `config.model_reasoning_effort` on `thread/start` or
+`thread/resume`, alongside any host MCP entries. The [pinned protocol][thread-protocol] declares
+the request-scoped `config` field and the [official config reference][config-reference] names this
+key. Opening and per-turn model/effort IDs must be nonempty, bounded and free of control
+characters. Opaque model IDs remain valid without membership in a static catalog. The harness
+reports an effort as accepted only after the app-server accepts the thread; any effort the
+response reports stays separately observed.
+An isolated 0.154.0 app-server probe returned `reasoningEffort: high` for a
+`config.model_reasoning_effort: high` thread start and wrote no `config.toml`.
+
 ## Approvals
 
 Two of the server's questions are approvals a person can answer:

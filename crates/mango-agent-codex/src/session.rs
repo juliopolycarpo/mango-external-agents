@@ -2345,6 +2345,8 @@ impl Session for CodexSession {
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         refuse_unsupported_reset(&patch)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        crate::configuration::validate_ids(&patch)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let vendor = crate::permissions::overrides(&patch);
         let configuration = patch.requested();
 

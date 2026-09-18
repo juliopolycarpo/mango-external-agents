@@ -778,6 +778,68 @@ async fn host_mcp_servers_use_the_thread_config_override_without_widening_the_ch
     assert!(!launch.env.contains_key("CONNECTOR_SECRET"));
 }
 
+#[tokio::test]
+async fn opening_with_explicit_effort_applies_it_on_the_thread_and_reports_acceptance() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let mut request = OpenSession::new("chat-1");
+    request.configuration =
+        ConfigurationPatch::new().effort(ConfigurationChange::Set(String::from("high")));
+    let session = CodexHarness::new()
+        .open_session(&host, request)
+        .await
+        .expect("expected a supported per-thread effort override");
+
+    let start = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("thread/start"))
+        .expect("expected a thread start");
+    let frame: serde_json::Value = serde_json::from_str(&start).expect("expected JSON");
+    assert_eq!(frame["params"]["config"]["model_reasoning_effort"], "high");
+    assert_eq!(
+        session.snapshot().configuration.accepted.effort.as_deref(),
+        Some("high")
+    );
+}
+
+#[tokio::test]
+async fn malformed_explicit_effort_is_refused_before_opening_codex() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let mut request = OpenSession::new("chat-1");
+    request.configuration =
+        ConfigurationPatch::new().effort(ConfigurationChange::Set(String::from("high\nunsafe")));
+    let result = CodexHarness::new().open_session(&host, request).await;
+    assert!(
+        matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "a nonempty, bounded model or effort id without controls", .. })),
+        "expected a typed configuration refusal"
+    );
+    assert!(launcher.launches().is_empty(), "expected no vendor launch");
+}
+
+#[tokio::test]
+async fn malformed_turn_model_is_refused_without_submitting_a_prompt() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected an open thread");
+    let result = session
+        .start_turn(TurnRequest::new("turn-1", "hello").with_configuration(
+            ConfigurationPatch::new().model(ConfigurationChange::Set(String::from("bad\nmodel"))),
+        ))
+        .await;
+    assert!(
+        matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "a nonempty, bounded model or effort id without controls", .. }))
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("turn/start")),
+        "expected no prompt submission"
+    );
+}
+
 /// A pinned app-server resume error, with the captured handshake and new-thread answer.
 /// The fake owns the error injection so each test can assert the wire consequence.
 struct ResumeErrorServer {
@@ -3768,8 +3830,8 @@ async fn a_reset_requested_at_open_is_refused_rather_than_silently_dropped() {
     );
     assert_eq!(
         launcher.launches().len(),
-        1,
-        "expected the refusal before thread/start, not a vendor round trip"
+        0,
+        "expected the refusal before launching the vendor"
     );
     assert!(
         !launcher
