@@ -166,6 +166,14 @@ id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, 
 
 ## Permissions
 
+A withdrawn question resolves on both sides. The agent hears ACP's own `Cancelled` outcome; a host
+that was shown the prompt hears `ApprovalResolved` with `DecisionSource::Cancelled` and an option id
+of `withdrawn`, which is not one of the request's own options — naming one would tell an audit trail
+somebody picked it. The resolution is queued on the same path every other one uses, so it goes out
+ahead of the turn's terminal; one that loses that race is dropped with the queue, because a
+resolution after the terminal is worse than none. A question the host was never told about produces
+no resolution at all: there is nothing for it to close.
+
 Two axes, six cells, answered per profile by `profile::matrix`. Routing never varies — who answers an
 approval is the host's own arrangement (a `PermissionBroker`, or the `ApprovalRequested` event) and the
 agent cannot tell the difference. Level does, and the three cases are **not** symmetric:

@@ -172,6 +172,13 @@ impl Drop for WithdrawOnDrop<'_> {
     }
 }
 
+/// The option id a withdrawal reports, for a decision nobody chose.
+///
+/// Not one of the request's own options, and deliberately so: naming one would tell an audit trail
+/// that somebody picked it. `PermissionEffect::Other` on the decision says the same thing in the
+/// field a policy layer reads.
+const WITHDRAWN_OPTION_ID: &str = "withdrawn";
+
 /// One agent request waiting for either the harness or the host to answer it.
 ///
 /// A request remains harness-owned while a standing refusal or broker decision is in progress. Only
@@ -200,6 +207,31 @@ impl PendingApproval {
         self.turn.approvals.push(EventKind::ApprovalRequested {
             request: self.question.clone(),
         });
+    }
+
+    /// Takes the question back, telling both sides it will not be answered.
+    ///
+    /// The agent hears ACP's own `Cancelled` outcome. The host hears
+    /// [`EventKind::ApprovalResolved`] with [`DecisionSource::Cancelled`] — but only if it was ever
+    /// told about the question, because a resolution for a prompt nobody rendered is a row a host
+    /// has nothing to close. Without it a host that *did* render one keeps a dialog that never
+    /// closes: the agent is answered, the turn ends, and nothing ever says the ask is over.
+    ///
+    /// Registered rather than emitted, on the same queue every other resolution uses, so it goes
+    /// out ahead of the turn's terminal. A withdrawal that loses that race stays in the queue and
+    /// is dropped with it, which is the right outcome: a resolution after the terminal is the one
+    /// thing worse than no resolution.
+    fn withdraw(self) {
+        if self.announced {
+            self.turn.approvals.push(EventKind::ApprovalResolved {
+                interaction_id: self.question.id().clone(),
+                decision: ApprovalDecision::unresolved(
+                    WITHDRAWN_OPTION_ID,
+                    DecisionSource::Cancelled,
+                ),
+            });
+        }
+        let _ = self.responder.respond(permission::cancelled());
     }
 
     /// Publish a successful decision before prompt completion can flush the terminal.
@@ -370,7 +402,7 @@ impl SessionState {
         // park itself, and then be withdrawn by a drain meant for its predecessor. The permission
         // handler's first act is to take this guard, so holding it here closes the window; the
         // answers themselves go out after it drops.
-        let stale = self.take_pending_responders();
+        let stale = self.take_pending();
         let handle = TurnHandle {
             sink,
             level,
@@ -384,8 +416,8 @@ impl SessionState {
         *self.lock_reducer() = Reducer::new();
         *self.lock_cancel_reason() = None;
         drop(turn);
-        for responder in stale {
-            let _ = responder.respond(permission::cancelled());
+        for pending in stale {
+            pending.withdraw();
         }
         Ok(handle)
     }
@@ -471,11 +503,11 @@ impl SessionState {
         };
         let mut cancelling = self.lock_cancel_reason();
         cancelling.get_or_insert(reason);
-        let pending = self.take_pending_responders();
+        let pending = self.take_pending();
         drop(cancelling);
         turn.cancellation.cancel();
-        for responder in pending {
-            let _ = responder.respond(permission::cancelled());
+        for pending in pending {
+            pending.withdraw();
         }
         true
     }
@@ -523,12 +555,12 @@ impl SessionState {
             // These are all owned by the current turn. Capture them before releasing the slot: a
             // newly started prompt clears the reducer and may park approvals of its own.
             let reason = self.lock_cancel_reason().take();
-            let pending = self.take_pending_responders();
+            let pending = self.take_pending();
             let closing = self.lock_reducer().finish();
             (turn, reason, pending, closing)
         };
-        for responder in pending {
-            let _ = responder.respond(permission::cancelled());
+        for pending in pending {
+            pending.withdraw();
         }
         Some((turn, reason, closing))
     }
@@ -584,20 +616,17 @@ impl SessionState {
     ///
     /// Taken out from under the lock in one statement, so nothing is held while the answers go out.
     pub(crate) fn withdraw_pending(&self) {
-        for responder in self.take_pending_responders() {
-            let _ = responder.respond(permission::cancelled());
+        for pending in self.take_pending() {
+            pending.withdraw();
         }
     }
 
-    /// Empties the question map, handing back the responders each one still owes an answer.
+    /// Empties the question map, handing back every request that still owes an answer.
     ///
-    /// The four places a turn can end all owe the same debt, and each of them takes the responders
+    /// The four places a turn can end all owe the same debt, and each of them takes the requests
     /// out in one statement so nothing is held while the answers go out.
-    fn take_pending_responders(&self) -> Vec<Responder<RequestPermissionResponse>> {
-        self.lock_pending()
-            .drain()
-            .map(|(_, held)| held.responder)
-            .collect()
+    fn take_pending(&self) -> Vec<PendingApproval> {
+        self.lock_pending().drain().map(|(_, held)| held).collect()
     }
 
     /// Parks an agent question unless cancellation already won its race.
