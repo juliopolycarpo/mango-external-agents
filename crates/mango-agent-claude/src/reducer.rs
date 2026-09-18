@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{
-    Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, ErrorCode,
-    EventKind, VendorError,
+    Activity, ActivityContent, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
+    Command, ErrorCode, EventKind, FileChange, VendorError,
 };
 use serde_json::Value;
 
@@ -508,15 +508,23 @@ impl TurnReducer {
             return None;
         }
         self.open_activities.push(call_id.to_owned());
+        // Verbatim. `Read` is `Read`, and an MCP tool keeps its namespaced name: renaming
+        // another company's tools in a host's interface would misattribute the work.
+        let mut activity = Activity::new(
+            name,
+            activity_kind(name),
+            summarize_tool_input(block.input()),
+        )
+        // The call id is the only identity a `tool_use` block carries; for Claude it is also
+        // the item id, since this dialect never numbers a transcript item apart from the call
+        // that produced it.
+        .with_item_id(call_id);
+        if let Some(content) = file_change_content(name, block.input()) {
+            activity = activity.with_content(content);
+        }
         Some(EventKind::ActivityStarted {
             call_id: call_id.to_owned(),
-            // Verbatim. `Read` is `Read`, and an MCP tool keeps its namespaced name: renaming
-            // another company's tools in a host's interface would misattribute the work.
-            activity: Activity::new(
-                name,
-                activity_kind(name),
-                summarize_tool_input(block.input()),
-            ),
+            activity,
         })
     }
 
@@ -540,19 +548,28 @@ impl TurnReducer {
                 continue;
             }
             self.nested_text.remove(call_id);
+            let body = block.result_text();
+            // The structured content is the tool's own body, regardless of a held denial: a host
+            // reading `content` sees what the tool actually returned, while `detail` keeps the
+            // vendor's own statement of why the call was refused.
+            let content = detail_for(&body).map(|text| ActivityContent::Output { text });
             let detail = self
                 .denied_activities
                 .remove(call_id)
                 .map(Cow::Owned)
-                .unwrap_or_else(|| block.result_text());
+                .unwrap_or(body);
+            let mut result = ActivityResult::new(if block.is_error() {
+                ActivityStatus::Failed
+            } else {
+                ActivityStatus::Completed
+            })
+            .with_optional_detail(detail_for(&detail));
+            if let Some(content) = content {
+                result = result.with_content(content);
+            }
             events.push(EventKind::ActivityCompleted {
                 call_id: call_id.to_owned(),
-                result: ActivityResult::new(if block.is_error() {
-                    ActivityStatus::Failed
-                } else {
-                    ActivityStatus::Completed
-                })
-                .with_optional_detail(detail_for(&detail)),
+                result,
             });
         }
         events
@@ -701,6 +718,34 @@ fn summarize_tool_input(input: Option<&Value>) -> String {
         .to_owned()
 }
 
+/// A file-editing tool call's own input, as a diff a host can render as one.
+///
+/// Only `Write`'s `file_path`/`content` keys are mapped: they are the only ones evidenced by a
+/// fixture in this repository, `fixtures/claude/transcripts/denied-write-turn.jsonl`. `Edit`,
+/// `MultiEdit` and `NotebookEdit` are not — no captured transcript or existing test in this repo
+/// exercises them, and the pinned CLI's own `system/init.tools` list on both fixtures does not
+/// even enumerate `MultiEdit` or `ExitPlanMode` — so their input keys are left unguessed rather
+/// than assumed from Anthropic's public tool descriptions, which this harness has no fixture to
+/// hold it to.
+///
+/// `kind` is left absent on purpose: `Write` also overwrites a file that already exists, and
+/// nothing in this stream says which of the two happened for a given call.
+fn file_change_content(name: &str, input: Option<&Value>) -> Option<ActivityContent> {
+    if name != "Write" {
+        return None;
+    }
+    let Value::Object(fields) = input? else {
+        return None;
+    };
+    let path = fields.get("file_path")?.as_str()?;
+    let content = fields.get("content")?.as_str()?;
+    let mut change = FileChange::new(path);
+    change.new_text = Some(content.to_owned());
+    Some(ActivityContent::Diff {
+        files: vec![change],
+    })
+}
+
 /// A detail field, bounded, or nothing for text that says nothing.
 fn detail_for(detail: &str) -> Option<String> {
     let bounded = head(detail, DETAIL_CARRY_MAX_CHARS);
@@ -798,7 +843,7 @@ mod tests {
     };
     use crate::protocol::StreamRecord;
     use mango_external_agents::normalize::TextLimit;
-    use mango_external_agents::{ActivityKind, ActivityUpdate, EventKind};
+    use mango_external_agents::{ActivityContent, ActivityKind, ActivityUpdate, EventKind};
     use serde_json::json;
 
     /// The carry bound has to stay above the sink's, or a cut stops being reported.
@@ -930,6 +975,86 @@ mod tests {
         assert_eq!(summarize_tool_input(Some(&json!({"limit": 5}))), "");
         assert_eq!(summarize_tool_input(Some(&json!("scalar"))), "");
         assert_eq!(summarize_tool_input(None), "");
+    }
+
+    /// The vendor's own call id is the only identity a `tool_use` block carries. For Claude the
+    /// item id and the call id coincide — this stream draws no difference between "this activity"
+    /// and "this call" the way a vendor that numbers transcript items separately would.
+    #[test]
+    fn carries_the_tool_use_id_as_the_activitys_own_item_id() {
+        let mut reducer = TurnReducer::new();
+        let events = reduce(
+            &mut reducer,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_9","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        let EventKind::ActivityStarted { activity, .. } =
+            events.first().expect("expected a started activity")
+        else {
+            panic!("expected an activity_started event, received {events:?}");
+        };
+        assert_eq!(activity.item_id.as_deref(), Some("toolu_9"));
+    }
+
+    /// `Write`'s `file_path`/`content` keys are evidenced by
+    /// `fixtures/claude/transcripts/denied-write-turn.jsonl`. `kind` stays absent rather than
+    /// `Created`: `Write` also overwrites a file that already exists, and this reducer has no
+    /// evidence the vendor ever says which of the two happened.
+    #[test]
+    fn a_write_calls_input_becomes_a_diff_with_no_kind_asserted() {
+        let mut reducer = TurnReducer::new();
+        let events = reduce(
+            &mut reducer,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"/work/repo/new.txt","content":"hello"}}]}}"#,
+        );
+        let EventKind::ActivityStarted { activity, .. } =
+            events.first().expect("expected a started activity")
+        else {
+            panic!("expected an activity_started event, received {events:?}");
+        };
+        let Some(ActivityContent::Diff { files }) = &activity.content else {
+            panic!("expected diff content, received {:?}", activity.content);
+        };
+        assert_eq!(files.len(), 1, "received {files:?}");
+        assert_eq!(files[0].path, "/work/repo/new.txt");
+        assert_eq!(files[0].new_text.as_deref(), Some("hello"));
+        assert_eq!(files[0].old_text, None);
+        assert_eq!(
+            files[0].kind, None,
+            "expected no kind asserted for a Write, received {:?}",
+            files[0].kind
+        );
+    }
+
+    /// The structured result body is the tool's own, independent of what closed the activity's
+    /// `detail` — a held denial still wins the one-line detail, but a host reading `content` gets
+    /// what the tool actually returned rather than nothing at all.
+    #[test]
+    fn a_tool_results_body_becomes_output_content_even_when_a_denial_wins_the_detail() {
+        let mut reducer = TurnReducer::new();
+        let mut events = reduce(
+            &mut reducer,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"/work/x.txt"}}]}}"#,
+        );
+        events.extend(reduce(
+            &mut reducer,
+            r#"{"type":"system","subtype":"permission_denied","tool_use_id":"toolu_1","message":"denied by policy"}"#,
+        ));
+        events.extend(reduce(
+            &mut reducer,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"the tool's own body"}]}}"#,
+        ));
+        let EventKind::ActivityCompleted { result, .. } =
+            events.last().expect("expected a completion")
+        else {
+            panic!("expected the call to close, received {events:?}");
+        };
+        assert_eq!(result.detail.as_deref(), Some("denied by policy"));
+        assert_eq!(
+            result.content,
+            Some(ActivityContent::Output {
+                text: String::from("the tool's own body")
+            })
+        );
     }
 
     #[test]

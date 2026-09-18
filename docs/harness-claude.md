@@ -391,6 +391,19 @@ The reducer holds three properties, each with a fixture case behind it:
   `system/api_retry` and `rate_limit_event` all appear on one live run, and the vocabulary keeps
   growing. Only a `result` ends the turn.
 
+**Structured content** is carried, not flattened, where a fixture evidences the shape. Every
+activity the reducer starts sets `item_id` from the `tool_use` block's own `id` — Claude's dialect
+draws no difference between a call and the transcript item it produced, so the two coincide. A
+`Write` call's `file_path`/`content` become a single-file `ActivityContent::Diff`, with `kind` left
+absent because `Write` also overwrites a file that already exists and nothing in the stream says
+which of the two happened; that mapping and the item id are both pinned by
+`fixtures/claude/transcripts/denied-write-turn.jsonl`. A closing `tool_result`'s own body becomes
+`ActivityContent::Output` on the `ActivityResult`, independent of a held `system/permission_denied`
+reason, which still wins the one-line `detail`. `Edit`, `MultiEdit`, `NotebookEdit`, `TodoWrite` and
+`ExitPlanMode` are not mapped: no captured transcript in this repo exercises them, and the pinned
+build's own `system/init.tools` list does not even enumerate `MultiEdit` or `ExitPlanMode`. A
+`mea capture` of a turn that drives them is what would unblock the rest of this table.
+
 **Slash commands** are published by provenance. A build that states `terminal_slash_commands` is
 authoritative; one that does not publishes only the names whose origin the same record states — a
 skill, a plugin's `plugin:command`, an MCP server's `mcp__*`. Announcing nothing is not announcing
