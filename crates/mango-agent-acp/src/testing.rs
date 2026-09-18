@@ -54,6 +54,8 @@ pub struct FakeAcpAgent {
     protocol_version: u16,
     load_session: bool,
     supports_listing: bool,
+    holds_listing: bool,
+    listed_sessions: Option<Vec<serde_json::Value>>,
     supports_close: bool,
     modes: Vec<String>,
     approval: Approval,
@@ -77,6 +79,8 @@ pub struct FakeAcpAgent {
     reuse_request_id_for_second_ask: bool,
     /// The complete session configuration catalog returned by lifecycle and set-option calls.
     config_options: Option<Vec<serde_json::Value>>,
+    /// One config option that refuses its update after earlier options may have succeeded.
+    config_option_error: Option<(String, i32, String)>,
     updates: Vec<serde_json::Value>,
     stop_reason: String,
     version_output: String,
@@ -96,6 +100,8 @@ impl FakeAcpAgent {
             protocol_version: 1,
             load_session: true,
             supports_listing: false,
+            holds_listing: false,
+            listed_sessions: None,
             supports_close: false,
             modes: Vec::new(),
             approval: Approval::Never,
@@ -105,6 +111,7 @@ impl FakeAcpAgent {
             asks_when_closing: false,
             reuse_request_id_for_second_ask: false,
             config_options: None,
+            config_option_error: None,
             updates: vec![
                 serde_json::json!({
                     "sessionUpdate": "available_commands_update",
@@ -171,6 +178,22 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn listing_sessions(mut self) -> Self {
         self.supports_listing = true;
+        self
+    }
+
+    /// Advertises listing but leaves each `session/list` request unanswered.
+    #[must_use]
+    pub fn holding_listing(mut self) -> Self {
+        self.supports_listing = true;
+        self.holds_listing = true;
+        self
+    }
+
+    /// Returns these rows from `session/list` after the client asks for a workspace.
+    #[must_use]
+    pub fn with_listed_sessions(mut self, sessions: Vec<serde_json::Value>) -> Self {
+        self.supports_listing = true;
+        self.listed_sessions = Some(sessions);
         self
     }
 
@@ -250,6 +273,18 @@ impl FakeAcpAgent {
         self
     }
 
+    /// Refuses an update of this config option with the supplied JSON-RPC error.
+    #[must_use]
+    pub fn refusing_config_option(
+        mut self,
+        config_id: impl Into<String>,
+        code: i32,
+        message: impl Into<String>,
+    ) -> Self {
+        self.config_option_error = Some((config_id.into(), code, message.into()));
+        self
+    }
+
     /// Ends its turns with this stop reason.
     #[must_use]
     pub fn with_stop_reason(mut self, stop_reason: impl Into<String>) -> Self {
@@ -300,18 +335,21 @@ impl FakeAcpAgent {
                 (true, None) => vec![self.load_session_result(id, config_options)],
                 (false, _) => vec![error(id, -32601, "method not found")],
             },
-            (Some("session/list"), Some(id)) => vec![result(
-                id,
-                serde_json::json!({
-                    "sessions": [{ "sessionId": "sess_old", "cwd": "/repo", "title": "Yesterday" }]
-                }),
-            )],
+            (Some("session/list"), Some(_id)) if self.holds_listing => Vec::new(),
+            (Some("session/list"), Some(id)) => vec![result(id, self.list_result(&message))],
             (Some("session/set_mode"), Some(id)) => vec![result(id, serde_json::json!({}))],
             (Some("session/set_config_option"), Some(id)) => {
-                vec![result(
-                    id,
-                    self.set_config_option_result(&message, config_options),
-                )]
+                match self.config_option_error.as_ref() {
+                    Some((config_id, code, error_message))
+                        if message["params"]["configId"].as_str() == Some(config_id) =>
+                    {
+                        vec![error(id, *code, error_message)]
+                    }
+                    _ => vec![result(
+                        id,
+                        self.set_config_option_result(&message, config_options),
+                    )],
+                }
             }
             (Some("session/close"), Some(id)) => {
                 let mut lines = Vec::new();
@@ -358,6 +396,19 @@ impl FakeAcpAgent {
             },
             "authMethods": [],
         })
+    }
+
+    fn list_result(&self, request: &serde_json::Value) -> serde_json::Value {
+        let cwd = request["params"]["cwd"].as_str().unwrap_or("/repo");
+        let sessions = self.listed_sessions.clone().unwrap_or_else(|| {
+            vec![serde_json::json!({
+                "sessionId": "sess_old",
+                "cwd": cwd,
+                "title": "Yesterday",
+                "updatedAt": "2026-09-17T12:34:56Z"
+            })]
+        });
+        serde_json::json!({ "sessions": sessions })
     }
 
     fn session_result(

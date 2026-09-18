@@ -17,34 +17,39 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/initialization>
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ClientCapabilities, EnvVariable, FileSystemCapabilities, HttpHeader,
-    Implementation, InitializeRequest, LoadSessionRequest, McpServer as AcpMcpServer,
-    McpServerHttp, McpServerStdio, NewSessionRequest, SessionId as AcpSessionId, SessionModeState,
+    AgentCapabilities, BooleanConfigOptionCapabilities, ClientCapabilities,
+    ClientSessionCapabilities, EnvVariable, FileSystemCapabilities, HttpHeader, Implementation,
+    InitializeRequest, LoadSessionRequest, McpServer as AcpMcpServer, McpServerHttp,
+    McpServerStdio, NewSessionRequest, SessionConfigOptionsCapabilities, SessionId as AcpSessionId,
+    SessionModeState,
 };
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
 };
 use mango_external_agents::permission::PermissionMatrix;
 use mango_external_agents::session::{
-    McpServer, McpTransport, OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason,
+    McpServer, McpTransport, OpenSession, ResumeMode, Session, SessionIds, SessionPage,
+    SessionQuery, resume_fallback_reason,
 };
 use mango_external_agents::state::{SessionSnapshot, TransportSelection};
 use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
     AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery, Error,
     ExecutablePath, GateVerdict, Harness, HarnessDescriptor, HarnessIdentity, HostContext,
-    LaunchSpec, LineStream, Result, StdioSpec,
+    LaunchSpec, LineStream, Result, SessionId, StdioSpec,
 };
 
 use crate::client::{self, SessionState};
 use crate::profile::{AcpProfile, matrix};
 use crate::session::{
     AcpSession, accepted_axes, catalog_from_options, configuration_from_catalog,
-    refuse_unsupported_reset,
+    refuse_unsupported_reset, validate_listing_workspace,
 };
 use crate::transport;
 use crate::version::{self, Comparison};
@@ -192,6 +197,12 @@ impl AcpHarness {
         ClientCapabilities::default()
             .fs(FileSystemCapabilities::default())
             .terminal(false)
+            .session(
+                ClientSessionCapabilities::new().config_options(
+                    SessionConfigOptionsCapabilities::new()
+                        .boolean(BooleanConfigOptionCapabilities::new()),
+                ),
+            )
     }
 }
 
@@ -232,6 +243,78 @@ fn map_mcp_servers(
             }),
         })
         .collect()
+}
+
+/// Checks host-supplied MCP entries before a vendor process can observe them.
+fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for server in servers {
+        if mango_external_agents::normalize::opaque_id(&server.name, "MCP server name").is_err() {
+            return Err(Error::HostConfiguration {
+                expected: "a non-empty MCP server name without control characters",
+                received: String::from("an invalid MCP server name"),
+            });
+        }
+        if !names.insert(&server.name) {
+            return Err(Error::HostConfiguration {
+                expected: "unique MCP server names",
+                received: String::from("a duplicate MCP server name"),
+            });
+        }
+        match &server.transport {
+            McpTransport::Stdio { command, args, .. } => {
+                if !Path::new(command).is_absolute()
+                    || !mango_external_agents::normalize::is_argv_value_with_max(
+                        command,
+                        mango_external_agents::normalize::MAX_PATH_LENGTH,
+                    )
+                {
+                    return Err(Error::HostConfiguration {
+                        expected: "an absolute MCP stdio command path",
+                        received: String::from("a relative MCP stdio command"),
+                    });
+                }
+                if args
+                    .iter()
+                    .any(|argument| !mango_external_agents::normalize::is_argv_value(argument))
+                {
+                    return Err(Error::HostConfiguration {
+                        expected: "MCP stdio arguments with a value shape",
+                        received: String::from("an invalid MCP stdio argument"),
+                    });
+                }
+            }
+            McpTransport::Http { url, .. } if !is_http_mcp_url(url) => {
+                return Err(Error::HostConfiguration {
+                    expected: "an absolute http or https MCP URL without control characters",
+                    received: String::from("an invalid HTTP MCP URL"),
+                });
+            }
+            McpTransport::Http { .. } => {}
+            _ => {
+                return Err(Error::HostConfiguration {
+                    expected: "a stable ACP MCP transport",
+                    received: String::from("an unsupported MCP transport"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a host-provided MCP endpoint has the scheme and authority ACP can pass through.
+fn is_http_mcp_url(url: &str) -> bool {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    matches!(scheme, "http" | "https")
+        && remainder
+            .split('/')
+            .next()
+            .is_some_and(|authority| !authority.is_empty())
+        && url
+            .chars()
+            .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
 #[async_trait::async_trait]
@@ -282,6 +365,8 @@ impl Harness for AcpHarness {
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
         self.validate_open_session(host, &request)
+            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
+        validate_mcp_servers(&request.mcp_servers)
             .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
         refuse_unsupported_reset(&request.configuration)
             .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
@@ -424,6 +509,7 @@ impl Harness for AcpHarness {
             Arc::clone(&connection),
             opened.session_id,
             handshake.capabilities,
+            opened.modes.clone(),
         );
         let close = session.close_state();
 
@@ -515,6 +601,56 @@ impl Harness for AcpHarness {
             }
         });
         Ok(Box::new(session))
+    }
+
+    async fn list_native_sessions(
+        &self,
+        host: &HostContext,
+        query: SessionQuery,
+    ) -> Result<SessionPage> {
+        validate_listing_workspace(host, &query)?;
+        let spec =
+            AcpSpec::ChildPipes(StdioSpec::new(self.profile.resolved_argv(&self.executable)));
+        let launched =
+            transport::connect(host, &spec, self.descriptor.vendor_environment_keys).await?;
+        let session_id = SessionId::new("acp-listing");
+        let opening = SessionSnapshot::opening(
+            SessionIds {
+                session_id: session_id.clone(),
+                native_session_id: String::new(),
+            },
+            self.descriptor.identity.clone(),
+            TransportSelection::new(Some(TransportKind::Acp), TransportKind::Acp),
+            host.now(),
+        )
+        .with_configuration(ConfigurationState::unknown())
+        .with_catalog(ConfigurationCatalog::empty());
+        let snapshot = mango_external_agents::SessionState::new(Arc::clone(host.clock()), opening);
+        let state = Arc::new(SessionState::new(
+            session_id,
+            host,
+            Configuration::unknown(),
+            snapshot,
+        ));
+        let connection =
+            Arc::new(client::drive(launched, state, host.client_info().name.clone()).await?);
+        let connection = client::ConnectionShutdownGuard::new(connection);
+        let page = async {
+            let handshake = self.initialize(connection.connection(), host).await?;
+            crate::session::list_sessions(
+                connection.connection(),
+                &self.profile,
+                host,
+                &handshake.capabilities,
+                query,
+            )
+            .await
+        }
+        .await;
+        connection
+            .shutdown(mango_external_agents::CancelReason::Requested)
+            .await;
+        page
     }
 }
 

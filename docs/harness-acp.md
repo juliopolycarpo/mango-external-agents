@@ -172,6 +172,12 @@ explicit selection, later turns inherit it until another accepted override repla
 `Session::snapshot().configuration.accepted` reports that current selection. A rejected turn cannot
 change it.
 
+Configuration and prompt submission share one session gate. A patch is refused while a prompt is
+active, and a prompt cannot begin between two option requests. If an agent explicitly refuses a
+later option, the snapshot and partial outcome retain every earlier response-confirmed setting with
+`Rollback::NotAttempted`: ACP v1 defines no operation to reset an option safely. A timeout or link
+failure remains an error after publishing only the last confirmed state.
+
 ACP v1 returns `configOptions` from `session/new`, `session/load`, and every
 `session/set_config_option` response. The harness retains that complete agent-ordered catalog and
 its current values. It maps the unambiguous `model` and `thought_level` categories to the neutral
@@ -273,6 +279,9 @@ Everything declined: `fs.readTextFile`, `fs.writeTextFile` and `terminal` are al
 files and terminals, so an agent asking this client to write one would be asking the library to act on
 the host's filesystem on a third party's instruction. This is not a gap — every agent here has its own
 file and shell tools and uses them, which is what the activity events describe.
+
+The client also advertises `session.configOptions.boolean`, the ACP v1 capability needed for agents to
+offer boolean live configuration options. See [session configuration options](https://agentclientprotocol.com/protocol/v1/session-config-options).
 
 ## Profiles
 
@@ -379,9 +388,11 @@ conclusive stale-session reply (`session/load` code `-32002`), then records the 
 reason. Authentication, timeout, link, malformed-response, and other vendor failures do not grant
 permission to create a different conversation.
 
-`NativeSession::updated_at` is left absent even when `session/list` returns one: it is an RFC 3339
-string on the wire and a `SystemTime` in the core, and a date crate for one optional picker field is not
-worth the dependency.
+Harness-level listing creates a short-lived initialized connection and sends `session/list` without
+`session/new`. It always sends the host-authorised `cwd`, refuses a caller-supplied different
+workspace before launch, and excludes returned rows whose `cwd` differs. Valid RFC 3339 `updatedAt`
+strings become `NativeSession::updated_at`; malformed or absent timestamps remain unknown. This
+follows ACP's [session setup](https://agentclientprotocol.com/protocol/v1/session-setup) contract.
 
 ## Attachments
 
@@ -401,6 +412,10 @@ never going to work.
   `session/load.mcpServers`. Stdio preserves the host's name, command, arguments, and server-only
   environment. HTTP preserves name, endpoint, and headers only when `initialize` advertised
   `mcpCapabilities.http`; a request without that capability is refused before either lifecycle call.
+  Before any ACP process starts, every entry must have a unique valid name; a stdio command must be
+  an absolute, control-free path; arguments must have an argv value shape; and an HTTP endpoint must
+  be an absolute `http` or `https` URL without control text. The mapping follows
+  [ACP v1 session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
   ACP-over-HTTP remains unrelated and unsupported.
 - **Model selection.** ACP v1's documented session configuration surface carries model and
   reasoning selectors when an agent offers them. The harness never invents a static model catalog;

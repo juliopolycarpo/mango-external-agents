@@ -7,7 +7,10 @@ async fn stdio_mcp_servers_are_sent_on_session_new() {
     let mut request = mango_external_agents::OpenSession::new("mcp");
     request
         .mcp_servers
-        .push(mango_external_agents::McpServer::stdio("docs", "docs-mcp"));
+        .push(mango_external_agents::McpServer::stdio(
+            "docs",
+            "/usr/bin/docs-mcp",
+        ));
     let session = AcpHarness::builtin("cursor")
         .expect("expected Cursor profile")
         .open_session(&host(launcher.clone()), request)
@@ -23,7 +26,7 @@ async fn stdio_mcp_servers_are_sent_on_session_new() {
         request["params"]["mcpServers"],
         serde_json::json!([{
             "name": "docs",
-            "command": "docs-mcp",
+            "command": "/usr/bin/docs-mcp",
             "args": [],
             "env": [],
         }]),
@@ -33,6 +36,59 @@ async fn stdio_mcp_servers_are_sent_on_session_new() {
         .close(CloseReason::Requested)
         .await
         .expect("expected close");
+}
+
+/// Bad MCP entries are a host configuration error, before an ACP child can receive one.
+#[tokio::test]
+async fn malformed_mcp_servers_are_not_submitted_or_spawned() {
+    let cases = [
+        vec![mango_external_agents::McpServer::stdio(
+            "",
+            "/usr/bin/docs-mcp",
+        )],
+        vec![mango_external_agents::McpServer::stdio(
+            "docs",
+            "relative-mcp",
+        )],
+        vec![
+            mango_external_agents::McpServer::stdio("docs", "/usr/bin/docs-mcp"),
+            mango_external_agents::McpServer::stdio("docs", "/usr/bin/other-mcp"),
+        ],
+        vec![mango_external_agents::McpServer::stdio(
+            "docs",
+            "/usr/bin/docs\u{1b}mcp",
+        )],
+    ];
+    for servers in cases {
+        let launcher = Arc::new(FakeLauncher::new());
+        let mut request = mango_external_agents::OpenSession::new("mcp");
+        request.mcp_servers = servers;
+        let result = AcpHarness::builtin("cursor")
+            .expect("expected Cursor profile")
+            .open_session(&host(launcher.clone()), request)
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected invalid MCP settings to be refused before launch"),
+        };
+        assert_eq!(
+            error.dispatch(),
+            mango_external_agents::Dispatch::NotSubmitted,
+            "expected a retry-safe pre-launch refusal, received {error:?}"
+        );
+        assert!(
+            matches!(
+                error.cause(),
+                mango_external_agents::Error::HostConfiguration { .. }
+            ),
+            "expected a typed host configuration refusal, received {error:?}"
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected no ACP child for invalid MCP settings, received {:?}",
+            launcher.launches()
+        );
+    }
 }
 
 #[tokio::test]

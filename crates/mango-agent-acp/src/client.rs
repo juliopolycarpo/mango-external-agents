@@ -976,6 +976,44 @@ impl Drop for RequestAbandonment {
     }
 }
 
+/// Owns a short-lived connection until its request completes or the caller cancels it.
+///
+/// Listing has no session handle that could close the child later. This guard makes cancellation of
+/// that picker request take the same shutdown path as an explicit close.
+pub(crate) struct ConnectionShutdownGuard {
+    connection: Arc<ConnectionHandle>,
+}
+
+impl ConnectionShutdownGuard {
+    /// Starts a scope that ends the connection when it leaves the async call.
+    pub(crate) fn new(connection: Arc<ConnectionHandle>) -> Self {
+        Self { connection }
+    }
+
+    /// The live connection while the scope remains active.
+    pub(crate) fn connection(&self) -> &ConnectionHandle {
+        &self.connection
+    }
+
+    /// Ends the child before the normal scope exit.
+    pub(crate) async fn shutdown(&self, reason: mango_external_agents::CancelReason) {
+        self.connection.shutdown(reason).await;
+    }
+}
+
+impl Drop for ConnectionShutdownGuard {
+    fn drop(&mut self) {
+        let connection = Arc::clone(&self.connection);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                connection
+                    .shutdown(mango_external_agents::CancelReason::Shutdown)
+                    .await;
+            });
+        }
+    }
+}
+
 impl std::fmt::Debug for ConnectionHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

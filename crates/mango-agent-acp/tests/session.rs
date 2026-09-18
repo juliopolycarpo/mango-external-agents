@@ -16,8 +16,8 @@ use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
     Configuration, ConfigurationChange, ConfigurationOptionId, ConfigurationPatch,
     ConfigurationValue, DecisionSource, Dispatch, Error, EventKind, Harness, HostContext, Limits,
-    OpenSession, PermissionLevel, Session, SessionStatus, SessionSubscription, TurnRequest,
-    TurnStream, VendorInfo,
+    ManagedProcess, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, Session,
+    SessionStatus, SessionSubscription, TurnRequest, TurnStream, VendorInfo,
 };
 
 const VENDOR: VendorInfo = VendorInfo {
@@ -42,6 +42,40 @@ fn host(launcher: &FakeLauncher) -> HostContext {
         })
         .build()
         .expect("expected a host")
+}
+
+/// A launcher that exposes the child control injected into a short-lived picker connection.
+#[derive(Clone, Default)]
+struct CapturingLauncher {
+    inner: FakeLauncher,
+    control: Arc<Mutex<Option<Arc<dyn ProcessControl>>>>,
+}
+
+impl CapturingLauncher {
+    fn push(&self, process: FakeProcess) {
+        self.inner.push(process);
+    }
+
+    fn child(&self) -> Arc<dyn ProcessControl> {
+        self.control
+            .lock()
+            .expect("expected captured child state")
+            .clone()
+            .expect("expected picker child")
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for CapturingLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<ManagedProcess> {
+        let process = self.inner.spawn(spec).await?;
+        *self.control.lock().expect("expected captured child state") =
+            Some(Arc::clone(&process.control));
+        Ok(process)
+    }
 }
 
 fn host_with_clock(launcher: &FakeLauncher, clock: Arc<dyn Clock>) -> HostContext {
@@ -1072,6 +1106,145 @@ async fn an_abandoned_generic_request_closes_admission_and_reaps_the_silent_peer
     })
     .await
     .expect("expected abandoned request cleanup to reap the silent peer");
+}
+
+/// Picker listing uses a short-lived initialized ACP connection; it must never create a conversation.
+#[tokio::test]
+async fn harness_listing_is_workspace_bound_before_any_conversation_opens() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().listing_sessions().process());
+    let harness = AcpHarness::new(profile());
+    let host = host(&launcher);
+    let page = harness
+        .list_sessions(&host, Default::default())
+        .await
+        .expect("expected the advertised picker listing");
+    assert_eq!(page.sessions.len(), 1);
+    assert_eq!(
+        page.sessions[0].workspace_path.as_deref(),
+        host.cwd().to_str()
+    );
+    assert!(
+        page.sessions[0].updated_at.is_some(),
+        "expected RFC3339 updatedAt to map"
+    );
+    let requests = launcher.written();
+    assert!(
+        requests
+            .iter()
+            .any(|line| line.contains("\"session/list\"")),
+        "expected session/list, received {requests:?}"
+    );
+    assert!(
+        !requests.iter().any(|line| line.contains("\"session/new\"")),
+        "expected picker listing not to create a conversation, received {requests:?}"
+    );
+    let list: serde_json::Value = requests
+        .iter()
+        .find(|line| line.contains("\"session/list\""))
+        .map(|line| serde_json::from_str(line).expect("expected JSON-RPC"))
+        .expect("expected session/list request");
+    assert_eq!(list["params"]["cwd"], host.cwd().display().to_string());
+}
+
+/// A caller cannot use an ACP picker to query a directory the host did not authorize.
+#[tokio::test]
+async fn harness_listing_refuses_a_different_workspace_before_launch() {
+    let launcher = FakeLauncher::new();
+    let harness = AcpHarness::new(profile());
+    let error = harness
+        .list_sessions(
+            &host(&launcher),
+            mango_external_agents::SessionQuery {
+                workspace_path: Some("/another/workspace".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("expected a cross-workspace picker query to be refused");
+    assert!(
+        matches!(error, Error::HostConfiguration { .. }),
+        "received {error:?}"
+    );
+    assert!(
+        launcher.launches().is_empty(),
+        "expected no child, received {:?}",
+        launcher.launches()
+    );
+}
+
+/// Aborting a picker while its list request is held still ends the injected child process.
+#[tokio::test]
+async fn aborting_harness_listing_shuts_down_its_short_lived_child() {
+    let launcher = CapturingLauncher::default();
+    launcher.push(FakeAcpAgent::new().holding_listing().process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .build()
+        .expect("expected a host");
+    let harness = Arc::new(AcpHarness::new(profile()));
+    let task = tokio::spawn({
+        let harness = Arc::clone(&harness);
+        let host = host.clone();
+        async move { harness.list_sessions(&host, Default::default()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !launcher
+            .inner
+            .written()
+            .iter()
+            .any(|line| line.contains("\"session/list\""))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the fake to hold session/list");
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(Duration::from_secs(4), launcher.child().wait())
+        .await
+        .expect("expected the dropped picker scope to kill its child")
+        .expect("expected child cleanup to succeed");
+}
+
+/// Rows outside the host workspace and malformed timestamps never reach a picker as local sessions.
+#[tokio::test]
+async fn listing_filters_foreign_rows_and_keeps_only_valid_updated_at() {
+    let launcher = FakeLauncher::new();
+    let workspace = std::env::temp_dir().display().to_string();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_listed_sessions(vec![
+                serde_json::json!({
+                    "sessionId": "foreign", "cwd": "/another/workspace", "title": "Foreign",
+                    "updatedAt": "2026-09-17T12:34:56Z"
+                }),
+                serde_json::json!({ "sessionId": "missing-cwd", "title": "Malformed" }),
+                serde_json::json!({
+                    "sessionId": "bad-time", "cwd": workspace, "title": "Local",
+                    "updatedAt": "not-a-timestamp"
+                }),
+            ])
+            .process(),
+    );
+    let harness = AcpHarness::new(profile());
+    let page = harness
+        .list_sessions(&host(&launcher), Default::default())
+        .await
+        .expect("expected the safe local listing");
+    assert_eq!(
+        page.sessions.len(),
+        1,
+        "expected the foreign row to be excluded"
+    );
+    assert_eq!(page.sessions[0].native_session_id, "bad-time");
+    assert_eq!(
+        page.sessions[0].updated_at, None,
+        "expected malformed RFC3339 to stay unknown"
+    );
 }
 
 /// Narrowing a turn below a mode-bearing session level looks harmless and is not. The agent stays in
@@ -2420,6 +2593,11 @@ async fn the_handshake_declines_the_filesystem_and_terminal_and_names_the_host()
     assert_eq!(capabilities["fs"]["readTextFile"], false);
     assert_eq!(capabilities["fs"]["writeTextFile"], false);
     assert_eq!(capabilities["terminal"], false);
+    assert_eq!(
+        capabilities["session"]["configOptions"]["boolean"],
+        serde_json::json!({}),
+        "expected the pinned ACP v1 boolean config-option capability"
+    );
     session
         .close(CloseReason::Requested)
         .await
@@ -2602,6 +2780,128 @@ async fn a_live_acp_catalog_is_applied_between_turns_and_reports_current_values(
     );
 }
 
+/// Accepted ACP defaults survive a later prompt whose request leaves configuration at `keep`.
+#[tokio::test]
+async fn a_turn_keeps_the_last_accepted_model_effort_and_native_settings() {
+    let agent = FakeAcpAgent::new().with_config_options(vec![
+        serde_json::json!({
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": "small", "options": [
+                { "value": "small", "name": "Small" }, { "value": "large", "name": "Large" }
+            ]
+        }),
+        serde_json::json!({
+            "id": "thought", "name": "Thought", "category": "thought_level", "type": "select",
+            "currentValue": "low", "options": [
+                { "value": "low", "name": "Low" }, { "value": "high", "name": "High" }
+            ]
+        }),
+        serde_json::json!({ "id": "web-search", "name": "Web", "type": "boolean", "currentValue": false }),
+    ]);
+    let (session, _) = open(agent, ConfigurationPatch::new()).await;
+    session
+        .configure(
+            ConfigurationPatch::new()
+                .model(ConfigurationChange::Set(String::from("large")))
+                .effort(ConfigurationChange::Set(String::from("high")))
+                .native(
+                    ConfigurationOptionId::new("web-search"),
+                    ConfigurationChange::Set(ConfigurationValue::Boolean(true)),
+                ),
+        )
+        .await
+        .expect("expected all three settings to be accepted");
+    let mut turn = session
+        .start_turn(TurnRequest::new("inherit-settings", "continue"))
+        .await
+        .expect("expected a turn without configuration overrides");
+    let _ = drain(&mut turn).await;
+    let accepted = &session.snapshot().configuration.accepted;
+    assert_eq!(accepted.model.as_deref(), Some("large"));
+    assert_eq!(accepted.effort.as_deref(), Some("high"));
+    assert_eq!(
+        accepted
+            .native
+            .get(&ConfigurationOptionId::new("web-search")),
+        Some(&ConfigurationValue::Boolean(true)),
+        "expected the last vendor-confirmed native setting to persist"
+    );
+}
+
+/// A later explicit vendor refusal reports the preceding confirmed settings as a partial outcome.
+#[tokio::test]
+async fn a_later_config_option_refusal_publishes_the_confirmed_partial_state() {
+    let agent = FakeAcpAgent::new()
+        .with_config_options(vec![
+            serde_json::json!({
+                "id": "model", "name": "Model", "category": "model", "type": "select",
+                "currentValue": "small", "options": [
+                    { "value": "small", "name": "Small" }, { "value": "large", "name": "Large" }
+                ]
+            }),
+            serde_json::json!({ "id": "web-search", "name": "Web", "type": "boolean", "currentValue": false }),
+        ])
+        .refusing_config_option("web-search", -32001, "option rejected");
+    let (session, _) = open(agent, ConfigurationPatch::new()).await;
+    let outcome = session
+        .configure(
+            ConfigurationPatch::new()
+                .model(ConfigurationChange::Set(String::from("large")))
+                .native(
+                    ConfigurationOptionId::new("web-search"),
+                    ConfigurationChange::Set(ConfigurationValue::Boolean(true)),
+                ),
+        )
+        .await
+        .expect("expected a vendor refusal to produce a partial configuration outcome");
+    assert!(
+        outcome.is_partial(),
+        "expected partial outcome, received {outcome:?}"
+    );
+    assert_eq!(
+        outcome.rollback,
+        mango_external_agents::Rollback::NotAttempted
+    );
+    assert_eq!(
+        session.snapshot().configuration.accepted.model.as_deref(),
+        Some("large"),
+        "expected the preceding response-confirmed model to remain visible"
+    );
+    assert_eq!(
+        session
+            .snapshot()
+            .configuration
+            .accepted
+            .native
+            .get(&ConfigurationOptionId::new("web-search")),
+        None,
+        "expected the refused native setting not to be reported as accepted"
+    );
+}
+
+/// A profile without a full-access mode cannot claim that an ACP configuration applied it.
+#[tokio::test]
+async fn configuration_refuses_full_access_when_the_profile_has_no_matching_mode() {
+    let (session, _) = open(FakeAcpAgent::new(), ConfigurationPatch::new()).await;
+    let outcome = session
+        .configure(
+            at_level(PermissionLevel::FullAccess)
+                .routing(ConfigurationChange::Set(ApprovalRouting::User)),
+        )
+        .await
+        .expect("expected a typed partial configuration outcome");
+    assert!(
+        !outcome.is_complete(),
+        "expected full access to be rejected"
+    );
+    assert_eq!(session.snapshot().configuration.accepted.level, None);
+    assert_eq!(
+        session.snapshot().configuration.accepted.routing,
+        None,
+        "expected the paired routing not to be claimed after the level rejection"
+    );
+}
+
 /// ACP can replace its complete configuration catalog while a session is live.
 ///
 /// The update is session state, so it must reach the snapshot without becoming turn transcript.
@@ -2653,6 +2953,44 @@ async fn a_config_option_update_replaces_the_live_catalog_and_observed_values() 
         .close(CloseReason::Requested)
         .await
         .expect("expected close");
+}
+
+/// Option rows cross from an external agent into a host snapshot through the catalog normalizer.
+#[tokio::test]
+async fn catalog_rows_are_bounded_on_open_and_on_config_option_updates() {
+    let oversized = format!("unsafe\u{1b}{}", "x".repeat(400));
+    let initial = serde_json::json!({
+        "id": "\u{0}", "name": oversized, "type": "boolean", "currentValue": false
+    });
+    let updated = serde_json::json!({
+        "id": "safe", "name": oversized, "type": "boolean", "currentValue": true
+    });
+    let agent = FakeAcpAgent::new()
+        .with_config_options(vec![initial])
+        .with_updates(vec![serde_json::json!({
+            "sessionUpdate": "config_option_update", "configOptions": [updated]
+        })]);
+    let (session, _) = open(agent, ConfigurationPatch::new()).await;
+    assert!(
+        session.snapshot().catalog.options().is_empty(),
+        "expected the malformed initial id to be dropped"
+    );
+    let mut turn = session
+        .start_turn(TurnRequest::new("catalog-normalization", "hello"))
+        .await
+        .expect("expected a turn");
+    let _ = drain(&mut turn).await;
+    let snapshot = session.snapshot();
+    let option = &snapshot.catalog.options()[0];
+    let name = option.name.as_deref().expect("expected a normalized name");
+    assert!(
+        name.chars().count() <= 256,
+        "expected bounded name, received {name:?}"
+    );
+    assert!(
+        !name.contains('\u{1b}'),
+        "expected control text removed, received {name:?}"
+    );
 }
 
 /// The contract a host is entitled to assume, run against the real harness.
