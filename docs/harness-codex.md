@@ -364,7 +364,6 @@ this tool letting an agent out of its sandbox, checked into the repository.
 ## Known gaps
 
 - No websocket or unix-socket transport (see above).
-- No MCP passthrough (see above).
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
