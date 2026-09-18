@@ -158,7 +158,9 @@ reaches a host as `content` rather than being flattened:
 A diff block wins the one content slot on a call that sends both; the text alongside it is treated as
 commentary and stays in `detail` — this crate does not synthesise a unified diff from `old_text` and
 `new_text`, or a `FileChange` from `locations`, which reaches a host only as a bounded count under
-`extensions["locations"]`. `raw_input`/`raw_output` never reach a host: both are unbounded vendor
+`extensions["locationCount"]` — named for what it is rather than for the vendor's field, because a
+key called `locations` holding a number tells a host the paths are in there and the scalar-only
+extension channel means they never can be. `raw_input`/`raw_output` never reach a host: both are unbounded vendor
 payloads. The tool-call activity's `item_id` is the same string as its call id, ACP naming no separate
 id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, not the agent's.
 

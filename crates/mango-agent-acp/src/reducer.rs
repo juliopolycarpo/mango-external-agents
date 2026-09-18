@@ -453,14 +453,19 @@ fn tool_call_content(content: &[ToolCallContent]) -> Option<ActivityContent> {
 ///
 /// `locations` is a list of paths the call touched or will touch, not itself a diff — carrying it
 /// whole would duplicate what `tool_call_content` already carries for a call that sends diffs, and
-/// invent structure for one that does not. A count is the one honest, bounded fact left, keyed by
-/// the vendor's own field name.
+/// invent structure for one that does not. A count is the one honest, bounded fact left.
+///
+/// Keyed `locationCount` rather than by the vendor's own field name, which is the one place this
+/// crate departs from "key it as the vendor spelled it". A key named `locations` holding a number
+/// tells a host the paths are in there; the extension channel is scalar-only, so they never can be,
+/// and a name that promises a list nothing will ever deliver is worse than a name the vendor did
+/// not write.
 fn locations_extension(locations: &[ToolCallLocation]) -> Option<Extensions> {
     if locations.is_empty() {
         return None;
     }
     let count = i64::try_from(locations.len()).unwrap_or(i64::MAX);
-    Some(Extensions::new().with("locations", ExtensionValue::Integer(count)))
+    Some(Extensions::new().with("locationCount", ExtensionValue::Integer(count)))
 }
 
 fn plan_title(plan: &Plan) -> String {
@@ -921,7 +926,7 @@ mod tests {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(
-            activity.extensions.get("locations"),
+            activity.extensions.get("locationCount"),
             Some(&ExtensionValue::Integer(2)),
             "received {:?}",
             activity.extensions
