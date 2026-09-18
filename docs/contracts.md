@@ -188,6 +188,12 @@ Two fields inside `FileChange` are deliberately optional for the same reason:
 `PlanStep::priority` is on the same terms: present where the vendor ranks its steps, absent where it
 does not — an unranked step is one nobody ranked, not a low-priority one.
 
+A diff's **bodies share a budget**, `DIFF_MAX_CONTENT_LENGTH`. Each of a `FileChange`'s three is
+bounded on its own, which stops any one of them being a payload channel and does not stop 256 of
+them together: the per-file ceilings multiply out to megabytes against a turn buffer a host sizes in
+megabytes. Files past the budget keep their row — the path and the counts, which is what a host
+lists — and lose their contents, and `truncated` says so.
+
 `Extensions` is the long tail: a flat, scalar-only map, capped at 32 entries, with bounded keys and
 values, run through the same credential redaction a stderr tail is. It is **observational**.
 Nothing read from it is executed, dispatched or turned into an RPC, and there is deliberately no

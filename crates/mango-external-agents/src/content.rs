@@ -22,6 +22,16 @@ pub const PLAN_MAX_STEPS: usize = 128;
 /// How many files one diff summary may carry.
 pub const DIFF_MAX_FILES: usize = 256;
 
+/// How many code points of file *contents* one diff summary may carry in total.
+///
+/// Each of [`FileChange`]'s three bodies is bounded on its own, which is enough to stop any one of
+/// them being a payload channel and not enough to stop [`DIFF_MAX_FILES`] of them together: the
+/// per-file ceilings multiply out to megabytes, against a turn buffer a host sizes in megabytes.
+/// So the bodies share a budget. Files past it keep their row — the path and the counts, which is
+/// what a host lists — and lose their contents, because knowing *which* files changed is worth more
+/// than the first few bodies and costs almost nothing.
+pub const DIFF_MAX_CONTENT_LENGTH: usize = 256 * 1024;
+
 /// Where one plan step stands.
 #[derive(
     Clone,
@@ -350,6 +360,30 @@ impl FileChange {
         self.normalized_with_truncation().0
     }
 
+    /// This change with every body dropped, keeping the row that says which file it was.
+    #[must_use]
+    fn without_contents(self) -> Self {
+        Self {
+            unified_diff: None,
+            old_text: None,
+            new_text: None,
+            ..self
+        }
+    }
+
+    /// How many code points its three bodies hold together.
+    fn content_length(&self) -> usize {
+        [
+            self.unified_diff.as_deref(),
+            self.old_text.as_deref(),
+            self.new_text.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|body| body.chars().count())
+        .sum()
+    }
+
     /// The same, saying whether any of its three bodies was cut.
     ///
     /// A dropped row is reported by the caller, which is the only one that knows a row went
@@ -466,15 +500,26 @@ impl ActivityContent {
             Self::Diff { files } => {
                 let offered = files.len();
                 let mut truncated = false;
-                let files: Vec<FileChange> = files
-                    .into_iter()
-                    .filter_map(|file| {
-                        let (file, cut) = file.normalized_with_truncation();
-                        truncated |= cut;
-                        file
-                    })
-                    .take(DIFF_MAX_FILES)
-                    .collect();
+                let mut spent = 0usize;
+                let mut carried: Vec<FileChange> = Vec::with_capacity(offered.min(DIFF_MAX_FILES));
+                for file in files {
+                    if carried.len() == DIFF_MAX_FILES {
+                        break;
+                    }
+                    let (file, cut) = file.normalized_with_truncation();
+                    truncated |= cut;
+                    let Some(file) = file else {
+                        continue;
+                    };
+                    spent = spent.saturating_add(file.content_length());
+                    if spent <= DIFF_MAX_CONTENT_LENGTH {
+                        carried.push(file);
+                        continue;
+                    }
+                    truncated = true;
+                    carried.push(file.without_contents());
+                }
+                let files = carried;
                 truncated |= files.len() < offered;
                 (Self::Diff { files }, truncated)
             }
@@ -489,8 +534,8 @@ impl ActivityContent {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityContent, DIFF_MAX_FILES, FileChange, FileChangeKind, PLAN_MAX_STEPS, PlanStep,
-        PlanStepStatus,
+        ActivityContent, DIFF_MAX_CONTENT_LENGTH, DIFF_MAX_FILES, FileChange, FileChangeKind,
+        PLAN_MAX_STEPS, PlanStep, PlanStepStatus,
     };
 
     /// A host cannot render a checklist from a paragraph, which is what folding a plan into detail
@@ -592,6 +637,52 @@ mod tests {
             panic!("expected a diff");
         };
         assert_eq!(files.len(), DIFF_MAX_FILES);
+    }
+
+    /// Per-file bounds stop any one body being a payload channel; they do not stop 256 of them
+    /// together, which multiply out to megabytes against a turn buffer a host sizes in megabytes.
+    /// The rows survive — which files changed is what a host lists — and the bodies stop.
+    #[test]
+    fn a_diffs_bodies_share_a_budget_and_the_rows_past_it_keep_their_paths() {
+        let body = "x".repeat(4_000);
+        let ActivityContent::Diff { files } = (ActivityContent::Diff {
+            files: (0..200)
+                .map(|index| {
+                    FileChange::new(format!("src/file{index}.rs"))
+                        .with_new_text(body.clone())
+                        .with_line_counts(10, 2)
+                })
+                .collect(),
+        })
+        .normalized() else {
+            panic!("expected a diff");
+        };
+
+        assert_eq!(files.len(), 200, "every row survives");
+        assert!(
+            files[0].new_text.is_some(),
+            "the first bodies are carried, received {:?}",
+            files[0]
+        );
+        assert_eq!(
+            files[199].new_text, None,
+            "a body past the budget is dropped, received {:?}",
+            files[199]
+        );
+        assert_eq!(
+            files[199].added_lines,
+            Some(10),
+            "the row keeps what a host lists it by"
+        );
+        let carried: usize = files
+            .iter()
+            .filter_map(|file| file.new_text.as_deref())
+            .map(|text| text.chars().count())
+            .sum();
+        assert!(
+            carried <= DIFF_MAX_CONTENT_LENGTH,
+            "expected at most {DIFF_MAX_CONTENT_LENGTH} code points of contents, received {carried}"
+        );
     }
 
     #[test]
