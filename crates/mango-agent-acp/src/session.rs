@@ -646,9 +646,10 @@ pub(crate) async fn list_sessions(
     if capabilities.session_capabilities.list.is_none() {
         return Err(Error::not_supported(Capability::SessionListing));
     }
+    let workspace = host.absolute_cwd()?;
     validate_listing_workspace(host, &query)?;
     let limit = query.limit.unwrap_or(SESSION_PAGE_LIMIT);
-    let mut request = ListSessionsRequest::new().cwd(host.cwd().to_path_buf());
+    let mut request = ListSessionsRequest::new().cwd(std::path::PathBuf::from(workspace));
     if let Some(cursor) = query.cursor {
         request = request.cursor(cursor);
     }
@@ -660,7 +661,7 @@ pub(crate) async fn list_sessions(
         request,
     )
     .await?;
-    let workspace = host.cwd().display().to_string();
+    let workspace = String::from(workspace);
     let sessions: Vec<NativeSession> = response
         .sessions
         .into_iter()

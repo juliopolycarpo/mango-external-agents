@@ -396,6 +396,8 @@ impl Harness for AcpHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
+        host.absolute_cwd()
+            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
         self.validate_open_session(host, &request)
             .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
         validate_mcp_servers(&request.mcp_servers)
@@ -635,6 +637,7 @@ impl Harness for AcpHarness {
         host: &HostContext,
         query: SessionQuery,
     ) -> Result<SessionPage> {
+        host.absolute_cwd()?;
         validate_listing_workspace(host, &query)?;
         let spec =
             AcpSpec::ChildPipes(StdioSpec::new(self.profile.resolved_argv(&self.executable)));

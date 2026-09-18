@@ -1459,6 +1459,57 @@ async fn harness_listing_refuses_a_different_workspace_before_launch() {
     );
 }
 
+/// ACP puts the workspace on `session/new`, `session/load`, and `session/list`; a relative host
+/// path must be rejected before any of those requests can cause the launcher to create a child.
+#[tokio::test]
+async fn acp_refuses_a_noncanonical_workspace_before_launch() {
+    let launcher = FakeLauncher::new();
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd("relative-workspace")
+        .client_info("mea-tests", "0.1.0")
+        .build()
+        .expect("expected a host");
+    let harness = AcpHarness::new(profile());
+
+    let opening = refusal(
+        harness
+            .open_session(&host, OpenSession::new("relative-workspace"))
+            .await,
+    );
+    assert!(
+        matches!(
+            opening.cause(),
+            Error::HostConfiguration {
+                expected: "an absolute, lexically normalized UTF-8 workspace path",
+                ..
+            }
+        ),
+        "received {opening:?}"
+    );
+    assert_eq!(opening.dispatch(), Dispatch::NotSubmitted);
+
+    let listing = harness
+        .list_sessions(&host, Default::default())
+        .await
+        .expect_err("expected a noncanonical picker workspace to be refused");
+    assert!(
+        matches!(
+            listing.cause(),
+            Error::HostConfiguration {
+                expected: "an absolute, lexically normalized UTF-8 workspace path",
+                ..
+            }
+        ),
+        "received {listing:?}"
+    );
+    assert!(
+        launcher.launches().is_empty(),
+        "expected no child for either invalid workspace request, received {:?}",
+        launcher.launches()
+    );
+}
+
 /// Aborting a picker while its list request is held still ends the injected child process.
 #[tokio::test]
 async fn aborting_harness_listing_shuts_down_its_short_lived_child() {
