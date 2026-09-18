@@ -791,11 +791,13 @@ fn record_stop_locked(
     reason: CancelReason,
     settled: bool,
 ) {
+    let mut owns_active_turn = false;
     let should_clear = if let Some(active) = state
         .active
         .as_mut()
         .filter(|active| std::ptr::eq(active.end.as_ref(), end))
     {
+        owns_active_turn = true;
         active.stopped = true;
         active.settled |= settled;
         active.settled
@@ -803,8 +805,9 @@ fn record_stop_locked(
         false
     };
     // This belongs in the same critical section as clearing the owner: otherwise a pump can
-    // retire the slot between the reap and its forced-stop taint.
-    if taint_continuation {
+    // retire the slot between the reap and its forced-stop taint. A stale cleanup must not taint
+    // the continuation a newer attempt now owns.
+    if owns_active_turn && taint_continuation {
         state.nonresumable = Some(reason);
     }
     if should_clear {
@@ -1891,6 +1894,36 @@ mod tests {
         assert!(
             active.teardown.is_some(),
             "expected the stop reason and retained teardown to publish under one owner lock"
+        );
+    }
+
+    #[test]
+    fn a_stale_teardown_cannot_taint_a_newer_turns_continuation() {
+        let stale_end = Arc::new(TurnEnd::new());
+        let current_end = Arc::new(TurnEnd::new());
+        let mut state = Mutable::default();
+        state.active = Some(ActiveTurn {
+            end: Arc::clone(&current_end),
+            stop: CancelToken::new(),
+            control: None,
+            stopped: false,
+            settled: false,
+            teardown: None,
+        });
+
+        record_stop_locked(&mut state, &stale_end, true, CancelReason::Requested, true);
+
+        assert!(
+            state.nonresumable.is_none(),
+            "expected a stale teardown to leave the newer turn resumable, received {:?}",
+            state.nonresumable
+        );
+        assert!(
+            state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.end, &current_end)),
+            "expected the newer turn to remain active"
         );
     }
 
