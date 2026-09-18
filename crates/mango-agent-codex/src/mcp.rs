@@ -29,8 +29,7 @@ pub(crate) fn override_for(servers: &[McpServer]) -> Result<Option<BTreeMap<Stri
                 json!({"command": command, "args": args, "env": env})
             }
             McpTransport::Http { url, headers }
-                if (url.starts_with("http://") || url.starts_with("https://"))
-                    && !url.chars().any(char::is_control)
+                if valid_http_mcp_url(url)
                     && headers.keys().all(|name| valid_header_name(name))
                     && headers
                         .values()
@@ -57,6 +56,29 @@ pub(crate) fn override_for(servers: &[McpServer]) -> Result<Option<BTreeMap<Stri
         String::from("mcp_servers"),
         Value::Object(entries),
     )])))
+}
+
+/// Whether an MCP endpoint is an absolute HTTP URL that the app-server can safely pass through.
+fn valid_http_mcp_url(url: &str) -> bool {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let host = authority.host();
+    let Some(after_host) = authority.as_str().strip_prefix(host) else {
+        return false;
+    };
+    matches!(uri.scheme_str(), Some("http" | "https"))
+        && !host.is_empty()
+        && !authority.as_str().contains('@')
+        && (after_host.is_empty()
+            || (after_host.starts_with(':') && authority.port_u16().is_some()))
+        && !url.contains('#')
+        && url
+            .chars()
+            .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
 /// HTTP field names use the token grammar; no whitespace or separator can change a header.
@@ -115,5 +137,26 @@ mod tests {
         }];
         let error = override_for(&bad_http).expect_err("expected an unsupported URL to fail");
         assert!(!format!("{error:?}").contains("canary"));
+    }
+
+    #[test]
+    fn http_mcp_urls_require_an_absolute_authority_without_whitespace() {
+        for url in [
+            "http://",
+            "https://docs.example/mcp endpoint",
+            "https://docs.example/mcp\tendpoint",
+        ] {
+            let server = [McpServer {
+                name: String::from("remote"),
+                transport: McpTransport::Http {
+                    url: String::from(url),
+                    headers: BTreeMap::new(),
+                },
+            }];
+            assert!(
+                matches!(override_for(&server), Err(Error::HostConfiguration { .. })),
+                "expected {url:?} to be rejected before launch"
+            );
+        }
     }
 }

@@ -17,6 +17,7 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+http = "1.4.0"
 mango-external-agents = { workspace = true, features = ["stdio"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
