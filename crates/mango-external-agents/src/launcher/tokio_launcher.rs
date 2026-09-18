@@ -409,6 +409,27 @@ impl ProcessControl for TokioChild {
         }
         end_process_tree(pid, self.kill_grace, self.exit.clone()).await
     }
+
+    async fn interrupt(&self, _reason: CancelReason) -> Result<crate::process::InterruptOutcome> {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{Signal, killpg};
+            if let Some(pid) = self.pid
+                && self.exited().is_none()
+                && !self.killed.load(Ordering::Acquire)
+            {
+                killpg(group_of(pid), Signal::SIGINT).map_err(|error| Error::Launch {
+                    program: String::from("process group"),
+                    message: format!("interrupt failed with OS error {error}"),
+                })?;
+            }
+            Ok(crate::process::InterruptOutcome::Delivered)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(crate::process::InterruptOutcome::Unsupported)
+        }
+    }
 }
 
 impl Drop for TokioChild {

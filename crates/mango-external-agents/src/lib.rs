@@ -74,8 +74,8 @@ pub use permission::{
     UnsupportedReason,
 };
 pub use process::{
-    ByteSink, ByteSource, ExitStatus, LaunchSpec, LineLimits, LineStream, ManagedProcess,
-    ProcessControl, ProcessLauncher, StderrTail,
+    ByteSink, ByteSource, ExitStatus, InterruptOutcome, LaunchSpec, LineLimits, LineStream,
+    ManagedProcess, ProcessControl, ProcessLauncher, StderrTail, StopOutcome,
 };
 pub use registry::HarnessRegistry;
 pub use session::{

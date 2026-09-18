@@ -181,6 +181,8 @@ impl std::error::Error for VendorError {}
 /// Everything that can go wrong between a host and a vendor CLI.
 #[non_exhaustive]
 pub enum Error {
+    /// Another attempt still owns this session's turn slot.
+    Busy,
     /// A failure annotated where the operation's submission stage is known.
     Operation {
         /// How far this operation got before it failed.
@@ -359,6 +361,7 @@ impl fmt::Display for Error {
     /// Formats failures for diagnostics without including raw vendor or host-provided payloads.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Busy => formatter.write_str("expected an idle session, received an active turn"),
             Self::Operation { source, .. } => source.fmt(formatter),
             Self::Vendor(error) => error.fmt(formatter),
             Self::NotSupported { capability } => write!(

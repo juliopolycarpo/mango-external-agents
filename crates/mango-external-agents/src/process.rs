@@ -21,6 +21,9 @@ use crate::error::{Error, Result};
 use crate::redact;
 use crate::session::CancelReason;
 
+#[cfg(test)]
+mod shutdown_tests;
+
 /// What the library asks a host's launcher for.
 ///
 /// `cwd` and `env` are already decided: the directory is the one the host authorised, and the
@@ -110,11 +113,77 @@ pub trait ProcessControl: Send + Sync {
     /// Waits for the child to exit.
     async fn wait(&self) -> Result<ExitStatus>;
 
+    /// Requests the platform's graceful user interrupt, when supported by the host.
+    ///
+    /// Delivery does not prove the vendor stopped or saved resumable state. For example,
+    /// a Unix launcher can deliver SIGINT; a Windows host may provide a console-specific port.
+    async fn interrupt(&self, _reason: CancelReason) -> Result<InterruptOutcome> {
+        Ok(InterruptOutcome::Unsupported)
+    }
+
     /// Ends the child and everything it started.
     ///
     /// The escalation is the launcher's: the library asks once, with the reason, and a launcher
     /// that knows its platform decides what "end it" means there.
     async fn kill(&self, reason: CancelReason) -> Result<()>;
+}
+
+/// Whether the host can deliver a graceful process interrupt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptOutcome {
+    /// The interrupt was delivered; completion still requires waiting for exit.
+    Delivered,
+    /// No graceful interrupt is available on this launcher.
+    Unsupported,
+}
+
+/// How process shutdown completed, after the child was reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The child exited after the graceful interrupt and before escalation.
+    Interrupted,
+    /// Process-tree termination was required, or graceful interrupt was unavailable.
+    Terminated,
+}
+
+/// Interrupts, waits for the host's grace, then terminates and reaps if needed.
+///
+/// Every host call has a deadline. A timeout reports incomplete cleanup rather than success.
+/// The host's `kill` implementation owns containment and process-tree termination.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(control: &dyn mango_external_agents::ProcessControl) {
+/// use mango_external_agents::{CancelReason, process::stop_process};
+/// let outcome = stop_process(control, CancelReason::Requested,
+///     std::time::Duration::from_secs(2)).await;
+/// # }
+/// ```
+pub async fn stop_process(
+    control: &dyn ProcessControl,
+    reason: CancelReason,
+    grace: std::time::Duration,
+) -> Result<StopOutcome> {
+    let interrupt = tokio::time::timeout(grace, control.interrupt(reason)).await;
+    if matches!(interrupt, Ok(Ok(InterruptOutcome::Delivered)))
+        && matches!(tokio::time::timeout(grace, control.wait()).await, Ok(Ok(_)))
+    {
+        return Ok(StopOutcome::Interrupted);
+    }
+    tokio::time::timeout(grace, control.kill(reason))
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("process-tree termination"),
+            after: grace,
+        })??;
+    tokio::time::timeout(grace, control.wait())
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("process reaping"),
+            after: grace,
+        })??;
+    Ok(StopOutcome::Terminated)
 }
 
 /// How a child ended.
