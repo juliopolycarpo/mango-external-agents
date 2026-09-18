@@ -563,11 +563,14 @@ impl Harness for AcpHarness {
             return Err(error);
         }
 
-        if !request.configuration.is_empty() {
-            let outcome = match session
-                .configure_session(request.configuration.clone())
-                .await
-            {
+        // `apply_mode` already established the profile-owned permission pair. Sending it through
+        // the option path again performs a second `session/set_mode` for no new state, so only
+        // negotiate catalog-backed settings here.
+        let mut options = request.configuration.clone();
+        options.level = mango_external_agents::ConfigurationChange::Keep;
+        options.routing = mango_external_agents::ConfigurationChange::Keep;
+        if !options.is_empty() {
+            let outcome = match session.configure_session(options).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     let _ = session

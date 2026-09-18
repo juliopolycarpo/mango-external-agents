@@ -189,6 +189,52 @@ impl InterleavingConfigAgent {
     }
 }
 
+/// An ACP peer whose accepted model change exposes a new configuration row in its replacement
+/// catalog. It proves semantic native checks use the catalog current at each wire submission.
+struct ReclassifyingCatalogAgent;
+
+impl ReclassifyingCatalogAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(Self::answer)
+    }
+
+    fn answer(line: &str) -> Vec<String> {
+        let request: serde_json::Value =
+            serde_json::from_str(line).expect("expected harness JSON-RPC request");
+        let id = request["id"].clone();
+        let response = match request["method"].as_str() {
+            Some("initialize") => serde_json::json!({
+                "protocolVersion": 1,
+                "agentInfo": { "name": "reclassifying-fake", "version": "1" },
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "promptCapabilities": { "image": true, "embeddedContext": true },
+                    "sessionCapabilities": {},
+                },
+                "authMethods": [],
+            }),
+            Some("session/new") => serde_json::json!({
+                "sessionId": "reclassifying-session",
+                "configOptions": [InterleavingConfigAgent::model_option("small")],
+            }),
+            Some("session/set_config_option") => serde_json::json!({
+                "configOptions": [
+                    InterleavingConfigAgent::model_option("large"),
+                    {
+                        "id": "mode", "name": "Mode", "category": "mode", "type": "select",
+                        "currentValue": "plan", "options": [
+                            { "value": "plan", "name": "Plan" },
+                            { "value": "code", "name": "Code" }
+                        ]
+                    }
+                ],
+            }),
+            _ => serde_json::json!({}),
+        };
+        vec![InterleavingConfigAgent::result(id, response)]
+    }
+}
+
 /// A named ACP peer that announces a newer catalog while an opening response is in flight.
 struct OpeningCatalogInterleavingAgent {
     method: &'static str,
@@ -3512,6 +3558,329 @@ async fn configuration_refuses_full_access_when_the_profile_has_no_matching_mode
         None,
         "expected the paired routing not to be claimed after the level rejection"
     );
+}
+
+/// Opening establishes a profile-mapped mode once; the catalog configuration pass must not repeat
+/// the same `session/set_mode` request after that mode already succeeded.
+#[tokio::test]
+async fn opening_a_permission_level_applies_its_profile_mode_once() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().with_modes(["plan"]).process());
+    let profile = Arc::new(
+        AcpProfile::custom("fake", ["fake-acp", "acp"], VENDOR).with_modes(SessionModeIds {
+            read_only: Some("plan"),
+            ..SessionModeIds::UNKNOWN
+        }),
+    );
+
+    let session = AcpHarness::new(profile)
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("one-mode").with_configuration(at_level(PermissionLevel::ReadOnly)),
+        )
+        .await
+        .expect("expected the read-only session to open");
+
+    assert_eq!(
+        launcher
+            .written()
+            .iter()
+            .filter(|line| line.contains("\"session/set_mode\""))
+            .count(),
+        1,
+        "expected one profile mode request while opening"
+    );
+    assert_eq!(
+        session.snapshot().configuration.accepted.level,
+        Some(PermissionLevel::ReadOnly),
+        "expected the single mode request to establish the accepted level"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// ACP config rows labelled `mode` can bypass the profile's permission mapping if they are treated
+/// as ordinary native options. The host must retain the read-only level it established through the
+/// profile instead of sending a raw switch to the agent's execute mode.
+#[tokio::test]
+async fn a_native_mode_write_cannot_bypass_the_profiles_permission_matrix() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_modes(["plan", "code"])
+            .with_config_options(vec![serde_json::json!({
+                "id": "mode", "name": "Mode", "category": "mode", "type": "select",
+                "currentValue": "plan", "options": [
+                    { "value": "plan", "name": "Plan" },
+                    { "value": "code", "name": "Code" }
+                ]
+            })])
+            .process(),
+    );
+    let profile = Arc::new(
+        AcpProfile::custom("fake", ["fake-acp", "acp"], VENDOR).with_modes(SessionModeIds {
+            full_access: Some("code"),
+            read_only: Some("plan"),
+            ..SessionModeIds::UNKNOWN
+        }),
+    );
+    let session = AcpHarness::new(profile)
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("native-mode").with_configuration(at_level(PermissionLevel::ReadOnly)),
+        )
+        .await
+        .expect("expected the read-only session to open");
+    let writes_before = launcher.written();
+
+    let outcome = session
+        .configure(ConfigurationPatch::new().native(
+            ConfigurationOptionId::new("mode"),
+            ConfigurationChange::Set(ConfigurationValue::Text(String::from("code"))),
+        ))
+        .await
+        .expect("expected a typed configuration outcome");
+
+    assert!(
+        !outcome.is_complete(),
+        "expected the raw mode selector to be rejected, received {outcome:?}"
+    );
+    assert_eq!(
+        session.snapshot().configuration.accepted.level,
+        Some(PermissionLevel::ReadOnly),
+        "expected the established read-only level to remain authoritative"
+    );
+    assert_eq!(
+        launcher.written(),
+        writes_before,
+        "expected no raw mode config request to reach the agent"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A patch cannot address one ACP semantic row through both its neutral axis and native id: the
+/// two values would otherwise leave the accepted model or effort disagreeing with the agent.
+#[tokio::test]
+async fn semantic_axes_and_native_ids_cannot_target_the_same_acp_option() {
+    let agent = FakeAcpAgent::new().with_config_options(vec![
+        serde_json::json!({
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": "small", "options": [
+                { "value": "small", "name": "Small" }, { "value": "large", "name": "Large" }
+            ]
+        }),
+        serde_json::json!({
+            "id": "thought", "name": "Thought", "category": "thought_level", "type": "select",
+            "currentValue": "low", "options": [
+                { "value": "low", "name": "Low" }, { "value": "high", "name": "High" }
+            ]
+        }),
+    ]);
+    let (session, launcher) = open(agent, ConfigurationPatch::new()).await;
+    let writes_before = launcher.written();
+
+    let outcome = session
+        .configure(
+            ConfigurationPatch::new()
+                .model(ConfigurationChange::Set(String::from("large")))
+                .effort(ConfigurationChange::Set(String::from("high")))
+                .native(
+                    ConfigurationOptionId::new("model"),
+                    ConfigurationChange::Set(ConfigurationValue::Text(String::from("small"))),
+                )
+                .native(
+                    ConfigurationOptionId::new("thought"),
+                    ConfigurationChange::Set(ConfigurationValue::Text(String::from("low"))),
+                ),
+        )
+        .await
+        .expect("expected a typed configuration outcome");
+
+    assert!(
+        !outcome.is_complete(),
+        "expected conflicting targets to be refused, received {outcome:?}"
+    );
+    assert_eq!(
+        launcher.written(),
+        writes_before,
+        "expected no conflicted config write to reach the agent"
+    );
+    let accepted = &session.snapshot().configuration.accepted;
+    assert_eq!(
+        accepted.model, None,
+        "expected no model to be claimed accepted"
+    );
+    assert_eq!(
+        accepted.effort, None,
+        "expected no effort to be claimed accepted"
+    );
+    assert!(
+        accepted.native.is_empty(),
+        "expected no semantic id to be claimed as native acceptance"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Refusing native writes to semantic rows on every call prevents an earlier native request from
+/// leaving the neutral accepted model or effort axis stale on a later configuration call.
+#[tokio::test]
+async fn native_semantic_options_are_refused_across_calls_before_acceptance_drift() {
+    let agent = FakeAcpAgent::new().with_config_options(vec![
+        serde_json::json!({
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": "small", "options": [
+                { "value": "small", "name": "Small" }, { "value": "large", "name": "Large" }
+            ]
+        }),
+        serde_json::json!({
+            "id": "thought", "name": "Thought", "category": "thought_level", "type": "select",
+            "currentValue": "low", "options": [
+                { "value": "low", "name": "Low" }, { "value": "high", "name": "High" }
+            ]
+        }),
+    ]);
+    let (session, launcher) = open(agent, ConfigurationPatch::new()).await;
+    let writes_before = launcher.written();
+
+    for (id, value) in [("model", "large"), ("thought", "high")] {
+        let outcome = session
+            .configure(ConfigurationPatch::new().native(
+                ConfigurationOptionId::new(id),
+                ConfigurationChange::Set(ConfigurationValue::Text(String::from(value))),
+            ))
+            .await
+            .expect("expected a typed semantic-option refusal");
+        assert!(
+            !outcome.is_complete(),
+            "expected {id} to be rejected as a semantic axis, received {outcome:?}"
+        );
+    }
+
+    assert_eq!(
+        launcher.written(),
+        writes_before,
+        "expected no semantic native config request to reach the agent"
+    );
+    let accepted = &session.snapshot().configuration.accepted;
+    assert_eq!(accepted.model, None, "expected no stale model acceptance");
+    assert_eq!(accepted.effort, None, "expected no stale effort acceptance");
+    assert!(
+        accepted.native.is_empty(),
+        "expected no semantic option to become a native accepted setting"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A successful model update can replace the catalog before the next requested native setting is
+/// considered. A row that becomes `mode` in that response must be refused before its raw write.
+#[tokio::test]
+async fn a_catalog_refresh_cannot_make_a_native_mode_write_permissible() {
+    let launcher = FakeLauncher::new();
+    launcher.push(ReclassifyingCatalogAgent::process());
+    let session = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("reclassified-mode"))
+        .await
+        .expect("expected a session");
+
+    let outcome = session
+        .configure(
+            ConfigurationPatch::new()
+                .model(ConfigurationChange::Set(String::from("large")))
+                .native(
+                    ConfigurationOptionId::new("mode"),
+                    ConfigurationChange::Set(ConfigurationValue::Text(String::from("code"))),
+                ),
+        )
+        .await
+        .expect("expected a partial configuration outcome");
+
+    assert!(
+        outcome.is_partial(),
+        "expected the refreshed mode row to be refused, received {outcome:?}"
+    );
+    assert_eq!(
+        session.snapshot().configuration.accepted.model.as_deref(),
+        Some("large"),
+        "expected the model response confirmed before the native refusal to remain accepted"
+    );
+    let writes = launcher.written();
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|line| line.contains("\"session/set_config_option\""))
+            .count(),
+        1,
+        "expected only the confirmed model write, received {writes:?}"
+    );
+    assert!(
+        writes
+            .iter()
+            .all(|line| !line.contains("\"configId\":\"mode\"")),
+        "expected no raw mode write after catalog refresh, received {writes:?}"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A mode row is discovered only after `session/new`, but it must still be rejected before the
+/// opening path can send a raw `session/set_config_option` that changes permissions outside the
+/// profile matrix.
+#[tokio::test]
+async fn opening_refuses_a_native_mode_write_before_submitting_it() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_config_options(vec![serde_json::json!({
+                "id": "mode", "name": "Mode", "category": "mode", "type": "select",
+                "currentValue": "plan", "options": [
+                    { "value": "plan", "name": "Plan" },
+                    { "value": "code", "name": "Code" }
+                ]
+            })])
+            .process(),
+    );
+
+    let result = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("opening-native-mode").with_configuration(
+                ConfigurationPatch::new().native(
+                    ConfigurationOptionId::new("mode"),
+                    ConfigurationChange::Set(ConfigurationValue::Text(String::from("code"))),
+                ),
+            ),
+        )
+        .await;
+    let Err(error) = result else {
+        panic!("expected the un-mapped mode selector to be refused");
+    };
+
+    assert!(
+        matches!(error.cause(), Error::HostConfiguration { .. }),
+        "received {error:?}"
+    );
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .all(|line| !line.contains("session/set_config_option")),
+        "expected the opening refusal before a raw mode write, sent {:?}",
+        launcher.written()
+    );
+    assert_eq!(launcher.live_children(), 0, "expected opening cleanup");
 }
 
 /// ACP can replace its complete configuration catalog while a session is live.

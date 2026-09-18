@@ -181,10 +181,12 @@ failure remains an error after publishing only the last confirmed state.
 ACP v1 returns `configOptions` from `session/new`, `session/load`, and every
 `session/set_config_option` response. The harness retains that complete agent-ordered catalog and
 its current values. It maps the unambiguous `model` and `thought_level` categories to the neutral
-model and effort axes; all other options retain their agent ids as native settings. A host changes
-them through `Session::configure` between turns. Each setting request waits for the agent's full
-response before the accepted and observed readings move. Model changes therefore refresh a
-model-dependent effort catalog before an effort request is sent.
+model and effort axes. Those categories, and `mode`, are reserved: a native write to any of them is
+refused, including on a later call, so accepted neutral settings cannot diverge from the agent and a
+raw mode selector cannot bypass the profile's permission matrix. Other options retain their agent
+ids as native settings. A host changes them through `Session::configure` between turns. Each setting
+request waits for the agent's full response before the accepted and observed readings move. Model
+changes therefore refresh a model-dependent effort catalog before an effort request is sent.
 
 `Reset` is rejected as `ResetNotSupported`, because stable ACP v1 sets explicit values and defines
 no return-to-default operation. A value of the wrong scalar type, a select value outside the current

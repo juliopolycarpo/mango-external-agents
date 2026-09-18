@@ -7,6 +7,7 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -120,6 +121,16 @@ struct ConfigurationCatalogResponse {
     revision: u64,
 }
 
+/// Native ids that address semantic ACP configuration instead of a vendor-specific setting.
+///
+/// ACP exposes model, reasoning and mode selectors in the same catalog as vendor-specific
+/// options. The first two map to neutral axes and mode controls the profile's permission matrix, so
+/// a native write would make the accepted configuration contradict what the agent actually runs.
+struct NativeSemanticTargets {
+    reserved: BTreeSet<ConfigurationOptionId>,
+    rejections: Vec<RejectedSetting>,
+}
+
 impl std::fmt::Debug for AcpSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -214,6 +225,8 @@ impl AcpSession {
         let mut applied = Vec::new();
         let mut accepted = self.connection_state.configuration();
         let (mut catalog, mut catalog_revision) = self.connection_state.catalog_snapshot();
+        let semantic_targets = native_semantic_targets(&patch, &catalog);
+        rejected.extend(semantic_targets.rejections.clone());
         let mut requested = self
             .session_state
             .snapshot()
@@ -239,6 +252,17 @@ impl AcpSession {
                 continue;
             };
             let id = option.id.clone();
+            if matches!(patch.native.get(&id), Some(ConfigurationChange::Set(_))) {
+                rejected.push(RejectedSetting::new(
+                    ConfigurationOptionId::new(axis),
+                    SettingRejection::RefusedByHarness {
+                        detail: String::from(
+                            "the same ACP configuration option was also addressed as native",
+                        ),
+                    },
+                ));
+                continue;
+            }
             let chosen = value.clone();
             let value = ConfigurationValue::Text(value.clone());
             if let Some(rejection) = validate_value(option, &value) {
@@ -276,6 +300,9 @@ impl AcpSession {
             let ConfigurationChange::Set(value) = change else {
                 continue;
             };
+            if semantic_targets.reserved.contains(id) {
+                continue;
+            }
             let Some(option) = catalog.option(id) else {
                 rejected.push(RejectedSetting::new(
                     id.clone(),
@@ -283,6 +310,15 @@ impl AcpSession {
                 ));
                 continue;
             };
+            if let Some(detail) = semantic_native_target(&option.category) {
+                rejected.push(RejectedSetting::new(
+                    id.clone(),
+                    SettingRejection::RefusedByHarness {
+                        detail: format!("native writes cannot target {detail}"),
+                    },
+                ));
+                continue;
+            }
             if let Some(rejection) = validate_value(option, value) {
                 rejected.push(RejectedSetting::new(id.clone(), rejection));
                 continue;
@@ -323,7 +359,7 @@ impl AcpSession {
             if !crate::profile::matrix(&self.profile.modes).supports(level, routing) {
                 rejected.push(RejectedSetting::new(
                     ConfigurationOptionId::new("level"),
-                    SettingRejection::RefusedByVendor {
+                    SettingRejection::RefusedByHarness {
                         detail: String::from(
                             "the ACP profile cannot establish that permission level",
                         ),
@@ -339,7 +375,7 @@ impl AcpSession {
                 if !advertised {
                     rejected.push(RejectedSetting::new(
                         ConfigurationOptionId::new("level"),
-                        SettingRejection::RefusedByVendor {
+                        SettingRejection::RefusedByHarness {
                             detail: String::from(
                                 "the ACP agent did not advertise the configured mode",
                             ),
@@ -378,7 +414,7 @@ impl AcpSession {
             }) {
                 rejected.push(RejectedSetting::new(
                     ConfigurationOptionId::new("routing"),
-                    SettingRejection::RefusedByVendor {
+                    SettingRejection::RefusedByHarness {
                         detail: String::from(
                             "the ACP profile cannot establish that permission routing",
                         ),
@@ -885,6 +921,52 @@ fn validate_value(
         });
     }
     None
+}
+
+/// Refuses native patches that could side-step a semantic ACP configuration axis.
+///
+/// The catalog may expose `model`, `thought_level`, and `mode` as ordinary ids. The first two
+/// already have neutral host axes; the last controls permissions through the profile matrix. No
+/// native id is sent for those categories, including during session opening, because the resulting
+/// accepted state could otherwise claim a different model, effort, or permission level.
+fn native_semantic_targets(
+    patch: &ConfigurationPatch,
+    catalog: &ConfigurationCatalog,
+) -> NativeSemanticTargets {
+    let mut targets = NativeSemanticTargets {
+        reserved: BTreeSet::new(),
+        rejections: Vec::new(),
+    };
+    for (id, change) in &patch.native {
+        if !matches!(change, ConfigurationChange::Set(_)) {
+            continue;
+        }
+        let Some(option) = catalog.option(id) else {
+            continue;
+        };
+        let detail = semantic_native_target(&option.category);
+        let Some(detail) = detail else {
+            continue;
+        };
+        targets.reserved.insert(id.clone());
+        targets.rejections.push(RejectedSetting::new(
+            id.clone(),
+            SettingRejection::RefusedByHarness {
+                detail: format!("native writes cannot target {detail}"),
+            },
+        ));
+    }
+    targets
+}
+
+/// Why a catalog category cannot be changed through the native configuration map.
+fn semantic_native_target(category: &ConfigurationCategory) -> Option<&'static str> {
+    match category {
+        ConfigurationCategory::Model => Some("the ACP model axis"),
+        ConfigurationCategory::ReasoningEffort => Some("the ACP reasoning-effort axis"),
+        ConfigurationCategory::Mode => Some("the ACP profile permission matrix"),
+        _ => None,
+    }
 }
 
 /// Every reset is a refusal: ACP v1 only sets explicit current values.
