@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{
     Activity, ActivityContent, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
-    Command, ErrorCode, EventKind, FileChange, VendorError,
+    Command, ErrorCode, EventKind, FileChange, FileChangeKind, VendorError,
 };
 use serde_json::Value;
 
@@ -722,10 +722,20 @@ fn summarize_tool_input(input: Option<&Value>) -> String {
 ///
 /// Two tools, and the reason the list stops there is evidence rather than effort. `Write`'s
 /// `file_path`/`content` keys are evidenced by the captured transcript
-/// `fixtures/claude/transcripts/denied-write-turn.jsonl`. `Edit`'s `file_path`/`old_string`/
-/// `new_string` keys were read off a live headless run of the vendor CLI, which is weaker evidence
-/// — it is one build rather than the pin — and the test below pins the mapping to those exact key
-/// names so a rename fails here rather than silently producing an empty diff.
+/// `fixtures/claude/transcripts/denied-write-turn.jsonl`. `Edit`'s `file_path` and the fact that it
+/// states a before were read off a live headless run of the vendor CLI, which is weaker evidence —
+/// it is one build rather than the pin — and the test below pins the key names so a rename fails
+/// here rather than silently producing an empty diff.
+///
+/// **`Edit`'s two strings are deliberately not carried.**
+/// [`FileChange::old_text`](mango_external_agents::FileChange) and `new_text` are documented as the
+/// file's contents on either side of the change, which is what ACP's diff block sends and what a
+/// host is entitled to render or diff. `old_string`/`new_string` are a *region* of a file, not the
+/// file — putting them in those fields would make one field mean two different things depending on
+/// which vendor filled it, and a host doing the documented thing would report that a two-thousand
+/// line file had been replaced by one line. The neutral contract has no field for a region, so the
+/// region is omitted rather than misfiled. What survives is the path and the one thing `Edit`
+/// states that `Write` does not: there was a before, so the file was modified.
 ///
 /// `MultiEdit`, `NotebookEdit`, `TodoWrite` and `ExitPlanMode` stay unmapped. No captured
 /// transcript in this repository exercises any of them, and the `system/init.tools` list on both
@@ -751,8 +761,12 @@ fn file_change_content(name: &str, input: Option<&Value>) -> Option<ActivityCont
     let path = fields.get("file_path")?.as_str()?;
     let change = match name {
         "Write" => FileChange::new(path).with_new_text(bounded("content")?),
+        // Both strings are read and neither is carried: reading them is how this arm knows the
+        // call states a before, and a call missing either is one whose shape this mapping does
+        // not recognise.
         "Edit" => {
-            FileChange::new(path).with_texts(Some(bounded("old_string")?), bounded("new_string")?)
+            let (_before, _after) = (bounded("old_string")?, bounded("new_string")?);
+            FileChange::new(path).with_kind(FileChangeKind::Modified)
         }
         _ => return None,
     };
@@ -858,7 +872,9 @@ mod tests {
     };
     use crate::protocol::StreamRecord;
     use mango_external_agents::normalize::TextLimit;
-    use mango_external_agents::{ActivityContent, ActivityKind, ActivityUpdate, EventKind};
+    use mango_external_agents::{
+        ActivityContent, ActivityKind, ActivityUpdate, EventKind, FileChangeKind,
+    };
     use serde_json::json;
 
     /// The carry bound has to stay above the sink's, or a cut stops being reported.
@@ -1042,9 +1058,9 @@ mod tests {
 
     /// `Edit` states what was there before, which is the one thing that makes a modification
     /// distinguishable from a creation without guessing. The literal keys are pinned here so a
-    /// rename upstream fails as a missing field rather than as a diff with no body.
+    /// rename upstream fails as a missing field rather than as a row that quietly stops appearing.
     #[test]
-    fn an_edit_calls_input_becomes_a_diff_that_keeps_both_sides() {
+    fn an_edit_call_reports_the_file_it_modified_without_misfiling_its_two_fragments() {
         let mut reducer = TurnReducer::new();
         let events = reduce(
             &mut reducer,
@@ -1060,13 +1076,16 @@ mod tests {
         };
         assert_eq!(files.len(), 1, "received {files:?}");
         assert_eq!(files[0].path, "/work/repo/notes.txt");
-        assert_eq!(files[0].old_text.as_deref(), Some("line two"));
-        assert_eq!(files[0].new_text.as_deref(), Some("LINE TWO"));
         assert_eq!(
             files[0].kind,
-            Some(mango_external_agents::FileChangeKind::Modified),
+            Some(FileChangeKind::Modified),
             "a stated before is what makes this a modification rather than a guess"
         );
+        // `old_string`/`new_string` are a region of the file, and `old_text`/`new_text` are the
+        // file. Putting one in the other would make a host render a whole file as one line — and
+        // the same host would be right about ACP, which sends the contents.
+        assert_eq!(files[0].old_text, None, "received {files:?}");
+        assert_eq!(files[0].new_text, None, "received {files:?}");
     }
 
     /// An input missing a key this mapping needs produces no diff rather than a half one. A file

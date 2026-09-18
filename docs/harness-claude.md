@@ -139,9 +139,12 @@ id, and each turn spawns, streams and reaps its own child.
   The first turn passes it to `--resume`; only `system/init` echoing that exact UUID confirms the
   resumed snapshot. A missing, invalid or different id ends that turn with a protocol error instead
   of presenting another conversation as the requested history. Conversation content or a result
-  before that confirmation is refused without emitting it. Later valid `system/init` ids still
-  replace the active handle, because they are vendor-issued identities for a conversation this
-  session already established.
+  before that confirmation is refused without emitting it. A later turn is held to the same handle:
+  once the session is established, a `system/init` naming a different id fails that turn rather than
+  replacing the handle a host persisted — see
+  [A later turn may not answer from another conversation](#the-event-stream). Only the *first*
+  turn's echo may replace the minted id, because that turn proposes one rather than naming an
+  existing conversation.
 
   A failed strict verification, including a stream that ends before `system/init` without a host
   cancellation, leaves the session nonresumable even when native cleanup finishes through the
@@ -406,12 +409,16 @@ draws no difference between a call and the transcript item it produced, so the t
 `Write` call's `file_path`/`content` become a single-file `ActivityContent::Diff`, with `kind` left
 absent because `Write` also overwrites a file that already exists and nothing in the stream says
 which of the two happened; that mapping and the item id are both pinned by
-`fixtures/claude/transcripts/denied-write-turn.jsonl`. An `Edit` call's
-`file_path`/`old_string`/`new_string` become the same thing, and there `kind` **is** stated —
-`Modified` — because a stated before is what distinguishes a modification from a creation without
-guessing. Its key names come from a live headless run rather than from a fixture, which is weaker
-evidence and is why a reducer test pins the three literal names: a rename upstream fails there
-rather than silently producing a diff with no body. A closing `tool_result`'s own body becomes
+`fixtures/claude/transcripts/denied-write-turn.jsonl`. An `Edit` call becomes a single-file `Diff` too, and
+there `kind` **is** stated — `Modified` — because a stated before is what distinguishes a
+modification from a creation without guessing. Its two strings are deliberately **not** carried:
+`old_text`/`new_text` are documented as the file's contents on either side of the change, which is
+what an ACP diff block sends, and `old_string`/`new_string` are a *region* of a file. Misfiling one
+as the other would make the same host code report that a two-thousand line file had been replaced
+by one line for Claude while being right about ACP. The neutral contract has no field for a region,
+so the region is omitted rather than misfiled. The key names come from a live headless run rather
+than from a fixture, which is weaker evidence and is why a reducer test pins them: a rename upstream
+fails there rather than as a row that quietly stops appearing. A closing `tool_result`'s own body becomes
 `ActivityContent::Output` on the `ActivityResult`, independent of a held `system/permission_denied`
 reason, which still wins the one-line `detail`.
 
