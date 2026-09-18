@@ -1,9 +1,11 @@
-//! One turn's events, bounded, and the only way a harness can produce them.
+//! Bounded turn transcripts with terminal commitment independent of reader progress.
 //!
-//! A harness reducer pushes raw vendor-shaped facts through an [`EventSink`], which normalises
-//! them and puts them on a bounded channel. The two bounds are deliberate and neither can be
-//! bypassed: a value the vendor wrote is cut or refused before the host sees it, and a host that
-//! stops reading stops the vendor rather than growing the library's memory.
+//! Payload overflow fails the stream explicitly. Control events have their own count reserve,
+//! and a terminal is retained outside that queue so shutdown never waits for the UI.
+
+mod buffer;
+use buffer::Buffer;
+pub use buffer::EventReceiver;
 
 use tokio::sync::mpsc;
 
@@ -16,26 +18,16 @@ use std::sync::Arc;
 
 /// One turn's events, in order.
 ///
-/// The channel is bounded (see [`Limits::turn_channel_capacity`](crate::Limits)): a host that
-/// stops reading applies backpressure all the way to the vendor process, which is the behaviour
-/// worth having when the alternative is buffering a runaway stream until the process dies.
-///
-/// The bound is a number of events, not a number of bytes, and each event was already bounded by
-/// the line cap it arrived under — so the honest ceiling before backpressure engages is the two
-/// multiplied together. A host that cares about the byte figure sets
-/// [`Limits::turn_channel_capacity`](crate::Limits) against its own line cap rather than reading
-/// the default as a memory guarantee.
-///
-/// The channel itself is **not** public. A host reads through [`TurnStream::recv`], which is all a
-/// host ever did with it — and keeping the receiver private is what leaves room for this type to
-/// own a turn's lifetime, or to carry a different budget, without that being a breaking change to
-/// everyone who had matched on an `mpsc::Receiver`.
+/// Payloads obey the event and byte budgets in [`crate::Limits`]. At most two terminal events
+/// are reserved separately, so a live consumer can read them after the native work has stopped.
+/// Dropping this owner is abandonment; a browser disconnect should only detach from the host's
+/// supervisor, which keeps this stream and decides when to cancel it.
 pub struct TurnStream {
     turn_id: TurnId,
     attempt: AttemptId,
     native_turn_id: String,
     dispatch: Dispatch,
-    events: mpsc::Receiver<AgentEvent>,
+    events: EventReceiver,
 }
 
 impl TurnStream {
@@ -49,7 +41,7 @@ impl TurnStream {
         turn_id: TurnId,
         attempt: AttemptId,
         native_turn_id: impl Into<String>,
-        events: mpsc::Receiver<AgentEvent>,
+        events: EventReceiver,
     ) -> Self {
         Self {
             turn_id,
@@ -83,6 +75,23 @@ impl TurnStream {
     /// Which session, turn and attempt this stream belongs to.
     pub fn operation(&self, session_id: SessionId) -> OperationRef {
         OperationRef::new(session_id, self.turn_id.clone(), self.attempt)
+    }
+
+    /// The committed outcome, available even if the transcript has not been read.
+    ///
+    /// For example, a retrying supervisor checks this before reconciling uncertain dispatch.
+    pub fn terminal_status(&self) -> Option<TerminalStatus> {
+        self.events.terminal_status()
+    }
+
+    /// Marks dispatch uncertainty without giving up the owned event stream.
+    ///
+    /// For example, a vendor that has no prompt acknowledgement uses AcceptanceUnknown until
+    /// its terminal response proves completion. This never authorizes automatic replay.
+    #[must_use]
+    pub fn with_dispatch(mut self, dispatch: Dispatch) -> Self {
+        self.dispatch = dispatch;
+        self
     }
 
     /// The next event, or `None` once the turn is over.
@@ -120,6 +129,23 @@ impl std::fmt::Debug for TurnStream {
     }
 }
 
+/// The logical terminal outcome, independent of transcript delivery and process reaping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalStatus {
+    /// Native work completed successfully.
+    Completed,
+    /// The owned attempt was cancelled.
+    Cancelled {
+        /// The reason the owner supplied.
+        reason: CancelReason,
+    },
+    /// Native work or stream delivery failed. Dispatch certainty still governs replay.
+    Failed {
+        /// The normalized failure category.
+        code: crate::ErrorCode,
+    },
+}
+
 /// A review's stream, plus the thread the vendor decided to run it on.
 ///
 /// The extra field is the whole reason starting a review is awaited: a turn has nothing to report
@@ -148,13 +174,31 @@ impl std::fmt::Debug for ReviewStream {
 ///
 /// Cloneable: a reducer that fans a turn out over several tasks shares one sink and the events
 /// stay in the order they were sent.
-#[derive(Clone)]
 pub struct EventSink {
     session_id: SessionId,
     turn_id: TurnId,
     attempt: AttemptId,
     clock: Arc<dyn Clock>,
-    sender: mpsc::Sender<AgentEvent>,
+    buffer: Arc<Buffer>,
+}
+
+impl Clone for EventSink {
+    fn clone(&self) -> Self {
+        self.buffer.add_sender();
+        Self {
+            session_id: self.session_id.clone(),
+            turn_id: self.turn_id.clone(),
+            attempt: self.attempt,
+            clock: Arc::clone(&self.clock),
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+impl Drop for EventSink {
+    fn drop(&mut self) {
+        self.buffer.remove_sender();
+    }
 }
 
 impl std::fmt::Debug for EventSink {
@@ -182,114 +226,126 @@ impl EventSink {
         attempt: AttemptId,
         clock: Arc<dyn Clock>,
         capacity: usize,
-    ) -> (Self, mpsc::Receiver<AgentEvent>) {
-        let (sender, receiver) = mpsc::channel(capacity.max(1));
+    ) -> (Self, EventReceiver) {
+        Self::with_limits(
+            session_id,
+            turn_id,
+            attempt,
+            clock,
+            &crate::Limits {
+                turn_channel_capacity: capacity,
+                ..crate::Limits::default()
+            },
+        )
+    }
+
+    /// Creates a stream under the host's event, byte and pending-interaction budgets.
+    ///
+    /// For example, harnesses pass `host.limits()` to give every stream the same policy.
+    pub fn with_limits(
+        session_id: SessionId,
+        turn_id: TurnId,
+        attempt: AttemptId,
+        clock: Arc<dyn Clock>,
+        limits: &crate::Limits,
+    ) -> (Self, EventReceiver) {
+        let (buffer, events) = Buffer::new(*limits);
         (
             Self {
                 session_id,
                 turn_id,
                 attempt,
                 clock,
-                sender,
+                buffer,
             },
-            receiver,
+            events,
         )
     }
 
-    /// Normalises one event and puts it on the channel, waiting if the host is behind.
+    /// Normalizes and queues an event without waiting on the consumer.
     ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidVendorValue`] when a vendor id does not survive bounding, and
-    /// [`Error::Closed`] when the host dropped the stream. Both end the reducer's loop: there is
-    /// nobody to tell, and a turn nobody is reading is a turn to stop feeding.
+    /// For example, a protocol callback can publish text while continuing to acknowledge RPCs.
+    /// Overflow returns `LimitExceeded` and commits a reserved `stream-overflow` failure; the
+    /// driver must stop native work. Events after a terminal are refused.
     pub async fn emit(&self, kind: EventKind) -> Result<()> {
-        let event = self.event(kind)?;
-        self.sender.send(event).await.map_err(|_| Error::Closed {
-            subject: "turn stream",
-        })
-    }
-
-    /// Ends the turn, marking why it stopped first.
-    ///
-    /// [`EventKind::Cancelled`] is a marker rather than a terminal, so it is always followed by
-    /// [`EventKind::Completed`]: a host that does not recognise the marker still sees its turn end
-    /// rather than hanging on a kind it consumed and dropped.
-    ///
-    /// # Errors
-    ///
-    /// As [`EventSink::emit`].
-    pub async fn cancel(&self, reason: CancelReason) -> Result<()> {
-        self.emit(EventKind::Cancelled { reason }).await?;
-        self.complete().await
-    }
-
-    /// Offers a cancellation without leaving a lone marker if shutdown interrupts this future.
-    ///
-    /// Reserves both events together. A one-slot channel receives only `Completed` because it
-    /// cannot fit both events atomically. Ordinary turn cancellation uses [`Self::cancel`].
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # async fn example(sink: &mango_external_agents::stream::EventSink) {
-    /// use mango_external_agents::CancelReason;
-    /// let _ = tokio::time::timeout(std::time::Duration::from_millis(200),
-    ///     sink.cancel_on_close(CancelReason::Shutdown)).await;
-    /// # }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::emit`].
-    pub async fn cancel_on_close(&self, reason: CancelReason) -> Result<()> {
-        let completed = self.event(EventKind::Completed)?;
-        // A channel with room for one cannot reserve the marker and its terminal together. A
-        // terminal alone is the only shape that cannot be cut in half by a shutdown timeout.
-        if self.sender.max_capacity() < 2 {
-            return self
-                .sender
-                .send(completed)
-                .await
-                .map_err(|_| Error::Closed {
-                    subject: "turn stream",
-                });
+        if matches!(kind, EventKind::Completed) {
+            return self.complete().await;
         }
-        let cancelled = self.event(EventKind::Cancelled { reason })?;
-        let mut permits = self
-            .sender
-            .reserve_many(2)
-            .await
-            .map_err(|_| Error::Closed {
-                subject: "turn stream",
-            })?;
-        permits
-            .next()
-            .expect("expected a permit for the cancellation marker")
-            .send(cancelled);
-        permits
-            .next()
-            .expect("expected a permit for the cancellation terminal")
-            .send(completed);
-        Ok(())
+        if let EventKind::Error { error } = kind {
+            return self.fail(error).await;
+        }
+        let result = self.buffer.push(self.event(kind)?);
+        if let Err(error @ Error::LimitExceeded { .. }) = &result {
+            let _ = self
+                .fail(VendorError::new(
+                    crate::ErrorCode::from_static("stream-overflow"),
+                    error.to_string(),
+                ))
+                .await;
+        }
+        result
     }
 
-    /// Ends the turn with a failure.
+    /// Commits cancellation and its compatibility terminal together, even when the queue is full.
     ///
-    /// # Errors
+    /// For example, shutdown records its reason without waiting for transcript consumption.
+    pub async fn cancel(&self, reason: CancelReason) -> Result<()> {
+        self.buffer.finish(
+            vec![
+                self.event(EventKind::Cancelled { reason })?,
+                self.event(EventKind::Completed)?,
+            ],
+            TerminalStatus::Cancelled { reason },
+        )
+    }
+
+    /// Commits cancellation during close using the same reserved terminal as ordinary cancel.
     ///
-    /// As [`EventSink::emit`].
+    /// For example, `sink.cancel_on_close(CancelReason::Shutdown).await` never waits on a reader.
+    pub async fn cancel_on_close(&self, reason: CancelReason) -> Result<()> {
+        self.cancel(reason).await
+    }
+
+    /// Commits a failure once, retaining its normalized payload for a live receiver.
+    ///
+    /// For example, a failed native prompt calls this before releasing its attempt slot.
     pub async fn fail(&self, error: VendorError) -> Result<()> {
-        self.emit(EventKind::Error { error }).await
+        let status = TerminalStatus::Failed {
+            code: error.code.clone(),
+        };
+        self.buffer
+            .finish(vec![self.event(EventKind::Error { error })?], status)
     }
 
-    /// Ends the turn.
+    /// Commits successful completion once without waiting for the consumer.
     ///
-    /// # Errors
-    ///
-    /// As [`EventSink::emit`].
+    /// For example, a native terminal response calls this before releasing admission.
     pub async fn complete(&self) -> Result<()> {
-        self.emit(EventKind::Completed).await
+        self.buffer.finish(
+            vec![self.event(EventKind::Completed)?],
+            TerminalStatus::Completed,
+        )
+    }
+
+    /// Waits for owner abandonment, even when the vendor is silent.
+    ///
+    /// Drivers select this alongside native output to stop a dropped stream promptly.
+    pub async fn closed(&self) {
+        self.buffer.closed().await;
+    }
+
+    /// Waits for terminal commitment, including an overflow failure.
+    ///
+    /// Drivers select this when publication failure must interrupt pending vendor work.
+    pub async fn terminated(&self) {
+        self.buffer.terminated().await;
+    }
+
+    /// Whether any producer has already committed a terminal outcome.
+    ///
+    /// Drivers use this to reject late callbacks after shutdown or overflow.
+    pub fn is_terminal(&self) -> bool {
+        self.buffer.status().is_some()
     }
 
     fn event(&self, kind: EventKind) -> Result<AgentEvent> {
@@ -306,7 +362,7 @@ impl EventSink {
     ///
     /// Worth checking before doing expensive work for an event nobody will read.
     pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
+        self.buffer.is_closed()
     }
 
     /// The session these events belong to.
@@ -332,7 +388,7 @@ impl EventSink {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventSink, TurnStream};
+    use super::{EventReceiver, EventSink, TurnStream};
     use crate::error::Error;
     use crate::event::{EventKind, SessionId, TurnId};
     use crate::host::{Clock, SystemClock};
@@ -340,6 +396,108 @@ mod tests {
     use crate::session::CancelReason;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    #[tokio::test]
+    async fn byte_pressure_commits_a_terminal_and_never_exceeds_the_budget() {
+        let limits = crate::Limits {
+            turn_buffer_bytes: 512,
+            ..crate::Limits::default()
+        };
+        let (sink, mut events) = EventSink::with_limits(
+            SessionId::new("s"),
+            TurnId::new("t"),
+            AttemptId::FIRST,
+            Arc::new(SystemClock),
+            &limits,
+        );
+        sink.emit(EventKind::TextDelta {
+            text: "a".repeat(256),
+        })
+        .await
+        .expect("first payload fits");
+        assert!(events.queued_bytes() <= 512);
+        let result = sink
+            .emit(EventKind::TextDelta {
+                text: "b".repeat(256),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::LimitExceeded {
+                subject: "queued turn payload bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.terminal_status(),
+            Some(super::TerminalStatus::Failed { .. })
+        ));
+        events.recv().await.expect("queued payload");
+        assert_eq!(events.queued_bytes(), 0);
+        assert!(
+            events
+                .recv()
+                .await
+                .expect("overflow terminal")
+                .is_terminal()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_status_is_observable_without_draining_and_rejects_late_events() {
+        let (sink, events) = sink(1);
+        sink.emit(EventKind::TextDelta {
+            text: "queued".into(),
+        })
+        .await
+        .expect("queued");
+        let mut stream =
+            TurnStream::accepted(TurnId::new("turn"), AttemptId::FIRST, "native", events)
+                .with_dispatch(Dispatch::AcceptanceUnknown);
+        let (first, second) = tokio::join!(sink.complete(), sink.cancel(CancelReason::Requested));
+        first.expect("first terminal");
+        second.expect("duplicate terminal is harmless");
+        assert_eq!(
+            stream.terminal_status(),
+            Some(super::TerminalStatus::Completed)
+        );
+        assert_eq!(stream.dispatch(), Dispatch::AcceptanceUnknown);
+        assert!(sink.is_terminal());
+        sink.terminated().await;
+        assert!(
+            sink.emit(EventKind::TextDelta {
+                text: "late".into()
+            })
+            .await
+            .is_err()
+        );
+        stream.recv().await.expect("queued");
+        assert!(stream.recv().await.expect("terminal").is_terminal());
+        assert!(stream.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receiver_drop_wakes_an_owner_without_vendor_output() {
+        let (sink, events) = sink(1);
+        let observer = sink.clone();
+        drop(sink);
+        drop(events);
+        observer.closed().await;
+        assert!(observer.is_closed());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_sender_wakes_a_waiting_receiver() {
+        let (sink, mut events) = sink(1);
+        let copy = sink.clone();
+        drop(sink);
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(copy);
+        assert!(events.recv().await.is_none());
+    }
 
     /// A clock that never moves, so an event's stamp is a value a test can assert on.
     struct FrozenClock(SystemTime);
@@ -350,12 +508,7 @@ mod tests {
         }
     }
 
-    fn sink(
-        capacity: usize,
-    ) -> (
-        EventSink,
-        tokio::sync::mpsc::Receiver<crate::event::AgentEvent>,
-    ) {
+    fn sink(capacity: usize) -> (EventSink, EventReceiver) {
         EventSink::new(
             SessionId::new("session-1"),
             TurnId::new("turn-1"),
@@ -498,37 +651,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_host_that_stops_reading_stalls_the_writer_instead_of_growing_memory() {
-        let (sink, mut events) = sink(2);
-
-        for index in 0..2 {
+    async fn a_full_stream_reports_overflow_without_blocking_control() {
+        let (sink, mut events) = sink(1);
+        sink.emit(EventKind::TextDelta {
+            text: "queued".into(),
+        })
+        .await
+        .expect("first event");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
             sink.emit(EventKind::TextDelta {
-                text: index.to_string(),
-            })
-            .await
-            .expect("expected the event to be sent");
-        }
-
-        // The channel is full and nobody is reading: the next emit must not return.
-        let blocked = tokio::time::timeout(
-            Duration::from_secs(30),
-            sink.emit(EventKind::TextDelta {
-                text: String::from("third"),
+                text: "overflow".into(),
             }),
         )
         .await;
         assert!(
-            blocked.is_err(),
-            "expected the writer to stall on a full channel, received {blocked:?}"
+            matches!(result, Ok(Err(Error::LimitExceeded { .. }))),
+            "expected immediate explicit overflow, received {result:?}"
         );
-
-        // Reading one frees exactly one slot, and the writer proceeds.
-        events.recv().await.expect("expected an event");
-        sink.emit(EventKind::TextDelta {
-            text: String::from("third"),
-        })
-        .await
-        .expect("expected the event to be sent once a slot freed");
+        assert!(matches!(
+            events.recv().await.expect("queued event").kind,
+            EventKind::TextDelta { .. }
+        ));
+        assert!(matches!(
+            events.recv().await.expect("reserved terminal").kind,
+            EventKind::Error { .. }
+        ));
+        assert!(events.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -553,55 +702,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn closing_never_leaves_a_cancellation_marker_without_a_terminal() {
-        let (sink, mut events) = sink(2);
+    async fn closing_commits_a_complete_terminal_behind_a_full_one_slot_stream() {
+        let (sink, mut events) = sink(1);
         sink.emit(EventKind::TextDelta {
-            text: String::from("queued"),
+            text: "queued".into(),
         })
         .await
-        .expect("queued event");
+        .expect("queued");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            sink.cancel_on_close(CancelReason::Shutdown),
+        )
+        .await;
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                sink.cancel_on_close(CancelReason::Shutdown)
-            )
-            .await
-            .is_err()
+            matches!(result, Ok(Ok(()))),
+            "expected nonblocking terminal commit, received {result:?}"
         );
         assert!(matches!(
-            events.recv().await.expect("original event").kind,
+            events.recv().await.expect("queued").kind,
             EventKind::TextDelta { .. }
         ));
-        assert!(
-            events.try_recv().is_err(),
-            "expected no partial cancellation marker"
-        );
-        sink.cancel_on_close(CancelReason::Shutdown)
-            .await
-            .expect("atomic cancellation");
         assert!(matches!(
             events.recv().await.expect("marker").kind,
-            EventKind::Cancelled {
-                reason: CancelReason::Shutdown
-            }
+            EventKind::Cancelled { .. }
         ));
         assert_eq!(
             events.recv().await.expect("terminal").kind,
             EventKind::Completed
         );
-    }
-
-    #[tokio::test]
-    async fn one_slot_close_falls_back_to_a_terminal() {
-        let (sink, mut events) = sink(1);
-        sink.cancel_on_close(CancelReason::Shutdown)
-            .await
-            .expect("close terminal");
-        assert_eq!(
-            events.recv().await.expect("terminal").kind,
-            EventKind::Completed
-        );
-        assert!(events.try_recv().is_err());
+        assert!(events.recv().await.is_none());
     }
 
     #[tokio::test]
