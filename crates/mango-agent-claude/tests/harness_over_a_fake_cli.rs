@@ -914,7 +914,7 @@ mod a_turn {
     }
 
     #[tokio::test]
-    async fn resumes_after_a_cancelled_turn_rather_than_minting_the_same_id_again() {
+    async fn a_cancelled_turn_starts_a_fresh_conversation_instead_of_resuming_killed_work() {
         let launcher = Arc::new(
             FakeClaudeCli::new()
                 .with_turn(Run::stalling([
@@ -952,7 +952,14 @@ mod a_turn {
         let argvs = launcher.turn_argvs();
         assert_eq!(
             value_after(&argvs[1], "--resume"),
-            Some("aaaaaaaa-1111-2222-3333-444444444444")
+            None,
+            "expected no resume of the prompt SIGTERM left unfinished"
+        );
+        let fresh = value_after(&argvs[1], "--session-id")
+            .expect("expected a fresh session id after cancellation");
+        assert_ne!(
+            fresh, "aaaaaaaa-1111-2222-3333-444444444444",
+            "expected the next turn to avoid the killed conversation"
         );
     }
 
@@ -1160,18 +1167,13 @@ mod a_turn {
 
     /// Two `start_turn`s racing the same spawn window.
     ///
-    /// Both used to read `active` as `None` before the spawn, both to spawn their own child, and
-    /// the later assignment to overwrite the first `ActiveTurn` without ending it: two children
-    /// ran and only the second could ever be reached by a later `cancel`. Reserving the slot
-    /// before the spawn awaits means the second call finds the first's reservation rather than an
-    /// empty one, and supersedes it exactly the way a sequential second call already does.
+    /// The first claim owns the slot before it waits for the launcher. The second request must
+    /// therefore observe that reservation and receive a typed busy refusal without launching a
+    /// second vendor process or changing the first request's cancellation reason.
     #[tokio::test]
-    async fn a_second_start_turn_racing_the_first_spawn_supersedes_it_rather_than_losing_it() {
-        let launcher = Arc::new(
-            FakeClaudeCli::new()
-                .with_turn(Run::stalling::<[String; 0], String>([]))
-                .with_turn(Run::stalling::<[String; 0], String>([])),
-        );
+    async fn a_second_start_turn_racing_the_first_spawn_is_refused_as_busy() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
         let gate = launcher.gate_turn_spawns();
         let session = shared(&launcher).await;
 
@@ -1185,38 +1187,26 @@ mod a_turn {
         });
         gate.wait_for_spawn().await;
 
-        let second = tokio::spawn({
-            let session = Arc::clone(&session);
-            async move {
-                session
-                    .start_turn(TurnRequest::new("turn-2", "hello again"))
-                    .await
-            }
-        });
-        gate.wait_for_spawn().await;
+        let second = session
+            .start_turn(TurnRequest::new("turn-2", "hello again"))
+            .await
+            .expect_err("expected the active first turn to refuse the second request");
+        assert!(
+            matches!(second.cause(), Error::Busy),
+            "expected a typed busy refusal, received {second:?}"
+        );
 
-        gate.release();
         gate.release();
 
         let first_outcome = first.await.expect("expected the first task to finish");
-        let second_outcome = second.await.expect("expected the second task to finish");
-
         assert!(
-            matches!(
-                first_outcome,
-                Err(ref error)
-                    if matches!(
-                        error.cause(),
-                        Error::Cancelled {
-                            reason: CancelReason::Requested
-                        }
-                    )
-            ),
-            "expected the first turn to be refused as superseded, received {first_outcome:?}"
+            first_outcome.is_ok(),
+            "expected the first turn to keep its claim, received {first_outcome:?}"
         );
-        assert!(
-            second_outcome.is_ok(),
-            "expected the second turn to be handed a stream, received {second_outcome:?}"
+        assert_eq!(
+            launcher.turn_argvs().len(),
+            1,
+            "expected only the admitted turn to reach Claude"
         );
 
         session
@@ -2095,6 +2085,43 @@ mod cancelling_and_closing {
     use super::*;
 
     #[tokio::test]
+    async fn cancellation_uses_a_supported_graceful_interrupt_before_escalating() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_graceful_interrupt()
+                .with_turn(Run::stalling(Vec::<String>::new())),
+        );
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect("expected cancellation to stop the turn");
+        let events = drain(&mut turn).await;
+
+        assert_eq!(
+            launcher.graceful_interrupts(),
+            1,
+            "expected the harness to ask the supported launcher for one graceful interrupt"
+        );
+        assert_eq!(
+            launcher.kill_requests(),
+            0,
+            "expected no forced termination after the graceful interrupt exited the child"
+        );
+        assert!(
+            events.contains(&EventKind::Cancelled {
+                reason: CancelReason::Requested
+            }),
+            "expected the interrupted turn to retain its cancellation marker, received {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn closes_the_stream_without_putting_a_failure_in_the_transcript() {
         let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::stalling([
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}"#,
@@ -2225,33 +2252,39 @@ mod cancelling_and_closing {
     }
 
     #[tokio::test]
-    async fn starting_a_second_turn_ends_the_first() {
-        let launcher = Arc::new(
-            FakeClaudeCli::new()
-                .with_turn(Run::stalling(Vec::<String>::new()))
-                .with_turn(Run::replaying(r#"{"type":"result","is_error":false}"#)),
-        );
+    async fn starting_a_second_turn_refuses_while_the_first_is_active() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling(Vec::<String>::new())));
         let session = open(&launcher).await;
         let mut first = session
             .start_turn(TurnRequest::new("turn-1", "one"))
             .await
             .expect("expected a turn");
-        let mut second = session
+        let error = session
             .start_turn(TurnRequest::new("turn-2", "two"))
             .await
-            .expect("expected a second turn");
+            .expect_err("expected the active first turn to refuse the second request");
+        assert!(
+            matches!(error.cause(), Error::Busy),
+            "expected a typed busy refusal, received {error:?}"
+        );
+        assert_eq!(
+            launcher.turn_argvs().len(),
+            1,
+            "expected no replacement launch"
+        );
 
+        session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect("expected cleanup to stop the admitted turn");
         let first_events = drain(&mut first).await;
-        assert_eq!(first_events.last(), Some(&EventKind::Completed));
         assert!(
             first_events.contains(&EventKind::Cancelled {
                 reason: CancelReason::Requested
             }),
-            "received {first_events:?}"
+            "expected the original turn to retain ownership, received {first_events:?}"
         );
-
-        let second_events = drain(&mut second).await;
-        assert_eq!(second_events.last(), Some(&EventKind::Completed));
     }
 
     #[tokio::test]
@@ -2274,5 +2307,33 @@ mod cancelling_and_closing {
         })
         .await
         .expect("expected dropping the stream to end the vendor's process");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_owning_session_reaps_an_active_child_even_if_the_stream_survives() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        drop(session);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while launcher.a_child_is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected dropping the session to stop and reap its child");
+        let events = drain(&mut turn).await;
+        assert!(
+            events.contains(&EventKind::Cancelled {
+                reason: CancelReason::Shutdown
+            }),
+            "expected the retained stream to report owner shutdown, received {events:?}"
+        );
     }
 }

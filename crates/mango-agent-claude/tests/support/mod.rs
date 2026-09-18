@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use mango_external_agents::testing::FrozenClock;
 use mango_external_agents::{
-    ByteSink, ByteSource, CancelReason, EnvSource, ExitStatus, HostContext, LaunchSpec, Limits,
-    ManagedProcess, ProcessControl, ProcessLauncher, Result, StderrTail,
+    ByteSink, ByteSource, CancelReason, EnvSource, ExitStatus, HostContext, InterruptOutcome,
+    LaunchSpec, Limits, ManagedProcess, ProcessControl, ProcessLauncher, Result, StderrTail,
 };
 use tokio::sync::Notify;
 
@@ -144,6 +144,8 @@ pub struct FakeClaudeCli {
     /// Whether each killed child's `--mcp-config` file was still on disk when it was killed.
     config_at_kill: Arc<Mutex<Vec<bool>>>,
     kill_requests: Arc<Mutex<usize>>,
+    graceful_interrupts: Arc<Mutex<usize>>,
+    interrupt_supported: bool,
 }
 
 impl Default for FakeClaudeCli {
@@ -167,6 +169,8 @@ impl FakeClaudeCli {
             spawn_gate: Mutex::new(None),
             config_at_kill: Arc::new(Mutex::new(Vec::new())),
             kill_requests: Arc::new(Mutex::new(0)),
+            graceful_interrupts: Arc::new(Mutex::new(0)),
+            interrupt_supported: false,
         }
     }
 
@@ -202,6 +206,13 @@ impl FakeClaudeCli {
     #[must_use]
     pub fn with_turn(self, run: Run) -> Self {
         lock(&self.turns).push_back(run);
+        self
+    }
+
+    /// Makes turn children acknowledge a graceful host interrupt before a kill is considered.
+    #[must_use]
+    pub fn with_graceful_interrupt(mut self) -> Self {
+        self.interrupt_supported = true;
         self
     }
 
@@ -259,6 +270,11 @@ impl FakeClaudeCli {
         *lock(&self.kill_requests)
     }
 
+    /// How many turn children the harness asked to stop gracefully.
+    pub fn graceful_interrupts(&self) -> usize {
+        *lock(&self.graceful_interrupts)
+    }
+
     /// Whether every child this launcher handed out has ended.
     pub fn all_children_ended(&self) -> bool {
         lock(&self.children).iter().all(|child| child.is_finished())
@@ -309,9 +325,8 @@ fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl ProcessLauncher for FakeClaudeCli {
     async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
         let (run, stderr_bytes) = self.run_for(&spec.argv);
-        let gate = (!is_probe(&spec.argv))
-            .then(|| lock(&self.spawn_gate).clone())
-            .flatten();
+        let is_turn = !is_probe(&spec.argv);
+        let gate = is_turn.then(|| lock(&self.spawn_gate).clone()).flatten();
         if let Some(gate) = gate {
             gate.arrived.notify_one();
             gate.release.notified().await;
@@ -342,6 +357,9 @@ impl ProcessLauncher for FakeClaudeCli {
             mcp_config,
             config_at_kill: Arc::clone(&self.config_at_kill),
             kill_requests: Arc::clone(&self.kill_requests),
+            graceful_interrupts: Arc::clone(&self.graceful_interrupts),
+            interrupt_supported: self.interrupt_supported,
+            is_turn,
         });
         lock(&self.children).push(Arc::clone(&child));
 
@@ -368,6 +386,9 @@ struct Child {
     mcp_config: Option<PathBuf>,
     config_at_kill: Arc<Mutex<Vec<bool>>>,
     kill_requests: Arc<Mutex<usize>>,
+    graceful_interrupts: Arc<Mutex<usize>>,
+    interrupt_supported: bool,
+    is_turn: bool,
 }
 
 impl Child {
@@ -402,12 +423,27 @@ impl ProcessControl for Child {
         }
     }
 
+    async fn interrupt(&self, _reason: CancelReason) -> Result<InterruptOutcome> {
+        if !self.interrupt_supported {
+            return Ok(InterruptOutcome::Unsupported);
+        }
+        if self.is_turn {
+            *lock(&self.graceful_interrupts) += 1;
+        }
+        if !self.is_finished() {
+            self.end(ExitStatus {
+                code: Some(130),
+                signal: None,
+            });
+        }
+        Ok(InterruptOutcome::Delivered)
+    }
+
     /// 128 + SIGTERM, which is what the vendor documents for a `claude -p` run stopped that way.
     async fn kill(&self, _reason: CancelReason) -> Result<()> {
-        // Counted before the early return: the ask itself is what the trait bounds. Only for a
-        // turn child, which is the one a `--mcp-config` identifies; the version and help probes
-        // are ended by their own code paths and would otherwise be counted here too.
-        if self.mcp_config.is_some() {
+        // Counted before the early return: the ask itself is what the trait bounds. Version and
+        // help probes are ended by their own code paths, so only turn children contribute.
+        if self.is_turn {
             *lock(&self.kill_requests) += 1;
         }
         // A child that already ended is not killed again. `TokioChild` escalates once and the

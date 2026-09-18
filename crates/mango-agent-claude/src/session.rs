@@ -19,11 +19,12 @@
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
+use mango_external_agents::process::stop_process;
 use mango_external_agents::{
     CancelReason, CloseReason, Configuration, ConfigurationState, Dispatch, Error, ErrorCode,
     EventKind, EventSink, ExecutablePath, HostContext, PermissionResponse, Result,
-    SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec, TurnRequest,
-    TurnStream, VendorError, event, transports::stdio,
+    SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec, StopOutcome,
+    TurnRequest, TurnStream, VendorError, event, transports::stdio,
 };
 use serde_json::json;
 
@@ -52,6 +53,15 @@ type TurnEnd = OnceLock<CancelReason>;
 /// reason, even though there is nothing yet to kill.
 struct ActiveTurn {
     end: Arc<TurnEnd>,
+    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+}
+
+/// An active attempt synchronously claimed for teardown.
+///
+/// The attempt has already recorded the caller's reason before this value is returned. `control`
+/// is absent only while a start is still awaiting the launcher; that start observes the recorded
+/// reason once its child exists and becomes responsible for stopping the child it created.
+struct TakenTurn {
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
 }
 
@@ -106,6 +116,9 @@ struct Shared {
     surface: Option<CliSurface>,
     lifecycle: SessionLifecycle,
     mutable: Mutex<Mutable>,
+    /// Runtime that opened the session, retained for `Drop` paths which can run on another
+    /// thread after the caller has left that runtime's context.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Shared {
@@ -157,6 +170,7 @@ impl ClaudeSession {
                 surface,
                 lifecycle: SessionLifecycle::default(),
                 mutable: Mutex::new(mutable),
+                runtime: tokio::runtime::Handle::try_current().ok(),
             }),
         }
     }
@@ -167,8 +181,32 @@ impl ClaudeSession {
     /// `Session` method that held this lock across an await would deadlock the moment the turn
     /// channel filled, which is exactly when a host is least able to do anything about it.
     async fn stop_active_turn(&self, reason: CancelReason) {
-        let control = take_turn(&mut self.shared.lock(), reason);
-        end_turn(control, reason).await;
+        let taken = take_turn(&mut self.shared.lock(), reason);
+        let Some(taken) = taken else {
+            return;
+        };
+        // Claude documents that a SIGTERM leaves the current prompt unfinished and that a later
+        // `--resume` continues it. Do not let a start racing the asynchronous reap select that
+        // stale handle. A native `result` may establish continuity again, but only while this
+        // exact attempt still owns the slot.
+        reset_continuation(&self.shared);
+        let _ = end_turn(taken.control, reason, self.shared.host.limits().kill_grace).await;
+    }
+}
+
+impl Drop for ClaudeSession {
+    /// Stops an active child when the last owning session handle disappears.
+    ///
+    /// The stream pump holds `Shared`, not `ClaudeSession`, so waiting for `Shared::drop` would
+    /// leave a running child alive precisely when no host session can cancel it. The synchronous
+    /// claim ensures a pump that is already completing cannot be stopped twice.
+    fn drop(&mut self) {
+        let taken = take_turn(&mut self.shared.lock(), CancelReason::Shutdown);
+        let Some(taken) = taken else {
+            return;
+        };
+        reset_continuation(&self.shared);
+        spawn_teardown(&self.shared, taken.control, CancelReason::Shutdown);
     }
 }
 
@@ -178,15 +216,14 @@ impl ClaudeSession {
 /// still `None` — nothing to kill yet, but the reason must not be lost. Recording it here, under
 /// the lock that empties the slot, is what makes that reason visible to the spawn once it returns;
 /// only the actual kill happens after the guard is released.
-fn take_turn(
-    state: &mut Mutable,
-    reason: CancelReason,
-) -> Option<Arc<dyn mango_external_agents::ProcessControl>> {
+fn take_turn(state: &mut Mutable, reason: CancelReason) -> Option<TakenTurn> {
     let active = state.active.take()?;
     if active.end.set(reason).is_err() {
         return None;
     }
-    active.control
+    Some(TakenTurn {
+        control: active.control,
+    })
 }
 
 /// Kills the child a `start_turn` launched if that call never hands back its stream.
@@ -234,16 +271,14 @@ impl Drop for AbandonedStart {
                 None
             }
         };
-        let Some(control) = taken else {
+        let Some(taken) = taken else {
             return;
         };
-        // `kill` is async and a `Drop` is not, so the reap runs on a task of its own. Off a
-        // runtime there is nothing to spawn onto and nothing left that could await a child.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = control.kill(CancelReason::Requested).await;
-            });
-        }
+        reset_continuation(&self.shared);
+        // `kill` is async and a `Drop` is not, so the reap runs on the runtime that opened the
+        // session. Retaining that handle matters when a host drops the last session reference
+        // from a non-Tokio worker.
+        spawn_teardown(&self.shared, taken.control, CancelReason::Requested);
     }
 }
 
@@ -251,10 +286,45 @@ impl Drop for AbandonedStart {
 async fn end_turn(
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
     reason: CancelReason,
-) {
+    grace: Duration,
+) -> Option<StopOutcome> {
     if let Some(control) = control {
-        let _ = control.kill(reason).await;
+        return stop_process(control.as_ref(), reason, grace).await.ok();
     }
+    None
+}
+
+/// Schedules a stop from a synchronous ownership-release path.
+fn spawn_teardown(
+    shared: &Shared,
+    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+    reason: CancelReason,
+) {
+    let grace = shared.host.limits().kill_grace;
+    if let Some(runtime) = shared
+        .runtime
+        .as_ref()
+        .cloned()
+        .or_else(|| tokio::runtime::Handle::try_current().ok())
+    {
+        runtime.spawn(async move {
+            let _ = end_turn(control, reason, grace).await;
+        });
+    }
+}
+
+/// Makes the next admitted turn a fresh Claude conversation.
+///
+/// Anthropic documents that a process tree terminated with SIGTERM leaves its current turn
+/// unfinished and `--resume` continues that prompt. Resetting while the stopping attempt still
+/// owns (or has just released) the active slot closes the race where a host cancels and retries
+/// before the old stream pump has noticed EOF.
+fn reset_continuation(shared: &Shared) {
+    let mut state = shared.lock();
+    state.established = false;
+    shared
+        .core_state
+        .set_native_session_id(uuid::Uuid::new_v4().to_string());
 }
 
 #[async_trait::async_trait]
@@ -320,20 +390,22 @@ impl mango_external_agents::Session for ClaudeSession {
         models::validate_configuration(&configuration, self.shared.surface.as_ref())
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
-        // A host that starts a second turn has decided the first is over. Taken before anything is
-        // spawned so the two cannot both hold a child, and the slot this turn claims is reserved
-        // in the same statement: a `cancel`, a `close`, or a third `start_turn` landing before
-        // `stdio::open` returns below then has this reservation, rather than an empty slot, to
-        // record its reason against.
+        // Admission is a refusal boundary. A second request never silently replaces, queues, or
+        // cancels the work that already owns this session: the caller that wants to stop work
+        // says so through `cancel` and waits for the resulting terminal state. The slot is
+        // nevertheless reserved before spawning, so a stop landing while `stdio::open` is
+        // pending has a reason to record against rather than an empty window to race through.
         let end = Arc::new(TurnEnd::default());
-        let (previous, mut mcp_lease) = {
+        let mut mcp_lease = {
             let Some(_lifecycle) = self.shared.lifecycle.begin_start() else {
                 return Err(
                     Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
                 );
             };
             let mut state = self.shared.lock();
-            let previous = take_turn(&mut state, CancelReason::Requested);
+            if state.active.is_some() {
+                return Err(Error::Busy.with_dispatch(Dispatch::NotSubmitted));
+            }
             state.active = Some(ActiveTurn {
                 end: Arc::clone(&end),
                 control: None,
@@ -341,15 +413,11 @@ impl mango_external_agents::Session for ClaudeSession {
             // The reservation and this clone share the same critical section. A close that wins
             // after it can release the session's reference, but this attempt still owns the file
             // until it has either installed or reaped the child it launches.
-            (
-                previous,
-                // In a cancellation-safe owner for the same reason `open_session`'s artifact is:
-                // a caller that drops this future between here and the return reaches no explicit
-                // release, and a close that won the race leaves this clone the last reference.
-                crate::mcp::Prepared::new(state.mcp_config.as_ref().map(Arc::clone)),
-            )
+            // In a cancellation-safe owner for the same reason `open_session`'s artifact is:
+            // a caller that drops this future between here and the return reaches no explicit
+            // release, and a close that won the race leaves this clone the last reference.
+            crate::mcp::Prepared::new(state.mcp_config.as_ref().map(Arc::clone))
         };
-        end_turn(previous, CancelReason::Requested).await;
 
         let native_session_id = self
             .shared
@@ -417,13 +485,12 @@ impl mango_external_agents::Session for ClaudeSession {
         // session's `Arc` while the launcher awaited, but it cannot remove the file until this
         // call either installs the child or kills the stopped child below. Installing hands the
         // artifact back to the session, and this clone is then the cheap one to drop.
-        let limits = *self.shared.host.limits();
-        let (sink, events) = EventSink::new(
+        let (sink, events) = EventSink::with_limits(
             self.shared.core_state.snapshot().ids.session_id.clone(),
             request.turn_id.clone(),
             request.attempt,
             Arc::clone(self.shared.host.clock()),
-            limits.turn_channel_capacity,
+            self.shared.host.limits(),
         );
         let control = Arc::clone(&transport.control);
         // Re-checked under the same guard that installs the control, because `stdio::open` is
@@ -452,7 +519,12 @@ impl mango_external_agents::Session for ClaudeSession {
             }
         };
         if let Some(reason) = stopped {
-            let _ = control.kill(reason).await;
+            let _ = stop_process(
+                control.as_ref(),
+                reason,
+                self.shared.host.limits().kill_grace,
+            )
+            .await;
             // After the kill, never before: the child read `--mcp-config` at startup. And off the
             // worker, because a close that won the race left this lease holding the last
             // reference, so this is where the `remove_dir_all` happens.
@@ -562,7 +634,12 @@ impl mango_external_agents::Session for ClaudeSession {
             // validates — must not plant a live process nobody holds a handle to. Reaped the same
             // way a stop landing in this window is.
             clear_active(&self.shared, &end);
-            let _ = control.kill(CancelReason::Requested).await;
+            let _ = stop_process(
+                control.as_ref(),
+                CancelReason::Requested,
+                self.shared.host.limits().kill_grace,
+            )
+            .await;
             abandoned.disarm();
             return Err(error.with_dispatch(Dispatch::Accepted));
         }
@@ -622,7 +699,12 @@ impl mango_external_agents::Session for ClaudeSession {
         // release its own resources, so publishing it before the child and its MCP artifact are
         // actually handled lies about the session's lifetime.
         self.shared.core_state.set_status(SessionStatus::Closing);
-        end_turn(control, CancelReason::from(reason)).await;
+        end_turn(
+            control.and_then(|taken| taken.control),
+            CancelReason::from(reason),
+            self.shared.host.limits().kill_grace,
+        )
+        .await;
         // The session releases its reference here. A start still awaiting a child holds its own
         // `Arc` until it releases it just before its post-release ownership check, and that check
         // sees this close and kills the child it launched. Either order is safe: whichever
@@ -676,7 +758,16 @@ async fn pump(
     let written = sender.send(prompt_line(&input)).await;
     let closed = sender.close().await;
     if let Err(error) = written.and(closed) {
-        finish(&mut reducer, &sink, &end, &control, Some(error), exit_grace).await;
+        finish(
+            &shared,
+            &mut reducer,
+            &sink,
+            &end,
+            &control,
+            Some(error),
+            exit_grace,
+        )
+        .await;
         clear_active(&shared, &end);
         return;
     }
@@ -685,9 +776,18 @@ async fn pump(
     let mut failure = None;
     loop {
         let line = tokio::select! {
+            () = sink.closed() => {
+                if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Requested) {
+                    reset_continuation(&shared);
+                    let _ = end_turn(taken.control, CancelReason::Requested, exit_grace).await;
+                }
+                return;
+            }
             () = cancel_token.cancelled() => {
-                let _ = end.set(CancelReason::Shutdown);
-                let _ = control.kill(CancelReason::Shutdown).await;
+                if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Shutdown) {
+                    reset_continuation(&shared);
+                    let _ = end_turn(taken.control, CancelReason::Shutdown, exit_grace).await;
+                }
                 break;
             }
             received = tokio::time::timeout(STREAM_IDLE_TIMEOUT, receiver.recv()) => received,
@@ -713,7 +813,7 @@ async fn pump(
         };
         let reduction = reducer.reduce(&record);
         if let Some(init) = reduction.init {
-            apply_init(&shared, init);
+            apply_init(&shared, &end, init);
         }
         for event in reduction.events {
             match sink.emit(event).await {
@@ -721,13 +821,24 @@ async fn pump(
                 // The host dropped the stream. There is nobody to tell, and a turn nobody is
                 // reading is a turn to stop feeding.
                 Err(Error::Closed { .. }) => {
-                    let _ = end.set(CancelReason::Requested);
-                    let _ = control.kill(CancelReason::Requested).await;
-                    clear_active(&shared, &end);
+                    if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Requested)
+                    {
+                        reset_continuation(&shared);
+                        let _ = end_turn(taken.control, CancelReason::Requested, exit_grace).await;
+                    }
                     return;
                 }
-                // A vendor value that could not be made safe to keep. One event is dropped; the
-                // turn is not, because the rest of the run is still worth watching.
+                // EventSink commits its bounded overflow terminal before returning this error.
+                // No later vendor frame may follow that terminal, and a process whose output the
+                // stream rejected must not keep working for an absent consumer.
+                Err(_) if sink.is_terminal() => {
+                    if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Requested)
+                    {
+                        reset_continuation(&shared);
+                        let _ = end_turn(taken.control, CancelReason::Requested, exit_grace).await;
+                    }
+                    return;
+                }
                 Err(_) => {}
             }
         }
@@ -736,12 +847,22 @@ async fn pump(
         }
     }
 
-    finish(&mut reducer, &sink, &end, &control, failure, exit_grace).await;
+    finish(
+        &shared,
+        &mut reducer,
+        &sink,
+        &end,
+        &control,
+        failure,
+        exit_grace,
+    )
+    .await;
     clear_active(&shared, &end);
 }
 
 /// Writes the turn's terminal event, whichever way it ended, and reaps the child.
 async fn finish(
+    shared: &Shared,
     reducer: &mut TurnReducer,
     sink: &EventSink,
     end: &TurnEnd,
@@ -749,7 +870,8 @@ async fn finish(
     failure: Option<Error>,
     exit_grace: Duration,
 ) {
-    if reducer.finished() {
+    let native_finished = reducer.finished();
+    if native_finished {
         // The vendor's own `result` already ended the turn. A cancel that arrived after it changes
         // nothing: the turn did finish.
     } else if let Some(&reason) = end.get() {
@@ -757,6 +879,7 @@ async fn finish(
             let _ = sink.emit(event).await;
         }
         let _ = sink.cancel(reason).await;
+        reset_continuation_if_owned(shared, end);
     } else {
         // The exit status is worth a moment, because it is what names an exit the vendor documents
         // — but only a moment. A link that broke while the child worked on, or an idle timeout,
@@ -771,6 +894,7 @@ async fn finish(
         for event in reducer.abort(no_result_error(failure, exit, control.stderr_tail())) {
             let _ = sink.emit(event).await;
         }
+        reset_continuation_if_owned(shared, end);
     }
     // What can still be running here is a background *Bash* task the run started — a dev server, a
     // watch build — which the vendor gives about five seconds after the result before terminating
@@ -782,7 +906,12 @@ async fn finish(
     // lands after the record that wait produced, so it pre-empts nothing.
     //
     // <https://code.claude.com/docs/en/headless.md>
-    let _ = control.kill(CancelReason::Shutdown).await;
+    // A caller that took an active turn already owns its stop request. Asking the launcher again
+    // would violate ProcessControl's one-stop contract; a native result or a broken stream has no
+    // such owner and still needs the post-terminal process-tree reap.
+    if native_finished || end.get().is_none() {
+        let _ = stop_process(control.as_ref(), CancelReason::Shutdown, exit_grace).await;
+    }
 }
 
 /// Forgets this turn, unless a newer one already replaced it.
@@ -795,6 +924,39 @@ fn clear_active(shared: &Shared, end: &Arc<TurnEnd>) {
     {
         state.active = None;
     }
+}
+
+/// Takes this exact attempt for teardown, leaving a newer attempt untouched.
+fn take_matching_turn(
+    shared: &Shared,
+    end: &Arc<TurnEnd>,
+    reason: CancelReason,
+) -> Option<TakenTurn> {
+    let mut state = shared.lock();
+    if !state
+        .active
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(&active.end, end))
+    {
+        return None;
+    }
+    take_turn(&mut state, reason)
+}
+
+/// Resets continuation only while this attempt still owns the slot.
+fn reset_continuation_if_owned(shared: &Shared, end: &TurnEnd) {
+    let mut state = shared.lock();
+    if !state
+        .active
+        .as_ref()
+        .is_some_and(|active| std::ptr::eq(active.end.as_ref(), end))
+    {
+        return;
+    }
+    state.established = false;
+    shared
+        .core_state
+        .set_native_session_id(uuid::Uuid::new_v4().to_string());
 }
 
 /// Folds a run's `system/init` back into the session.
@@ -815,7 +977,18 @@ fn clear_active(shared: &Shared, end: &Arc<TurnEnd>) {
 /// account's own default; reading it as if it could establish one is actively unsafe, because a
 /// single turn at auto-review would then resolve the plain default level to `auto` for the rest of
 /// the session. A user who asked to be asked would stop being asked.
-fn apply_init(shared: &Shared, init: RunInit) {
+fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) {
+    // Buffered output from a stopped attempt must not re-establish its native continuation after
+    // a retry has claimed the slot. Keep the admission check and each state publication under the
+    // mutable state lock so cancel's reset cannot be overtaken between the check and the write.
+    let mut state = shared.lock();
+    if !state
+        .active
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(&active.end, end))
+    {
+        return;
+    }
     if let Some(commands) = init.commands {
         shared
             .core_state
@@ -835,7 +1008,7 @@ fn apply_init(shared: &Shared, init: RunInit) {
     };
     // The conversation exists either way — that is what the record proves, and it is what makes
     // the next turn a `--resume`.
-    shared.lock().established = true;
+    state.established = true;
     // Which handle it is followed under is a different question. This is the one value in this
     // file a vendor process chooses and a later argv carries, so it is vetted like the resume
     // reference a host supplies: a handle beginning with `-` would be read by the CLI's parser as

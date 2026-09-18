@@ -4,7 +4,7 @@ Drives the `claude` CLI a user already installed, through the headless surface A
 documents, over one child process per turn. It never logs in, never reads a credential and never
 downloads a binary.
 
-Facts below were read on 2026-09-13 against `claude` **2.1.270** and the vendor's own pages.
+Facts below were re-checked on 2026-09-17 against `claude` **2.1.270** and the vendor's own pages.
 Re-verify before relying on them; `mea capture --harness claude` regenerates the public contract
 under `fixtures/claude/contract/`.
 
@@ -134,7 +134,10 @@ id, and each turn spawns, streams and reaps its own child.
   force. The same argument-position rule applies to an explicit `--model` value.
 
   <https://code.claude.com/docs/en/cli-reference.md>
-- **A second `start_turn` ends the first.** A host that starts one has decided the first is over.
+- **A second `start_turn` is refused while one is active.** Admission claims the session's sole
+  active-turn slot before a child starts. A concurrent caller receives `Error::Busy` before any
+  second Claude invocation is launched; it must explicitly cancel the active turn and wait for
+  its terminal state before retrying.
 - **`start_turn` and `close` share the core lifecycle gate.** It covers the synchronous child
   reservation and teardown claim, then releases before every await. Close therefore either takes the
   reservation or makes the starting call reap the child it launched, rather than leaving a process
@@ -152,10 +155,12 @@ id, and each turn spawns, streams and reaps its own child.
 
 ## Cancellation, and what the vendor actually does
 
-`Session::cancel` records a reason, kills the child through the host's launcher, and the turn's
-pump writes `Cancelled { reason }` followed by `Completed`. Exit 143 is read as a clean stop rather
-than a failure: putting an error in the transcript for something the user asked for is worse than
-saying nothing.
+`Session::cancel` records a reason and asks the host launcher to interrupt the child first. The
+host supplies the OS-specific interrupt and containment policy. If the child does not exit during
+the host-configured grace period, the launcher escalates to process-tree termination and reaps it.
+The turn pump writes `Cancelled { reason }` followed by `Completed`; an unread transcript cannot
+block that control-plane cleanup. Exit 143 is read as a clean stop rather than a failure: putting
+an error in the transcript for something the user asked for is worse than saying nothing.
 
 **The vendor's own turn is left unfinished.** This is a real asymmetry and it is the vendor's
 documented behaviour, not this harness's choice:
@@ -165,11 +170,11 @@ documented behaviour, not this harness's choice:
 > session, Claude Code continues the turn that SIGTERM left unfinished.
 > — [headless.md](https://code.claude.com/docs/en/headless.md)
 
-So a cancelled turn's work may resume on the *next* turn of the same session. SIGINT is what the
-vendor documents as ending a turn cleanly, and the library cannot ask for it: `ProcessControl::kill`
-is the host's port, and which signal "end it" means is the launcher's decision. A host that wants
-the vendor's clean-cancel semantics implements that in its own launcher. A core-owned way to ask
-for an interrupt rather than a kill is the obvious follow-up.
+The harness therefore never resumes a conversation after a cancelled attempt that did not produce
+a native `result`: it mints a new session id for the next admitted turn, so Claude cannot continue
+the killed prompt. SIGINT is what the vendor documents as ending a turn cleanly. A launcher reports
+that graceful interruption separately from forced termination, but only a native `result` proves
+that the vendor completed a turn which is safe to continue.
 
 Closing stdin is also what the vendor documents as cancelling a pending prompt, and this harness
 closes it immediately after the prompt — so a run that would otherwise wait for an answer nobody
