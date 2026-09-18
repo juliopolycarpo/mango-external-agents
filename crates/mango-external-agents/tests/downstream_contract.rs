@@ -334,7 +334,9 @@ fn every_protected_request_type_is_constructible_through_its_builders() {
         .by_subagent("explorer")
         .with_content(ActivityContent::Diff {
             files: vec![
-                FileChange::new("src/lib.rs", FileChangeKind::Modified).with_line_counts(10, 2),
+                FileChange::new("src/lib.rs")
+                    .with_kind(FileChangeKind::Modified)
+                    .with_line_counts(10, 2),
             ],
         })
         .with_extensions(

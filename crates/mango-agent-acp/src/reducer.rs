@@ -120,11 +120,7 @@ impl Reducer {
         if std::mem::take(&mut self.plan_started) {
             events.push(EventKind::ActivityCompleted {
                 call_id: String::from(PLAN_CALL_ID),
-                result: ActivityResult {
-                    status: ActivityStatus::Completed,
-                    detail: None,
-                    truncated: false,
-                },
+                result: ActivityResult::new(ActivityStatus::Completed),
             });
         }
         events
@@ -208,11 +204,7 @@ impl Reducer {
         if std::mem::replace(&mut self.plan_started, true) {
             return vec![EventKind::ActivityUpdated {
                 call_id: String::from(PLAN_CALL_ID),
-                update: ActivityUpdate {
-                    title: Some(title),
-                    detail: Some(detail),
-                    truncated: false,
-                },
+                update: ActivityUpdate::new().with_title(title).with_detail(detail),
             }];
         }
         vec![EventKind::ActivityStarted {
@@ -299,7 +291,7 @@ fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
     if let Some(result) = fields.status.and_then(finished) {
         return vec![EventKind::ActivityCompleted {
             call_id,
-            result: ActivityResult { detail, ..result },
+            result: result.with_optional_detail(detail),
         }];
     }
     if fields.title.is_none() && detail.is_none() {
@@ -309,11 +301,9 @@ fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
     }
     vec![EventKind::ActivityUpdated {
         call_id,
-        update: ActivityUpdate {
-            title: fields.title,
-            detail,
-            truncated: false,
-        },
+        update: ActivityUpdate::new()
+            .with_optional_title(fields.title)
+            .with_optional_detail(detail),
     }]
 }
 
@@ -327,11 +317,7 @@ fn finished(status: ToolCallStatus) -> Option<ActivityResult> {
         // guessing "completed" would close an activity that is still running.
         _ => return None,
     };
-    Some(ActivityResult {
-        status,
-        detail: None,
-        truncated: false,
-    })
+    Some(ActivityResult::new(status))
 }
 
 /// The agent's own tool name when it sent one, its title otherwise.

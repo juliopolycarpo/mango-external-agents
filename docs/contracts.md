@@ -171,6 +171,23 @@ started it. `ActivityContent` keeps a plan as steps with their own state, a diff
 their own counts, and output as its own thing — none of them flattened into prose a host would have
 to re-parse.
 
+`ActivityUpdate` and `ActivityResult` carry the same `content`. They have to: a plan is announced
+once and revised several times, and a tool result is where most vendors say what they actually did.
+Without it the second announcement of a checklist could only arrive as a new title, and the files a
+patch touched would reach a host as a paragraph.
+
+Two fields inside `FileChange` are deliberately optional for the same reason:
+
+- `kind` is **absent** where the vendor does not state one. Two of the three vendors send a path and
+  a body and never say whether the file was created, modified or deleted; deriving it by re-reading
+  the diff text would be the host depending on vendor prose that this type exists to prevent.
+- `old_text`/`new_text` carry contents where a vendor sends contents, and `unified_diff` carries a
+  diff where a vendor sends a diff. Neither is ever computed from the other. Rendering one from the
+  other is a host's own choice; doing it here would put bytes no vendor wrote into a transcript.
+
+`PlanStep::priority` is on the same terms: present where the vendor ranks its steps, absent where it
+does not — an unranked step is one nobody ranked, not a low-priority one.
+
 `Extensions` is the long tail: a flat, scalar-only map, capped at 32 entries, with bounded keys and
 values, run through the same credential redaction a stderr tail is. It is **observational**.
 Nothing read from it is executed, dispatched or turned into an RPC, and there is deliberately no

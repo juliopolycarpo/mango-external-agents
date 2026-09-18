@@ -100,8 +100,8 @@ pub fn completed(item: &ThreadItem) -> Option<ActivityResult> {
         // report, so they end as completed rather than as an unknown this harness invented.
         _ => (ItemStatus::Completed, None),
     };
-    Some(ActivityResult {
-        status: match status {
+    Some(
+        ActivityResult::new(match status {
             ItemStatus::Completed => ActivityStatus::Completed,
             ItemStatus::Failed => ActivityStatus::Failed,
             ItemStatus::Declined => ActivityStatus::Cancelled,
@@ -109,10 +109,9 @@ pub fn completed(item: &ThreadItem) -> Option<ActivityResult> {
             // or carrying a spelling this build does not know, has finished by some route nobody
             // here can name. `Completed` would assert success it has no evidence of.
             ItemStatus::InProgress | ItemStatus::Unknown => ActivityStatus::Failed,
-        },
-        detail,
-        truncated: false,
-    })
+        })
+        .with_optional_detail(detail),
+    )
 }
 
 fn command_detail(output: Option<&str>, exit_code: Option<i64>) -> Option<String> {

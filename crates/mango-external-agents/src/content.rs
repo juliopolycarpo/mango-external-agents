@@ -50,6 +50,24 @@ pub enum PlanStepStatus {
     Dropped,
 }
 
+/// How important one plan step is, as the vendor ranked it.
+///
+/// Absent where the vendor states no ranking. An unranked step is one nobody ranked, not a
+/// low-priority one, which is why this is an [`Option`] on [`PlanStep`] rather than a default.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum PlanStepPriority {
+    /// Critical to the goal.
+    High,
+    /// Important, not critical.
+    Medium,
+    /// Nice to have.
+    Low,
+}
+
 /// One step of a plan the vendor wrote.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +82,9 @@ pub struct PlanStep {
     pub title: String,
     /// Where it stands.
     pub status: PlanStepStatus,
+    /// How the vendor ranked it, when it ranked it at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<PlanStepPriority>,
 }
 
 impl fmt::Debug for PlanStep {
@@ -73,6 +94,7 @@ impl fmt::Debug for PlanStep {
             .debug_struct("PlanStep")
             .field("has_id", &self.id.is_some())
             .field("status", &self.status)
+            .field("priority", &self.priority)
             .finish_non_exhaustive()
     }
 }
@@ -84,6 +106,7 @@ impl PlanStep {
             id: None,
             title: title.into(),
             status: PlanStepStatus::Pending,
+            priority: None,
         }
     }
 
@@ -101,6 +124,13 @@ impl PlanStep {
         self
     }
 
+    /// Records how the vendor ranked it.
+    #[must_use]
+    pub fn with_priority(mut self, priority: PlanStepPriority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
     /// This step with its title bounded and an unusable id dropped.
     ///
     /// The id is dropped rather than refusing the step: a step nobody can address is still a step
@@ -113,11 +143,16 @@ impl PlanStep {
                 .and_then(|id| normalize::opaque_id(&id, "plan step id").ok()),
             title: normalize::bound_text(&self.title, TextLimit::Title).text,
             status: self.status,
+            priority: self.priority,
         }
     }
 }
 
 /// What happened to one file.
+///
+/// Carried as an [`Option`] on [`FileChange`]: two of the three vendors this library drives send a
+/// path and a body without ever saying which of these it is, and deriving one by re-reading the
+/// diff text would be the host depending on a vendor's prose that this module exists to prevent.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -145,8 +180,9 @@ pub enum FileChangeKind {
 pub struct FileChange {
     /// The path, as the vendor spelled it.
     pub path: String,
-    /// What happened to it.
-    pub kind: FileChangeKind,
+    /// What happened to it, when the vendor said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<FileChangeKind>,
     /// Where it was before, for a rename.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_path: Option<String>,
@@ -159,6 +195,16 @@ pub struct FileChange {
     /// The diff itself, when the vendor sent one and it fits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_diff: Option<String>,
+    /// The contents before the change, when the vendor sent contents rather than a diff.
+    ///
+    /// Absent for a file the vendor says is new, and absent for a vendor that sends a diff: one of
+    /// the two shapes is never derived from the other. Rendering a diff from these two is the
+    /// host's own choice; computing one here would put bytes no vendor wrote into a transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    /// The contents after it, on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
 }
 
 impl fmt::Debug for FileChange {
@@ -171,27 +217,63 @@ impl fmt::Debug for FileChange {
             .field("added_lines", &self.added_lines)
             .field("removed_lines", &self.removed_lines)
             .field("has_unified_diff", &self.unified_diff.is_some())
+            .field("has_old_text", &self.old_text.is_some())
+            .field("has_new_text", &self.new_text.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl FileChange {
-    /// One file, with nothing counted.
-    pub fn new(path: impl Into<String>, kind: FileChangeKind) -> Self {
+    /// One file, with nothing said about it beyond its path.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{FileChange, FileChangeKind};
+    ///
+    /// let change = FileChange::new("src/lib.rs").with_kind(FileChangeKind::Modified);
+    /// assert_eq!(change.kind, Some(FileChangeKind::Modified));
+    /// ```
+    pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            kind,
+            kind: None,
             previous_path: None,
             added_lines: None,
             removed_lines: None,
             unified_diff: None,
+            old_text: None,
+            new_text: None,
         }
     }
 
-    /// Records where the file was before a rename.
+    /// Records what the vendor said happened to it.
+    #[must_use]
+    pub fn with_kind(mut self, kind: FileChangeKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    /// Records where the file was before a rename, and that it was one.
     #[must_use]
     pub fn moved_from(mut self, previous_path: impl Into<String>) -> Self {
         self.previous_path = Some(previous_path.into());
+        self.kind = Some(FileChangeKind::Renamed);
+        self
+    }
+
+    /// Carries the contents the vendor sent on either side of the change.
+    ///
+    /// `None` for `old` is the vendor saying the file is new, which is the one kind this can be
+    /// read off a body rather than guessed.
+    #[must_use]
+    pub fn with_texts(mut self, old: Option<String>, new: impl Into<String>) -> Self {
+        self.kind = Some(match old {
+            Some(_) => FileChangeKind::Modified,
+            None => FileChangeKind::Created,
+        });
+        self.old_text = old;
+        self.new_text = Some(new.into());
         self
     }
 
@@ -225,6 +307,12 @@ impl FileChange {
             unified_diff: self
                 .unified_diff
                 .map(|diff| normalize::bound_text(&diff, TextLimit::Detail).text),
+            old_text: self
+                .old_text
+                .map(|text| normalize::bound_text(&text, TextLimit::Detail).text),
+            new_text: self
+                .new_text
+                .map(|text| normalize::bound_text(&text, TextLimit::Detail).text),
             ..self
         })
     }
@@ -344,9 +432,11 @@ mod tests {
     fn a_diff_keeps_per_file_counts_and_the_vendors_own_order() {
         let content = ActivityContent::Diff {
             files: vec![
-                FileChange::new("src/lib.rs", FileChangeKind::Modified).with_line_counts(10, 2),
-                FileChange::new("src/new.rs", FileChangeKind::Created),
-                FileChange::new("src/moved.rs", FileChangeKind::Renamed).moved_from("src/old.rs"),
+                FileChange::new("src/lib.rs")
+                    .with_kind(FileChangeKind::Modified)
+                    .with_line_counts(10, 2),
+                FileChange::new("src/new.rs").with_kind(FileChangeKind::Created),
+                FileChange::new("src/moved.rs").moved_from("src/old.rs"),
             ],
         }
         .normalized();
@@ -367,8 +457,8 @@ mod tests {
     fn a_file_whose_path_cannot_be_carried_whole_is_dropped() {
         let content = ActivityContent::Diff {
             files: vec![
-                FileChange::new("p".repeat(4_097), FileChangeKind::Modified),
-                FileChange::new("src/lib.rs", FileChangeKind::Modified),
+                FileChange::new("p".repeat(4_097)).with_kind(FileChangeKind::Modified),
+                FileChange::new("src/lib.rs").with_kind(FileChangeKind::Modified),
             ],
         }
         .normalized();
@@ -394,7 +484,9 @@ mod tests {
 
         let ActivityContent::Diff { files } = (ActivityContent::Diff {
             files: (0..DIFF_MAX_FILES + 10)
-                .map(|index| FileChange::new(format!("file{index}.rs"), FileChangeKind::Modified))
+                .map(|index| {
+                    FileChange::new(format!("file{index}.rs")).with_kind(FileChangeKind::Modified)
+                })
                 .collect(),
         })
         .normalized() else {
@@ -410,7 +502,7 @@ mod tests {
                 steps: vec![PlanStep::new("one")],
             },
             ActivityContent::Diff {
-                files: vec![FileChange::new("a.rs", FileChangeKind::Deleted)],
+                files: vec![FileChange::new("a.rs").with_kind(FileChangeKind::Deleted)],
             },
             ActivityContent::Output {
                 text: String::from("done"),
@@ -429,7 +521,8 @@ mod tests {
     fn an_over_long_diff_body_is_cut_rather_than_dropping_the_file_it_describes() {
         let content = ActivityContent::Diff {
             files: vec![
-                FileChange::new("src/lib.rs", FileChangeKind::Modified)
+                FileChange::new("src/lib.rs")
+                    .with_kind(FileChangeKind::Modified)
                     .with_unified_diff("+".repeat(9_000)),
             ],
         }

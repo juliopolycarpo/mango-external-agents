@@ -12,6 +12,7 @@ use crate::configuration::{
     ConfigurationState, ConfigurationValue, ConfigurationValueType, RejectedSetting, Rollback,
     SettingRejection,
 };
+use crate::content::ActivityContent;
 use crate::discovery::{AuthMode, AuthState, Discovery, GateVerdict, Model};
 use crate::error::{Error, ErrorCode, Result, VendorError};
 use crate::event::{
@@ -394,17 +395,13 @@ impl FakeSession {
             })
             .await?;
         let result = if option_id == "deny" {
-            ActivityResult {
-                status: ActivityStatus::Cancelled,
-                detail: Some(String::from("refused")),
-                truncated: false,
-            }
+            ActivityResult::new(ActivityStatus::Cancelled).with_detail("refused")
         } else {
-            ActivityResult {
-                status: ActivityStatus::Completed,
-                detail: Some(String::from("3 passed")),
-                truncated: false,
-            }
+            ActivityResult::new(ActivityStatus::Completed)
+                .with_detail("3 passed")
+                .with_content(ActivityContent::Output {
+                    text: String::from("test result: ok. 3 passed; 0 failed"),
+                })
         };
         turn.sink
             .emit(EventKind::ActivityCompleted {

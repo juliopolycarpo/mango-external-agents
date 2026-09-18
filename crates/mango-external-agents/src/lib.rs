@@ -37,7 +37,9 @@ pub use configuration::{
     ConfigurationPatch, ConfigurationSource, ConfigurationState, ConfigurationValue,
     ConfigurationValueType, RejectedSetting, Rollback, SettingRejection,
 };
-pub use content::{ActivityContent, FileChange, FileChangeKind, PlanStep, PlanStepStatus};
+pub use content::{
+    ActivityContent, FileChange, FileChangeKind, PlanStep, PlanStepPriority, PlanStepStatus,
+};
 pub use discovery::{
     AuthMode, AuthState, Discovery, DiscoveryReceipt, DiscoveryReceiptMeasurements, GateVerdict,
     Model, ReasoningEffort,

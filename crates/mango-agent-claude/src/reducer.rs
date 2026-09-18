@@ -481,11 +481,7 @@ impl TurnReducer {
             let merged = self.append_nested(parent, text);
             events.push(EventKind::ActivityUpdated {
                 call_id: parent.to_owned(),
-                update: ActivityUpdate {
-                    title: None,
-                    detail: detail_for(merged),
-                    truncated: false,
-                },
+                update: ActivityUpdate::new().with_optional_detail(detail_for(merged)),
             });
         }
         events
@@ -551,15 +547,12 @@ impl TurnReducer {
                 .unwrap_or_else(|| block.result_text());
             events.push(EventKind::ActivityCompleted {
                 call_id: call_id.to_owned(),
-                result: ActivityResult {
-                    status: if block.is_error() {
-                        ActivityStatus::Failed
-                    } else {
-                        ActivityStatus::Completed
-                    },
-                    detail: detail_for(&detail),
-                    truncated: false,
-                },
+                result: ActivityResult::new(if block.is_error() {
+                    ActivityStatus::Failed
+                } else {
+                    ActivityStatus::Completed
+                })
+                .with_optional_detail(detail_for(&detail)),
             });
         }
         events
@@ -598,11 +591,8 @@ impl TurnReducer {
                     .unwrap_or_default();
                 EventKind::ActivityCompleted {
                     call_id,
-                    result: ActivityResult {
-                        status: ActivityStatus::Cancelled,
-                        detail: detail_for(detail),
-                        truncated: false,
-                    },
+                    result: ActivityResult::new(ActivityStatus::Cancelled)
+                        .with_optional_detail(detail_for(detail)),
                 }
             })
             .collect()
@@ -825,12 +815,9 @@ mod tests {
         );
 
         let overlong = "m".repeat(DETAIL_CARRY_MAX_CHARS + 1);
-        let update = ActivityUpdate {
-            title: None,
-            detail: detail_for(&overlong),
-            truncated: false,
-        }
-        .normalized();
+        let update = ActivityUpdate::new()
+            .with_optional_detail(detail_for(&overlong))
+            .normalized();
         assert!(
             update.truncated,
             "expected the sink to report the cut it made, received {update:?}"

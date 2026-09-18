@@ -685,8 +685,12 @@ impl Default for ActivityKind {
 }
 
 /// What changed about a running activity.
+///
+/// Every field is a replacement, not a patch on a patch: a field left `None` is one this update
+/// says nothing about, and a host keeps whatever it already had for it.
 #[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ActivityUpdate {
     /// A new summary, when it changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -694,6 +698,13 @@ pub struct ActivityUpdate {
     /// New detail, when it changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The structured thing it produced, when that changed.
+    ///
+    /// The field that makes a revised plan a plan again. Without it the second announcement of a
+    /// checklist could only arrive as a new title, and a host that rendered steps the first time
+    /// would have to re-parse a sentence to keep them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<ActivityContent>,
     /// True when any field above was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
@@ -706,12 +717,80 @@ impl fmt::Debug for ActivityUpdate {
             .debug_struct("ActivityUpdate")
             .field("has_title", &self.title.is_some())
             .field("has_detail", &self.detail.is_some())
+            .field("content", &self.content)
             .field("truncated", &self.truncated)
             .finish()
     }
 }
 
 impl ActivityUpdate {
+    /// An update that says nothing yet.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::ActivityUpdate;
+    ///
+    /// let update = ActivityUpdate::new().with_title("running tests");
+    /// assert_eq!(update.title.as_deref(), Some("running tests"));
+    /// assert!(update.detail.is_none());
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the summary.
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Replaces the detail.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Replaces the summary, when there is one to replace it with.
+    #[must_use]
+    pub fn with_optional_title(mut self, title: Option<String>) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// Replaces the detail, when there is one to replace it with.
+    #[must_use]
+    pub fn with_optional_detail(mut self, detail: Option<String>) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    /// Replaces the structured thing it produced, when there is one.
+    #[must_use]
+    pub fn with_optional_content(mut self, content: Option<ActivityContent>) -> Self {
+        self.content = content;
+        self
+    }
+
+    /// Replaces the structured thing it produced.
+    #[must_use]
+    pub fn with_content(mut self, content: ActivityContent) -> Self {
+        self.content = Some(content);
+        self
+    }
+
+    /// Whether this update would change anything a host is showing.
+    ///
+    /// An update with nothing in it is noise in a transcript, and a reducer that emits one for
+    /// every status-only frame fills a host's log with rows that render identically.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.detail.is_none() && self.content.is_none()
+    }
+
     /// This update with every field bounded.
     #[must_use]
     pub fn normalized(self) -> Self {
@@ -727,6 +806,7 @@ impl ActivityUpdate {
         Self {
             title: title.map(|title| title.text),
             detail: detail.map(|detail| detail.text),
+            content: self.content.map(ActivityContent::normalized),
             truncated,
         }
     }
@@ -750,12 +830,20 @@ pub enum ActivityStatus {
 /// An activity's outcome.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ActivityResult {
     /// How it ended.
     pub status: ActivityStatus,
     /// What the vendor said about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The structured thing it produced.
+    ///
+    /// A tool result is where most vendors put what they actually did — the files a patch touched,
+    /// the output a command printed. Carrying it only as `detail` costs a host the per-file counts
+    /// it would render, and there is no second announcement to recover them from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<ActivityContent>,
     /// True when the detail was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
@@ -768,12 +856,54 @@ impl fmt::Debug for ActivityResult {
             .debug_struct("ActivityResult")
             .field("status", &self.status)
             .field("has_detail", &self.detail.is_some())
+            .field("content", &self.content)
             .field("truncated", &self.truncated)
             .finish()
     }
 }
 
 impl ActivityResult {
+    /// An outcome with nothing said about it beyond how it ended.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{ActivityResult, ActivityStatus};
+    ///
+    /// let result = ActivityResult::new(ActivityStatus::Completed).with_detail("exit 0");
+    /// assert_eq!(result.status, ActivityStatus::Completed);
+    /// ```
+    #[must_use]
+    pub fn new(status: ActivityStatus) -> Self {
+        Self {
+            status,
+            detail: None,
+            content: None,
+            truncated: false,
+        }
+    }
+
+    /// Carries what the vendor said about it.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Carries what the vendor said about it, when it said anything.
+    #[must_use]
+    pub fn with_optional_detail(mut self, detail: Option<String>) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    /// Carries the structured thing it produced.
+    #[must_use]
+    pub fn with_content(mut self, content: ActivityContent) -> Self {
+        self.content = Some(content);
+        self
+    }
+
     /// This result with its detail bounded.
     #[must_use]
     pub fn normalized(self) -> Self {
@@ -784,6 +914,7 @@ impl ActivityResult {
         Self {
             status: self.status,
             detail: detail.map(|detail| detail.text),
+            content: self.content.map(ActivityContent::normalized),
             truncated,
         }
     }
@@ -1018,6 +1149,7 @@ mod tests {
         AccountLimits, Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
         Command, EventKind, RateLimitWindow,
     };
+    use crate::content::{ActivityContent, FileChange, PlanStep, PlanStepStatus};
     use crate::error::{Error, ErrorCode, VendorError};
     use crate::interaction::{
         Answer, AnswerValue, InteractionId, QuestionId, QuestionOptionId, QuestionOutcome,
@@ -1089,16 +1221,17 @@ mod tests {
             truncated: false,
             ..Activity::default()
         };
-        let update = ActivityUpdate {
-            title: Some(String::from("update-title-secret")),
-            detail: Some(String::from("update-detail-secret")),
-            truncated: false,
-        };
-        let result = ActivityResult {
-            status: ActivityStatus::Failed,
-            detail: Some(String::from("result-detail-secret")),
-            truncated: false,
-        };
+        let update = ActivityUpdate::new()
+            .with_title("update-title-secret")
+            .with_detail("update-detail-secret")
+            .with_content(ActivityContent::Plan {
+                steps: vec![PlanStep::new("plan-step-secret")],
+            });
+        let result = ActivityResult::new(ActivityStatus::Failed)
+            .with_detail("result-detail-secret")
+            .with_content(ActivityContent::Output {
+                text: String::from("result-output-secret"),
+            });
         let window = RateLimitWindow {
             label: Some(String::from("window-label-secret")),
             ..RateLimitWindow::default()
@@ -1125,7 +1258,9 @@ mod tests {
                 "activity-detail-secret",
                 "update-title-secret",
                 "update-detail-secret",
+                "plan-step-secret",
                 "result-detail-secret",
+                "result-output-secret",
                 "window-label-secret",
                 "plan-type-secret",
             ] {
@@ -1466,24 +1601,88 @@ mod tests {
 
     #[test]
     fn an_update_and_a_result_carry_the_truncation_they_caused() {
-        let update = ActivityUpdate {
-            title: Some("t".repeat(300)),
-            detail: None,
-            truncated: false,
-        }
-        .normalized();
+        let update = ActivityUpdate::new()
+            .with_title("t".repeat(300))
+            .normalized();
         assert!(update.truncated);
 
-        let result = ActivityResult {
-            status: ActivityStatus::Failed,
-            detail: Some("d".repeat(5_000)),
-            truncated: false,
-        }
-        .normalized();
+        let result = ActivityResult::new(ActivityStatus::Failed)
+            .with_detail("d".repeat(5_000))
+            .normalized();
         assert!(result.truncated);
         assert_eq!(
             result.detail.map(|detail| detail.chars().count()),
             Some(4_096)
+        );
+    }
+
+    /// The field a revised plan needs. Before it, a second announcement of a checklist could only
+    /// arrive as a new title, and a host that rendered steps the first time had a sentence to
+    /// re-parse the second.
+    #[test]
+    fn an_update_carries_a_revised_plan_as_steps_rather_than_as_a_sentence() {
+        let update = ActivityUpdate::new()
+            .with_content(ActivityContent::Plan {
+                steps: vec![
+                    PlanStep::new("read the reducer").with_status(PlanStepStatus::Completed),
+                    PlanStep::new("write the test"),
+                ],
+            })
+            .normalized();
+
+        let Some(ActivityContent::Plan { steps }) = update.content else {
+            panic!("expected the revised plan back, received {update:?}");
+        };
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].status, PlanStepStatus::Completed);
+        assert_eq!(steps[1].status, PlanStepStatus::Pending);
+    }
+
+    /// A tool result is where most vendors say what they actually did. Carrying it only as
+    /// `detail` costs a host the per-file counts, and no later frame repeats them.
+    #[test]
+    fn a_result_carries_the_files_it_touched_with_their_own_counts() {
+        let result = ActivityResult::new(ActivityStatus::Completed)
+            .with_content(ActivityContent::Diff {
+                files: vec![FileChange::new("src/lib.rs").with_line_counts(10, 2)],
+            })
+            .normalized();
+
+        let Some(ActivityContent::Diff { files }) = result.content else {
+            panic!("expected the diff back, received {result:?}");
+        };
+        assert_eq!(files[0].added_lines, Some(10));
+        assert_eq!(files[0].kind, None, "unstated is unknown, not modified");
+    }
+
+    /// The bound applies to content the same way it applies to detail: an update is not a channel
+    /// for an unbounded payload just because the payload is typed.
+    #[test]
+    fn content_on_an_update_is_bounded_like_every_other_vendor_written_field() {
+        let update = ActivityUpdate::new()
+            .with_content(ActivityContent::Output {
+                text: "o".repeat(9_000),
+            })
+            .normalized();
+
+        let Some(ActivityContent::Output { text }) = update.content else {
+            panic!("expected output back, received {update:?}");
+        };
+        assert_eq!(text.chars().count(), 4_096);
+    }
+
+    /// An empty update renders identically to no update at all, so a reducer has one place to ask
+    /// rather than three conditions that drift apart.
+    #[test]
+    fn an_update_that_changes_nothing_says_so() {
+        assert!(ActivityUpdate::new().is_empty());
+        assert!(!ActivityUpdate::new().with_detail("ran").is_empty());
+        assert!(
+            !ActivityUpdate::new()
+                .with_content(ActivityContent::Output {
+                    text: String::from("ok")
+                })
+                .is_empty()
         );
     }
 

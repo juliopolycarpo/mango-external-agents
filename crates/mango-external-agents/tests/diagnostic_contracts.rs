@@ -106,7 +106,8 @@ fn activity_content_extensions_and_operation_reference_do_not_replay_payloads() 
     };
     let diff = ActivityContent::Diff {
         files: vec![
-            FileChange::new(PAYLOAD, FileChangeKind::Modified)
+            FileChange::new(PAYLOAD)
+                .with_kind(FileChangeKind::Modified)
                 .moved_from(PAYLOAD)
                 .with_unified_diff(PAYLOAD),
         ],
@@ -126,7 +127,8 @@ fn activity_content_extensions_and_operation_reference_do_not_replay_payloads() 
     assert_payload_free(output);
     assert_payload_free(PlanStep::new(PAYLOAD).with_id(PAYLOAD));
     assert_payload_free(
-        FileChange::new(PAYLOAD, FileChangeKind::Modified)
+        FileChange::new(PAYLOAD)
+            .with_kind(FileChangeKind::Modified)
             .moved_from(PAYLOAD)
             .with_unified_diff(PAYLOAD),
     );
