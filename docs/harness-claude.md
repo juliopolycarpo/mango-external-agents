@@ -363,15 +363,14 @@ catalog an earlier run published.
   reconstructing it would mean reading the email this harness deliberately drops.
 - **`--permission-prompts none`** is passed where the build declares it; the TypeScript adapter
   added this late and the reasoning is carried over intact.
-- The **idle timeout** (10 minutes of silence) lives here rather than in a supervisor above.
+- The **idle timeout** is host-configured and lives here rather than in a supervisor above.
 
 ## Known gaps
 
 - `GateVerdict::VersionTooOld` carries the version and the floor but has nowhere to name *which*
   flag went missing, so a build refused for a missing flag reports an upgrade rather than the
   specific cause. The fixture-backed surface test is what names it for a maintainer.
-- A real `ResumeMode::Fallback`, and a core-owned way to ask a launcher for an interrupt rather
-  than a kill, are both recorded above as follow-ups.
+- A real `ResumeMode::Fallback` is recorded above as a follow-up.
 
 Discovery exposes the account and build restrictions in `Discovery.permission_matrix`; the static
 `Harness::permission_matrix` is its upper bound. Hosts can use the probed matrix to disable

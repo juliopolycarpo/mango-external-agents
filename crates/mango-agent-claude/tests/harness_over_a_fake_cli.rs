@@ -1352,6 +1352,42 @@ mod a_turn {
     }
 
     #[tokio::test]
+    async fn aborting_a_stopped_start_during_reap_keeps_the_child_owned() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let spawn = launcher.gate_turn_spawns();
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "hold"))
+                    .await
+                    .map(drop)
+            }
+        });
+        spawn.wait_for_spawn().await;
+        session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect("expected the pending spawn to record cancellation");
+        spawn.release();
+        stop.wait_for_spawn().await;
+        starting.abort();
+        let _ = starting.await;
+        stop.release();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while launcher.a_child_is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the dropped reaper to retain and reap the child");
+    }
+
+    #[tokio::test]
     async fn refuses_a_turn_carrying_attachments_rather_than_dropping_them() {
         let launcher = Arc::new(FakeClaudeCli::new());
         let session = open(&launcher).await;

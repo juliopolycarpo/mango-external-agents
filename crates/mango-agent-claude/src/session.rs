@@ -272,6 +272,8 @@ struct AbandonedStart {
     shared: Arc<Shared>,
     end: Arc<TurnEnd>,
     spawn: Option<tokio::task::JoinHandle<Result<stdio::StdioTransport>>>,
+    /// Installed before any cleanup await so an abort transfers this child to `Drop`.
+    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
     /// Kept until the late child is reaped when a dropped start races a session close.
     mcp_lease: crate::mcp::Prepared<Arc<ConfigFile>>,
     armed: bool,
@@ -307,6 +309,7 @@ impl Drop for AbandonedStart {
         // `ProcessControl::kill` documents one stop request. Once a child has been installed, a
         // prior stop owns that process; a pending launcher remains this guard's responsibility.
         let spawn = self.spawn.take();
+        let owned_control = self.control.take();
         let taken = {
             let state = self.shared.lock();
             let active = state
@@ -320,10 +323,11 @@ impl Drop for AbandonedStart {
                 // `cancel` or `close` already recorded the reason while it was spawning. Once
                 // the launcher handed us a child, an existing stop owns that process and must
                 // not receive a second signal from this drop path.
-                (spawn.is_some() || newly_stopped).then(|| TakenTurn {
-                    end: Arc::clone(&active.end),
-                    control: active.control.as_ref().map(Arc::clone),
-                })
+                (spawn.is_some() || owned_control.is_some() && !active.stopped || newly_stopped)
+                    .then(|| TakenTurn {
+                        end: Arc::clone(&active.end),
+                        control: active.control.as_ref().map(Arc::clone),
+                    })
             })
         };
         let Some(taken) = taken else {
@@ -339,7 +343,7 @@ impl Drop for AbandonedStart {
                     Ok(Ok(transport)) => Some(transport.control),
                     Ok(Err(_)) | Err(_) => None,
                 },
-                None => taken.control,
+                None => owned_control.or(taken.control),
             };
             let outcome = end_turn(control, reason, &limits).await;
             crate::mcp::release_off_worker(lease).await;
@@ -563,6 +567,7 @@ impl mango_external_agents::Session for ClaudeSession {
             shared: Arc::clone(&self.shared),
             end: Arc::clone(&end),
             spawn: None,
+            control: None,
             mcp_lease: crate::mcp::Prepared::new(mcp_lease.get().cloned()),
             armed: true,
         };
@@ -652,6 +657,7 @@ impl mango_external_agents::Session for ClaudeSession {
             self.shared.host.limits(),
         );
         let control = Arc::clone(&transport.control);
+        abandoned.control = Some(Arc::clone(&control));
         // Re-checked under the same guard that installs the control, because `stdio::open` is
         // awaited above and a stop can have landed while this reservation had no control to kill:
         // a `close` marks `closed` and takes it, a `cancel` or a racing `start_turn` takes it and
@@ -810,6 +816,7 @@ impl mango_external_agents::Session for ClaudeSession {
             return Err(error.with_dispatch(Dispatch::Accepted));
         }
         abandoned.disarm();
+        abandoned.control = None;
         tokio::spawn(pump(
             Arc::clone(&self.shared),
             transport.link,
