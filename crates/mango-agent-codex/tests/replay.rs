@@ -1096,20 +1096,34 @@ async fn a_native_interrupt_in_progress_keeps_admission_owned() {
             _ => None,
         }
     }));
-    let (host, _) = with_launcher(launcher, None);
-    let session = CodexHarness::new()
-        .open_session(&host, OpenSession::new("chat-1"))
-        .await
-        .expect("expected a session");
+    let mut limits = replay_limits();
+    limits.shutdown_timeout = std::time::Duration::from_millis(30);
+    let (host, launcher) = with_launcher_limits(launcher, None, limits);
+    let session: Arc<dyn Session> = Arc::from(
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session"),
+    );
     let _turn = session
         .start_turn(TurnRequest::new("turn-1", "one"))
         .await
         .expect("expected a turn");
 
-    session
-        .cancel(CancelReason::Requested)
-        .await
-        .expect("expected the native interrupt acknowledgement");
+    let cancelling_session = Arc::clone(&session);
+    let cancellation =
+        tokio::spawn(async move { cancelling_session.cancel(CancelReason::Requested).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"turn/interrupt\""))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the native interrupt request");
     let error = session
         .start_turn(TurnRequest::new("turn-2", "two"))
         .await
@@ -1119,10 +1133,17 @@ async fn a_native_interrupt_in_progress_keeps_admission_owned() {
         "expected a typed busy refusal while native cancellation is in progress, received {error:?}"
     );
 
-    session
-        .close(CloseReason::Shutdown)
-        .await
-        .expect("expected bounded cleanup after the admission check");
+    assert!(
+        matches!(
+            cancellation
+                .await
+                .expect("expected cancellation task to finish")
+                .expect_err("expected the silent native turn to time out")
+                .cause(),
+            mango_external_agents::Error::Timeout { .. }
+        ),
+        "expected cancellation to escalate after its terminal deadline"
+    );
 }
 
 /// An inactive native turn cannot retain the host's process beyond its configured idle deadline.
