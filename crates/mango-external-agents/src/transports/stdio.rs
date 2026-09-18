@@ -68,10 +68,13 @@ pub async fn open(
         })
         .await?;
 
-    let stdin = child.stdin.take().ok_or_else(|| Error::Launch {
-        program: program.to_owned(),
-        message: String::from("a child without a writable stdin"),
-    })?;
+    let Some(stdin) = child.stdin.take() else {
+        let _ = child.control.kill(crate::CancelReason::Shutdown).await;
+        return Err(Error::Launch {
+            program: program.to_owned(),
+            message: String::from("a child without a writable stdin"),
+        });
+    };
 
     Ok(StdioTransport {
         link: Link::new(
@@ -122,9 +125,22 @@ mod tests {
     use crate::env::EnvSource;
     use crate::error::Error;
     use crate::host::HostContext;
+    use crate::process::{LaunchSpec, ManagedProcess, ProcessLauncher};
     use crate::testing::{FakeLauncher, FakeProcess};
     use crate::transport::{ExecutablePath, StdioSpec};
     use std::sync::Arc;
+
+    /// A host launcher that returns a live child without the requested input pipe.
+    struct MissingStdinLauncher(Arc<FakeLauncher>);
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for MissingStdinLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> crate::Result<ManagedProcess> {
+            let mut child = self.0.spawn(spec).await?;
+            child.stdin = None;
+            Ok(child)
+        }
+    }
 
     fn host(launcher: Arc<FakeLauncher>) -> HostContext {
         HostContext::builder()
@@ -165,6 +181,36 @@ mod tests {
         assert_eq!(launch.env.get("CONNECTOR_SECRET"), None);
         assert!(launch.stdin, "expected a writable stdin");
         assert!(launch.hide_window, "expected no console window");
+    }
+
+    #[tokio::test]
+    async fn a_child_missing_its_requested_input_pipe_is_reaped() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let host = HostContext::builder()
+            .launcher(Arc::new(MissingStdinLauncher(Arc::clone(&launcher))))
+            .cwd("/workspace")
+            .client_info("test-host", "0.0.0")
+            .build()
+            .expect("expected a host");
+
+        let result = open(
+            &host,
+            &StdioSpec::new(["codex", "app-server"]),
+            &ExecutablePath::default(),
+            &[],
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("expected the absent input pipe to be refused"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::Launch { .. }));
+        assert_eq!(
+            launcher.live_children(),
+            0,
+            "expected the failed transport to reap its child"
+        );
     }
 
     #[tokio::test]
