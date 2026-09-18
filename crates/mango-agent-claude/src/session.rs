@@ -338,29 +338,38 @@ async fn await_durable_stop(
     reason: CancelReason,
     settled: bool,
 ) -> Result<()> {
-    let teardown = install_teardown(&shared, &taken.end);
-    start_teardown(&shared, &teardown.state, taken, reason, settled);
-    teardown.state.wait().await
+    // The slot this caller took is read back under a second guard, and the pump can retire it in
+    // between: a native `result` reaps the child, `record_stop` marks it stopped and `settle_owner`
+    // clears the owner, all without this caller's reason ever reaching the `OnceLock` first. A turn
+    // already reaped and settled has no native work left to bound and no outcome to publish, which
+    // is the state the caller asked for.
+    let Some(teardown) = install_teardown(&shared, &taken.end) else {
+        return Ok(());
+    };
+    start_teardown(&shared, &teardown, taken, reason, settled);
+    teardown.wait().await
 }
 
-struct InstalledTeardown {
-    state: Arc<Teardown>,
+/// Names the one teardown a turn publishes, or nothing when its slot is already gone.
+fn install_teardown(shared: &Shared, end: &TurnEnd) -> Option<Arc<Teardown>> {
+    install_teardown_locked(&mut shared.lock(), end)
 }
-fn install_teardown(shared: &Shared, end: &TurnEnd) -> InstalledTeardown {
-    let mut state = shared.lock();
+
+fn install_teardown_locked(state: &mut Mutable, end: &TurnEnd) -> Option<Arc<Teardown>> {
     let active = state
         .active
         .as_mut()
-        .filter(|a| std::ptr::eq(a.end.as_ref(), end))
-        .expect("active teardown owner");
-    if let Some(existing) = &active.teardown {
-        return InstalledTeardown {
-            state: Arc::clone(existing),
-        };
-    }
-    let created = Arc::new(Teardown::new());
-    active.teardown = Some(Arc::clone(&created));
-    InstalledTeardown { state: created }
+        .filter(|a| std::ptr::eq(a.end.as_ref(), end))?;
+    Some(turn_teardown(active))
+}
+
+/// The teardown an active turn publishes, created on the first caller that asks for it.
+fn turn_teardown(active: &mut ActiveTurn) -> Arc<Teardown> {
+    Arc::clone(
+        active
+            .teardown
+            .get_or_insert_with(|| Arc::new(Teardown::new())),
+    )
 }
 async fn wait_existing_teardown(shared: &Shared) -> Result<()> {
     let teardown = {
@@ -682,7 +691,16 @@ fn record_stop(
     reason: CancelReason,
     settled: bool,
 ) {
-    let mut state = shared.lock();
+    record_stop_locked(&mut shared.lock(), end, taint_continuation, reason, settled);
+}
+
+fn record_stop_locked(
+    state: &mut Mutable,
+    end: &TurnEnd,
+    taint_continuation: bool,
+    reason: CancelReason,
+    settled: bool,
+) {
     let should_clear = if let Some(active) = state
         .active
         .as_mut()
@@ -706,7 +724,10 @@ fn record_stop(
 
 /// Records a terminal commit (or receiver abandonment) and releases an already reaped owner.
 fn settle_owner(shared: &Shared, end: &Arc<TurnEnd>) {
-    let mut state = shared.lock();
+    settle_owner_locked(&mut shared.lock(), end);
+}
+
+fn settle_owner_locked(state: &mut Mutable, end: &Arc<TurnEnd>) {
     if state
         .active
         .as_mut()
@@ -1185,12 +1206,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 let mut state = self.shared.lock();
                 let taken = request_stop(&mut state, CancelReason::from(reason))
                     .or_else(|| active_turn(&state));
-                let active = state.active.as_mut().map(|turn| {
-                    Arc::clone(
-                        turn.teardown
-                            .get_or_insert_with(|| Arc::new(Teardown::new())),
-                    )
-                });
+                let active = state.active.as_mut().map(turn_teardown);
                 let close = Arc::new(Teardown::new());
                 state.close_teardown = Some(Arc::clone(&close));
                 CloseClaim::New {
@@ -1607,8 +1623,47 @@ fn no_result_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{Mutable, TurnEnd, no_result_error, prompt_line};
+    use super::{
+        ActiveTurn, Mutable, TurnEnd, install_teardown_locked, no_result_error, prompt_line,
+        record_stop_locked, request_stop, settle_owner_locked,
+    };
     use mango_external_agents::{CancelReason, ExitStatus};
+    use std::sync::Arc;
+
+    /// `cancel` takes the turn under one guard and names its teardown under the next, and the pump
+    /// runs between them on another worker: after Claude's own `result`, `record_stop` marks the
+    /// turn stopped and `settle_owner` clears the owner, both without a reason ever reaching the
+    /// `OnceLock` the taker consulted. Reading the slot back as if it were still there turned a
+    /// cancel that raced a finishing turn into a panic rather than a stop.
+    #[test]
+    fn a_cancel_whose_slot_the_pump_settled_finds_no_teardown_owner() {
+        let end = Arc::new(TurnEnd::new());
+        let mut state = Mutable::default();
+        state.active = Some(ActiveTurn {
+            end: Arc::clone(&end),
+            control: None,
+            stopped: false,
+            settled: false,
+            teardown: None,
+        });
+
+        let taken = request_stop(&mut state, CancelReason::Requested)
+            .expect("expected an unstopped turn to be takeable");
+
+        // The pump, on its own worker: the vendor's `result` reaped the child, then the terminal
+        // committed and released the slot.
+        record_stop_locked(&mut state, &taken.end, false, CancelReason::Shutdown, false);
+        settle_owner_locked(&mut state, &end);
+        assert!(
+            state.active.is_none(),
+            "expected the settled pump to have released the slot, received one still installed"
+        );
+
+        assert!(
+            install_teardown_locked(&mut state, &taken.end).is_none(),
+            "expected a settled slot to report no teardown owner, received an installed teardown"
+        );
+    }
 
     /// A session dropped rather than closed must hand its artifact to the blocking pool, not run
     /// `remove_dir_all` on the thread that dropped it — a host root can be a FUSE or network mount.
