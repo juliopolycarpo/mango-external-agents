@@ -10,10 +10,10 @@ use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::{
     ApprovalRouting, AuthMode, AuthState, CancelReason, CancelToken, CloseReason, Configuration,
     ConfigurationChange, ConfigurationOptionId, ConfigurationPatch, ConfigurationValue,
-    DiscoveryReceipt, Dispatch, Error, EventKind, ExecutablePath, GateVerdict, Harness, HarnessId,
-    HostContext, InteractionId, LaunchSpec, Limits, LineLimits, ManagedProcess, OpenSession,
-    PermissionLevel, PermissionResponse, ProcessLauncher, Result, ResumeMode, Session,
-    SessionStatus, TurnRequest, TurnStream,
+    DiscoveryReceipt, DiscoveryReceiptMeasurements, Dispatch, Error, EventKind, ExecutablePath,
+    GateVerdict, Harness, HarnessId, HostContext, InteractionId, LaunchSpec, Limits, LineLimits,
+    ManagedProcess, OpenSession, PermissionLevel, PermissionResponse, ProcessLauncher, Result,
+    ResumeMode, Session, SessionStatus, TurnRequest, TurnStream,
 };
 use support::{
     FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, SpawnGate, host,
@@ -314,10 +314,27 @@ mod opening_a_session {
         let host = host(Arc::clone(&launcher));
         let discovery = harness.discover(&host).await.expect("expected a discovery");
         let before = launcher.launches().len();
-        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now());
+        let mut request = OpenSession::new("chat-1");
+        if let Some(executable) = &discovery.executable {
+            request = request.with_executable(ExecutablePath::resolved(executable.clone()));
+        }
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
 
         harness
-            .open_session(&host, OpenSession::new("chat-1").with_discovery(receipt))
+            .open_session(&host, request.with_discovery(receipt))
             .await
             .expect("expected the fresh receipt to open a session");
 
