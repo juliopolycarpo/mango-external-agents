@@ -401,8 +401,9 @@ which of the two happened; that mapping and the item id are both pinned by
 `ActivityContent::Output` on the `ActivityResult`, independent of a held `system/permission_denied`
 reason, which still wins the one-line `detail`. `Edit`, `MultiEdit`, `NotebookEdit`, `TodoWrite` and
 `ExitPlanMode` are not mapped: no captured transcript in this repo exercises them, and the pinned
-build's own `system/init.tools` list does not even enumerate `MultiEdit` or `ExitPlanMode`. A
-`mea capture` of a turn that drives them is what would unblock the rest of this table.
+build's own `system/init.tools` list does not even enumerate `MultiEdit`, `TodoWrite` or
+`ExitPlanMode`. A `mea capture` of a turn that drives them is what would unblock the rest of this
+table.
 
 **Slash commands** are published by provenance. A build that states `terminal_slash_commands` is
 authoritative; one that does not publishes only the names whose origin the same record states — a

@@ -724,9 +724,9 @@ fn summarize_tool_input(input: Option<&Value>) -> String {
 /// fixture in this repository, `fixtures/claude/transcripts/denied-write-turn.jsonl`. `Edit`,
 /// `MultiEdit` and `NotebookEdit` are not — no captured transcript or existing test in this repo
 /// exercises them, and the pinned CLI's own `system/init.tools` list on both fixtures does not
-/// even enumerate `MultiEdit` or `ExitPlanMode` — so their input keys are left unguessed rather
-/// than assumed from Anthropic's public tool descriptions, which this harness has no fixture to
-/// hold it to.
+/// even enumerate `MultiEdit`, `TodoWrite` or `ExitPlanMode` — so their input keys are left
+/// unguessed rather than assumed from Anthropic's public tool descriptions, which this harness has
+/// no fixture to hold it to.
 ///
 /// `kind` is left absent on purpose: `Write` also overwrites a file that already exists, and
 /// nothing in this stream says which of the two happened for a given call.
@@ -740,7 +740,9 @@ fn file_change_content(name: &str, input: Option<&Value>) -> Option<ActivityCont
     let path = fields.get("file_path")?.as_str()?;
     let content = fields.get("content")?.as_str()?;
     let mut change = FileChange::new(path);
-    change.new_text = Some(content.to_owned());
+    // Bounded before it is owned, on the same terms as `detail_for`: the sink normalises again,
+    // but nothing here should hold a copy larger than what this module ever carries.
+    change.new_text = Some(head(content, DETAIL_CARRY_MAX_CHARS).to_owned());
     Some(ActivityContent::Diff {
         files: vec![change],
     })
