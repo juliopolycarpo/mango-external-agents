@@ -382,10 +382,10 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 | `start_review`          | `Error::NotSupported`                                                                                                            |
 | `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                     |
 
-A resume against an agent that does not advertise `loadSession` is an explicit `Resume` refusal in
-both modes. `ResumeMode::Fallback` opens a new conversation only after the pinned profiles'
-conclusive stale-session reply (`session/load` code `-32002`), then records the typed fallback
-reason. Authentication, timeout, link, malformed-response, and other vendor failures do not grant
+A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
+refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
+that absence or the pinned profiles return a stale-session reply (`session/load` code `-32002`),
+then records the fallback reason. Authentication, timeout, link, malformed-response, and other vendor failures do not grant
 permission to create a different conversation.
 
 Harness-level listing creates a short-lived initialized connection and sends `session/list` without

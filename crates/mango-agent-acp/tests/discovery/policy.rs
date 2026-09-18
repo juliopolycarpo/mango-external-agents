@@ -228,6 +228,40 @@ async fn strict_resume_is_a_typed_refusal_when_the_agent_does_not_advertise_it()
     );
 }
 
+/// A negotiated absence of session/load conclusively rules out resume before a load is attempted.
+#[tokio::test]
+async fn fallback_starts_new_when_the_agent_does_not_advertise_load_session() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(FakeAcpAgent::new().without_load_session().process());
+    let session = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(
+            &host(launcher.clone()),
+            mango_external_agents::OpenSession::new("resume")
+                .resuming("agent-session", mango_external_agents::ResumeMode::Fallback),
+        )
+        .await
+        .expect("expected a conclusive absence of loadSession to start fresh");
+
+    assert!(!session.snapshot().resumed);
+    assert_ne!(session.ids().native_session_id, "agent-session");
+    assert!(
+        session
+            .snapshot()
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("loadSession")),
+        "expected a stated fallback reason"
+    );
+    let written = launcher.written();
+    assert!(written.iter().any(|line| line.contains("\"session/new\"")));
+    assert!(!written.iter().any(|line| line.contains("\"session/load\"")));
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+}
+
 /// A resumed remote session runs under the directory the current host authorized.
 ///
 /// Its saved ACP id is opaque history, not authority to reuse the directory from a prior hub.

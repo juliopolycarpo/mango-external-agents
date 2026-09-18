@@ -785,6 +785,13 @@ impl AcpHarness {
         };
 
         if !handshake.capabilities.load_session {
+            if resume.mode == ResumeMode::Fallback {
+                let mut opened = self.new_session(connection, host, cwd, mcp_servers).await?;
+                opened.fallback_reason = Some(String::from(
+                    "the ACP agent did not advertise loadSession for the requested resume",
+                ));
+                return Ok(opened);
+            }
             return Err(Error::not_supported(
                 mango_external_agents::Capability::Resume,
             ));
