@@ -20,9 +20,10 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use mango_external_agents::{
-    CancelReason, CloseReason, Configuration, Error, ErrorCode, EventSink, ExecutablePath,
-    HostContext, PermissionResponse, Result, SessionIds, SessionInfo, SessionLifecycle, StdioSpec,
-    TurnRequest, TurnStream, VendorError, transports::stdio,
+    CancelReason, CloseReason, Configuration, ConfigurationState, Dispatch, Error, ErrorCode,
+    EventKind, EventSink, ExecutablePath, HostContext, PermissionResponse, Result,
+    SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec, TurnRequest,
+    TurnStream, VendorError, event, transports::stdio,
 };
 use serde_json::json;
 
@@ -54,15 +55,18 @@ struct ActiveTurn {
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
 }
 
-/// Everything about a session that changes after it is opened.
+/// Everything about a session that changes after it is opened and that
+/// [`mango_external_agents::SessionState`] has no axis for — Claude's own process bookkeeping
+/// rather than a fact a host reads off a snapshot.
 #[derive(Default)]
-struct SessionState {
-    /// The handle the next turn resumes.
-    ///
-    /// Normally the id this session was opened with: `--session-id` is echoed back verbatim. A run
-    /// that reported a different one is followed, because that is the conversation that now exists.
-    native_session_id: String,
+struct Mutable {
     /// False until a run has actually created the conversation on disk.
+    ///
+    /// Distinct from [`SessionSnapshot::resumed`](mango_external_agents::SessionSnapshot::resumed):
+    /// that records whether *opening* continued an existing conversation, and never changes again.
+    /// This records whether the CLI should be told `--resume` or `--session-id` on the *next* turn,
+    /// which flips from false to true the first time a run actually writes the conversation to
+    /// disk — including a session that opened fresh.
     established: bool,
     /// The turn now running, when one is.
     active: Option<ActiveTurn>,
@@ -72,11 +76,9 @@ struct SessionState {
     /// start holds a second owner until it installs or reaps its child, then the final owner removes
     /// the file. A session dropped without being closed releases this state too.
     mcp_config: Option<Arc<ConfigFile>>,
-    /// The settings a turn without an override inherits.
-    configuration: Configuration,
 }
 
-impl Drop for SessionState {
+impl Drop for Mutable {
     /// Hands the session's own artifact reference to the blocking pool, as every other path that
     /// can drop the last one does.
     ///
@@ -97,16 +99,18 @@ impl Drop for SessionState {
 struct Shared {
     host: HostContext,
     executable: ExecutablePath,
-    info: SessionInfo,
+    /// The vendor's own handle, the settings in force, the commands announced and what this
+    /// session can do — everything [`mango_external_agents::Session::state`] answers with.
+    core_state: CoreSessionState,
     availability: ModeAvailability,
     surface: Option<CliSurface>,
     lifecycle: SessionLifecycle,
-    state: Mutex<SessionState>,
+    mutable: Mutex<Mutable>,
 }
 
 impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, SessionState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, Mutable> {
+        self.mutable.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -124,32 +128,35 @@ impl ClaudeSession {
     /// and a wrong guess is recoverable: a session Claude has forgotten fails at the first turn
     /// with the vendor's own message rather than at a probe nobody asked for. That is why
     /// [`ResumeMode`](mango_external_agents::ResumeMode) makes no difference here, and why
-    /// [`SessionInfo::fallback_reason`] is always `None` — nothing was verified, so nothing fell
-    /// back.
+    /// [`SessionSnapshot::fallback_reason`](mango_external_agents::SessionSnapshot::fallback_reason)
+    /// is always `None` — nothing was verified, so nothing fell back.
+    ///
+    /// `core_state` arrives already carrying the opening snapshot — see
+    /// [`ClaudeHarness::open_session`](crate::ClaudeHarness) — so `established` here starts at
+    /// whether that snapshot itself records a resumed conversation.
     pub(crate) fn new(
         host: HostContext,
         executable: ExecutablePath,
-        info: SessionInfo,
+        core_state: CoreSessionState,
         availability: ModeAvailability,
         surface: Option<CliSurface>,
         mcp_config: Option<ConfigFile>,
     ) -> Self {
-        let state = SessionState {
-            native_session_id: info.ids.native_session_id.clone(),
-            established: info.resumed,
+        let established = core_state.snapshot().resumed;
+        let mutable = Mutable {
+            established,
             active: None,
             mcp_config: mcp_config.map(Arc::new),
-            configuration: info.effective_configuration.clone(),
         };
         Self {
             shared: Arc::new(Shared {
                 host,
                 executable,
-                info,
+                core_state,
                 availability,
                 surface,
                 lifecycle: SessionLifecycle::default(),
-                state: Mutex::new(state),
+                mutable: Mutex::new(mutable),
             }),
         }
     }
@@ -172,7 +179,7 @@ impl ClaudeSession {
 /// the lock that empties the slot, is what makes that reason visible to the spawn once it returns;
 /// only the actual kill happens after the guard is released.
 fn take_turn(
-    state: &mut SessionState,
+    state: &mut Mutable,
     reason: CancelReason,
 ) -> Option<Arc<dyn mango_external_agents::ProcessControl>> {
     let active = state.active.take()?;
@@ -252,30 +259,23 @@ async fn end_turn(
 
 #[async_trait::async_trait]
 impl mango_external_agents::Session for ClaudeSession {
-    fn info(&self) -> &SessionInfo {
-        &self.shared.info
-    }
-
-    /// The handle in force, which is not always the one opening minted.
+    /// This session's live, observable state.
     ///
-    /// `--session-id` proposes a UUID and `system/init` normally echoes it back, but a run is free
-    /// to report another, and from then on that is the only handle `--resume` accepts. Every turn
-    /// after the first already follows it; this is what lets a host see it too, so the value it
-    /// persists is the one its next `open_session` can actually resume. `info()` keeps the id
-    /// opening answered with, which is what makes the change legible rather than silent.
-    fn ids(&self) -> SessionIds {
-        SessionIds {
-            native_session_id: self.shared.lock().native_session_id.clone(),
-            ..self.shared.info.ids.clone()
-        }
-    }
-
-    async fn configuration(&self) -> Configuration {
-        self.shared.lock().configuration.clone()
+    /// The vendor's own handle is folded onto it by `apply_init` as `system/init` reports one —
+    /// `--session-id` proposes a UUID and a run is free to report another, and from then on that
+    /// is the only handle `--resume` accepts. [`SessionState::set_native_session_id`] is how that
+    /// change reaches a host, in place of the turn-specific override [`Session::ids`] used to
+    /// carry.
+    ///
+    /// [`SessionState::set_native_session_id`]: mango_external_agents::SessionState::set_native_session_id
+    /// [`Session::ids`]: mango_external_agents::Session::ids
+    fn state(&self) -> &CoreSessionState {
+        &self.shared.core_state
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
-        self.validate_turn_request(&request)?;
+        self.validate_turn_request(&request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         if !request.attachments.is_empty() {
             // Claude Code's stream-json input takes content blocks, but nothing here encodes one
             // and `Capabilities::images` is false. Refusing is the honest answer: silently
@@ -284,23 +284,41 @@ impl mango_external_agents::Session for ClaudeSession {
             return Err(Error::HostConfiguration {
                 expected: "a turn with no attachments, which this harness does not forward",
                 received: format!("{} attachments", request.attachments.len()),
-            });
+            }
+            .with_dispatch(Dispatch::NotSubmitted));
         }
 
         let requested_configuration = request.configuration.clone();
-        let configuration = {
-            let current = self.shared.lock().configuration.clone();
-            requested_configuration
-                .as_ref()
-                .map_or(current.clone(), |overrides| {
-                    current.with_overrides(overrides)
-                })
-        };
-        let mode = self.shared.resolve_mode(&configuration)?;
+        if let Some(patch) = &requested_configuration {
+            // Same rule as opening: a fresh child is the only place Claude's mode and model land,
+            // so there is no argv this harness could encode that un-sets one mid-session.
+            mango_external_agents::configuration::refuse_unsupported_native(patch)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+            mango_external_agents::configuration::refuse_unsupported_reset(patch)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        }
+        // Read from `requested`, not `accepted`: opening starts nothing, so the first turn has
+        // nothing accepted to inherit yet, and every later turn's `requested` already carries
+        // forward whatever the last explicit ask resolved to — see the update below.
+        let current = self
+            .shared
+            .core_state
+            .snapshot()
+            .configuration
+            .requested
+            .clone();
+        let configuration = requested_configuration
+            .as_ref()
+            .map_or_else(|| current.clone(), |patch| current.patched(patch));
+        let mode = self
+            .shared
+            .resolve_mode(&configuration)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         // Configuration is caller-owned and becomes a value position after a Claude option.
         // Reject it before reserving a child: omitting an invalid explicit value would run the
         // turn under a setting the host did not select.
-        models::validate_configuration(&configuration, self.shared.surface.as_ref())?;
+        models::validate_configuration(&configuration, self.shared.surface.as_ref())
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
         // A host that starts a second turn has decided the first is over. Taken before anything is
         // spawned so the two cannot both hold a child, and the slot this turn claims is reserved
@@ -310,7 +328,9 @@ impl mango_external_agents::Session for ClaudeSession {
         let end = Arc::new(TurnEnd::default());
         let (previous, mut mcp_lease) = {
             let Some(_lifecycle) = self.shared.lifecycle.begin_start() else {
-                return Err(Error::Closed { subject: "session" });
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
             };
             let mut state = self.shared.lock();
             let previous = take_turn(&mut state, CancelReason::Requested);
@@ -331,9 +351,16 @@ impl mango_external_agents::Session for ClaudeSession {
         };
         end_turn(previous, CancelReason::Requested).await;
 
-        let (native_session_id, established) = {
+        let native_session_id = self
+            .shared
+            .core_state
+            .snapshot()
+            .ids
+            .native_session_id
+            .clone();
+        let established = {
             let state = self.shared.lock();
-            (state.native_session_id.clone(), state.established)
+            state.established
         };
         let mcp_config = mcp_lease.get().map(|file| file.argument().to_owned());
         let argv = match (TurnArgv {
@@ -364,7 +391,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 // makes this lease the last one and its drop the `remove_dir_all`. Off the worker,
                 // for the same reason the write is.
                 crate::mcp::release_off_worker(mcp_lease.take()).await;
-                return Err(error);
+                return Err(error.with_dispatch(Dispatch::NotSubmitted));
             }
         };
 
@@ -392,8 +419,9 @@ impl mango_external_agents::Session for ClaudeSession {
         // artifact back to the session, and this clone is then the cheap one to drop.
         let limits = *self.shared.host.limits();
         let (sink, events) = EventSink::new(
-            self.shared.info.ids.session_id.clone(),
+            self.shared.core_state.snapshot().ids.session_id.clone(),
             request.turn_id.clone(),
+            request.attempt,
             Arc::clone(self.shared.host.clock()),
             limits.turn_channel_capacity,
         );
@@ -429,11 +457,12 @@ impl mango_external_agents::Session for ClaudeSession {
             // worker, because a close that won the race left this lease holding the last
             // reference, so this is where the `remove_dir_all` happens.
             crate::mcp::release_off_worker(mcp_lease.take()).await;
-            return Err(if self.shared.lifecycle.is_closed() {
+            return Err((if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
                 Error::Cancelled { reason }
-            });
+            })
+            .with_dispatch(Dispatch::Accepted));
         }
 
         // Before the pump, and this ordering is the whole point: the release parks on the blocking
@@ -465,7 +494,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // been handed out yet, so refusing here is still the honest answer.
         let stopped = {
             let lifecycle = self.shared.lifecycle.lock();
-            let mut state = self.shared.lock();
+            let state = self.shared.lock();
             if lifecycle.is_closed()
                 || !state
                     .active
@@ -482,9 +511,22 @@ impl mango_external_agents::Session for ClaudeSession {
                 // that had already written these defaults would hand a cancelled turn's model and
                 // permissions to the next turn that asked for nothing. This is the last point
                 // where the start can still fail, and no await follows it.
-                if requested_configuration.is_some() {
-                    state.configuration = configuration.clone();
-                }
+                // The successful CLI spawn does not settle this boundary by itself: releasing
+                // the MCP lease above awaits, so a close, cancel, or newer turn can still refuse
+                // this attempt. Only now is the argv configuration accepted. An unconfigured
+                // turn inherits accepted settings without replacing the last explicit request.
+                let requested = if requested_configuration.is_some() {
+                    configuration.clone()
+                } else {
+                    current
+                };
+                self.shared
+                    .core_state
+                    .set_configuration(ConfigurationState::new(
+                        requested,
+                        configuration.clone(),
+                        Configuration::unknown(),
+                    ));
                 None
             }
         };
@@ -495,14 +537,35 @@ impl mango_external_agents::Session for ClaudeSession {
             // itself — and `ProcessControl::kill` documents that the library asks once. The guard
             // is disarmed for the same reason.
             abandoned.disarm();
-            return Err(if self.shared.lifecycle.is_closed() {
+            return Err((if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
                 Error::Cancelled { reason }
-            });
+            })
+            .with_dispatch(Dispatch::Accepted));
         }
 
-        // The pump owns the child from here, and there is no await between this and the return.
+        // The pump owns the child from here, after the turn-start event is enqueued.
+        // `claude --print` names no turn, so the handle is the host's own id: a value the host can
+        // reproduce, which is what a retry needs. Emitted here, before the pump task exists to
+        // race it with anything the vendor says, so it is always the first thing on the stream —
+        // including on a run whose own `system/init` never arrives.
+        let native_turn_id = request.turn_id.as_str().to_owned();
+        if let Err(error) = sink
+            .emit(EventKind::TurnStarted {
+                native_turn_id: native_turn_id.clone(),
+            })
+            .await
+        {
+            // The child is already running and installed in `state.active` by this point, so an
+            // id too strange for `EventKind::normalized` to keep — an id `TurnId::new` never
+            // validates — must not plant a live process nobody holds a handle to. Reaped the same
+            // way a stop landing in this window is.
+            clear_active(&self.shared, &end);
+            let _ = control.kill(CancelReason::Requested).await;
+            abandoned.disarm();
+            return Err(error.with_dispatch(Dispatch::Accepted));
+        }
         abandoned.disarm();
         tokio::spawn(pump(
             Arc::clone(&self.shared),
@@ -511,22 +574,20 @@ impl mango_external_agents::Session for ClaudeSession {
             sink,
             end,
             request.input,
-            established,
         ));
 
-        Ok(TurnStream {
-            // `claude --print` names no turn, so the handle is the host's own id: a value the host
-            // can reproduce, which is what a retry needs.
-            native_turn_id: request.turn_id.as_str().to_owned(),
-            turn_id: request.turn_id,
+        Ok(TurnStream::accepted(
+            request.turn_id,
+            request.attempt,
+            native_turn_id,
             events,
-        })
+        ))
     }
 
     /// There is nothing to answer.
     ///
     /// `Capabilities::interactive_approvals` is false for this harness, so no
-    /// [`EventKind::ApprovalRequested`](mango_external_agents::EventKind::ApprovalRequested) is
+    /// [`EventKind::ApprovalRequested`] is
     /// ever emitted and nothing routes an answer here. Reaching this method means a caller invented
     /// an approval. See `docs/harness-claude.md` for what the vendor does offer and why this
     /// harness does not drive it.
@@ -557,6 +618,10 @@ impl mango_external_agents::Session for ClaudeSession {
             // closed, so a following close returns before reaching here.
             (control, crate::mcp::Prepared::new(state.mcp_config.take()))
         };
+        // Closing is visible while teardown is still in flight. A host that sees `Closed` may
+        // release its own resources, so publishing it before the child and its MCP artifact are
+        // actually handled lies about the session's lifetime.
+        self.shared.core_state.set_status(SessionStatus::Closing);
         end_turn(control, CancelReason::from(reason)).await;
         // The session releases its reference here. A start still awaiting a child holds its own
         // `Arc` until it releases it just before its post-release ownership check, and that check
@@ -566,7 +631,12 @@ impl mango_external_agents::Session for ClaudeSession {
         // the directory is a synchronous filesystem call against the host's own scratch root.
         // Reported rather than swallowed: this close promised the session's resources were
         // released, and the file holds the `env` and `headers` a host configured its servers with.
-        crate::mcp::remove_on_close(mcp_config.take()).await
+        let cleanup = crate::mcp::remove_on_close(mcp_config.take()).await;
+        // A failed removal still concludes this session. The error reports the artifact left on
+        // disk, but no later session operation can make progress against a lifecycle the close
+        // transition already claimed.
+        self.shared.core_state.set_status(SessionStatus::Closed);
+        cleanup
     }
 }
 
@@ -592,9 +662,8 @@ async fn pump(
     sink: EventSink,
     end: Arc<TurnEnd>,
     input: String,
-    resumed: bool,
 ) {
-    let mut reducer = TurnReducer::new(resumed);
+    let mut reducer = TurnReducer::new();
     // The host's own patience for a child that should be exiting; it owns the process, so it owns
     // how long the turn waits on one that is not.
     let exit_grace = shared.host.limits().kill_grace;
@@ -730,9 +799,16 @@ fn clear_active(shared: &Shared, end: &Arc<TurnEnd>) {
 
 /// Folds a run's `system/init` back into the session.
 ///
+/// Both facts here are session state, not turn events — see [`RunInit`] and
+/// [`mango_external_agents::state`] for why they moved off the stream and onto
+/// [`mango_external_agents::SessionState`].
+///
 /// The session id is the one thing discovery could not know, because it takes a live process to
 /// learn it — and the record proves the conversation now exists on disk, which is what makes the
 /// *next* turn a `--resume` rather than another attempt to mint an id the CLI has already taken.
+/// The command catalog is read whether or not the session id arrived, because it is useful on its
+/// own and a run that only failed to name itself should not lose it — see
+/// [`commands::catalog`](crate::commands::catalog).
 ///
 /// `init.permission_mode` is deliberately **not** folded back. Every run is launched with an
 /// explicit `--permission-mode`, so the record echoes the mode this harness chose rather than the
@@ -740,20 +816,33 @@ fn clear_active(shared: &Shared, end: &Arc<TurnEnd>) {
 /// single turn at auto-review would then resolve the plain default level to `auto` for the rest of
 /// the session. A user who asked to be asked would stop being asked.
 fn apply_init(shared: &Shared, init: RunInit) {
+    if let Some(commands) = init.commands {
+        shared
+            .core_state
+            .set_commands(event::normalized_catalog(commands));
+    }
+
+    if let Some(model) = init.model {
+        let configuration = shared.core_state.snapshot().configuration.clone();
+        let observed = configuration.observed.clone().with_model(model);
+        shared
+            .core_state
+            .set_configuration(configuration.with_observed(observed));
+    }
+
     let Some(session_id) = init.session_id else {
         return;
     };
-    let mut state = shared.lock();
     // The conversation exists either way — that is what the record proves, and it is what makes
     // the next turn a `--resume`.
-    state.established = true;
+    shared.lock().established = true;
     // Which handle it is followed under is a different question. This is the one value in this
     // file a vendor process chooses and a later argv carries, so it is vetted like the resume
     // reference a host supplies: a handle beginning with `-` would be read by the CLI's parser as
     // a flag rather than as `--resume`'s value. An unrecognisable echo leaves the minted id in
     // force, which is the id this run was asked to write and the better of the two guesses.
     if crate::argv::is_vendor_session_id(&session_id) {
-        state.native_session_id = session_id;
+        shared.core_state.set_native_session_id(session_id);
     }
 }
 
@@ -803,7 +892,7 @@ fn no_result_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionState, TurnEnd, no_result_error, prompt_line};
+    use super::{Mutable, TurnEnd, no_result_error, prompt_line};
     use mango_external_agents::{CancelReason, ExitStatus};
 
     /// A session dropped rather than closed must hand its artifact to the blocking pool, not run
@@ -842,7 +931,7 @@ mod tests {
 
             // Field by field: `SessionState` implements `Drop` now, so struct-update syntax
             // cannot move the rest out of a default.
-            let mut state = SessionState::default();
+            let mut state = Mutable::default();
             state.mcp_config = Some(std::sync::Arc::new(file));
             drop(state);
 

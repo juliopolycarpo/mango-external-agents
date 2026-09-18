@@ -14,8 +14,12 @@
 use std::fmt;
 use std::time::SystemTime;
 
+use crate::content::ActivityContent;
 use crate::error::{Result, VendorError};
+use crate::extension::Extensions;
+use crate::interaction::{InteractionId, QuestionOutcome, QuestionRequest};
 use crate::normalize::{self, COMMAND_CATALOG_MAX_ITEMS, TextLimit};
+use crate::operation::{AttemptId, OperationRef};
 use crate::permission::{ApprovalDecision, PermissionRequest};
 use crate::session::CancelReason;
 
@@ -47,9 +51,15 @@ impl fmt::Display for SessionId {
     }
 }
 
-/// The host's own id for a turn, which is also its idempotency key.
+/// The host's own id for one logical turn.
 ///
 /// A retry that means "the same turn" reuses it; a retry that means "a new turn" mints a new one.
+/// Which dispatch of it is [`crate::AttemptId`], and the vendor's own handle is a third
+/// thing again — see [`crate::operation`] for why none of the three can stand in for another.
+///
+/// **Not an idempotency key.** Reusing it does not make a vendor deduplicate anything, and nothing
+/// in this library pretends otherwise; whether a dispatch is safe to repeat is
+/// [`Dispatch`](crate::Dispatch)'s question.
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -75,13 +85,28 @@ impl fmt::Display for TurnId {
 }
 
 /// One normalised event, stamped with where and when it happened.
+///
+/// Every event names the attempt it came from as well as the turn. A late event from an attempt
+/// the host has already replaced is one it must not let mutate the attempt that replaced it, and
+/// without the attempt on the event there is nothing to check that against —
+/// [`OperationRef::is_superseded_by`](crate::OperationRef::is_superseded_by) is the check.
+///
+/// Nothing that is a fact about the *session* arrives here. The vendor's session handle, the
+/// slash-command catalog and the settings in force are read from
+/// [`Session::snapshot`](crate::Session::snapshot) and watched through
+/// [`Session::subscribe`](crate::Session::subscribe), because they change between turns and before
+/// the first one — and carrying them here meant inventing a turn id for something no turn
+/// produced.
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AgentEvent {
     /// The session this belongs to.
     pub session_id: SessionId,
-    /// The turn this belongs to.
+    /// The logical turn this belongs to.
     pub turn_id: TurnId,
+    /// Which dispatch of that turn produced it.
+    pub attempt: AttemptId,
     /// When the library stamped it, from the host's clock.
     pub at: SystemTime,
     /// What happened.
@@ -110,27 +135,28 @@ impl AgentEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(self.kind, EventKind::Completed | EventKind::Error { .. })
     }
+
+    /// Which session, turn and attempt this event belongs to.
+    pub fn operation(&self) -> OperationRef {
+        OperationRef::new(self.session_id.clone(), self.turn_id.clone(), self.attempt)
+    }
 }
 
 /// What happened, in the vocabulary every harness normalises onto.
+///
+/// Turn-scoped, all of it. See [`AgentEvent`] for where session-scoped facts went and why.
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventKind {
-    /// The vendor opened or resumed its own session.
-    SessionStarted {
-        /// The vendor's own session handle.
-        native_session_id: String,
-        /// Whether the vendor resumed an existing conversation rather than starting one.
-        resumed: bool,
-    },
-    /// The session's slash-command catalog, as the vendor announced it.
+    /// The vendor accepted this turn and named its own handle for it.
     ///
-    /// Session state rather than transcript: it describes what a user may type next, so it is
-    /// never persisted as a message, and the last one received wins.
-    CommandsAvailable {
-        /// The commands this session will expand.
-        commands: Vec<Command>,
+    /// The turn-scoped counterpart to opening a session: it says "this attempt is running, and the
+    /// vendor calls it this". Emitted once per accepted attempt, before anything else on the
+    /// stream.
+    TurnStarted {
+        /// The vendor's own handle for this turn, for the calls that name one.
+        native_turn_id: String,
     },
     /// A piece of the answer.
     TextDelta {
@@ -185,9 +211,25 @@ pub enum EventKind {
     /// An approval was answered, however it was reached.
     ApprovalResolved {
         /// Which question.
-        request_id: String,
-        /// What was decided.
+        interaction_id: InteractionId,
+        /// What was decided, including how far the chosen option reached.
         decision: ApprovalDecision,
+    },
+    /// The vendor is asking for information, and the turn is waiting.
+    ///
+    /// Not an approval. Answering it through [`Session::answer`](crate::Session::answer) tells the
+    /// agent something and authorises nothing; a [`PermissionBroker`](crate::PermissionBroker) is
+    /// never consulted about one.
+    QuestionAsked {
+        /// What is being asked, and the choices the vendor offered.
+        request: QuestionRequest,
+    },
+    /// A round of questions ended, however it ended.
+    QuestionResolved {
+        /// Which round.
+        interaction_id: InteractionId,
+        /// How it ended.
+        outcome: QuestionOutcome,
     },
     /// Tokens this turn used, as the vendor reported them.
     Usage {
@@ -224,13 +266,14 @@ impl fmt::Debug for EventKind {
     /// Formats event shape without replaying prompts, answers, or vendor payloads into logs.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SessionStarted { resumed, .. } => formatter
-                .debug_struct("SessionStarted")
-                .field("resumed", resumed)
+            Self::TurnStarted { .. } => formatter.write_str("TurnStarted"),
+            Self::QuestionAsked { request } => formatter
+                .debug_struct("QuestionAsked")
+                .field("question_count", &request.questions.len())
                 .finish(),
-            Self::CommandsAvailable { commands } => formatter
-                .debug_struct("CommandsAvailable")
-                .field("command_count", &commands.len())
+            Self::QuestionResolved { outcome, .. } => formatter
+                .debug_struct("QuestionResolved")
+                .field("outcome", outcome)
                 .finish(),
             Self::TextDelta { text } => formatter
                 .debug_struct("TextDelta")
@@ -302,15 +345,8 @@ impl EventKind {
     /// to the vendor would name a different object.
     pub fn normalized(self) -> Result<Self> {
         Ok(match self {
-            Self::SessionStarted {
-                native_session_id,
-                resumed,
-            } => Self::SessionStarted {
-                native_session_id: normalize::opaque_id(&native_session_id, "native session id")?,
-                resumed,
-            },
-            Self::CommandsAvailable { commands } => Self::CommandsAvailable {
-                commands: normalize_commands(commands),
+            Self::TurnStarted { native_turn_id } => Self::TurnStarted {
+                native_turn_id: normalize::opaque_id(&native_turn_id, "native turn id")?,
             },
             Self::TextDelta { text } => Self::TextDelta {
                 text: normalize::sanitize_field(&text).text,
@@ -334,14 +370,24 @@ impl EventKind {
                 request: request.normalized()?,
             },
             Self::ApprovalResolved {
-                request_id,
+                interaction_id,
                 decision,
             } => Self::ApprovalResolved {
-                request_id: normalize::opaque_id(&request_id, "approval request id")?,
+                interaction_id: interaction_id.normalized()?,
                 decision: ApprovalDecision {
                     option_id: normalize::opaque_id(&decision.option_id, "approval option id")?,
-                    source: decision.source,
+                    ..decision
                 },
+            },
+            Self::QuestionAsked { request } => Self::QuestionAsked {
+                request: request.normalized()?,
+            },
+            Self::QuestionResolved {
+                interaction_id,
+                outcome,
+            } => Self::QuestionResolved {
+                interaction_id: interaction_id.normalized()?,
+                outcome: outcome.normalized()?,
             },
             Self::AccountLimits { limits } => Self::AccountLimits {
                 limits: limits.normalized(),
@@ -387,6 +433,52 @@ impl fmt::Debug for Command {
     }
 }
 
+impl Command {
+    /// A command with no help text.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+        }
+    }
+
+    /// Carries the one line of help the vendor wrote.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+/// Bounds a whole slash-command catalog before it reaches a host.
+///
+/// Called by a harness on its way to
+/// [`SessionState::set_commands`](crate::SessionState::set_commands), which is where a catalog
+/// lives now that it is session state rather than a turn event. A name is dropped rather than
+/// truncated, a name with whitespace in it is dropped, a leading `/` is taken off, and the whole
+/// catalog is cut to its ceiling — each of those a drop rather than a repair, because a repaired
+/// command name is a command the CLI does not have.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::{Command, event};
+///
+/// let kept = event::normalized_catalog(vec![
+///     Command::new("/review"),
+///     Command::new("bad name"),
+///     Command::new("compact"),
+/// ]);
+/// assert_eq!(
+///     kept.iter().map(|command| command.name.as_str()).collect::<Vec<_>>(),
+///     vec!["review", "compact"]
+/// );
+/// ```
+#[must_use]
+pub fn normalized_catalog(commands: Vec<Command>) -> Vec<Command> {
+    normalize_commands(commands)
+}
+
 /// A neutral bucket for what a vendor is doing, small enough that every vendor maps onto it.
 ///
 /// It picks an icon and nothing else. Assistant text and reasoning are *not* activity — they are
@@ -420,8 +512,18 @@ pub enum ActivityKind {
 }
 
 /// What the vendor is doing, as something to render.
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// Carries three kinds of thing beyond the label: **identity**, so a later update can address this
+/// activity rather than replace the list; **relationships**, so a host can nest what a subagent did
+/// under the call that started it; and **content**, so a plan stays a plan and a diff stays a diff
+/// instead of both becoming paragraphs of `detail`.
+///
+/// Everything a vendor reported that has no field here goes to [`extensions`](Self::extensions),
+/// which is scalar-only, capped and redacted. There is no raw-frame channel anywhere: a host never
+/// has to know a vendor's wire types to read one of these.
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Activity {
     /// The vendor's own tool name, verbatim.
     ///
@@ -435,6 +537,27 @@ pub struct Activity {
     /// More, when the vendor said more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The vendor's own id for the item this activity is, when it has one distinct from the call.
+    ///
+    /// Several vendors number their transcript items separately from their tool calls, and an
+    /// update naming an item id is one a host cannot route without keeping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    /// The activity this one happened inside, when the vendor nests them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Which subagent did it, when a vendor runs more than one.
+    ///
+    /// Kept apart from [`parent_id`](Self::parent_id) because they answer different questions: the
+    /// parent is where this sits in a tree, the subagent is who was running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
+    /// The structured thing it produced, when it produced one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<ActivityContent>,
+    /// Useful vendor detail with no field of its own: bounded, observational, never executable.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
+    pub extensions: Extensions,
     /// True when any field above was cut to fit its bound.
     #[serde(default)]
     pub truncated: bool,
@@ -455,7 +578,73 @@ impl fmt::Debug for Activity {
 }
 
 impl Activity {
+    /// An activity with a name, a bucket and a one-line title.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Activity, ActivityKind};
+    ///
+    /// let activity = Activity::new("Bash", ActivityKind::Command, "ls -la");
+    /// assert_eq!(activity.name, "Bash");
+    /// assert!(activity.extensions.is_empty());
+    /// ```
+    pub fn new(name: impl Into<String>, kind: ActivityKind, title: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            title: title.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Carries more of what the vendor said.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Carries the vendor's own item id.
+    #[must_use]
+    pub fn with_item_id(mut self, item_id: impl Into<String>) -> Self {
+        self.item_id = Some(item_id.into());
+        self
+    }
+
+    /// Records the activity this one happened inside.
+    #[must_use]
+    pub fn inside(mut self, parent_id: impl Into<String>) -> Self {
+        self.parent_id = Some(parent_id.into());
+        self
+    }
+
+    /// Records which subagent was running.
+    #[must_use]
+    pub fn by_subagent(mut self, subagent_id: impl Into<String>) -> Self {
+        self.subagent_id = Some(subagent_id.into());
+        self
+    }
+
+    /// Carries the structured thing it produced.
+    #[must_use]
+    pub fn with_content(mut self, content: ActivityContent) -> Self {
+        self.content = Some(content);
+        self
+    }
+
+    /// Carries bounded observational metadata.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
     /// This activity with every field bounded.
+    ///
+    /// Ids are dropped rather than cut, and dropping one does not take the activity with it: an
+    /// activity nobody can address is still one somebody can read, whereas an activity carrying a
+    /// shortened parent id would nest itself under the wrong thing.
     #[must_use]
     pub fn normalized(self) -> Self {
         let name = normalize::bound_text(&self.name, TextLimit::ActivityName);
@@ -472,8 +661,26 @@ impl Activity {
             kind: self.kind,
             title: title.text,
             detail: detail.map(|detail| detail.text),
+            item_id: self
+                .item_id
+                .and_then(|id| normalize::opaque_id(&id, "activity item id").ok()),
+            parent_id: self
+                .parent_id
+                .and_then(|id| normalize::opaque_id(&id, "activity parent id").ok()),
+            subagent_id: self
+                .subagent_id
+                .and_then(|id| normalize::opaque_id(&id, "activity subagent id").ok()),
+            content: self.content.map(ActivityContent::normalized),
+            extensions: self.extensions.normalized(),
             truncated,
         }
+    }
+}
+
+impl Default for ActivityKind {
+    /// Anything the library has no bucket for.
+    fn default() -> Self {
+        Self::Other
     }
 }
 
@@ -810,24 +1017,24 @@ mod tests {
         Command, EventKind, RateLimitWindow,
     };
     use crate::error::{Error, ErrorCode, VendorError};
+    use crate::interaction::{
+        Answer, AnswerValue, InteractionId, QuestionId, QuestionOptionId, QuestionOutcome,
+        UnsupportedQuestion,
+    };
+    use crate::normalize::TextLimit;
 
-    fn commands(names: &[(&str, Option<&str>)]) -> EventKind {
-        EventKind::CommandsAvailable {
-            commands: names
-                .iter()
-                .map(|(name, description)| Command {
-                    name: (*name).to_owned(),
-                    description: description.map(ToOwned::to_owned),
-                })
-                .collect(),
-        }
+    fn commands(names: &[(&str, Option<&str>)]) -> Vec<Command> {
+        names
+            .iter()
+            .map(|(name, description)| Command {
+                name: (*name).to_owned(),
+                description: description.map(ToOwned::to_owned),
+            })
+            .collect()
     }
 
-    fn normalized_commands(kind: EventKind) -> Vec<Command> {
-        match kind.normalized().expect("expected a catalog") {
-            EventKind::CommandsAvailable { commands } => commands,
-            other => panic!("expected a catalog, received {other:?}"),
-        }
+    fn normalized_commands(commands: Vec<Command>) -> Vec<Command> {
+        super::normalized_catalog(commands)
     }
 
     #[test]
@@ -839,11 +1046,8 @@ mod tests {
             EventKind::ReasoningDelta {
                 text: String::from("reasoning-text-secret"),
             },
-            EventKind::CommandsAvailable {
-                commands: vec![Command {
-                    name: String::from("command-name-secret"),
-                    description: Some(String::from("command-description-secret")),
-                }],
+            EventKind::TurnStarted {
+                native_turn_id: String::from("native-turn-id-secret"),
             },
             EventKind::Error {
                 error: VendorError::new(
@@ -858,8 +1062,7 @@ mod tests {
             for secret in [
                 "assistant-text-secret",
                 "reasoning-text-secret",
-                "command-name-secret",
-                "command-description-secret",
+                "native-turn-id-secret",
                 "vendor-error-message-secret",
             ] {
                 assert!(
@@ -882,6 +1085,7 @@ mod tests {
             title: String::from("activity-title-secret"),
             detail: Some(String::from("activity-detail-secret")),
             truncated: false,
+            ..Activity::default()
         };
         let update = ActivityUpdate {
             title: Some(String::from("update-title-secret")),
@@ -1035,16 +1239,11 @@ mod tests {
 
     #[test]
     fn cuts_an_over_long_catalog_to_the_ceiling() {
-        let names: Vec<String> = (0..300).map(|index| format!("command{index}")).collect();
-        let kept = normalized_commands(EventKind::CommandsAvailable {
-            commands: names
-                .iter()
-                .map(|name| Command {
-                    name: name.clone(),
-                    description: None,
-                })
+        let kept = normalized_commands(
+            (0..300)
+                .map(|index| Command::new(format!("command{index}")))
                 .collect(),
-        });
+        );
 
         assert_eq!(kept.len(), 256);
     }
@@ -1083,13 +1282,7 @@ mod tests {
     fn refuses_an_activity_whose_call_id_cannot_survive_bounding() {
         let kind = EventKind::ActivityStarted {
             call_id: "c".repeat(129),
-            activity: Activity {
-                name: String::from("Bash"),
-                kind: ActivityKind::Command,
-                title: String::from("ls"),
-                detail: None,
-                truncated: false,
-            },
+            activity: Activity::new("Bash", ActivityKind::Command, "ls"),
         };
 
         let error = kind
@@ -1107,17 +1300,69 @@ mod tests {
         );
     }
 
+    /// The label on an unrecognised form is vendor text, and `normalized` promises every
+    /// vendor-supplied value is bounded. Passing the outcome through untouched let it past the one
+    /// door a turn event has.
+    #[test]
+    fn bounds_the_vendor_label_a_refused_question_carries() {
+        let kind = EventKind::QuestionResolved {
+            interaction_id: InteractionId::new("ask-1"),
+            outcome: QuestionOutcome::Refused {
+                reason: UnsupportedQuestion::UnrecognisedForm {
+                    received: "f".repeat(4_096),
+                },
+            },
+        };
+
+        let EventKind::QuestionResolved {
+            outcome:
+                QuestionOutcome::Refused {
+                    reason: UnsupportedQuestion::UnrecognisedForm { received },
+                },
+            ..
+        } = kind.normalized().expect("expected a bounded event")
+        else {
+            panic!("expected the refusal to survive as a refusal");
+        };
+        assert_eq!(received.chars().count(), TextLimit::Title.max_code_points());
+    }
+
+    /// An answer a harness reports itself never passed `QuestionRequest::validate`, so the sink is
+    /// the only place its ids are held to a bound.
+    #[test]
+    fn refuses_an_answered_outcome_whose_option_id_cannot_survive_bounding() {
+        let kind = EventKind::QuestionResolved {
+            interaction_id: InteractionId::new("ask-1"),
+            outcome: QuestionOutcome::Answered {
+                answers: vec![Answer::new(
+                    QuestionId::new("branch"),
+                    AnswerValue::Chosen {
+                        option_ids: vec![QuestionOptionId::new("o".repeat(129))],
+                    },
+                )],
+            },
+        };
+
+        let error = kind
+            .normalized()
+            .expect_err("expected a refusal, received an event");
+        assert!(
+            matches!(
+                error,
+                Error::InvalidVendorValue {
+                    field: "question option id",
+                    ..
+                }
+            ),
+            "expected an invalid option id, received {error:?}"
+        );
+    }
+
     #[test]
     fn marks_an_activity_truncated_when_any_field_was_cut() {
         let kind = EventKind::ActivityStarted {
             call_id: String::from("call_1"),
-            activity: Activity {
-                name: "n".repeat(200),
-                kind: ActivityKind::Command,
-                title: String::from("ls"),
-                detail: None,
-                truncated: false,
-            },
+            activity: Activity::new("n".repeat(200), ActivityKind::Command, "ls"),
         };
         match kind.normalized().expect("expected an activity") {
             EventKind::ActivityStarted { activity, .. } => {
@@ -1126,6 +1371,95 @@ mod tests {
             }
             other => panic!("expected an activity, received {other:?}"),
         }
+    }
+
+    /// Identity and relationships are what let a host nest a subagent's work under the call that
+    /// started it, and address one activity in a later update instead of replacing the list.
+    #[test]
+    fn an_activity_keeps_its_identity_relationships_and_typed_content() {
+        use crate::content::{ActivityContent, PlanStep};
+        use crate::extension::{ExtensionValue, Extensions};
+
+        let kind = EventKind::ActivityStarted {
+            call_id: String::from("call_1"),
+            activity: Activity::new("Task", ActivityKind::Subagent, "plan the work")
+                .with_item_id("item_9")
+                .inside("call_0")
+                .by_subagent("explorer")
+                .with_content(ActivityContent::Plan {
+                    steps: vec![PlanStep::new("read the reducer").with_id("step-1")],
+                })
+                .with_extensions(Extensions::new().with("model", ExtensionValue::text("opus"))),
+        };
+
+        let EventKind::ActivityStarted { activity, .. } =
+            kind.normalized().expect("expected an activity")
+        else {
+            panic!("expected an activity");
+        };
+        assert_eq!(activity.item_id.as_deref(), Some("item_9"));
+        assert_eq!(activity.parent_id.as_deref(), Some("call_0"));
+        assert_eq!(activity.subagent_id.as_deref(), Some("explorer"));
+        assert_eq!(
+            activity.extensions.get("model"),
+            Some(&ExtensionValue::text("opus"))
+        );
+        let Some(ActivityContent::Plan { steps }) = &activity.content else {
+            panic!("expected a plan, received {:?}", activity.content);
+        };
+        assert_eq!(steps[0].id.as_deref(), Some("step-1"));
+    }
+
+    /// An activity nobody can address is still one somebody can read, so an unusable relationship
+    /// id is dropped rather than taking the event with it — and dropped rather than cut, because a
+    /// shortened parent id would nest the activity under the wrong thing.
+    #[test]
+    fn an_unusable_relationship_id_is_dropped_without_losing_the_activity() {
+        let kind = EventKind::ActivityStarted {
+            call_id: String::from("call_1"),
+            activity: Activity::new("Task", ActivityKind::Subagent, "work").inside("p".repeat(129)),
+        };
+
+        let EventKind::ActivityStarted { activity, .. } =
+            kind.normalized().expect("expected the activity to survive")
+        else {
+            panic!("expected an activity");
+        };
+        assert_eq!(activity.parent_id, None);
+        assert_eq!(activity.title, "work");
+    }
+
+    /// The turn-scoped counterpart to opening a session. A vendor handle that cannot be carried
+    /// whole is refused rather than cut, like every other id echoed back to a vendor.
+    #[test]
+    fn a_turn_start_carries_the_vendors_own_handle_and_refuses_an_unusable_one() {
+        let started = EventKind::TurnStarted {
+            native_turn_id: String::from("turn_abc"),
+        }
+        .normalized()
+        .expect("expected a turn start");
+        assert_eq!(
+            started,
+            EventKind::TurnStarted {
+                native_turn_id: String::from("turn_abc")
+            }
+        );
+
+        let error = EventKind::TurnStarted {
+            native_turn_id: "t".repeat(129),
+        }
+        .normalized()
+        .expect_err("expected a refusal");
+        assert!(
+            matches!(
+                error,
+                Error::InvalidVendorValue {
+                    field: "native turn id",
+                    ..
+                }
+            ),
+            "received {error:?}"
+        );
     }
 
     #[test]

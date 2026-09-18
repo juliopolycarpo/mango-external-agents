@@ -70,6 +70,7 @@ mod tests {
         let (sink, mut received) = EventSink::new(
             mango_external_agents::SessionId::new("chat"),
             mango_external_agents::TurnId::new("turn"),
+            mango_external_agents::AttemptId::default(),
             Arc::new(SystemClock),
             1,
         );
@@ -118,6 +119,7 @@ mod tests {
         let (sink, mut received) = EventSink::new(
             mango_external_agents::SessionId::new("chat"),
             mango_external_agents::TurnId::new("turn"),
+            mango_external_agents::AttemptId::default(),
             Arc::new(SystemClock),
             1,
         );

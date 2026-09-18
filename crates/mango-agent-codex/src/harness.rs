@@ -5,18 +5,21 @@
 
 use std::sync::Arc;
 
+use mango_external_agents::Dispatch;
+use mango_external_agents::configuration::{Configuration, ConfigurationCatalog};
 use mango_external_agents::discovery::{AuthState, Discovery, GateVerdict, Model, ReasoningEffort};
 use mango_external_agents::error::{Error, Result};
 use mango_external_agents::harness::{
-    Capabilities, Harness, HarnessDescriptor, HarnessKind, VendorInfo,
+    Capabilities, CapabilityCeiling, DiscoveredCapabilities, Harness, HarnessDescriptor, VendorInfo,
 };
+use mango_external_agents::identity::HarnessIdentity;
 use mango_external_agents::jsonrpc::{Client, ClientOptions};
 use mango_external_agents::permission::PermissionMatrix;
 use mango_external_agents::process::LaunchSpec;
 use mango_external_agents::session::{
-    Configuration, OpenSession, ResumeMode, Session, SessionIds, SessionInfo,
-    resume_fallback_reason,
+    OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason,
 };
+use mango_external_agents::state::{SessionSnapshot, SessionState, TransportSelection};
 use mango_external_agents::transport::{ExecutablePath, StdioSpec, TransportKind};
 use mango_external_agents::transports::stdio;
 use mango_external_agents::{ClientInfo as HostClientInfo, HostContext};
@@ -24,8 +27,9 @@ use mango_external_agents::{ClientInfo as HostClientInfo, HostContext};
 use crate::discovery::{self, LOGIN_HINT, PROGRAM};
 use crate::permissions::PermissionOverrides;
 use crate::protocol::requests::{
-    AccountReadResponse, ClientInfo, InitializeParams, InitializeResponse, ModelListParams,
-    ModelListResponse, ThreadResumeParams, ThreadStartParams, ThreadStartResponse, empty_params,
+    AccountReadResponse, ApprovalsReviewer, ClientInfo, InitializeParams, InitializeResponse,
+    ModelListParams, ModelListResponse, ThreadResumeParams, ThreadStartParams, ThreadStartResponse,
+    empty_params,
 };
 use crate::protocol::schema::MINIMUM_CODEX_VERSION;
 use crate::protocol::{CODE_PREFIX, PEER_NAME, method};
@@ -63,8 +67,15 @@ const CAPABILITIES: Capabilities = Capabilities {
     structured_streaming: true,
     reasoning_stream: true,
     interactive_approvals: true,
+    // Neither is implemented yet: the app-server has no documented question surface distinct from
+    // an approval, and settings can only be changed by opening a new turn, not mid-session.
+    questions: false,
     resume: true,
     model_catalog: true,
+    // Not enumerated: `mea capture` has not yet been run against a settings-listing surface, and an
+    // empty catalog is the honest answer until one is.
+    configuration_catalog: false,
+    session_configuration: false,
     images: true,
     usage_reporting: true,
     cancellation: true,
@@ -104,19 +115,19 @@ impl CodexHarness {
     ///
     /// ```
     /// use mango_agent_codex::CodexHarness;
-    /// use mango_external_agents::{Harness, HarnessKind};
+    /// use mango_external_agents::{Harness, HarnessId};
     ///
     /// let harness = CodexHarness::new();
-    /// assert_eq!(harness.descriptor().kind, HarnessKind::Codex);
-    /// assert!(!harness.descriptor().capabilities.mcp_passthrough);
+    /// assert_eq!(harness.descriptor().id(), &HarnessId::codex());
+    /// assert!(!harness.descriptor().capabilities.capabilities().mcp_passthrough);
     /// ```
     #[must_use]
     pub fn new() -> Self {
         Self {
             descriptor: Arc::new(HarnessDescriptor {
-                kind: HarnessKind::Codex,
+                identity: HarnessIdentity::codex(),
                 vendor: VENDOR,
-                capabilities: CAPABILITIES,
+                capabilities: CapabilityCeiling::new(CAPABILITIES),
                 transports: TRANSPORTS,
                 vendor_environment_keys: VENDOR_ENVIRONMENT_KEYS,
             }),
@@ -173,9 +184,10 @@ impl Harness for CodexHarness {
                 version: Some(version),
                 gate,
                 auth: AuthState::Unknown,
-                capabilities: Capabilities::none(),
+                capabilities: DiscoveredCapabilities::none(),
                 permission_matrix: self.permission_matrix(),
                 models: Vec::new(),
+                configuration_catalog: ConfigurationCatalog::empty(),
             });
         }
 
@@ -185,9 +197,10 @@ impl Harness for CodexHarness {
             version: Some(version),
             gate,
             auth,
-            capabilities: CAPABILITIES,
+            capabilities: DiscoveredCapabilities::new(CAPABILITIES),
             permission_matrix: self.permission_matrix(),
             models,
+            configuration_catalog: ConfigurationCatalog::empty(),
         })
     }
 
@@ -196,7 +209,14 @@ impl Harness for CodexHarness {
         host: &HostContext,
         request: OpenSession,
     ) -> Result<Box<dyn Session>> {
-        self.validate_open_session(&request)?;
+        self.validate_open_session(host, &request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        mango_external_agents::configuration::refuse_unsupported_native(&request.configuration)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        let effective_transport = self
+            .descriptor()
+            .resolve_transport(request.transport)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let executable = self.program_for(&request);
         let transport = stdio::open(
             host,
@@ -220,8 +240,8 @@ impl Harness for CodexHarness {
 
         // Everything from here can fail, and every failure has to take the child with it: a
         // half-opened session leaves a `codex app-server` running with nobody holding its handle.
-        let opened = open_thread(host, &client, &request).await;
-        let (info, thread_id) = match opened {
+        let opened = open_thread(host, &client, &request, effective_transport).await;
+        let (state, thread_id) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 let _ = client.close().await;
@@ -235,7 +255,7 @@ impl Harness for CodexHarness {
 
         shared.adopt_thread(thread_id);
         Ok(Box::new(CodexSession::new(
-            info,
+            state,
             shared,
             client,
             transport.control,
@@ -248,7 +268,8 @@ async fn open_thread(
     host: &HostContext,
     client: &Client,
     request: &OpenSession,
-) -> Result<(SessionInfo, String)> {
+    effective_transport: TransportKind,
+) -> Result<(SessionState, String)> {
     let handshake: InitializeResponse = client
         .request(
             method::INITIALIZE,
@@ -282,16 +303,19 @@ async fn open_thread(
         return Err(Error::AuthRequired { login_hint });
     }
 
-    let configuration = &request.configuration;
-    let vendor = crate::permissions::overrides(configuration);
+    // Codex has no "drop my override and fall back to config.toml" semantics on any surface this
+    // harness drives, so a patch asking for one is refused rather than reported as applied.
+    mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)?;
+    let vendor = crate::permissions::overrides(&request.configuration);
     let cwd = host.cwd().to_string_lossy().into_owned();
+    let requested_model = request.configuration.model.set_value().cloned();
 
     let (response, resumed, fallback_reason) = match &request.resume {
         Some(resume) => {
             let params = ThreadResumeParams {
                 thread_id: resume.native_session_id.clone(),
                 cwd: cwd.clone(),
-                model: configuration.model.clone(),
+                model: requested_model.clone(),
                 approval_policy: vendor.approval_policy,
                 sandbox: vendor.sandbox,
                 approvals_reviewer: vendor.approvals_reviewer,
@@ -307,7 +331,7 @@ async fn open_thread(
                 Err(error) if resume.mode == ResumeMode::Fallback => {
                     let reason = resume_fallback_reason(method::THREAD_RESUME, &error);
                     (
-                        start_thread(client, &cwd, configuration, vendor).await?,
+                        start_thread(client, &cwd, &requested_model, vendor).await?,
                         false,
                         Some(reason),
                     )
@@ -316,36 +340,76 @@ async fn open_thread(
             }
         }
         None => (
-            start_thread(client, &cwd, configuration, vendor).await?,
+            start_thread(client, &cwd, &requested_model, vendor).await?,
             false,
             None,
         ),
     };
 
     let thread_id = response.thread.id.clone();
+    let ids = SessionIds {
+        session_id: request.session_id.clone(),
+        native_session_id: thread_id.clone(),
+    };
+
+    // What this harness really put on the wire. `thread/start` and `thread/resume` have no
+    // `effort` field at all, so a patch asking for one at open time is honestly left out here
+    // rather than claimed as encoded.
+    let mut accepted = Configuration::unknown();
+    if let Some(model) = &requested_model {
+        accepted = accepted.with_model(model.clone());
+    }
+    if let Some(level) = request.configuration.level.set_value() {
+        accepted = accepted.with_level(*level);
+    }
+    if let Some(routing) = request.configuration.routing.set_value() {
+        accepted = accepted.with_routing(*routing);
+    }
+
+    // What the vendor itself reported back. `approvalsReviewer` is unambiguous evidence of
+    // routing; `approvalPolicy` alone cannot be read back into a `PermissionLevel`, because the
+    // same policy pairs with more than one sandbox in this harness's own table — so `level` stays
+    // unknown here rather than guessing.
+    let mut observed = Configuration::unknown();
+    if let Some(model) = &response.model {
+        observed = observed.with_model(model.clone());
+    }
+    if let Some(effort) = &response.reasoning_effort {
+        observed = observed.with_effort(effort.clone());
+    }
+    if let Some(reviewer) = response.approvals_reviewer {
+        observed = observed.with_routing(match reviewer {
+            ApprovalsReviewer::User => mango_external_agents::ApprovalRouting::User,
+            ApprovalsReviewer::AutoReview => mango_external_agents::ApprovalRouting::AutoReview,
+        });
+    }
+
+    let configuration_state = mango_external_agents::configuration::ConfigurationState::new(
+        request.configuration.requested(),
+        accepted,
+        observed,
+    );
+
+    let mut snapshot = SessionSnapshot::opening(
+        ids,
+        HarnessIdentity::codex(),
+        TransportSelection::new(request.transport, effective_transport),
+        host.now(),
+    )
+    .with_capabilities(mango_external_agents::harness::SessionCapabilities::new(
+        CAPABILITIES,
+    ))
+    .with_configuration(configuration_state)
+    .with_catalog(ConfigurationCatalog::empty());
+    if resumed {
+        snapshot = snapshot.resumed();
+    }
+    if let Some(reason) = fallback_reason {
+        snapshot = snapshot.with_fallback_reason(reason);
+    }
+
     Ok((
-        SessionInfo {
-            ids: SessionIds {
-                session_id: request.session_id.clone(),
-                native_session_id: thread_id.clone(),
-            },
-            resumed,
-            fallback_reason,
-            effective_configuration: Configuration {
-                // What the vendor actually chose, which may not be what was asked for.
-                model: response
-                    .model
-                    .clone()
-                    .or_else(|| configuration.model.clone()),
-                effort: response
-                    .reasoning_effort
-                    .clone()
-                    .or_else(|| configuration.effort.clone()),
-                level: configuration.level,
-                routing: configuration.routing,
-            },
-            capabilities: CAPABILITIES,
-        },
+        SessionState::new(std::sync::Arc::clone(host.clock()), snapshot),
         thread_id,
     ))
 }
@@ -353,7 +417,7 @@ async fn open_thread(
 async fn start_thread(
     client: &Client,
     cwd: &str,
-    configuration: &Configuration,
+    model: &Option<String>,
     vendor: PermissionOverrides,
 ) -> Result<ThreadStartResponse> {
     client
@@ -361,7 +425,7 @@ async fn start_thread(
             method::THREAD_START,
             ThreadStartParams {
                 cwd: cwd.to_owned(),
-                model: configuration.model.clone(),
+                model: model.clone(),
                 approval_policy: vendor.approval_policy,
                 sandbox: vendor.sandbox,
                 approvals_reviewer: vendor.approvals_reviewer,

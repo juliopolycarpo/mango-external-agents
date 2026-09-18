@@ -116,7 +116,7 @@ mod tests {
     use mango_external_agents::testing::{FakeHarness, FakeLauncher};
     use mango_external_agents::{
         CancelReason, CloseReason, Error, ErrorCode, EventSink, Harness, HostContext, OpenSession,
-        PermissionResponse, Result, Session, SessionInfo, SystemClock, TurnRequest, TurnStream,
+        PermissionResponse, Result, Session, SessionState, SystemClock, TurnRequest, TurnStream,
         VendorError,
     };
 
@@ -209,14 +209,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Session for VendorFailureSession {
-        fn info(&self) -> &SessionInfo {
-            self.inner.info()
+        fn state(&self) -> &SessionState {
+            self.inner.state()
         }
 
         async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
             let (sink, events) = EventSink::new(
-                self.info().ids.session_id.clone(),
+                self.ids().session_id.clone(),
                 request.turn_id.clone(),
+                request.attempt,
                 Arc::new(SystemClock),
                 1,
             );
@@ -225,11 +226,12 @@ mod tests {
                 "the scripted vendor failure",
             ))
             .await?;
-            Ok(TurnStream {
-                turn_id: request.turn_id,
-                native_turn_id: String::from("failed-turn"),
+            Ok(TurnStream::accepted(
+                request.turn_id,
+                request.attempt,
+                "failed-turn",
                 events,
-            })
+            ))
         }
 
         async fn respond(&self, response: PermissionResponse) -> Result<()> {
@@ -285,8 +287,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Session for StartFailureSession {
-        fn info(&self) -> &SessionInfo {
-            self.inner.info()
+        fn state(&self) -> &SessionState {
+            self.inner.state()
         }
 
         async fn start_turn(&self, _request: TurnRequest) -> Result<TurnStream> {

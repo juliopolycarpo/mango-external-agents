@@ -82,10 +82,12 @@ pub async fn connect(
     vendor_environment_keys: &[&str],
 ) -> Result<LaunchedAgent> {
     let AcpSpec::ChildPipes(stdio) = spec else {
+        // Unreachable today: this crate builds only `AcpSpec::ChildPipes`, and `AcpSpec::Http`
+        // has no constructor here. `HarnessId::new("acp")` names the transport generically since
+        // `connect` is not handed a profile to name more specifically.
         return Err(Error::UnsupportedTransport {
-            harness: mango_external_agents::HarnessKind::Acp(
-                mango_external_agents::AcpProfileId::new("acp"),
-            ),
+            harness: mango_external_agents::HarnessId::new("acp")
+                .expect("expected \"acp\" to be a valid harness id"),
             transport: mango_external_agents::TransportKind::Acp,
         });
     };

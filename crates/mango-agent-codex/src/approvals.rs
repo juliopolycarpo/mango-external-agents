@@ -8,8 +8,10 @@
 use std::time::SystemTime;
 
 use mango_external_agents::event::ActivityKind;
+use mango_external_agents::interaction::{Interaction, InteractionId, InteractionKind};
+use mango_external_agents::operation::OperationRef;
 use mango_external_agents::permission::{
-    PermissionOption, PermissionOptionKind, PermissionRequest,
+    PermissionEffect, PermissionOption, PermissionRequest, PermissionRisk, PermissionScope,
 };
 
 use crate::protocol::approvals::{
@@ -43,6 +45,17 @@ impl PendingApproval {
             .map(|(_, decision)| decision.clone())
     }
 
+    /// The offered option carrying this id, for building an audit-worthy
+    /// [`ApprovalDecision`](mango_external_agents::permission::ApprovalDecision) from what was
+    /// really offered rather than from a bare id.
+    #[must_use]
+    pub fn option(&self, option_id: &str) -> Option<&PermissionOption> {
+        self.request
+            .options
+            .iter()
+            .find(|option| option.id == option_id)
+    }
+
     /// The answer that refuses without stopping the turn.
     ///
     /// What a timed-out or cancelled question is resolved with: the turn goes on, and the agent is
@@ -60,17 +73,21 @@ impl PendingApproval {
 #[must_use]
 pub(crate) fn to_request(
     request: &ServerRequest,
+    operation: OperationRef,
     expires_at: SystemTime,
 ) -> Option<PendingApproval> {
     match request {
-        ServerRequest::CommandExecution(params) => Some(from_command(params, expires_at)),
-        ServerRequest::FileChange(params) => Some(from_file_change(params, expires_at)),
+        ServerRequest::CommandExecution(params) => {
+            Some(from_command(params, operation, expires_at))
+        }
+        ServerRequest::FileChange(params) => Some(from_file_change(params, operation, expires_at)),
         ServerRequest::Refused { .. } => None,
     }
 }
 
 fn from_command(
     params: &CommandExecutionApprovalParams,
+    operation: OperationRef,
     expires_at: SystemTime,
 ) -> PendingApproval {
     let command = params.command.as_deref().unwrap_or("a command");
@@ -103,6 +120,7 @@ fn from_command(
 
     build(
         params.approval_id.as_deref().unwrap_or(&params.item_id),
+        operation,
         ActivityKind::Command,
         title,
         detail,
@@ -111,13 +129,18 @@ fn from_command(
     )
 }
 
-fn from_file_change(params: &FileChangeApprovalParams, expires_at: SystemTime) -> PendingApproval {
+fn from_file_change(
+    params: &FileChangeApprovalParams,
+    operation: OperationRef,
+    expires_at: SystemTime,
+) -> PendingApproval {
     let title = match params.grant_root.as_deref() {
         Some(root) => format!("Write under {root}"),
         None => String::from("Apply file changes"),
     };
     build(
         &params.item_id,
+        operation,
         ActivityKind::FileChange,
         title,
         params.reason.clone(),
@@ -138,73 +161,84 @@ fn base_decisions() -> Vec<ApprovalDecisionValue> {
 
 fn build(
     id: &str,
+    operation: OperationRef,
     kind: ActivityKind,
     title: String,
     detail: Option<String>,
     decisions: Vec<ApprovalDecisionValue>,
     expires_at: SystemTime,
 ) -> PendingApproval {
-    let options = decisions.iter().map(option_for).collect();
+    let options: Vec<PermissionOption> = decisions.iter().map(option_for).collect();
     let decisions = decisions
         .into_iter()
         .map(|decision| (decision.option_id().to_owned(), decision))
         .collect();
-    PendingApproval {
-        request: PermissionRequest {
-            // The question, as the vendor names it: its own callback id where it has one, and the
-            // item it gates otherwise. Not the JSON-RPC request id, which names the frame rather
-            // than the thing being asked about — a host that stored one could not line it up with
-            // anything it had already been told.
-            //
-            // The distinction matters where one command raises two questions. Upstream says
-            // several callbacks can share a parent item, so keying by the item would have the
-            // second question overwrite the first: the first host to answer would be answering
-            // for both, and the waiter it displaced would sit out the deadline and decline a
-            // question somebody had already allowed.
-            id: id.to_owned(),
-            kind,
-            title,
-            detail,
-            options,
-            expires_at,
-            truncated: false,
-        },
-        decisions,
-    }
+    // The question, as the vendor names it: its own callback id where it has one, and the item it
+    // gates otherwise. Not the JSON-RPC request id, which names the frame rather than the thing
+    // being asked about — a host that stored one could not line it up with anything it had
+    // already been told.
+    //
+    // The distinction matters where one command raises two questions. Upstream says several
+    // callbacks can share a parent item, so keying by the item would have the second question
+    // overwrite the first: the first host to answer would be answering for both, and the waiter it
+    // displaced would sit out the deadline and decline a question somebody had already allowed.
+    let interaction = Interaction::new(
+        InteractionId::new(id),
+        InteractionKind::Permission,
+        operation.session_id.clone(),
+        expires_at,
+    )
+    .during(operation);
+    let request = PermissionRequest::new(interaction, kind, title, options);
+    let request = match detail {
+        Some(detail) => request.with_detail(detail),
+        None => request,
+    };
+    PendingApproval { request, decisions }
 }
 
 /// What one vendor decision means, in the neutral vocabulary a policy can answer in.
 fn option_for(decision: &ApprovalDecisionValue) -> PermissionOption {
-    let (kind, label, destructive) = match decision {
-        ApprovalDecisionValue::Accept => (PermissionOptionKind::AllowOnce, "Allow once", false),
-        ApprovalDecisionValue::AcceptForSession => (
-            PermissionOptionKind::AllowAlways,
-            "Allow for this session",
-            false,
-        ),
-        ApprovalDecisionValue::Decline => (PermissionOptionKind::RejectOnce, "Deny", false),
-        // Not RejectOnce. The core's contract for that kind is "refuse this one thing; the turn
-        // goes on", and `cancel` stops the turn — so a broker answering `deny()` must never be
-        // handed this one, and a person choosing it must know it is different.
-        ApprovalDecisionValue::Cancel => {
-            (PermissionOptionKind::Other, "Deny and stop the turn", true)
+    match decision {
+        ApprovalDecisionValue::Accept => {
+            PermissionOption::new(decision.option_id(), PermissionEffect::Allow)
+                .with_label("Allow once")
+                .with_scope(PermissionScope::Once)
         }
-        ApprovalDecisionValue::AcceptWithExecpolicyAmendment(_) => (
-            PermissionOptionKind::Other,
-            "Allow, and stop asking for commands like this",
-            true,
-        ),
-        ApprovalDecisionValue::ApplyNetworkPolicyAmendment(_) => (
-            PermissionOptionKind::Other,
-            "Allow, and apply the proposed network rule",
-            true,
-        ),
-    };
-    let option = PermissionOption::new(decision.option_id(), kind).with_label(label);
-    if destructive {
-        option.destructive()
-    } else {
-        option
+        ApprovalDecisionValue::AcceptForSession => {
+            PermissionOption::new(decision.option_id(), PermissionEffect::Allow)
+                .with_label("Allow for this session")
+                .with_scope(PermissionScope::Session)
+        }
+        ApprovalDecisionValue::Decline => {
+            PermissionOption::new(decision.option_id(), PermissionEffect::Reject)
+                .with_label("Deny")
+                .with_scope(PermissionScope::Once)
+        }
+        // Not `Reject`. The core's contract for that effect is "refuse this one thing; the turn
+        // goes on", and `cancel` stops the turn — so a broker answering `deny()` must never be
+        // handed this one, and a person choosing it must know it is different. Codex does not say
+        // how far a cancel reaches, so no scope is claimed for it either.
+        ApprovalDecisionValue::Cancel => {
+            PermissionOption::new(decision.option_id(), PermissionEffect::Other)
+                .with_label("Deny and stop the turn")
+                .with_risk(PermissionRisk::Destructive)
+        }
+        // Both amendments genuinely write a standing rule the vendor applies to later requests on
+        // its own — an execpolicy or network policy amendment, not a one-off grant — so they are
+        // marked `policy_changing` rather than left to guess at a scope Codex never states.
+        ApprovalDecisionValue::AcceptWithExecpolicyAmendment(_) => {
+            PermissionOption::new(decision.option_id(), PermissionEffect::Other)
+                .with_label("Allow, and stop asking for commands like this")
+                .with_risk(PermissionRisk::Destructive)
+                .policy_changing()
+        }
+        ApprovalDecisionValue::ApplyNetworkPolicyAmendment(_) => {
+            PermissionOption::new(decision.option_id(), PermissionEffect::Other)
+                .with_label("Allow, and apply the proposed network rule")
+                .with_risk(PermissionRisk::Destructive)
+                .policy_changing()
+        }
     }
 }
 
@@ -226,6 +260,7 @@ mod tests {
         );
         super::to_request(
             &request,
+            operation(),
             mango_external_agents::Limits::default()
                 .approval_expires_at(std::time::SystemTime::UNIX_EPOCH)
                 .expect("default approval deadline"),
@@ -235,14 +270,25 @@ mod tests {
 
     use super::to_request as build_request;
     use crate::protocol::approvals::{ApprovalDecisionValue, ServerRequest, method};
-    use mango_external_agents::event::ActivityKind;
-    use mango_external_agents::permission::PermissionOptionKind;
+    use mango_external_agents::event::{ActivityKind, SessionId, TurnId};
+    use mango_external_agents::operation::{AttemptId, OperationRef};
+    use mango_external_agents::permission::PermissionEffect;
     use serde_json::json;
     use std::time::{Duration, SystemTime};
+
+    /// The session, turn and attempt a captured server request is answered under.
+    fn operation() -> OperationRef {
+        OperationRef::new(
+            SessionId::new("chat-1"),
+            TurnId::new("turn-1"),
+            AttemptId::default(),
+        )
+    }
 
     fn to_request(request: &ServerRequest, now: SystemTime) -> Option<super::PendingApproval> {
         build_request(
             request,
+            operation(),
             mango_external_agents::Limits::default()
                 .approval_expires_at(now)
                 .ok()?,
@@ -297,9 +343,10 @@ mod tests {
         let one = command_approval("exec-1", Some("callback-a"));
         let two = command_approval("exec-1", Some("callback-b"));
         assert_ne!(
-            one.request.id, two.request.id,
+            one.request.id(),
+            two.request.id(),
             "expected two callbacks on one item to be told apart, received {} twice",
-            one.request.id
+            one.request.id()
         );
     }
 
@@ -307,14 +354,14 @@ mod tests {
     #[test]
     fn a_command_with_no_callback_of_its_own_is_named_by_the_item_it_gates() {
         let asked = command_approval("exec-1", None);
-        assert_eq!(asked.request.id, "exec-1");
+        assert_eq!(asked.request.id().as_str(), "exec-1");
     }
 
     #[test]
     fn a_command_approval_is_a_question_about_the_activity_a_host_already_shows() {
         let pending = to_request(&command_request(json!({})), now()).expect("expected a question");
 
-        assert_eq!(pending.request.id, "exec-ee0f9baa");
+        assert_eq!(pending.request.id().as_str(), "exec-ee0f9baa");
         assert_eq!(pending.request.kind, ActivityKind::Command);
         assert!(
             pending.request.title.contains("printf 'mango'"),
@@ -331,7 +378,7 @@ mod tests {
             pending.request.detail
         );
         assert_eq!(
-            pending.request.expires_at,
+            pending.request.expires_at(),
             mango_external_agents::Limits::default()
                 .approval_expires_at(now())
                 .expect("default approval deadline")
@@ -367,8 +414,8 @@ mod tests {
             .iter()
             .find(|option| option.id == "cancel")
             .expect("expected a cancel option");
-        assert_eq!(cancel.kind, PermissionOptionKind::Other);
-        assert!(cancel.destructive);
+        assert_eq!(cancel.effect, PermissionEffect::Other);
+        assert!(cancel.is_destructive());
 
         // And the narrow refusal a broker reaches for is still there, and still ordinary.
         let deny = pending.request.deny().expect("expected a refusal");
@@ -469,6 +516,23 @@ mod tests {
         );
     }
 
+    /// The offered option behind an id, for building an audit decision from what was really
+    /// offered rather than from a bare string nobody can trace back to its reach or its risk.
+    #[test]
+    fn the_offered_option_behind_an_id_carries_its_own_reach_and_risk() {
+        let pending = to_request(&command_request(json!({})), now()).expect("expected a question");
+
+        let accept = pending
+            .option("accept")
+            .expect("expected the accept option");
+        assert_eq!(accept.effect, PermissionEffect::Allow);
+
+        assert!(
+            pending.option("acceptEverythingForever").is_none(),
+            "expected no option for an id nobody offered"
+        );
+    }
+
     /// Every option this harness offers must survive the core's own bounding, or the request is
     /// refused on its way to the host and the turn waits on a prompt nobody sees.
     #[test]
@@ -489,6 +553,6 @@ mod tests {
             .normalized()
             .expect("expected the question to survive bounding");
         assert_eq!(bounded.options.len(), 6);
-        assert_eq!(bounded.id, "exec-ee0f9baa");
+        assert_eq!(bounded.id().as_str(), "exec-ee0f9baa");
     }
 }

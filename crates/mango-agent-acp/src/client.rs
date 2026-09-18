@@ -37,12 +37,13 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use mango_external_agents::approval::ApprovalDeadline;
+use mango_external_agents::configuration::Configuration;
 use mango_external_agents::event::{EventKind, SessionId};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
     broker_response,
 };
-use mango_external_agents::session::{CancelReason, Configuration};
+use mango_external_agents::session::CancelReason;
 use mango_external_agents::{
     Clock, Error, EventSink, HostContext, ProcessControl, Result, VendorError,
 };
@@ -50,7 +51,7 @@ use mango_external_agents::{
 use crate::approval_events::ApprovalEvents;
 use crate::error::vendor_error;
 use crate::permission;
-use crate::reducer::Reducer;
+use crate::reducer::{Reducer, SessionFact};
 use crate::transport::LaunchedAgent;
 
 /// Whether a host's answer reached the agent, or arrived after the question was already settled.
@@ -75,7 +76,11 @@ pub(crate) struct TurnHandle {
     ///
     /// Without it, `end_turn` takes whatever handle is present — and a `session/prompt` task that
     /// answered late would end, and emit the terminal of, a turn that is not its own.
-    generation: u64,
+    ///
+    /// Also this harness's own stand-in for a per-turn vendor handle: see
+    /// [`AcpSession::start_turn`](crate::session::AcpSession::start_turn)'s doc comment on
+    /// `native_turn_id` for why ACP has no better one to offer.
+    pub(crate) generation: u64,
     /// Set by whoever emitted this turn's terminal.
     ///
     /// A handler holding a clone can be parked mid-frame while `close` emits the terminal on another
@@ -116,15 +121,30 @@ impl PendingApproval {
     }
 
     /// Publish a successful decision before prompt completion can flush the terminal.
+    ///
+    /// `option_id` always names one of `self.question`'s own options: the host's own choice is
+    /// validated against them in [`SessionState::answer`], and every automatic path — the standing
+    /// refusal, the broker, the expiry fallback — is built from
+    /// [`PermissionRequest::allow`](mango_external_agents::PermissionRequest::allow) or
+    /// [`PermissionRequest::deny`](mango_external_agents::PermissionRequest::deny), which can only
+    /// return one of them. The fallback to [`ApprovalDecision::unresolved`] is defence in depth for
+    /// an id that somehow is not among them, not a path this harness's own callers can reach.
     fn respond_with_resolution(
         self,
         response: RequestPermissionResponse,
         option_id: String,
         source: DecisionSource,
     ) -> agent_client_protocol::Result<()> {
+        let decision = self
+            .question
+            .options
+            .iter()
+            .find(|option| option.id == option_id)
+            .map(|option| ApprovalDecision::from_option(option, source))
+            .unwrap_or_else(|| ApprovalDecision::unresolved(option_id, source));
         let event = EventKind::ApprovalResolved {
-            request_id: self.question.id.clone(),
-            decision: ApprovalDecision { option_id, source },
+            interaction_id: self.question.id().clone(),
+            decision,
         };
         self.turn
             .approvals
@@ -147,6 +167,10 @@ impl TurnHandle {
 /// Everything the dispatch loop's handlers and the session's own methods share.
 pub(crate) struct SessionState {
     session_id: SessionId,
+    /// The core's own live session state, so a fact the reducer surfaces — the command catalog so
+    /// far — can be published the moment it arrives rather than waiting for a turn to end. Cheap to
+    /// clone: every clone shares one picture with [`crate::session::AcpSession`]'s own handle.
+    core_state: mango_external_agents::SessionState,
     clock: Arc<dyn Clock>,
     broker: Option<Arc<dyn PermissionBroker>>,
     /// The host limits used to form every approval deadline.
@@ -205,9 +229,11 @@ impl SessionState {
         session_id: SessionId,
         host: &HostContext,
         configuration: Configuration,
+        core_state: mango_external_agents::SessionState,
     ) -> Self {
         Self {
             session_id,
+            core_state,
             clock: Arc::clone(host.clock()),
             broker: host.broker().cloned(),
             limits: *host.limits(),
@@ -369,9 +395,24 @@ impl SessionState {
         Some((turn, reason, closing))
     }
 
-    /// The events one frame produces, computed under the guard because the reducer is pure.
-    fn reduce(&self, notification: SessionNotification) -> Vec<EventKind> {
+    /// The events and session facts one frame produces, computed under the guard because the
+    /// reducer is pure.
+    fn reduce(&self, notification: SessionNotification) -> (Vec<EventKind>, Vec<SessionFact>) {
         self.lock_reducer().update(notification.update)
+    }
+
+    /// Publishes a session-scoped fact the reducer surfaced.
+    ///
+    /// Applied to the core's own live state rather than folded into the turn stream — see
+    /// [`SessionFact`]'s own doc comment for why — so a host reading
+    /// [`SessionState::subscribe`](mango_external_agents::SessionState::subscribe) sees a
+    /// re-announced catalog without having to watch every turn for it.
+    fn apply_fact(&self, fact: SessionFact) {
+        match fact {
+            SessionFact::Commands(commands) => self
+                .core_state
+                .set_commands(mango_external_agents::event::normalized_catalog(commands)),
+        }
     }
 
     /// The events that close out a turn: the other half of an open reasoning block.
@@ -524,7 +565,7 @@ impl SessionState {
         {
             let pending = self.lock_pending();
             let Some(pending) = pending
-                .get(&response.request_id)
+                .get(response.interaction_id.as_str())
                 .filter(|pending| pending.host_answerable)
             else {
                 return Ok(Answered::AlreadyResolved);
@@ -552,7 +593,7 @@ impl SessionState {
             false => permission::cancelled(),
         };
         let answered = self
-            .respond_pending(&response.request_id, outcome, response.source)
+            .respond_pending(response.interaction_id.as_str(), outcome, response.source)
             .map_err(|error| Error::Vendor(vendor_error("session/request_permission", &error)))?;
         match alive {
             true => Ok(answered),
@@ -606,7 +647,13 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     let Some(turn) = state.turn() else {
         return;
     };
-    for kind in state.reduce(notification) {
+    let (events, facts) = state.reduce(notification);
+    // Published before the turn events: a session fact is true the moment the agent announced it,
+    // not only once a host has read every event that preceded it on this turn's own stream.
+    for fact in facts {
+        state.apply_fact(fact);
+    }
+    for kind in events {
         // Re-checked each time round: this handler can be parked on a full channel while `close`
         // emits the terminal on another task, and resuming would put the rest of this frame after it.
         if turn.is_finished() || turn.sink.emit(kind).await.is_err() {
@@ -656,7 +703,13 @@ async fn on_request_permission(
     let Ok(expires_at) = state.limits.approval_expires_at(now) else {
         return responder.respond(permission::cancelled());
     };
-    let question = permission::request_from(&request, id.clone(), expires_at);
+    let question = permission::request_from(
+        &request,
+        id.clone(),
+        state.session_id.clone(),
+        turn.sink.operation(),
+        expires_at,
+    );
     let question = match question.normalized() {
         Ok(question) => question,
         // A question nobody could render — no options, or an id that cannot survive bounding — is
@@ -664,7 +717,7 @@ async fn on_request_permission(
         Err(_) => return responder.respond(permission::cancelled()),
     };
 
-    let Some(deadline) = ApprovalDeadline::new(question.expires_at, now) else {
+    let Some(deadline) = ApprovalDeadline::new(question.expires_at(), now) else {
         return responder.respond(permission::cancelled());
     };
     let (timer_done, done) = tokio::sync::oneshot::channel();
@@ -770,6 +823,12 @@ pub(crate) struct ConnectionHandle {
     control: Arc<dyn ProcessControl>,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>>,
+    /// Fires once the dispatch loop is over, whichever way it ended.
+    ///
+    /// Separate from `driver` because both are needed at once: `shutdown` takes the join handle to
+    /// bound its own wind-down, and the session's lifecycle watcher has to observe the same event
+    /// without competing for it.
+    driver_done: mango_external_agents::CancelToken,
 }
 
 impl std::fmt::Debug for ConnectionHandle {
@@ -806,31 +865,39 @@ pub(crate) async fn drive(
 
     let notifications = Arc::clone(&state);
     let approvals = Arc::clone(&state);
-    let driver = tokio::spawn(
-        Client
-            .builder()
-            .name(client_name)
-            .on_receive_notification(
-                async move |notification: SessionNotification, _cx| {
-                    on_session_update(&notifications, notification).await;
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_notification!(),
-            )
-            .on_receive_request(
-                async move |request: RequestPermissionRequest, responder, cx| {
-                    on_request_permission(&approvals, request, responder, cx).await
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
-                // The closure *is* the connection's lifetime, so it hands a clone out and parks.
-                // Returning here shuts the dispatch loop down, which is why only `shutdown` does.
-                let _ = ready_tx.send(connection.clone());
-                let _ = shutdown_rx.await;
+    let driver_done = mango_external_agents::CancelToken::new();
+    let loop_over = driver_done.clone();
+    let connecting = Client
+        .builder()
+        .name(client_name)
+        .on_receive_notification(
+            async move |notification: SessionNotification, _cx| {
+                on_session_update(&notifications, notification).await;
                 Ok(())
-            }),
-    );
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |request: RequestPermissionRequest, responder, cx| {
+                on_request_permission(&approvals, request, responder, cx).await
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
+            // The closure *is* the connection's lifetime, so it hands a clone out and parks.
+            // Returning here shuts the dispatch loop down, which is why only `shutdown` does.
+            let _ = ready_tx.send(connection.clone());
+            let _ = shutdown_rx.await;
+            Ok(())
+        });
+    let driver = tokio::spawn(async move {
+        let outcome = connecting.await;
+        // Signalled whatever the outcome. An agent that exited or a transport that failed ends the
+        // loop without anyone having called `close`, and that is precisely the case a session's
+        // lifecycle would otherwise never hear about.
+        loop_over.cancel();
+        outcome
+    });
 
     let Ok(connection) = ready_rx.await else {
         // The closure never ran, so the transport failed first. Nothing is returned from this
@@ -854,6 +921,7 @@ pub(crate) async fn drive(
         control,
         shutdown: Mutex::new(Some(shutdown_tx)),
         driver: Mutex::new(Some(driver)),
+        driver_done,
     })
 }
 
@@ -870,6 +938,16 @@ impl ConnectionHandle {
     /// The child, for diagnostics and for ending it.
     pub(crate) fn control(&self) -> &Arc<dyn ProcessControl> {
         &self.control
+    }
+
+    /// Fires once the dispatch loop is over, whichever way it ended.
+    ///
+    /// Not the same event as [`ConnectionTo::incoming_closed`]: a clean EOF closes the incoming
+    /// half while the loop stays up, because its outgoing and task actors live for as long as any
+    /// [`ConnectionTo`] clone does — and this handle holds one. A transport that *failed* ends the
+    /// loop itself, and only this reports that. Anything watching for a dead agent wants both.
+    pub(crate) fn driver_done(&self) -> &mango_external_agents::CancelToken {
+        &self.driver_done
     }
 
     /// Ends the dispatch loop and the child. Idempotent.
@@ -972,9 +1050,28 @@ mod tests {
     use std::sync::Arc;
 
     use mango_external_agents::testing::FakeLauncher;
-    use mango_external_agents::{Configuration, EventSink, HostContext, TurnId};
+    use mango_external_agents::{
+        AttemptId, Configuration, EventSink, HarnessIdentity, HostContext, SessionIds,
+        SessionSnapshot, TransportKind, TransportSelection, TurnId,
+    };
 
     use super::{CancelReason, PermissionLevel, SessionId, SessionState};
+
+    /// A bare core session state, for the connection-level state under test to publish facts into.
+    fn core_state() -> mango_external_agents::SessionState {
+        mango_external_agents::SessionState::new(
+            std::sync::Arc::new(mango_external_agents::SystemClock),
+            SessionSnapshot::opening(
+                SessionIds {
+                    session_id: SessionId::new("session-1"),
+                    native_session_id: String::from("native-1"),
+                },
+                HarnessIdentity::claude(),
+                TransportSelection::new(None, TransportKind::Acp),
+                std::time::SystemTime::UNIX_EPOCH,
+            ),
+        )
+    }
 
     fn state() -> (SessionState, HostContext) {
         let host = HostContext::builder()
@@ -983,7 +1080,12 @@ mod tests {
             .client_info("acp-client-tests", "0.1.0")
             .build()
             .expect("expected a host context");
-        let state = SessionState::new(SessionId::new("session-1"), &host, Configuration::default());
+        let state = SessionState::new(
+            SessionId::new("session-1"),
+            &host,
+            Configuration::default(),
+            core_state(),
+        );
         (state, host)
     }
 
@@ -991,6 +1093,7 @@ mod tests {
         let (sink, _events) = EventSink::new(
             SessionId::new("session-1"),
             TurnId::new(turn_id),
+            AttemptId::default(),
             Arc::clone(host.clock()),
             1,
         );

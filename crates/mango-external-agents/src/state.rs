@@ -1,0 +1,763 @@
+//! What a session *is* right now, as opposed to what one turn said.
+//!
+//! Session state and turn transcript are different things and used to share a channel. The vendor
+//! handle, the slash-command catalog, the settings in force and what the session can do are all
+//! facts about the session; they change between turns, before the first one, and after the last.
+//! Carrying them as turn events meant a host could only learn them by running a turn, and meant
+//! inventing a turn id for something no turn produced.
+//!
+//! So they live here, behind two methods on [`Session`](crate::Session):
+//!
+//! - [`Session::snapshot`](crate::Session::snapshot) reads the current picture.
+//! - [`Session::subscribe`](crate::Session::subscribe) watches it change.
+//!
+//! # The race that is not possible
+//!
+//! Read-then-subscribe is the classic way to lose an update: the change lands between the read and
+//! the subscription and nobody ever hears about it. [`SessionSubscription`] is built the other way
+//! round — subscribing *is* reading. A subscription is created from the live value, so
+//! [`SessionSubscription::current`] answers with the snapshot the subscription was opened at, and
+//! [`SessionSubscription::changed`] wakes for anything after it. There is no window between the
+//! two calls because there are not two calls.
+//!
+//! Every snapshot also carries a [`SessionRevision`], which only ever increases. A consumer that
+//! persists one and later sees a lower number is looking at a stale read, and one that sees a gap
+//! knows updates were coalesced rather than lost — the last one wins, which is the right semantics
+//! for a picture of the present.
+
+use std::fmt;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use tokio::sync::watch;
+
+use crate::configuration::{ConfigurationCatalog, ConfigurationState};
+use crate::event::Command;
+use crate::harness::SessionCapabilities;
+use crate::host::Clock;
+use crate::identity::HarnessIdentity;
+use crate::session::SessionIds;
+use crate::transport::TransportKind;
+
+/// Which version of a session's picture this is.
+///
+/// Monotonic within one session and meaningless across sessions. A consumer compares two of them
+/// to order what it has seen; it never reads one as a count of changes, because coalesced updates
+/// share the revision of the last one to land.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct SessionRevision(u64);
+
+impl SessionRevision {
+    /// The revision a session opens at.
+    pub const INITIAL: Self = Self(0);
+
+    /// The next revision after this one.
+    ///
+    /// Saturating rather than wrapping: a session that somehow reached `u64::MAX` updates would,
+    /// on a wrap, start answering with revisions that read as older than what a host already has.
+    /// A stuck counter is a bug nobody can act on; a counter that goes backwards is a bug that
+    /// makes a host discard the truth.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// The revision as a number, for persisting or comparing.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for SessionRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// Where a session is in its life.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum SessionStatus {
+    /// Open and usable.
+    #[default]
+    Ready,
+    /// Closing: no new turn will be accepted, and whatever was running is being wound down.
+    Closing,
+    /// Closed. Nothing more will happen on it.
+    Closed,
+}
+
+// The variant order *is* the lifecycle ladder, and the derived `Ord` above is what
+// `SessionState::set_status` compares against to refuse a status that walks it back. A variant
+// added anywhere but the end — or inserted before `Closing` — changes which transitions are
+// accepted, so a new one belongs at the position the session actually reaches it.
+
+impl SessionStatus {
+    /// Whether a new turn would be accepted.
+    pub const fn is_usable(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+impl fmt::Display for SessionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Ready => "ready",
+            Self::Closing => "closing",
+            Self::Closed => "closed",
+        })
+    }
+}
+
+/// Which carrier a session asked for and which one it got.
+///
+/// Both, because they are allowed to differ only in one direction: a host that asked for nothing
+/// gets the harness's own preference, and a host that asked for something either gets it or is
+/// refused. A session that quietly ran on a different carrier would leave a host debugging the
+/// wrong connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct TransportSelection {
+    /// What the host asked for, when it asked for anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<TransportKind>,
+    /// What the session is actually running on.
+    pub effective: TransportKind,
+}
+
+impl TransportSelection {
+    /// A session running on the carrier the host asked for, or on the harness's default.
+    pub fn new(requested: Option<TransportKind>, effective: TransportKind) -> Self {
+        Self {
+            requested,
+            effective,
+        }
+    }
+
+    /// Whether the host asked for something other than what it got.
+    ///
+    /// Always false in practice — an undeclared request is refused at
+    /// [`validate_open_session`](crate::Harness::validate_open_session) — and worth being able to
+    /// assert.
+    pub fn was_substituted(&self) -> bool {
+        self.requested
+            .is_some_and(|requested| requested != self.effective)
+    }
+}
+
+/// Everything true about a session at one instant.
+///
+/// A value, not a view: reading two fields off one snapshot reads them from the same instant,
+/// which a set of getters on a live session could not promise.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionSnapshot {
+    /// Which version of the picture this is.
+    pub revision: SessionRevision,
+    /// The two ids this session answers to.
+    pub ids: SessionIds,
+    /// Which harness is driving it.
+    pub harness: HarnessIdentity,
+    /// Which carrier it asked for and which it is on.
+    pub transport: TransportSelection,
+    /// Where it is in its life.
+    pub status: SessionStatus,
+    /// What this session can do, after whatever the handshake narrowed.
+    pub capabilities: SessionCapabilities,
+    /// What it is set to, split by who says so.
+    pub configuration: ConfigurationState,
+    /// What it can be set to, as the vendor enumerates it.
+    pub catalog: ConfigurationCatalog,
+    /// The slash commands this session will expand, as the vendor announced them.
+    ///
+    /// Session state, not transcript: it says what a person may type next, so the last
+    /// announcement wins and none of it is ever persisted as a message.
+    pub commands: Vec<Command>,
+    /// Whether the vendor continued a conversation rather than starting one.
+    pub resumed: bool,
+    /// Why a requested resume did not happen, when one was asked for and did not.
+    pub fallback_reason: Option<String>,
+    /// When this picture was taken, from the host's clock.
+    ///
+    /// Re-stamped on every published change, so two snapshots of one session carry two instants.
+    /// A host comparing it against its own cache is asking "how old is what I am looking at",
+    /// which a value frozen at open could not answer.
+    pub observed_at: SystemTime,
+}
+
+impl fmt::Debug for SessionSnapshot {
+    /// Reports session state without logging host ids, vendor ids, commands, or fallback text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionSnapshot")
+            .field("revision", &self.revision)
+            .field(
+                "has_host_session_id",
+                &!self.ids.session_id.as_str().is_empty(),
+            )
+            .field(
+                "has_native_session_id",
+                &!self.ids.native_session_id.is_empty(),
+            )
+            .field("harness", &self.harness)
+            .field("transport", &self.transport)
+            .field("status", &self.status)
+            .field("capabilities", &self.capabilities)
+            .field("configuration", &self.configuration)
+            .field("catalog", &self.catalog)
+            .field("command_count", &self.commands.len())
+            .field("resumed", &self.resumed)
+            .field("has_fallback_reason", &self.fallback_reason.is_some())
+            .field("observed_at", &self.observed_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionSnapshot {
+    /// The picture a session opens with.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{
+    ///     HarnessIdentity, SessionIds, SessionId, SessionRevision, SessionSnapshot,
+    ///     TransportKind, TransportSelection,
+    /// };
+    /// use std::time::SystemTime;
+    ///
+    /// let snapshot = SessionSnapshot::opening(
+    ///     SessionIds {
+    ///         session_id: SessionId::new("chat-1"),
+    ///         native_session_id: String::from("native-1"),
+    ///     },
+    ///     HarnessIdentity::claude(),
+    ///     TransportSelection::new(None, TransportKind::Stdio),
+    ///     SystemTime::UNIX_EPOCH,
+    /// );
+    /// assert_eq!(snapshot.revision, SessionRevision::INITIAL);
+    /// assert!(snapshot.commands.is_empty());
+    /// ```
+    pub fn opening(
+        ids: SessionIds,
+        harness: HarnessIdentity,
+        transport: TransportSelection,
+        observed_at: SystemTime,
+    ) -> Self {
+        Self {
+            revision: SessionRevision::INITIAL,
+            ids,
+            harness,
+            transport,
+            status: SessionStatus::Ready,
+            capabilities: SessionCapabilities::none(),
+            configuration: ConfigurationState::unknown(),
+            catalog: ConfigurationCatalog::empty(),
+            commands: Vec::new(),
+            resumed: false,
+            fallback_reason: None,
+            observed_at,
+        }
+    }
+
+    /// Records what this session can do.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: SessionCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Records what it is set to.
+    #[must_use]
+    pub fn with_configuration(mut self, configuration: ConfigurationState) -> Self {
+        self.configuration = configuration;
+        self
+    }
+
+    /// Records what it can be set to.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: ConfigurationCatalog) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
+    /// Records that the vendor continued a conversation rather than starting one.
+    #[must_use]
+    pub fn resumed(mut self) -> Self {
+        self.resumed = true;
+        self
+    }
+
+    /// Records why a requested resume did not happen.
+    #[must_use]
+    pub fn with_fallback_reason(mut self, reason: impl Into<String>) -> Self {
+        self.fallback_reason = Some(reason.into());
+        self
+    }
+}
+
+/// The live, observable state of one session.
+///
+/// Held by the harness's session implementation and read through
+/// [`Session::snapshot`](crate::Session::snapshot). Cheap to clone: every clone shares one
+/// picture, so a reducer task and the session handle cannot disagree about what is current.
+#[derive(Clone)]
+pub struct SessionState {
+    clock: Arc<dyn Clock>,
+    sender: watch::Sender<Arc<SessionSnapshot>>,
+}
+
+impl fmt::Debug for SessionState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionState")
+            .field("snapshot", &self.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionState {
+    /// A state holding this opening picture, stamped by the host's own clock.
+    ///
+    /// The clock is the host's for the same reason [`EventSink`](crate::EventSink)'s is: a
+    /// library reading `SystemTime::now()` on its own behalf is a library a host cannot put under
+    /// a test clock, and every instant it publishes is one a host will compare against its own.
+    pub fn new(clock: Arc<dyn Clock>, snapshot: SessionSnapshot) -> Self {
+        Self {
+            clock,
+            sender: watch::Sender::new(Arc::new(snapshot)),
+        }
+    }
+
+    /// The picture as it stands.
+    pub fn snapshot(&self) -> Arc<SessionSnapshot> {
+        Arc::clone(&self.sender.borrow())
+    }
+
+    /// A subscription that cannot miss a change made after it was opened.
+    ///
+    /// See the module documentation for why there is no read-then-subscribe window.
+    pub fn subscribe(&self) -> SessionSubscription {
+        let mut receiver = self.sender.subscribe();
+        let current = Arc::clone(&receiver.borrow_and_update());
+        SessionSubscription { receiver, current }
+    }
+
+    /// Applies a change and publishes the result, bumping the revision.
+    ///
+    /// The revision is bumped here rather than by the caller, so a harness cannot publish a
+    /// changed picture under a revision a consumer has already seen.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{
+    ///     Clock, HarnessIdentity, SessionId, SessionIds, SessionSnapshot, SessionState,
+    ///     SystemClock, TransportKind, TransportSelection,
+    /// };
+    ///
+    /// let clock = std::sync::Arc::new(SystemClock);
+    /// let state = SessionState::new(
+    ///     clock.clone(),
+    ///     SessionSnapshot::opening(
+    ///         SessionIds {
+    ///             session_id: SessionId::new("chat-1"),
+    ///             native_session_id: String::from("native-1"),
+    ///         },
+    ///         HarnessIdentity::claude(),
+    ///         TransportSelection::new(None, TransportKind::Stdio),
+    ///         clock.now(),
+    ///     ),
+    /// );
+    ///
+    /// let before = state.snapshot().revision;
+    /// state.update(|snapshot| snapshot.resumed = true);
+    /// assert!(state.snapshot().revision > before);
+    /// assert!(state.snapshot().resumed);
+    /// ```
+    ///
+    /// Not the door for `status`: it writes the snapshot verbatim, so a status set through here
+    /// escapes the ladder [`set_status`](Self::set_status) enforces. Use that.
+    pub fn update(&self, change: impl FnOnce(&mut SessionSnapshot)) {
+        let now = self.clock.now();
+        self.sender.send_modify(|current| {
+            let mut next = SessionSnapshot::clone(current);
+            change(&mut next);
+            next.revision = current.revision.next();
+            next.observed_at = now;
+            *current = Arc::new(next);
+        });
+    }
+
+    /// Records the vendor's own handle, which a vendor may mint after opening has answered.
+    ///
+    /// The shape Claude Code has: `--session-id` proposes one and the run's own announcement is
+    /// free to report another, which is then the only handle a resume can use.
+    pub fn set_native_session_id(&self, native_session_id: impl Into<String>) {
+        let native_session_id = native_session_id.into();
+        if self.snapshot().ids.native_session_id == native_session_id {
+            return;
+        }
+        self.update(|snapshot| snapshot.ids.native_session_id = native_session_id);
+    }
+
+    /// Records the slash commands the vendor announced.
+    ///
+    /// The last announcement wins: this is what a person may type next, not a log of what the
+    /// vendor has said about it.
+    pub fn set_commands(&self, commands: Vec<Command>) {
+        if self.snapshot().commands == commands {
+            return;
+        }
+        self.update(|snapshot| snapshot.commands = commands);
+    }
+
+    /// Records what the session is now set to, bounded on the way in.
+    ///
+    /// The `observed` half is filled straight from whatever a vendor said about itself, and this
+    /// is the only boundary between that and a host's picker — a turn event would have passed
+    /// through `EventSink`, and a session update has no such door of its own.
+    pub fn set_configuration(&self, configuration: ConfigurationState) {
+        let configuration = configuration.normalized();
+        if self.snapshot().configuration == configuration {
+            return;
+        }
+        self.update(|snapshot| snapshot.configuration = configuration);
+    }
+
+    /// Records where the session is in its life.
+    ///
+    /// Monotonic along `Ready` → `Closing` → `Closed`: a status at or behind the one already
+    /// published is ignored. A session never reopens, and two things can wind one down — an
+    /// explicit `close` and a harness watcher that saw the vendor connection die — so without this
+    /// the loser of that race publishes `Closing` after `Closed` and a host watching the
+    /// subscription sees the lifecycle run backwards.
+    ///
+    /// The comparison happens inside the write rather than before it, which is the whole point:
+    /// a read-then-[`update`](Self::update) pair is two operations, and the racing `close` reads
+    /// `Ready`, loses the whole wind-down to the watcher, and then writes its stale `Closing` over
+    /// the `Closed` that landed in between. Nothing here is a no-op notification either — a status
+    /// that does not advance leaves the revision alone, because a subscriber woken with an
+    /// identical picture cannot tell that from a change.
+    pub fn set_status(&self, status: SessionStatus) {
+        let now = self.clock.now();
+        self.sender.send_if_modified(|current| {
+            if status <= current.status {
+                return false;
+            }
+            // The same bookkeeping `update` does, because a subscriber cannot tell which door a
+            // snapshot came through.
+            let mut next = SessionSnapshot::clone(current);
+            next.status = status;
+            next.revision = current.revision.next();
+            next.observed_at = now;
+            *current = Arc::new(next);
+            true
+        });
+    }
+}
+
+/// A view of one session's state that wakes when it changes.
+///
+/// Coalescing: a consumer that is slow sees the latest picture rather than every intermediate one.
+/// That is the right behaviour for a snapshot — an old picture of the present is not useful — and
+/// it is why [`SessionRevision`] exists, so a consumer that cares can tell coalescing from
+/// stillness.
+#[derive(Clone)]
+pub struct SessionSubscription {
+    receiver: watch::Receiver<Arc<SessionSnapshot>>,
+    current: Arc<SessionSnapshot>,
+}
+
+impl fmt::Debug for SessionSubscription {
+    /// Reports the last observed picture without formatting the watch receiver internals.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionSubscription")
+            .field("current", &self.current())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionSubscription {
+    /// The picture as of this subscription's last wake-up, or of when it was opened.
+    pub fn current(&self) -> Arc<SessionSnapshot> {
+        Arc::clone(&self.current)
+    }
+
+    /// Waits for the next change and answers with it.
+    ///
+    /// `None` once the session's state is gone, which is how a consumer learns the session handle
+    /// itself was dropped.
+    pub async fn changed(&mut self) -> Option<Arc<SessionSnapshot>> {
+        self.receiver.changed().await.ok()?;
+        self.current = Arc::clone(&self.receiver.borrow_and_update());
+        Some(Arc::clone(&self.current))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn an_update_before_the_initial_read_is_delivered_only_once() {
+        let state = state();
+        let mut subscription = state.subscribe();
+        state.set_status(SessionStatus::Closing);
+        let initial = subscription.current();
+        let changed = subscription
+            .changed()
+            .await
+            .expect("expected the pending update");
+        assert!(
+            changed.revision > initial.revision,
+            "expected a newer revision after current; received the same update twice"
+        );
+        assert_eq!(subscription.current().revision, changed.revision);
+        drop(state);
+        assert!(
+            subscription.changed().await.is_none(),
+            "expected no duplicate update"
+        );
+    }
+
+    use super::{
+        SessionRevision, SessionSnapshot, SessionState, SessionStatus, SessionSubscription,
+        TransportSelection,
+    };
+    use crate::configuration::{Configuration, ConfigurationState};
+    use crate::event::{Command, SessionId};
+    use crate::identity::HarnessIdentity;
+    use crate::session::SessionIds;
+    use crate::transport::TransportKind;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn state() -> SessionState {
+        state_on(Arc::new(crate::host::SystemClock))
+    }
+
+    fn state_on(clock: Arc<dyn crate::host::Clock>) -> SessionState {
+        let opened_at = clock.now();
+        SessionState::new(
+            clock,
+            SessionSnapshot::opening(
+                SessionIds {
+                    session_id: SessionId::new("chat-1"),
+                    native_session_id: String::from("native-1"),
+                },
+                HarnessIdentity::claude(),
+                TransportSelection::new(None, TransportKind::Stdio),
+                opened_at,
+            ),
+        )
+    }
+
+    fn command(name: &str) -> Command {
+        Command {
+            name: String::from(name),
+            description: None,
+        }
+    }
+
+    /// The classic read-then-subscribe race: the change lands between the read and the
+    /// subscription. It cannot happen here because subscribing *is* reading — the subscription is
+    /// created from the live value, so anything published after it is one this consumer wakes for.
+    #[tokio::test]
+    async fn a_change_published_after_subscribing_is_never_lost() {
+        let state = state();
+        let mut subscription = state.subscribe();
+        let opened_at = subscription.current().revision;
+
+        state.set_commands(vec![command("review")]);
+
+        let seen = subscription
+            .changed()
+            .await
+            .expect("expected the change to reach the subscriber");
+        assert!(seen.revision > opened_at);
+        assert_eq!(seen.commands, vec![command("review")]);
+    }
+
+    /// A consumer that subscribes after a change has already landed sees it in `current()`, not as
+    /// a missed wake-up. This is the other half of why there is no window: the subscription's
+    /// first read is the live value, whatever happened before it.
+    #[tokio::test]
+    async fn a_change_published_before_subscribing_is_already_in_the_first_read() {
+        let state = state();
+        state.set_native_session_id("native-2");
+
+        let subscription = state.subscribe();
+        assert_eq!(subscription.current().ids.native_session_id, "native-2");
+    }
+
+    /// Several changes while a consumer is away coalesce into the latest picture. The revision is
+    /// what lets it tell coalescing from stillness.
+    #[tokio::test]
+    async fn several_changes_coalesce_into_the_latest_picture() {
+        let state = state();
+        let mut subscription = state.subscribe();
+
+        state.set_commands(vec![command("one")]);
+        state.set_commands(vec![command("two")]);
+        state.set_status(SessionStatus::Closing);
+
+        let seen = subscription.changed().await.expect("expected a change");
+        assert_eq!(seen.commands, vec![command("two")]);
+        assert_eq!(seen.status, SessionStatus::Closing);
+        assert_eq!(
+            seen.revision.get(),
+            3,
+            "expected one revision per published change, received {}",
+            seen.revision
+        );
+    }
+
+    /// Session facts change outside any turn: before the first one, between two, and after the
+    /// last. That is the whole reason they are not turn events.
+    #[tokio::test]
+    async fn session_state_changes_with_no_turn_anywhere_in_sight() {
+        let state = state();
+        let mut subscription = state.subscribe();
+
+        state.set_configuration(
+            ConfigurationState::unknown()
+                .with_observed(Configuration::unknown().with_model("opus")),
+        );
+
+        let seen = subscription.changed().await.expect("expected a change");
+        assert_eq!(
+            seen.configuration.observed.model.as_deref(),
+            Some("opus"),
+            "expected a settings change with no turn to reach a subscriber"
+        );
+    }
+
+    /// A republished identical value would wake every subscriber for nothing and burn a revision a
+    /// host would read as a change.
+    #[test]
+    fn publishing_the_same_value_twice_does_not_bump_the_revision() {
+        let state = state();
+        state.set_commands(vec![command("review")]);
+        let after_first = state.snapshot().revision;
+
+        state.set_commands(vec![command("review")]);
+        assert_eq!(state.snapshot().revision, after_first);
+
+        state.set_native_session_id("native-1");
+        assert_eq!(state.snapshot().revision, after_first);
+    }
+
+    /// A session runs for hours. A host reading `observed_at` to decide whether its cached picture
+    /// is worth re-rendering would get the opening instant for every snapshot in the session, and
+    /// `SessionSnapshot` is non-exhaustive, so it would have no way to notice the field never moved.
+    #[test]
+    fn every_published_picture_carries_the_instant_it_was_taken() {
+        let clock = Arc::new(crate::testing::FrozenClock::default());
+        let state = state_on(clock.clone());
+        let opened_at = state.snapshot().observed_at;
+
+        clock.advance(Duration::from_secs(90));
+        state.set_commands(vec![command("review")]);
+        let after_first = state.snapshot().observed_at;
+        assert_eq!(after_first, opened_at + Duration::from_secs(90));
+
+        clock.advance(Duration::from_secs(30));
+        state.set_status(SessionStatus::Closing);
+        assert_eq!(
+            state.snapshot().observed_at,
+            after_first + Duration::from_secs(30),
+            "expected each published change to carry its own instant"
+        );
+    }
+
+    #[test]
+    fn a_revision_only_ever_goes_forward() {
+        assert_eq!(SessionRevision::INITIAL.get(), 0);
+        assert!(SessionRevision::INITIAL.next() > SessionRevision::INITIAL);
+        assert_eq!(SessionRevision::INITIAL.next().to_string(), "1");
+    }
+
+    /// A host that asked for a carrier and silently got another would debug the wrong connection.
+    #[test]
+    fn a_selection_reports_what_was_asked_for_next_to_what_is_running() {
+        let asked = TransportSelection::new(Some(TransportKind::Stdio), TransportKind::Stdio);
+        assert!(!asked.was_substituted());
+
+        let defaulted = TransportSelection::new(None, TransportKind::Stdio);
+        assert_eq!(defaulted.requested, None);
+        assert!(!defaulted.was_substituted());
+
+        let substituted =
+            TransportSelection::new(Some(TransportKind::WebSocket), TransportKind::Stdio);
+        assert!(substituted.was_substituted());
+    }
+
+    #[tokio::test]
+    async fn a_subscription_ends_when_the_session_state_is_dropped() {
+        let state = state();
+        let mut subscription: SessionSubscription = state.subscribe();
+        drop(state);
+        assert!(
+            subscription.changed().await.is_none(),
+            "expected the subscription to end with the session"
+        );
+    }
+
+    /// An explicit `close` and a harness watcher that saw the connection die both wind a session
+    /// down, and either can get there first. The loser must not walk the status back.
+    #[test]
+    fn a_published_status_never_walks_back_down_the_ladder() {
+        let closed = state();
+        closed.set_status(SessionStatus::Closed);
+        closed.set_status(SessionStatus::Closing);
+        assert_eq!(closed.snapshot().status, SessionStatus::Closed);
+        closed.set_status(SessionStatus::Ready);
+        assert_eq!(closed.snapshot().status, SessionStatus::Closed);
+
+        let closing = state();
+        closing.set_status(SessionStatus::Closing);
+        let settled = closing.snapshot().revision;
+        closing.set_status(SessionStatus::Ready);
+        assert_eq!(closing.snapshot().status, SessionStatus::Closing);
+        // The observable consequence of comparing inside the write: a status that does not advance
+        // publishes nothing at all, rather than waking subscribers with the same picture.
+        assert_eq!(closing.snapshot().revision, settled);
+        closing.set_status(SessionStatus::Closed);
+        assert_eq!(closing.snapshot().status, SessionStatus::Closed);
+        assert!(closing.snapshot().revision > settled);
+    }
+
+    #[test]
+    fn a_closing_session_stops_being_usable() {
+        assert!(SessionStatus::Ready.is_usable());
+        assert!(!SessionStatus::Closing.is_usable());
+        assert!(!SessionStatus::Closed.is_usable());
+        assert_eq!(SessionStatus::Closing.to_string(), "closing");
+    }
+}

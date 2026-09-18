@@ -9,7 +9,9 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::Duration;
 
-use crate::harness::{Capability, HarnessKind};
+use crate::harness::Capability;
+use crate::identity::HarnessId;
+use crate::operation::Dispatch;
 use crate::redact;
 use crate::transport::TransportKind;
 
@@ -179,6 +181,14 @@ impl std::error::Error for VendorError {}
 /// Everything that can go wrong between a host and a vendor CLI.
 #[non_exhaustive]
 pub enum Error {
+    /// A failure annotated where the operation's submission stage is known.
+    Operation {
+        /// How far this operation got before it failed.
+        dispatch: Dispatch,
+        /// The original typed failure, retained for inspection and diagnostics.
+        source: Box<Error>,
+    },
+
     /// The vendor answered with a failure of its own.
     Vendor(VendorError),
 
@@ -197,7 +207,7 @@ pub enum Error {
     /// without touching the machine.
     UnsupportedTransport {
         /// The harness that was asked.
-        harness: HarnessKind,
+        harness: HarnessId,
         /// The transport kind it does not speak.
         transport: TransportKind,
     },
@@ -349,6 +359,7 @@ impl fmt::Display for Error {
     /// Formats failures for diagnostics without including raw vendor or host-provided payloads.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Operation { source, .. } => source.fmt(formatter),
             Self::Vendor(error) => error.fmt(formatter),
             Self::NotSupported { capability } => write!(
                 formatter,
@@ -423,6 +434,7 @@ impl fmt::Debug for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Operation { source, .. } => Some(source.as_ref()),
             Self::Vendor(error) => Some(error),
             _ => None,
         }
@@ -447,8 +459,76 @@ impl Error {
     /// wrong, or about a link that is already gone.
     pub fn retryable(&self) -> bool {
         match self {
+            Self::Operation { source, .. } => source.retryable(),
             Self::Vendor(error) => error.retryable,
             _ => false,
+        }
+    }
+
+    /// How far the request that produced this failure got.
+    ///
+    /// The question a bare `Result` cannot answer and a host has to before it retries: a refusal
+    /// this library raised before writing anything is safe to replay, and a link that broke after
+    /// the request went out is not. See [`Dispatch`] for why "probably did not arrive" is the
+    /// reading that runs a turn twice.
+    ///
+    /// This says nothing about whether the *vendor* deduplicates a replay. It does not, unless it
+    /// documents that it does, and no identity this library mints changes that.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Capability, Dispatch, Error};
+    ///
+    /// assert_eq!(
+    ///     Error::not_supported(Capability::Steering)
+    ///         .with_dispatch(Dispatch::NotSubmitted).dispatch(),
+    ///     Dispatch::NotSubmitted,
+    /// );
+    /// assert_eq!(
+    ///     Error::Closed { subject: "link" }.dispatch(),
+    ///     Dispatch::AcceptanceUnknown,
+    /// );
+    /// ```
+    pub fn dispatch(&self) -> Dispatch {
+        match self {
+            Self::Operation { dispatch, .. } => *dispatch,
+            // The same error category can occur before or after submission. Only the caller
+            // at that boundary can establish certainty; an unannotated error proves neither.
+            _ => Dispatch::AcceptanceUnknown,
+        }
+    }
+
+    /// Records dispatch certainty at the boundary that knows it, retaining the typed cause.
+    ///
+    /// Replaces a previous annotation so wrapping through several layers does not build a chain.
+    ///
+    /// ```
+    /// use mango_external_agents::{Dispatch, Error};
+    /// let error = Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted);
+    /// assert!(error.dispatch().is_safe_to_replay());
+    /// assert!(matches!(error.cause(), Error::Closed { .. }));
+    /// ```
+    #[must_use]
+    pub fn with_dispatch(self, dispatch: Dispatch) -> Self {
+        let source = match self {
+            Self::Operation { source, .. } => source,
+            source => Box::new(source),
+        };
+        Self::Operation { dispatch, source }
+    }
+
+    /// The original failure without dispatch annotations, for typed matching.
+    ///
+    /// ```
+    /// use mango_external_agents::{Dispatch, Error};
+    /// let error = Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted);
+    /// assert!(matches!(error.cause(), Error::Closed { subject: "session" }));
+    /// ```
+    pub fn cause(&self) -> &Self {
+        match self {
+            Self::Operation { source, .. } => source.cause(),
+            cause => cause,
         }
     }
 }
@@ -477,6 +557,7 @@ mod tests {
 
     use super::{CODE_MAX_LENGTH, Error, ErrorCode, VendorError, jsonrpc_code_is_retryable};
     use crate::harness::Capability;
+    use crate::operation::Dispatch;
 
     #[test]
     fn reserved_jsonrpc_codes_are_not_retryable() {
@@ -506,6 +587,99 @@ mod tests {
         );
         assert!(vendor.retryable());
         assert!(!Error::not_supported(Capability::Steering).retryable());
+    }
+
+    /// The three answers a host has to tell apart before it replays anything. Retryability and
+    /// dispatch are different questions: a vendor can say "try again" about a request it definitely
+    /// received, and a broken link says nothing about whether the request arrived.
+    #[test]
+    fn failure_categories_do_not_establish_the_operation_stage() {
+        let not_submitted = [
+            Error::not_supported(Capability::Steering),
+            Error::VersionGate {
+                found: String::from("1.0.0"),
+                minimum: String::from("2.0.0"),
+            },
+            Error::AuthRequired {
+                login_hint: String::from("claude login"),
+            },
+            Error::Launch {
+                program: String::from("claude"),
+                message: String::from("not found"),
+            },
+            Error::HostConfiguration {
+                expected: "a cwd",
+                received: String::from("none"),
+            },
+        ];
+        for error in not_submitted {
+            assert_eq!(
+                error.dispatch(),
+                Dispatch::AcceptanceUnknown,
+                "expected {error:?} to need an operation-stage annotation"
+            );
+            assert!(!error.dispatch().is_safe_to_replay());
+        }
+
+        let accepted = [
+            Error::Vendor(VendorError::new(
+                ErrorCode::from_static("codex-busy"),
+                "busy",
+            )),
+            Error::Protocol {
+                expected: String::from("a frame"),
+                received: String::from("nothing"),
+            },
+            // The one that reads like a library refusal and is not: the value it refused is one
+            // the vendor wrote, so the vendor had already read the request.
+            Error::InvalidVendorValue {
+                field: "activity call id",
+                received: String::from("   "),
+            },
+        ];
+        for error in accepted {
+            assert_eq!(
+                error.dispatch(),
+                Dispatch::AcceptanceUnknown,
+                "expected {error:?} to need an operation-stage annotation"
+            );
+            assert!(!error.dispatch().is_safe_to_replay());
+        }
+
+        let unknown = [
+            Error::Closed { subject: "link" },
+            Error::Timeout {
+                operation: String::from("turn/start"),
+                after: std::time::Duration::from_secs(1),
+            },
+            Error::Link {
+                peer: String::from("Codex app-server"),
+                message: String::from("broken pipe"),
+            },
+        ];
+        for error in unknown {
+            assert_eq!(
+                error.dispatch(),
+                Dispatch::AcceptanceUnknown,
+                "expected {error:?} to need reconciliation"
+            );
+            assert!(error.dispatch().needs_reconciliation());
+            assert!(!error.dispatch().is_safe_to_replay());
+        }
+    }
+
+    /// A vendor saying "retry" is not a vendor saying "this never happened".
+    #[test]
+    fn retryability_and_dispatch_certainty_are_different_questions() {
+        let retryable = Error::Vendor(
+            VendorError::new(ErrorCode::from_static("codex-busy"), "busy")
+                .with_vendor_code("-31000", true),
+        );
+        assert!(retryable.retryable());
+        assert!(
+            !retryable.dispatch().is_safe_to_replay(),
+            "expected a vendor-acknowledged failure not to read as never-dispatched"
+        );
     }
 
     #[test]

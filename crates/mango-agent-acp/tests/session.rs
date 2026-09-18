@@ -13,9 +13,10 @@ use mango_agent_acp::testing::{Approval, FakeAcpAgent};
 use mango_agent_acp::{AcpHarness, AcpProfile, SessionModeIds};
 use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, RecordingBroker};
 use mango_external_agents::{
-    ApprovalRouting, BrokerDecision, CancelReason, Clock, CloseReason, Configuration,
-    DecisionSource, Error, EventKind, Harness, HostContext, Limits, OpenSession, PermissionLevel,
-    Session, TurnRequest, TurnStream, VendorInfo,
+    ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
+    Configuration, ConfigurationChange, ConfigurationPatch, DecisionSource, Error, EventKind,
+    Harness, HostContext, Limits, OpenSession, PermissionLevel, Session, SessionStatus,
+    SessionSubscription, TurnRequest, TurnStream, VendorInfo,
 };
 
 const VENDOR: VendorInfo = VendorInfo {
@@ -52,20 +53,35 @@ fn host_with_clock(launcher: &FakeLauncher, clock: Arc<dyn Clock>) -> HostContex
         .expect("expected a host")
 }
 
-/// A named clock that blocks the first event stamp until a test releases it.
+/// A named clock that blocks the next read after a test arms it, until the test releases it.
+///
+/// Armed rather than counted. Opening a session reads the host's clock more than once — the
+/// opening snapshot's stamp, and again every time the handshake publishes a session fact through
+/// `SessionState` — so a clock that blocked "the second read" would block inside `open_session`
+/// and never return. Arming after the session is open makes the next read the one a test means:
+/// `EventSink::emit`'s stamp on `TurnStarted`, the first event a turn can produce. That is the
+/// window a `close` has to be forced into, between the turn handle being installed and its prompt
+/// being written to the wire.
 #[derive(Debug, Default)]
-struct SessionStartedClock {
-    state: Mutex<SessionStartedClockState>,
+struct TurnStartedClock {
+    state: Mutex<TurnStartedClockState>,
     changed: Condvar,
 }
 
 #[derive(Debug, Default)]
-struct SessionStartedClockState {
+struct TurnStartedClockState {
+    armed: bool,
     blocked: bool,
     released: bool,
 }
 
-impl SessionStartedClock {
+impl TurnStartedClock {
+    /// Blocks the next read, and only the next one.
+    fn arm(&self) {
+        let mut state = self.state.lock().expect("expected the clock state");
+        state.armed = true;
+    }
+
     fn wait_until_blocked(&self) {
         let mut state = self.state.lock().expect("expected the clock state");
         while !state.blocked {
@@ -80,10 +96,12 @@ impl SessionStartedClock {
     }
 }
 
-impl Clock for SessionStartedClock {
+impl Clock for TurnStartedClock {
     fn now(&self) -> SystemTime {
         let mut state = self.state.lock().expect("expected the clock state");
-        if !state.released {
+        if state.armed && !state.released {
+            // Disarmed as it blocks, so the reads that follow the release run straight through.
+            state.armed = false;
             state.blocked = true;
             self.changed.notify_all();
             while !state.released {
@@ -110,11 +128,13 @@ fn host_with_broker(
     (host, broker)
 }
 
-fn permissive() -> Configuration {
-    Configuration {
-        level: Some(PermissionLevel::Default),
-        ..Configuration::default()
-    }
+/// A patch that sets only the level, leaving every other axis untouched.
+fn at_level(level: PermissionLevel) -> ConfigurationPatch {
+    ConfigurationPatch::new().level(ConfigurationChange::Set(level))
+}
+
+fn permissive() -> ConfigurationPatch {
+    at_level(PermissionLevel::Default)
 }
 
 /// The failure a call was expected to produce.
@@ -149,7 +169,7 @@ async fn drain(turn: &mut TurnStream) -> Vec<EventKind> {
 
 async fn open(
     agent: FakeAcpAgent,
-    configuration: Configuration,
+    configuration: ConfigurationPatch,
 ) -> (Box<dyn Session>, FakeLauncher) {
     let launcher = FakeLauncher::new();
     launcher.push(agent.process());
@@ -164,6 +184,88 @@ async fn open(
     (session, launcher)
 }
 
+/// The status a session settles on, once it stops changing.
+///
+/// Only the terminal is asserted on: a [`SessionSubscription`] coalesces, so a teardown that does
+/// not block between its transitions legitimately shows a subscriber only the last one. Reports
+/// the status it is stuck on rather than hanging to a bare timeout, so a lifecycle that never ends
+/// fails as "received Ready".
+async fn status_once_settled(lifecycle: &mut SessionSubscription) -> SessionStatus {
+    loop {
+        if lifecycle.current().status == SessionStatus::Closed {
+            return SessionStatus::Closed;
+        }
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), lifecycle.changed()).await,
+            Ok(Some(_))
+        ) {
+            return lifecycle.current().status;
+        }
+    }
+}
+
+/// An agent that exits, or a transport that fails, ends the dispatch loop with no `close` in
+/// sight. Nothing else on that path touches the lifecycle, so without a watcher the handle reports
+/// `Ready` forever and a host learns the connection is dead only from the next request's failure.
+#[tokio::test]
+async fn an_agent_that_dies_ends_the_published_lifecycle() {
+    let launcher = FakeLauncher::new();
+    let agent_gone = CancelToken::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .process()
+            .ending_stdout_when(agent_gone.clone()),
+    );
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    assert_eq!(lifecycle.current().status, SessionStatus::Ready);
+
+    agent_gone.cancel();
+
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected a dead dispatch loop to end the published lifecycle"
+    );
+    // The half a status assertion alone cannot see. `ending_stdout_when` closes the pipe and leaves
+    // the child running, which is exactly the shape a watcher that publishes `Closed` without
+    // reaping would report as "nothing more will happen".
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected Closed to mean the child is gone, not only that the pipe closed"
+    );
+}
+
+/// The other half of the watcher, and the one a clean EOF cannot reach: a session dropped instead
+/// of closed releases the dispatch loop's shutdown channel with the handle, so the loop ends with
+/// no EOF to report. Without the driver-done arm the lifecycle would stop at `Ready` there.
+#[tokio::test]
+async fn a_session_dropped_without_a_close_still_ends_its_lifecycle() {
+    let (session, launcher) = open(FakeAcpAgent::new(), permissive()).await;
+    let mut lifecycle = session.subscribe();
+    assert_eq!(lifecycle.current().status, SessionStatus::Ready);
+
+    drop(session);
+
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected a dropped session to reach its terminal rather than stay Ready forever"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the watcher to reap the child the dropped session abandoned"
+    );
+}
+
 #[tokio::test]
 async fn a_turn_streams_the_agents_updates_and_ends_exactly_once() {
     let (session, _launcher) = open(FakeAcpAgent::new(), permissive()).await;
@@ -175,20 +277,23 @@ async fn a_turn_streams_the_agents_updates_and_ends_exactly_once() {
     let events = drain(&mut turn).await;
 
     assert!(
-        matches!(events.first(), Some(EventKind::SessionStarted { native_session_id, .. }) if native_session_id == "sess_fake"),
-        "expected the conversation to be named first, received {events:?}"
+        matches!(events.first(), Some(EventKind::TurnStarted { .. })),
+        "expected the turn to be named first, received {events:?}"
     );
+    // The vendor's own session id, which used to ride the first turn event, is session state now:
+    // it has to reach the host through `SessionState::set_native_session_id` instead.
+    assert_eq!(session.ids().native_session_id, "sess_fake");
     assert!(
         events
             .iter()
             .any(|kind| matches!(kind, EventKind::TextDelta { text } if text == "hello")),
         "received {events:?}"
     );
+    // The command catalog is session state now, not a turn event: it lands on the session's own
+    // snapshot rather than in the stream.
     assert!(
-        events
-            .iter()
-            .any(|kind| matches!(kind, EventKind::CommandsAvailable { .. })),
-        "received {events:?}"
+        !session.snapshot().commands.is_empty(),
+        "expected the announced command catalog to reach session state"
     );
     assert!(
         events
@@ -205,7 +310,7 @@ async fn a_turn_streams_the_agents_updates_and_ends_exactly_once() {
         "expected exactly one terminal, received {events:?}"
     );
     assert!(
-        !turn.native_turn_id.is_empty(),
+        !turn.native_turn_id().is_empty(),
         "expected the prompt's own id"
     );
 }
@@ -314,14 +419,11 @@ async fn a_broker_answers_without_the_question_waiting_for_a_person() {
 async fn a_read_only_session_refuses_every_request_without_asking_anyone() {
     let (session, _launcher) = open(
         FakeAcpAgent::new().asking_for_approval(Approval::Once),
-        Configuration {
-            level: Some(PermissionLevel::ReadOnly),
-            ..Configuration::default()
-        },
+        at_level(PermissionLevel::ReadOnly),
     )
     .await;
     assert_eq!(
-        session.info().effective_configuration.level,
+        session.snapshot().configuration.accepted.level,
         Some(PermissionLevel::ReadOnly)
     );
 
@@ -355,10 +457,7 @@ async fn a_read_only_session_refuses_every_request_without_asking_anyone() {
 async fn a_host_cannot_override_a_standing_read_only_refusal() {
     let (session, _launcher) = open(
         FakeAcpAgent::new().asking_for_approval(Approval::Once),
-        Configuration {
-            level: Some(PermissionLevel::ReadOnly),
-            ..Configuration::default()
-        },
+        at_level(PermissionLevel::ReadOnly),
     )
     .await;
 
@@ -414,34 +513,29 @@ fn has_automatic_refusal(events: &[EventKind]) -> bool {
 async fn turn_overrides_stick_and_omitted_axes_preserve_the_last_accepted_restriction() {
     let (session, _launcher) = open(
         FakeAcpAgent::new().asking_for_approval(Approval::Once),
-        Configuration::default(),
+        ConfigurationPatch::new(),
     )
     .await;
 
     let mut first = session
         .start_turn(
-            TurnRequest::new("turn-1", "delete the build").with_configuration(Configuration {
-                level: Some(PermissionLevel::ReadOnly),
-                ..Configuration::default()
-            }),
+            TurnRequest::new("turn-1", "delete the build")
+                .with_configuration(at_level(PermissionLevel::ReadOnly)),
         )
         .await
         .expect("expected the explicit restriction to be accepted");
     assert!(has_automatic_refusal(&drain(&mut first).await));
     assert_eq!(
-        session.configuration().await,
-        Configuration {
-            level: Some(PermissionLevel::ReadOnly),
-            ..Configuration::default()
-        }
+        session.snapshot().configuration.accepted,
+        Configuration::unknown().with_level(PermissionLevel::ReadOnly)
     );
 
     let mut second = session
         .start_turn(
-            TurnRequest::new("turn-2", "delete the build").with_configuration(Configuration {
-                routing: Some(ApprovalRouting::AutoReview),
-                ..Configuration::default()
-            }),
+            TurnRequest::new("turn-2", "delete the build").with_configuration(
+                ConfigurationPatch::new()
+                    .routing(ConfigurationChange::Set(ApprovalRouting::AutoReview)),
+            ),
         )
         .await
         .expect("expected the routing-only override to inherit the restriction");
@@ -453,12 +547,10 @@ async fn turn_overrides_stick_and_omitted_axes_preserve_the_last_accepted_restri
         .expect("expected omitted settings to inherit the accepted restriction");
     assert!(has_automatic_refusal(&drain(&mut third).await));
     assert_eq!(
-        session.configuration().await,
-        Configuration {
-            level: Some(PermissionLevel::ReadOnly),
-            routing: Some(ApprovalRouting::AutoReview),
-            ..Configuration::default()
-        }
+        session.snapshot().configuration.accepted,
+        Configuration::unknown()
+            .with_level(PermissionLevel::ReadOnly)
+            .with_routing(ApprovalRouting::AutoReview)
     );
 }
 
@@ -468,10 +560,7 @@ async fn turn_overrides_stick_and_omitted_axes_preserve_the_last_accepted_restri
 async fn a_read_only_session_still_asks_when_the_agent_offered_no_way_to_refuse() {
     let (session, _launcher) = open(
         FakeAcpAgent::new().asking_for_approval(Approval::OnlyAllows),
-        Configuration {
-            level: Some(PermissionLevel::ReadOnly),
-            ..Configuration::default()
-        },
+        at_level(PermissionLevel::ReadOnly),
     )
     .await;
 
@@ -560,7 +649,7 @@ async fn a_cancelled_turn_reports_the_reason_the_host_gave_and_still_completes()
 async fn cancellation_withdraws_a_permission_that_arrives_after_cancel() {
     let (session, launcher) = open(
         FakeAcpAgent::new().asking_for_approval(Approval::Once),
-        Configuration::default(),
+        ConfigurationPatch::new(),
     )
     .await;
 
@@ -615,7 +704,7 @@ async fn a_second_turn_is_refused_while_one_is_in_flight() {
         .expect_err("expected a refusal, received a second turn");
 
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
         "received {error:?}"
     );
 }
@@ -632,42 +721,70 @@ async fn closing_twice_is_not_an_error_and_a_turn_after_it_is_refused() {
         .close(CloseReason::Requested)
         .await
         .expect("expected the second close to be accepted");
+    assert_eq!(
+        session.snapshot().status,
+        mango_external_agents::SessionStatus::Closed,
+        "expected a closed session to say so on its own snapshot"
+    );
 
     let error = session
         .start_turn(TurnRequest::new("turn-1", "still there?"))
         .await
         .expect_err("expected a closed session");
     assert!(
-        matches!(error, Error::Closed { subject: "session" }),
+        matches!(error.cause(), Error::Closed { subject: "session" }),
         "received {error:?}"
     );
 }
 
-/// `SessionStarted` is emitted after the turn handle is installed. If close wins while that event is
+/// `TurnStarted` is emitted after the turn handle is installed. If close wins while that event is
 /// stalled, releasing the event must not let the starter submit a detached `session/prompt`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_close_between_handle_installation_and_prompt_write_refuses_the_detached_turn() {
     let launcher = FakeLauncher::new();
     launcher.push(FakeAcpAgent::new().process());
-    let clock = Arc::new(SessionStartedClock::default());
+    let clock = Arc::new(TurnStartedClock::default());
     let host = host_with_clock(&launcher, Arc::clone(&clock) as Arc<dyn Clock>);
     let opened = AcpHarness::new(profile())
         .open_session(&host, OpenSession::new("chat-1"))
         .await
         .expect("expected a session");
     let session: Arc<dyn Session> = Arc::from(opened);
+    let configuration_before = session.snapshot().configuration.clone();
 
+    // Armed only now: opening reads the clock for its own snapshot and again for every session
+    // fact the handshake publishes, and blocking any of those would stall the open itself.
+    clock.arm();
     let starting = {
         let session = Arc::clone(&session);
-        tokio::spawn(async move { session.start_turn(TurnRequest::new("turn-1", "one")).await })
+        tokio::spawn(async move {
+            session
+                .start_turn(
+                    TurnRequest::new("turn-1", "one")
+                        .with_configuration(at_level(PermissionLevel::ReadOnly)),
+                )
+                .await
+        })
     };
     clock.wait_until_blocked();
 
-    session
-        .close(CloseReason::ConsentRevoked)
-        .await
-        .expect("expected the close to land while the start event was stalled");
+    let mut closing = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::ConsentRevoked).await })
+    };
+    let close_result = tokio::time::timeout(Duration::from_secs(2), &mut closing).await;
+    let close_won = close_result.is_ok();
     clock.release();
+    if let Ok(result) = close_result {
+        result
+            .expect("expected close task")
+            .expect("expected close");
+    } else {
+        closing
+            .await
+            .expect("expected close task")
+            .expect("expected close");
+    }
 
     let error = refusal(
         starting
@@ -675,7 +792,16 @@ async fn a_close_between_handle_installation_and_prompt_write_refuses_the_detach
             .expect("expected the start task to return a result"),
     );
     assert!(
-        matches!(error, Error::Closed { subject: "session" }),
+        close_won,
+        "expected close to finish while TurnStarted is stalled; received a close blocked by configuration publication"
+    );
+    assert_eq!(
+        session.snapshot().configuration,
+        configuration_before,
+        "a turn closed before submission must not publish its configuration"
+    );
+    assert!(
+        matches!(error.cause(), Error::Closed { subject: "session" }),
         "received {error:?}"
     );
     assert!(
@@ -741,18 +867,18 @@ async fn closing_returns_even_with_a_full_turn_channel_nobody_is_reading() {
 #[tokio::test]
 async fn session_listing_follows_what_the_agent_advertised() {
     let (silent, _launcher) = open(FakeAcpAgent::new(), permissive()).await;
-    assert!(!silent.info().capabilities.session_listing);
+    assert!(!silent.capabilities().has(Capability::SessionListing));
     let error = silent
         .list_sessions(Default::default())
         .await
         .expect_err("expected a refusal");
     assert!(
-        matches!(error, Error::NotSupported { .. }),
+        matches!(error.cause(), Error::NotSupported { .. }),
         "received {error:?}"
     );
 
     let (listing, _launcher) = open(FakeAcpAgent::new().listing_sessions(), permissive()).await;
-    assert!(listing.info().capabilities.session_listing);
+    assert!(listing.capabilities().has(Capability::SessionListing));
     let page = listing
         .list_sessions(Default::default())
         .await
@@ -783,10 +909,7 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
     let session = AcpHarness::new(moded)
         .open_session(
             &host(&launcher),
-            OpenSession::new("chat-1").with_configuration(Configuration {
-                level: Some(PermissionLevel::FullAccess),
-                ..Configuration::default()
-            }),
+            OpenSession::new("chat-1").with_configuration(at_level(PermissionLevel::FullAccess)),
         )
         .await
         .expect("expected a session");
@@ -794,15 +917,13 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
     let error = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-1", "just read").with_configuration(Configuration {
-                    level: Some(PermissionLevel::ReadOnly),
-                    ..Configuration::default()
-                }),
+                TurnRequest::new("turn-1", "just read")
+                    .with_configuration(at_level(PermissionLevel::ReadOnly)),
             )
             .await,
     );
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("the session's own level")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("the session's own level")),
         "received {error:?}"
     );
     // The refusal names the relationship, not the agent's mode id.
@@ -940,15 +1061,12 @@ async fn a_read_only_session_never_lets_a_broker_allow_even_when_it_cannot_refus
     let session = AcpHarness::new(profile())
         .open_session(
             &host,
-            OpenSession::new("chat-1").with_configuration(Configuration {
-                level: Some(PermissionLevel::ReadOnly),
-                ..Configuration::default()
-            }),
+            OpenSession::new("chat-1").with_configuration(at_level(PermissionLevel::ReadOnly)),
         )
         .await
         .expect("expected a session");
     assert_eq!(
-        session.info().effective_configuration.level,
+        session.snapshot().configuration.accepted.level,
         Some(PermissionLevel::ReadOnly)
     );
 
@@ -1072,7 +1190,7 @@ async fn a_dropped_turn_stream_does_not_free_the_slot_while_the_prompt_is_in_fli
 
     let error = refusal(session.start_turn(TurnRequest::new("turn-2", "two")).await);
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
         "received {error:?}"
     );
 }
@@ -1092,20 +1210,18 @@ async fn a_rejected_concurrent_turn_does_not_change_the_inherited_configuration(
     let error = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-2", "two").with_configuration(Configuration {
-                    level: Some(PermissionLevel::ReadOnly),
-                    ..Configuration::default()
-                }),
+                TurnRequest::new("turn-2", "two")
+                    .with_configuration(at_level(PermissionLevel::ReadOnly)),
             )
             .await,
     );
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
         "received {error:?}"
     );
     assert_eq!(
-        session.configuration().await,
-        permissive(),
+        session.snapshot().configuration.accepted,
+        Configuration::unknown().with_level(PermissionLevel::Default),
         "a rejected turn must not replace the last accepted settings"
     );
 
@@ -1239,10 +1355,9 @@ async fn a_handshake_the_agent_never_answers_ends_on_the_hosts_own_deadline() {
 /// copying an identifier that could contain tenant data or credentials into diagnostics.
 #[tokio::test(start_paused = true)]
 async fn a_custom_profiles_id_stays_out_of_the_timeout_diagnostic() {
-    let hostile_id = format!(
-        "fake\u{7}\x1b[31m credential=profile-secret {}",
-        "x".repeat(4_000)
-    );
+    // Profile ids now validate their syntax at construction. A valid tenant-bearing identifier
+    // must still stay out of operation diagnostics rather than bypassing that contract here.
+    let hostile_id = "profile-secret";
     let launcher = FakeLauncher::new();
     launcher.push(FakeProcess::responding(|_| Vec::new()));
     let host = HostContext::builder()
@@ -1353,15 +1468,13 @@ async fn a_turn_asking_for_a_level_this_profile_cannot_reach_is_refused() {
     let error = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
-                    level: Some(PermissionLevel::FullAccess),
-                    ..Configuration::default()
-                }),
+                TurnRequest::new("turn-1", "do everything")
+                    .with_configuration(at_level(PermissionLevel::FullAccess)),
             )
             .await,
     );
     assert!(
-        matches!(error, Error::HostConfiguration { .. }),
+        matches!(error.cause(), Error::HostConfiguration { .. }),
         "received {error:?}"
     );
 }
@@ -1383,10 +1496,7 @@ async fn a_custom_profile_id_stays_out_of_pair_refusals() {
     let refused_open = match harness
         .open_session(
             &host(&launcher),
-            OpenSession::new("chat-1").with_configuration(Configuration {
-                level: Some(PermissionLevel::FullAccess),
-                ..Configuration::default()
-            }),
+            OpenSession::new("chat-1").with_configuration(at_level(PermissionLevel::FullAccess)),
         )
         .await
     {
@@ -1404,17 +1514,15 @@ async fn a_custom_profile_id_stays_out_of_pair_refusals() {
     let refused_turn = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
-                    level: Some(PermissionLevel::FullAccess),
-                    ..Configuration::default()
-                }),
+                TurnRequest::new("turn-1", "do everything")
+                    .with_configuration(at_level(PermissionLevel::FullAccess)),
             )
             .await,
     );
 
     for error in [&refused_open, &refused_turn] {
         assert!(
-            matches!(error, Error::HostConfiguration { .. }),
+            matches!(error.cause(), Error::HostConfiguration { .. }),
             "expected a host-configuration refusal, received {error:?}"
         );
         for rendered in [error.to_string(), format!("{error:?}")] {
@@ -1454,10 +1562,7 @@ async fn a_custom_mode_id_stays_out_of_protocol_refusals() {
     let refused_open = match AcpHarness::new(profile())
         .open_session(
             &host(&unadvertised),
-            OpenSession::new("chat-1").with_configuration(Configuration {
-                level: Some(PermissionLevel::Default),
-                ..Configuration::default()
-            }),
+            OpenSession::new("chat-1").with_configuration(at_level(PermissionLevel::Default)),
         )
         .await
     {
@@ -1476,27 +1581,22 @@ async fn a_custom_mode_id_stays_out_of_protocol_refusals() {
     let session = AcpHarness::new(profile())
         .open_session(
             &host(&advertised),
-            OpenSession::new("chat-2").with_configuration(Configuration {
-                level: Some(PermissionLevel::Default),
-                ..Configuration::default()
-            }),
+            OpenSession::new("chat-2").with_configuration(at_level(PermissionLevel::Default)),
         )
         .await
         .expect("expected a session");
     let refused_turn = refusal(
         session
             .start_turn(
-                TurnRequest::new("turn-1", "do everything").with_configuration(Configuration {
-                    level: Some(PermissionLevel::FullAccess),
-                    ..Configuration::default()
-                }),
+                TurnRequest::new("turn-1", "do everything")
+                    .with_configuration(at_level(PermissionLevel::FullAccess)),
             )
             .await,
     );
 
     for error in [&refused_open, &refused_turn] {
         assert!(
-            matches!(error, Error::Protocol { .. }),
+            matches!(error.cause(), Error::Protocol { .. }),
             "expected a protocol refusal, received {error:?}"
         );
         for rendered in [error.to_string(), format!("{error:?}")] {
@@ -1624,16 +1724,13 @@ async fn a_mode_the_agent_never_advertised_is_refused_and_ends_the_child() {
         AcpHarness::new(insists)
             .open_session(
                 &recording_host(&launcher),
-                OpenSession::new("chat-1").with_configuration(Configuration {
-                    level: Some(PermissionLevel::ReadOnly),
-                    ..Configuration::default()
-                }),
+                OpenSession::new("chat-1").with_configuration(at_level(PermissionLevel::ReadOnly)),
             )
             .await,
     );
 
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("the requested level")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("the requested level")),
         "received {error:?}"
     );
     // The refusal names the relationship, not the profile's mode id.
@@ -1666,7 +1763,7 @@ async fn a_signed_out_agent_yields_the_profiles_own_login_command_and_no_authent
     );
 
     assert!(
-        matches!(&error, Error::AuthRequired { login_hint } if login_hint == "fake-acp login"),
+        matches!(error.cause(), Error::AuthRequired { login_hint } if login_hint == "fake-acp login"),
         "received {error:?}"
     );
     assert!(
@@ -1717,7 +1814,7 @@ async fn an_agent_answering_another_protocol_version_is_refused() {
             .await,
     );
     assert!(
-        matches!(&error, Error::Protocol { expected, .. } if expected.contains("protocol version 1")),
+        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("protocol version 1")),
         "received {error:?}"
     );
 }
@@ -1734,16 +1831,16 @@ async fn a_level_this_profile_cannot_reach_is_refused_rather_than_downgraded() {
         AcpHarness::new(profile())
             .open_session(
                 &host(&launcher),
-                OpenSession::new("chat-1").with_configuration(Configuration {
-                    level: Some(PermissionLevel::FullAccess),
-                    routing: Some(ApprovalRouting::User),
-                    ..Configuration::default()
-                }),
+                OpenSession::new("chat-1").with_configuration(
+                    ConfigurationPatch::new()
+                        .level(ConfigurationChange::Set(PermissionLevel::FullAccess))
+                        .routing(ConfigurationChange::Set(ApprovalRouting::User)),
+                ),
             )
             .await,
     );
     assert!(
-        matches!(error, Error::HostConfiguration { .. }),
+        matches!(error.cause(), Error::HostConfiguration { .. }),
         "received {error:?}"
     );
 }
@@ -1822,3 +1919,6 @@ async fn the_harness_passes_the_core_conformance_suite() {
 
 #[path = "session/expiry.rs"]
 mod expiry;
+
+#[path = "session/contracts.rs"]
+mod contracts;

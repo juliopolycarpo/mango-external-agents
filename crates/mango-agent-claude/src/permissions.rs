@@ -333,20 +333,15 @@ mod tests {
                 .expect("expected omitted permissions to be accepted"),
             None
         );
-        let explicit = Configuration {
-            level: Some(PermissionLevel::Default),
-            routing: Some(ApprovalRouting::User),
-            ..Configuration::default()
-        };
+        let explicit = Configuration::unknown()
+            .with_level(PermissionLevel::Default)
+            .with_routing(ApprovalRouting::User);
         assert_eq!(
             configuration_mode(&explicit, &availability)
                 .expect("expected the complete pair to resolve"),
             Some(CliMode::Manual)
         );
-        let partial = Configuration {
-            level: Some(PermissionLevel::Default),
-            ..Configuration::default()
-        };
+        let partial = Configuration::unknown().with_level(PermissionLevel::Default);
         let error = configuration_mode(&partial, &availability)
             .expect_err("expected Claude to reject its partial mode pair");
         assert!(

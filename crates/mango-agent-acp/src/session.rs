@@ -14,17 +14,21 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, ListSessionsRequest, PromptRequest,
     SessionId as AcpSessionId, SetSessionModeRequest,
 };
+use mango_external_agents::configuration::{
+    Configuration, ConfigurationPatch, refuse_unsupported_native,
+};
 use mango_external_agents::event::EventKind;
 use mango_external_agents::session::{
-    AccountUsage, CancelReason, CloseReason, Configuration, NativeSession, Session, SessionIds,
-    SessionInfo, SessionPage, SessionQuery, TurnRequest,
+    AccountUsage, CancelReason, CloseReason, NativeSession, Session, SessionIds, SessionPage,
+    SessionQuery, TurnRequest,
 };
+use mango_external_agents::state::SessionStatus;
 use mango_external_agents::{
-    Capability, Error, EventSink, HostContext, PermissionResponse, Result, SessionLifecycle,
-    TurnStream,
+    Capability, Dispatch, Error, EventSink, HostContext, PermissionResponse, Result,
+    SessionLifecycle, TurnStream,
 };
 
-use crate::client::{self, ConnectionHandle, SessionState, link_failure, with_stderr};
+use crate::client::{self, ConnectionHandle, link_failure, with_stderr};
 use crate::profile::AcpProfile;
 use crate::{content, reducer};
 
@@ -36,10 +40,13 @@ const CLOSE_GRACE: Duration = Duration::from_secs(3);
 
 /// One conversation with one ACP agent.
 pub struct AcpSession {
-    info: SessionInfo,
     profile: Arc<AcpProfile>,
     host: HostContext,
-    state: Arc<SessionState>,
+    /// The dispatch loop's own shared state: the running turn, pending approvals, the inherited
+    /// configuration and a handle to `session_state` for publishing session facts as they arrive.
+    connection_state: Arc<client::SessionState>,
+    /// The core's live, observable session state — the one thing [`Session::state`] hands back.
+    session_state: mango_external_agents::SessionState,
     connection: Arc<ConnectionHandle>,
     native_session_id: AcpSessionId,
     agent_capabilities: AgentCapabilities,
@@ -51,27 +58,31 @@ impl std::fmt::Debug for AcpSession {
         formatter
             .debug_struct("AcpSession")
             .field("profile", &self.profile.id)
-            .field("ids", &self.info.ids)
+            .field("ids", &self.session_state.snapshot().ids)
             .field("closed", &self.lifecycle.is_closed())
             .finish_non_exhaustive()
     }
 }
 
 impl AcpSession {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one session, seven facts about it"
+    )]
     pub(crate) fn new(
-        info: SessionInfo,
         profile: Arc<AcpProfile>,
         host: HostContext,
-        state: Arc<SessionState>,
+        connection_state: Arc<client::SessionState>,
+        session_state: mango_external_agents::SessionState,
         connection: Arc<ConnectionHandle>,
         native_session_id: AcpSessionId,
         agent_capabilities: AgentCapabilities,
     ) -> Self {
         Self {
-            info,
             profile,
             host,
-            state,
+            connection_state,
+            session_state,
             connection,
             native_session_id,
             agent_capabilities,
@@ -117,16 +128,21 @@ impl AcpSession {
 
     /// The configuration one turn runs under, refusing what ACP v1 has no surface for.
     ///
-    /// A per-turn configuration goes through exactly the checks `open_session` applies, and for the
-    /// same reason: a pair this profile cannot run has to be refused rather than quietly replaced by
-    /// one it can. The case that made this a real hole was a turn asking for
+    /// A per-turn patch goes through exactly the checks `open_session` applies, and for the same
+    /// reason: a pair this profile cannot run has to be refused rather than quietly replaced by one
+    /// it can. The case that made this a real hole was a turn asking for
     /// [`PermissionLevel::FullAccess`](mango_external_agents::PermissionLevel) on a profile with no
     /// mode for it — nothing would have set a mode, nothing would have refused a request, and the
     /// turn would have run as `Default` while the host believed it had granted more.
     fn effective(&self, request: &TurnRequest) -> Result<Configuration> {
+        let base = self.connection_state.configuration();
         let configuration = match &request.configuration {
-            Some(overrides) => self.state.configuration().with_overrides(overrides),
-            None => self.state.configuration(),
+            Some(patch) => {
+                refuse_unsupported_native(patch)?;
+                refuse_unsupported_reset(patch)?;
+                base.patched(patch)
+            }
+            None => base,
         };
         refuse_model_selection(&configuration)?;
         if let Some(level) = configuration.level {
@@ -152,7 +168,7 @@ impl AcpSession {
         // ACP modes are selected once, while the session opens. The live inherited configuration
         // may later gain mode-free overrides, but it must not become the baseline used to infer a
         // mode this running agent never received.
-        let session_level = self.info.effective_configuration.level;
+        let session_level = self.session_state.snapshot().configuration.accepted.level;
         let wanted_mode = configuration
             .level
             .and_then(|level| self.profile.modes.for_level(level));
@@ -171,6 +187,37 @@ impl AcpSession {
         }
         Ok(configuration)
     }
+
+    /// Publishes what this harness actually applied, next to what was asked.
+    ///
+    /// `accepted` carries only the axes ACP mode selection can honour — level and routing — never
+    /// the full merged configuration: model and reasoning effort are refused upstream, and a
+    /// vendor-native option this harness has no catalog for is never encoded onto the wire, so
+    /// claiming either was "accepted" would be a claim this harness cannot back up.
+    fn publish_configuration(&self, configuration: &Configuration) {
+        let state = self.session_state.snapshot().configuration.clone();
+        self.session_state.set_configuration(
+            state
+                .with_requested(configuration.clone())
+                .with_accepted(accepted_axes(configuration)),
+        );
+    }
+}
+
+/// The subset of a [`Configuration`] this harness genuinely encodes: level, through
+/// `session/set_mode`, and routing, which decides locally who answers an approval. Everything else
+/// a patch could carry — model, reasoning effort, a vendor-native option — is refused before
+/// it reaches here; see
+/// [`AcpSession::publish_configuration`].
+pub(crate) fn accepted_axes(configuration: &Configuration) -> Configuration {
+    let mut accepted = Configuration::unknown();
+    if let Some(level) = configuration.level {
+        accepted = accepted.with_level(level);
+    }
+    if let Some(routing) = configuration.routing {
+        accepted = accepted.with_routing(routing);
+    }
+    accepted
 }
 
 /// Refuses a configuration naming a model or a reasoning effort.
@@ -195,53 +242,77 @@ pub(crate) fn refuse_model_selection(configuration: &Configuration) -> Result<()
     }
 }
 
+/// Refuses a patch that asks to remove an override this harness has no way to remove.
+///
+/// A thin, named wrapper over [`mango_external_agents::configuration::refuse_unsupported_reset`]:
+/// every axis this harness accepts — level, through a `session/set_mode` chosen once at open, and
+/// routing, decided locally — has no vendor-side "put it back" either, so a reset request is refused
+/// the same way everywhere it can be asked, rather than only where it happens to be checked.
+pub(crate) fn refuse_unsupported_reset(patch: &ConfigurationPatch) -> Result<()> {
+    mango_external_agents::configuration::refuse_unsupported_reset(patch)
+}
+
 #[async_trait::async_trait]
 impl Session for AcpSession {
-    fn info(&self) -> &SessionInfo {
-        &self.info
-    }
-
-    async fn configuration(&self) -> Configuration {
-        self.state.configuration()
+    fn state(&self) -> &mango_external_agents::SessionState {
+        &self.session_state
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
         if self.lifecycle.is_closed() {
-            return Err(Error::Closed { subject: "session" });
+            return Err(Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted));
         }
-        self.validate_turn_request(&request)?;
+        self.validate_turn_request(&request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let prompt = content::prompt(
             &request.input,
             &request.attachments,
             &self.agent_capabilities.prompt_capabilities,
-        )?;
+        )
+        .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
         let (sink, events) = EventSink::new(
-            self.info.ids.session_id.clone(),
+            self.session_state.snapshot().ids.session_id.clone(),
             request.turn_id.clone(),
+            request.attempt,
             Arc::clone(self.host.clock()),
             self.host.limits().turn_channel_capacity,
         );
         // A configuration update and the single ACP prompt slot are one transaction. A second
         // caller must not merge from an old snapshot while this one accepts its settings, then win
         // the slot later and restore the stale snapshot over the newer restriction.
-        let handle = {
+        //
+        // ACP's `session/prompt` names no per-turn handle of its own, so `native_turn_id` is this
+        // harness's own per-session turn sequence number, minted here — before the wire request is
+        // sent — rather than read off the JSON-RPC id `send_request` would assign. That id is only
+        // known once the request is actually dispatched, and dispatching it has to stay gated behind
+        // the same re-entrant start guard `retry_cancel_error` depends on below; minting our own
+        // avoids reordering that gate around a value the wire cannot supply early enough. One real
+        // cost: unlike Claude's or Codex's native turn ids, this one never appears in a captured
+        // JSON-RPC transcript, so a host correlating captures by turn id will not find it there.
+        let (handle, native_turn_id, configuration) = {
             let Some(_lifecycle) = self.lifecycle.begin_start() else {
-                return Err(Error::Closed { subject: "session" });
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
             };
-            let _starting = self.state.lock_turn_start();
-            let configuration = self.effective(&request)?;
-            let handle = self.state.begin_turn(sink.clone(), configuration.level)?;
-            self.state.accept_configuration(configuration);
-            handle
+            let _starting = self.connection_state.lock_turn_start();
+            let configuration = self
+                .effective(&request)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+            let handle = self
+                .connection_state
+                .begin_turn(sink.clone(), configuration.level)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+            let native_turn_id = format!("acp-turn-{}", handle.generation);
+            (handle, native_turn_id, configuration)
         };
 
-        // Emitted before the prompt is sent, so the first event a host reads names the conversation
-        // the rest of the turn belongs to.
+        // Emitted before the prompt is sent, so the first event a host reads names the turn the
+        // rest of the stream belongs to.
         if let Err(error) = sink
-            .emit(EventKind::SessionStarted {
-                native_session_id: self.native_session_id.to_string(),
-                resumed: self.info.resumed,
+            .emit(EventKind::TurnStarted {
+                native_turn_id: native_turn_id.clone(),
             })
             .await
         {
@@ -253,29 +324,38 @@ impl Session for AcpSession {
             // fails only if the receiving half of the stream is already gone, and the stream is built
             // in this function and handed to the caller after it returns, so nothing can have dropped
             // it yet. It is the correct release for a path that exists as defence in depth.
-            if let Some((turn, _, _)) = self.state.end_turn_matching(&handle) {
+            if let Some((turn, _, _)) = self.connection_state.end_turn_matching(&handle) {
                 let _ = turn.finish();
             }
-            return Err(error);
+            return Err(error.with_dispatch(Dispatch::NotSubmitted));
         }
 
-        // `SessionStarted` is emitted first, which can give `cancel` a window before ACP has a
-        // prompt to cancel. Re-enter the start guard while sending the wire request; if cancellation
+        // `TurnStarted` is emitted first, which can give `cancel` a window before ACP has a prompt
+        // to cancel. Re-enter the start guard while sending the wire request; if cancellation
         // already won that window, queue a second notification after the prompt so the agent applies
         // it to this turn rather than treating the earlier notification as a no-op.
         let (sent, retry_cancel_error) = {
             let Some(_lifecycle) = self.lifecycle.begin_start() else {
-                return Err(Error::Closed { subject: "session" });
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
             };
-            let _starting = self.state.lock_turn_start();
-            if !self.state.can_submit_prompt(&handle) {
-                return Err(Error::Closed { subject: "session" });
+            let _starting = self.connection_state.lock_turn_start();
+            if !self.connection_state.can_submit_prompt(&handle) {
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
             }
             let sent = self
                 .connection
                 .connection()
                 .send_request(PromptRequest::new(self.native_session_id.clone(), prompt));
-            let retry_cancel_error = match self.state.is_cancelling() {
+            // The reserved handle alone is not submission. A close can win while TurnStarted is
+            // being published; only inherit this patch once the prompt has entered the SDK.
+            self.connection_state
+                .accept_configuration(configuration.clone());
+            self.publish_configuration(&configuration);
+            let retry_cancel_error = match self.connection_state.is_cancelling() {
                 true => self
                     .connection
                     .connection()
@@ -292,9 +372,8 @@ impl Session for AcpSession {
             };
             (sent, retry_cancel_error)
         };
-        let native_turn_id = sent.id().to_string();
 
-        let state = Arc::clone(&self.state);
+        let state = Arc::clone(&self.connection_state);
         let connection = Arc::clone(&self.connection);
         let profile = Arc::clone(&self.profile);
         // Spawned rather than awaited: the response *is* the turn's end, and a host that could not
@@ -344,22 +423,23 @@ impl Session for AcpSession {
         });
 
         if let Some(error) = retry_cancel_error {
-            return Err(error);
+            return Err(error.with_dispatch(Dispatch::AcceptanceUnknown));
         }
 
-        Ok(TurnStream {
-            turn_id: request.turn_id,
+        Ok(TurnStream::accepted(
+            request.turn_id,
+            request.attempt,
             native_turn_id,
             events,
-        })
+        ))
     }
 
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
         self.require_capability(Capability::InteractiveApprovals)?;
-        let Some(turn) = self.state.turn() else {
+        let Some(turn) = self.connection_state.turn() else {
             return Ok(());
         };
-        self.state.answer(&response)?;
+        self.connection_state.answer(&response)?;
         turn.approvals.flush(&turn.sink).await
     }
 
@@ -373,8 +453,8 @@ impl Session for AcpSession {
         // agent whose permission await is not itself cancellation-aware never returns from its tool
         // call otherwise, so `session/prompt` never answers, the turn emits no terminal at all, and
         // the turn slot stays occupied for the life of the session.
-        let _starting = self.state.lock_turn_start();
-        if !self.state.begin_cancellation(reason) {
+        let _starting = self.connection_state.lock_turn_start();
+        if !self.connection_state.begin_cancellation(reason) {
             return Ok(());
         }
         // A notification, so there is no answer to wait for and no deadline to apply: `session/cancel`
@@ -399,9 +479,10 @@ impl Session for AcpSession {
             if !lifecycle.close() {
                 return Ok(());
             }
-            let _starting = self.state.lock_turn_start();
-            self.state.begin_cancellation(reason.into());
-            self.state.end_turn()
+            self.session_state.set_status(SessionStatus::Closing);
+            let _starting = self.connection_state.lock_turn_start();
+            self.connection_state.begin_cancellation(reason.into());
+            self.connection_state.end_turn()
         };
 
         // Every question the agent is still waiting on is withdrawn first, while the transport is
@@ -422,7 +503,7 @@ impl Session for AcpSession {
         let terminal = ending
             .as_ref()
             .is_some_and(super::client::TurnHandle::finish);
-        self.state.withdraw_pending();
+        self.connection_state.withdraw_pending();
 
         if self.agent_capabilities.session_capabilities.close.is_some() {
             let _ = tokio::time::timeout(
@@ -436,7 +517,7 @@ impl Session for AcpSession {
             // Anything the agent asked during the handshake. `on_request_permission` answers such a
             // question itself once the turn is finished, so this is the belt to that braces: nothing
             // may be left parked when the transport goes.
-            self.state.withdraw_pending();
+            self.connection_state.withdraw_pending();
         }
 
         if let Some(turn) = ending
@@ -444,7 +525,7 @@ impl Session for AcpSession {
         {
             // The same debts the prompt's own task settles: an open reasoning block and an unfinished
             // plan activity. A turn cut short by a close owes them just as much as one that ran out.
-            let closing = self.state.finish_reducing();
+            let closing = self.connection_state.finish_reducing();
             // Spawned rather than awaited under a timeout. `close` must not hang on a host that
             // stopped reading its own stream — but a timeout that *dropped* this future would send
             // nothing at all: `mpsc::Sender::send` is cancel-safe, so abandoning it mid-send loses the
@@ -465,6 +546,7 @@ impl Session for AcpSession {
         }
 
         self.connection.shutdown(reason.into()).await;
+        self.session_state.set_status(SessionStatus::Closed);
         Ok(())
     }
 
@@ -512,26 +594,25 @@ impl Session for AcpSession {
 impl AcpSession {
     /// The two ids, for a caller holding a concrete session.
     #[must_use]
-    pub fn session_ids(&self) -> &SessionIds {
-        &self.info.ids
+    pub fn session_ids(&self) -> SessionIds {
+        self.session_state.snapshot().ids.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_model_selection;
-    use mango_external_agents::session::Configuration;
-    use mango_external_agents::{Error, PermissionLevel};
+    use super::{accepted_axes, refuse_model_selection, refuse_unsupported_reset};
+    use mango_external_agents::configuration::{
+        Configuration, ConfigurationChange, ConfigurationPatch,
+    };
+    use mango_external_agents::{ApprovalRouting, Error, PermissionLevel};
 
     /// Dropping the field would leave a host believing it chose a model while the agent ran whatever
     /// it was configured with, which is a silent disagreement rather than a refusal.
     #[test]
     fn a_configuration_naming_a_model_is_refused_rather_than_ignored() {
-        let error = refuse_model_selection(&Configuration {
-            model: Some(String::from("gpt-5-codex")),
-            ..Configuration::default()
-        })
-        .expect_err("expected a refusal, received acceptance");
+        let error = refuse_model_selection(&Configuration::unknown().with_model("gpt-5-codex"))
+            .expect_err("expected a refusal, received acceptance");
         let Error::Protocol { received, .. } = &error else {
             panic!("received {error:?}");
         };
@@ -540,21 +621,54 @@ mod tests {
 
     #[test]
     fn a_configuration_naming_a_reasoning_effort_is_refused_the_same_way() {
-        assert!(
-            refuse_model_selection(&Configuration {
-                effort: Some(String::from("high")),
-                ..Configuration::default()
-            })
-            .is_err()
-        );
+        assert!(refuse_model_selection(&Configuration::unknown().with_effort("high")).is_err());
     }
 
     #[test]
     fn a_configuration_that_only_chooses_a_level_and_a_routing_is_accepted() {
-        refuse_model_selection(&Configuration {
-            level: Some(PermissionLevel::Default),
-            ..Configuration::default()
-        })
-        .expect("expected acceptance, received a refusal");
+        refuse_model_selection(&Configuration::unknown().with_level(PermissionLevel::Default))
+            .expect("expected acceptance, received a refusal");
+    }
+
+    /// ACP has no vendor-side "put it back": neither the mode a session opens under nor the local
+    /// routing decision can be un-set, so a reset is refused the same way everywhere it is asked.
+    #[test]
+    fn a_patch_asking_to_reset_an_axis_is_refused_by_name() {
+        let error = refuse_unsupported_reset(
+            &ConfigurationPatch::new()
+                .level(ConfigurationChange::Reset)
+                .model(ConfigurationChange::Reset),
+        )
+        .expect_err("expected a refusal, received acceptance");
+        assert!(
+            matches!(&error, Error::HostConfiguration { received, .. } if received.contains("model, level")),
+            "expected the refusal to name every axis that asked, received {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_patch_that_only_sets_axes_is_accepted() {
+        refuse_unsupported_reset(
+            &ConfigurationPatch::new().level(ConfigurationChange::Set(PermissionLevel::ReadOnly)),
+        )
+        .expect("expected a set-only patch to be accepted");
+    }
+
+    /// Only level and routing are ever reported as accepted: this harness never encodes a model, a
+    /// reasoning effort or a vendor-native option onto the ACP wire, so claiming one landed would be
+    /// a claim this harness cannot back up.
+    #[test]
+    fn accepted_axes_keeps_only_what_this_harness_really_encodes() {
+        let configuration = Configuration::unknown()
+            .with_model("opus")
+            .with_level(PermissionLevel::ReadOnly)
+            .with_routing(ApprovalRouting::AutoReview);
+        let accepted = accepted_axes(&configuration);
+        assert_eq!(accepted.level, Some(PermissionLevel::ReadOnly));
+        assert_eq!(accepted.routing, Some(ApprovalRouting::AutoReview));
+        assert_eq!(
+            accepted.model, None,
+            "expected the model to stay unaccepted: nothing here ever encodes one"
+        );
     }
 }

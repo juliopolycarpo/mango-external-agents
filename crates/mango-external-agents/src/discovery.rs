@@ -9,14 +9,19 @@
 //! know would be to read a token file, the answer is [`AuthState::Unknown`] and the host tells the
 //! user to run the vendor's own login command.
 
+use std::fmt;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
-use crate::harness::Capabilities;
+use crate::configuration::ConfigurationCatalog;
+use crate::error::{Error, Result};
+use crate::harness::{CapabilityCeiling, DiscoveredCapabilities, HarnessDescriptor};
+use crate::identity::HarnessId;
 use crate::normalize::{self, MODEL_CATALOG_MAX_ITEMS, REASONING_EFFORT_MAX_ITEMS, TextLimit};
 use crate::permission::{PermissionMatrix, UnsupportedReason};
 
 /// How the installed CLI was found, and what it can do.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Discovery {
     /// Where the executable is, when the probe found one.
     pub executable: Option<PathBuf>,
@@ -27,15 +32,45 @@ pub struct Discovery {
     /// Whether somebody is signed in, as far as a non-secret surface can say.
     pub auth: AuthState,
     /// What this build actually supports, which may be narrower than the harness's ceiling.
-    pub capabilities: Capabilities,
+    pub capabilities: DiscoveredCapabilities,
     /// Which permission configurations this installed build can run.
     ///
     /// A probe may narrow the harness declaration for account or policy facts it learned. The
     /// provided [`Harness::discover`](crate::Harness::discover) method clamps it back to that
     /// declaration before a host receives it.
+    ///
+    /// This is the **declared** matrix narrowed by whatever the probe could learn without opening
+    /// a session. A cell an account or an administrator policy removes only at open time still
+    /// reads as supported here; the refusal arrives from
+    /// [`open_session`](crate::Harness::open_session).
     pub permission_matrix: PermissionMatrix,
     /// The models the vendor advertises, when it enumerates them.
     pub models: Vec<Model>,
+    /// Everything else the vendor lets a session be configured with, when it enumerates them.
+    ///
+    /// Empty is "the vendor does not publish its settings", which is a different statement from a
+    /// catalog whose rows are all unsupported.
+    pub configuration_catalog: ConfigurationCatalog,
+}
+
+impl fmt::Debug for Discovery {
+    /// Reports discovery shape without logging probe-written paths, labels, or catalog values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Discovery")
+            .field("has_executable", &self.executable.is_some())
+            .field("has_version", &self.version.is_some())
+            .field("gate", &self.gate)
+            .field("auth", &self.auth)
+            .field("capabilities", &self.capabilities)
+            .field("permission_matrix", &self.permission_matrix)
+            .field("model_count", &self.models.len())
+            .field(
+                "configuration_option_count",
+                &self.configuration_catalog.options().len(),
+            )
+            .finish()
+    }
 }
 
 impl Discovery {
@@ -46,11 +81,12 @@ impl Discovery {
             version: None,
             gate: GateVerdict::NotInstalled,
             auth: AuthState::Unknown,
-            capabilities: Capabilities::none(),
+            capabilities: DiscoveredCapabilities::none(),
             permission_matrix: PermissionMatrix::none(UnsupportedReason::Other(String::from(
                 "the agent executable is not installed",
             ))),
             models: Vec::new(),
+            configuration_catalog: ConfigurationCatalog::empty(),
         }
     }
 
@@ -82,6 +118,7 @@ impl Discovery {
                 .filter_map(Model::normalized)
                 .take(MODEL_CATALOG_MAX_ITEMS)
                 .collect(),
+            configuration_catalog: self.configuration_catalog.normalized(),
             ..self
         }
     }
@@ -90,12 +127,253 @@ impl Discovery {
     #[must_use]
     pub fn bounded_by(
         mut self,
-        capability_ceiling: &Capabilities,
+        capability_ceiling: &CapabilityCeiling,
         declared_permissions: &PermissionMatrix,
     ) -> Self {
         self.capabilities = self.capabilities.clamped_to(capability_ceiling);
         self.permission_matrix = self.permission_matrix.bounded_by(declared_permissions);
         self
+    }
+}
+
+/// How long a host-vouched discovery stays usable when nobody says otherwise.
+pub const DISCOVERY_RECEIPT_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// A discovery a host already ran, offered back so opening a session need not run it again.
+///
+/// Probing costs process launches — up to six for one Claude Code open — and a host that has just
+/// drawn a picker from a probe has the answer in its hand. This is the seam that lets it say so.
+///
+/// It is **not** a cache. Nothing in this library stores one, looks one up, or reuses one across
+/// calls: the receipt travels on the [`OpenSession`](crate::OpenSession) that uses it and is
+/// forgotten afterwards. Deciding how fresh an answer has to be stays the host's decision, which
+/// is the same reason [`Harness::probe`](crate::Harness::probe) may not memoise.
+///
+/// What it carries beyond the discovery itself is identity: which harness this was a probe *of*,
+/// which executable, and opaque fingerprints of the executable and the environment it was probed
+/// under. A host that upgraded the CLI between the probe and the open has a receipt that no longer
+/// describes the file about to be launched, and [`DiscoveryReceipt::verify_for`] says so.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DiscoveryReceipt {
+    /// Which harness this was a probe of.
+    pub harness: HarnessId,
+    /// What the probe found.
+    pub discovery: Discovery,
+    /// An opaque fingerprint of the executable the host probed, when it computed one.
+    ///
+    /// The library never computes or interprets one: a host that hashes the binary, reads its
+    /// mtime, or records its package version all produce something [`DiscoveryReceipt::describes`]
+    /// can compare for equality, which is all it needs to.
+    ///
+    /// It is **not** checked by [`DiscoveryReceipt::verify_for`], and cannot be: measuring what
+    /// the executable looks like *now* is something only the host can do. A host that wants the
+    /// check measures again at open time and calls [`DiscoveryReceipt::describes`].
+    pub executable_fingerprint: Option<String>,
+    /// An opaque fingerprint of the environment the probe ran under, when the host computed one.
+    ///
+    /// Compared by [`DiscoveryReceipt::describes`] on the same terms as the executable's.
+    pub environment_fingerprint: Option<String>,
+    /// When the probe ran.
+    pub observed_at: SystemTime,
+    /// How long after `observed_at` this receipt may still be used.
+    pub max_age: Duration,
+}
+
+impl fmt::Debug for DiscoveryReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryReceipt")
+            .field("harness", &self.harness)
+            .field("has_executable", &self.discovery.executable.is_some())
+            .field(
+                "has_executable_fingerprint",
+                &self.executable_fingerprint.is_some(),
+            )
+            .field(
+                "has_environment_fingerprint",
+                &self.environment_fingerprint.is_some(),
+            )
+            .field("observed_at", &self.observed_at)
+            .field("max_age", &self.max_age)
+            .finish()
+    }
+}
+
+impl DiscoveryReceipt {
+    /// A receipt for a probe that ran at `observed_at`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Discovery, DiscoveryReceipt, HarnessId};
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let now = SystemTime::now();
+    /// let receipt = DiscoveryReceipt::new(HarnessId::claude(), Discovery::not_installed(), now);
+    /// assert!(receipt.is_fresh(now));
+    /// assert!(!receipt.is_fresh(now + Duration::from_secs(3_600)));
+    /// ```
+    pub fn new(harness: HarnessId, discovery: Discovery, observed_at: SystemTime) -> Self {
+        Self {
+            harness,
+            discovery,
+            executable_fingerprint: None,
+            environment_fingerprint: None,
+            observed_at,
+            max_age: DISCOVERY_RECEIPT_MAX_AGE,
+        }
+    }
+
+    /// Records the host's own fingerprint of the executable it probed.
+    #[must_use]
+    pub fn with_executable_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.executable_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Records the host's own fingerprint of the environment the probe ran under.
+    #[must_use]
+    pub fn with_environment_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.environment_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Sets how long this receipt may be used for.
+    #[must_use]
+    pub fn valid_for(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// How old this receipt is at `now`, or nothing when `now` is before it was taken.
+    ///
+    /// The second case is not hypothetical: a clock steps backwards on an NTP correction, a
+    /// resumed virtual machine, or a receipt stamped by a machine that was ahead of this one. An
+    /// unsigned duration cannot express it, so it is reported as absence rather than folded into
+    /// zero — folding it into zero is what would make such a receipt look fresh for as long as the
+    /// skew lasted.
+    pub fn age(&self, now: SystemTime) -> Option<Duration> {
+        now.duration_since(self.observed_at).ok()
+    }
+
+    /// Whether this receipt is still inside its own freshness window.
+    ///
+    /// False when `now` is before [`observed_at`](Self::observed_at): a receipt this library
+    /// cannot age is a receipt it will not vouch for.
+    pub fn is_fresh(&self, now: SystemTime) -> bool {
+        self.age(now).is_some_and(|age| age <= self.max_age)
+    }
+
+    /// Refuses a receipt that does not match what the host is measuring now.
+    ///
+    /// The half [`DiscoveryReceipt::verify_for`] cannot do. A fingerprint is whatever the host
+    /// chose it to be — a hash, an mtime, a package version — so the only thing that can say
+    /// whether the executable on disk is still the one that was probed is the host, measuring
+    /// again. This compares the two.
+    ///
+    /// A fingerprint the receipt does not carry is not checked: a host that recorded nothing is
+    /// vouching without one, which is its decision to make.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HostConfiguration`] naming which fingerprint moved.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{Discovery, DiscoveryReceipt, HarnessId};
+    /// use std::time::SystemTime;
+    ///
+    /// let receipt = DiscoveryReceipt::new(HarnessId::claude(), Discovery::not_installed(),
+    ///     SystemTime::now())
+    ///     .with_executable_fingerprint("sha256:abc");
+    ///
+    /// assert!(receipt.describes(Some("sha256:abc"), None).is_ok());
+    /// assert!(receipt.describes(Some("sha256:def"), None).is_err());
+    /// ```
+    pub fn describes(
+        &self,
+        executable_fingerprint: Option<&str>,
+        environment_fingerprint: Option<&str>,
+    ) -> Result<()> {
+        compare(
+            "executable",
+            self.executable_fingerprint.as_deref(),
+            executable_fingerprint,
+        )?;
+        compare(
+            "environment",
+            self.environment_fingerprint.as_deref(),
+            environment_fingerprint,
+        )
+    }
+
+    /// Refuses a receipt that does not describe the session about to be opened.
+    ///
+    /// Applied by [`Harness::validate_open_session`](crate::Harness::validate_open_session), so a
+    /// harness that accepts receipts gets the identity and freshness checks without writing them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HostConfiguration`] naming which of the three did not match: the harness it was a
+    /// probe of, the executable the session will launch, or its age.
+    pub fn verify_for(
+        &self,
+        descriptor: &HarnessDescriptor,
+        now: SystemTime,
+        request: &crate::OpenSession,
+    ) -> Result<()> {
+        if &self.harness != descriptor.id() {
+            return Err(Error::HostConfiguration {
+                expected: "a discovery receipt for the harness being opened",
+                received: String::from("a receipt for a different harness"),
+            });
+        }
+        if !self.is_fresh(now) {
+            let age = self.age(now).map_or_else(
+                || String::from("one taken in the future"),
+                |age| format!("one {}s old", age.as_secs()),
+            );
+            return Err(Error::HostConfiguration {
+                expected: "a discovery receipt inside its own freshness window",
+                received: format!("{age}, valid for {}s", self.max_age.as_secs()),
+            });
+        }
+        let requested = request.executable.get();
+        let probed = self.discovery.executable.as_ref();
+        match (requested, probed) {
+            (Some(requested), Some(probed)) if requested != probed => {
+                Err(Error::HostConfiguration {
+                    expected: "a discovery receipt for the executable being launched",
+                    received: String::from("a receipt and request that name different executables"),
+                })
+            }
+            (Some(_), None) => Err(Error::HostConfiguration {
+                expected: "a discovery receipt for the executable being launched",
+                received: String::from("a receipt without an executable and a request with one"),
+            }),
+            // The probe resolved a path and the request did not, so the launcher will resolve the
+            // program name itself — off a `PATH` that may well answer with a different file. A
+            // receipt that vouches for one binary cannot vouch for whichever one that turns out to
+            // be, so it is refused rather than quietly applied to it.
+            (None, Some(_)) => Err(Error::HostConfiguration {
+                expected: "a request naming the executable its receipt was a probe of",
+                received: String::from("a receipt with an executable and a request without one"),
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Refuses one fingerprint that moved since the probe.
+fn compare(subject: &'static str, recorded: Option<&str>, measured: Option<&str>) -> Result<()> {
+    match (recorded, measured) {
+        (Some(recorded), Some(measured)) if recorded != measured => Err(Error::HostConfiguration {
+            expected: "a discovery receipt whose fingerprints still match",
+            received: format!("the {subject} fingerprint changed"),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -112,7 +390,7 @@ fn bounded_executable(executable: PathBuf) -> Option<PathBuf> {
 }
 
 /// Whether the installed build can be driven.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GateVerdict {
     /// It can.
@@ -131,6 +409,18 @@ pub enum GateVerdict {
     /// Deliberately not a refusal: a CLI that changed the shape of `--version` is not a CLI that
     /// stopped working, and a host may still choose to try.
     Unknown,
+}
+
+impl fmt::Debug for GateVerdict {
+    /// Names the gate result without logging versions reported by a probe.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usable => formatter.write_str("Usable"),
+            Self::NotInstalled => formatter.write_str("NotInstalled"),
+            Self::VersionTooOld { .. } => formatter.write_str("VersionTooOld"),
+            Self::Unknown => formatter.write_str("Unknown"),
+        }
+    }
 }
 
 impl GateVerdict {
@@ -154,7 +444,7 @@ impl GateVerdict {
 ///
 /// Reported, never established. The library has no login method anywhere, opens no browser and
 /// reads no token: this is what a non-secret vendor surface said, or `Unknown`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthState {
     /// Somebody is signed in.
@@ -171,6 +461,20 @@ pub enum AuthState {
     },
     /// The probe could not tell without reading a credential, so it did not look.
     Unknown,
+}
+
+impl fmt::Debug for AuthState {
+    /// Names the auth state without logging a vendor login hint.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoggedIn { mode } => formatter
+                .debug_struct("LoggedIn")
+                .field("mode", mode)
+                .finish(),
+            Self::LoggedOut { .. } => formatter.write_str("LoggedOut"),
+            Self::Unknown => formatter.write_str("Unknown"),
+        }
+    }
 }
 
 impl AuthState {
@@ -193,7 +497,7 @@ impl AuthState {
 }
 
 /// How an account is signed in.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthMode {
     /// A consumer subscription.
@@ -202,6 +506,17 @@ pub enum AuthMode {
     ApiKey,
     /// Something else the vendor named.
     Other(String),
+}
+
+impl fmt::Debug for AuthMode {
+    /// Names the auth mode without logging a vendor-defined mode label.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Subscription => "Subscription",
+            Self::ApiKey => "ApiKey",
+            Self::Other(_) => "Other",
+        })
+    }
 }
 
 impl AuthMode {
@@ -218,7 +533,7 @@ impl AuthMode {
 }
 
 /// A model as the vendor advertised it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {
     /// The vendor's own id, sent back verbatim when this model is chosen.
@@ -238,6 +553,24 @@ pub struct Model {
     /// Which of them applies when nobody chooses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<String>,
+}
+
+impl fmt::Debug for Model {
+    /// Reports model shape without logging vendor ids or labels.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Model")
+            .field("has_id", &!self.id.is_empty())
+            .field("has_display_name", &self.display_name.is_some())
+            .field("has_description", &self.description.is_some())
+            .field("is_default", &self.is_default)
+            .field("reasoning_effort_count", &self.reasoning_efforts.len())
+            .field(
+                "has_default_reasoning_effort",
+                &self.default_reasoning_effort.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Model {
@@ -280,7 +613,7 @@ impl Model {
 }
 
 /// One vendor-defined reasoning choice, kept without flattening it to an enum of ours.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningEffort {
     /// The vendor's own id.
@@ -291,6 +624,18 @@ pub struct ReasoningEffort {
     /// What the vendor says it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+impl fmt::Debug for ReasoningEffort {
+    /// Reports reasoning-effort shape without logging a vendor id or labels.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReasoningEffort")
+            .field("has_id", &!self.id.is_empty())
+            .field("has_display_name", &self.display_name.is_some())
+            .field("has_description", &self.description.is_some())
+            .finish()
+    }
 }
 
 impl ReasoningEffort {
@@ -311,8 +656,12 @@ impl ReasoningEffort {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthMode, AuthState, Discovery, GateVerdict, Model, ReasoningEffort};
-    use crate::harness::Capabilities;
+    use super::{
+        AuthMode, AuthState, Discovery, DiscoveryReceipt, GateVerdict, Model, ReasoningEffort,
+    };
+    use crate::configuration::ConfigurationCatalog;
+    use crate::harness::DiscoveredCapabilities;
+    use crate::identity::HarnessId;
     use crate::permission::{PermissionMatrix, UnsupportedReason};
 
     fn usable() -> Discovery {
@@ -323,9 +672,10 @@ mod tests {
             auth: AuthState::LoggedIn {
                 mode: AuthMode::Subscription,
             },
-            capabilities: Capabilities::none(),
+            capabilities: DiscoveredCapabilities::none(),
             permission_matrix: PermissionMatrix::none(UnsupportedReason::NotOfferedByVendor),
             models: Vec::new(),
+            configuration_catalog: ConfigurationCatalog::empty(),
         }
     }
 
@@ -334,7 +684,7 @@ mod tests {
         let discovery = Discovery::not_installed();
         assert_eq!(discovery.gate, GateVerdict::NotInstalled);
         assert_eq!(discovery.auth, AuthState::Unknown);
-        assert_eq!(discovery.capabilities, Capabilities::none());
+        assert_eq!(discovery.capabilities, DiscoveredCapabilities::none());
         assert_eq!(discovery.permission_matrix.cells().len(), 6);
         assert!(
             discovery.permission_matrix.cells().iter().all(|cell| {
@@ -534,6 +884,321 @@ mod tests {
                 .as_ref()
                 .map(|name| name.chars().count()),
             Some(256)
+        );
+    }
+
+    fn request() -> crate::OpenSession {
+        crate::OpenSession::new("chat-1").with_executable(
+            crate::transport::ExecutablePath::resolved("/usr/local/bin/claude"),
+        )
+    }
+
+    fn descriptor() -> crate::harness::HarnessDescriptor {
+        crate::harness::HarnessDescriptor {
+            identity: crate::identity::HarnessIdentity::claude(),
+            vendor: crate::harness::VendorInfo {
+                company: "Anthropic",
+                terms_url: "https://www.anthropic.com/legal/consumer-terms",
+                privacy_url: "https://www.anthropic.com/legal/privacy",
+                skills_are_slash_commands: true,
+            },
+            capabilities: crate::harness::CapabilityCeiling::none(),
+            transports: &[crate::transport::TransportKind::Stdio],
+            vendor_environment_keys: &[],
+        }
+    }
+
+    /// A receipt is a seam, not a cache: it says which probe, of what, and when, and every one of
+    /// those is checked against the session about to be opened.
+    #[test]
+    fn a_fresh_receipt_for_the_same_harness_and_executable_is_accepted() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
+            .with_executable_fingerprint("sha256:abc")
+            .with_environment_fingerprint("env-1");
+
+        assert_eq!(receipt.age(now), Some(std::time::Duration::ZERO));
+        assert!(receipt.is_fresh(now));
+        receipt
+            .verify_for(
+                &descriptor(),
+                now + std::time::Duration::from_secs(10),
+                &crate::OpenSession::new("chat-1").with_executable(
+                    crate::transport::ExecutablePath::resolved("/usr/local/bin/claude"),
+                ),
+            )
+            .expect("expected a fresh matching receipt to be accepted");
+
+        // The fingerprints are the host's own check, because only the host can measure what the
+        // file looks like now.
+        receipt
+            .describes(Some("sha256:abc"), Some("env-1"))
+            .expect("expected matching fingerprints to be accepted");
+        let error = receipt
+            .describes(Some("sha256:def"), Some("env-1"))
+            .expect_err("expected a moved executable fingerprint to be refused");
+        assert!(
+            error.to_string().contains("executable fingerprint changed"),
+            "expected the diagnostic to name which fingerprint moved, received {error}"
+        );
+        let error = receipt
+            .describes(Some("sha256:abc"), Some("env-2"))
+            .expect_err("expected a moved environment fingerprint to be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("environment fingerprint changed"),
+            "received {error}"
+        );
+        // A host that recorded nothing is vouching without a fingerprint, which is its decision.
+        receipt
+            .describes(None, None)
+            .expect("expected an unmeasured fingerprint to be left alone");
+    }
+
+    /// A receipt for a resolved path cannot vouch for a request without an executable.
+    #[test]
+    fn a_receipt_for_a_resolved_executable_refuses_a_request_that_names_none() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let error = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
+            .verify_for(&descriptor(), now, &crate::OpenSession::new("chat-1"))
+            .expect_err("expected a refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("a receipt with an executable and a request without one"),
+            "received {error}"
+        );
+    }
+
+    #[test]
+    fn a_receipt_without_an_executable_cannot_vouch_for_a_requested_one() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let error = DiscoveryReceipt::new(HarnessId::claude(), Discovery::not_installed(), now)
+            .verify_for(
+                &descriptor(),
+                now,
+                &crate::OpenSession::new("chat-1").with_executable(
+                    crate::transport::ExecutablePath::resolved("/opt/claude/bin/claude"),
+                ),
+            )
+            .expect_err("expected an executable requested without a probed path to be refused");
+        assert_eq!(
+            error.to_string(),
+            "expected a discovery receipt for the executable being launched, received a receipt without an executable and a request with one"
+        );
+    }
+
+    #[test]
+    fn receipt_debug_omits_probe_and_fingerprint_payloads() {
+        let receipt = DiscoveryReceipt::new(
+            HarnessId::claude(),
+            usable(),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .with_executable_fingerprint("executable-fingerprint-secret")
+        .with_environment_fingerprint("environment-fingerprint-secret");
+        let rendered = format!("{receipt:?}");
+        for secret in [
+            "executable-fingerprint-secret",
+            "environment-fingerprint-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no receipt payload in debug output, received {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_diagnostics_omit_probe_payloads() {
+        let secret_executable = "/private/discovery-executable-secret";
+        let secret_version = "discovery-version-secret";
+        let secret_login_hint = "discovery-login-hint-secret";
+        let secret_model = "discovery-model-secret";
+        let secret_effort = "discovery-effort-secret";
+        let discovery = Discovery {
+            executable: Some(secret_executable.into()),
+            version: Some(String::from(secret_version)),
+            gate: GateVerdict::VersionTooOld {
+                found: String::from(secret_version),
+                minimum: String::from("discovery-minimum-secret"),
+            },
+            auth: AuthState::LoggedOut {
+                login_hint: String::from(secret_login_hint),
+            },
+            models: vec![Model {
+                id: String::from(secret_model),
+                display_name: Some(String::from("discovery-model-name-secret")),
+                description: Some(String::from("discovery-model-description-secret")),
+                reasoning_efforts: vec![ReasoningEffort {
+                    id: String::from(secret_effort),
+                    display_name: Some(String::from("discovery-effort-name-secret")),
+                    description: Some(String::from("discovery-effort-description-secret")),
+                }],
+                default_reasoning_effort: Some(String::from(secret_effort)),
+                ..Model::default()
+            }],
+            ..usable()
+        };
+        let receipt = DiscoveryReceipt::new(
+            HarnessId::claude(),
+            discovery.clone(),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .with_executable_fingerprint("recorded-fingerprint-secret");
+        let fingerprint_error = receipt
+            .describes(Some("measured-fingerprint-secret"), None)
+            .expect_err("expected a changed fingerprint to be refused");
+        let executable_error = DiscoveryReceipt::new(
+            HarnessId::claude(),
+            discovery,
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .verify_for(
+            &descriptor(),
+            std::time::SystemTime::UNIX_EPOCH,
+            &crate::OpenSession::new("chat-1").with_executable(
+                crate::transport::ExecutablePath::resolved("/private/requested-executable-secret"),
+            ),
+        )
+        .expect_err("expected a different executable to be refused");
+
+        for rendered in [
+            format!("{receipt:?}"),
+            format!("{:#?}", receipt.discovery),
+            format!(
+                "{:?}",
+                GateVerdict::VersionTooOld {
+                    found: String::from(secret_version),
+                    minimum: String::from("discovery-minimum-secret"),
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthState::LoggedIn {
+                    mode: AuthMode::Other(String::from("discovery-auth-mode-secret")),
+                }
+            ),
+            format!(
+                "{:?}",
+                Model {
+                    id: String::from(secret_model),
+                    display_name: Some(String::from("discovery-model-name-secret")),
+                    description: Some(String::from("discovery-model-description-secret")),
+                    reasoning_efforts: vec![ReasoningEffort {
+                        id: String::from(secret_effort),
+                        display_name: Some(String::from("discovery-effort-name-secret")),
+                        description: Some(String::from("discovery-effort-description-secret")),
+                    }],
+                    default_reasoning_effort: Some(String::from(secret_effort)),
+                    ..Model::default()
+                }
+            ),
+            format!(
+                "{:?}",
+                ReasoningEffort {
+                    id: String::from(secret_effort),
+                    display_name: Some(String::from("discovery-effort-name-secret")),
+                    description: Some(String::from("discovery-effort-description-secret")),
+                }
+            ),
+            fingerprint_error.to_string(),
+            executable_error.to_string(),
+        ] {
+            for secret in [
+                secret_executable,
+                secret_version,
+                secret_login_hint,
+                secret_model,
+                secret_effort,
+                "discovery-minimum-secret",
+                "discovery-model-name-secret",
+                "discovery-model-description-secret",
+                "discovery-effort-name-secret",
+                "discovery-effort-description-secret",
+                "discovery-auth-mode-secret",
+                "recorded-fingerprint-secret",
+                "measured-fingerprint-secret",
+                "/private/requested-executable-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected no probe payload in diagnostics, received {rendered}"
+                );
+            }
+        }
+    }
+
+    /// A host that upgraded the CLI between the probe and the open has a receipt that no longer
+    /// describes the file about to be launched.
+    #[test]
+    fn a_receipt_for_another_executable_is_refused_by_shape() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let error = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
+            .verify_for(
+                &descriptor(),
+                now,
+                &crate::OpenSession::new("chat-1").with_executable(
+                    crate::transport::ExecutablePath::resolved("/opt/claude/bin/claude"),
+                ),
+            )
+            .expect_err("expected a refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("a receipt and request that name different executables"),
+            "expected an executable mismatch shape, received {error}"
+        );
+    }
+
+    #[test]
+    fn a_receipt_for_another_harness_is_refused_by_shape() {
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        let error = DiscoveryReceipt::new(HarnessId::codex(), usable(), now)
+            .verify_for(&descriptor(), now, &request())
+            .expect_err("expected a refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("a receipt for a different harness"),
+            "expected a harness mismatch shape, received {error}"
+        );
+    }
+
+    #[test]
+    fn a_stale_receipt_is_refused_with_its_own_age_and_window() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), usable(), now)
+            .valid_for(std::time::Duration::from_secs(60));
+        let later = now + std::time::Duration::from_secs(61);
+
+        assert!(!receipt.is_fresh(later));
+        let error = receipt
+            .verify_for(&descriptor(), later, &request())
+            .expect_err("expected a refusal");
+        assert!(
+            error.to_string().contains("61s old, valid for 60s"),
+            "expected the age and the window in the diagnostic, received {error}"
+        );
+    }
+
+    /// A clock that went backwards must not make a receipt look fresh forever — which is exactly
+    /// what folding an un-measurable age into zero would have done, for as long as the skew lasted.
+    #[test]
+    fn a_receipt_this_library_cannot_age_is_one_it_will_not_vouch_for() {
+        let observed = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), usable(), observed);
+        let earlier = std::time::SystemTime::UNIX_EPOCH;
+
+        assert_eq!(receipt.age(earlier), None);
+        assert!(!receipt.is_fresh(earlier));
+        let error = receipt
+            .verify_for(&descriptor(), earlier, &request())
+            .expect_err("expected a refusal");
+        assert!(
+            error.to_string().contains("taken in the future"),
+            "received {error}"
         );
     }
 }

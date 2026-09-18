@@ -81,7 +81,11 @@ only ever end its own turn.
 or close the session. The gate is released before every await, so a close either sees a claimed prompt
 to end or prevents the start from submitting one after teardown begins.
 
-`TurnStream::native_turn_id` is the prompt request's own JSON-RPC id — ACP has no turn id of its own.
+`TurnStream::native_turn_id` is `acp-turn-<n>`, a per-session sequence this harness mints — ACP
+names no turn handle of its own. It is minted synchronously, before the prompt reaches the wire, so
+`EventKind::TurnStarted` is genuinely the first event a turn produces rather than something that
+arrives only if the agent answers. The cost is that this id appears in no captured transcript: it is
+the harness's own counter, not something a vendor said.
 
 Steering is `Error::NotSupported` on every profile: ACP v1 has no surface for adding to a turn that is
 already running.
@@ -96,7 +100,7 @@ already running.
 | `tool_call`                                                          | `ActivityStarted`, plus `ActivityCompleted` when it already carries a terminal status |
 | `tool_call_update`                                                   | `ActivityUpdated`, or `ActivityCompleted` on `completed`/`failed`                     |
 | `plan`                                                               | `ActivityStarted`/`ActivityUpdated` under one synthetic call id                       |
-| `available_commands_update`                                          | `CommandsAvailable`, names bare                                                       |
+| `available_commands_update`                                          | session state, not a turn event — the snapshot's `commands`, names bare               |
 | `usage_update`                                                       | `ThreadUsage`, with `size` as the context window                                      |
 | `current_mode_update`, `config_option_update`, `session_info_update` | dropped — session state, not transcript                                               |
 
@@ -141,9 +145,17 @@ A level a profile cannot reach is refused at `open_session` and again at `start_
 downgraded: silently running a read-only request under "ask every time" would grant more freedom than
 anybody chose.
 
-An omitted permission axis leaves the vendor's configuration untouched. After a host makes an
+A patch axis left at `keep` leaves the vendor's configuration untouched. After a host makes an
 explicit selection, later turns inherit it until another accepted override replaces it.
-`Session::configuration()` reports that current selection. A rejected turn cannot change it.
+`Session::snapshot().configuration.accepted` reports that current selection. A rejected turn cannot
+change it.
+
+Native option `Set` and `Reset` patches are refused before launch or prompt submission: this
+adapter has no native configuration catalog or mapping. `Keep` remains a no-op. A turn's local
+settings become inherited only when `session/prompt` enters the SDK, under the same gate that
+excludes close; reserving a turn handle alone does not accept its patch. The
+[v1 prompt lifecycle](https://agentclientprotocol.com/protocol/v1/prompt-turn) defines the prompt
+response as completion, so the adapter does not wait for that response to publish local acceptance.
 
 A per-turn level is compared to the session's **by mode**, and any pair whose mode differs from the one
 the session was opened under is refused in both directions. Narrowing looks harmless and is not: a turn
@@ -159,9 +171,21 @@ level was selected. They cannot become new pending questions or reach the broker
 Cancellation and completion cleanup remain attached to their turn. A close that wins before the
 prompt is queued prevents that prompt from being sent.
 
-ACP's four option kinds map one-to-one onto the core's, so a host policy can answer without reading a
-label in a language it does not know. The option set itself is passed through with the agent's own
-ids, order and words. The request id is one the harness mints itself, never reused for the life of
+ACP's four option kinds map onto the core's effect and reach, so a host policy can answer without
+reading a label in a language it does not know. The option set itself is passed through with the
+agent's own ids, order and words.
+
+| ACP kind        | Effect | Scope  | Writes a rule |
+| --------------- | ------ | ------ | ------------- |
+| `allow_once`    | Allow  | `Once` | no            |
+| `allow_always`  | Allow  | —      | **yes**       |
+| `reject_once`   | Reject | `Once` | no            |
+| `reject_always` | Reject | —      | **yes**       |
+
+The two `always` kinds carry no scope on purpose. ACP says the agent should remember the choice; it
+does not say for how long, and a session-wide reading would be a promise the protocol never made.
+`policy_changing` says exactly what ACP does state, and an unstated reach is never rendered as the
+narrow one. The request id is one the harness mints itself, never reused for the life of
 the session — not the tool call id, which repeats when an agent asks about the same call twice, and
 not the JSON-RPC id, which is the agent's own to choose and to reuse once a request is no longer
 outstanding.
@@ -209,9 +233,10 @@ install locations without editing the profile or changing a user's `PATH`.
   `--version` is not an agent that stopped working.
 - Versions compare as dotted numbers of any length rather than as semver, because Cursor versions by
   date; a semver parser would call `2026.08.25-3e8eec8` unparseable and gate a build that works.
-- `Discovery::capabilities` is the harness **ceiling**, because what a build supports is only knowable
-  from `initialize`. What the agent actually advertised arrives on `SessionInfo::capabilities` after
-  `open_session`.
+- `Discovery::capabilities` is as wide as the harness **ceiling**, because what a build supports is
+  only knowable from `initialize`. What the agent actually advertised arrives as the session-effective
+  tier on `Session::snapshot().capabilities` after `open_session` — which is the case the three
+  capability tiers exist for.
 
 ## Client capabilities
 
@@ -320,7 +345,7 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 | `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                    |
 
 A resume against an agent that does not advertise `loadSession` is `Error::Protocol` under
-`ResumeMode::Strict`, and a fresh conversation with `SessionInfo::fallback_reason` set otherwise.
+`ResumeMode::Strict`, and a fresh conversation with `SessionSnapshot::fallback_reason` set otherwise.
 
 `NativeSession::updated_at` is left absent even when `session/list` returns one: it is an RFC 3339
 string on the wire and a `SystemTime` in the core, and a date crate for one optional picker field is not

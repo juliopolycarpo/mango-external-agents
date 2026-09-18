@@ -1,9 +1,10 @@
 //! Shared discovery and turn arguments, checked before launching a vendor.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use clap::Parser;
-use mango_external_agents::{AcpProfileId, HarnessKind, PermissionLevel, TransportKind};
+use mango_external_agents::{HarnessId, PermissionLevel, ProfileId, TransportKind};
 
 #[derive(Parser)]
 #[command(name = "mea", disable_help_flag = true)]
@@ -23,8 +24,39 @@ struct Arguments {
     prompt: Vec<String>,
 }
 
+/// What this CLI's own `--harness` flag selected.
+///
+/// The library dropped its `HarnessKind` enum for [`HarnessId`], a validated string a host
+/// dispatches on — but a `match` over a string prefix (`"acp:"`) is worse than the enum it
+/// replaced. This is `mea`'s own three-way vocabulary for `claude`, `codex` and `acp:<profile>`;
+/// [`HarnessChoice::id`] is the one place it is translated into the registry's own key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HarnessChoice {
+    Claude,
+    Codex,
+    Acp(ProfileId),
+}
+
+impl HarnessChoice {
+    /// The registry key this selection dispatches through. Example: `HarnessChoice::Codex.id()`
+    /// is `HarnessId::codex()`; `a_harness_choice_maps_onto_the_registrys_own_id` below covers it.
+    pub(crate) fn id(&self) -> HarnessId {
+        match self {
+            Self::Claude => HarnessId::claude(),
+            Self::Codex => HarnessId::codex(),
+            Self::Acp(profile) => HarnessId::acp(profile),
+        }
+    }
+}
+
+impl fmt::Display for HarnessChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.id(), formatter)
+    }
+}
+
 pub(crate) struct Options {
-    pub kind: Option<HarnessKind>,
+    pub kind: Option<HarnessChoice>,
     pub level: Option<PermissionLevel>,
     pub transport: Option<TransportKind>,
     pub cwd: Option<PathBuf>,
@@ -77,11 +109,11 @@ fn transport(named: &str) -> Result<TransportKind, String> {
     }
 }
 
-fn kind(harness: Option<&str>, profile: Option<&str>) -> Result<Option<HarnessKind>, String> {
+fn kind(harness: Option<&str>, profile: Option<&str>) -> Result<Option<HarnessChoice>, String> {
     match (harness, profile) {
         (None, None) => Ok(None),
-        (Some("claude"), None) => Ok(Some(HarnessKind::Claude)),
-        (Some("codex"), None) => Ok(Some(HarnessKind::Codex)),
+        (Some("claude"), None) => Ok(Some(HarnessChoice::Claude)),
+        (Some("codex"), None) => Ok(Some(HarnessChoice::Codex)),
         (Some("acp"), Some(profile)) => acp(profile),
         (Some(name), None) if let Some(profile) = name.strip_prefix("acp:") => acp(profile),
         _ => Err(format!(
@@ -90,13 +122,14 @@ fn kind(harness: Option<&str>, profile: Option<&str>) -> Result<Option<HarnessKi
     }
 }
 
-fn acp(profile: &str) -> Result<Option<HarnessKind>, String> {
+fn acp(profile: &str) -> Result<Option<HarnessChoice>, String> {
     if mango_agent_acp::builtin_profile(profile).is_none() {
         return Err(format!(
             "expected a built-in ACP profile, received {profile:?}"
         ));
     }
-    Ok(Some(HarnessKind::Acp(AcpProfileId::new(profile))))
+    let profile = ProfileId::new(profile).map_err(|error| error.to_string())?;
+    Ok(Some(HarnessChoice::Acp(profile)))
 }
 
 #[cfg(test)]
@@ -121,7 +154,9 @@ mod tests {
         let options = Options::parse(&args).expect("valid turn arguments");
         assert_eq!(
             options.kind,
-            Some(HarnessKind::Acp(AcpProfileId::new("cursor")))
+            Some(HarnessChoice::Acp(
+                ProfileId::new("cursor").expect("expected a valid profile")
+            ))
         );
         assert_eq!(options.cwd, Some(PathBuf::from(".")));
         assert_eq!(options.transport, Some(TransportKind::Acp));
@@ -199,13 +234,13 @@ impl CaptureOptions {
     }
 
     /// Resolves the requested vendor. Example: `acp` uses the documented default capture profile.
-    pub fn kind(&self) -> Result<HarnessKind, String> {
+    pub fn kind(&self) -> Result<HarnessChoice, String> {
         let name = self.harness.as_deref().unwrap_or("codex");
         let default_profile =
             (name == "acp").then_some(crate::capture::DEFAULT_ACP_CAPTURE_PROFILE);
         let selected = kind(Some(name), self.profile.as_deref().or(default_profile))?
             .ok_or("expected a capture harness, received none")?;
-        if self.transcripts && selected != HarnessKind::Codex {
+        if self.transcripts && selected != HarnessChoice::Codex {
             return Err(format!(
                 "expected codex for --transcripts, received {selected}"
             ));
@@ -224,13 +259,14 @@ mod capture_tests {
             CaptureOptions::parse(&["--harness".into(), "acp".into()]).expect("valid capture");
         assert_eq!(
             options.kind().expect("ACP capture profile"),
-            HarnessKind::Acp(AcpProfileId::new(
-                crate::capture::DEFAULT_ACP_CAPTURE_PROFILE
-            ))
+            HarnessChoice::Acp(
+                ProfileId::new(crate::capture::DEFAULT_ACP_CAPTURE_PROFILE)
+                    .expect("expected a valid profile")
+            )
         );
         let legacy = CaptureOptions::parse(&["codex".into()]).expect("legacy capture");
         assert!(legacy.legacy.is_some());
-        assert_eq!(legacy.kind().expect("Codex"), HarnessKind::Codex);
+        assert_eq!(legacy.kind().expect("Codex"), HarnessChoice::Codex);
     }
 
     #[test]
@@ -249,16 +285,16 @@ mod capture_tests {
 }
 
 /// The fixture root for one captured profile. Example: ACP OpenCode lives in `fixtures/acp/opencode`.
-pub(crate) fn capture_output(kind: &HarnessKind) -> PathBuf {
+pub(crate) fn capture_output(kind: &HarnessChoice) -> PathBuf {
     let vendor = match kind {
-        HarnessKind::Claude => "claude",
-        HarnessKind::Codex => "codex",
-        _ => "acp",
+        HarnessChoice::Claude => "claude",
+        HarnessChoice::Codex => "codex",
+        HarnessChoice::Acp(_) => "acp",
     };
     let root = PathBuf::from("fixtures").join(vendor);
     match kind {
-        HarnessKind::Acp(profile) => root.join(profile.to_string()),
-        _ => root,
+        HarnessChoice::Acp(profile) => root.join(profile.as_str()),
+        HarnessChoice::Claude | HarnessChoice::Codex => root,
     }
 }
 
@@ -269,20 +305,36 @@ mod output_tests {
     #[test]
     fn acp_captures_default_to_separate_profile_directories() {
         assert_eq!(
-            capture_output(&HarnessKind::Acp(AcpProfileId::new("opencode"))),
+            capture_output(&HarnessChoice::Acp(
+                ProfileId::new("opencode").expect("expected a valid profile")
+            )),
             PathBuf::from("fixtures/acp/opencode")
         );
         assert_eq!(
-            capture_output(&HarnessKind::Acp(AcpProfileId::new("cursor"))),
+            capture_output(&HarnessChoice::Acp(
+                ProfileId::new("cursor").expect("expected a valid profile")
+            )),
             PathBuf::from("fixtures/acp/cursor")
         );
         assert_eq!(
-            capture_output(&HarnessKind::Claude),
+            capture_output(&HarnessChoice::Claude),
             PathBuf::from("fixtures/claude")
         );
         assert_eq!(
-            capture_output(&HarnessKind::Codex),
+            capture_output(&HarnessChoice::Codex),
             PathBuf::from("fixtures/codex")
         );
+    }
+
+    #[test]
+    fn a_harness_choice_maps_onto_the_registrys_own_id() {
+        assert_eq!(HarnessChoice::Claude.id(), HarnessId::claude());
+        assert_eq!(HarnessChoice::Codex.id(), HarnessId::codex());
+        let profile = ProfileId::new("cursor").expect("expected a valid profile");
+        assert_eq!(
+            HarnessChoice::Acp(profile.clone()).id(),
+            HarnessId::acp(&profile)
+        );
+        assert_eq!(HarnessChoice::Codex.to_string(), "codex");
     }
 }

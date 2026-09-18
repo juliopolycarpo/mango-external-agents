@@ -4,6 +4,8 @@
 //! replays them. That is the only way to test a dialect on a machine where the vendor's CLI is not
 //! installed — which is every machine, in CI.
 
+#[path = "replay/contracts.rs"]
+mod contracts;
 mod support;
 
 use std::sync::Arc;
@@ -12,13 +14,14 @@ use std::time::SystemTime;
 use mango_agent_codex::CodexHarness;
 use mango_external_agents::event::EventKind;
 use mango_external_agents::permission::{
-    BrokerDecision, DecisionSource, PermissionBroker, PermissionOptionKind, PermissionRequest,
+    BrokerDecision, DecisionSource, PermissionBroker, PermissionEffect, PermissionRequest,
     PermissionResponse,
 };
 use mango_external_agents::testing::{FakeLauncher, FakeProcess};
 use mango_external_agents::{
-    ApprovalRouting, CancelReason, Clock, CloseReason, Configuration, EnvSource, Harness,
-    HostContext, OpenSession, PermissionLevel, Session, SessionQuery, Steer, TurnRequest,
+    ApprovalRouting, CancelReason, Clock, CloseReason, ConfigurationChange, ConfigurationPatch,
+    EnvSource, Harness, HostContext, OpenSession, PermissionLevel, Session, SessionQuery,
+    SessionStatus, SessionSubscription, Steer, TurnRequest,
 };
 use support::Transcript;
 
@@ -343,6 +346,18 @@ fn host_with(
     with_launcher(launcher, broker)
 }
 
+/// A patch that sets only the permission level.
+fn level_patch(level: PermissionLevel) -> ConfigurationPatch {
+    ConfigurationPatch::new().level(ConfigurationChange::Set(level))
+}
+
+/// A patch that sets both the permission level and who answers its prompts.
+fn permission_patch(level: PermissionLevel, routing: ApprovalRouting) -> ConfigurationPatch {
+    ConfigurationPatch::new()
+        .level(ConfigurationChange::Set(level))
+        .routing(ConfigurationChange::Set(routing))
+}
+
 /// What `codex --version` prints, for a test whose harness probes before it opens anything.
 fn version_answer() -> FakeProcess {
     FakeProcess::transcript([format!(
@@ -558,7 +573,7 @@ async fn opening_a_session_adopts_the_thread_the_server_opened() {
 
     assert_eq!(session.ids().session_id.as_str(), "chat-1");
     assert_eq!(session.ids().native_session_id, expected);
-    assert!(!session.info().resumed);
+    assert!(!session.snapshot().resumed);
 }
 
 /// The recorded turn: a command runs, the answer streams, usage and quota arrive, the turn ends.
@@ -582,8 +597,8 @@ async fn a_recorded_turn_replays_as_a_turn_that_ends_exactly_once() {
     );
 
     assert!(
-        matches!(events.first(), Some(EventKind::SessionStarted { .. })),
-        "expected the vendor session to be announced first, received {events:#?}"
+        matches!(events.first(), Some(EventKind::TurnStarted { .. })),
+        "expected the vendor's acceptance of this attempt first, received {events:#?}"
     );
     assert!(
         events
@@ -613,21 +628,25 @@ async fn a_recorded_turn_replays_as_a_turn_that_ends_exactly_once() {
     );
 }
 
-/// A vendor session is opened once. Announcing it again on a later turn would tell a host the
-/// conversation had just started on a turn where nothing did.
+/// The turn-scoped counterpart to opening a session: the vendor accepted this attempt and named
+/// its own handle for it, first on every turn's stream — not just the first, since it says
+/// something about this attempt rather than about the session.
+///
+/// The session's own identity — its native id, whether it was resumed — is set once, at open,
+/// and does not vary from one turn to the next; that fact used to ride a session-wide
+/// announcement on the first turn and now lives on [`Session::snapshot`] from the moment the
+/// session opens.
 #[tokio::test]
-async fn the_vendor_session_is_announced_on_the_first_turn_and_not_again() {
+async fn every_turn_announces_its_own_acceptance_while_the_sessions_identity_stays_put() {
     let (session, _) = open("turn").await;
+    let opened = session.snapshot();
 
     let mut first = session
         .start_turn(TurnRequest::new("turn-1", "one"))
         .await
         .expect("expected a turn");
     let first = drain(&mut first).await;
-    assert!(matches!(
-        first.first(),
-        Some(EventKind::SessionStarted { .. })
-    ));
+    assert!(matches!(first.first(), Some(EventKind::TurnStarted { .. })));
 
     let mut second = session
         .start_turn(TurnRequest::new("turn-2", "two"))
@@ -635,10 +654,14 @@ async fn the_vendor_session_is_announced_on_the_first_turn_and_not_again() {
         .expect("expected a second turn");
     let second = drain(&mut second).await;
     assert!(
-        !second
-            .iter()
-            .any(|kind| matches!(kind, EventKind::SessionStarted { .. })),
-        "expected no second announcement, received {second:#?}"
+        matches!(second.first(), Some(EventKind::TurnStarted { .. })),
+        "expected the second turn to announce its own acceptance too, received {second:#?}"
+    );
+
+    assert_eq!(
+        session.snapshot().ids.native_session_id,
+        opened.ids.native_session_id,
+        "expected the session's own identity to stay put across turns"
     );
 }
 
@@ -663,7 +686,7 @@ async fn a_second_turn_started_while_one_is_running_is_refused_rather_than_steer
         .expect_err("expected a refusal, received a second turn");
 
     assert!(
-        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
                  if vendor.code.as_str() == "codex-turn-already-running"),
         "expected the turn-already-running refusal, received {error:?}"
     );
@@ -701,7 +724,7 @@ async fn a_cancelled_start_holds_the_slot_until_its_vendor_handle_arrives() {
         .await
         .expect_err("expected the unnamed vendor turn to keep the slot occupied");
     assert!(
-        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
                  if vendor.code.as_str() == "codex-turn-already-running"),
         "expected a running-turn refusal, received {error:?}"
     );
@@ -786,7 +809,7 @@ async fn an_ambiguous_start_timeout_on_a_full_one_slot_stream_cannot_become_a_st
         .await
         .expect_err("expected the unanswered start to time out");
     assert!(
-        matches!(first, mango_external_agents::Error::Timeout { .. }),
+        matches!(first.cause(), mango_external_agents::Error::Timeout { .. }),
         "expected an ambiguous timeout, received {first:?}"
     );
 
@@ -795,7 +818,7 @@ async fn an_ambiguous_start_timeout_on_a_full_one_slot_stream_cannot_become_a_st
         .await
         .expect_err("expected the ambiguous first turn to retain the slot");
     assert!(
-        matches!(&second, mango_external_agents::Error::Vendor(vendor)
+        matches!(second.cause(), mango_external_agents::Error::Vendor(vendor)
             if vendor.code.as_str() == "codex-turn-already-running"),
         "expected a local running-turn refusal, received {second:?}"
     );
@@ -825,10 +848,8 @@ async fn a_delayed_start_success_cannot_replace_the_live_turns_vendor_handle() {
     let first = tokio::spawn(async move {
         first_session
             .start_turn(
-                TurnRequest::new("turn-reused", "one").with_configuration(Configuration {
-                    level: Some(PermissionLevel::FullAccess),
-                    ..Configuration::default()
-                }),
+                TurnRequest::new("turn-reused", "one")
+                    .with_configuration(level_patch(PermissionLevel::FullAccess)),
             )
             .await
     });
@@ -837,17 +858,19 @@ async fn a_delayed_start_success_cannot_replace_the_live_turns_vendor_handle() {
     let mut second = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match session
-                .start_turn(TurnRequest::new("turn-reused", "two").with_configuration(
-                    Configuration {
-                        level: Some(PermissionLevel::ReadOnly),
-                        ..Configuration::default()
-                    },
-                ))
+                .start_turn(
+                    TurnRequest::new("turn-reused", "two")
+                        .with_configuration(level_patch(PermissionLevel::ReadOnly)),
+                )
                 .await
             {
                 Ok(turn) => break turn,
-                Err(mango_external_agents::Error::Vendor(vendor))
-                    if vendor.code.as_str() == "codex-turn-already-running" =>
+                Err(error)
+                    if matches!(
+                        error.cause(),
+                        mango_external_agents::Error::Vendor(vendor)
+                            if vendor.code.as_str() == "codex-turn-already-running"
+                    ) =>
                 {
                     tokio::task::yield_now().await;
                 }
@@ -857,7 +880,7 @@ async fn a_delayed_start_success_cannot_replace_the_live_turns_vendor_handle() {
     })
     .await
     .expect("expected the completion notification to free the first slot");
-    assert_eq!(second.native_turn_id, "vendor-turn-2");
+    assert_eq!(second.native_turn_id(), "vendor-turn-2");
 
     session
         .refresh_account_usage()
@@ -868,7 +891,7 @@ async fn a_delayed_start_success_cannot_replace_the_live_turns_vendor_handle() {
         .expect("expected the delayed start task to finish")
         .expect("expected the delayed start success");
     assert_eq!(
-        session.configuration().await.level,
+        session.snapshot().configuration.accepted.level,
         Some(PermissionLevel::ReadOnly),
         "expected the later accepted turn's read-only defaults, not the delayed full-access response"
     );
@@ -905,8 +928,12 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
                 .await
             {
                 Ok(turn) => break turn,
-                Err(mango_external_agents::Error::Vendor(vendor))
-                    if vendor.code.as_str() == "codex-turn-already-running" =>
+                Err(error)
+                    if matches!(
+                        error.cause(),
+                        mango_external_agents::Error::Vendor(vendor)
+                            if vendor.code.as_str() == "codex-turn-already-running"
+                    ) =>
                 {
                     tokio::task::yield_now().await;
                 }
@@ -930,7 +957,7 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
         .await
         .expect_err("expected the live replacement to keep the slot");
     assert!(
-        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
                  if vendor.code.as_str() == "codex-turn-already-running"),
         "expected a running-turn refusal, received {error:?}"
     );
@@ -961,17 +988,14 @@ async fn a_turn_whose_host_stopped_reading_still_holds_the_slot_against_a_steer(
 
     drop(first);
     // One event onto the closed stream, which is what a host that left looks like from here.
+    let option_id = asked
+        .options
+        .iter()
+        .find(|option| option.effect == PermissionEffect::Reject)
+        .map(|option| option.id.clone())
+        .expect("expected a refusal among the recorded options");
     session
-        .respond(PermissionResponse {
-            request_id: asked.id.clone(),
-            option_id: asked
-                .options
-                .iter()
-                .find(|option| option.kind == PermissionOptionKind::RejectOnce)
-                .map(|option| option.id.clone())
-                .expect("expected a refusal among the recorded options"),
-            source: DecisionSource::User,
-        })
+        .respond(PermissionResponse::from_user(asked.id().clone(), option_id))
         .await
         .expect("expected the refusal to reach the server");
 
@@ -981,7 +1005,7 @@ async fn a_turn_whose_host_stopped_reading_still_holds_the_slot_against_a_steer(
         .await
         .expect_err("expected a refusal, received a second turn on a live one");
     assert!(
-        matches!(&error, mango_external_agents::Error::Vendor(vendor)
+        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
                  if vendor.code.as_str() == "codex-turn-already-running"),
         "expected the turn-already-running refusal, received {error:?}"
     );
@@ -1057,17 +1081,14 @@ async fn a_question_is_answerable_the_instant_the_host_is_told_about_it() {
         .expect("expected a turn");
 
     let asked = await_approval(&mut turn).await;
+    let option_id = asked
+        .options
+        .iter()
+        .find(|option| option.effect == PermissionEffect::Reject)
+        .map(|option| option.id.clone())
+        .expect("expected a refusal among the recorded options");
     let answered = session
-        .respond(PermissionResponse {
-            request_id: asked.id.clone(),
-            option_id: asked
-                .options
-                .iter()
-                .find(|option| option.kind == PermissionOptionKind::RejectOnce)
-                .map(|option| option.id.clone())
-                .expect("expected a refusal among the recorded options"),
-            source: DecisionSource::User,
-        })
+        .respond(PermissionResponse::from_user(asked.id().clone(), option_id))
         .await;
     broker.make_up_its_mind();
 
@@ -1427,6 +1448,28 @@ async fn a_cancelled_turn_still_completes_and_says_why_it_stopped() {
     );
 }
 
+/// The status a session settles on, once it stops changing.
+///
+/// Only the terminal status is asserted on, never the `Closing` before it: a
+/// [`SessionSubscription`] coalesces, so a teardown that does not block between its two
+/// transitions publishes both and a subscriber legitimately sees only the second.
+///
+/// Reports the status it is stuck on rather than hanging to a bare timeout: a lifecycle that never
+/// ends has to fail as "received `Ready`", which names the bug, not as "the test timed out", which
+/// names nothing.
+async fn status_once_settled(lifecycle: &mut SessionSubscription) -> SessionStatus {
+    loop {
+        if lifecycle.current().status == SessionStatus::Closed {
+            return SessionStatus::Closed;
+        }
+        let next =
+            tokio::time::timeout(std::time::Duration::from_secs(5), lifecycle.changed()).await;
+        if !matches!(next, Ok(Some(_))) {
+            return lifecycle.current().status;
+        }
+    }
+}
+
 /// The host's lifetime token stops an ordinary vendor turn even when no approval is pending.
 #[tokio::test]
 async fn host_shutdown_cancels_an_ordinary_turn_and_ends_its_child() {
@@ -1475,6 +1518,129 @@ async fn host_shutdown_cancels_an_ordinary_turn_and_ends_its_child() {
             .await
             .is_err(),
         "expected the shutdown session to reject a second turn"
+    );
+}
+
+/// A session the host's own lifetime token tore down never saw `close`, so the shutdown watcher
+/// owes the lifecycle the transitions `close` publishes. Without them the snapshot keeps saying
+/// `Ready` while every later start is refused, and a subscriber is told nothing at all.
+#[tokio::test]
+async fn host_shutdown_publishes_the_lifecycle_its_watcher_drove() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("turn").as_process());
+    let cancel = mango_external_agents::CancelToken::new();
+    let (host, _) = with_launcher_limits_and_cancel(
+        Arc::clone(&launcher),
+        None,
+        replay_limits(),
+        cancel.clone(),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    assert_eq!(lifecycle.current().status, SessionStatus::Ready);
+
+    cancel.cancel();
+
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected the watcher to publish the terminal close publishes"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected Closed to mean the child is gone, not only that the status moved"
+    );
+}
+
+/// The `Closing` half of the same wind-down, which the terminal assertions cannot see: a
+/// subscription coalesces, so the two transitions are only distinguishable while the watcher is
+/// actually parked between them.
+///
+/// An unread turn under a one-slot channel is that park — the same lever
+/// `a_host_that_stops_reading_cannot_stop_the_session_from_closing` pulls. The channel is full the
+/// instant `start_turn` returns, so `cancel_active`'s terminal parks on it until `TERMINAL_GRACE`,
+/// and paused time does not advance to that grace while this task is awake.
+#[tokio::test(start_paused = true)]
+async fn the_watcher_publishes_closing_while_its_wind_down_is_still_parked() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("turn").as_process());
+    let cancel = mango_external_agents::CancelToken::new();
+    let (host, _) = with_launcher_limits_and_cancel(
+        launcher,
+        None,
+        mango_external_agents::Limits {
+            turn_channel_capacity: 1,
+            request_timeout: std::time::Duration::from_secs(5),
+            ..mango_external_agents::Limits::default()
+        },
+        cancel.clone(),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    // Held, never read: this is the host that walked away.
+    let _unread = session
+        .start_turn(TurnRequest::new("turn-1", "run echo mango"))
+        .await
+        .expect("expected a turn");
+    // Twice, so the pump gets the thread and then reaches its park inside the emit.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    cancel.cancel();
+
+    let closing = lifecycle
+        .changed()
+        .await
+        .expect("expected the watcher to publish a change");
+    assert_eq!(
+        closing.status,
+        SessionStatus::Closing,
+        "expected Closing to be visible while the wind-down is still parked"
+    );
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected the parked wind-down to still reach its terminal"
+    );
+}
+
+/// The other way the watcher runs: the app-server disappears on its own. `connection_terminated`
+/// stops new work and cancels `terminated`, and the lifecycle has to follow — a host left holding
+/// a `Ready` session over a dead connection learns it only from the next refusal.
+#[tokio::test]
+async fn a_dead_app_server_connection_publishes_the_session_terminal() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let close_stdout = mango_external_agents::CancelToken::new();
+    launcher.push(
+        Transcript::load("turn")
+            .as_process()
+            .ending_stdout_when(close_stdout.clone()),
+    );
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+
+    close_stdout.cancel();
+
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected a terminated connection to end the published lifecycle"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the watcher to reap the child it reported closed"
     );
 }
 
@@ -1595,9 +1761,9 @@ async fn app_server_eof_after_an_activity_fails_the_turn_without_waiting_for_a_t
 /// next `start_turn` — parks behind a host that is never coming back, and a close that cannot
 /// return leaves a `codex app-server` running for the life of the process.
 ///
-/// The capacity is exactly what `start_turn` emits before the vendor says anything: one
-/// `SessionStarted`. The channel is therefore full the instant the turn is returned, and the
-/// pump's first real event parks. A larger capacity and the test proves nothing; a smaller one and
+/// The capacity is exactly what `start_turn` emits before returning the stream: one
+/// `TurnStarted`. The channel is therefore full the instant the turn is returned, and the pump's
+/// first real event parks. A larger capacity and the test proves nothing; a smaller one and
 /// `start_turn` itself parks and this hangs instead of failing.
 #[tokio::test(start_paused = true)]
 async fn a_host_that_stops_reading_cannot_stop_the_session_from_closing() {
@@ -1659,7 +1825,7 @@ async fn closing_twice_is_harmless_and_ends_the_child() {
         .await
         .expect_err("expected a closed session to refuse a turn");
     assert!(
-        matches!(error, mango_external_agents::Error::Closed { .. }),
+        matches!(error.cause(), mango_external_agents::Error::Closed { .. }),
         "expected a closed-session refusal, received {error:?}"
     );
 }
@@ -1737,8 +1903,8 @@ async fn a_review_the_server_named_no_thread_for_runs_on_the_one_this_session_ho
     let writes_before_steer = launcher.written().len();
     let steer = session
         .steer(Steer {
-            turn_id: review.turn.turn_id,
-            native_turn_id: review.turn.native_turn_id,
+            turn_id: review.turn.turn_id().clone(),
+            native_turn_id: review.turn.native_turn_id().to_owned(),
             input: String::from("also inspect this"),
         })
         .await
@@ -1788,16 +1954,27 @@ async fn a_recorded_review_runs_on_the_thread_this_session_is_subscribed_to() {
         "expected no delivery member, which the server reads as inline; received {frame}"
     );
 
+    // The review's own id, as `review/start` answered it — the one every later item and
+    // completion on this stream is routed against.
+    let native_turn_id = review.turn.native_turn_id().to_owned();
+
     let events = drain(&mut review.turn).await;
     assert!(
         matches!(events.last(), Some(EventKind::Completed)),
         "expected the review to end like any other turn, received {events:#?}"
     );
-    assert!(
-        !events
-            .iter()
-            .any(|kind| matches!(kind, EventKind::SessionStarted { .. })),
-        "expected a review not to announce the vendor session, received {events:#?}"
+    // A review is an attempt like any other, and gets its own acceptance first — there is no
+    // session-wide announcement left to ride the stream instead. Captured transcripts show the
+    // vendor's own `turn/started` notification can name a different id for a review than
+    // `review/start`'s response does; the announcement must carry the response's id regardless
+    // of whether that notification or the response itself won the race to send it.
+    assert_eq!(
+        events.first(),
+        Some(&EventKind::TurnStarted {
+            native_turn_id: native_turn_id.clone()
+        }),
+        "expected the review to announce its own acceptance under its own response id, \
+         received {events:#?}"
     );
 }
 
@@ -1856,11 +2033,10 @@ async fn refreshing_account_usage_reports_the_windows_the_vendor_named() {
 #[tokio::test]
 async fn the_configuration_a_host_chose_reaches_the_thread_as_three_settings() {
     let (host, launcher) = host_replaying(&["turn"]);
-    let request = OpenSession::new("chat-1").with_configuration(Configuration {
-        level: Some(PermissionLevel::Default),
-        routing: Some(ApprovalRouting::AutoReview),
-        ..Configuration::default()
-    });
+    let request = OpenSession::new("chat-1").with_configuration(permission_patch(
+        PermissionLevel::Default,
+        ApprovalRouting::AutoReview,
+    ));
     let _session = CodexHarness::new()
         .open_session(&host, request)
         .await
@@ -1878,10 +2054,12 @@ async fn the_configuration_a_host_chose_reaches_the_thread_as_three_settings() {
     assert_eq!(frame["params"]["cwd"], "/workspace");
 }
 
-/// The announcement rides the first turn's stream, so a first turn the server refuses takes it
-/// with it. The next turn to actually start is the one that carries it.
+/// The old session-wide announcement rode the first turn's stream, so a first turn the server
+/// refused took it down with it, and only the next turn to actually start carried it. That
+/// coupling is gone: the session's own identity is known from the moment the session opens,
+/// before any turn runs, so a refused first turn cannot take it down with it.
 #[tokio::test]
-async fn a_first_turn_the_server_refused_does_not_take_the_session_announcement_with_it() {
+async fn a_first_turn_the_server_refused_does_not_take_the_sessions_identity_with_it() {
     let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = Arc::clone(&refused);
     let launcher = Arc::new(FakeLauncher::new());
@@ -1908,11 +2086,21 @@ async fn a_first_turn_the_server_refused_does_not_take_the_session_announcement_
         .open_session(&host, OpenSession::new("chat-1"))
         .await
         .expect("expected a session");
+    let opened = session.snapshot();
+    assert!(
+        !opened.ids.native_session_id.is_empty(),
+        "expected the session's own identity to be known before any turn ran"
+    );
 
-    session
+    let error = session
         .start_turn(TurnRequest::new("turn-1", "one"))
         .await
         .expect_err("expected the server's refusal to reach the caller");
+    assert_eq!(
+        error.dispatch(),
+        mango_external_agents::Dispatch::Accepted,
+        "expected a definitive server rejection not to be safe to replay"
+    );
 
     let mut second = session
         .start_turn(TurnRequest::new("turn-2", "two"))
@@ -1920,10 +2108,14 @@ async fn a_first_turn_the_server_refused_does_not_take_the_session_announcement_
         .expect("expected the next turn to run");
     let events = drain(&mut second).await;
     assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, EventKind::SessionStarted { .. })),
-        "expected the first turn that actually started to announce the session, received {events:#?}"
+        matches!(events.first(), Some(EventKind::TurnStarted { .. })),
+        "expected the next turn that actually started to announce its own acceptance, \
+         received {events:#?}"
+    );
+    assert_eq!(
+        session.snapshot().ids.native_session_id,
+        opened.ids.native_session_id,
+        "expected the refused first turn to leave the session's identity untouched"
     );
 }
 
@@ -1979,17 +2171,23 @@ async fn review_targets_are_available_through_the_shared_session_trait() {
 #[tokio::test]
 async fn successful_permission_overrides_become_observable_defaults() {
     let (session, launcher) = open("turn").await;
-    let configuration = Configuration {
-        level: Some(PermissionLevel::FullAccess),
-        ..session.configuration().await
-    };
+    // Nothing was asked for at open, so the opening picture carries no level at all — proof that
+    // the override below is not retroactively rewriting what opening the session reported.
+    let opened_level = session.snapshot().configuration.accepted.level;
+    assert_eq!(opened_level, None);
+
     let mut first = session
-        .start_turn(TurnRequest::new("override", "mango").with_configuration(configuration.clone()))
+        .start_turn(
+            TurnRequest::new("override", "mango")
+                .with_configuration(level_patch(PermissionLevel::FullAccess)),
+        )
         .await
         .expect("expected full-access override");
     drain(&mut first).await;
-    assert_eq!(session.configuration().await, configuration);
-    assert_eq!(session.info().effective_configuration.level, None);
+    assert_eq!(
+        session.snapshot().configuration.accepted.level,
+        Some(PermissionLevel::FullAccess)
+    );
     let mut second = session
         .start_turn(TurnRequest::new("inherited", "done"))
         .await
@@ -2005,7 +2203,7 @@ async fn successful_permission_overrides_become_observable_defaults() {
     assert!(frames[1]["params"].get("sandboxPolicy").is_none());
     assert!(frames[1]["params"].get("approvalPolicy").is_none());
     assert_eq!(
-        session.configuration().await.level,
+        session.snapshot().configuration.accepted.level,
         Some(PermissionLevel::FullAccess)
     );
 }
@@ -2145,12 +2343,8 @@ async fn permission_transitions_replay_the_captured_policies() {
     for (index, level) in levels.into_iter().enumerate() {
         let mut stream = session
             .start_turn(
-                TurnRequest::new(format!("policy-{index}"), "mango").with_configuration(
-                    Configuration {
-                        level: Some(level),
-                        ..Configuration::default()
-                    },
-                ),
+                TurnRequest::new(format!("policy-{index}"), "mango")
+                    .with_configuration(level_patch(level)),
             )
             .await
             .expect("expected permission transition");
@@ -2161,7 +2355,7 @@ async fn permission_transitions_replay_the_captured_policies() {
                 .any(|event| matches!(event, EventKind::Completed)),
             "expected completed policy transition {level:?}, received {events:?}"
         );
-        assert_eq!(session.configuration().await.level, Some(level));
+        assert_eq!(session.snapshot().configuration.accepted.level, Some(level));
     }
 
     let mut inherited = session
@@ -2176,7 +2370,7 @@ async fn permission_transitions_replay_the_captured_policies() {
         "expected completed inherited transition, received {events:?}"
     );
     assert_eq!(
-        session.configuration().await.level,
+        session.snapshot().configuration.accepted.level,
         Some(PermissionLevel::FullAccess),
         "an unconfigured turn must retain the last accepted explicit level"
     );
@@ -2223,11 +2417,10 @@ async fn permission_transitions_replay_the_captured_policies() {
 #[tokio::test]
 async fn a_turn_permission_override_applies_both_halves_atomically() {
     let (host, launcher) = host_replaying(&["turn"]);
-    let request = OpenSession::new("chat-1").with_configuration(Configuration {
-        level: Some(PermissionLevel::FullAccess),
-        routing: Some(ApprovalRouting::User),
-        ..Configuration::default()
-    });
+    let request = OpenSession::new("chat-1").with_configuration(permission_patch(
+        PermissionLevel::FullAccess,
+        ApprovalRouting::User,
+    ));
     let session = CodexHarness::new()
         .open_session(&host, request)
         .await
@@ -2235,11 +2428,10 @@ async fn a_turn_permission_override_applies_both_halves_atomically() {
 
     let mut turn = session
         .start_turn(
-            TurnRequest::new("turn-1", "read the tree").with_configuration(Configuration {
-                level: Some(PermissionLevel::ReadOnly),
-                routing: Some(ApprovalRouting::User),
-                ..Configuration::default()
-            }),
+            TurnRequest::new("turn-1", "read the tree").with_configuration(permission_patch(
+                PermissionLevel::ReadOnly,
+                ApprovalRouting::User,
+            )),
         )
         .await
         .expect("expected the explicit read-only override to start");
@@ -2261,11 +2453,10 @@ async fn a_turn_permission_override_applies_both_halves_atomically() {
 #[tokio::test]
 async fn a_turn_that_repeats_the_sessions_own_level_is_the_turn_it_always_was() {
     let (host, _launcher) = host_replaying(&["turn"]);
-    let request = OpenSession::new("chat-1").with_configuration(Configuration {
-        level: Some(PermissionLevel::Default),
-        routing: Some(ApprovalRouting::User),
-        ..Configuration::default()
-    });
+    let request = OpenSession::new("chat-1").with_configuration(permission_patch(
+        PermissionLevel::Default,
+        ApprovalRouting::User,
+    ));
     let session = CodexHarness::new()
         .open_session(&host, request)
         .await
@@ -2273,11 +2464,10 @@ async fn a_turn_that_repeats_the_sessions_own_level_is_the_turn_it_always_was() 
 
     let mut turn = session
         .start_turn(
-            TurnRequest::new("turn-1", "create mango.txt").with_configuration(Configuration {
-                level: Some(PermissionLevel::Default),
-                routing: Some(ApprovalRouting::AutoReview),
-                ..Configuration::default()
-            }),
+            TurnRequest::new("turn-1", "create mango.txt").with_configuration(permission_patch(
+                PermissionLevel::Default,
+                ApprovalRouting::AutoReview,
+            )),
         )
         .await
         .expect("expected the turn to run");
@@ -2338,7 +2528,7 @@ async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
     assert!(!discovery.is_usable());
     assert_eq!(
         discovery.capabilities,
-        mango_external_agents::Capabilities::none(),
+        mango_external_agents::harness::DiscoveredCapabilities::none(),
         "expected a build that cannot be driven to claim nothing"
     );
     assert_eq!(
@@ -2352,6 +2542,12 @@ async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
 #[tokio::test]
 async fn the_harness_passes_the_cores_conformance_suite() {
     // The suite probes before it opens anything, and a probe spawns `codex --version` first.
+    //
+    // `approval` rather than a longer conversation: the suite watches for a session update on a
+    // subscription it opens before `check_turn` rather than starting a turn of its own, so it
+    // needs no more recorded turns than it did before session state existed — and this is the one
+    // recorded conversation where the vendor actually asks for an approval, which is the round
+    // trip the suite cannot prove anywhere else.
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(version_answer());
     launcher.push(Transcript::load("handshake").as_process());
@@ -2400,15 +2596,98 @@ async fn host_mcp_servers_are_refused_before_spawning_codex() {
             0,
             "expected unsupported MCP configuration to be refused before spawning Codex"
         );
+        let error = match result {
+            Ok(_) => panic!("expected the typed MCP passthrough refusal"),
+            Err(error) => error,
+        };
         assert!(
             matches!(
-                result,
-                Err(mango_external_agents::Error::HostConfiguration {
+                error.cause(),
+                mango_external_agents::Error::HostConfiguration {
                     expected: "no MCP servers for a harness without MCP passthrough",
-                    ref received,
-                }) if received == "MCP server count 1"
+                    received,
+                } if received == "MCP server count 1"
             ),
             "expected the typed MCP passthrough refusal"
         );
+        assert_eq!(
+            error.dispatch(),
+            mango_external_agents::Dispatch::NotSubmitted
+        );
     }
+}
+
+/// Codex has no "drop my override and fall back to config.toml" surface on `thread/start` or
+/// `thread/resume`: neither accepts anything meaning "unset this". A patch that asks for a reset
+/// at open time is refused explicitly rather than silently encoded as if nothing had been asked
+/// for — which is what `overrides()` reading `ConfigurationChange::Reset` as absent would
+/// otherwise do.
+#[tokio::test]
+async fn a_reset_requested_at_open_is_refused_rather_than_silently_dropped() {
+    let (host, launcher) = host_replaying(&["turn"]);
+    let request = OpenSession::new("chat-1")
+        .with_configuration(ConfigurationPatch::new().level(ConfigurationChange::Reset));
+
+    let error = match CodexHarness::new().open_session(&host, request).await {
+        Ok(_) => panic!("expected a reset request to be refused rather than accepted"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error.cause(),
+            mango_external_agents::Error::HostConfiguration { .. }
+        ),
+        "expected a typed configuration refusal, received {error:?}"
+    );
+    assert!(
+        error.to_string().contains("remove the override on level"),
+        "expected the refusal to name what was asked, received {error}"
+    );
+    assert_eq!(
+        launcher.launches().len(),
+        1,
+        "expected the refusal before thread/start, not a vendor round trip"
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"thread/start\"")),
+        "expected no thread/start to reach the vendor for a patch this harness cannot encode"
+    );
+}
+
+/// The same refusal, for a reset asked of a running session's own turn. `turn/start` has no reset
+/// semantics either, so this must fail before anything reaches the wire rather than being read as
+/// an omitted axis.
+#[tokio::test]
+async fn a_reset_requested_on_a_turn_is_refused_rather_than_silently_dropped() {
+    let (session, launcher) = open("turn").await;
+    let before = launcher.written().len();
+
+    let error = session
+        .start_turn(
+            TurnRequest::new("turn-1", "mango")
+                .with_configuration(ConfigurationPatch::new().routing(ConfigurationChange::Reset)),
+        )
+        .await
+        .expect_err("expected a reset request to be refused rather than accepted");
+
+    assert!(
+        matches!(
+            error.cause(),
+            mango_external_agents::Error::HostConfiguration { .. }
+        ),
+        "expected a typed configuration refusal, received {error:?}"
+    );
+    assert!(
+        error.to_string().contains("remove the override on routing"),
+        "expected the refusal to name what was asked, received {error}"
+    );
+    assert_eq!(
+        launcher.written().len(),
+        before,
+        "expected no turn/start to reach the vendor for a patch this harness cannot encode"
+    );
 }

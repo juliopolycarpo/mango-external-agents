@@ -81,7 +81,11 @@ claude --print
 - **Omitted permissions preserve the user's CLI profile.** No permission mode or prompt override
   is passed until the host selects permissions. Claude's single mode flag requires both axes on
   the first selection; subsequent partial updates inherit the other axis. Accepted settings persist
-  in `Session::configuration()` and are repeated on later batch invocations.
+  in `Session::snapshot().configuration.accepted` and are repeated on later batch invocations.
+  Permission settings stay out of `observed`: a flag this harness put on a command line is a flag
+  it encoded, not a setting the vendor reported it is running under. `system/init` does report a
+  model for a live run, so that one value is published in
+  `Session::snapshot().configuration.observed.model` ([headless.md](https://code.claude.com/docs/en/headless.md)).
 - **`--permission-prompts none`** accompanies an explicit permission mode only on a build that
   declares it (2.1.259+). It is
   pinning, not a fix: the vendor's current default is `host`, and this harness is not an answering
@@ -107,14 +111,14 @@ id, and each turn spawns, streams and reaps its own child.
   a host holds a resumable handle before any tokens are spent. The first turn passes
   `--session-id`; every later one passes `--resume`, using whatever handle the run's own
   `system/init` reported.
-- **`Session::ids()` is the handle in force; `Session::info()` is the opening snapshot.** A run may
-  report a `session_id` other than the one `--session-id` proposed, and from then on that is the
-  only handle `--resume` accepts — so it is the one a host persists. `info().ids` keeps the id
-  opening answered with, which is what makes the change legible rather than silent.
+- **`Session::ids()` and `Session::snapshot().ids` are the handle in force.** A run may report a
+  `session_id` other than the one `--session-id` proposed, and from then on that is the only handle
+  `--resume` accepts — so it is the one a host persists. The opening snapshot remains available to
+  the host that retained it when the session was opened.
 - **Resume is vetted for shape, never verified for existence.** Verifying that a conversation is
   still there would cost a process launch per open, and a wrong guess is recoverable: a session the
   vendor has forgotten fails at the first turn with the vendor's own message. `ResumeMode::Fallback`
-  therefore behaves exactly like `Strict`, and `SessionInfo::fallback_reason` is always `None` —
+  therefore behaves exactly like `Strict`, and `SessionSnapshot::fallback_reason` is always `None` —
   nothing was verified, so nothing fell back. Implementing a real fallback means retrying a failed
   first turn under a fresh id, and that waits for a stable signal to key off (today the only one is
   vendor prose).
@@ -213,6 +217,12 @@ A mode this build's own `--permission-mode` does not list narrows that cell to
 
 `Capabilities::interactive_approvals` is **false**. No `ApprovalRequested` is ever emitted, and
 `Session::respond` returns `Error::NotSupported { capability: Capability::InteractiveApprovals }`.
+`Session::answer` and `Session::configure` refuse the same way, under `Capability::Questions` and
+`Capability::SessionConfiguration`: Claude Code's headless surface asks no typed questions, and its
+model and permission-mode flags are argv on a fresh child rather than settings an open session can
+be re-pointed at. `Discovery::configuration_catalog` is empty for the same reason — the CLI
+publishes no settings surface to enumerate, which is a different statement from a catalog whose rows
+are all unsupported.
 A tool the permission mode refuses arrives as `system/permission_denied` followed by a
 `tool_result` marked in error, and is rendered as one failed activity carrying the vendor's own
 reason — the run continues and exits zero, so a refused tool is not a failed turn.
@@ -242,6 +252,11 @@ This is a measured verdict, and the measurement is worth recording because it is
 Three probes, all documented, read-only and non-secret: `claude --version`, `claude --help` and
 `claude auth status` ("Show authentication status as JSON. Use `--text` for human-readable output.
 Exits with code 0 if logged in, 1 if not").
+
+An accepted `DiscoveryReceipt` reuses its version and authentication answers when opening a
+session, but re-runs `--help`. The receipt records normalized discovery facts, not the exact help
+grammar needed to decide current safe argv such as permission modes, effort levels and MCP support;
+inventing that grammar from a capability summary would risk passing an undeclared flag.
 
 `auth status` returns more personal data than any other vendor's status call — `email`, `orgId`,
 `orgName`, `projectsDirectory`, `subscriptionType`. **None of it leaves the parser.** Two facts do:

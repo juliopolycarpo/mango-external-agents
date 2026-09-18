@@ -13,11 +13,16 @@ async fn unsupported_host_mcp_servers_are_refused_before_launch() {
         .open_session(&host(launcher.clone()), request)
         .await;
     match result {
-        Err(Error::HostConfiguration {
-            expected: "no MCP servers for a harness without MCP passthrough",
-            received,
-        }) => assert_eq!(received, "MCP server count 1"),
-        Err(error) => panic!("expected an unsupported MCP configuration, received {error}"),
+        Err(error) => {
+            assert!(matches!(error.cause(), Error::HostConfiguration {
+                expected: "no MCP servers for a harness without MCP passthrough",
+                received,
+            } if received == "MCP server count 1"));
+            assert_eq!(
+                error.dispatch(),
+                mango_external_agents::Dispatch::NotSubmitted
+            );
+        }
         Ok(session) => {
             session
                 .close(CloseReason::Requested)
@@ -80,7 +85,7 @@ async fn a_fallback_resume_reports_why_the_load_failed() {
         .await
         .expect("expected the fallback to open a fresh session");
 
-    let info = session.info();
+    let info = session.snapshot();
     assert!(!info.resumed, "expected a fresh conversation");
     let reason = info
         .fallback_reason

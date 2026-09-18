@@ -45,6 +45,12 @@ on the wire)".
 | `turn/interrupt`                | `Session::cancel`                      |
 | `review/start`                  | `Session::start_review`                |
 
+Listing and account usage are session-scoped in this adapter: they use the open session's
+app-server connection. Its advertised `session_listing` and `account_usage` capabilities refer to
+the `Session` methods above. The separate `Harness::list_sessions` and `Harness::account_usage`
+services remain `Error::NotSupported`; this adapter does not launch a short-lived app-server for
+a picker before opening a conversation.
+
 `clientInfo.name` is always the host's own name, from `HostContext::client_info`. The README says
 this identifies the client to OpenAI's compliance logging platform, so writing anything else would
 be a misattribution rather than a nicety.
@@ -68,7 +74,7 @@ can represent parent-child activity and approval ownership.
 One long-lived `codex app-server` per session. `thread/start` opens a conversation;
 `thread/resume` continues one, with `excludeTurns: true` — the vendor keeps the transcript it
 wrote, and this library never replays one into anybody's context. `ResumeMode::Fallback` starts a
-new thread and records why in `SessionInfo::fallback_reason`.
+new thread and records why in `SessionSnapshot::fallback_reason`.
 
 `turn/start` on a live turn is taken by the app-server as a **steer** — its own documentation says
 `turnTrigger` is "ignored when this request steers an already-active turn". A host that meant a new
@@ -112,7 +118,7 @@ completion; a stalled consumer never receives a cancellation marker without its 
 
 All six explicit (level, routing) pairs are supported. Omitted permission fields leave the user's
 Codex profile in control: the harness sends no sandbox, approval policy or reviewer override for
-an axis the host has never selected. `Configuration::default()` does not impose read-only mode.
+an axis the host has never selected. An empty `ConfigurationPatch` does not impose read-only mode.
 A selected level is two vendor settings that move together,
 because setting one without the other produces a configuration nobody chose:
 
@@ -139,9 +145,14 @@ excludes temporary directories. Full access is sent only from a host-selected co
 These fields use the pinned CLI's schema, which does not yet declare the newer `ReadOnlyAccess`
 fields shown in the current online documentation.
 
-Codex persists successful turn overrides. `Session::configuration()` reports the settings a later
-turn inherits; omitted fields retain the last host selection, or the user's Codex defaults if
-there has been no selection. `SessionInfo::effective_configuration` remains the opening snapshot.
+Codex persists successful turn overrides. `Session::snapshot().configuration` reports the settings
+a later turn inherits, split three ways: `requested` is what the host asked for, `accepted` is what
+this harness encoded onto `thread/start` and `turn/start`, and `observed` contains only fields the
+app-server returned while opening the thread. A successful turn override clears an observed value
+only for the axis it actually superseded, because `turn/start` does not report the setting it used.
+An older delayed success cannot clear an observation a newer generation already owns. A patch axis
+left at `keep` retains the last host selection, or the user's Codex defaults if there has been no
+selection.
 Native reviews inherit the same current settings. Hosts use the shared `Session` trait and need
 no Codex-specific permission state machine.
 
@@ -151,14 +162,20 @@ Two of the server's questions are approvals a person can answer:
 `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`. Options come from
 the declared `CommandExecutionApprovalDecision` / `FileChangeApprovalDecision` enums:
 
-| Vendor decision                 | Neutral kind         | Note                                             |
-| ------------------------------- | -------------------- | ------------------------------------------------ |
-| `accept`                        | `AllowOnce`          |                                                  |
-| `acceptForSession`              | `AllowAlways`        |                                                  |
-| `decline`                       | `RejectOnce`         | The turn goes on                                 |
-| `cancel`                        | `Other`, destructive | Stops the turn, which `RejectOnce` must not mean |
-| `acceptWithExecpolicyAmendment` | `Other`, destructive | Only when the request proposed one               |
-| `applyNetworkPolicyAmendment`   | `Other`, destructive | Only when the request proposed one               |
+| Vendor decision                 | Effect  | Scope     | Risk        | Writes a rule | Note                                         |
+| ------------------------------- | ------- | --------- | ----------- | ------------- | -------------------------------------------- |
+| `accept`                        | Allow   | `Once`    | unspecified | no            |                                              |
+| `acceptForSession`              | Allow   | `Session` | unspecified | no            | Codex forgets it when the thread ends        |
+| `decline`                       | Reject  | `Once`    | unspecified | no            | The turn goes on                             |
+| `cancel`                        | `Other` | —         | destructive | no            | Stops the turn, which a reject must not mean |
+| `acceptWithExecpolicyAmendment` | `Other` | —         | destructive | **yes**       | Only when the request proposed one           |
+| `applyNetworkPolicyAmendment`   | `Other` | —         | destructive | **yes**       | Only when the request proposed one           |
+
+Four facts rather than one word. The two amendments are the reason: each one writes a policy Codex
+applies to later requests on its own, and the old vocabulary had no way to say that — `Other` said
+"only a person can weigh this" and nothing about what agreeing would leave behind. Their scope is
+left **unstated**, because Codex does not say how far an amendment reaches, and an unstated reach is
+never read as the narrow one.
 
 The running server also writes an `availableDecisions` member that **its own generated schema does
 not declare**. It is deliberately not read: building the option set a person chooses from out of an

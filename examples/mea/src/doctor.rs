@@ -88,12 +88,12 @@ pub(crate) fn text(report: &DiscoveryReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mango_external_agents::HarnessKind;
+    use mango_external_agents::HarnessId;
 
     #[test]
     fn logged_out_reports_the_vendors_login_command() {
         let report = DiscoveryReport {
-            kind: HarnessKind::Claude,
+            kind: HarnessId::claude(),
             result: Ok(Discovery {
                 gate: GateVerdict::Usable,
                 version: Some("2.1.0".into()),
@@ -121,7 +121,7 @@ mod tests {
             None
         );
         let report = DiscoveryReport {
-            kind: HarnessKind::Codex,
+            kind: HarnessId::codex(),
             result: Err("probe failed".into()),
         };
         assert!(text(&report).contains("probe failed"));
