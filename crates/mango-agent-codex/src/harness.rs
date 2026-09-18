@@ -29,8 +29,8 @@ use crate::discovery::{self, LOGIN_HINT, PROGRAM};
 use crate::permissions::PermissionOverrides;
 use crate::protocol::requests::{
     AccountReadResponse, ApprovalsReviewer, ClientInfo, InitializeParams, InitializeResponse,
-    ModelListParams, ModelListResponse, ThreadResumeParams, ThreadStartParams, ThreadStartResponse,
-    empty_params,
+    ModelListParams, ModelListResponse, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
+    ThreadStartParams, ThreadStartResponse, ThreadSummary, empty_params,
 };
 use crate::protocol::schema::MINIMUM_CODEX_VERSION;
 use crate::protocol::{CODE_PREFIX, PEER_NAME, method};
@@ -223,6 +223,13 @@ impl Harness for CodexHarness {
             .descriptor()
             .resolve_transport(request.transport)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        let cwd = host.cwd().to_str().ok_or_else(|| {
+            Error::HostConfiguration {
+                expected: "a UTF-8 Codex workspace path",
+                received: String::from("a non-UTF-8 authorized directory"),
+            }
+            .with_dispatch(Dispatch::NotSubmitted)
+        })?;
         let executable = self.program_for(&request);
         let transport = stdio::open(
             host,
@@ -246,7 +253,15 @@ impl Harness for CodexHarness {
 
         // Everything from here can fail, and every failure has to take the child with it: a
         // half-opened session leaves a `codex app-server` running with nobody holding its handle.
-        let opened = open_thread(host, &client, &request, effective_transport, mcp_config).await;
+        let opened = open_thread(
+            host,
+            &client,
+            &request,
+            effective_transport,
+            mcp_config,
+            cwd,
+        )
+        .await;
         let (state, thread_id) = match opened {
             Ok(opened) => opened,
             Err(error) => {
@@ -288,6 +303,7 @@ async fn open_thread(
     request: &OpenSession,
     effective_transport: TransportKind,
     mcp_config: Option<BTreeMap<String, serde_json::Value>>,
+    cwd: &str,
 ) -> Result<(SessionState, String)> {
     let handshake: InitializeResponse = client
         .request(
@@ -323,14 +339,15 @@ async fn open_thread(
     }
 
     let vendor = crate::permissions::overrides(&request.configuration);
-    let cwd = host.cwd().to_string_lossy().into_owned();
     let requested_model = request.configuration.model.set_value().cloned();
 
     let (response, resumed, fallback_reason) = match &request.resume {
         Some(resume) => {
+            let workspace_verified =
+                preflight_resume_workspace(client, &resume.native_session_id, cwd).await?;
             let params = ThreadResumeParams {
                 thread_id: resume.native_session_id.clone(),
-                cwd: cwd.clone(),
+                cwd: cwd.to_owned(),
                 model: requested_model.clone(),
                 approval_policy: vendor.approval_policy,
                 sandbox: vendor.sandbox,
@@ -344,14 +361,22 @@ async fn open_thread(
                 .request::<_, ThreadStartResponse>(method::THREAD_RESUME, params)
                 .await
             {
-                Ok(response) => (response, true, None),
+                Ok(response) if workspace_verified => (response, true, None),
+                Ok(_) => {
+                    return Err(Error::HostConfiguration {
+                        expected: "a Codex thread in the host's authorized workspace",
+                        received: String::from(
+                            "thread/read could not verify the original workspace",
+                        ),
+                    });
+                }
                 Err(error)
                     if resume.mode == ResumeMode::Fallback
                         && missing_rollout(&error, &resume.native_session_id) =>
                 {
                     let reason = resume_fallback_reason(method::THREAD_RESUME, &error);
                     (
-                        start_thread(client, &cwd, &requested_model, vendor, &mcp_config).await?,
+                        start_thread(client, cwd, &requested_model, vendor, &mcp_config).await?,
                         false,
                         Some(reason),
                     )
@@ -360,12 +385,21 @@ async fn open_thread(
             }
         }
         None => (
-            start_thread(client, &cwd, &requested_model, vendor, &mcp_config).await?,
+            start_thread(client, cwd, &requested_model, vendor, &mcp_config).await?,
             false,
             None,
         ),
     };
 
+    authorize_thread(
+        &response.thread,
+        request
+            .resume
+            .as_ref()
+            .filter(|_| resumed)
+            .map(|resume| resume.native_session_id.as_str()),
+        cwd,
+    )?;
     let thread_id = response.thread.id.clone();
     let ids = SessionIds {
         session_id: request.session_id.clone(),
@@ -442,6 +476,59 @@ fn missing_rollout(error: &Error, native_session_id: &str) -> bool {
     matches!(error.cause(), Error::Vendor(vendor)
         if vendor.vendor_code.as_deref() == Some("-32600")
             && vendor.message == format!("no rollout found for thread id {native_session_id}"))
+}
+
+/// Proves a native thread's original workspace before loading it for a resumed conversation.
+/// A missing read is left unverified; only the resume method can prove that fallback is safe.
+async fn preflight_resume_workspace(
+    client: &Client,
+    native_session_id: &str,
+    cwd: &str,
+) -> Result<bool> {
+    let read = client
+        .request::<_, ThreadReadResponse>(
+            method::THREAD_READ,
+            ThreadReadParams {
+                thread_id: native_session_id.to_owned(),
+                include_turns: false,
+            },
+        )
+        .await;
+    match read {
+        Ok(read) => {
+            authorize_thread(&read.thread, Some(native_session_id), cwd)?;
+            Ok(true)
+        }
+        Err(error) if thread_not_loaded(&error, native_session_id) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The pinned metadata-only read's missing-thread response, never a generic RPC failure.
+fn thread_not_loaded(error: &Error, native_session_id: &str) -> bool {
+    matches!(error.cause(), Error::Vendor(vendor)
+        if vendor.vendor_code.as_deref() == Some("-32600")
+            && vendor.message == format!("thread not loaded: {native_session_id}"))
+}
+
+/// Rejects a different identity or workspace before a handle can be exposed to the host.
+fn authorize_thread(thread: &ThreadSummary, expected_id: Option<&str>, cwd: &str) -> Result<()> {
+    if let Some(expected_id) = expected_id
+        && thread.id != expected_id
+    {
+        return Err(Error::HostConfiguration {
+            expected: "the requested Codex thread id",
+            received: String::from("a different native thread id"),
+        });
+    }
+    if thread.cwd.as_deref() != Some(cwd) {
+        return Err(Error::HostConfiguration {
+            expected: "a Codex thread in the host's authorized workspace",
+            received: String::from("a missing or different workspace"),
+        });
+    }
+    mango_external_agents::normalize::opaque_id(&thread.id, "native thread id")?;
+    Ok(())
 }
 
 async fn start_thread(

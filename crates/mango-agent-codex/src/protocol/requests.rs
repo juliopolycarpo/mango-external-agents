@@ -180,6 +180,24 @@ pub struct ThreadResumeParams {
     pub exclude_turns: bool,
 }
 
+/// Reads native metadata without loading transcript turns into the response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadParams {
+    /// The native conversation the host intends to resume.
+    pub thread_id: String,
+    /// Always false: workspace authorization needs only thread metadata.
+    pub include_turns: bool,
+}
+
+/// The app-server's metadata-only thread answer.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadResponse {
+    /// The thread identity and original workspace.
+    pub thread: ThreadSummary,
+}
+
 /// One conversation, as much of it as this harness reads.
 ///
 /// The upstream `Thread` carries thirty members; the five kept here are the ones a session id, a

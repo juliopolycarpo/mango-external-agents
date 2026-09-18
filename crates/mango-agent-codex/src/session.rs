@@ -2615,16 +2615,24 @@ pub(crate) async fn list_threads(
     query: SessionQuery,
 ) -> Result<SessionPage> {
     validate_list_workspace(host, &query)?;
+    let cwd = host
+        .cwd()
+        .to_str()
+        .ok_or_else(|| Error::HostConfiguration {
+            expected: "a UTF-8 Codex workspace path",
+            received: String::from("a non-UTF-8 authorized directory"),
+        })?;
     let params = ThreadListParams {
         cursor: query.cursor,
         limit: query.limit,
-        cwd: Some(host.cwd().to_string_lossy().into_owned()),
+        cwd: Some(cwd.to_owned()),
     };
     let page: ThreadListResponse = client.request(method::THREAD_LIST, params).await?;
     Ok(SessionPage {
         sessions: page
             .data
             .into_iter()
+            .filter(|thread| thread.cwd.as_deref() == Some(cwd))
             .map(|thread| NativeSession {
                 native_session_id: thread.id,
                 // A title may be absent; the preview is the first user message when supplied.
@@ -2646,6 +2654,12 @@ pub(crate) async fn list_threads(
 
 /// Refuses a remote or unrelated workspace before any list request or probe launch.
 pub(crate) fn validate_list_workspace(host: &HostContext, query: &SessionQuery) -> Result<()> {
+    if host.cwd().to_str().is_none() {
+        return Err(Error::HostConfiguration {
+            expected: "a UTF-8 Codex workspace path",
+            received: String::from("a non-UTF-8 authorized directory"),
+        });
+    }
     if query
         .workspace_path
         .as_ref()

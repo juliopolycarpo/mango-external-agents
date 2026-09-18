@@ -847,7 +847,11 @@ struct ResumeErrorServer {
 }
 
 /// The captured thread answer, returned to a resume request with that request's id.
-struct ResumeSuccessServer;
+struct ResumeSuccessServer {
+    read_workspace: &'static str,
+    resume_id: Option<&'static str>,
+    resume_workspace: Option<&'static str>,
+}
 
 impl ResumeSuccessServer {
     fn process(self) -> FakeProcess {
@@ -859,9 +863,21 @@ impl ResumeSuccessServer {
             .expect("expected the captured thread answer")
             .clone();
         transcript.as_process_intercepting(move |frame| {
+            if frame["method"] == "thread/read" {
+                return Some(vec![serde_json::json!({
+                    "id": frame["id"],
+                    "result": {"thread": {"id": frame["params"]["threadId"], "cwd": self.read_workspace}},
+                }).to_string()]);
+            }
             (frame["method"] == "thread/resume").then(|| {
                 let mut answer = result.clone();
                 answer["id"] = frame["id"].clone();
+                if let Some(id) = self.resume_id {
+                    answer["result"]["thread"]["id"] = id.into();
+                }
+                if let Some(cwd) = self.resume_workspace {
+                    answer["result"]["thread"]["cwd"] = cwd.into();
+                }
                 vec![answer.to_string()]
             })
         })
@@ -871,7 +887,14 @@ impl ResumeSuccessServer {
 #[tokio::test]
 async fn resumed_codex_thread_receives_the_same_host_mcp_override() {
     let launcher = Arc::new(FakeLauncher::new());
-    launcher.push(ResumeSuccessServer.process());
+    launcher.push(
+        ResumeSuccessServer {
+            read_workspace: "/workspace",
+            resume_id: None,
+            resume_workspace: None,
+        }
+        .process(),
+    );
     let (host, launcher) = with_launcher(launcher, None);
     let native_id = Transcript::load("handshake")
         .thread_id()
@@ -889,6 +912,13 @@ async fn resumed_codex_thread_receives_the_same_host_mcp_override() {
     assert!(session.snapshot().resumed);
     let written = launcher.written();
     assert!(!written.iter().any(|line| line.contains("thread/start")));
+    let read = written
+        .iter()
+        .find(|line| line.contains("thread/read"))
+        .expect("expected a metadata-only workspace preflight");
+    let read: serde_json::Value = serde_json::from_str(read).expect("expected JSON");
+    assert_eq!(read["params"]["threadId"], native_id);
+    assert_eq!(read["params"]["includeTurns"], false);
     let resume = written
         .iter()
         .find(|line| line.contains("thread/resume"))
@@ -901,9 +931,86 @@ async fn resumed_codex_thread_receives_the_same_host_mcp_override() {
     );
 }
 
+#[tokio::test]
+async fn a_foreign_resume_workspace_is_refused_before_loading_a_thread_or_starting_fresh() {
+    for mode in [
+        mango_external_agents::ResumeMode::Strict,
+        mango_external_agents::ResumeMode::Fallback,
+    ] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(
+            ResumeSuccessServer {
+                read_workspace: "/other/workspace",
+                resume_id: None,
+                resume_workspace: None,
+            }
+            .process(),
+        );
+        let (host, launcher) = with_launcher(launcher, None);
+        let native_id = Transcript::load("handshake")
+            .thread_id()
+            .expect("expected a captured thread id");
+        let result = CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1").resuming(&native_id, mode))
+            .await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "a Codex thread in the host's authorized workspace", .. }))
+        );
+        let written = launcher.written();
+        assert!(written.iter().any(|line| line.contains("thread/read")));
+        assert!(!written.iter().any(|line| line.contains("thread/resume")));
+        assert!(!written.iter().any(|line| line.contains("thread/start")));
+    }
+}
+
+#[tokio::test]
+async fn resume_refuses_a_changed_identity_or_workspace_after_a_valid_preflight() {
+    for (changed_id, changed_cwd) in [
+        (Some("different-thread"), None),
+        (None, Some("/other/workspace")),
+    ] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(
+            ResumeSuccessServer {
+                read_workspace: "/workspace",
+                resume_id: changed_id,
+                resume_workspace: changed_cwd,
+            }
+            .process(),
+        );
+        let (host, launcher) = with_launcher(launcher, None);
+        let native_id = Transcript::load("handshake")
+            .thread_id()
+            .expect("expected a captured thread id");
+        let result = CodexHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1")
+                    .resuming(&native_id, mango_external_agents::ResumeMode::Strict),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { .. }))
+        );
+        assert!(
+            !launcher
+                .written()
+                .iter()
+                .any(|line| line.contains("turn/start")),
+            "expected no prompt after a changed resume answer"
+        );
+    }
+}
+
 impl ResumeErrorServer {
     fn process(self) -> FakeProcess {
         Transcript::load("handshake").as_process_intercepting(move |frame| {
+            if frame["method"] == "thread/read" {
+                return Some(vec![serde_json::json!({
+                    "id": frame["id"],
+                    "error": {"code": -32600, "message": format!("thread not loaded: {}", frame["params"]["threadId"].as_str().unwrap_or_default())},
+                }).to_string()]);
+            }
             (frame["method"] == "thread/resume").then(|| {
                 vec![
                     serde_json::json!({
@@ -3141,6 +3248,46 @@ async fn listing_without_a_user_conversation_uses_only_the_authorized_workspace(
     assert_eq!(frame["params"]["limit"], 50);
 }
 
+/// A fake list answer that includes rows the host never authorized.
+struct MixedWorkspaceListServer;
+
+impl MixedWorkspaceListServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake").as_process_intercepting(|frame| {
+            (frame["method"] == "thread/list").then(|| {
+                vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "result": {
+                            "data": [
+                                {"id": "local", "cwd": "/workspace", "preview": "allowed"},
+                                {"id": "foreign", "cwd": "/private", "preview": "secret"},
+                                {"id": "unscoped", "preview": "unknown"},
+                            ],
+                            "nextCursor": null,
+                        },
+                    })
+                    .to_string(),
+                ]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn listing_discards_rows_outside_the_authorized_workspace() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(MixedWorkspaceListServer.process());
+    let (host, _) = with_launcher(launcher, None);
+    let page = CodexHarness::new()
+        .list_sessions(&host, SessionQuery::default())
+        .await
+        .expect("expected a filtered picker page");
+    assert_eq!(page.sessions.len(), 1);
+    assert_eq!(page.sessions[0].native_session_id, "local");
+    assert_eq!(page.sessions[0].preview.as_deref(), Some("allowed"));
+}
+
 #[tokio::test]
 async fn listing_a_different_workspace_is_refused_before_spawning() {
     let (host, launcher) = host_replaying(&[]);
@@ -3154,6 +3301,38 @@ async fn listing_a_different_workspace_is_refused_before_spawning() {
         "expected a workspace authorization refusal"
     );
     assert!(launcher.launches().is_empty(), "expected no child process");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_non_utf8_workspace_is_refused_before_opening_or_listing_codex() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let launcher = Arc::new(FakeLauncher::new());
+    let cwd = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/workspace/\xff".to_vec()));
+    let host = HostContext::builder()
+        .launcher(launcher.clone())
+        .cwd(cwd)
+        .client_info("mango-test", "0.0.1")
+        .environment(EnvSource::from_pairs([("PATH", "/usr/bin")]))
+        .build()
+        .expect("expected a host with an opaque Unix path");
+
+    for result in [
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .map(|_| ()),
+        CodexHarness::new()
+            .list_sessions(&host, SessionQuery::default())
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "a UTF-8 Codex workspace path", .. }))
+        );
+    }
+    assert!(launcher.launches().is_empty());
 }
 
 /// The recorded `account/rateLimits/read`.

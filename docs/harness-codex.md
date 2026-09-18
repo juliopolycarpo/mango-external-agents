@@ -39,6 +39,7 @@ on the wire)".
 | `account/rateLimits/read`       | `Session::refresh_account_usage`       |
 | `model/list`                    | `Discovery::models`                    |
 | `thread/start`, `thread/resume` | `Harness::open_session`                |
+| `thread/read`                   | Metadata-only resume workspace check   |
 | `thread/list`                   | Session and harness-level listing      |
 | `turn/start`                    | `Session::start_turn`                  |
 | `turn/steer`                    | `Session::steer`                       |
@@ -49,7 +50,13 @@ on the wire)".
 page and closes it without starting a thread. A live `Session::list_sessions` reuses its own
 connection. Both paths require the host's authorized working directory as the `cwd` filter and
 refuse a query for another directory. The vendor's cursor, native id, title, preview and Unix
-second timestamps pass through when supplied. Account usage remains session-scoped; the separate
+second timestamps pass through when supplied. Rows with missing or foreign workspace paths are
+discarded even if the server returns them under the `cwd` filter. Before `thread/resume`, the
+harness calls `thread/read` with `includeTurns: false` and requires its native id and original
+working directory to match the request and the host's authorised directory. It checks the resume
+response again before exposing the handle. A `thread/read` absence alone never authorises a fresh
+fallback: the pinned `thread/resume` missing-rollout result must still confirm that outcome.
+Account usage remains session-scoped; the separate
 `Harness::account_usage` service returns `Error::NotSupported`.
 
 `clientInfo.name` is always the host's own name, from `HostContext::client_info`. The README says
