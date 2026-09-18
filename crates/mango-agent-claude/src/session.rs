@@ -197,18 +197,35 @@ impl ClaudeSession {
         let Some(taken) = taken else {
             return Ok(());
         };
-        if let Some(control) = taken.control {
-            let outcome = end_turn(Some(control), reason, self.shared.host.limits()).await?;
-            record_stop(
-                &self.shared,
-                &taken.end,
-                !matches!(outcome, Some(StopOutcome::Interrupted)),
-                reason,
-                false,
-            );
-        }
-        Ok(())
+        await_durable_stop(Arc::clone(&self.shared), taken, reason, false).await
     }
+}
+
+/// Starts teardown before exposing an await. Dropping the caller detaches this task, leaving the
+/// process control owned until it reaps or reports its bounded failure.
+async fn await_durable_stop(
+    shared: Arc<Shared>,
+    taken: TakenTurn,
+    reason: CancelReason,
+    settled: bool,
+) -> Result<()> {
+    let limits = *shared.host.limits();
+    tokio::spawn(async move {
+        let outcome = end_turn(taken.control, reason, &limits).await?;
+        record_stop(
+            &shared,
+            &taken.end,
+            !matches!(outcome, Some(StopOutcome::Interrupted)),
+            reason,
+            settled,
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|_| Error::Launch {
+        program: String::from(PROGRAM),
+        message: String::from("the Claude teardown worker was cancelled"),
+    })?
 }
 
 impl Drop for ClaudeSession {
@@ -872,23 +889,18 @@ impl mango_external_agents::Session for ClaudeSession {
         // release its own resources, so publishing it before the child and its MCP artifact are
         // actually handled lies about the session's lifetime.
         self.shared.core_state.set_status(SessionStatus::Closing);
-        let stopped = end_turn(
-            control
-                .as_ref()
-                .and_then(|taken| taken.control.as_ref().map(Arc::clone)),
-            CancelReason::from(reason),
-            self.shared.host.limits(),
-        )
-        .await;
-        if let (Ok(Some(_)), Some(taken)) = (&stopped, &control) {
-            record_stop(
-                &self.shared,
-                &taken.end,
-                false,
-                CancelReason::from(reason),
-                false,
-            );
-        }
+        let stopped = match control {
+            Some(taken) => {
+                await_durable_stop(
+                    Arc::clone(&self.shared),
+                    taken,
+                    CancelReason::from(reason),
+                    false,
+                )
+                .await
+            }
+            None => Ok(()),
+        };
         // The session releases its reference here. A start still awaiting a child holds its own
         // `Arc` until it releases it just before its post-release ownership check, and that check
         // sees this close and kills the child it launched. Either order is safe: whichever
@@ -902,7 +914,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // disk, but no later session operation can make progress against a lifecycle the close
         // transition already claimed.
         self.shared.core_state.set_status(SessionStatus::Closed);
-        stopped.map(drop).and(cleanup)
+        stopped.and(cleanup)
     }
 }
 
