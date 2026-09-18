@@ -162,6 +162,12 @@ The turn pump writes `Cancelled { reason }` followed by `Completed`; an unread t
 block that control-plane cleanup. Exit 143 is read as a clean stop rather than a failure: putting
 an error in the transcript for something the user asked for is worse than saying nothing.
 
+Close waits for a pending launch and for native cleanup before reporting success. If native cleanup
+fails, it returns the error, keeps the session `Closing`, and preserves the MCP artifact in the
+host's scratch directory because the child may still read it. The host reclaims that artifact after
+independently establishing that no child remains. If native cleanup succeeds but artifact removal
+fails, the session is `Closed` and close reports the removal error.
+
 **The vendor's own turn is left unfinished.** This is a real asymmetry and it is the vendor's
 documented behaviour, not this harness's choice:
 
