@@ -162,8 +162,9 @@ impl EventReceiver {
     ///
     /// For example, a harness passes this receiver to `TurnStream::accepted`.
     pub async fn recv(&mut self) -> Option<AgentEvent> {
+        let buffer = Arc::clone(&self.buffer);
         loop {
-            let changed = self.buffer.changed.notified();
+            let changed = buffer.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             match self.try_recv() {
@@ -175,7 +176,7 @@ impl EventReceiver {
     }
 
     /// Reads without waiting, for example when draining events during a host poll.
-    pub fn try_recv(&self) -> std::result::Result<AgentEvent, TryRecvError> {
+    pub fn try_recv(&mut self) -> std::result::Result<AgentEvent, TryRecvError> {
         let mut state = self
             .buffer
             .state
