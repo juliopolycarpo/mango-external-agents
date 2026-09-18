@@ -98,6 +98,22 @@ pub(crate) struct TurnHandle {
 ///
 /// A request remains harness-owned while a standing refusal or broker decision is in progress. Only
 /// an undecided request becomes host-answerable, immediately before its event is emitted.
+/// Settles the questions a cancellation owes, however its own answer turns out.
+///
+/// The expiry path answers one question and notifies the agent, and either call can fail on a
+/// connection the peer has already dropped. Both are `?`, so the withdrawal cannot be the
+/// statement after them: the one case that needs it most is the one that never reaches it. As a
+/// guard it runs on the early return too, and the obligation survives a later edit that moves the
+/// lines around. There is no test behind this, and there cannot be one yet — the SDK only builds a
+/// `Responder` inside a live connection, so the failure it guards against needs a dead one.
+struct WithdrawOnDrop<'a>(&'a SessionState);
+
+impl Drop for WithdrawOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.withdraw_pending();
+    }
+}
+
 struct PendingApproval {
     responder: Responder<RequestPermissionResponse>,
     host_answerable: bool,
@@ -529,9 +545,13 @@ impl SessionState {
         pending.announce();
         let Some(option_id) = pending.expiry_option.as_ref() else {
             cancelling.get_or_insert(CancelReason::Timeout);
+            // Structural rather than ordered: both calls below leave through `?`, and a question
+            // stranded in the map holds a responder the agent is still waiting on and a slot
+            // against `max_pending_requests` for the rest of the session. A guard settles the
+            // debt on every exit, so no later rearrangement of these two lines can strand it.
+            let _debts = WithdrawOnDrop(self);
             let sent = pending.connection.send_notification(pending.cancel);
             pending.responder.respond(permission::cancelled())?;
-            self.withdraw_pending();
             sent?;
             return Ok(Answered::AlreadyResolved);
         };
@@ -542,6 +562,9 @@ impl SessionState {
     }
 
     /// Withdraws one pending request when its turn cannot continue.
+    ///
+    /// Sibling of [`SessionState::withdraw_pending`]; see `WithdrawOnDrop` for why the sweeping
+    /// form is reached from a guard rather than from a statement.
     pub(crate) fn withdraw_pending_by_id(&self, id: &str) -> agent_client_protocol::Result<()> {
         let pending = self.lock_pending().remove(id);
         match pending {
