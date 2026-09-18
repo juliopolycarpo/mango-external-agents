@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use mango_external_agents::event::EventKind;
 use mango_external_agents::{
-    BrokerDecision, CancelReason, CloseReason, Error, PermissionBroker, Result, Session,
-    TurnRequest, TurnStream,
+    ActivityContent, BrokerDecision, CancelReason, CloseReason, Error, PermissionBroker, Result,
+    Session, TurnRequest, TurnStream,
 };
 
 /// How long one turn is given before it is cancelled.
@@ -78,6 +78,28 @@ async fn print_turn(
         }
         match &event.kind {
             EventKind::TextDelta { text } if !json => print!("{text}"),
+            // A question is not a permission, and this is the branch that proves it: nothing here
+            // consults the broker, and answering grants the agent nothing.
+            EventKind::QuestionAsked { request } => {
+                if !json {
+                    println!("{}", serde_json::json!(event.kind));
+                }
+                session
+                    .answer(crate::ask::answer_round(request).await)
+                    .await?;
+            }
+            EventKind::ActivityStarted { activity, .. } if !json => {
+                println!("{}", serde_json::json!(event.kind));
+                print_content(activity.content.as_ref());
+            }
+            EventKind::ActivityUpdated { update, .. } if !json => {
+                println!("{}", serde_json::json!(event.kind));
+                print_content(update.content.as_ref());
+            }
+            EventKind::ActivityCompleted { result, .. } if !json => {
+                println!("{}", serde_json::json!(event.kind));
+                print_content(result.content.as_ref());
+            }
             EventKind::ApprovalRequested { request } => {
                 if !json {
                     println!("{}", serde_json::json!(event.kind));
@@ -105,6 +127,32 @@ async fn print_turn(
         }
     }
     Ok(())
+}
+
+/// Renders structured content as the structure it is, beside the JSON the line above printed.
+///
+/// The JSON already carries every field; this exists so a person running the smoke tool can see at
+/// a glance that a plan arrived as steps and a diff as files, which is the whole reason the
+/// harnesses stopped flattening them into a sentence.
+fn print_content(content: Option<&ActivityContent>) {
+    match content {
+        Some(ActivityContent::Plan { steps }) => {
+            for step in steps {
+                println!("    [{}] {}", step.status, step.title);
+            }
+        }
+        Some(ActivityContent::Diff { files }) => {
+            for file in files {
+                let counts = match (file.added_lines, file.removed_lines) {
+                    (Some(added), Some(removed)) => format!(" (+{added} -{removed})"),
+                    _ => String::new(),
+                };
+                println!("    {}{counts}", file.path);
+            }
+        }
+        Some(ActivityContent::Output { text }) => println!("    {text}"),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +202,55 @@ mod tests {
             .await
             .expect_err("expected the session to have been closed");
         assert!(matches!(error, Error::Closed { subject: "session" }));
+    }
+
+    /// The branch a question takes, and the reason it is a separate test from the approval above:
+    /// a turn that stops to ask something is a turn no broker may answer, so nothing but the
+    /// question path can unblock it. Before this, `mea` printed the question and waited for a
+    /// deadline that ends the turn.
+    #[tokio::test(start_paused = true)]
+    async fn answers_a_question_without_consulting_the_broker_and_closes_the_session() {
+        let broker = RecordingBroker::default();
+        let session = FakeHarness::new()
+            .asking_a_question()
+            .open_session(&host(), OpenSession::new("mea-question"))
+            .await
+            .expect("expected a fake session");
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::run_with_broker(
+                session.as_ref(),
+                TurnRequest::new("mea-turn-1", "which branch?"),
+                true,
+                &broker,
+            ),
+        )
+        .await
+        .expect("expected mea to answer the question instead of waiting")
+        .expect("expected the turn to finish");
+
+        assert!(
+            !broker.consulted.load(Ordering::SeqCst),
+            "a question grants no authority, so no broker may be asked one"
+        );
+    }
+
+    /// A broker that records whether anything ever asked it to decide.
+    #[derive(Default)]
+    struct RecordingBroker {
+        consulted: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl mango_external_agents::PermissionBroker for RecordingBroker {
+        async fn decide(
+            &self,
+            _request: &mango_external_agents::PermissionRequest,
+        ) -> mango_external_agents::BrokerDecision {
+            self.consulted.store(true, Ordering::SeqCst);
+            mango_external_agents::BrokerDecision::Ask
+        }
     }
 
     #[tokio::test]

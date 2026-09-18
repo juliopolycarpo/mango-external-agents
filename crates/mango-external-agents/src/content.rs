@@ -50,6 +50,18 @@ pub enum PlanStepStatus {
     Dropped,
 }
 
+impl fmt::Display for PlanStepStatus {
+    /// The status as one lowercase word, for a host rendering a checklist.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in progress",
+            Self::Completed => "completed",
+            Self::Dropped => "dropped",
+        })
+    }
+}
+
 /// How important one plan step is, as the vendor ranked it.
 ///
 /// Absent where the vendor states no ranking. An unranked step is one nobody ranked, not a
@@ -167,6 +179,18 @@ pub enum FileChangeKind {
     Deleted,
     /// It is at a different path.
     Renamed,
+}
+
+impl fmt::Display for FileChangeKind {
+    /// What happened, as one lowercase word.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Created => "created",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+        })
+    }
 }
 
 /// One file an activity touched.

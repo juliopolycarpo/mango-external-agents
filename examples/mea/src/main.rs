@@ -4,6 +4,7 @@
 //! conversation with terminal approvals and optional NDJSON. `capture` records public contracts
 //! and explicit archival transcripts. The binary is built from source and is not published.
 
+mod ask;
 mod capture;
 mod doctor;
 mod options;
