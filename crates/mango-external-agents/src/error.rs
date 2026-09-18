@@ -458,10 +458,11 @@ impl Error {
 
     /// Whether an identical retry could plausibly succeed.
     ///
-    /// Only a vendor failure can say so; everything else is a statement about this call being
-    /// wrong, or about a link that is already gone.
+    /// A busy session may be retried after its owner finishes. Other retryable refusals come
+    /// from the vendor. Dispatch certainty must still be checked before replaying any request.
     pub fn retryable(&self) -> bool {
         match self {
+            Self::Busy => true,
             Self::Operation { source, .. } => source.retryable(),
             Self::Vendor(error) => error.retryable,
             _ => false,
