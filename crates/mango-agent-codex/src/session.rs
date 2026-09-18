@@ -960,7 +960,19 @@ impl PeerHandler for CodexHandler {
             }
         }
 
-        self.shared.signal_idle_change();
+        // Idle accounting measures *this* turn's silence. A subagent's thread, a detached review,
+        // another turn of this thread and an account-level quota update all ride the same
+        // connection, and resetting the deadline for them would let steady foreign traffic keep a
+        // genuinely hung turn alive for as long as the connection lasts. Routed, not reduced: a
+        // frame can belong to this turn and still render nothing, as `turn/started` and a retrying
+        // `error` do, and withholding the reset for those would time out a turn that is working.
+        if reducer::routes_to_active_turn(
+            &notification,
+            self.shared.thread_id(),
+            Some(active_route.native_turn_id.as_str()),
+        ) {
+            self.shared.signal_idle_change();
+        }
 
         let outcome = reducer::reduce_for_active_turn(
             &notification,

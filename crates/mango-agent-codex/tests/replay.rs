@@ -18,7 +18,7 @@ use mango_external_agents::permission::{
     BrokerDecision, DecisionSource, PermissionBroker, PermissionEffect, PermissionRequest,
     PermissionResponse,
 };
-use mango_external_agents::testing::{FakeLauncher, FakeProcess};
+use mango_external_agents::testing::{Announcer, FakeLauncher, FakeProcess};
 use mango_external_agents::{
     ApprovalRouting, CancelReason, Clock, CloseReason, ConfigurationChange, ConfigurationPatch,
     EnvSource, ExitStatus, Harness, HostContext, InterruptOutcome, LaunchSpec, ManagedProcess,
@@ -1653,6 +1653,120 @@ async fn an_idle_native_turn_is_cancelled_and_reaped_at_the_hosts_deadline() {
             .iter()
             .any(|line| line.contains("\"turn/interrupt\"") && line.contains("idle-turn")),
         "expected idle expiry to interrupt the native turn"
+    );
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup after idle cancellation");
+}
+
+/// Foreign traffic on the shared connection is not this turn's progress.
+///
+/// A subagent's thread, a detached review's and an account-level quota update all arrive on the
+/// same pipe. Restarting the idle deadline for them let steady unrelated traffic keep a genuinely
+/// silent turn alive for as long as the connection lasted, which is the one thing
+/// `Limits::idle_timeout` exists to bound.
+#[tokio::test(start_paused = true)]
+async fn traffic_for_another_conversation_does_not_extend_this_turns_idle_deadline() {
+    let transcript = Transcript::load("interrupt");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the recorded thread id");
+    let announcer = Announcer::new();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        transcript
+            .as_process_intercepting(move |frame| {
+                let method = frame.get("method").and_then(serde_json::Value::as_str);
+                let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                match method {
+                    Some("turn/start") => Some(vec![
+                        serde_json::json!({
+                            "id": id,
+                            "result": {"turn": {"id": "idle-turn"}},
+                        })
+                        .to_string(),
+                    ]),
+                    Some("turn/interrupt") => Some(vec![
+                        serde_json::json!({"id": id, "result": {}}).to_string(),
+                        serde_json::json!({
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": thread_id,
+                                "turn": {"id": "idle-turn", "status": "interrupted"},
+                            },
+                        })
+                        .to_string(),
+                    ]),
+                    _ => None,
+                }
+            })
+            .announcing(announcer.clone()),
+    );
+    let mut limits = replay_limits();
+    limits.idle_timeout = std::time::Duration::from_secs(5);
+    let (host, launcher) = with_launcher_limits(launcher, None, limits);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected an active turn");
+    tokio::task::yield_now().await;
+
+    // Another conversation speaking every three seconds against this turn's five second deadline.
+    // Under `start_paused` the runtime advances to the nearest timer, so the noise task and the
+    // idle watcher compete on virtual time exactly as two real peers would on wall-clock time.
+    let noise = tokio::spawn({
+        let announcer = announcer.clone();
+        async move {
+            for round in 0..40_u32 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                announcer.announce(
+                    serde_json::json!({
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": format!("detached-review-{round}"),
+                            "turn": {"id": format!("detached-turn-{round}")},
+                        },
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    });
+
+    // Bounded, so a deadline that never fires reads as a missing interrupt rather than as a hang.
+    let mut interrupted = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"turn/interrupt\"") && line.contains("idle-turn"))
+        {
+            interrupted = true;
+            break;
+        }
+    }
+    noise.abort();
+    assert!(
+        interrupted,
+        "expected the silent turn's idle deadline to expire while another conversation talked, received {} frames and no interrupt",
+        launcher.written().len()
+    );
+
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::Cancelled {
+                reason: CancelReason::Timeout
+            }
+        )),
+        "expected the expired deadline to name its timeout reason, received {events:#?}"
     );
     session
         .close(CloseReason::Shutdown)
