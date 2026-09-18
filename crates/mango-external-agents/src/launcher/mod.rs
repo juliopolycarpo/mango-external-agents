@@ -2,8 +2,8 @@
 //!
 //! Optional on purpose. A host that already owns its sandbox — job objects, cgroups, a container,
 //! a bubblewrap profile — implements the port itself and this module never compiles. What is here
-//! is the ordinary answer: a child in its own process group, no console window on Windows, and an
-//! escalation that asks before it insists.
+//! is the ordinary answer: a child in its own process group on Unix, nested private Job Objects
+//! on Windows, no console window where requested, and an escalation that asks before it insists.
 
 #[cfg(all(feature = "launcher-tokio", windows))]
 mod powershell;

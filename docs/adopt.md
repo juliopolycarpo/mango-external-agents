@@ -275,3 +275,13 @@ On Windows, `TokioLauncher` also resolves installed `.ps1` entrypoints when nati
 resolution fails. It searches only the supplied `PATH`, runs Windows PowerShell from the supplied
 `SystemRoot` with `-File`, and preserves arguments as data. This covers Cursor's official Windows
 launcher without requiring a host to create a wrapper or change execution policy.
+
+Before a Windows child runs, `TokioLauncher` starts it suspended and attaches it to an outer
+[Job Object](https://learn.microsoft.com/windows/win32/procthread/job-objects). It then creates
+the nested Job that terminates the tree. Windows reports the outer Job's direct and nested members
+through its process list, so cancellation waits until that list is empty, including when the
+original child already exited. `ProcessControl::wait` reports the original child independently, so
+contained helpers continue until they finish or the host calls `kill` or drops the control.
+Dropping a handle requests cleanup while the host runtime remains live; the Job's close policy
+terminates remaining members during runtime shutdown. A failed attachment terminates the suspended
+child and reports launch failure rather than returning an uncontained process.

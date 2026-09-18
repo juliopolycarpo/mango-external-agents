@@ -20,14 +20,15 @@ and reaps its process trees.
 
 These are different observations:
 
-| Observation                     | What it proves                                                                                              |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `cancel` request                | The owner requested native cancellation. Protocol acknowledgement may still be pending.                     |
-| Native terminal                 | The vendor ended that turn. Persistent Codex and ACP processes can remain alive.                            |
-| `TurnStream::terminal_status()` | One logical outcome is committed, including failures caused by overflow. It does not prove process reaping. |
-| Stream drained                  | The consumer read all queued events and the reserved terminal.                                              |
-| Successful `close`              | Session cleanup completed. New admission is permanently refused.                                            |
-| Successful process stop         | The launcher completed process-tree cleanup and reaped the leader.                                          |
+| Observation                       | What it proves                                                                                                    |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `cancel` request                  | The owner requested native cancellation. Protocol acknowledgement may still be pending.                           |
+| Native terminal                   | The vendor ended that turn. Persistent Codex and ACP processes can remain alive.                                  |
+| `TurnStream::terminal_status()`   | One logical outcome is committed, including failures caused by overflow. It does not prove process reaping.       |
+| Stream drained                    | The consumer read all queued events and the reserved terminal.                                                    |
+| Successful `close`                | Session cleanup completed. New admission is permanently refused.                                                  |
+| Successful `ProcessControl::wait` | The launched child exited. Its contained descendants can still serve work until they exit or the host stops them. |
+| Successful process stop           | The launcher completed process-tree cleanup, reaped the leader, and observed its containment group empty.         |
 
 `ProcessControl::interrupt` distinguishes a delivered graceful interrupt, no delivery to an already
 exited or stopping child, and an unsupported operation. The Tokio launcher uses SIGINT on Unix and
@@ -36,6 +37,14 @@ implement their platform's interruption mechanism. `stop_process_with_limits` wa
 `kill_grace`, then uses `shutdown_timeout` for each cleanup stage. Tree cleanup still runs after a
 leader exits because descendants may hold the workspace. SIGTERM or forced termination does not
 establish the same vendor continuation state as a clean interrupt.
+
+On Windows, `TokioLauncher` creates each child suspended, places it in an outer [Job Object](https://learn.microsoft.com/windows/win32/procthread/job-objects), then resumes it only
+after the nested terminating Job is ready. A Job contains children created by its members. Cleanup
+terminates the nested Job and waits for the outer Job's direct and nested process list to become
+empty, so a leader exit cannot make a surviving helper look stopped. If setup cannot establish
+that containment, launch fails and the suspended child is terminated. `ProcessControl::wait`
+reports the launched leader separately; a surviving helper remains available until it finishes or
+the host calls `kill` or drops the process control.
 
 Claude's native continuation after an interrupted or killed turn needs particular care. See
 [the Claude contract](harness-claude.md). Cancellation must never silently switch the caller to a
