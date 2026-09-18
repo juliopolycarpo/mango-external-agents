@@ -287,6 +287,7 @@ An accepted `DiscoveryReceipt` reuses its version and authentication answers whe
 session, but re-runs `--help`. The receipt records normalized discovery facts, not the exact help
 grammar needed to decide current safe argv such as permission modes, effort levels and MCP support;
 inventing that grammar from a capability summary would risk passing an undeclared flag.
+A receipt that says the CLI was not installed retains the no-CLI launch refusal without probing it.
 
 `auth status` returns more personal data than any other vendor's status call — `email`, `orgId`,
 `orgName`, `projectsDirectory`, `subscriptionType`. **None of it leaves the parser.** Two facts do:

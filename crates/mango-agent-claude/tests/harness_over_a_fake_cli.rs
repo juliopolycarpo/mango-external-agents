@@ -369,6 +369,43 @@ mod opening_a_session {
     use super::*;
 
     #[tokio::test]
+    async fn a_not_installed_receipt_keeps_the_no_cli_refusal_without_probing() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(
+            HarnessId::claude(),
+            mango_external_agents::Discovery::not_installed(),
+            host.now(),
+        )
+        .with_executable_fingerprint("no-cli")
+        .with_environment_fingerprint("same-environment")
+        .with_authorization_fingerprint("same-authorization")
+        .bind_to_open(
+            harness.descriptor(),
+            &host,
+            &request,
+            DiscoveryReceiptMeasurements::new()
+                .with_executable_fingerprint("no-cli")
+                .with_environment_fingerprint("same-environment")
+                .with_authorization_fingerprint("same-authorization"),
+        )
+        .expect("expected current receipt evidence to match");
+
+        let error = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .map(|_| ())
+            .expect_err("expected a no-CLI refusal");
+        assert!(
+            matches!(error.cause(), Error::Launch { .. }),
+            "expected the no-CLI launch refusal, received {error:?}"
+        );
+        assert!(launcher.launches().is_empty(), "expected no vendor probe");
+    }
+
+    #[tokio::test]
     async fn a_fresh_receipt_reuses_the_version_and_auth_answers_but_rechecks_help() {
         let launcher = Arc::new(FakeClaudeCli::new());
         let harness = ClaudeHarness::new();

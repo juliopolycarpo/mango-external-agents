@@ -185,6 +185,9 @@ impl ClaudeHarness {
         let Some(receipt) = receipt else {
             return self.survey(host, executable).await;
         };
+        if matches!(receipt.discovery.gate, GateVerdict::NotInstalled) {
+            return Survey::default();
+        }
 
         let surface = probe::output(host, executable, &["--help"])
             .await
@@ -196,9 +199,7 @@ impl ClaudeHarness {
             .as_deref()
             .and_then(version::parse);
         let refusal = match receipt.discovery.gate {
-            GateVerdict::NotInstalled | GateVerdict::VersionTooOld { .. } => {
-                Some(SurveyRefusal::VersionTooOld)
-            }
+            GateVerdict::VersionTooOld { .. } => Some(SurveyRefusal::VersionTooOld),
             GateVerdict::MissingRequiredSurface { .. } => {
                 Some(SurveyRefusal::MissingRequiredSurface)
             }
