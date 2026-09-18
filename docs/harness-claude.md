@@ -128,7 +128,8 @@ id, and each turn spawns, streams and reaps its own child.
   remains an unverified candidate in `Session::ids()` while `SessionSnapshot::resumed` is false.
   The first turn passes it to `--resume`; only `system/init` echoing that exact UUID confirms the
   resumed snapshot. A missing, invalid or different id ends that turn with a protocol error instead
-  of presenting another conversation as the requested history. Later valid `system/init` ids still
+  of presenting another conversation as the requested history. Conversation content or a result
+  before that confirmation is refused without emitting it. Later valid `system/init` ids still
   replace the active handle, because they are vendor-issued identities for a conversation this
   session already established.
 

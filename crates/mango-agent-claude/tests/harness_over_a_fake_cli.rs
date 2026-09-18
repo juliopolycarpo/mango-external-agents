@@ -636,6 +636,44 @@ mod opening_a_session {
     }
 
     #[tokio::test]
+    async fn strict_resume_does_not_emit_content_before_identity_confirmation() {
+        let requested = "22222222-3333-4444-5555-666666666666";
+        let different = "33333333-4444-5555-6666-777777777777";
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&format!(
+            r#"{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"text"}}}}}}
+{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"foreign content"}}}}}}
+{{"type":"system","subtype":"init","session_id":"{different}"}}
+{{"type":"result","is_error":false}}"#
+        ))));
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").resuming(requested, ResumeMode::Strict),
+            )
+            .await
+            .expect("expected a strict resume session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        let events = drain(&mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { .. })),
+            "expected a terminal protocol failure, received {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                EventKind::TurnStarted { .. } | EventKind::Error { .. }
+            )),
+            "expected no unconfirmed vendor content, received {events:?}"
+        );
+        assert!(!session.snapshot().resumed);
+    }
+
+    #[tokio::test]
     async fn fails_a_strict_resume_that_ends_without_identity_confirmation() {
         let requested = "22222222-3333-4444-5555-666666666666";
         let launcher = Arc::new(

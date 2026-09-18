@@ -1523,14 +1523,22 @@ async fn pump(
         let Some(record) = StreamRecord::parse(&line) else {
             continue;
         };
-        if record.kind() == Some("result") && resume_confirmation_pending(&shared) {
-            failure = Some(Error::Protocol {
-                expected: String::from(
-                    "a system/init record confirming the requested Claude resume handle before result",
-                ),
-                received: String::from("a result before resume confirmation"),
-            });
-            break;
+        if resume_confirmation_pending(&shared)
+            && !(record.kind() == Some("system") && record.subtype() == Some("init"))
+        {
+            match record.kind() {
+                Some(kind @ ("stream_event" | "assistant" | "user" | "result")) => {
+                    failure = Some(Error::Protocol {
+                        expected: String::from(
+                            "a system/init record confirming the requested Claude resume handle before conversation content or result",
+                        ),
+                        received: format!("a {kind} record before resume confirmation"),
+                    });
+                    break;
+                }
+                // Non-conversation notices say nothing about which history this process loaded.
+                _ => continue,
+            }
         }
         let reduction = reducer.reduce(&record);
         if let Some(init) = reduction.init
