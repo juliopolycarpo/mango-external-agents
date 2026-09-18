@@ -89,6 +89,8 @@ pub(crate) struct TurnHandle {
     finished: Arc<AtomicBool>,
     /// Wakes the prompt owner when native cancellation starts.
     pub(crate) cancellation: mango_external_agents::CancelToken,
+    /// A notification error belongs to this generation, never a later prompt.
+    pub(crate) cancel_failure: Arc<Mutex<Option<String>>>,
     pub(crate) approvals: Arc<ApprovalEvents>,
 }
 
@@ -199,8 +201,6 @@ pub(crate) struct SessionState {
     /// the response coming back. Flattening it would report a shutdown or a withdrawn consent as
     /// "you stopped this turn".
     cancel_reason: Mutex<Option<CancelReason>>,
-    /// A cancellation notification that could not reach the agent.
-    cancel_failure: Mutex<Option<String>>,
     /// Touched only by the notification handler, which the dispatch loop runs one at a time.
     reducer: Mutex<Reducer>,
     /// Questions the agent is waiting on, keyed by [`SessionState::mint_approval_id`]'s id.
@@ -246,7 +246,6 @@ impl SessionState {
             turn_start: Mutex::new(()),
             generations: AtomicU64::new(0),
             cancel_reason: Mutex::new(None),
-            cancel_failure: Mutex::new(None),
             reducer: Mutex::new(Reducer::new()),
             pending: Mutex::new(HashMap::new()),
             next_approval: AtomicU64::new(0),
@@ -294,15 +293,12 @@ impl SessionState {
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
             finished: Arc::new(AtomicBool::new(false)),
             cancellation: mango_external_agents::CancelToken::new(),
+            cancel_failure: Arc::new(Mutex::new(None)),
             approvals: Arc::new(ApprovalEvents::default()),
         };
         *turn = Some(handle.clone());
         *self.lock_reducer() = Reducer::new();
         *self.lock_cancel_reason() = None;
-        *self
-            .cancel_failure
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
         drop(turn);
         for responder in stale {
             let _ = responder.respond(permission::cancelled());
@@ -354,19 +350,11 @@ impl SessionState {
     }
 
     /// Records a failed cancellation write for the prompt owner to publish on its owned stream.
-    pub(crate) fn record_cancel_failure(&self, message: impl Into<String>) {
-        *self
+    pub(crate) fn record_cancel_failure(&self, handle: &TurnHandle, message: impl Into<String>) {
+        *handle
             .cancel_failure
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(message.into());
-    }
-
-    /// Takes the cancellation write failure once the matching prompt owns terminal delivery.
-    pub(crate) fn take_cancel_failure(&self) -> Option<String> {
-        self.cancel_failure
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
     }
 
     /// The running turn, if there is one.
@@ -386,16 +374,16 @@ impl SessionState {
     /// What a `session/prompt` task calls. Its own turn may already have been ended by a `close`, and
     /// a *later* turn may have started in the meantime — so an unconditional take would let a task
     /// that answered late end, and emit the terminal of, a conversation that is not its own.
-    pub(crate) fn end_turn_matching(
+    pub(crate) fn prepare_terminal_matching(
         &self,
         handle: &TurnHandle,
     ) -> Option<(TurnHandle, Option<CancelReason>, Vec<EventKind>)> {
         let (turn, reason, pending, closing) = {
-            let mut active = self.lock_turn();
+            let active = self.lock_turn();
             if active.as_ref()?.generation != handle.generation {
                 return None;
             }
-            let turn = active.take()?;
+            let turn = active.clone()?;
             // These are all owned by the current turn. Capture them before releasing the slot: a
             // newly started prompt clears the reducer and may park approvals of its own.
             let reason = self.lock_cancel_reason().take();
@@ -407,6 +395,17 @@ impl SessionState {
             let _ = responder.respond(permission::cancelled());
         }
         Some((turn, reason, closing))
+    }
+
+    /// Releases an already-terminal generation after its stream outcome is committed.
+    pub(crate) fn release_turn_matching(&self, handle: &TurnHandle) {
+        let mut active = self.lock_turn();
+        if active
+            .as_ref()
+            .is_some_and(|current| current.generation == handle.generation)
+        {
+            active.take();
+        }
     }
 
     /// The events and session facts one frame produces, computed under the guard because the
@@ -1193,8 +1192,9 @@ mod tests {
         assert!(state.begin_cancellation(CancelReason::ConsentRevoked));
 
         let (_, reason, _) = state
-            .end_turn_matching(&first)
+            .prepare_terminal_matching(&first)
             .expect("expected the first turn to still own the slot");
+        state.release_turn_matching(&first);
         state
             .begin_turn(sink(&host, "turn-2"), Some(PermissionLevel::Default))
             .expect("expected the second turn to acquire the released slot");
@@ -1211,8 +1211,9 @@ mod tests {
             .begin_turn(sink(&host, "turn-1"), Some(PermissionLevel::Default))
             .expect("expected the first turn");
         state
-            .end_turn_matching(&first)
+            .prepare_terminal_matching(&first)
             .expect("expected the installed handle to end");
+        state.release_turn_matching(&first);
 
         assert!(
             !state.can_submit_prompt(&first),

@@ -14,8 +14,8 @@ use mango_agent_acp::{AcpHarness, AcpProfile, SessionModeIds};
 use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, RecordingBroker};
 use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
-    Configuration, ConfigurationChange, ConfigurationPatch, DecisionSource, Error, EventKind,
-    Harness, HostContext, Limits, OpenSession, PermissionLevel, Session, SessionStatus,
+    Configuration, ConfigurationChange, ConfigurationPatch, DecisionSource, Dispatch, Error,
+    EventKind, Harness, HostContext, Limits, OpenSession, PermissionLevel, Session, SessionStatus,
     SessionSubscription, TurnRequest, TurnStream, VendorInfo,
 };
 
@@ -705,6 +705,60 @@ async fn a_second_turn_is_refused_while_one_is_in_flight() {
         .expect_err("expected a refusal, received a second turn");
 
     assert!(matches!(error.cause(), Error::Busy), "received {error:?}");
+}
+
+/// ACP queues a prompt locally but does not acknowledge that the peer received it.
+#[tokio::test]
+async fn an_accepted_acp_prompt_keeps_replay_safety_unknown() {
+    let (session, _launcher) =
+        open(FakeAcpAgent::new().never_finishing_turns(), permissive()).await;
+
+    let turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected a prompt stream");
+
+    assert_eq!(turn.dispatch(), Dispatch::AcceptanceUnknown);
+}
+
+/// Revocation between session setup and prompt admission must not queue native work.
+#[tokio::test]
+async fn a_revoked_host_cannot_admit_an_acp_prompt() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let cancel = CancelToken::new();
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .cancel(cancel.clone())
+        .build()
+        .expect("expected a host");
+    let session = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session before revocation");
+
+    cancel.cancel();
+    let error = refusal(session.start_turn(TurnRequest::new("turn-1", "one")).await);
+    assert!(
+        matches!(
+            error.cause(),
+            Error::Cancelled {
+                reason: CancelReason::Shutdown
+            }
+        ),
+        "received {error:?}"
+    );
+    assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("session/prompt")),
+        "revoked host must not queue a prompt, received {:?}",
+        launcher.written()
+    );
 }
 
 #[tokio::test]

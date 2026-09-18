@@ -80,6 +80,10 @@ then escalates through the host's process control if the prompt remains live. Th
 installed until that native work can no longer report, and each turn carries a generation so a late
 prompt can only ever end its own turn.
 
+ACP v1 does not acknowledge a submitted prompt or assign it a turn handle. The SDK accepting the
+request into its outgoing queue is therefore `Dispatch::AcceptanceUnknown`: after a broken pipe, a
+host cannot safely replay the same prompt without knowing whether the agent received it.
+
 `start_turn` and `close` share the core lifecycle gate while they synchronously claim the prompt slot
 or close the session. The gate is released before every await, so a close either sees a claimed prompt
 to end or prevents the start from submitting one after teardown begins.
