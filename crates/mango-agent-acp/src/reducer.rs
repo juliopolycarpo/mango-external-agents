@@ -419,6 +419,14 @@ fn content_text(content: &[ToolCallContent]) -> Option<String> {
 /// Never a unified diff synthesised from the two texts: the core forbids computing one
 /// representation of a change from another, so `old_text`/`new_text` are carried as ACP sent them
 /// and nothing here builds a patch out of them.
+///
+/// The `kind` falls out of [`FileChange::with_texts`], which reads an absent `oldText` as a new
+/// file — ACP's own words for that field are "the original content (None for new files)". It is the
+/// one kind in this crate that is read rather than stated, and the caveat is that the schema crate
+/// marks `oldText` `DefaultOnError`: an agent sending a malformed one produces the same `None` an
+/// omitted one does, and that file is reported as created. Following the protocol's own definition
+/// is the documented behaviour; the alternative is dropping the signal for every honest agent to
+/// guard against a broken one.
 fn content_diffs(content: &[ToolCallContent]) -> Vec<FileChange> {
     content
         .iter()

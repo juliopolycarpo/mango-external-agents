@@ -155,6 +155,13 @@ reaches a host as `content` rather than being flattened:
 | a [`tool_call` diff block](https://agentclientprotocol.com/protocol/v1/tool-calls#content) | `Diff { files }`, one `FileChange` per block, `old_text`/`new_text` carried as sent |
 | a tool call's own text, when it sends no diff                                              | `Output { text }`                                                                   |
 
+A diff block's `kind` is the one this crate reads rather than one a vendor states: ACP defines
+`oldText` as "the original content (None for new files)", so its absence is `Created` and its
+presence is `Modified`. The schema crate marks that field `DefaultOnError`, so an agent sending a
+*malformed* `oldText` produces the same absence an omitted one does and its file is reported as
+created. Following the protocol's own definition is the documented behaviour; the alternative drops
+a real signal for every honest agent to guard against a broken one.
+
 A diff block wins the one content slot on a call that sends both; the text alongside it is treated as
 commentary and stays in `detail` — this crate does not synthesise a unified diff from `old_text` and
 `new_text`, or a `FileChange` from `locations`, which reaches a host only as a bounded count under
