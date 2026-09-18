@@ -401,6 +401,8 @@ pub struct Client {
 struct ClientState {
     sender: Mutex<Box<dyn LinkSender>>,
     pending: Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, JsonRpcError>>>>,
+    /// The connection's runtime also owns cleanup when a request is dropped on another thread.
+    runtime: tokio::runtime::Handle,
     options: ClientOptions,
     next_id: AtomicU64,
     closed: AtomicBool,
@@ -423,14 +425,12 @@ impl Drop for PendingCall {
             pending.remove(&self.id);
             return;
         }
-        // Off a runtime there is nothing to spawn onto, and `tokio::spawn` would panic inside a
-        // `Drop`. A close or a dying pump fails the entry that is left behind either way.
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
+        // A host can drop this future outside the connection's runtime. Keep cleanup on the
+        // runtime that owns the pump rather than retaining an abandoned correlation until the
+        // next request or close. The host keeps that runtime alive through session shutdown.
         let state = Arc::clone(&self.state);
         let id = self.id.clone();
-        runtime.spawn(async move {
+        self.state.runtime.spawn(async move {
             state.pending.lock().await.remove(&id);
         });
     }
@@ -452,6 +452,7 @@ impl Client {
         let state = Arc::new(ClientState {
             sender: Mutex::new(sender),
             pending: Mutex::new(HashMap::new()),
+            runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
@@ -1954,21 +1955,42 @@ mod tests {
     async fn dropping_a_request_off_a_runtime_cleans_up_without_panicking() {
         let link = ScriptedLink::new();
         let client = Client::connect(
-            link.into_link(),
+            link.clone().into_link(),
             RecordingHandler::arc(None),
             ClientOptions::default(),
         );
+        let mut request = Box::pin(client.request::<_, Value>("test/held", json!({})));
+        std::future::poll_fn(|cx| {
+            assert!(
+                request.as_mut().poll(cx).is_pending(),
+                "expected the submitted request to wait for its peer"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        link.wait_for_sent(1).await;
         let state = Arc::clone(&client.state);
         // Held for the whole drop, so the guard's `try_lock` fails and it has to take the
         // deferred path. Without this the fast path succeeds and the test proves nothing.
         let held = state.pending.lock().await;
-        let guard = super::PendingCall {
-            state: Arc::clone(&state),
-            id: String::from("1"),
-        };
-        std::thread::spawn(move || drop(guard))
-            .join()
-            .expect("expected dropping a request off a runtime not to panic");
+        assert_eq!(held.len(), 1, "expected one submitted correlation entry");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || drop(request))
+                .join()
+                .expect("expected dropping a request off a runtime not to panic");
+        });
         drop(held);
+        let cleaned = tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.pending.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            cleaned.is_ok(),
+            "expected abandoned request correlation to be removed without another call or close; received {} pending entries",
+            state.pending.lock().await.len()
+        );
     }
 }
