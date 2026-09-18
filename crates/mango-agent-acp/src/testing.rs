@@ -81,6 +81,8 @@ pub struct FakeAcpAgent {
     config_options: Option<Vec<serde_json::Value>>,
     /// One config option that refuses its update after earlier options may have succeeded.
     config_option_error: Option<(String, i32, String)>,
+    /// A mode request that fails after earlier configuration options may have succeeded.
+    set_mode_error: Option<(i32, String)>,
     updates: Vec<serde_json::Value>,
     stop_reason: String,
     version_output: String,
@@ -112,6 +114,7 @@ impl FakeAcpAgent {
             reuse_request_id_for_second_ask: false,
             config_options: None,
             config_option_error: None,
+            set_mode_error: None,
             updates: vec![
                 serde_json::json!({
                     "sessionUpdate": "available_commands_update",
@@ -233,6 +236,22 @@ impl FakeAcpAgent {
         self
     }
 
+    /// Refuses `session/set_mode` after advertising a mode.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let agent = FakeAcpAgent::new().with_modes(["plan"])
+    ///     .refusing_set_mode(-32001, "mode rejected");
+    /// let _process = agent.process();
+    /// ```
+    #[must_use]
+    pub fn refusing_set_mode(mut self, code: i32, message: impl Into<String>) -> Self {
+        self.set_mode_error = Some((code, message.into()));
+        self
+    }
+
     /// Does not advertise `session/load`.
     #[must_use]
     pub fn without_load_session(mut self) -> Self {
@@ -337,7 +356,10 @@ impl FakeAcpAgent {
             },
             (Some("session/list"), Some(_id)) if self.holds_listing => Vec::new(),
             (Some("session/list"), Some(id)) => vec![result(id, self.list_result(&message))],
-            (Some("session/set_mode"), Some(id)) => vec![result(id, serde_json::json!({}))],
+            (Some("session/set_mode"), Some(id)) => match &self.set_mode_error {
+                Some((code, message)) => vec![error(id, *code, message)],
+                None => vec![result(id, serde_json::json!({}))],
+            },
             (Some("session/set_config_option"), Some(id)) => {
                 match self.config_option_error.as_ref() {
                     Some((config_id, code, error_message))

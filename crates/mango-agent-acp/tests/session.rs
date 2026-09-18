@@ -2879,6 +2879,50 @@ async fn a_later_config_option_refusal_publishes_the_confirmed_partial_state() {
     );
 }
 
+/// A legacy mode request can fail after an option request succeeded; the prior write remains real.
+#[tokio::test]
+async fn a_later_mode_refusal_publishes_the_confirmed_partial_state() {
+    let agent = FakeAcpAgent::new()
+        .with_modes(["plan"])
+        .with_config_options(vec![serde_json::json!({
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": "small", "options": [
+                { "value": "small", "name": "Small" }, { "value": "large", "name": "Large" }
+            ]
+        })])
+        .refusing_set_mode(-32001, "mode rejected");
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process());
+    let profile = Arc::new(
+        AcpProfile::custom("fake", ["fake-acp", "acp"], VENDOR).with_modes(SessionModeIds {
+            read_only: Some("plan"),
+            ..SessionModeIds::UNKNOWN
+        }),
+    );
+    let session = AcpHarness::new(profile)
+        .open_session(&host(&launcher), OpenSession::new("chat-configuration"))
+        .await
+        .expect("expected the fake session to open");
+
+    let outcome = session
+        .configure(
+            ConfigurationPatch::new()
+                .model(ConfigurationChange::Set(String::from("large")))
+                .level(ConfigurationChange::Set(PermissionLevel::ReadOnly)),
+        )
+        .await;
+    assert_eq!(
+        session.snapshot().configuration.accepted.model.as_deref(),
+        Some("large"),
+        "expected the response-confirmed model to survive the later mode refusal"
+    );
+    assert_eq!(session.snapshot().configuration.accepted.level, None);
+    assert!(
+        matches!(outcome, Ok(ref outcome) if outcome.is_partial()),
+        "expected a partial outcome for the refused mode, received {outcome:?}"
+    );
+}
+
 /// A profile without a full-access mode cannot claim that an ACP configuration applied it.
 #[tokio::test]
 async fn configuration_refuses_full_access_when_the_profile_has_no_matching_mode() {

@@ -174,7 +174,7 @@ change it.
 
 Configuration and prompt submission share one session gate. A patch is refused while a prompt is
 active, and a prompt cannot begin between two option requests. If an agent explicitly refuses a
-later option, the snapshot and partial outcome retain every earlier response-confirmed setting with
+later option or mode request, the snapshot and partial outcome retain every earlier response-confirmed setting with
 `Rollback::NotAttempted`: ACP v1 defines no operation to reset an option safely. A timeout or link
 failure remains an error after publishing only the last confirmed state.
 

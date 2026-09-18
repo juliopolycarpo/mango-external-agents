@@ -316,7 +316,19 @@ impl AcpSession {
                         },
                     ));
                 } else {
-                    self.set_mode(mode).await?;
+                    if let Err(error) = self.set_mode(mode).await {
+                        return self.option_failure_outcome(
+                            ConfigurationOptionId::new("level"),
+                            error,
+                            ConfigurationProgress {
+                                requested,
+                                accepted,
+                                catalog,
+                                applied,
+                                rejected,
+                            },
+                        );
+                    }
                     accepted = accepted.with_level(level);
                     applied.push(ConfigurationOptionId::new("level"));
                 }
