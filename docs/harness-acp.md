@@ -144,6 +144,24 @@ ACP supplies none of its own, and flattening it would report a shutdown as "you 
 Every other reason, `refusal` included, completes the turn: a refusal is the agent ending its own turn,
 and reporting it as an error would tell a host to retry a decision.
 
+### Structured activity content
+
+`plan`, `tool_call` and `tool_call_update` carry more than a title and a one-line `detail`, and it
+reaches a host as `content` rather than being flattened:
+
+| ACP                                                                                        | `ActivityContent`                                                                   |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| [`plan`](https://agentclientprotocol.com/protocol/agent-plan)'s entries                    | `Plan { steps }` — no `id`, because ACP names no id for an entry                    |
+| a [`tool_call` diff block](https://agentclientprotocol.com/protocol/v1/tool-calls#content) | `Diff { files }`, one `FileChange` per block, `old_text`/`new_text` carried as sent |
+| a tool call's own text, when it sends no diff                                              | `Output { text }`                                                                   |
+
+A diff block wins the one content slot on a call that sends both; the text alongside it is treated as
+commentary and stays in `detail` — this crate does not synthesise a unified diff from `old_text` and
+`new_text`, or a `FileChange` from `locations`, which reaches a host only as a bounded count under
+`extensions["locations"]`. `raw_input`/`raw_output` never reach a host: both are unbounded vendor
+payloads. The tool-call activity's `item_id` is the same string as its call id, ACP naming no separate
+id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, not the agent's.
+
 ## Permissions
 
 Two axes, six cells, answered per profile by `profile::matrix`. Routing never varies — who answers an
