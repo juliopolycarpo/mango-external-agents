@@ -186,6 +186,15 @@ id, and each turn spawns, streams and reaps its own child.
 
   <https://code.claude.com/docs/en/headless.md>
 
+**A later turn may not answer from another conversation.** Every turn after the first is spawned
+with `--resume <handle>`, so its `system/init` echoing a different handle means the CLI answered
+from history this session has never seen. That turn fails with `Error::Protocol` and the handle the
+host persisted stays in force; adopting the new one would replace it with a conversation nobody
+read, silently and with no event to notice. The first turn stays lenient on purpose: it *proposes*
+a handle with `--session-id`, and a CLI that started a different conversation anyway has made that
+one the real one, so following its id is the better guess. A strict resume is stricter still — see
+[Session model](#session-model).
+
 ## Cancellation, and what the vendor actually does
 
 `Session::cancel` records a reason and asks the host launcher to interrupt the child first. The
