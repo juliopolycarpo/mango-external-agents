@@ -42,11 +42,23 @@ async fn run_with_broker(
     json: bool,
     broker: &dyn PermissionBroker,
 ) -> Result<()> {
+    run_with_host(session, request, json, broker, &crate::ask::TerminalInput).await
+}
+
+/// The same, with both host-facing surfaces injected: who decides an approval, and who types an
+/// answer. Separate because they are separate authorities — one grants, the other does not.
+async fn run_with_host(
+    session: &dyn Session,
+    request: TurnRequest,
+    json: bool,
+    broker: &dyn PermissionBroker,
+    asker: &dyn crate::ask::QuestionInput,
+) -> Result<()> {
     let outcome = async {
         let mut stream = session.start_turn(request).await?;
         match tokio::time::timeout(
             TURN_DEADLINE,
-            print_turn(session, &mut stream, json, broker),
+            print_turn(session, &mut stream, json, broker, asker),
         )
         .await
         {
@@ -71,6 +83,7 @@ async fn print_turn(
     turn: &mut TurnStream,
     json: bool,
     broker: &dyn PermissionBroker,
+    asker: &dyn crate::ask::QuestionInput,
 ) -> Result<()> {
     while let Some(event) = turn.recv().await {
         if json {
@@ -84,9 +97,8 @@ async fn print_turn(
                 if !json {
                     println!("{}", serde_json::json!(event.kind));
                 }
-                session
-                    .answer(crate::ask::answer_round(request).await)
-                    .await?;
+                let answers = crate::ask::answer_round(asker, request).await;
+                session.answer(answers).await?;
             }
             EventKind::ActivityStarted { activity, .. } if !json => {
                 println!("{}", serde_json::json!(event.kind));
@@ -219,11 +231,12 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_millis(100),
-            super::run_with_broker(
+            super::run_with_host(
                 session.as_ref(),
                 TurnRequest::new("mea-turn-1", "which branch?"),
                 true,
                 &broker,
+                &NobodyTyping,
             ),
         )
         .await
@@ -234,6 +247,18 @@ mod tests {
             !broker.consulted.load(Ordering::SeqCst),
             "a question grants no authority, so no broker may be asked one"
         );
+    }
+
+    /// Nobody at the keyboard, injected rather than inferred from the process's own stdin: a run
+    /// from an interactive shell would otherwise block a thread in `read_line` and fail this test
+    /// for a reason that has nothing to do with what it checks.
+    struct NobodyTyping;
+
+    #[async_trait::async_trait]
+    impl crate::ask::QuestionInput for NobodyTyping {
+        async fn read_line(&self, _prompt: &str) -> Option<String> {
+            None
+        }
     }
 
     /// A broker that records whether anything ever asked it to decide.
