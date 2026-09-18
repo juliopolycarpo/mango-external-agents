@@ -41,13 +41,11 @@ impl UnknownMessageAgent {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn unsupported_session_messages_are_consumed_without_sdk_retry_storage() {
-    let agent = UnknownMessageAgent::default();
+async fn drive_fake_agent(process: FakeProcess) -> (Arc<ConnectionHandle>, FakeLauncher) {
     let launcher = FakeLauncher::new();
-    launcher.push(agent.process());
+    launcher.push(process);
     let host = HostContext::builder()
-        .launcher(Arc::new(launcher))
+        .launcher(Arc::new(launcher.clone()))
         .cwd(std::env::temp_dir())
         .client_info("bounded-acp-tests", "0.1.0")
         .build()
@@ -82,6 +80,13 @@ async fn unsupported_session_messages_are_consumed_without_sdk_retry_storage() {
             .await
             .expect("driver"),
     );
+    (connection, launcher)
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsupported_session_messages_are_consumed_without_sdk_retry_storage() {
+    let agent = UnknownMessageAgent::default();
+    let (connection, _) = drive_fake_agent(agent.process()).await;
     tokio::time::timeout(Duration::from_secs(1), agent.answered.cancelled())
         .await
         .expect("expected method-not-found response instead of retaining unknown session messages");
@@ -95,4 +100,44 @@ async fn unsupported_session_messages_are_consumed_without_sdk_retry_storage() {
     assert_eq!(replies[0]["error"]["code"], -32601);
     connection.begin_shutdown(CancelReason::Shutdown);
     connection.wait_shutdown().await.expect("cleanup");
+}
+
+struct StalledDriver;
+
+impl StalledDriver {
+    fn start() -> tokio::task::JoinHandle<agent_client_protocol::Result<()>> {
+        tokio::spawn(std::future::pending())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborting_and_joining_a_stalled_driver_still_reports_successful_reaping() {
+    let (connection, launcher) = drive_fake_agent(UnknownMessageAgent::default().process()).await;
+    // Replace the owned driver with one that cannot finish voluntarily. This injects the failure
+    // at the driver boundary: transport writer gates alone do not stop the SDK from winding down.
+    let previous = connection
+        .driver
+        .lock()
+        .expect("driver")
+        .take()
+        .expect("owned driver");
+    previous.abort();
+    previous.await.expect_err("old driver was cancelled");
+    let stalled = StalledDriver::start();
+    let finished = stalled.abort_handle();
+    *connection.driver.lock().expect("driver") = Some(stalled);
+    connection.begin_shutdown(CancelReason::Shutdown);
+    let result = connection.wait_shutdown().await;
+    assert!(
+        finished.is_finished(),
+        "expected the driver to be joined before shutdown completes"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the child to be reaped"
+    );
+    result.expect(
+        "expected successful cleanup result after both driver join and child reap were proven",
+    );
 }

@@ -1143,28 +1143,23 @@ impl ConnectionHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        let driver_error = if let Some(mut driver) = driver {
+        if let Some(mut driver) = driver {
             match tokio::time::timeout(self.limits.shutdown_timeout, &mut driver).await {
-                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Ok(()))) => {}
                 // The transport commonly reports its own close as an error. The driver has still
                 // joined, and process cleanup is the fact that decides whether teardown succeeded.
-                Ok(Ok(Err(_)) | Err(_)) => None,
+                Ok(Ok(Err(_)) | Err(_)) => {}
                 Err(_) => {
                     driver.abort();
                     let _ = driver.await;
-                    Some(String::from(
-                        "the ACP connection driver did not stop before the shutdown deadline",
-                    ))
+                    // The task has now joined. A successful bounded process cleanup below proves
+                    // the session is no longer live, so reporting an incomplete close would leave
+                    // the host permanently at `Closing` despite a reaped child.
                 }
             }
-        } else {
-            None
-        };
+        }
         let process = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
         process?;
-        if let Some(message) = driver_error {
-            return Err(Error::Vendor(link_failure(message)));
-        }
         Ok(())
     }
 }
@@ -1242,7 +1237,7 @@ pub(crate) fn link_failure(message: String) -> VendorError {
 }
 
 #[cfg(test)]
-mod unsupported_tests;
+mod connection_tests;
 
 #[cfg(test)]
 mod tests {
