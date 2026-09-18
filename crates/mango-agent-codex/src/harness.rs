@@ -645,6 +645,7 @@ async fn probe_app_server(
 struct ProbeConnection {
     client: Client,
     control: Arc<dyn ProcessControl>,
+    closed: bool,
 }
 
 impl ProbeConnection {
@@ -667,6 +668,7 @@ impl ProbeConnection {
         let connection = Self {
             client,
             control: transport.control,
+            closed: false,
         };
         let handshake: Result<InitializeResponse> = connection
             .client
@@ -694,12 +696,30 @@ impl ProbeConnection {
         Ok(connection)
     }
 
-    async fn close(self) {
+    async fn close(mut self) {
         let _ = self.client.close().await;
         let _ = self
             .control
             .kill(mango_external_agents::CancelReason::Shutdown)
             .await;
+        self.closed = true;
+    }
+}
+
+impl Drop for ProbeConnection {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let control = Arc::clone(&self.control);
+        runtime.spawn(async move {
+            let _ = control
+                .kill(mango_external_agents::CancelReason::Shutdown)
+                .await;
+        });
     }
 }
 

@@ -47,7 +47,8 @@ on the wire)".
 | `review/start`                  | `Session::start_review`                |
 
 `Harness::list_sessions` opens a short-lived app-server connection, initializes it, asks for a
-page and closes it without starting a thread. A live `Session::list_sessions` reuses its own
+page and closes it without starting a thread. Canceling the picker request also kills that
+connection's child through the injected process control. A live `Session::list_sessions` reuses its own
 connection. Both paths require the host's authorized working directory as the `cwd` filter and
 refuse a query for another directory. The vendor's cursor, native id, title, preview and Unix
 second timestamps pass through when supplied. Rows with missing or foreign workspace paths are

@@ -3288,6 +3288,55 @@ async fn listing_discards_rows_outside_the_authorized_workspace() {
     assert_eq!(page.sessions[0].preview.as_deref(), Some("allowed"));
 }
 
+/// A responsive app-server that leaves the picker request unanswered.
+struct UnansweredListServer;
+
+impl UnansweredListServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake")
+            .as_process_intercepting(|frame| (frame["method"] == "thread/list").then(Vec::new))
+    }
+}
+
+#[tokio::test]
+async fn canceling_a_picker_request_reaps_its_probe_child() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(UnansweredListServer.process());
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+    let task = tokio::spawn(async move {
+        CodexHarness::new()
+            .list_sessions(&host, SessionQuery::default())
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if launcher
+                .written()
+                .iter()
+                .any(|line| line.contains("thread/list"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the picker request to reach the fake app-server");
+    assert_eq!(launcher.live_children(), 1);
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if launcher.live_children() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected cancellation to kill the probe child");
+}
+
 #[tokio::test]
 async fn listing_a_different_workspace_is_refused_before_spawning() {
     let (host, launcher) = host_replaying(&[]);
