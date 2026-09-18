@@ -120,7 +120,7 @@ struct InterleavingConfigAgent;
 
 impl InterleavingConfigAgent {
     fn process() -> FakeProcess {
-        FakeProcess::responding(|line| Self::answer(line))
+        FakeProcess::responding(Self::answer)
     }
 
     fn answer(line: &str) -> Vec<String> {
