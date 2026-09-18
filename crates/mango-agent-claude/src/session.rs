@@ -1275,7 +1275,9 @@ async fn pump(
     // The host's own patience for a child that should be exiting; it owns the process, so it owns
     // how long the turn waits on one that is not.
     let exit_grace = shared.host.limits().kill_grace;
-    let idle_timeout = shared.host.limits().idle_timeout;
+    // The host's cap, floored: below `pinned::STREAM_IDLE_TIMEOUT` it stops describing a stalled
+    // child and starts cutting turns whose tool call is merely slow.
+    let idle_timeout = crate::pinned::stream_idle_timeout(shared.host.limits());
     let (mut sender, mut receiver) = link.split();
 
     // One message, then end of input. A second message would run as its own turn with its own

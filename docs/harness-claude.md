@@ -369,7 +369,11 @@ catalog an earlier run published.
   reconstructing it would mean reading the email this harness deliberately drops.
 - **`--permission-prompts none`** is passed where the build declares it; the TypeScript adapter
   added this late and the reasoning is carried over intact.
-- The **idle timeout** is host-configured and lives here rather than in a supervisor above.
+- The **idle timeout** is host-configured and lives here rather than in a supervisor above, but the
+  harness floors it at `pinned::STREAM_IDLE_TIMEOUT` (ten minutes). A Claude tool call legitimately
+  runs for minutes with the vendor emitting nothing, so a shorter cap does not describe a stalled
+  child — it cuts a working turn. A host that wants a longer leash sets `Limits::idle_timeout`
+  above the floor and gets it.
 
 ## Known gaps
 
