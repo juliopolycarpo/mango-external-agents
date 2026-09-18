@@ -181,6 +181,7 @@ impl fmt::Debug for VendorError {
 impl std::error::Error for VendorError {}
 
 /// Everything that can go wrong between a host and a vendor CLI.
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum Error {
     /// Another attempt still owns this session's turn slot.

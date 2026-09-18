@@ -181,7 +181,8 @@ pub(crate) struct Shared {
     /// The first teardown requester owns a detached cleanup worker that survives caller drop.
     teardown_started: AtomicBool,
     teardown_complete: AtomicBool,
-    teardown_failed: AtomicBool,
+    /// The teardown worker's one failure, retained so every close waiter can recover it.
+    teardown_error: Mutex<Option<Error>>,
     teardown_done: Notify,
     /// Request-id state for messages whose request task and resolution notification race on the
     /// same connection. Both classifications share one lock so a normal confirmation cannot be
@@ -210,7 +211,7 @@ impl Shared {
             idle_changes,
             teardown_started: AtomicBool::new(false),
             teardown_complete: AtomicBool::new(false),
-            teardown_failed: AtomicBool::new(false),
+            teardown_error: Mutex::new(None),
             teardown_done: Notify::new(),
             resolution_markers: Mutex::new(ResolutionMarkers::default()),
             #[cfg(test)]
@@ -1845,9 +1846,13 @@ impl CodexSession {
         if stop.is_ok() {
             state.set_status(SessionStatus::Closed);
         }
-        stop?;
-        close?;
-        Ok(())
+        match stop {
+            Ok(_) => close,
+            Err(source) => Err(Error::CleanupRequired {
+                control,
+                source: Box::new(source),
+            }),
+        }
     }
 
     /// Starts exactly one detached teardown worker so an abandoned `close` future cannot orphan
@@ -1868,29 +1873,25 @@ impl CodexSession {
         }
         let worker_shared = Arc::clone(&shared);
         tokio::spawn(async move {
-            if Self::shutdown_session(worker_shared, client, control, state, reason)
-                .await
-                .is_err()
+            if let Err(error) =
+                Self::shutdown_session(worker_shared, client, control, state, reason).await
             {
-                shared.teardown_failed.store(true, Ordering::Release);
+                *shared.teardown_error.lock().await = Some(error);
             }
             shared.teardown_complete.store(true, Ordering::Release);
             shared.teardown_done.notify_waiters();
         });
     }
 
-    /// Waits for the one teardown worker and reports an unreaped process as a failed close.
+    /// Waits for the one teardown worker and preserves its typed cleanup failure for every caller.
     async fn wait_for_shutdown(shared: &Shared) -> Result<()> {
         loop {
             let done = shared.teardown_done.notified();
             if shared.teardown_complete.load(Ordering::Acquire) {
-                return if shared.teardown_failed.load(Ordering::Acquire) {
-                    Err(Error::Link {
-                        peer: String::from("Codex app-server"),
-                        message: String::from("bounded process cleanup did not complete"),
-                    })
-                } else {
-                    Ok(())
+                let error = shared.teardown_error.lock().await;
+                return match error.as_ref() {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(()),
                 };
             }
             done.await;

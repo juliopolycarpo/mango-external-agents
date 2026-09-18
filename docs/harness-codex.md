@@ -132,7 +132,8 @@ events. A dropped library `TurnStream` is owner abandonment: the harness refuses
 sends `turn/interrupt`, waits through the host's graceful-turn bound, and closes and reaps the
 app-server if the turn will not settle. A browser disconnect that should leave work running must
 therefore retain the stream in a host supervisor. Dropping the owning session follows the same
-bounded cleanup path. Closing twice is harmless.
+bounded cleanup path. Closing twice waits for the first reaper; if it cannot reap the child, each
+caller receives the same `Error::CleanupRequired` control for host reconciliation.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.

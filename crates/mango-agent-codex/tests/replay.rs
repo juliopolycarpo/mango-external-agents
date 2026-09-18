@@ -74,6 +74,7 @@ struct GatedLauncher {
     inner: Arc<FakeLauncher>,
     kill_gate: Option<Arc<FakeGate>>,
     interrupt_write_gate: Option<Arc<FakeGate>>,
+    keep_child_alive_after_stdin_close: bool,
 }
 
 impl GatedLauncher {
@@ -86,7 +87,13 @@ impl GatedLauncher {
             inner,
             kill_gate,
             interrupt_write_gate,
+            keep_child_alive_after_stdin_close: false,
         }
+    }
+
+    fn keeping_child_alive_after_stdin_close(mut self) -> Self {
+        self.keep_child_alive_after_stdin_close = true;
+        self
     }
 }
 
@@ -102,6 +109,11 @@ impl ProcessLauncher for GatedLauncher {
                 }) as Box<dyn mango_external_agents::ByteSink>
             });
         }
+        if self.keep_child_alive_after_stdin_close {
+            child.stdin = child.stdin.take().map(|inner| {
+                Box::new(NonTerminatingStdin { inner }) as Box<dyn mango_external_agents::ByteSink>
+            });
+        }
         if let Some(gate) = &self.kill_gate {
             child.control = Arc::new(GatedProcessControl {
                 inner: child.control,
@@ -109,6 +121,22 @@ impl ProcessLauncher for GatedLauncher {
             });
         }
         Ok(child)
+    }
+}
+
+/// Keeps a fake child alive when its app-server link closes so kill ownership remains observable.
+struct NonTerminatingStdin {
+    inner: Box<dyn mango_external_agents::ByteSink>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSink for NonTerminatingStdin {
+    async fn write_all(&mut self, bytes: &[u8]) -> mango_external_agents::Result<()> {
+        self.inner.write_all(bytes).await
+    }
+
+    async fn close(&mut self) -> mango_external_agents::Result<()> {
+        Ok(())
     }
 }
 
@@ -1419,6 +1447,89 @@ async fn aborting_a_close_future_leaves_its_owned_reaper_running() {
         .close(CloseReason::Shutdown)
         .await
         .expect("expected repeated close to observe the first close worker's result");
+}
+
+/// A timed-out session reaper leaves recovery with the host, including for later close callers.
+#[tokio::test(start_paused = true)]
+async fn failed_close_retains_one_cleanup_control_for_reconciliation() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("turn").as_process());
+    let kill_gate = FakeGate::closed();
+    let gated = Arc::new(
+        GatedLauncher::new(Arc::clone(&launcher), Some(Arc::clone(&kill_gate)), None)
+            .keeping_child_alive_after_stdin_close(),
+    );
+    let limits = mango_external_agents::Limits {
+        shutdown_timeout: std::time::Duration::from_secs(1),
+        ..replay_limits()
+    };
+    let host = host_context(
+        gated,
+        None,
+        limits,
+        mango_external_agents::CancelToken::new(),
+        None,
+    );
+    let session: Arc<dyn Session> = Arc::from(
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session"),
+    );
+
+    let closing_session = Arc::clone(&session);
+    let close = tokio::spawn(async move { closing_session.close(CloseReason::Shutdown).await });
+    kill_gate.wait_until_entered().await;
+    tokio::time::advance(limits.shutdown_timeout).await;
+
+    let error = close
+        .await
+        .expect("expected the close waiter to complete")
+        .expect_err("expected bounded cleanup to time out");
+    assert!(
+        matches!(
+            error.cause(),
+            mango_external_agents::Error::Timeout {
+                operation,
+                after,
+            } if operation == "process-tree termination" && *after == limits.shutdown_timeout
+        ),
+        "expected the bounded process cleanup timeout, received {error:?}"
+    );
+    let control = error
+        .cleanup_control()
+        .expect("expected the failed close to retain a cleanup control");
+
+    let repeated = session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect_err("expected the repeated close to observe the first cleanup failure");
+    let repeated_control = repeated
+        .cleanup_control()
+        .expect("expected a repeated close to retain the same cleanup control");
+    assert!(
+        Arc::ptr_eq(&control, &repeated_control),
+        "expected every close waiter to receive the same process control"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        1,
+        "expected the timed-out reaper to leave the child for host reconciliation"
+    );
+
+    kill_gate.open();
+    mango_external_agents::process::stop_process_with_limits(
+        control.as_ref(),
+        CancelReason::Shutdown,
+        host.limits(),
+    )
+    .await
+    .expect("expected the host to reconcile and reap the child");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected host reconciliation to reap the timed-out child"
+    );
 }
 
 /// Cancellation assigns its stop worker before the native interrupt write can wait. Dropping the
