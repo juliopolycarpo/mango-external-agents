@@ -987,8 +987,9 @@ async fn a_turn_cannot_narrow_below_the_mode_the_session_was_opened_under() {
 
 /// `close` must not drop a half-sent terminal. A timeout that abandoned the `emit` would send nothing —
 /// `mpsc::Sender::send` is cancel-safe — so a host that stopped reading and then closed would get a
-/// stream that just ends, with no `Cancelled` and no `Completed`, which the core's conformance rules
-/// refuse.
+/// stream that just ends, with no terminal, which the core's conformance rules refuse. Depending on
+/// whether close or the full transcript wins first, that terminal is either the existing overflow
+/// error or close's cancellation pair.
 #[tokio::test]
 async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() {
     let launcher = FakeLauncher::new();
@@ -1033,10 +1034,11 @@ async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() 
         "expected exactly one terminal, received {events:?}"
     );
     assert!(
-        events
-            .iter()
-            .any(|kind| matches!(kind, EventKind::Error { .. })),
-        "expected the overflow terminal to survive close, received {events:?}"
+        matches!(
+            events.last(),
+            Some(EventKind::Completed | EventKind::Error { .. })
+        ),
+        "expected the committed terminal to remain last, received {events:?}"
     );
 }
 
