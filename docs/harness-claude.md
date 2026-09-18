@@ -26,13 +26,16 @@ stream-json output" —
 without it fails at startup.
 
 **The flag surface is the gate; the version is the fallback.** `claude --help` is parsed for the
-flags and vocabularies this harness depends on, and the pin only decides when that parse produced
-nothing usable. A repackaged or backported build that has everything a turn passes stays usable;
-an at-pin build that lost a flag is refused before a session opens. A `--help` that yielded
-neither the permission modes nor any required flag reads as "the probe failed", never as "the
-binary has no options". A multi-line wrapper banner can include its own semver, so discovery reads
-the semver from the line that identifies Claude Code rather than accepting the first semver in all
-stdout. A single bare version remains accepted for the documented compact form.
+flags and vocabularies this harness depends on. A repackaged or backported build that has every
+flag a turn passes stays usable, even below the pin. Discovery reports a parsed surface missing one
+of those flags as `GateVerdict::MissingRequiredSurface`; opening returns `Error::Protocol` with a
+static expected shape and no raw help text. A `--help` that yielded neither the permission modes
+nor any required flag is unreadable, never "a binary with no options": a parsed old version then
+reports `GateVerdict::VersionTooOld`, while a current or unreadable version reports
+`GateVerdict::Unknown` and opening returns a distinct safe `Error::Protocol` refusal. A multi-line
+wrapper banner can include its own semver, so discovery reads the semver from the line that
+identifies Claude Code rather than accepting the first semver in all stdout. A single bare version
+remains accepted for the documented compact form.
 
 Two later builds change behaviour without changing what this harness may pass, so they are
 recorded rather than gated on:
@@ -317,12 +320,13 @@ this library never runs.
 description are the whole catalog. Nothing is marked default, deliberately: the help declares no
 default, and naming one would put `--model` on every argv and override whatever default the account
 is on. A build that advertises no aliases reports no catalog at all, which is not the same as an
-empty one. An explicit model must fit Claude's documented identifier shape and an argv value
-position; an invalid value is refused before a child starts rather than omitted.
+empty one. An explicit model is an opaque vendor value: it is checked only for the documented argv
+value shape, never rejected merely because it is absent from a partial alias catalog. An invalid
+value is refused before a child starts rather than omitted or allowed to alter the CLI defaults.
 
 **Effort.** `--effort` is passed only for the exact level this build itself printed, and only when
 the host chose one. An explicit level that is unavailable after a downgrade is refused before a
-child starts, so the turn never silently falls back to another effort.
+child starts, so the turn never silently falls back to another effort or replaces accepted defaults.
 
 ## MCP passthrough
 
@@ -389,12 +393,6 @@ catalog an earlier run published.
   runs for minutes with the vendor emitting nothing, so a shorter cap does not describe a stalled
   child — it cuts a working turn. A host that wants a longer leash sets `Limits::idle_timeout`
   above the floor and gets it.
-
-## Known gaps
-
-- `GateVerdict::VersionTooOld` carries the version and the floor but has nowhere to name *which*
-  flag went missing, so a build refused for a missing flag reports an upgrade rather than the
-  specific cause. The fixture-backed surface test is what names it for a maintainer.
 
 
 Discovery exposes the account and build restrictions in `Discovery.permission_matrix`; the static

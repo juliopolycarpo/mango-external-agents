@@ -36,6 +36,36 @@ const CEILING: Capabilities = Capabilities {
     ..probed_capabilities()
 };
 
+/// The documented help shape that proves every argv this harness builds is accepted.
+const REQUIRED_LAUNCH_SURFACE: &str =
+    "a Claude --help surface declaring every required launch flag";
+
+/// A safe summary of parsed help that omitted one or more required flags.
+const MISSING_REQUIRED_LAUNCH_FLAG: &str = "one or more required flags were absent";
+
+/// Why the launch surface could not establish a driveable Claude build.
+#[derive(Clone, Copy)]
+enum SurveyRefusal {
+    VersionTooOld,
+    MissingRequiredSurface,
+    UnreadableHelp,
+}
+
+/// Classifies a help probe without treating a changed or unreadable surface as a version claim.
+fn classify_surface(
+    surface: Option<&CliSurface>,
+    version: Option<&semver::Version>,
+) -> Option<SurveyRefusal> {
+    let Some(surface) = surface else {
+        return if version.is_some_and(|version| !version::is_supported(Some(version))) {
+            Some(SurveyRefusal::VersionTooOld)
+        } else {
+            Some(SurveyRefusal::UnreadableHelp)
+        };
+    };
+    (!surface.missing_required_flags().is_empty()).then_some(SurveyRefusal::MissingRequiredSurface)
+}
+
 /// Claude Code, driven through its documented headless surface.
 ///
 /// Stateless and shareable: it holds no session, caches no discovery and spawns nothing of its own.
@@ -105,7 +135,7 @@ impl ClaudeHarness {
 
         // A build that cannot be driven is not asked who is signed in: the answer would be true and
         // useless, and it costs a third process launch to learn.
-        if let Some(refusal) = CliSurface::refusal(surface.as_ref(), version.as_ref()) {
+        if let Some(refusal) = classify_surface(surface.as_ref(), version.as_ref()) {
             return Survey {
                 banner: Some(banner),
                 version,
@@ -166,11 +196,16 @@ impl ClaudeHarness {
             .as_deref()
             .and_then(version::parse);
         let refusal = match receipt.discovery.gate {
-            GateVerdict::NotInstalled | GateVerdict::VersionTooOld { .. } => Some(String::new()),
-            GateVerdict::Usable | GateVerdict::Unknown => {
-                CliSurface::refusal(surface.as_ref(), version.as_ref())
+            GateVerdict::NotInstalled | GateVerdict::VersionTooOld { .. } => {
+                Some(SurveyRefusal::VersionTooOld)
             }
-            _ => Some(String::new()),
+            GateVerdict::MissingRequiredSurface { .. } => {
+                Some(SurveyRefusal::MissingRequiredSurface)
+            }
+            GateVerdict::Usable | GateVerdict::Unknown => {
+                classify_surface(surface.as_ref(), version.as_ref())
+            }
+            _ => Some(SurveyRefusal::UnreadableHelp),
         };
         let account_kind = match receipt.discovery.auth {
             AuthState::LoggedIn {
@@ -218,7 +253,7 @@ struct Survey {
     banner: Option<String>,
     version: Option<semver::Version>,
     /// Why this build cannot be driven, when it cannot.
-    refusal: Option<String>,
+    refusal: Option<SurveyRefusal>,
     authentication: Authentication,
     availability: ModeAvailability,
     surface: Option<CliSurface>,
@@ -304,14 +339,22 @@ impl Harness for ClaudeHarness {
         }
 
         let executable = self.executable.get().cloned();
-        if survey.refusal.is_some() {
-            return Ok(Discovery {
-                executable,
-                version: survey.reported(),
-                gate: GateVerdict::VersionTooOld {
+        if let Some(refusal) = survey.refusal {
+            let gate = match refusal {
+                SurveyRefusal::VersionTooOld => GateVerdict::VersionTooOld {
                     found: survey.found(),
                     minimum: String::from(MINIMUM_VERSION),
                 },
+                SurveyRefusal::MissingRequiredSurface => GateVerdict::MissingRequiredSurface {
+                    expected: REQUIRED_LAUNCH_SURFACE,
+                    received: MISSING_REQUIRED_LAUNCH_FLAG,
+                },
+                SurveyRefusal::UnreadableHelp => GateVerdict::Unknown,
+            };
+            return Ok(Discovery {
+                executable,
+                version: survey.reported(),
+                gate,
                 auth: AuthState::Unknown,
                 capabilities: Capabilities::none().into(),
                 permission_matrix: permissions::matrix(&survey.availability),
@@ -427,10 +470,20 @@ impl ClaudeHarness {
                 message: String::from("a CLI that reported no version"),
             });
         }
-        if survey.refusal.is_some() {
-            return Err(Error::VersionGate {
-                found: survey.found(),
-                minimum: String::from(MINIMUM_VERSION),
+        if let Some(refusal) = survey.refusal {
+            return Err(match refusal {
+                SurveyRefusal::VersionTooOld => Error::VersionGate {
+                    found: survey.found(),
+                    minimum: String::from(MINIMUM_VERSION),
+                },
+                SurveyRefusal::MissingRequiredSurface => Error::Protocol {
+                    expected: String::from(REQUIRED_LAUNCH_SURFACE),
+                    received: String::from(MISSING_REQUIRED_LAUNCH_FLAG),
+                },
+                SurveyRefusal::UnreadableHelp => Error::Protocol {
+                    expected: String::from("a readable Claude --help launch surface"),
+                    received: String::from("unreadable vendor output"),
+                },
             });
         }
         if let AuthState::LoggedOut { login_hint } = &survey.authentication.state {

@@ -6,7 +6,7 @@
 //! the CLI describes its own surface before anything is spawned in anger, so it is what this
 //! harness probes.
 //!
-//! This is deliberately a better gate than the version number. [`MINIMUM_VERSION`] records 2.1.211
+//! This is deliberately a better gate than the version number. [`MINIMUM_VERSION`](crate::pinned::MINIMUM_VERSION) records 2.1.211
 //! because that is where `--forward-subagent-text` arrived, but the version is a proxy for the flag
 //! and the flag is the thing that matters: a repackaged build, a vendor that backports, or a pin
 //! that went stale all make the number disagree with the binary. Reading the surface asks the
@@ -27,7 +27,6 @@
 use std::collections::BTreeSet;
 
 use crate::help::{self, Option_};
-use crate::pinned::MINIMUM_VERSION;
 
 /// The option whose choice list is Claude's permission vocabulary.
 const PERMISSION_MODE_FLAG: &str = "--permission-mode";
@@ -161,36 +160,6 @@ impl CliSurface {
     pub fn declares_mcp_config(&self) -> bool {
         self.flags.contains(MCP_CONFIG_FLAG)
     }
-
-    /// Why this build cannot be driven, or nothing when it can.
-    ///
-    /// The flag surface decides, and the version only steps in when the surface could not be read.
-    /// That ordering is the point: the pin exists because `--forward-subagent-text` landed in a
-    /// particular release, so asking whether the flag is *there* answers the real question, and a
-    /// below-pin build that has everything this harness passes stays usable instead of being
-    /// refused by arithmetic.
-    pub fn refusal(surface: Option<&Self>, version: Option<&semver::Version>) -> Option<String> {
-        let Some(surface) = surface else {
-            // No usable surface, so the pin is all that is left to go on.
-            if crate::version::is_supported(version) {
-                return None;
-            }
-            let found =
-                version.map_or_else(|| String::from("no version"), semver::Version::to_string);
-            return Some(format!(
-                "Claude Code {found} predates the {MINIMUM_VERSION} this harness drives, and its flag surface could not be read"
-            ));
-        };
-        let missing = surface.missing_required_flags();
-        if missing.is_empty() {
-            return None;
-        }
-        let found = version.map_or_else(|| String::from("this build"), semver::Version::to_string);
-        Some(format!(
-            "Claude Code {found} does not offer {}, which every turn passes; upgrade to {MINIMUM_VERSION} or later",
-            missing.join(", ")
-        ))
-    }
 }
 
 fn option_block<'a>(options: &'a [Option_], flag: &str) -> Option<&'a str> {
@@ -200,7 +169,6 @@ fn option_block<'a>(options: &'a [Option_], flag: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::CliSurface;
-    use crate::version;
 
     const HELP_2_1_227: &str = include_str!("../../../fixtures/claude/help/2.1.227.txt");
     /// `claude --help` in full, from the build installed when this harness was written.
@@ -316,47 +284,6 @@ mod tests {
         assert!(
             !surface.declares_permission_prompts(),
             "expected an unread surface to promise no flag"
-        );
-    }
-
-    #[test]
-    fn keeps_a_build_older_than_the_pin_when_every_flag_it_passes_is_there() {
-        let surface = CliSurface::parse(HELP_2_1_227);
-        let below_pin = version::parse("2.1.150");
-        assert_eq!(
-            CliSurface::refusal(Some(&surface), below_pin.as_ref()),
-            None,
-            "expected the flag surface to decide, not the arithmetic"
-        );
-    }
-
-    #[test]
-    fn names_the_version_to_upgrade_to_when_a_flag_every_turn_passes_is_gone() {
-        let stripped = HELP_2_1_260.replace("--forward-subagent-text", "--forward-subagent-txt");
-        let surface = CliSurface::parse(&stripped);
-        let refusal = CliSurface::refusal(Some(&surface), version::parse("2.1.260").as_ref())
-            .expect("expected a refusal");
-        assert!(
-            refusal.contains("--forward-subagent-text") && refusal.contains("2.1.211"),
-            "expected the missing flag and the floor, received {refusal:?}"
-        );
-    }
-
-    #[test]
-    fn falls_back_to_the_pin_when_the_surface_could_not_be_read() {
-        assert_eq!(
-            CliSurface::refusal(None, version::parse("2.1.270").as_ref()),
-            None
-        );
-        let refusal = CliSurface::refusal(None, version::parse("2.1.200").as_ref())
-            .expect("expected a refusal");
-        assert!(
-            refusal.contains("2.1.200") && refusal.contains("2.1.211"),
-            "received {refusal:?}"
-        );
-        assert!(
-            CliSurface::refusal(None, None).is_some(),
-            "expected an unreadable version and an unreadable surface to refuse"
         );
     }
 
