@@ -316,17 +316,7 @@ async fn open_thread(
         .await?;
     client.notify(method::INITIALIZED, empty_params()).await?;
 
-    // The build that is running has just named itself in the handshake, so the gate costs nothing
-    // extra here. A user agent nobody could parse is not a refusal — the same reasoning as
-    // `GateVerdict::Unknown` — so the session goes on.
-    if let Some(version) = discovery::parse_user_agent_version(&handshake.user_agent)
-        && discovery::meets_minimum(&version, MINIMUM_CODEX_VERSION) == Some(false)
-    {
-        return Err(Error::VersionGate {
-            found: version,
-            minimum: String::from(MINIMUM_CODEX_VERSION),
-        });
-    }
+    require_supported_handshake_version(&handshake)?;
 
     let account: AccountReadResponse = client
         .request(method::ACCOUNT_READ, empty_params())
@@ -467,6 +457,22 @@ async fn open_thread(
         SessionState::new(std::sync::Arc::clone(host.clock()), snapshot),
         thread_id,
     ))
+}
+
+/// Refuses an app-server that identified itself below this harness's pinned protocol floor.
+fn require_supported_handshake_version(handshake: &InitializeResponse) -> Result<()> {
+    // The build that is running has just named itself in the handshake, so the gate costs nothing
+    // extra here. A user agent nobody could parse is not a refusal — the same reasoning as
+    // `GateVerdict::Unknown` — so the connection goes on.
+    if let Some(version) = discovery::parse_user_agent_version(&handshake.user_agent)
+        && discovery::meets_minimum(&version, MINIMUM_CODEX_VERSION) == Some(false)
+    {
+        return Err(Error::VersionGate {
+            found: version,
+            minimum: String::from(MINIMUM_CODEX_VERSION),
+        });
+    }
+    Ok(())
 }
 
 /// The pinned app-server uses this exact invalid-request response when its thread store has no
@@ -681,11 +687,12 @@ impl ProbeConnection {
             )
             .await;
         let result = match handshake {
-            Ok(_) => {
+            Ok(handshake) => {
                 connection
                     .client
                     .notify(method::INITIALIZED, empty_params())
-                    .await
+                    .await?;
+                require_supported_handshake_version(&handshake)
             }
             Err(error) => Err(error),
         };

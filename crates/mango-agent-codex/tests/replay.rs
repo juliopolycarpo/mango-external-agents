@@ -3248,6 +3248,67 @@ async fn listing_without_a_user_conversation_uses_only_the_authorized_workspace(
     assert_eq!(frame["params"]["limit"], 50);
 }
 
+/// A server that identifies an app-server older than the pinned protocol at initialization.
+struct OldProbeHandshakeServer;
+
+impl OldProbeHandshakeServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake").as_process_intercepting(|frame| {
+            (frame["method"] == "initialize").then(|| {
+                vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "result": {
+                            "userAgent": "codex/0.147.0 (Linux)",
+                            "platformOs": "linux",
+                        },
+                    })
+                    .to_string(),
+                ]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn picker_refuses_an_app_server_below_the_pinned_handshake_version() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(OldProbeHandshakeServer.process());
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+
+    let result = CodexHarness::new()
+        .list_sessions(&host, SessionQuery::default())
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ref error)
+                if matches!(
+                    error.cause(),
+                    mango_external_agents::Error::VersionGate {
+                        found,
+                        minimum,
+                    } if found == "0.147.0"
+                        && minimum == mango_agent_codex::MINIMUM_CODEX_VERSION
+                )
+        ),
+        "expected the handshake version gate, received {result:?}"
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/list")),
+        "expected no picker request after the version gate"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the probe child reaped"
+    );
+}
+
 /// A fake list answer that includes rows the host never authorized.
 struct MixedWorkspaceListServer;
 

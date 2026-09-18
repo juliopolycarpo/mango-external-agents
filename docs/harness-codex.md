@@ -8,12 +8,12 @@ vendor's current documentation before relying on them.
 
 ## The executable and the version gate
 
-|                   |                                                                              |
-| ----------------- | ---------------------------------------------------------------------------- |
-| Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name    |
-| Arguments         | `app-server`, and nothing else                                               |
-| Version read from | `codex --version` for a probe; the handshake's own `userAgent` for a session |
-| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`              |
+|                   |                                                                                                     |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
+| Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                           |
+| Arguments         | `app-server`, and nothing else                                                                      |
+| Version read from | `codex --version` for discovery; the handshake's own `userAgent` for a session or picker connection |
+| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`                                     |
 
 The floor is the pinned build rather than something older. The app-server's item families and its
 `thread/`–`turn/` method names changed shape inside the 0.15x series, so a lower floor would be a
@@ -23,6 +23,8 @@ app-server is spawned for it.
 
 A `--version` line nobody can parse is `GateVerdict::Unknown`, not a refusal: a CLI that changed
 the shape of its version output has not stopped working, and the host may still choose to try.
+The session and short-lived picker connection also apply that same floor to a parseable handshake
+`userAgent` before they send a thread request, then clean up the child on a refusal.
 
 ## The documented surface this harness drives
 
