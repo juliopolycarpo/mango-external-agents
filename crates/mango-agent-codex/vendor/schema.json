@@ -136,6 +136,12 @@
         "requiresOpenaiAuth"
       ]
     },
+    "GrantedPermissionProfile": {
+      "properties": [
+        "fileSystem",
+        "network"
+      ]
+    },
     "InitializeParams": {
       "properties": [
         "capabilities",
@@ -164,6 +170,33 @@
         "startedAtMs",
         "threadId",
         "turnId"
+      ]
+    },
+    "McpServerElicitationAction": {
+      "values": [
+        "accept",
+        "cancel",
+        "decline"
+      ]
+    },
+    "McpServerElicitationRequestParams": {
+      "properties": [
+        "_meta",
+        "elicitationId",
+        "message",
+        "mode",
+        "requestedSchema",
+        "serverName",
+        "threadId",
+        "turnId",
+        "url"
+      ]
+    },
+    "McpServerElicitationRequestResponse": {
+      "properties": [
+        "_meta",
+        "action",
+        "content"
       ]
     },
     "McpToolCallStatus": {
@@ -214,6 +247,31 @@
         "declined",
         "failed",
         "inProgress"
+      ]
+    },
+    "PermissionGrantScope": {
+      "values": [
+        "session",
+        "turn"
+      ]
+    },
+    "PermissionsRequestApprovalParams": {
+      "properties": [
+        "cwd",
+        "environmentId",
+        "itemId",
+        "permissions",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "PermissionsRequestApprovalResponse": {
+      "properties": [
+        "permissions",
+        "scope",
+        "strictAutoReview"
       ]
     },
     "RateLimitSnapshot": {
@@ -555,6 +613,42 @@
         "outputTokens",
         "reasoningOutputTokens",
         "totalTokens"
+      ]
+    },
+    "ToolRequestUserInputAnswer": {
+      "properties": [
+        "answers"
+      ]
+    },
+    "ToolRequestUserInputOption": {
+      "properties": [
+        "description",
+        "label"
+      ]
+    },
+    "ToolRequestUserInputParams": {
+      "properties": [
+        "autoResolutionMs",
+        "isBlocking",
+        "itemId",
+        "questions",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "ToolRequestUserInputQuestion": {
+      "properties": [
+        "header",
+        "id",
+        "isOther",
+        "isSecret",
+        "options",
+        "question"
+      ]
+    },
+    "ToolRequestUserInputResponse": {
+      "properties": [
+        "answers"
       ]
     },
     "Turn": {
