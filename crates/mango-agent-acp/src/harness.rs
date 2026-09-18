@@ -29,6 +29,7 @@ use agent_client_protocol::schema::v1::{
     McpServerStdio, NewSessionRequest, SessionConfigOptionsCapabilities, SessionId as AcpSessionId,
     SessionModeState,
 };
+use http::header::{HeaderName, HeaderValue};
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
 };
@@ -262,7 +263,7 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
             });
         }
         match &server.transport {
-            McpTransport::Stdio { command, args, .. } => {
+            McpTransport::Stdio { command, args, env } => {
                 if !Path::new(command).is_absolute()
                     || !mango_external_agents::normalize::is_argv_value_with_max(
                         command,
@@ -283,6 +284,17 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
                         received: String::from("an invalid MCP stdio argument"),
                     });
                 }
+                if env.iter().any(|(name, value)| {
+                    let mut bytes = name.bytes();
+                    !matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+                        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        || value.chars().any(char::is_control)
+                }) {
+                    return Err(Error::HostConfiguration {
+                        expected: "portable MCP stdio environment names and values without control characters",
+                        received: String::from("an invalid MCP stdio environment entry"),
+                    });
+                }
             }
             McpTransport::Http { url, .. } if !is_http_mcp_url(url) => {
                 return Err(Error::HostConfiguration {
@@ -290,7 +302,19 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
                     received: String::from("an invalid HTTP MCP URL"),
                 });
             }
-            McpTransport::Http { .. } => {}
+            McpTransport::Http { headers, .. } => {
+                if headers.iter().any(|(name, value)| {
+                    HeaderName::from_bytes(name.as_bytes()).is_err()
+                        || HeaderValue::from_str(value).is_err()
+                        || value.contains('\r')
+                        || value.contains('\n')
+                }) {
+                    return Err(Error::HostConfiguration {
+                        expected: "valid HTTP MCP header names and values without line breaks",
+                        received: String::from("an invalid HTTP MCP header"),
+                    });
+                }
+            }
             _ => {
                 return Err(Error::HostConfiguration {
                     expected: "a stable ACP MCP transport",
@@ -304,14 +328,22 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
 
 /// Whether a host-provided MCP endpoint has the scheme and authority ACP can pass through.
 fn is_http_mcp_url(url: &str) -> bool {
-    let Some((scheme, remainder)) = url.split_once("://") else {
+    let Ok(uri) = url.parse::<http::Uri>() else {
         return false;
     };
-    matches!(scheme, "http" | "https")
-        && remainder
-            .split('/')
-            .next()
-            .is_some_and(|authority| !authority.is_empty())
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let host = authority.host();
+    let Some(after_host) = authority.as_str().strip_prefix(host) else {
+        return false;
+    };
+    matches!(uri.scheme_str(), Some("http" | "https"))
+        && !host.is_empty()
+        && !authority.as_str().contains('@')
+        && (after_host.is_empty()
+            || (after_host.starts_with(':') && authority.port_u16().is_some()))
+        && !url.contains('#')
         && url
             .chars()
             .all(|character| !character.is_control() && !character.is_whitespace())

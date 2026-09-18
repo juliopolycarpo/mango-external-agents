@@ -968,6 +968,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "http",
  "mango-external-agents",
  "serde_json",
  "tokio",

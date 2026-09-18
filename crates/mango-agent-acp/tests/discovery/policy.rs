@@ -5,12 +5,17 @@ async fn stdio_mcp_servers_are_sent_on_session_new() {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(FakeAcpAgent::new().process());
     let mut request = mango_external_agents::OpenSession::new("mcp");
-    request
-        .mcp_servers
-        .push(mango_external_agents::McpServer::stdio(
-            "docs",
-            "/usr/bin/docs-mcp",
-        ));
+    request.mcp_servers.push(mango_external_agents::McpServer {
+        name: String::from("docs"),
+        transport: mango_external_agents::McpTransport::Stdio {
+            command: String::from("/usr/bin/docs-mcp"),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::from([(
+                String::from("DOCS_TOKEN"),
+                String::from("test-token"),
+            )]),
+        },
+    });
     let session = AcpHarness::builtin("cursor")
         .expect("expected Cursor profile")
         .open_session(&host(launcher.clone()), request)
@@ -28,9 +33,50 @@ async fn stdio_mcp_servers_are_sent_on_session_new() {
             "name": "docs",
             "command": "/usr/bin/docs-mcp",
             "args": [],
-            "env": [],
+            "env": [{ "name": "DOCS_TOKEN", "value": "test-token" }],
         }]),
         "expected the supported stdio MCP server on session/new"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+}
+
+#[tokio::test]
+async fn advertised_http_mcp_preserves_endpoint_and_headers() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(FakeAcpAgent::new().with_http_mcp().process());
+    let mut request = mango_external_agents::OpenSession::new("mcp");
+    request.mcp_servers.push(mango_external_agents::McpServer {
+        name: String::from("remote"),
+        transport: mango_external_agents::McpTransport::Http {
+            url: String::from("https://mcp.example:8443/endpoint"),
+            headers: std::collections::BTreeMap::from([(
+                String::from("Authorization"),
+                String::from("Bearer test-token"),
+            )]),
+        },
+    });
+    let session = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(&host(launcher.clone()), request)
+        .await
+        .expect("expected the advertised HTTP MCP server to open");
+    let request = launcher
+        .written()
+        .into_iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(&line).expect("expected JSON-RPC"))
+        .find(|message| message.get("method") == Some(&serde_json::json!("session/new")))
+        .expect("expected session/new");
+    assert_eq!(request["params"]["mcpServers"][0]["name"], "remote");
+    assert_eq!(
+        request["params"]["mcpServers"][0]["url"],
+        "https://mcp.example:8443/endpoint"
+    );
+    assert_eq!(
+        request["params"]["mcpServers"][0]["headers"][0],
+        serde_json::json!({ "name": "Authorization", "value": "Bearer test-token" })
     );
     session
         .close(CloseReason::Requested)
@@ -58,6 +104,73 @@ async fn malformed_mcp_servers_are_not_submitted_or_spawned() {
             "docs",
             "/usr/bin/docs\u{1b}mcp",
         )],
+        vec![mango_external_agents::McpServer::stdio(
+            "docs\u{1b}",
+            "/usr/bin/docs-mcp",
+        )],
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Stdio {
+                command: String::from("/usr/bin/docs-mcp"),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::from([(
+                    String::from("BAD=NAME"),
+                    String::from("token"),
+                )]),
+            },
+        }],
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Stdio {
+                command: String::from("/usr/bin/docs-mcp"),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::from([(
+                    String::from("DOCS_TOKEN"),
+                    String::from("token\r\nforged"),
+                )]),
+            },
+        }],
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Http {
+                url: String::from("https://mcp.example/path"),
+                headers: std::collections::BTreeMap::from([(
+                    String::from("X: forged"),
+                    String::from("value"),
+                )]),
+            },
+        }],
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Http {
+                url: String::from("https://mcp.example/path"),
+                headers: std::collections::BTreeMap::from([(
+                    String::from("Authorization"),
+                    String::from("ok\r\nX-Injected: yes"),
+                )]),
+            },
+        }],
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Http {
+                url: String::from("http://?query"),
+                headers: std::collections::BTreeMap::new(),
+            },
+        }],
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Http {
+                url: String::from("https://mcp.example:not-a-port/path"),
+                headers: std::collections::BTreeMap::new(),
+            },
+        }],
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Http {
+                url: String::from("https://[::1/path"),
+                headers: std::collections::BTreeMap::new(),
+            },
+        }],
     ];
     for servers in cases {
         let launcher = Arc::new(FakeLauncher::new());

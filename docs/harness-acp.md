@@ -413,8 +413,9 @@ never going to work.
   environment. HTTP preserves name, endpoint, and headers only when `initialize` advertised
   `mcpCapabilities.http`; a request without that capability is refused before either lifecycle call.
   Before any ACP process starts, every entry must have a unique valid name; a stdio command must be
-  an absolute, control-free path; arguments must have an argv value shape; and an HTTP endpoint must
-  be an absolute `http` or `https` URL without control text. The mapping follows
+  an absolute, control-free path; arguments and server-only environment entries must have valid
+  shapes; and an HTTP endpoint must parse as an absolute `http` or `https` URI with a host and valid
+  port. Header names and values are checked before launch. The mapping follows
   [ACP v1 session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
   ACP-over-HTTP remains unrelated and unsupported.
 - **Model selection.** ACP v1's documented session configuration surface carries model and

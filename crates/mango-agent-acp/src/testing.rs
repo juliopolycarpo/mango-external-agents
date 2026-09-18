@@ -54,6 +54,7 @@ pub struct FakeAcpAgent {
     protocol_version: u16,
     load_session: bool,
     supports_listing: bool,
+    supports_http_mcp: bool,
     holds_listing: bool,
     listed_sessions: Option<Vec<serde_json::Value>>,
     supports_close: bool,
@@ -102,6 +103,7 @@ impl FakeAcpAgent {
             protocol_version: 1,
             load_session: true,
             supports_listing: false,
+            supports_http_mcp: false,
             holds_listing: false,
             listed_sessions: None,
             supports_close: false,
@@ -233,6 +235,21 @@ impl FakeAcpAgent {
         S: Into<String>,
     {
         self.modes = modes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Advertises HTTP MCP server support in the ACP handshake.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let agent = FakeAcpAgent::new().with_http_mcp();
+    /// let _process = agent.process();
+    /// ```
+    #[must_use]
+    pub fn with_http_mcp(mut self) -> Self {
+        self.supports_http_mcp = true;
         self
     }
 
@@ -413,6 +430,7 @@ impl FakeAcpAgent {
             "agentInfo": { "name": "fake-acp", "version": "1.2.3" },
             "agentCapabilities": {
                 "loadSession": self.load_session,
+                "mcpCapabilities": { "http": self.supports_http_mcp },
                 "promptCapabilities": { "image": true, "embeddedContext": true },
                 "sessionCapabilities": session_capabilities,
             },
