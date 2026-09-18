@@ -1464,27 +1464,23 @@ async fn finish(
     // lands after the record that wait produced, so it pre-empts nothing.
     //
     // <https://code.claude.com/docs/en/headless.md>
-    // A caller that took an active turn already owns its stop request. Asking the launcher again
-    // would violate ProcessControl's one-stop contract; a native result or a broken stream has no
-    // such owner and still needs the post-terminal process-tree reap.
-    let abnormal = !native_finished && end.get().is_none();
-    if (native_finished || abnormal)
-        && let Ok(outcome) = stop_process_with_limits(
+    // A caller that took an active turn recorded its reason on `end` and already owns that turn's
+    // stop request. Asking the launcher again would violate `ProcessControl`'s one-stop contract —
+    // and a launcher that refuses the second ask reports a failed teardown to the caller whose stop
+    // actually succeeded. A native result or a broken stream has no such owner, and those are the
+    // only two shapes that still need the post-terminal process-tree reap here.
+    if end.get().is_none()
+        && stop_process_with_limits(
             control.as_ref(),
             CancelReason::Shutdown,
             shared.host.limits(),
         )
         .await
+        .is_ok()
     {
         // A terminal without Claude's own `result` leaves the native conversation at an
         // unknown point. Do not resume it merely because the harness contained the process.
-        record_stop(
-            shared,
-            end,
-            abnormal || matches!(outcome, StopOutcome::Terminated) && !native_finished,
-            CancelReason::Shutdown,
-            false,
-        );
+        record_stop(shared, end, !native_finished, CancelReason::Shutdown, false);
     }
 }
 

@@ -299,6 +299,25 @@ impl FakeClaudeCli {
         !self.all_children_ended()
     }
 
+    /// Makes the newest live turn child print one more line after it has gone quiet.
+    ///
+    /// A [`Run`] says everything it is going to say before a test can arrange anything around it,
+    /// which leaves one ordering out of reach: the vendor's own `result` arriving *after* a stop
+    /// already owns the turn. That window is where the harness has to decide whether it still owes
+    /// the launcher a teardown ask, so a fake that cannot reach it cannot hold that decision.
+    pub fn announce_to_turn(&self, line: impl Into<String>) {
+        let child = lock(&self.children)
+            .iter()
+            .rev()
+            .find(|child| child.is_turn && !child.is_finished())
+            .map(Arc::clone);
+        let Some(child) = child else {
+            return;
+        };
+        lock(&child.pending).push_back(line.into());
+        child.changed.notify_waiters();
+    }
+
     fn run_for(&self, argv: &[String]) -> (Run, Vec<u8>) {
         if argv.iter().any(|argument| argument == "--version") {
             return (Run::replaying(&lock(&self.version)), Vec::new());

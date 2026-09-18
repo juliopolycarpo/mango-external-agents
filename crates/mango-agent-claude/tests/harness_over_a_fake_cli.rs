@@ -2402,6 +2402,55 @@ mod cancelling_and_closing {
         );
     }
 
+    /// `ProcessControl::kill` documents that the library asks once. A cancel claims the turn and
+    /// owns its stop, and the pump's own teardown then has nothing left to ask for — including
+    /// when Claude's `result` lands while that cancel is still inside the launcher. Asking twice
+    /// is not free: the real `TokioChild` refuses the second ask while the first is still inside
+    /// its grace, so the cancel that actually stopped the child reports a failed teardown.
+    #[tokio::test]
+    async fn a_result_landing_under_a_cancel_never_asks_the_launcher_to_stop_twice() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let cancelling = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.cancel(CancelReason::Requested).await }
+        });
+        // The cancel owns the stop and is inside the launcher: its ask is already counted.
+        stop.wait_for_spawn().await;
+        assert_eq!(launcher.kill_requests(), 1);
+
+        // Claude answers anyway. The pump now reaches its terminal with a finished reducer *and* a
+        // recorded stop reason, which is the one combination that used to ask a second time.
+        launcher.announce_to_turn(r#"{"type":"result","is_error":false}"#);
+        let events = drain(&mut turn).await;
+        assert!(
+            events.contains(&EventKind::Completed),
+            "expected the vendor's own result to end the turn, received {events:?}"
+        );
+
+        // Settled well past the point the second ask would have been made: it is issued as soon as
+        // the launcher reports no graceful interrupt, with nothing awaited in between.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            launcher.kill_requests(),
+            1,
+            "expected the cancel that owns this turn to be the only caller to ask"
+        );
+
+        stop.release();
+        cancelling
+            .await
+            .expect("expected the cancel task to finish")
+            .expect("expected the cancel to report the stop it owns");
+    }
+
     #[tokio::test]
     async fn a_stopping_turn_remains_busy_until_its_process_is_reaped() {
         let launcher = Arc::new(
