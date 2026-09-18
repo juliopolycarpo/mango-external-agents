@@ -123,38 +123,38 @@ impl ClaudeHarness {
     }
 
     /// Everything the three probes established, in one pass.
-    async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Survey {
-        let Some(banner) = probe::output(host, executable, &["--version"]).await else {
-            return Survey::default();
+    async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Result<Survey> {
+        let Some(banner) = probe::output(host, executable, &["--version"]).await? else {
+            return Ok(Survey::default());
         };
         let version = version::parse(&banner);
         let surface = probe::output(host, executable, &["--help"])
-            .await
+            .await?
             .map(|help| CliSurface::parse(&help))
             .filter(CliSurface::is_usable);
 
         // A build that cannot be driven is not asked who is signed in: the answer would be true and
         // useless, and it costs a third process launch to learn.
         if let Some(refusal) = classify_surface(surface.as_ref(), version.as_ref()) {
-            return Survey {
+            return Ok(Survey {
                 banner: Some(banner),
                 version,
                 refusal: Some(refusal),
                 ..Survey::default()
-            };
+            });
         }
 
         // Neither read depends on the other's result: one is a process boot, the other a file read.
         let (authentication, auto_mode_disabled_by_policy) = tokio::join!(
             async {
-                probe::output(host, executable, &["auth", "status"])
-                    .await
-                    .map_or_else(Authentication::unknown, |stdout| {
-                        auth::parse_status(&stdout)
-                    })
+                let stdout = probe::output(host, executable, &["auth", "status"]).await?;
+                Ok::<Authentication, Error>(stdout.map_or_else(Authentication::unknown, |stdout| {
+                    auth::parse_status(&stdout)
+                }))
             },
             read_auto_mode_policy(host)
         );
+        let authentication = authentication?;
         let availability = ModeAvailability {
             account_kind: authentication.kind,
             auto_mode_disabled_by_policy,
@@ -164,14 +164,14 @@ impl ClaudeHarness {
                 .cloned(),
         };
 
-        Survey {
+        Ok(Survey {
             banner: Some(banner),
             version,
             refusal: None,
             authentication,
             availability,
             surface,
-        }
+        })
     }
 
     /// Reuses a host-vouched probe where its public record is sufficient, while re-reading the
@@ -181,16 +181,16 @@ impl ClaudeHarness {
         host: &HostContext,
         executable: &ExecutablePath,
         receipt: Option<&mango_external_agents::DiscoveryReceipt>,
-    ) -> Survey {
+    ) -> Result<Survey> {
         let Some(receipt) = receipt else {
             return self.survey(host, executable).await;
         };
         if matches!(receipt.discovery.gate, GateVerdict::NotInstalled) {
-            return Survey::default();
+            return Ok(Survey::default());
         }
 
         let surface = probe::output(host, executable, &["--help"])
-            .await
+            .await?
             .map(|help| CliSurface::parse(&help))
             .filter(CliSurface::is_usable);
         let version = receipt
@@ -231,7 +231,7 @@ impl ClaudeHarness {
                 .cloned(),
         };
 
-        Survey {
+        Ok(Survey {
             banner: receipt
                 .discovery
                 .version
@@ -245,7 +245,7 @@ impl ClaudeHarness {
             },
             availability,
             surface,
-        }
+        })
     }
 }
 
@@ -335,7 +335,7 @@ impl Harness for ClaudeHarness {
     }
 
     async fn probe(&self, host: &HostContext) -> Result<Discovery> {
-        let survey = self.survey(host, &self.executable).await;
+        let survey = self.survey(host, &self.executable).await?;
         if !survey.installed() {
             return Ok(Discovery::not_installed());
         }
@@ -417,9 +417,16 @@ impl Harness for ClaudeHarness {
             ConfigFile::write(&request.mcp_servers, scratch).await?
         });
         let executable = self.executable_for(&request);
-        let survey = self
+        let survey = match self
             .survey_for_open(host, &executable, request.discovery.as_ref())
-            .await;
+            .await
+        {
+            Ok(survey) => survey,
+            Err(error) => {
+                crate::mcp::release_off_worker(mcp_config.take()).await;
+                return Err(error);
+            }
+        };
 
         // Every refusal below owns the artifact written above, and removing it is a synchronous
         // `remove_dir_all` against the host's own scratch root. Gathered into one call so a failed

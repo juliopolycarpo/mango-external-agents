@@ -119,6 +119,10 @@ fn copy_error(error: &Error) -> Error {
     match error {
         Error::Busy => Error::Busy,
         Error::Operation { dispatch, source } => copy_error(source).with_dispatch(*dispatch),
+        Error::CleanupRequired { control, source } => Error::CleanupRequired {
+            control: Arc::clone(control),
+            source: Box::new(copy_error(source)),
+        },
         Error::Vendor(error) => Error::Vendor(error.clone()),
         Error::NotSupported { capability } => Error::NotSupported {
             capability: *capability,

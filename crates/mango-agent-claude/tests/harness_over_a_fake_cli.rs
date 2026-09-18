@@ -13,8 +13,8 @@ use mango_external_agents::{
     ConfigurationChange, ConfigurationOptionId, ConfigurationPatch, ConfigurationValue,
     DiscoveryReceipt, DiscoveryReceiptMeasurements, Dispatch, Error, EventKind, ExecutablePath,
     GateVerdict, Harness, HarnessId, HostContext, InteractionId, LaunchSpec, Limits, LineLimits,
-    ManagedProcess, OpenSession, PermissionLevel, PermissionResponse, ProcessLauncher, Result,
-    ResumeMode, Session, SessionStatus, TurnRequest, TurnStream,
+    ManagedProcess, OpenSession, PermissionLevel, PermissionResponse, ProcessControl,
+    ProcessLauncher, Result, ResumeMode, Session, SessionStatus, TurnRequest, TurnStream,
 };
 use support::{
     FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, SpawnGate, host,
@@ -95,8 +95,89 @@ impl ProcessLauncher for FailingTurnLauncher {
     }
 }
 
+/// Makes a probe's failed native cleanup visible to the harness caller.
+struct CleanupRequiredProbeLauncher {
+    inner: Arc<FakeClaudeCli>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for CleanupRequiredProbeLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        let mut child = self.inner.spawn(spec).await?;
+        child.stdin = None;
+        child.control = Arc::new(FailingProbeCleanup {
+            inner: child.control,
+        });
+        Ok(child)
+    }
+}
+
+/// Refuses forced termination so the host must retain its process control.
+struct FailingProbeCleanup {
+    inner: Arc<dyn ProcessControl>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for FailingProbeCleanup {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> Result<mango_external_agents::ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, _reason: CancelReason) -> Result<()> {
+        Err(Error::Closed {
+            subject: "test probe process",
+        })
+    }
+}
+
 mod discovery {
     use super::*;
+
+    #[tokio::test]
+    async fn propagates_probe_cleanup_required_through_discovery_and_opening() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let host = host_under(
+            Arc::new(CleanupRequiredProbeLauncher {
+                inner: Arc::clone(&launcher),
+            }),
+            Limits::default(),
+        );
+
+        let discovery = ClaudeHarness::new().discover(&host).await;
+        let error = discovery.expect_err("expected failed probe cleanup to reach discovery");
+        assert!(
+            matches!(error, Error::CleanupRequired { .. }),
+            "expected the cleanup-required error rather than an unavailable discovery, received {error:?}"
+        );
+        assert!(
+            error.cleanup_control().is_some(),
+            "expected discovery to retain the host cleanup control"
+        );
+
+        let opening = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await;
+        let error = match opening {
+            Ok(_) => panic!("expected failed probe cleanup to reach opening"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, Error::CleanupRequired { .. }),
+            "expected the cleanup-required error rather than a launch refusal, received {error:?}"
+        );
+        assert!(
+            error.cleanup_control().is_some(),
+            "expected opening to retain the host cleanup control"
+        );
+    }
 
     #[tokio::test]
     async fn reads_the_binary_rather_than_the_pin() {
