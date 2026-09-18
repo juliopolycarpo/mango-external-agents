@@ -112,6 +112,52 @@ impl ProcessLauncher for GatedLauncher {
     }
 }
 
+/// Makes the app-server probe lose stdin and report a cleanup failure to its host.
+struct CleanupRequiredProbeLauncher {
+    inner: Arc<FakeLauncher>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for CleanupRequiredProbeLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> mango_external_agents::Result<ManagedProcess> {
+        let app_server = spec.argv.iter().any(|argument| argument == "app-server");
+        let mut child = self.inner.spawn(spec).await?;
+        if app_server {
+            child.stdin = None;
+            child.control = Arc::new(FailingProbeCleanup {
+                inner: child.control,
+            });
+        }
+        Ok(child)
+    }
+}
+
+/// Refuses forced termination so discovery has to return the host cleanup handle.
+struct FailingProbeCleanup {
+    inner: Arc<dyn ProcessControl>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for FailingProbeCleanup {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, _reason: CancelReason) -> mango_external_agents::Result<()> {
+        Err(mango_external_agents::Error::Closed {
+            subject: "test probe process",
+        })
+    }
+}
+
 /// Holds an interrupt write before it reaches the recorded app-server.
 struct GatedStdin {
     inner: Box<dyn mango_external_agents::ByteSink>,
@@ -4050,6 +4096,34 @@ async fn a_machine_with_no_codex_on_it_discovers_nothing_rather_than_failing() {
         mango_external_agents::GateVerdict::NotInstalled
     );
     assert!(!discovery.is_usable());
+}
+
+#[tokio::test]
+async fn a_probe_cleanup_failure_reaches_discovery_with_its_host_control() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(version_answer());
+    launcher.push(FakeProcess::responding(|_| Vec::new()));
+    let host = HostContext::builder()
+        .launcher(Arc::new(CleanupRequiredProbeLauncher {
+            inner: Arc::clone(&launcher),
+        }))
+        .cwd(workspace_path())
+        .client_info("mango-test", "0.0.1")
+        .build()
+        .expect("expected a host");
+
+    let error = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect_err("expected failed app-server cleanup to reach discovery");
+    assert!(
+        matches!(error, mango_external_agents::Error::CleanupRequired { .. }),
+        "expected cleanup-required rather than unknown discovery, received {error:?}"
+    );
+    assert!(
+        error.cleanup_control().is_some(),
+        "expected discovery to retain the host cleanup control"
+    );
 }
 
 /// An old build reports the gate verdict rather than crashing, and claims no capabilities.

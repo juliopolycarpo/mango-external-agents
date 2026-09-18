@@ -16,7 +16,7 @@ use mango_external_agents::harness::{
 use mango_external_agents::identity::HarnessIdentity;
 use mango_external_agents::jsonrpc::{Client, ClientOptions};
 use mango_external_agents::permission::PermissionMatrix;
-use mango_external_agents::process::{LaunchSpec, ProcessControl};
+use mango_external_agents::process::{LaunchSpec, ProcessCleanupGuard};
 use mango_external_agents::session::{
     OpenSession, ResumeMode, Session, SessionIds, SessionPage, SessionQuery, resume_fallback_reason,
 };
@@ -191,7 +191,7 @@ impl Harness for CodexHarness {
             });
         }
 
-        let (auth, models) = probe_app_server(host, &self.executable).await;
+        let (auth, models) = probe_app_server(host, &self.executable).await?;
         Ok(Discovery {
             executable: self.executable.get().cloned(),
             version: Some(version),
@@ -235,6 +235,11 @@ impl Harness for CodexHarness {
         )
         .await?;
 
+        let cleanup = ProcessCleanupGuard::new(
+            transport.control,
+            *host.limits(),
+            mango_external_agents::CancelReason::Shutdown,
+        );
         let shared = Arc::new(Shared::new(host.clone(), request.session_id.clone()));
         let client = Arc::new(Client::connect(
             transport.link,
@@ -262,11 +267,10 @@ impl Harness for CodexHarness {
             Ok(opened) => opened,
             Err(error) => {
                 let _ = client.close().await;
-                let _ = transport
-                    .control
-                    .kill(mango_external_agents::CancelReason::Shutdown)
-                    .await;
-                return Err(error);
+                return match cleanup.finish().await {
+                    Ok(_) => Err(error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                };
             }
         };
 
@@ -275,7 +279,7 @@ impl Harness for CodexHarness {
             state,
             shared,
             client,
-            transport.control,
+            cleanup.into_control(),
         )))
     }
 
@@ -287,8 +291,10 @@ impl Harness for CodexHarness {
         crate::session::validate_list_workspace(host, &query)?;
         let connection = ProbeConnection::open(host, &self.executable).await?;
         let page = crate::session::list_threads(&connection.client, host, query).await;
-        connection.close().await;
-        page
+        match connection.close().await {
+            Ok(()) => page,
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -582,6 +588,7 @@ async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result
         .await
     {
         Ok(child) => child,
+        Err(error) if error.cleanup_control().is_some() => return Err(error),
         Err(_) => return Ok(None),
     };
 
@@ -589,14 +596,16 @@ async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result
         std::mem::replace(&mut child.stdout, Box::new(NoBytes)),
         host.limits().line,
     );
+    let cleanup = ProcessCleanupGuard::new(
+        child.control,
+        *host.limits(),
+        mango_external_agents::CancelReason::Shutdown,
+    );
     // Bounded, because a probe must end. `codex --version` prints one line and exits, but a
     // binary that is not the one the host thinks it is may print nothing and sit there — and a
     // probe that waited on it would hang whatever called it, with no turn to cancel.
     let first = tokio::time::timeout(host.limits().request_timeout, lines.next_line()).await;
-    let _ = child
-        .control
-        .kill(mango_external_agents::CancelReason::Shutdown)
-        .await;
+    cleanup.finish().await?;
     Ok(first
         .ok()
         .and_then(|line| line.ok().flatten())
@@ -621,10 +630,12 @@ impl mango_external_agents::process::ByteSource for NoBytes {
 async fn probe_app_server(
     host: &HostContext,
     executable: &ExecutablePath,
-) -> (AuthState, Vec<Model>) {
+) -> Result<(AuthState, Vec<Model>)> {
     let unknown = (AuthState::Unknown, Vec::new());
-    let Ok(connection) = ProbeConnection::open(host, executable).await else {
-        return unknown;
+    let connection = match ProbeConnection::open(host, executable).await {
+        Ok(connection) => connection,
+        Err(error) if error.cleanup_control().is_some() => return Err(error),
+        Err(_) => return Ok(unknown),
     };
 
     let account: AccountReadResponse = connection
@@ -646,15 +657,17 @@ async fn probe_app_server(
             .map(to_model)
             .collect(),
     );
-    connection.close().await;
-    probed
+    match connection.close().await {
+        Ok(()) => Ok(probed),
+        Err(error) if error.cleanup_control().is_some() => Err(error),
+        Err(_) => Ok(unknown),
+    }
 }
 
 /// One bounded app-server connection for pre-conversation read-only services.
 struct ProbeConnection {
     client: Client,
-    control: Arc<dyn ProcessControl>,
-    closed: bool,
+    cleanup: ProcessCleanupGuard,
 }
 
 impl ProbeConnection {
@@ -677,8 +690,11 @@ impl ProbeConnection {
         );
         let connection = Self {
             client,
-            control: transport.control,
-            closed: false,
+            cleanup: ProcessCleanupGuard::new(
+                transport.control,
+                *host.limits(),
+                mango_external_agents::CancelReason::Shutdown,
+            ),
         };
         let handshake: Result<InitializeResponse> = connection
             .client
@@ -691,46 +707,28 @@ impl ProbeConnection {
             )
             .await;
         let result = match handshake {
-            Ok(handshake) => {
-                connection
-                    .client
-                    .notify(method::INITIALIZED, empty_params())
-                    .await?;
-                require_supported_handshake_version(&handshake)
-            }
+            Ok(handshake) => connection
+                .client
+                .notify(method::INITIALIZED, empty_params())
+                .await
+                .and_then(|()| require_supported_handshake_version(&handshake)),
             Err(error) => Err(error),
         };
         if let Err(error) = result {
-            connection.close().await;
-            return Err(error);
+            return match connection.close().await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error),
+            };
         }
         Ok(connection)
     }
 
-    async fn close(mut self) {
-        let _ = self.client.close().await;
-        let _ = self
-            .control
-            .kill(mango_external_agents::CancelReason::Shutdown)
-            .await;
-        self.closed = true;
-    }
-}
-
-impl Drop for ProbeConnection {
-    fn drop(&mut self) {
-        if self.closed {
-            return;
+    async fn close(self) -> Result<()> {
+        let client = self.client.close().await;
+        match self.cleanup.finish().await {
+            Ok(_) => client,
+            Err(error) => Err(error),
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let control = Arc::clone(&self.control);
-        runtime.spawn(async move {
-            let _ = control
-                .kill(mango_external_agents::CancelReason::Shutdown)
-                .await;
-        });
     }
 }
 
