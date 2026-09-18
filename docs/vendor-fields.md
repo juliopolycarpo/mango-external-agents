@@ -93,6 +93,27 @@ refused one is a request it answered "no" to. Only requests can be refused.
 | `ClientCapabilities::elicitation`        | runtime | —                                                    | refuse      | Advertising it promises to render an arbitrary JSON-schema form and return whatever fields it names, including one named `password`                                                                        | `harness::tests::the_client_advertises_no_elicitation_surface_of_any_mode`              |
 | `ClientCapabilities::fs`, `terminal`     | runtime | —                                                    | refuse      | The host owns files and terminals; an agent asking this client to touch one is asking the library to act on a third party's instruction                                                                    | `harness::tests::the_client_declines_every_filesystem_and_terminal_capability`          |
 
+## Against the TypeScript adapters this library replaces
+
+The runtime's `apps/runtime/src/services/external-agents/` tree is where these harnesses were ported
+from. Every difference found comparing the two is one of four things, and none of them is an
+unexplained regression.
+
+| Difference                                                         | Classification            | Note                                                                                                       |
+| ------------------------------------------------------------------ | ------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Codex `item/tool/call` refused                                     | equivalent                | Both refuse it; it is the same invariant on both sides                                                     |
+| Codex command and file approvals, all four decisions               | equivalent                | Plus the two amendment-carrying decisions, which the TypeScript side also sends                            |
+| Codex `item/permissions/requestApproval` scope echo                | equivalent                | `grant:turn`/`grant:session`/`deny` there; `PermissionScope::Turn`/`Session` here                          |
+| Codex `item/tool/requestUserInput` treated as an **approval**      | required fix              | It grants nothing, so it is a question here — the distinction the TypeScript side could not express        |
+| ACP `plan` entries rendered as text                                | required fix              | Steps with their own status and priority here                                                              |
+| ACP diff blocks rendered as text                                   | required fix              | `FileChange` rows with both sides carried                                                                  |
+| ACP `rawInput`/`rawOutput` read                                    | intentional difference    | No raw vendor frame enters the public API here, at any size                                                |
+| Claude account fingerprinting (keyed HMAC of the account email)    | intentional difference    | Reconstructing it means reading the email this harness drops; see `docs/harness-claude.md`                 |
+| Claude `permission_denials` read and unused                        | equivalent                | Both ignore it; the same refusal arrives as a `tool_result`                                                |
+| Claude `mcp_servers`, `mcp_server_errors`, `plugin_errors` at init | unsupported peer surface  | They describe the operator's own machine; no neutral carrier, and carrying them puts local paths in a host |
+| Claude structured tool input (`TodoWrite`, diffs)                  | required fix, partly done | `Write` and `Edit` here; `TodoWrite` is owed a capture — see below                                         |
+| `TurnStarted`, `QuestionAsked`, `QuestionResolved`                 | intentional difference    | No TypeScript counterpart; the turn id was implicit there and a question had nowhere to go                 |
+
 ## What is missing from this table
 
 Two things, and both are gaps rather than decisions:
