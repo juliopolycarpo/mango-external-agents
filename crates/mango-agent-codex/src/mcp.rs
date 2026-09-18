@@ -1,9 +1,9 @@
 //! Host MCP entries as app-server's per-thread configuration override.
 
-use std::collections::BTreeMap;
-
+use http::header::{HeaderName, HeaderValue};
 use mango_external_agents::{Error, McpServer, McpTransport, Result};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// One request-only config map; nothing here writes the user's `config.toml`.
 pub(crate) fn override_for(servers: &[McpServer]) -> Result<Option<BTreeMap<String, Value>>> {
@@ -31,9 +31,7 @@ pub(crate) fn override_for(servers: &[McpServer]) -> Result<Option<BTreeMap<Stri
             McpTransport::Http { url, headers }
                 if valid_http_mcp_url(url)
                     && headers.keys().all(|name| valid_header_name(name))
-                    && headers
-                        .values()
-                        .all(|value| !value.contains('\r') && !value.contains('\n')) =>
+                    && headers.values().all(|value| valid_header_value(value)) =>
             {
                 json!({"url": url, "http_headers": headers})
             }
@@ -81,29 +79,14 @@ fn valid_http_mcp_url(url: &str) -> bool {
             .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
-/// HTTP field names use the token grammar; no whitespace or separator can change a header.
+/// HTTP field names use the library's token grammar; no whitespace or separator can change one.
 fn valid_header_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
+    HeaderName::from_bytes(name.as_bytes()).is_ok()
+}
+
+/// HTTP field values must be serializable by the HTTP library that validates their syntax.
+fn valid_header_value(value: &str) -> bool {
+    HeaderValue::from_str(value).is_ok()
 }
 
 #[cfg(test)]
@@ -158,5 +141,21 @@ mod tests {
                 "expected {url:?} to be rejected before launch"
             );
         }
+    }
+
+    #[test]
+    fn http_mcp_headers_reject_values_the_http_library_cannot_encode() {
+        let server = [McpServer {
+            name: String::from("remote"),
+            transport: McpTransport::Http {
+                url: String::from("https://docs.example/mcp"),
+                headers: BTreeMap::from([(String::from("X-Docs"), String::from("token\u{7f}"))]),
+            },
+        }];
+
+        assert!(
+            matches!(override_for(&server), Err(Error::HostConfiguration { .. })),
+            "expected a header value the HTTP library rejects to fail before launch"
+        );
     }
 }
