@@ -16,10 +16,9 @@ use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, Rec
 use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
     Configuration, ConfigurationChange, ConfigurationOptionId, ConfigurationPatch,
-    ConfigurationValue, DecisionSource, Dispatch, Error, EventKind, ExitStatus, Harness,
-    HostContext, Limits,
-    ManagedProcess, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, Session,
-    SessionStatus, SessionSubscription, TurnRequest, TurnStream, VendorInfo,
+    ConfigurationValue, DecisionSource, Dispatch, Error, EventKind, ExitStatus, Harness, HostContext, Limits,
+    ManagedProcess, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, ResumeMode,
+    Session, SessionStatus, SessionSubscription, TurnRequest, TurnStream, VendorInfo,
 };
 
 const VENDOR: VendorInfo = VendorInfo {
@@ -187,6 +186,81 @@ impl InterleavingConfigAgent {
 
     fn result(id: serde_json::Value, value: serde_json::Value) -> String {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": value }).to_string()
+    }
+}
+
+/// A named ACP peer that announces a newer catalog while an opening response is in flight.
+struct OpeningCatalogInterleavingAgent {
+    method: &'static str,
+}
+
+impl OpeningCatalogInterleavingAgent {
+    fn for_new() -> FakeProcess {
+        Self {
+            method: "session/new",
+        }
+        .process()
+    }
+
+    fn for_load() -> FakeProcess {
+        Self {
+            method: "session/load",
+        }
+        .process()
+    }
+
+    fn process(self) -> FakeProcess {
+        FakeProcess::responding(move |line| self.answer(line))
+    }
+
+    fn answer(&self, line: &str) -> Vec<String> {
+        let message: serde_json::Value =
+            serde_json::from_str(line).expect("expected harness JSON-RPC request");
+        let id = message["id"].clone();
+        match message["method"].as_str() {
+            Some("initialize") => vec![InterleavingConfigAgent::result(
+                id,
+                serde_json::json!({
+                    "protocolVersion": 1,
+                    "agentInfo": { "name": "opening-interleaving-fake", "version": "1" },
+                    "agentCapabilities": {
+                        "loadSession": true,
+                        "promptCapabilities": { "image": true, "embeddedContext": true },
+                        "sessionCapabilities": {},
+                    },
+                    "authMethods": [],
+                }),
+            )],
+            Some(method) if method == self.method => {
+                let session_id = if method == "session/load" {
+                    String::from("resumed-session")
+                } else {
+                    String::from("new-session")
+                };
+                let mut response = serde_json::json!({
+                    "configOptions": [InterleavingConfigAgent::model_option("stale")],
+                });
+                if method == "session/new" {
+                    response["sessionId"] = serde_json::Value::String(session_id.clone());
+                }
+                vec![
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "config_option_update",
+                                "configOptions": [InterleavingConfigAgent::model_option("newer")],
+                            },
+                        },
+                    })
+                    .to_string(),
+                    InterleavingConfigAgent::result(id, response),
+                ]
+            }
+            _ => vec![InterleavingConfigAgent::result(id, serde_json::json!({}))],
+        }
     }
 }
 
@@ -2986,6 +3060,49 @@ async fn a_config_notification_is_not_overwritten_by_a_stale_option_response() {
         snapshot.catalog.options()[0].current,
         Some(ConfigurationValue::Text(String::from("newer"))),
         "expected the public catalog not to regress to the response value"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A notification received while `session/new` is pending remains the authoritative catalog.
+#[tokio::test]
+async fn opening_a_new_session_keeps_a_newer_catalog_notification() {
+    let launcher = FakeLauncher::new();
+    launcher.push(OpeningCatalogInterleavingAgent::for_new());
+    let session = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("new-catalog-order"))
+        .await
+        .expect("expected the interleaving session to open");
+    assert_eq!(
+        session.snapshot().configuration.observed.model.as_deref(),
+        Some("newer"),
+        "expected the notification during session/new to remain authoritative"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A notification received while `session/load` is pending remains the authoritative catalog.
+#[tokio::test]
+async fn opening_a_loaded_session_keeps_a_newer_catalog_notification() {
+    let launcher = FakeLauncher::new();
+    launcher.push(OpeningCatalogInterleavingAgent::for_load());
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("load-catalog-order").resuming("resumed-session", ResumeMode::Strict),
+        )
+        .await
+        .expect("expected the interleaving session to load");
+    assert_eq!(
+        session.snapshot().configuration.observed.model.as_deref(),
+        Some("newer"),
+        "expected the notification during session/load to remain authoritative"
     );
     session
         .close(CloseReason::Requested)

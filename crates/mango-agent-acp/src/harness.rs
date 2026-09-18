@@ -49,8 +49,8 @@ use mango_external_agents::{
 use crate::client::{self, SessionState};
 use crate::profile::{AcpProfile, matrix};
 use crate::session::{
-    AcpSession, accepted_axes, catalog_from_options, configuration_from_catalog,
-    refuse_unsupported_reset, validate_listing_workspace,
+    AcpSession, accepted_axes, catalog_from_options, refuse_unsupported_reset,
+    validate_listing_workspace,
 };
 use crate::transport;
 use crate::version::{self, Comparison};
@@ -484,7 +484,10 @@ impl Harness for AcpHarness {
         // would leave an agent running with nothing driving it: the dispatch loop only winds down
         // when the shutdown channel drops, so the process would outlive the call that started it by
         // however long the drop took to reach it.
-        let opened = match self.handshake_and_open(&connection, host, &request).await {
+        let opened = match self
+            .handshake_and_open(&connection, &connection_state, host, &request)
+            .await
+        {
             Ok(opened) => opened,
             Err(error) => {
                 connection.begin_shutdown(mango_external_agents::CancelReason::Requested);
@@ -529,11 +532,7 @@ impl Harness for AcpHarness {
             .as_deref()
             .map(catalog_from_options)
             .unwrap_or_else(ConfigurationCatalog::empty);
-        let observed = configuration_from_catalog(&catalog);
-        session_state.update(|snapshot| {
-            snapshot.catalog = catalog;
-            snapshot.configuration.observed = observed;
-        });
+        connection_state.publish_lifecycle_catalog(opened.catalog_revision, catalog);
 
         let session = AcpSession::new(
             Arc::clone(&self.profile),
@@ -702,6 +701,7 @@ struct Opened {
     fallback_reason: Option<String>,
     modes: Option<SessionModeState>,
     config_options: Option<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>,
+    catalog_revision: u64,
 }
 
 impl AcpHarness {
@@ -709,6 +709,7 @@ impl AcpHarness {
     async fn handshake_and_open(
         &self,
         connection: &Arc<client::ConnectionHandle>,
+        connection_state: &client::SessionState,
         host: &HostContext,
         request: &OpenSession,
     ) -> Result<(Handshake, Opened)> {
@@ -718,6 +719,7 @@ impl AcpHarness {
         let opened = self
             .open(
                 connection,
+                connection_state,
                 host,
                 request,
                 &handshake,
@@ -778,6 +780,7 @@ impl AcpHarness {
     async fn open(
         &self,
         connection: &Arc<client::ConnectionHandle>,
+        connection_state: &client::SessionState,
         host: &HostContext,
         request: &OpenSession,
         handshake: &Handshake,
@@ -785,12 +788,16 @@ impl AcpHarness {
     ) -> Result<Opened> {
         let mcp_servers = map_mcp_servers(&request.mcp_servers, &handshake.capabilities)?;
         let Some(resume) = &request.resume else {
-            return self.new_session(connection, host, cwd, mcp_servers).await;
+            return self
+                .new_session(connection, connection_state, host, cwd, mcp_servers)
+                .await;
         };
 
         if !handshake.capabilities.load_session {
             if resume.mode == ResumeMode::Fallback {
-                let mut opened = self.new_session(connection, host, cwd, mcp_servers).await?;
+                let mut opened = self
+                    .new_session(connection, connection_state, host, cwd, mcp_servers)
+                    .await?;
                 opened.fallback_reason = Some(String::from(
                     "the ACP agent did not advertise loadSession for the requested resume",
                 ));
@@ -801,18 +808,24 @@ impl AcpHarness {
             ));
         }
 
-        let loaded = self
-            .request(
-                connection,
-                host,
-                "session/load",
+        let (catalog_revision, sent) = connection_state.with_catalog_revision(|revision| {
+            let sent = client::submit(connection,
                 LoadSessionRequest::new(
                     AcpSessionId::new(resume.native_session_id.clone()),
                     cwd.clone(),
                 )
                 .mcp_servers(mcp_servers.clone()),
-            )
-            .await;
+            );
+            (revision, sent)
+        });
+        let loaded = client::await_sent(
+            connection,
+            &self.profile,
+            host.limits().request_timeout,
+            "session/load",
+            sent?,
+        )
+        .await;
         match loaded {
             Ok(loaded) => Ok(Opened {
                 session_id: AcpSessionId::new(resume.native_session_id.clone()),
@@ -820,13 +833,16 @@ impl AcpHarness {
                 fallback_reason: None,
                 modes: loaded.modes,
                 config_options: loaded.config_options,
+                catalog_revision,
             }),
             Err(error) if resume.mode == ResumeMode::Strict => Err(error),
             // Fallback: a fresh conversation, and the host is told why rather than left to notice
             // that its history disappeared.
             Err(error) if resume_failure_is_conclusive(&error) => {
                 let reason = resume_fallback_reason("session/load", &error);
-                let mut opened = self.new_session(connection, host, cwd, mcp_servers).await?;
+                let mut opened = self
+                    .new_session(connection, connection_state, host, cwd, mcp_servers)
+                    .await?;
                 opened.fallback_reason = Some(reason);
                 Ok(opened)
             }
@@ -837,24 +853,30 @@ impl AcpHarness {
     async fn new_session(
         &self,
         connection: &Arc<client::ConnectionHandle>,
+        connection_state: &client::SessionState,
         host: &HostContext,
         cwd: std::path::PathBuf,
         mcp_servers: Vec<AcpMcpServer>,
     ) -> Result<Opened> {
-        let response = self
-            .request(
-                connection,
-                host,
-                "session/new",
-                NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
-            )
-            .await?;
+        let (catalog_revision, sent) = connection_state.with_catalog_revision(|revision| {
+            let sent = client::submit(connection, NewSessionRequest::new(cwd).mcp_servers(mcp_servers));
+            (revision, sent)
+        });
+        let response = client::await_sent(
+            connection,
+            &self.profile,
+            host.limits().request_timeout,
+            "session/new",
+            sent?,
+        )
+        .await?;
         Ok(Opened {
             session_id: response.session_id,
             resumed: false,
             fallback_reason: None,
             modes: response.modes,
             config_options: response.config_options,
+            catalog_revision,
         })
     }
 

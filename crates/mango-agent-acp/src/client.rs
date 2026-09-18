@@ -406,6 +406,15 @@ impl SessionState {
         (self.core_state.snapshot().catalog.clone(), *revision)
     }
 
+    /// Submits a synchronous request while holding its catalog-ordering baseline.
+    pub(crate) fn with_catalog_revision<ResultValue>(
+        &self,
+        submit: impl FnOnce(u64) -> ResultValue,
+    ) -> ResultValue {
+        let revision = self.lock_catalog_revision();
+        submit(*revision)
+    }
+
     /// Publishes a request response unless a later catalog notification already won the order.
     pub(crate) fn publish_response_configuration(
         &self,
@@ -414,23 +423,33 @@ impl SessionState {
         requested: Configuration,
         accepted: Configuration,
     ) -> ConfigurationState {
-        let mut revision = self.lock_catalog_revision();
-        let catalog = if *revision == response_revision {
-            *revision = revision.wrapping_add(1);
-            response_catalog
-        } else {
-            self.core_state.snapshot().catalog.clone()
-        };
-        let state = ConfigurationState::new(
-            requested,
-            accepted,
-            crate::session::configuration_from_catalog(&catalog),
-        );
-        self.core_state.update(|snapshot| {
-            snapshot.catalog = catalog;
-            snapshot.configuration = state.clone();
+        self.with_response_catalog(response_revision, response_catalog, |catalog| {
+            let state = ConfigurationState::new(
+                requested,
+                accepted,
+                crate::session::configuration_from_catalog(&catalog),
+            );
+            self.core_state.update(|snapshot| {
+                snapshot.catalog = catalog;
+                snapshot.configuration = state.clone();
+            });
+            state
+        })
+    }
+
+    /// Publishes an opening catalog only when no newer session notification has won.
+    pub(crate) fn publish_lifecycle_catalog(
+        &self,
+        response_revision: u64,
+        response_catalog: ConfigurationCatalog,
+    ) {
+        self.with_response_catalog(response_revision, response_catalog, |catalog| {
+            let observed = crate::session::configuration_from_catalog(&catalog);
+            self.core_state.update(|snapshot| {
+                snapshot.catalog = catalog;
+                snapshot.configuration.observed = observed;
+            });
         });
-        state
     }
 
     /// Guards one synchronous configuration merge and prompt-slot claim.
@@ -767,6 +786,22 @@ impl SessionState {
         self.catalog_revision
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn with_response_catalog<ResultValue>(
+        &self,
+        response_revision: u64,
+        response_catalog: ConfigurationCatalog,
+        update: impl FnOnce(ConfigurationCatalog) -> ResultValue,
+    ) -> ResultValue {
+        let mut revision = self.lock_catalog_revision();
+        let catalog = if *revision == response_revision {
+            *revision = revision.wrapping_add(1);
+            response_catalog
+        } else {
+            self.core_state.snapshot().catalog.clone()
+        };
+        update(catalog)
     }
 
     fn lock_reducer(&self) -> std::sync::MutexGuard<'_, Reducer> {
@@ -1431,13 +1466,47 @@ where
     Request: agent_client_protocol::JsonRpcRequest,
     Request::Response: Send,
 {
-    // `ConnectionTo::send_request` enters ACP's own unbounded task queue immediately. Acquire
-    // before constructing that request so a host's pending-request budget remains an admission
-    // bound rather than merely a bound on responses we happened to await.
-    let (_permit, sent) = connection
+    let sent = submit(connection, request)?;
+    await_sent(connection, profile, timeout, method, sent).await
+}
+
+/// A request admitted before submission, with cleanup owned until its response arrives.
+pub(crate) struct SubmittedRequest<'a, Response> {
+    sent: agent_client_protocol::SentRequest<Response>,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    abandonment: RequestAbandonment,
+}
+
+/// Submits synchronously so callers can bind catalog revision and request admission together.
+pub(crate) fn submit<Request>(
+    connection: &Arc<ConnectionHandle>,
+    request: Request,
+) -> Result<SubmittedRequest<'_, Request::Response>>
+where
+    Request: agent_client_protocol::JsonRpcRequest,
+{
+    let (permit, sent) = connection
         .requests
         .submit(|| connection.connection().send_request(request))?;
-    let mut abandonment = RequestAbandonment::new(Arc::clone(connection));
+    Ok(SubmittedRequest {
+        sent,
+        _permit: permit,
+        abandonment: RequestAbandonment::new(Arc::clone(connection)),
+    })
+}
+
+/// Awaits an admitted request already submitted under a synchronous lifecycle claim.
+pub(crate) async fn await_sent<Response>(
+    connection: &ConnectionHandle,
+    profile: &crate::profile::AcpProfile,
+    timeout: Duration,
+    method: &'static str,
+    submitted: SubmittedRequest<'_, Response>,
+) -> Result<Response>
+where
+    Response: Send,
+{
+    let SubmittedRequest { sent, _permit, mut abandonment } = submitted;
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
         return Err(Error::Timeout {
