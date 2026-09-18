@@ -57,6 +57,9 @@ struct ActiveTurn {
     /// Set only after native work has been reaped. A stopping owner stays admitted until the
     /// pump commits its terminal outcome (or its receiver is abandoned).
     stopped: bool,
+    /// The terminal result has committed, or its receiver was abandoned. A reaped process alone
+    /// cannot admit a replacement while its old stream still owns the terminal transition.
+    settled: bool,
 }
 
 /// An active attempt synchronously claimed for teardown.
@@ -196,10 +199,13 @@ impl ClaudeSession {
         };
         if let Some(control) = taken.control {
             let outcome = end_turn(Some(control), reason, self.shared.host.limits()).await?;
-            mark_stopped(&self.shared, &taken.end);
-            if matches!(outcome, Some(StopOutcome::Terminated)) {
-                mark_nonresumable(&self.shared, &taken.end, reason);
-            }
+            record_stop(
+                &self.shared,
+                &taken.end,
+                matches!(outcome, Some(StopOutcome::Terminated)),
+                reason,
+                false,
+            );
         }
         Ok(())
     }
@@ -212,7 +218,10 @@ impl Drop for ClaudeSession {
     /// leave a running child alive precisely when no host session can cancel it. The synchronous
     /// claim ensures a pump that is already completing cannot be stopped twice.
     fn drop(&mut self) {
-        let taken = request_stop(&mut self.shared.lock(), CancelReason::Shutdown);
+        let taken = {
+            let mut state = self.shared.lock();
+            request_stop(&mut state, CancelReason::Shutdown).or_else(|| active_turn(&state))
+        };
         let Some(taken) = taken else {
             return;
         };
@@ -237,6 +246,17 @@ fn request_stop(state: &mut Mutable, reason: CancelReason) -> Option<TakenTurn> 
     })
 }
 
+/// Clones the stopping owner so a close or final drop can finish cleanup begun by a caller that
+/// abandoned its cancellation future. `stop_process_with_limits` is idempotent at the process
+/// boundary; this never clears ownership itself.
+fn active_turn(state: &Mutable) -> Option<TakenTurn> {
+    let active = state.active.as_ref()?;
+    Some(TakenTurn {
+        end: Arc::clone(&active.end),
+        control: active.control.as_ref().map(Arc::clone),
+    })
+}
+
 /// Kills the child a `start_turn` launched if that call never hands back its stream.
 ///
 /// The awaits between installing a child and returning its stream are the problem this exists
@@ -252,6 +272,8 @@ struct AbandonedStart {
     shared: Arc<Shared>,
     end: Arc<TurnEnd>,
     spawn: Option<tokio::task::JoinHandle<Result<stdio::StdioTransport>>>,
+    /// Kept until the late child is reaped when a dropped start races a session close.
+    mcp_lease: crate::mcp::Prepared<Arc<ConfigFile>>,
     armed: bool,
 }
 
@@ -310,6 +332,7 @@ impl Drop for AbandonedStart {
         let limits = *self.shared.host.limits();
         let shared = Arc::clone(&self.shared);
         let reason = taken.end.get().copied().unwrap_or(CancelReason::Requested);
+        let lease = self.mcp_lease.take();
         spawn_owned(&self.shared, async move {
             let control = match spawn {
                 Some(task) => match task.await {
@@ -318,12 +341,16 @@ impl Drop for AbandonedStart {
                 },
                 None => taken.control,
             };
-            if let Ok(outcome) = end_turn(control, reason, &limits).await {
-                mark_stopped(&shared, &taken.end);
-                if matches!(outcome, Some(StopOutcome::Terminated)) {
-                    mark_nonresumable(&shared, &taken.end, reason);
-                }
-                clear_active(&shared, &taken.end);
+            let outcome = end_turn(control, reason, &limits).await;
+            crate::mcp::release_off_worker(lease).await;
+            if let Ok(outcome) = outcome {
+                record_stop(
+                    &shared,
+                    &taken.end,
+                    matches!(outcome, Some(StopOutcome::Terminated)),
+                    reason,
+                    true,
+                );
             }
         });
     }
@@ -344,27 +371,48 @@ async fn end_turn(
 }
 
 /// Records that native work has ended without allowing an older attempt to touch a newer slot.
-fn mark_stopped(shared: &Shared, end: &TurnEnd) {
+fn record_stop(
+    shared: &Shared,
+    end: &TurnEnd,
+    taint_continuation: bool,
+    reason: CancelReason,
+    settled: bool,
+) {
     let mut state = shared.lock();
-    if let Some(active) = state
+    let should_clear = if let Some(active) = state
         .active
         .as_mut()
         .filter(|active| std::ptr::eq(active.end.as_ref(), end))
     {
         active.stopped = true;
+        active.settled |= settled;
+        active.settled
+    } else {
+        false
+    };
+    // This belongs in the same critical section as clearing the owner: otherwise a pump can
+    // retire the slot between the reap and its forced-stop taint.
+    if taint_continuation {
+        state.nonresumable = Some(reason);
+    }
+    if should_clear {
+        state.active = None;
     }
 }
 
-/// Makes an explicitly cancelled session refuse an unsafe implicit resume.
-fn mark_nonresumable(shared: &Shared, end: &TurnEnd, reason: CancelReason) {
+/// Records a terminal commit (or receiver abandonment) and releases an already reaped owner.
+fn settle_owner(shared: &Shared, end: &Arc<TurnEnd>) {
     let mut state = shared.lock();
-    if let Some(active) = state
+    if state
         .active
-        .as_ref()
-        .filter(|active| std::ptr::eq(active.end.as_ref(), end))
-        && active.stopped
+        .as_mut()
+        .filter(|active| Arc::ptr_eq(&active.end, end))
+        .is_some_and(|active| {
+            active.settled = true;
+            active.stopped
+        })
     {
-        state.nonresumable = Some(reason);
+        state.active = None;
     }
 }
 
@@ -380,10 +428,13 @@ fn spawn_teardown(shared: &Arc<Shared>, taken: TakenTurn, reason: CancelReason) 
         let shared = Arc::clone(shared);
         runtime.spawn(async move {
             if let Ok(outcome) = end_turn(taken.control, reason, &limits).await {
-                mark_stopped(&shared, &taken.end);
-                if matches!(outcome, Some(StopOutcome::Terminated)) {
-                    mark_nonresumable(&shared, &taken.end, reason);
-                }
+                record_stop(
+                    &shared,
+                    &taken.end,
+                    matches!(outcome, Some(StopOutcome::Terminated)),
+                    reason,
+                    false,
+                );
             }
         });
     }
@@ -496,6 +547,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 end: Arc::clone(&end),
                 control: None,
                 stopped: false,
+                settled: false,
             });
             // The reservation and this clone share the same critical section. A close that wins
             // after it can release the session's reference, but this attempt still owns the file
@@ -511,6 +563,7 @@ impl mango_external_agents::Session for ClaudeSession {
             shared: Arc::clone(&self.shared),
             end: Arc::clone(&end),
             spawn: None,
+            mcp_lease: crate::mcp::Prepared::new(mcp_lease.get().cloned()),
             armed: true,
         };
 
@@ -525,7 +578,10 @@ impl mango_external_agents::Session for ClaudeSession {
             let state = self.shared.lock();
             state.established
         };
-        let mcp_config = mcp_lease.get().map(|file| file.argument().to_owned());
+        let mcp_config = abandoned
+            .mcp_lease
+            .get()
+            .map(|file| file.argument().to_owned());
         let argv = match (TurnArgv {
             program: PROGRAM,
             mode,
@@ -555,6 +611,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 // makes this lease the last one and its drop the `remove_dir_all`. Off the worker,
                 // for the same reason the write is.
                 crate::mcp::release_off_worker(mcp_lease.take()).await;
+                crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
                 return Err(error.with_dispatch(Dispatch::NotSubmitted));
             }
         };
@@ -578,6 +635,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 abandoned.disarm();
                 forget_reservation(&self.shared, &end);
                 crate::mcp::release_off_worker(mcp_lease.take()).await;
+                crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
                 return Err(error);
             }
         };
@@ -615,6 +673,7 @@ impl mango_external_agents::Session for ClaudeSession {
                     end: Arc::clone(&end),
                     control: Some(Arc::clone(&control)),
                     stopped: false,
+                    settled: false,
                 });
                 None
             } else {
@@ -628,12 +687,15 @@ impl mango_external_agents::Session for ClaudeSession {
             // worker, because a close that won the race left this lease holding the last
             // reference, so this is where the `remove_dir_all` happens.
             crate::mcp::release_off_worker(mcp_lease.take()).await;
+            crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
             let outcome = outcome.map_err(|error| error.with_dispatch(Dispatch::Accepted))?;
-            mark_stopped(&self.shared, &end);
-            if matches!(outcome, StopOutcome::Terminated) {
-                mark_nonresumable(&self.shared, &end, reason);
-            }
-            clear_active(&self.shared, &end);
+            record_stop(
+                &self.shared,
+                &end,
+                matches!(outcome, StopOutcome::Terminated),
+                reason,
+                true,
+            );
             return Err((if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
@@ -654,6 +716,7 @@ impl mango_external_agents::Session for ClaudeSession {
         // `close` already took the session's reference, and that `close` is killing the child
         // anyway.
         crate::mcp::release_off_worker(mcp_lease.take()).await;
+        crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
 
         // Re-checked for the same reason the guard above re-checks after `stdio::open`: the
         // release is an await, so a `close`, a `cancel` or a second `start_turn` can have taken
@@ -709,7 +772,7 @@ impl mango_external_agents::Session for ClaudeSession {
             abandoned.disarm();
             // No stream reached the caller, so no pump will retire an owner whose stop finished
             // while the MCP lease was releasing. The helper retains a still-stopping owner.
-            clear_active(&self.shared, &end);
+            settle_owner(&self.shared, &end);
             return Err((if self.shared.lifecycle.is_closed() {
                 Error::Closed { subject: "session" }
             } else {
@@ -741,8 +804,7 @@ impl mango_external_agents::Session for ClaudeSession {
             )
             .await;
             if stopped.is_ok() {
-                mark_stopped(&self.shared, &end);
-                clear_active(&self.shared, &end);
+                record_stop(&self.shared, &end, true, CancelReason::Requested, true);
             }
             abandoned.disarm();
             return Err(error.with_dispatch(Dispatch::Accepted));
@@ -790,7 +852,8 @@ impl mango_external_agents::Session for ClaudeSession {
                 return Ok(());
             }
             let mut state = self.shared.lock();
-            let control = request_stop(&mut state, CancelReason::from(reason));
+            let control = request_stop(&mut state, CancelReason::from(reason))
+                .or_else(|| active_turn(&state));
             // In the same cancellation-safe owner the open and the turn use: the kill below is a
             // `ProcessControl` call that can take as long as the host's escalation grace, and a
             // caller that gives up on the close in that window would otherwise drop this on the
@@ -811,7 +874,13 @@ impl mango_external_agents::Session for ClaudeSession {
         )
         .await;
         if let (Ok(Some(_)), Some(taken)) = (&stopped, &control) {
-            mark_stopped(&self.shared, &taken.end);
+            record_stop(
+                &self.shared,
+                &taken.end,
+                false,
+                CancelReason::from(reason),
+                false,
+            );
         }
         // The session releases its reference here. A start still awaiting a child holds its own
         // `Arc` until it releases it just before its post-release ownership check, and that check
@@ -877,7 +946,7 @@ async fn pump(
             exit_grace,
         )
         .await;
-        clear_active(&shared, &end);
+        settle_owner(&shared, &end);
         return;
     }
 
@@ -889,22 +958,28 @@ async fn pump(
                 if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Requested)
                     && let Ok(outcome) = end_turn(taken.control, CancelReason::Requested, shared.host.limits()).await
                 {
-                    mark_stopped(&shared, &taken.end);
-                    if matches!(outcome, Some(StopOutcome::Terminated)) {
-                        mark_nonresumable(&shared, &taken.end, CancelReason::Requested);
-                    }
-                    clear_active(&shared, &taken.end);
+                    record_stop(
+                        &shared,
+                        &taken.end,
+                        matches!(outcome, Some(StopOutcome::Terminated)),
+                        CancelReason::Requested,
+                        true,
+                    );
                 }
+                settle_owner(&shared, &end);
                 return;
             }
             () = cancel_token.cancelled() => {
                 if let Some(taken) = take_matching_turn(&shared, &end, CancelReason::Shutdown)
                     && let Ok(outcome) = end_turn(taken.control, CancelReason::Shutdown, shared.host.limits()).await
                 {
-                    mark_stopped(&shared, &taken.end);
-                    if matches!(outcome, Some(StopOutcome::Terminated)) {
-                        mark_nonresumable(&shared, &taken.end, CancelReason::Shutdown);
-                    }
+                    record_stop(
+                        &shared,
+                        &taken.end,
+                        matches!(outcome, Some(StopOutcome::Terminated)),
+                        CancelReason::Shutdown,
+                        false,
+                    );
                 }
                 break;
             }
@@ -944,11 +1019,15 @@ async fn pump(
                             end_turn(taken.control, CancelReason::Requested, shared.host.limits())
                                 .await
                     {
-                        mark_stopped(&shared, &taken.end);
-                        if matches!(outcome, Some(StopOutcome::Terminated)) {
-                            mark_nonresumable(&shared, &taken.end, CancelReason::Requested);
-                        }
+                        record_stop(
+                            &shared,
+                            &taken.end,
+                            matches!(outcome, Some(StopOutcome::Terminated)),
+                            CancelReason::Requested,
+                            true,
+                        );
                     }
+                    settle_owner(&shared, &end);
                     return;
                 }
                 // EventSink commits its bounded overflow terminal before returning this error.
@@ -960,11 +1039,15 @@ async fn pump(
                             end_turn(taken.control, CancelReason::Requested, shared.host.limits())
                                 .await
                     {
-                        mark_stopped(&shared, &taken.end);
-                        if matches!(outcome, Some(StopOutcome::Terminated)) {
-                            mark_nonresumable(&shared, &taken.end, CancelReason::Requested);
-                        }
+                        record_stop(
+                            &shared,
+                            &taken.end,
+                            matches!(outcome, Some(StopOutcome::Terminated)),
+                            CancelReason::Requested,
+                            true,
+                        );
                     }
+                    settle_owner(&shared, &end);
                     return;
                 }
                 Err(_) => {}
@@ -985,7 +1068,7 @@ async fn pump(
         exit_grace,
     )
     .await;
-    clear_active(&shared, &end);
+    settle_owner(&shared, &end);
 }
 
 /// Writes the turn's terminal event, whichever way it ended, and reaps the child.
@@ -1035,28 +1118,24 @@ async fn finish(
     // A caller that took an active turn already owns its stop request. Asking the launcher again
     // would violate ProcessControl's one-stop contract; a native result or a broken stream has no
     // such owner and still needs the post-terminal process-tree reap.
-    if (native_finished || end.get().is_none())
-        && stop_process_with_limits(
+    let abnormal = !native_finished && end.get().is_none();
+    if (native_finished || abnormal)
+        && let Ok(outcome) = stop_process_with_limits(
             control.as_ref(),
             CancelReason::Shutdown,
             shared.host.limits(),
         )
         .await
-        .is_ok()
     {
-        mark_stopped(shared, end);
-    }
-}
-
-/// Forgets this turn, unless a newer one already replaced it.
-fn clear_active(shared: &Shared, end: &Arc<TurnEnd>) {
-    let mut state = shared.lock();
-    if state
-        .active
-        .as_ref()
-        .is_some_and(|active| Arc::ptr_eq(&active.end, end) && active.stopped)
-    {
-        state.active = None;
+        // A terminal without Claude's own `result` leaves the native conversation at an
+        // unknown point. Do not resume it merely because the harness contained the process.
+        record_stop(
+            shared,
+            end,
+            abnormal || matches!(outcome, StopOutcome::Terminated) && !native_finished,
+            CancelReason::Shutdown,
+            false,
+        );
     }
 }
 

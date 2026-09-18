@@ -1091,7 +1091,11 @@ mod a_turn {
 
     #[tokio::test]
     async fn ends_the_stream_with_an_error_when_the_process_stops_before_a_result() {
-        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::exiting(1)));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::exiting(1))
+                .with_turn(Run::replaying(READ_TURN)),
+        );
         let session = open(&launcher).await;
         let mut turn = session
             .start_turn(TurnRequest::new("turn-1", "hello"))
@@ -1102,6 +1106,24 @@ mod a_turn {
         assert!(
             matches!(events.last(), Some(EventKind::Error { .. })),
             "received {events:?}"
+        );
+        let error = session
+            .start_turn(TurnRequest::new("turn-2", "do not resume unknown work"))
+            .await
+            .expect_err("expected a missing vendor result to taint continuation");
+        assert!(
+            matches!(
+                error.cause(),
+                Error::Cancelled {
+                    reason: CancelReason::Shutdown
+                }
+            ),
+            "received {error:?}"
+        );
+        assert_eq!(
+            launcher.turn_argvs().len(),
+            1,
+            "expected the unsafe continuation to be refused before launch"
         );
     }
 
@@ -2234,8 +2256,12 @@ mod cancelling_and_closing {
 
     #[tokio::test]
     async fn a_stopping_turn_remains_busy_until_its_process_is_reaped() {
-        let launcher =
-            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_graceful_interrupt()
+                .with_turn(Run::stalling::<[String; 0], String>([]))
+                .with_turn(Run::replaying(READ_TURN)),
+        );
         let stop = launcher.gate_turn_stops();
         let session = shared(&launcher).await;
         let first = session
@@ -2261,6 +2287,12 @@ mod cancelling_and_closing {
             .expect("expected cancellation task to finish")
             .expect("expected reaped cancellation to succeed");
         drop(first);
+
+        let mut next = session
+            .start_turn(TurnRequest::new("turn-3", "resume after terminal cleanup"))
+            .await
+            .expect("expected the terminal owner to release after successful cleanup");
+        drain(&mut next).await;
     }
 
     #[tokio::test(start_paused = true)]
