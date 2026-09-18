@@ -149,14 +149,28 @@ impl PlanStep {
     /// somebody can read, and losing the whole plan over one unusable id would be worse.
     #[must_use]
     pub fn normalized(self) -> Self {
-        Self {
-            id: self
-                .id
-                .and_then(|id| normalize::opaque_id(&id, "plan step id").ok()),
-            title: normalize::bound_text(&self.title, TextLimit::Title).text,
-            status: self.status,
-            priority: self.priority,
-        }
+        self.normalized_with_truncation().0
+    }
+
+    /// The same, saying whether anything was cut.
+    ///
+    /// The caller is an [`ActivityContent`], which is carried by an event that publishes a
+    /// `truncated` flag. A cut that never reaches that flag is a host told its payload is whole.
+    #[must_use]
+    fn normalized_with_truncation(self) -> (Self, bool) {
+        let title = normalize::bound_text(&self.title, TextLimit::Title);
+        let truncated = title.truncated;
+        (
+            Self {
+                id: self
+                    .id
+                    .and_then(|id| normalize::opaque_id(&id, "plan step id").ok()),
+                title: title.text,
+                status: self.status,
+                priority: self.priority,
+            },
+            truncated,
+        )
     }
 }
 
@@ -333,23 +347,45 @@ impl FileChange {
     /// path names a different file, and a row naming the wrong file is worse than a missing row.
     #[must_use]
     pub fn normalized(self) -> Option<Self> {
-        Some(Self {
-            path: normalize::vendor_path(&self.path)?,
-            kind: self.kind,
-            previous_path: self
-                .previous_path
-                .and_then(|path| normalize::vendor_path(&path)),
-            unified_diff: self
-                .unified_diff
-                .map(|diff| normalize::bound_text(&diff, TextLimit::Detail).text),
-            old_text: self
-                .old_text
-                .map(|text| normalize::bound_text(&text, TextLimit::Detail).text),
-            new_text: self
-                .new_text
-                .map(|text| normalize::bound_text(&text, TextLimit::Detail).text),
-            ..self
-        })
+        self.normalized_with_truncation().0
+    }
+
+    /// The same, saying whether any of its three bodies was cut.
+    ///
+    /// A dropped row is reported by the caller, which is the only one that knows a row went
+    /// missing; this reports only what it shortened itself.
+    #[must_use]
+    fn normalized_with_truncation(self) -> (Option<Self>, bool) {
+        let unified_diff = self
+            .unified_diff
+            .map(|diff| normalize::bound_text(&diff, TextLimit::Detail));
+        let old_text = self
+            .old_text
+            .map(|text| normalize::bound_text(&text, TextLimit::Detail));
+        let new_text = self
+            .new_text
+            .map(|text| normalize::bound_text(&text, TextLimit::Detail));
+        let truncated = [unified_diff.as_ref(), old_text.as_ref(), new_text.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|bounded| bounded.truncated);
+        let Some(path) = normalize::vendor_path(&self.path) else {
+            return (None, truncated);
+        };
+        (
+            Some(Self {
+                path,
+                kind: self.kind,
+                previous_path: self
+                    .previous_path
+                    .and_then(|path| normalize::vendor_path(&path)),
+                unified_diff: unified_diff.map(|bounded| bounded.text),
+                old_text: old_text.map(|bounded| bounded.text),
+                new_text: new_text.map(|bounded| bounded.text),
+                ..self
+            }),
+            truncated,
+        )
     }
 }
 
@@ -400,24 +436,52 @@ impl ActivityContent {
     /// This content with every vendor-written value bounded and unusable rows dropped.
     #[must_use]
     pub fn normalized(self) -> Self {
+        self.normalized_with_truncation().0
+    }
+
+    /// The same, saying whether anything was cut, shortened or dropped on the way through.
+    ///
+    /// Every event that carries content also publishes a `truncated` flag, and that flag is a
+    /// promise: a host reading `false` is entitled to treat what it received as whole. A plan cut
+    /// to its ceiling, a file whose path could not be carried, a body shortened to fit — all three
+    /// are the flag's business, and none of them shows up in the title or the detail the flag used
+    /// to be derived from.
+    #[must_use]
+    pub fn normalized_with_truncation(self) -> (Self, bool) {
         match self {
-            Self::Plan { steps } => Self::Plan {
-                steps: steps
+            Self::Plan { steps } => {
+                let dropped = steps.len() > PLAN_MAX_STEPS;
+                let mut truncated = dropped;
+                let steps = steps
                     .into_iter()
                     .take(PLAN_MAX_STEPS)
-                    .map(PlanStep::normalized)
-                    .collect(),
-            },
-            Self::Diff { files } => Self::Diff {
-                files: files
+                    .map(|step| {
+                        let (step, cut) = step.normalized_with_truncation();
+                        truncated |= cut;
+                        step
+                    })
+                    .collect();
+                (Self::Plan { steps }, truncated)
+            }
+            Self::Diff { files } => {
+                let offered = files.len();
+                let mut truncated = false;
+                let files: Vec<FileChange> = files
                     .into_iter()
-                    .filter_map(FileChange::normalized)
+                    .filter_map(|file| {
+                        let (file, cut) = file.normalized_with_truncation();
+                        truncated |= cut;
+                        file
+                    })
                     .take(DIFF_MAX_FILES)
-                    .collect(),
-            },
-            Self::Output { text } => Self::Output {
-                text: normalize::bound_text(&text, TextLimit::Detail).text,
-            },
+                    .collect();
+                truncated |= files.len() < offered;
+                (Self::Diff { files }, truncated)
+            }
+            Self::Output { text } => {
+                let bounded = normalize::bound_text(&text, TextLimit::Detail);
+                (Self::Output { text: bounded.text }, bounded.truncated)
+            }
         }
     }
 }

@@ -654,9 +654,17 @@ impl Activity {
         let detail = self
             .detail
             .map(|detail| normalize::bound_text(&detail, TextLimit::Detail));
+        let (content, content_truncated) = match self.content {
+            Some(content) => {
+                let (content, truncated) = content.normalized_with_truncation();
+                (Some(content), truncated)
+            }
+            None => (None, false),
+        };
         let truncated = self.truncated
             || name.truncated
             || title.truncated
+            || content_truncated
             || detail.as_ref().is_some_and(|detail| detail.truncated);
         Self {
             name: name.text,
@@ -672,7 +680,7 @@ impl Activity {
             subagent_id: self
                 .subagent_id
                 .and_then(|id| normalize::opaque_id(&id, "activity subagent id").ok()),
-            content: self.content.map(ActivityContent::normalized),
+            content,
             extensions: self.extensions.normalized(),
             truncated,
         }
@@ -802,13 +810,21 @@ impl ActivityUpdate {
         let detail = self
             .detail
             .map(|detail| normalize::bound_text(&detail, TextLimit::Detail));
+        let (content, content_truncated) = match self.content {
+            Some(content) => {
+                let (content, truncated) = content.normalized_with_truncation();
+                (Some(content), truncated)
+            }
+            None => (None, false),
+        };
         let truncated = self.truncated
+            || content_truncated
             || title.as_ref().is_some_and(|title| title.truncated)
             || detail.as_ref().is_some_and(|detail| detail.truncated);
         Self {
             title: title.map(|title| title.text),
             detail: detail.map(|detail| detail.text),
-            content: self.content.map(ActivityContent::normalized),
+            content,
             truncated,
         }
     }
@@ -912,11 +928,20 @@ impl ActivityResult {
         let detail = self
             .detail
             .map(|detail| normalize::bound_text(&detail, TextLimit::Detail));
-        let truncated = self.truncated || detail.as_ref().is_some_and(|detail| detail.truncated);
+        let (content, content_truncated) = match self.content {
+            Some(content) => {
+                let (content, truncated) = content.normalized_with_truncation();
+                (Some(content), truncated)
+            }
+            None => (None, false),
+        };
+        let truncated = self.truncated
+            || content_truncated
+            || detail.as_ref().is_some_and(|detail| detail.truncated);
         Self {
             status: self.status,
             detail: detail.map(|detail| detail.text),
-            content: self.content.map(ActivityContent::normalized),
+            content,
             truncated,
         }
     }
@@ -1668,6 +1693,10 @@ mod tests {
 
     /// The bound applies to content the same way it applies to detail: an update is not a channel
     /// for an unbounded payload just because the payload is typed.
+    ///
+    /// And the cut has to reach `truncated`. The flag is a promise — a host reading `false` treats
+    /// what it received as whole — and content is the one field whose shortening shows up nowhere
+    /// in the title or the detail the flag used to be derived from.
     #[test]
     fn content_on_an_update_is_bounded_like_every_other_vendor_written_field() {
         let update = ActivityUpdate::new()
@@ -1676,10 +1705,64 @@ mod tests {
             })
             .normalized();
 
-        let Some(ActivityContent::Output { text }) = update.content else {
+        let Some(ActivityContent::Output { text }) = update.content.clone() else {
             panic!("expected output back, received {update:?}");
         };
         assert_eq!(text.chars().count(), 4_096);
+        assert!(
+            update.truncated,
+            "a cut nobody reports is a host told its payload is whole"
+        );
+    }
+
+    /// Three ways content loses something, none of which touches a title or a detail.
+    #[test]
+    fn content_reports_every_shortening_dropping_and_cutting_it_did() {
+        let cut_body = ActivityResult::new(ActivityStatus::Completed)
+            .with_content(ActivityContent::Diff {
+                files: vec![FileChange::new("src/lib.rs").with_new_text("y".repeat(9_000))],
+            })
+            .normalized();
+        assert!(
+            cut_body.truncated,
+            "a shortened body, received {cut_body:?}"
+        );
+
+        let dropped_row = ActivityResult::new(ActivityStatus::Completed)
+            .with_content(ActivityContent::Diff {
+                files: vec![
+                    FileChange::new("p".repeat(5_000)).with_new_text("x"),
+                    FileChange::new("src/lib.rs").with_new_text("y"),
+                ],
+            })
+            .normalized();
+        let Some(ActivityContent::Diff { files }) = dropped_row.content.clone() else {
+            panic!("expected a diff back, received {dropped_row:?}");
+        };
+        assert_eq!(files.len(), 1);
+        assert!(
+            dropped_row.truncated,
+            "a file that could not be carried, received {dropped_row:?}"
+        );
+
+        let cut_plan = ActivityUpdate::new()
+            .with_content(ActivityContent::Plan {
+                steps: (0..crate::content::PLAN_MAX_STEPS + 1)
+                    .map(|index| PlanStep::new(format!("step {index}")))
+                    .collect(),
+            })
+            .normalized();
+        assert!(
+            cut_plan.truncated,
+            "a plan cut to its ceiling, received {cut_plan:?}"
+        );
+
+        let whole = ActivityUpdate::new()
+            .with_content(ActivityContent::Output {
+                text: String::from("done"),
+            })
+            .normalized();
+        assert!(!whole.truncated, "nothing was cut, received {whole:?}");
     }
 
     /// An empty update renders identically to no update at all, so a reducer has one place to ask

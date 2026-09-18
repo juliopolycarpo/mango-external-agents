@@ -47,16 +47,34 @@ fn rows(document: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Every `something::tests::name` the document names, as the bare function names.
+/// Every test the evidence column names, as the bare function names.
+///
+/// Read from the last cell of each data row rather than from the whole document, so a type path in
+/// a destination cell is never mistaken for a test. Inside it, a backticked path of three or more
+/// `::` segments ending in a snake_case name is a test — `reducer::tests::a_name`,
+/// `session::expiry::a_name`, `harness_over_a_fake_cli::a_turn::a_name`. Two segments would also
+/// match `SessionState::set_commands`, which is a method somebody cites, not a test anybody runs.
 fn named_tests(document: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    for chunk in document.split("::tests::").skip(1) {
-        let name: String = chunk
-            .chars()
-            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-            .collect();
-        if !name.is_empty() {
-            names.insert(name);
+    for row in rows(document) {
+        let Some(evidence) = row.last() else {
+            continue;
+        };
+        for token in evidence.split('`').skip(1).step_by(2) {
+            let segments: Vec<&str> = token.split("::").collect();
+            if segments.len() < 3 {
+                continue;
+            }
+            let Some(name) = segments.last() else {
+                continue;
+            };
+            let is_test_name = name.contains('_')
+                && name.chars().all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+                });
+            if is_test_name {
+                names.insert((*name).to_owned());
+            }
         }
     }
     names
