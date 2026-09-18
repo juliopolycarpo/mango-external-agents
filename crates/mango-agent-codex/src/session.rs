@@ -1658,9 +1658,14 @@ impl CodexSession {
             })
             .and_then(|result| result);
         let stop = stop_process_with_limits(&*control, reason, &limits).await;
+        // Reaping the app-server is the terminal lifetime fact. A blocked JSON-RPC writer can
+        // make closing its connection report an error after the child is gone, but leaving the
+        // observable session `Ready` then invites a host to submit work to a reaped process.
+        if stop.is_ok() {
+            state.set_status(SessionStatus::Closed);
+        }
         stop?;
         close?;
-        state.set_status(SessionStatus::Closed);
         Ok(())
     }
 

@@ -9,6 +9,7 @@ mod contracts;
 mod support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use mango_agent_codex::CodexHarness;
@@ -20,10 +21,152 @@ use mango_external_agents::permission::{
 use mango_external_agents::testing::{FakeLauncher, FakeProcess};
 use mango_external_agents::{
     ApprovalRouting, CancelReason, Clock, CloseReason, ConfigurationChange, ConfigurationPatch,
-    EnvSource, Harness, HostContext, OpenSession, PermissionLevel, Session, SessionQuery,
+    EnvSource, ExitStatus, Harness, HostContext, InterruptOutcome, LaunchSpec, ManagedProcess,
+    OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, Session, SessionQuery,
     SessionStatus, SessionSubscription, Steer, TurnRequest,
 };
 use support::Transcript;
+
+/// A test-controlled pause in a fake child operation.
+struct FakeGate {
+    entered: AtomicBool,
+    entered_notice: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+impl FakeGate {
+    fn closed() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            entered_notice: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    async fn wait_until_entered(&self) {
+        loop {
+            let notice = self.entered_notice.notified();
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            notice.await;
+        }
+    }
+
+    async fn wait_for_release(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notice.notify_waiters();
+        self.release
+            .acquire()
+            .await
+            .expect("the fake gate must stay open")
+            .forget();
+    }
+
+    fn open(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+/// A fake launcher that can hold one process kill or one native-interrupt write.
+#[derive(Clone)]
+struct GatedLauncher {
+    inner: Arc<FakeLauncher>,
+    kill_gate: Option<Arc<FakeGate>>,
+    interrupt_write_gate: Option<Arc<FakeGate>>,
+}
+
+impl GatedLauncher {
+    fn new(
+        inner: Arc<FakeLauncher>,
+        kill_gate: Option<Arc<FakeGate>>,
+        interrupt_write_gate: Option<Arc<FakeGate>>,
+    ) -> Self {
+        Self {
+            inner,
+            kill_gate,
+            interrupt_write_gate,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for GatedLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> mango_external_agents::Result<ManagedProcess> {
+        let mut child = self.inner.spawn(spec).await?;
+        if let Some(gate) = &self.interrupt_write_gate {
+            child.stdin = child.stdin.take().map(|inner| {
+                Box::new(GatedStdin {
+                    inner,
+                    gate: Arc::clone(gate),
+                }) as Box<dyn mango_external_agents::ByteSink>
+            });
+        }
+        if let Some(gate) = &self.kill_gate {
+            child.control = Arc::new(GatedProcessControl {
+                inner: child.control,
+                kill_gate: Arc::clone(gate),
+            });
+        }
+        Ok(child)
+    }
+}
+
+/// Holds an interrupt write before it reaches the recorded app-server.
+struct GatedStdin {
+    inner: Box<dyn mango_external_agents::ByteSink>,
+    gate: Arc<FakeGate>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSink for GatedStdin {
+    async fn write_all(&mut self, bytes: &[u8]) -> mango_external_agents::Result<()> {
+        if bytes
+            .windows(b"\"turn/interrupt\"".len())
+            .any(|part| part == b"\"turn/interrupt\"")
+        {
+            self.gate.wait_for_release().await;
+        }
+        self.inner.write_all(bytes).await
+    }
+
+    async fn close(&mut self) -> mango_external_agents::Result<()> {
+        self.inner.close().await
+    }
+}
+
+/// Holds generic process termination while preserving every other fake-child operation.
+struct GatedProcessControl {
+    inner: Arc<dyn ProcessControl>,
+    kill_gate: Arc<FakeGate>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for GatedProcessControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn interrupt(
+        &self,
+        reason: CancelReason,
+    ) -> mango_external_agents::Result<InterruptOutcome> {
+        self.inner.interrupt(reason).await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.kill_gate.wait_for_release().await;
+        self.inner.kill(reason).await
+    }
+}
 
 /// A host clock fixed at the instant a paused-time approval test begins.
 struct FixedClock(SystemTime);
@@ -432,8 +575,20 @@ fn with_launcher_limits_and_cancel_and_clock(
     cancel: mango_external_agents::CancelToken,
     clock: Option<Arc<dyn Clock>>,
 ) -> (HostContext, Arc<FakeLauncher>) {
+    let host = host_context(launcher.clone(), broker, limits, cancel, clock);
+    (host, launcher)
+}
+
+/// Builds a replay host around either the ordinary fake launcher or a gated wrapper.
+fn host_context(
+    launcher: Arc<dyn ProcessLauncher>,
+    broker: Option<Arc<dyn PermissionBroker>>,
+    limits: mango_external_agents::Limits,
+    cancel: mango_external_agents::CancelToken,
+    clock: Option<Arc<dyn Clock>>,
+) -> HostContext {
     let mut builder = HostContext::builder()
-        .launcher(launcher.clone())
+        .launcher(launcher)
         .cwd("/workspace")
         .client_info("mango-test", "0.0.1")
         .environment(EnvSource::from_pairs([
@@ -449,7 +604,7 @@ fn with_launcher_limits_and_cancel_and_clock(
     if let Some(broker) = broker {
         builder = builder.broker(broker);
     }
-    (builder.build().expect("expected a host"), launcher)
+    builder.build().expect("expected a host")
 }
 
 async fn open(scenario: &str) -> (Box<dyn Session>, Arc<FakeLauncher>) {
@@ -808,6 +963,249 @@ async fn dropping_a_start_future_reaps_an_unacknowledged_attempt() {
     assert!(
         matches!(error.cause(), mango_external_agents::Error::Closed { .. }),
         "expected a closed session after bounded abandoned-start teardown, received {error:?}"
+    );
+}
+
+/// A close future is only a waiter. Once it begins generic child cleanup, abandoning that waiter
+/// cannot leave a live app-server or require another host close to finish the work.
+#[tokio::test(start_paused = true)]
+async fn aborting_a_close_future_leaves_its_owned_reaper_running() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("turn").as_process());
+    let kill_gate = FakeGate::closed();
+    let gated = Arc::new(GatedLauncher::new(
+        Arc::clone(&launcher),
+        Some(Arc::clone(&kill_gate)),
+        None,
+    ));
+    let host = host_context(
+        gated,
+        None,
+        replay_limits(),
+        mango_external_agents::CancelToken::new(),
+        None,
+    );
+    let session: Arc<dyn Session> = Arc::from(
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session"),
+    );
+    let mut lifecycle = session.subscribe();
+
+    let closing_session = Arc::clone(&session);
+    let close = tokio::spawn(async move { closing_session.close(CloseReason::Shutdown).await });
+    kill_gate.wait_until_entered().await;
+    close.abort();
+    let _ = close.await;
+
+    kill_gate.open();
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected the detached close worker to publish Closed after its caller disappeared"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the detached close worker to reap the generic child"
+    );
+
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected repeated close to observe the first close worker's result");
+}
+
+/// Cancellation assigns its stop worker before the native interrupt write can wait. Dropping the
+/// caller during that write must still bound the silent vendor turn and reap its app-server.
+#[tokio::test(start_paused = true)]
+async fn aborting_a_cancel_future_still_bounds_a_silent_native_turn() {
+    let transcript = Transcript::load("interrupt");
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(|frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/start") => Some(vec![
+                serde_json::json!({"id": id, "result": {"turn": {"id": "silent-turn"}}})
+                    .to_string(),
+            ]),
+            // Codex accepted the interrupt but never tells us the turn ended.
+            Some("turn/interrupt") => Some(vec![
+                serde_json::json!({"id": id, "result": {}}).to_string(),
+            ]),
+            _ => None,
+        }
+    }));
+    let interrupt_write_gate = FakeGate::closed();
+    let gated = Arc::new(GatedLauncher::new(
+        Arc::clone(&launcher),
+        None,
+        Some(Arc::clone(&interrupt_write_gate)),
+    ));
+    let mut limits = replay_limits();
+    limits.kill_grace = std::time::Duration::from_secs(1);
+    limits.shutdown_timeout = std::time::Duration::from_secs(1);
+    let host = host_context(
+        gated,
+        None,
+        limits,
+        mango_external_agents::CancelToken::new(),
+        None,
+    );
+    let session: Arc<dyn Session> = Arc::from(
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session"),
+    );
+    let mut lifecycle = session.subscribe();
+    let _turn = session
+        .start_turn(TurnRequest::new("turn-1", "keep running"))
+        .await
+        .expect("expected a live native turn");
+
+    let cancelling_session = Arc::clone(&session);
+    let cancel =
+        tokio::spawn(async move { cancelling_session.cancel(CancelReason::Requested).await });
+    interrupt_write_gate.wait_until_entered().await;
+    cancel.abort();
+    let _ = cancel.await;
+
+    for _ in 0..10 {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected the owned stop worker to close the silent native turn without its caller",
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected bounded stop escalation to reap the silent app-server"
+    );
+
+    interrupt_write_gate.open();
+}
+
+/// Transcript pressure after `start_turn` returned is a terminal stream failure, not a reason to
+/// leave the accepted native prompt running. The recorded notifications are released only after
+/// the handle exists, then two unread payloads exercise a one-event budget.
+#[tokio::test]
+async fn post_acceptance_transcript_overflow_cancels_and_reaps_the_native_turn() {
+    let transcript = Transcript::load("turn");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the recorded transcript to name its thread");
+    let notifications_released = Arc::new(AtomicBool::new(false));
+    let released = Arc::clone(&notifications_released);
+    let notification_count = Arc::new(AtomicUsize::new(0));
+    let emitted = Arc::clone(&notification_count);
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/start") => Some(vec![
+                serde_json::json!({
+                    "id": id,
+                    "result": {"turn": {"id": "overflow-turn"}},
+                })
+                .to_string(),
+            ]),
+            Some("account/rateLimits/read") if released.load(Ordering::Acquire) => {
+                // Release one payload per gate call. This lets the handler commit the first
+                // payload before the second reaches its stream, so the test observes stream
+                // overflow rather than the JSON-RPC notification queue's own backpressure.
+                let delta = match emitted.fetch_add(1, Ordering::AcqRel) {
+                    0 => "first unread payload",
+                    _ => "second unread payload",
+                };
+                Some(vec![
+                    serde_json::json!({
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": thread_id,
+                            "turnId": "overflow-turn",
+                            "delta": delta,
+                        },
+                    })
+                    .to_string(),
+                    serde_json::json!({"id": id, "result": {"rateLimits": null}}).to_string(),
+                ])
+            }
+            // The prompt stays active after accepting the interrupt, forcing the session's owned
+            // shutdown path to reap the child rather than wait for a vendor terminal.
+            Some("turn/interrupt") => Some(vec![
+                serde_json::json!({"id": id, "result": {}}).to_string(),
+            ]),
+            _ => None,
+        }
+    }));
+    let mut limits = replay_limits();
+    limits.turn_channel_capacity = 1;
+    let (host, _) = with_launcher_limits(Arc::clone(&launcher), None, limits);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut lifecycle = session.subscribe();
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "keep the native prompt active"))
+        .await
+        .expect("expected an accepted native turn");
+
+    assert!(matches!(
+        turn.recv().await.map(|event| event.kind),
+        Some(EventKind::TurnStarted { .. })
+    ));
+    notifications_released.store(true, Ordering::Release);
+    session
+        .refresh_account_usage()
+        .await
+        .expect("expected the first gate call to queue one unread payload");
+    session
+        .refresh_account_usage()
+        .await
+        .expect("expected the second gate call to release the overflow payload");
+    tokio::task::yield_now().await;
+
+    let first = turn
+        .recv()
+        .await
+        .expect("expected the first unread payload");
+    assert!(
+        matches!(first.kind, EventKind::TextDelta { ref text } if text == "first unread payload"),
+        "expected the first unread payload before the reserved terminal, received {first:?}"
+    );
+    let terminal = turn
+        .recv()
+        .await
+        .expect("expected the reserved overflow terminal");
+    assert!(matches!(
+        terminal.kind,
+        EventKind::Error { error } if error.code.as_str() == "stream-overflow"
+    ));
+    assert!(turn.recv().await.is_none(), "expected one terminal only");
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| { line.contains("\"turn/interrupt\"") && line.contains("overflow-turn") }),
+        "expected stream overflow to interrupt the still-active native prompt"
+    );
+    assert_eq!(
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+        "expected overflow recovery to finish the session's owned teardown"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected overflow recovery to reap the app-server"
     );
 }
 
