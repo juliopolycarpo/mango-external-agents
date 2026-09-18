@@ -170,11 +170,11 @@ documented behaviour, not this harness's choice:
 > session, Claude Code continues the turn that SIGTERM left unfinished.
 > — [headless.md](https://code.claude.com/docs/en/headless.md)
 
-The harness therefore never resumes a conversation after a cancelled attempt that did not produce
-a native `result`: it mints a new session id for the next admitted turn, so Claude cannot continue
-the killed prompt. SIGINT is what the vendor documents as ending a turn cleanly. A launcher reports
-that graceful interruption separately from forced termination, but only a native `result` proves
-that the vendor completed a turn which is safe to continue.
+After forced termination the harness marks the session nonresumable and refuses another turn with
+the recorded cancellation reason. It never silently mints a replacement native conversation for a
+strict session, and it never resumes the killed prompt. SIGINT is what the vendor documents as
+ending a turn cleanly. A launcher reports that graceful interruption separately from forced
+termination, which preserves the existing native continuation.
 
 Closing stdin is also what the vendor documents as cancelling a pending prompt, and this harness
 closes it immediately after the prompt — so a run that would otherwise wait for an answer nobody

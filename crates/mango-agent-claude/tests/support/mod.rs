@@ -141,6 +141,8 @@ pub struct FakeClaudeCli {
     stderr: Mutex<Vec<u8>>,
     /// Held closed while a test wants a turn's spawn to still be in flight.
     spawn_gate: Mutex<Option<SpawnGate>>,
+    /// Held closed while a test needs process termination to remain in flight.
+    stop_gate: Mutex<Option<SpawnGate>>,
     /// Whether each killed child's `--mcp-config` file was still on disk when it was killed.
     config_at_kill: Arc<Mutex<Vec<bool>>>,
     kill_requests: Arc<Mutex<usize>>,
@@ -167,6 +169,7 @@ impl FakeClaudeCli {
             children: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
             spawn_gate: Mutex::new(None),
+            stop_gate: Mutex::new(None),
             config_at_kill: Arc::new(Mutex::new(Vec::new())),
             kill_requests: Arc::new(Mutex::new(0)),
             graceful_interrupts: Arc::new(Mutex::new(0)),
@@ -246,6 +249,17 @@ impl FakeClaudeCli {
             release: Arc::new(Notify::new()),
         };
         *lock(&self.spawn_gate) = Some(gate.clone());
+        gate
+    }
+
+    /// Holds the next turn's forced termination until the returned gate releases it.
+    #[must_use]
+    pub fn gate_turn_stops(&self) -> SpawnGate {
+        let gate = SpawnGate {
+            arrived: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *lock(&self.stop_gate) = Some(gate.clone());
         gate
     }
 
@@ -332,6 +346,7 @@ impl ProcessLauncher for FakeClaudeCli {
             gate.release.notified().await;
         }
         let mcp_config = value_after(&spec.argv, "--mcp-config").map(PathBuf::from);
+        let stop_gate = is_turn.then(|| lock(&self.stop_gate).clone()).flatten();
         lock(&self.launches).push(spec);
 
         let stderr = StderrTail::default();
@@ -360,6 +375,7 @@ impl ProcessLauncher for FakeClaudeCli {
             graceful_interrupts: Arc::clone(&self.graceful_interrupts),
             interrupt_supported: self.interrupt_supported,
             is_turn,
+            stop_gate,
         });
         lock(&self.children).push(Arc::clone(&child));
 
@@ -389,6 +405,7 @@ struct Child {
     graceful_interrupts: Arc<Mutex<usize>>,
     interrupt_supported: bool,
     is_turn: bool,
+    stop_gate: Option<SpawnGate>,
 }
 
 impl Child {
@@ -445,6 +462,10 @@ impl ProcessControl for Child {
         // help probes are ended by their own code paths, so only turn children contribute.
         if self.is_turn {
             *lock(&self.kill_requests) += 1;
+        }
+        if let Some(gate) = &self.stop_gate {
+            gate.arrived.notify_one();
+            gate.release.notified().await;
         }
         // A child that already ended is not killed again. `TokioChild` escalates once and the
         // second caller waits on the first caller's outcome without signalling anything, so a fake
