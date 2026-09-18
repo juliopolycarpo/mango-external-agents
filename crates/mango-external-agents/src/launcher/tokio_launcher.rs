@@ -695,6 +695,14 @@ mod tests {
             "forever" => loop {
                 std::thread::sleep(Duration::from_secs(60));
             },
+            "interrupt-ready" => {
+                use std::io::Write as _;
+                println!("MEA-READY");
+                std::io::stdout().flush().expect("flush ready marker");
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
             // Spawns a helper of its own and exits — the shape a vendor CLI leaves behind when it
             // hands its work to a daemon. The helper inherits this stdout and this process group,
             // so the pipe the test holds outlives the process the launcher can see.
@@ -716,6 +724,9 @@ mod tests {
                 let mut blocked = nix::sys::signal::SigSet::empty();
                 blocked.add(nix::sys::signal::Signal::SIGTERM);
                 let _ = blocked.thread_block();
+                use std::io::Write as _;
+                println!("MEA-READY");
+                std::io::stdout().flush().expect("flush ready marker");
                 loop {
                     std::thread::sleep(Duration::from_secs(60));
                 }
@@ -770,6 +781,91 @@ mod tests {
 
         assert_eq!(launcher.kill_grace(), Duration::from_secs(10));
         assert_eq!(launcher.stderr_tail_bytes(), 4_096);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_graceful_interrupt_is_sigint_and_is_reaped() {
+        let child = TokioLauncher::new()
+            .spawn(fixture("interrupt-ready"))
+            .await
+            .expect("child");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        while !lines
+            .next_line()
+            .await
+            .expect("ready output")
+            .expect("child must reach readiness")
+            .ends_with("MEA-READY")
+        {}
+        assert_eq!(
+            child
+                .control
+                .interrupt(CancelReason::Requested)
+                .await
+                .expect("interrupt"),
+            crate::InterruptOutcome::Delivered
+        );
+        let status = tokio::time::timeout(Duration::from_secs(5), child.control.wait())
+            .await
+            .expect("exit deadline")
+            .expect("reaped");
+        assert_eq!(status.signal, Some(2));
+        child
+            .control
+            .kill(CancelReason::Shutdown)
+            .await
+            .expect("tree cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_kill_future_does_not_abandon_escalation() {
+        // Inherit the mask before the child's libtest runtime creates any threads. Blocking
+        // only its fixture thread would leave its main thread able to receive process SIGTERM.
+        let original_mask = nix::sys::signal::SigSet::thread_get_mask().expect("signal mask");
+        let mut blocked = original_mask;
+        blocked.add(nix::sys::signal::Signal::SIGTERM);
+        blocked
+            .thread_set_mask()
+            .expect("block SIGTERM before spawn");
+        let spawned = TokioLauncher::new()
+            .with_kill_grace(Duration::from_millis(50))
+            .spawn(fixture("survives-sigterm"))
+            .await;
+        original_mask
+            .thread_set_mask()
+            .expect("restore test signal mask");
+        let child = spawned.expect("child");
+        let mut lines = LineStream::new(child.stdout, LineLimits::default());
+        while !lines
+            .next_line()
+            .await
+            .expect("ready output")
+            .expect("child must reach readiness")
+            .ends_with("MEA-READY")
+        {}
+        let mut stopping = Box::pin(child.control.kill(CancelReason::Shutdown));
+        std::future::poll_fn(|cx| {
+            assert!(
+                stopping.as_mut().poll(cx).is_pending(),
+                "expected cleanup in progress"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(stopping);
+        let waited = tokio::time::timeout(Duration::from_secs(5), child.control.wait()).await;
+        if waited.is_err() {
+            let pid = child.control.pid().expect("owned child PID");
+            let _ =
+                nix::sys::signal::killpg(super::group_of(pid), nix::sys::signal::Signal::SIGKILL);
+            let _ = child.control.wait().await;
+        }
+        let status = waited
+            .expect("owned escalation must reap child")
+            .expect("reaped");
+        assert_eq!(status.signal, Some(9));
     }
 
     /// A handshake that fails after the spawn drops every handle to the child. The reaper owns it
