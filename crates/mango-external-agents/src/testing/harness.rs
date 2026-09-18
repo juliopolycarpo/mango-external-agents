@@ -355,8 +355,21 @@ fn question_request(operation: OperationRef, expires_at: std::time::SystemTime) 
 }
 
 impl FakeSession {
-    async fn finish(&self, option_id: &str, source: DecisionSource) -> Result<()> {
-        let Some(turn) = self.pending.lock().await.take() else {
+    async fn finish(
+        &self,
+        option_id: &str,
+        source: DecisionSource,
+        owner: Option<&OperationRef>,
+    ) -> Result<()> {
+        let mut pending = self.pending.lock().await;
+        if owner.is_some_and(|owner| {
+            pending
+                .as_ref()
+                .is_none_or(|turn| turn.sink.operation() != *owner)
+        }) {
+            return Ok(());
+        }
+        let Some(turn) = pending.take() else {
             return Ok(());
         };
         let decision = turn
@@ -516,9 +529,17 @@ impl Session for FakeSession {
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        let mut pending = self.pending.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::Closed { subject: "session" });
         }
+        if pending
+            .as_ref()
+            .is_some_and(|turn| !turn.sink.is_closed() && !turn.sink.is_terminal())
+        {
+            return Err(Error::Busy.with_dispatch(crate::Dispatch::NotSubmitted));
+        }
+        pending.take();
         self.validate_turn_request(&request)?;
         if let Some(patch) = &request.configuration {
             let outcome = self.apply(patch);
@@ -526,12 +547,12 @@ impl Session for FakeSession {
         }
         let turn = self.turns.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot = self.state.snapshot();
-        let (sink, events) = EventSink::new(
+        let (sink, events) = EventSink::with_limits(
             snapshot.ids.session_id.clone(),
             request.turn_id.clone(),
             request.attempt,
             Arc::clone(self.host.clock()),
-            self.host.limits().turn_channel_capacity,
+            self.host.limits(),
         );
         let native_turn_id = format!("fake-turn-{turn}");
 
@@ -565,7 +586,7 @@ impl Session for FakeSession {
 
         if self.asks_a_question {
             let question = question_request(operation, self.host.now() + Duration::from_secs(300));
-            *self.pending.lock().await = Some(PendingTurn {
+            *pending = Some(PendingTurn {
                 sink: sink.clone(),
                 approval: None,
                 question: Some(question.clone()),
@@ -589,13 +610,16 @@ impl Session for FakeSession {
         })
         .await?;
 
-        let request_for_approval =
-            approval_request(operation, self.host.now() + Duration::from_secs(300));
-        *self.pending.lock().await = Some(PendingTurn {
+        let request_for_approval = approval_request(
+            operation.clone(),
+            self.host.now() + Duration::from_secs(300),
+        );
+        *pending = Some(PendingTurn {
             sink: sink.clone(),
             approval: Some(request_for_approval.clone()),
             question: None,
         });
+        drop(pending);
 
         // A host policy answers first when it has one; otherwise the question reaches the host.
         // The event is emitted either way — a turn whose approval a policy answered still shows
@@ -606,7 +630,8 @@ impl Session for FakeSession {
         })
         .await?;
         if let Some(response) = answer {
-            self.finish(&response.option_id, response.source).await?;
+            self.finish(&response.option_id, response.source, Some(&operation))
+                .await?;
         }
 
         Ok(stream())
@@ -620,7 +645,8 @@ impl Session for FakeSession {
                 "this harness would not take the answer",
             )));
         }
-        self.finish(&response.option_id, response.source).await
+        self.finish(&response.option_id, response.source, None)
+            .await
     }
 
     async fn answer(&self, response: QuestionResponse) -> Result<()> {
@@ -628,8 +654,8 @@ impl Session for FakeSession {
         // Validated before the pending turn is taken, never after. A refused answer must leave the
         // question outstanding: taking first would let one malformed answer end a turn that nobody
         // successfully answered, and the caller's retry would then find nothing to answer.
+        let mut pending = self.pending.lock().await;
         let asked = {
-            let pending = self.pending.lock().await;
             let Some(turn) = pending.as_ref() else {
                 return Ok(());
             };
@@ -642,7 +668,7 @@ impl Session for FakeSession {
             asked.validate(&response)?;
             asked
         };
-        let Some(turn) = self.pending.lock().await.take() else {
+        let Some(turn) = pending.take() else {
             return Ok(());
         };
         turn.sink
@@ -657,21 +683,19 @@ impl Session for FakeSession {
     }
 
     async fn cancel(&self, reason: CancelReason) -> Result<()> {
-        let Some(turn) = self.pending.lock().await.take() else {
+        let mut pending = self.pending.lock().await;
+        let Some(turn) = pending.take() else {
             return Ok(());
         };
         turn.sink.cancel(reason).await
     }
 
     async fn close(&self, _reason: CloseReason) -> Result<()> {
+        let mut pending = self.pending.lock().await;
         self.closed.store(true, Ordering::Release);
         self.state.set_status(SessionStatus::Closed);
-        // Taken in a statement of its own: an `if let` scrutinee's guard lives through the body,
-        // so cancelling under it would hold `pending` across an `emit` that a host which stopped
-        // reading parks indefinitely — and the calls waiting on that lock are the ones a host uses
-        // to get out of it.
-        let pending = self.pending.lock().await.take();
-        if let Some(turn) = pending {
+        // Terminal commitment is immediate and remains inside the admission critical section.
+        if let Some(turn) = pending.take() {
             // A close ends whatever was running, for the same reason.
             let _ = turn.sink.cancel(CancelReason::Shutdown).await;
         }
@@ -679,10 +703,6 @@ impl Session for FakeSession {
     }
 
     async fn steer(&self, steer: Steer) -> Result<SteerOutcome> {
-        // The sink is taken out from under the lock, never emitted into while holding it: a host
-        // that stopped reading parks `emit` on a full channel, and a steer parked there while
-        // still holding `pending` parks `cancel`, `close` and `respond` behind it — the three
-        // calls that exist to get out of exactly that state.
         let sink = self
             .pending
             .lock()
@@ -723,6 +743,49 @@ mod tests {
             .client_info("test-host", "0.0.0")
             .build()
             .expect("expected a context")
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_turn_refuses_a_second_start_without_replacing_its_owner() {
+        let session = FakeHarness::new()
+            .open_session(&host(), OpenSession::new("chat"))
+            .await
+            .expect("session");
+        let mut first = session
+            .start_turn(TurnRequest::new("first", "wait for approval"))
+            .await
+            .expect("first turn");
+        let second = session
+            .start_turn(TurnRequest::new("second", "must not replace"))
+            .await;
+        assert!(
+            matches!(second, Err(ref error) if matches!(error.cause(), crate::Error::Busy)),
+            "expected typed busy, received {second:?}"
+        );
+        session
+            .cancel(crate::CancelReason::Requested)
+            .await
+            .expect("cancel original");
+        let next = session
+            .start_turn(TurnRequest::new("next", "old stream is unread"))
+            .await
+            .expect("terminal commitment releases admission before drain");
+        drop(next);
+        let _replacement = session
+            .start_turn(TurnRequest::new(
+                "replacement",
+                "abandoned fake work is inactive",
+            ))
+            .await
+            .expect("abandoned fake work does not retain admission");
+        let mut terminal = false;
+        while let Some(event) = first.recv().await {
+            terminal |= event.is_terminal();
+        }
+        assert!(
+            terminal,
+            "expected the original stream to retain its terminal"
+        );
     }
 
     #[tokio::test]
