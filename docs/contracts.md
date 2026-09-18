@@ -290,6 +290,7 @@ of them is still reachable.
 | `SessionSnapshot`, `TransportSelection`, `HarnessIdentity`                                   | session facts accumulate                                                     |
 | `DiscoveryReceipt`                                                                           | identity and freshness metadata will grow                                    |
 | `PlanStep`, `FileChange`                                                                     | structured content grows                                                     |
+| `ActivityUpdate`, `ActivityResult`                                                           | both just gained `content`; a third field should not break a host again      |
 
 Left **open** on purpose:
 

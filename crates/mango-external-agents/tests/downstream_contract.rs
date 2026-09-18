@@ -22,19 +22,20 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use mango_external_agents::{
-    Activity, ActivityContent, ActivityKind, Answer, AnswerValue, ApprovalDecision, AttemptId,
-    Capabilities, CapabilityCeiling, Command, Configuration, ConfigurationCatalog,
-    ConfigurationCategory, ConfigurationChange, ConfigurationOption, ConfigurationOptionId,
-    ConfigurationOptionValue, ConfigurationPatch, ConfigurationSource, ConfigurationState,
-    ConfigurationValue, ConfigurationValueType, DecisionSource, Discovery, DiscoveryReceipt,
-    Dispatch, Error, ExtensionValue, Extensions, FileChange, FileChangeKind, Harness,
-    HarnessDescriptor, HarnessId, HarnessIdentity, HarnessRegistry, Interaction, InteractionId,
-    InteractionKind, McpServer, OpenSession, OperationRef, PermissionEffect, PermissionLevel,
-    PermissionOption, PermissionRequest, PermissionRisk, PermissionScope, PlanStep, PlanStepStatus,
-    ProfileId, ProtocolFamily, Question, QuestionForm, QuestionId, QuestionOption,
-    QuestionOptionId, QuestionRequest, QuestionResponse, Session, SessionCapabilities, SessionId,
-    SessionIds, SessionRevision, SessionSnapshot, SessionState, SessionStatus, TransportKind,
-    TransportSelection, TurnId, TurnRequest, VendorInfo,
+    Activity, ActivityContent, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
+    Answer, AnswerValue, ApprovalDecision, AttemptId, Capabilities, CapabilityCeiling, Command,
+    Configuration, ConfigurationCatalog, ConfigurationCategory, ConfigurationChange,
+    ConfigurationOption, ConfigurationOptionId, ConfigurationOptionValue, ConfigurationPatch,
+    ConfigurationSource, ConfigurationState, ConfigurationValue, ConfigurationValueType,
+    DecisionSource, Discovery, DiscoveryReceipt, Dispatch, Error, ExtensionValue, Extensions,
+    FileChange, FileChangeKind, Harness, HarnessDescriptor, HarnessId, HarnessIdentity,
+    HarnessRegistry, Interaction, InteractionId, InteractionKind, McpServer, OpenSession,
+    OperationRef, PermissionEffect, PermissionLevel, PermissionOption, PermissionRequest,
+    PermissionRisk, PermissionScope, PlanStep, PlanStepStatus, ProfileId, ProtocolFamily, Question,
+    QuestionForm, QuestionId, QuestionOption, QuestionOptionId, QuestionRequest, QuestionResponse,
+    Session, SessionCapabilities, SessionId, SessionIds, SessionRevision, SessionSnapshot,
+    SessionState, SessionStatus, TransportKind, TransportSelection, TurnId, TurnRequest,
+    VendorInfo,
 };
 
 /// A harness this crate has never heard of, written entirely against the public API.
@@ -562,6 +563,41 @@ fn structured_content_keeps_its_identity_through_serialization() {
     assert_eq!(
         serde_json::from_value::<ActivityContent>(encoded).expect("expected the content back"),
         content
+    );
+}
+
+/// Both halves of an activity's later life are reachable from outside this crate.
+///
+/// They became `#[non_exhaustive]` when they gained `content`, which is exactly the change that
+/// would have broken a host constructing them with a struct literal. The builders are the
+/// replacement, and this is the only place the attribute is real, so this is where they are proved
+/// to still work — including the shapes a reducer actually builds, where the title or the detail is
+/// an `Option` it did not decide.
+#[test]
+fn an_activity_update_and_result_are_constructible_through_their_builders() {
+    let update = ActivityUpdate::new()
+        .with_title("applying the patch")
+        .with_optional_detail(None)
+        .with_content(ActivityContent::Output {
+            text: String::from("2 files changed"),
+        });
+    assert_eq!(update.title.as_deref(), Some("applying the patch"));
+    assert!(update.detail.is_none());
+    assert!(!update.is_empty());
+
+    let result = ActivityResult::new(ActivityStatus::Completed)
+        .with_optional_detail(Some(String::from("exit 0")))
+        .with_content(ActivityContent::Diff {
+            files: vec![FileChange::new("src/lib.rs").with_line_counts(10, 2)],
+        });
+    assert_eq!(result.status, ActivityStatus::Completed);
+
+    let encoded = serde_json::to_value(&result).expect("expected a serializable result");
+    assert_eq!(encoded["content"]["type"], "diff");
+    assert_eq!(encoded["content"]["files"][0]["addedLines"], 10);
+    assert!(
+        encoded["content"]["files"][0].get("kind").is_none(),
+        "an unstated kind must not serialise as one, received {encoded}"
     );
 }
 
