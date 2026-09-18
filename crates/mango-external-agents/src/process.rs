@@ -130,15 +130,19 @@ pub trait ProcessControl: Send + Sync {
 
 /// Whether the host can deliver a graceful process interrupt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InterruptOutcome {
     /// The interrupt was delivered; completion still requires waiting for exit.
     Delivered,
+    /// No signal was sent because the process exited or tree termination already started.
+    NotDelivered,
     /// No graceful interrupt is available on this launcher.
     Unsupported,
 }
 
 /// How process shutdown completed, after the child was reaped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StopOutcome {
     /// The child exited after the graceful interrupt and before escalation.
     Interrupted,

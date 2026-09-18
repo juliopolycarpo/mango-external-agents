@@ -421,15 +421,16 @@ impl ProcessControl for TokioChild {
         #[cfg(unix)]
         {
             use nix::sys::signal::{Signal, killpg};
-            if let Some(pid) = self.pid
-                && self.exited().is_none()
-                && !self.killed.load(Ordering::Acquire)
-            {
-                killpg(group_of(pid), Signal::SIGINT).map_err(|error| Error::Launch {
-                    program: String::from("process group"),
-                    message: format!("interrupt failed with OS error {error}"),
-                })?;
+            if self.exited().is_some() || self.killed.load(Ordering::Acquire) {
+                return Ok(crate::process::InterruptOutcome::NotDelivered);
             }
+            let Some(pid) = self.pid else {
+                return Ok(crate::process::InterruptOutcome::NotDelivered);
+            };
+            killpg(group_of(pid), Signal::SIGINT).map_err(|error| Error::Launch {
+                program: String::from("process group"),
+                message: format!("interrupt failed with OS error {error}"),
+            })?;
             Ok(crate::process::InterruptOutcome::Delivered)
         }
         #[cfg(not(unix))]
@@ -816,6 +817,15 @@ mod tests {
             .kill(CancelReason::Shutdown)
             .await
             .expect("tree cleanup");
+        assert_eq!(
+            child
+                .control
+                .interrupt(CancelReason::Requested)
+                .await
+                .expect("observe stopped child"),
+            crate::InterruptOutcome::NotDelivered,
+            "an exited child cannot acknowledge a new graceful interrupt"
+        );
     }
 
     #[cfg(unix)]
