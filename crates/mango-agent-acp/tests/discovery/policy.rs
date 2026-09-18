@@ -4,11 +4,15 @@ use super::*;
 async fn stdio_mcp_servers_are_sent_on_session_new() {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(FakeAcpAgent::new().process());
+    let command = std::env::current_exe()
+        .expect("expected an absolute test executable path")
+        .to_string_lossy()
+        .into_owned();
     let mut request = mango_external_agents::OpenSession::new("mcp");
     request.mcp_servers.push(mango_external_agents::McpServer {
         name: String::from("docs"),
         transport: mango_external_agents::McpTransport::Stdio {
-            command: String::from("/usr/bin/docs-mcp"),
+            command: command.clone(),
             args: Vec::new(),
             env: std::collections::BTreeMap::from([(
                 String::from("DOCS_TOKEN"),
@@ -31,7 +35,7 @@ async fn stdio_mcp_servers_are_sent_on_session_new() {
         request["params"]["mcpServers"],
         serde_json::json!([{
             "name": "docs",
-            "command": "/usr/bin/docs-mcp",
+            "command": command,
             "args": [],
             "env": [{ "name": "DOCS_TOKEN", "value": "test-token" }],
         }]),
