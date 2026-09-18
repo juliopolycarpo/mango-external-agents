@@ -109,8 +109,15 @@ struct ConfigurationProgress {
     requested: Configuration,
     accepted: Configuration,
     catalog: ConfigurationCatalog,
+    catalog_revision: u64,
     applied: Vec<ConfigurationOptionId>,
     rejected: Vec<RejectedSetting>,
+}
+
+/// One complete catalog response, ordered against asynchronous ACP notifications.
+struct ConfigurationCatalogResponse {
+    catalog: ConfigurationCatalog,
+    revision: u64,
 }
 
 impl std::fmt::Debug for AcpSession {
@@ -189,7 +196,7 @@ impl AcpSession {
         let mut rejected = reset_rejections(&patch);
         let mut applied = Vec::new();
         let mut accepted = self.connection_state.configuration();
-        let mut catalog = self.session_state.snapshot().catalog.clone();
+        let (mut catalog, mut catalog_revision) = self.connection_state.catalog_snapshot();
         let mut requested = self
             .session_state
             .snapshot()
@@ -221,8 +228,8 @@ impl AcpSession {
                 rejected.push(RejectedSetting::new(id, rejection));
                 continue;
             }
-            catalog = match self.set_config_option(&id, value.clone()).await {
-                Ok(catalog) => catalog,
+            let response = match self.set_config_option(&id, value.clone()).await {
+                Ok(response) => response,
                 Err(error) => {
                     return self.option_failure_outcome(
                         id,
@@ -231,12 +238,15 @@ impl AcpSession {
                             requested,
                             accepted,
                             catalog,
+                            catalog_revision,
                             applied,
                             rejected,
                         },
                     );
                 }
             };
+            catalog = response.catalog;
+            catalog_revision = response.revision;
             accepted = match axis {
                 "model" => accepted.with_model(chosen),
                 "effort" => accepted.with_effort(chosen),
@@ -260,8 +270,8 @@ impl AcpSession {
                 rejected.push(RejectedSetting::new(id.clone(), rejection));
                 continue;
             }
-            catalog = match self.set_config_option(id, value.clone()).await {
-                Ok(catalog) => catalog,
+            let response = match self.set_config_option(id, value.clone()).await {
+                Ok(response) => response,
                 Err(error) => {
                     return self.option_failure_outcome(
                         id.clone(),
@@ -270,12 +280,15 @@ impl AcpSession {
                             requested,
                             accepted,
                             catalog,
+                            catalog_revision,
                             applied,
                             rejected,
                         },
                     );
                 }
             };
+            catalog = response.catalog;
+            catalog_revision = response.revision;
             accepted = accepted.with_native(id.clone(), value.clone());
             applied.push(id.clone());
         }
@@ -324,6 +337,7 @@ impl AcpSession {
                                 requested,
                                 accepted,
                                 catalog,
+                                catalog_revision,
                                 applied,
                                 rejected,
                             },
@@ -359,7 +373,8 @@ impl AcpSession {
             }
         }
 
-        let state = self.publish_catalog_configuration(&requested, &accepted, catalog);
+        let state =
+            self.publish_catalog_configuration(&requested, &accepted, catalog, catalog_revision);
         let outcome = ConfigurationOutcome::applied(state, applied);
         if rejected.is_empty() {
             Ok(outcome)
@@ -372,7 +387,7 @@ impl AcpSession {
         &self,
         id: &ConfigurationOptionId,
         value: ConfigurationValue,
-    ) -> Result<ConfigurationCatalog> {
+    ) -> Result<ConfigurationCatalogResponse> {
         let value = match value {
             ConfigurationValue::Text(value) => SessionConfigOptionValue::from(value.as_str()),
             ConfigurationValue::Boolean(value) => SessionConfigOptionValue::from(value),
@@ -389,6 +404,7 @@ impl AcpSession {
                 });
             }
         };
+        let response_revision = self.connection_state.catalog_snapshot().1;
         let response = self
             .request(
                 "session/set_config_option",
@@ -399,7 +415,18 @@ impl AcpSession {
                 ),
             )
             .await?;
-        Ok(catalog_from_options(&response.config_options))
+        let catalog = catalog_from_options(&response.config_options);
+        let (current_catalog, current_revision) = self.connection_state.catalog_snapshot();
+        if current_revision != response_revision {
+            return Ok(ConfigurationCatalogResponse {
+                catalog: current_catalog,
+                revision: current_revision,
+            });
+        }
+        Ok(ConfigurationCatalogResponse {
+            catalog,
+            revision: response_revision,
+        })
     }
 
     /// Publishes the configuration state confirmed before a later option request can fail.
@@ -408,18 +435,15 @@ impl AcpSession {
         requested: &Configuration,
         accepted: &Configuration,
         catalog: ConfigurationCatalog,
+        catalog_revision: u64,
     ) -> ConfigurationState {
         self.connection_state.accept_configuration(accepted.clone());
-        let state = ConfigurationState::new(
+        self.connection_state.publish_response_configuration(
+            catalog_revision,
+            catalog,
             requested.clone(),
             accepted.clone(),
-            configuration_from_catalog(&catalog),
-        );
-        self.session_state.update(|snapshot| {
-            snapshot.catalog = catalog;
-            snapshot.configuration = state.clone();
-        });
-        state
+        )
     }
 
     /// Publishes every setting confirmed before a vendor explicitly refuses a later option.
@@ -433,6 +457,7 @@ impl AcpSession {
             &progress.requested,
             &progress.accepted,
             progress.catalog,
+            progress.catalog_revision,
         );
         if !matches!(error.cause(), Error::Vendor(_)) {
             return Err(error);

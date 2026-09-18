@@ -78,6 +78,81 @@ impl ProcessLauncher for CapturingLauncher {
     }
 }
 
+/// A named ACP peer that publishes a newer catalog notification before returning a stale option response.
+struct InterleavingConfigAgent;
+
+impl InterleavingConfigAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(|line| Self::answer(line))
+    }
+
+    fn answer(line: &str) -> Vec<String> {
+        let message: serde_json::Value =
+            serde_json::from_str(line).expect("expected harness JSON-RPC request");
+        let id = message["id"].clone();
+        match message["method"].as_str() {
+            Some("initialize") => vec![Self::result(
+                id,
+                serde_json::json!({
+                    "protocolVersion": 1,
+                    "agentInfo": { "name": "interleaving-fake", "version": "1" },
+                    "agentCapabilities": {
+                        "loadSession": true,
+                        "promptCapabilities": { "image": true, "embeddedContext": true },
+                        "sessionCapabilities": {},
+                    },
+                    "authMethods": [],
+                }),
+            )],
+            Some("session/new") => vec![Self::result(
+                id,
+                serde_json::json!({
+                    "sessionId": "sess_fake",
+                    "configOptions": [Self::model_option("small")],
+                }),
+            )],
+            Some("session/set_config_option") => vec![
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "sess_fake",
+                        "update": {
+                            "sessionUpdate": "config_option_update",
+                            "configOptions": [Self::model_option("newer")],
+                        },
+                    },
+                })
+                .to_string(),
+                Self::result(
+                    id,
+                    serde_json::json!({ "configOptions": [Self::model_option("large")] }),
+                ),
+            ],
+            _ => vec![Self::result(id, serde_json::json!({}))],
+        }
+    }
+
+    fn model_option(current: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": current,
+            "options": [
+                { "value": "small", "name": "Small" },
+                { "value": "large", "name": "Large" },
+                { "value": "newer", "name": "Newer" },
+            ],
+        })
+    }
+
+    fn result(id: serde_json::Value, value: serde_json::Value) -> String {
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": value }).to_string()
+    }
+}
+
 fn host_with_clock(launcher: &FakeLauncher, clock: Arc<dyn Clock>) -> HostContext {
     HostContext::builder()
         .launcher(Arc::new(launcher.clone()))
@@ -2778,6 +2853,36 @@ async fn a_live_acp_catalog_is_applied_between_turns_and_reports_current_values(
             .get(&ConfigurationOptionId::new("web-search")),
         Some(&ConfigurationValue::Boolean(true))
     );
+}
+
+/// A newer `config_option_update` wins over the stale response that follows it on the same request.
+#[tokio::test]
+async fn a_config_notification_is_not_overwritten_by_a_stale_option_response() {
+    let launcher = FakeLauncher::new();
+    launcher.push(InterleavingConfigAgent::process());
+    let session = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("catalog-order"))
+        .await
+        .expect("expected the interleaving fake session to open");
+    session
+        .configure(ConfigurationPatch::new().model(ConfigurationChange::Set(String::from("large"))))
+        .await
+        .expect("expected the stale response itself to be accepted");
+    let snapshot = session.snapshot();
+    assert_eq!(
+        snapshot.configuration.observed.model.as_deref(),
+        Some("newer"),
+        "expected the notification published before the response to remain authoritative"
+    );
+    assert_eq!(
+        snapshot.catalog.options()[0].current,
+        Some(ConfigurationValue::Text(String::from("newer"))),
+        "expected the public catalog not to regress to the response value"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
 }
 
 /// Accepted ACP defaults survive a later prompt whose request leaves configuration at `keep`.

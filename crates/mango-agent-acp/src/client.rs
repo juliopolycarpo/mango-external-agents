@@ -36,7 +36,9 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use mango_external_agents::approval::ApprovalDeadline;
-use mango_external_agents::configuration::Configuration;
+use mango_external_agents::configuration::{
+    Configuration, ConfigurationCatalog, ConfigurationState,
+};
 use mango_external_agents::event::{EventKind, SessionId};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
@@ -201,6 +203,11 @@ pub(crate) struct SessionState {
     /// `None` on either permission axis leaves the vendor's own setting in force. Turning that
     /// absence into `ReadOnly` would alter an agent merely because a host omitted an override.
     configuration: Mutex<Configuration>,
+    /// Orders complete configuration catalogs from requests and notifications.
+    ///
+    /// A `config_option_update` can arrive before the response to `session/set_config_option` that
+    /// caused it. The later notification is authoritative, so a stale response must not replace it.
+    catalog_revision: Mutex<u64>,
     /// Serialises merging, accepting, and recording one turn's configuration.
     ///
     /// The prompt slot alone is not enough: a second caller could read the old inherited settings
@@ -259,6 +266,7 @@ impl SessionState {
             limits: *host.limits(),
             turn: Mutex::new(None),
             configuration: Mutex::new(configuration),
+            catalog_revision: Mutex::new(0),
             turn_start: Mutex::new(()),
             generations: AtomicU64::new(0),
             cancel_reason: Mutex::new(None),
@@ -330,6 +338,39 @@ impl SessionState {
     /// Records settings only after their turn won ACP's single prompt slot.
     pub(crate) fn accept_configuration(&self, configuration: Configuration) {
         *self.lock_configuration() = configuration;
+    }
+
+    /// The current complete catalog and its notification ordering token.
+    pub(crate) fn catalog_snapshot(&self) -> (ConfigurationCatalog, u64) {
+        let revision = self.lock_catalog_revision();
+        (self.core_state.snapshot().catalog.clone(), *revision)
+    }
+
+    /// Publishes a request response unless a later catalog notification already won the order.
+    pub(crate) fn publish_response_configuration(
+        &self,
+        response_revision: u64,
+        response_catalog: ConfigurationCatalog,
+        requested: Configuration,
+        accepted: Configuration,
+    ) -> ConfigurationState {
+        let mut revision = self.lock_catalog_revision();
+        let catalog = if *revision == response_revision {
+            *revision = revision.wrapping_add(1);
+            response_catalog
+        } else {
+            self.core_state.snapshot().catalog.clone()
+        };
+        let state = ConfigurationState::new(
+            requested,
+            accepted,
+            crate::session::configuration_from_catalog(&catalog),
+        );
+        self.core_state.update(|snapshot| {
+            snapshot.catalog = catalog;
+            snapshot.configuration = state.clone();
+        });
+        state
     }
 
     /// Guards one synchronous configuration merge and prompt-slot claim.
@@ -444,6 +485,8 @@ impl SessionState {
             SessionFact::ConfigurationOptions(options) => {
                 let catalog = crate::session::catalog_from_options(&options);
                 let observed = crate::session::configuration_from_catalog(&catalog);
+                let mut revision = self.lock_catalog_revision();
+                *revision = revision.wrapping_add(1);
                 self.core_state.update(|snapshot| {
                     snapshot.catalog = catalog;
                     snapshot.configuration.observed = observed;
