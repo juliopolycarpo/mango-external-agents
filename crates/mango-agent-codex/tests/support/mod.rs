@@ -6,9 +6,11 @@
 //!
 //! The one thing the replay cannot take literally is a JSON-RPC id: the harness numbers its own
 //! calls, and a recorded answer carries the number the recorder used. So a response is re-addressed
-//! to whatever id the call arrived under, and everything else is passed through byte for byte.
+//! to whatever id the call arrived under. Windows also retargets the `/workspace` fixture
+//! placeholder to a drive-qualified test path; every other value stays byte for byte.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mango_external_agents::testing::FakeProcess;
@@ -18,6 +20,41 @@ use serde_json::Value;
 const SENT: &str = ">>";
 /// The prefix it writes on a line the vendor sent.
 const RECEIVED: &str = "<<";
+
+/// The host directory replayed Codex receives on this platform.
+///
+/// Captures use `/workspace`, which is a full path on Unix. Windows needs a drive-qualified path
+/// for the same host contract, so the replay retargets only that fixture placeholder there.
+pub fn workspace_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::temp_dir().join("mango-agent-codex-replay-workspace")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/workspace")
+    }
+}
+
+#[cfg(windows)]
+fn retarget_fixture_workspace(value: &mut Value) {
+    match value {
+        Value::String(text) if text == "/workspace" => {
+            *text = workspace_path().to_string_lossy().into_owned();
+        }
+        Value::Array(values) => {
+            for value in values {
+                retarget_fixture_workspace(value);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                retarget_fixture_workspace(value);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// One call, and everything the server wrote before the next call.
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +113,12 @@ impl Transcript {
                     path.display()
                 )
             });
+            #[cfg(windows)]
+            let frame = {
+                let mut frame = frame;
+                retarget_fixture_workspace(&mut frame);
+                frame
+            };
             match prefix {
                 SENT => transcript.steps.push(Step {
                     sent: frame,
@@ -225,8 +268,36 @@ fn readdress(frame: &Value, id: Option<&Value>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{Step, Transcript, readdress};
+    use super::{Step, Transcript, readdress, workspace_path};
     use serde_json::json;
+
+    #[test]
+    fn replay_workspace_is_a_native_absolute_path() {
+        let workspace = workspace_path();
+        assert!(
+            workspace.is_absolute(),
+            "expected {workspace:?} to be absolute"
+        );
+        assert!(
+            workspace.to_str().is_some(),
+            "expected a UTF-8 test workspace"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replay_retargets_only_the_workspace_placeholder() {
+        let mut frame = json!({
+            "cwd": "/workspace",
+            "unrelated": "/private",
+        });
+        super::retarget_fixture_workspace(&mut frame);
+        assert_eq!(
+            frame["cwd"],
+            workspace_path().to_string_lossy().into_owned()
+        );
+        assert_eq!(frame["unrelated"], "/private");
+    }
 
     #[test]
     fn a_response_is_readdressed_to_the_call_that_is_waiting() {

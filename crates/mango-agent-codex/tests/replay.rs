@@ -22,10 +22,10 @@ use mango_external_agents::testing::{Announcer, FakeLauncher, FakeProcess};
 use mango_external_agents::{
     ApprovalRouting, CancelReason, Clock, CloseReason, ConfigurationChange, ConfigurationPatch,
     EnvSource, ExitStatus, Harness, HostContext, InterruptOutcome, LaunchSpec, ManagedProcess,
-    McpServer, McpTransport, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, Session,
-    SessionQuery, SessionStatus, SessionSubscription, Steer, TurnRequest,
+    McpServer, McpTransport, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher,
+    Session, SessionQuery, SessionStatus, SessionSubscription, Steer, TurnRequest,
 };
-use support::Transcript;
+use support::{Transcript, workspace_path};
 
 /// A test-controlled pause in a fake child operation.
 struct FakeGate {
@@ -589,7 +589,7 @@ fn host_context(
 ) -> HostContext {
     let mut builder = HostContext::builder()
         .launcher(launcher)
-        .cwd("/workspace")
+        .cwd(workspace_path())
         .client_info("mango-test", "0.0.1")
         .environment(EnvSource::from_pairs([
             ("PATH", "/usr/bin"),
@@ -674,7 +674,7 @@ async fn a_session_spawns_the_app_server_with_only_the_environment_it_documents(
 
     let launch = launcher.last_launch().expect("expected one launch");
     assert_eq!(launch.argv, vec!["codex", "app-server"]);
-    assert_eq!(launch.cwd.to_string_lossy(), "/workspace");
+    assert_eq!(launch.cwd, workspace_path());
     assert_eq!(
         launch.env.get("CODEX_HOME").map(String::as_str),
         Some("/home/user/.codex"),
@@ -848,9 +848,9 @@ struct ResumeErrorServer {
 
 /// The captured thread answer, returned to a resume request with that request's id.
 struct ResumeSuccessServer {
-    read_workspace: &'static str,
+    read_workspace: String,
     resume_id: Option<&'static str>,
-    resume_workspace: Option<&'static str>,
+    resume_workspace: Option<String>,
 }
 
 impl ResumeSuccessServer {
@@ -875,8 +875,8 @@ impl ResumeSuccessServer {
                 if let Some(id) = self.resume_id {
                     answer["result"]["thread"]["id"] = id.into();
                 }
-                if let Some(cwd) = self.resume_workspace {
-                    answer["result"]["thread"]["cwd"] = cwd.into();
+                if let Some(cwd) = self.resume_workspace.as_ref() {
+                    answer["result"]["thread"]["cwd"] = cwd.clone().into();
                 }
                 vec![answer.to_string()]
             })
@@ -889,7 +889,7 @@ async fn resumed_codex_thread_receives_the_same_host_mcp_override() {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(
         ResumeSuccessServer {
-            read_workspace: "/workspace",
+            read_workspace: workspace_path().to_string_lossy().into_owned(),
             resume_id: None,
             resume_workspace: None,
         }
@@ -940,7 +940,7 @@ async fn a_foreign_resume_workspace_is_refused_before_loading_a_thread_or_starti
         let launcher = Arc::new(FakeLauncher::new());
         launcher.push(
             ResumeSuccessServer {
-                read_workspace: "/other/workspace",
+                read_workspace: String::from("/other/workspace"),
                 resume_id: None,
                 resume_workspace: None,
             }
@@ -972,9 +972,9 @@ async fn resume_refuses_a_changed_identity_or_workspace_after_a_valid_preflight(
         let launcher = Arc::new(FakeLauncher::new());
         launcher.push(
             ResumeSuccessServer {
-                read_workspace: "/workspace",
+                read_workspace: workspace_path().to_string_lossy().into_owned(),
                 resume_id: changed_id,
-                resume_workspace: changed_cwd,
+                resume_workspace: changed_cwd.map(str::to_owned),
             }
             .process(),
         );
@@ -2913,7 +2913,7 @@ async fn app_server_eof_after_an_activity_fails_the_turn_without_waiting_for_a_t
                                 "id": "command-eof",
                                 "type": "commandExecution",
                                 "command": "sleep 60",
-                                "cwd": "/workspace",
+                                "cwd": workspace_path().to_string_lossy(),
                                 "status": "inProgress",
                             },
                         },
@@ -3244,7 +3244,10 @@ async fn listing_without_a_user_conversation_uses_only_the_authorized_workspace(
         .find(|line| line.contains("thread/list"))
         .expect("expected a list request");
     let frame: serde_json::Value = serde_json::from_str(list).expect("expected a JSON request");
-    assert_eq!(frame["params"]["cwd"], "/workspace");
+    assert_eq!(
+        frame["params"]["cwd"],
+        workspace_path().to_string_lossy().into_owned()
+    );
     assert_eq!(frame["params"]["limit"], 50);
 }
 
@@ -3321,7 +3324,7 @@ impl MixedWorkspaceListServer {
                         "id": frame["id"],
                         "result": {
                             "data": [
-                                {"id": "local", "cwd": "/workspace", "preview": "allowed"},
+                                {"id": "local", "cwd": frame["params"]["cwd"], "preview": "allowed"},
                                 {"id": "foreign", "cwd": "/private", "preview": "secret"},
                                 {"id": "unscoped", "preview": "unknown"},
                             ],
@@ -3347,8 +3350,8 @@ impl OversizedListServer {
                         "id": frame["id"],
                         "result": {
                             "data": [
-                                {"id": "first", "cwd": "/workspace"},
-                                {"id": "second", "cwd": "/workspace"},
+                                {"id": "first", "cwd": frame["params"]["cwd"]},
+                                {"id": "second", "cwd": frame["params"]["cwd"]},
                             ],
                             "nextCursor": "after-second",
                         },
@@ -3476,6 +3479,51 @@ async fn listing_a_different_workspace_is_refused_before_spawning() {
     assert!(launcher.launches().is_empty(), "expected no child process");
 }
 
+/// Codex receives the host working directory in every child launch and thread request. A relative
+/// or dotted path would let the child resolve it against ambient state, so reject it before any
+/// Codex child starts.
+#[tokio::test]
+async fn a_non_absolute_or_lexically_non_normalized_workspace_is_refused_before_spawning_codex() {
+    for cwd in [
+        std::path::PathBuf::from("relative-workspace"),
+        std::env::temp_dir()
+            .join("mango-agent-codex")
+            .join("..")
+            .join("workspace"),
+    ] {
+        let launcher = Arc::new(FakeLauncher::new());
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(cwd)
+            .client_info("mango-test", "0.0.1")
+            .environment(EnvSource::from_pairs([("PATH", "/usr/bin")]))
+            .build()
+            .expect("expected a host context that leaves Codex validation to the harness");
+
+        let results = [
+            CodexHarness::new()
+                .open_session(&host, OpenSession::new("chat-1"))
+                .await
+                .map(|_| ()),
+            CodexHarness::new()
+                .list_sessions(&host, SessionQuery::default())
+                .await
+                .map(|_| ()),
+            CodexHarness::new().discover(&host).await.map(|_| ()),
+        ];
+        for result in results {
+            assert!(
+                matches!(result, Err(ref error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "an absolute, lexically normalized UTF-8 workspace path", .. })),
+                "expected a typed workspace refusal, received {result:?}"
+            );
+        }
+        assert!(
+            launcher.launches().is_empty(),
+            "expected no Codex child for an unauthorized workspace"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_non_utf8_workspace_is_refused_before_opening_or_listing_codex() {
@@ -3502,7 +3550,7 @@ async fn a_non_utf8_workspace_is_refused_before_opening_or_listing_codex() {
             .map(|_| ()),
     ] {
         assert!(
-            matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "a UTF-8 Codex workspace path", .. }))
+            matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "an absolute, lexically normalized UTF-8 workspace path", .. }))
         );
     }
     assert!(launcher.launches().is_empty());
@@ -3552,7 +3600,10 @@ async fn the_configuration_a_host_chose_reaches_the_thread_as_three_settings() {
     assert_eq!(frame["params"]["sandbox"], "workspace-write");
     assert_eq!(frame["params"]["approvalPolicy"], "on-request");
     assert_eq!(frame["params"]["approvalsReviewer"], "auto_review");
-    assert_eq!(frame["params"]["cwd"], "/workspace");
+    assert_eq!(
+        frame["params"]["cwd"],
+        workspace_path().to_string_lossy().into_owned()
+    );
 }
 
 /// The old session-wide announcement rode the first turn's stream, so a first turn the server
@@ -3985,7 +4036,7 @@ async fn a_machine_with_no_codex_on_it_discovers_nothing_rather_than_failing() {
     let launcher = Arc::new(FakeLauncher::new());
     let host = HostContext::builder()
         .launcher(launcher)
-        .cwd("/workspace")
+        .cwd(workspace_path())
         .client_info("mango-test", "0.0.1")
         .build()
         .expect("expected a host");
@@ -4008,7 +4059,7 @@ async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
     launcher.push(FakeProcess::transcript(["codex-cli 0.147.0"]));
     let host = HostContext::builder()
         .launcher(launcher.clone())
-        .cwd("/workspace")
+        .cwd(workspace_path())
         .client_info("mango-test", "0.0.1")
         .build()
         .expect("expected a host");

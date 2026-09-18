@@ -167,7 +167,7 @@ impl Harness for CodexHarness {
     }
 
     async fn probe(&self, host: &HostContext) -> Result<Discovery> {
-        let version = match read_version(host, &self.executable).await {
+        let version = match read_version(host, &self.executable).await? {
             Some(version) => version,
             // Nothing answered `--version`, so nothing is installed as far as a probe can tell. An
             // executable the host resolved but cannot run is the same fact to a caller.
@@ -223,13 +223,9 @@ impl Harness for CodexHarness {
             .descriptor()
             .resolve_transport(request.transport)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
-        let cwd = host.cwd().to_str().ok_or_else(|| {
-            Error::HostConfiguration {
-                expected: "a UTF-8 Codex workspace path",
-                received: String::from("a non-UTF-8 authorized directory"),
-            }
-            .with_dispatch(Dispatch::NotSubmitted)
-        })?;
+        let cwd = host
+            .absolute_cwd()
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let executable = self.program_for(&request);
         let transport = stdio::open(
             host,
@@ -569,8 +565,9 @@ fn client_info(host: &HostClientInfo) -> ClientInfo {
 }
 
 /// Whatever `codex --version` printed, or nothing when it would not run.
-async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Option<String> {
-    let mut child = host
+async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result<Option<String>> {
+    host.absolute_cwd()?;
+    let mut child = match host
         .launcher()
         .spawn(LaunchSpec {
             argv: vec![
@@ -583,7 +580,10 @@ async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Option
             hide_window: true,
         })
         .await
-        .ok()?;
+    {
+        Ok(child) => child,
+        Err(_) => return Ok(None),
+    };
 
     let mut lines = mango_external_agents::process::LineStream::new(
         std::mem::replace(&mut child.stdout, Box::new(NoBytes)),
@@ -597,7 +597,10 @@ async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Option
         .control
         .kill(mango_external_agents::CancelReason::Shutdown)
         .await;
-    discovery::parse_version(&first.ok()?.ok().flatten()?)
+    Ok(first
+        .ok()
+        .and_then(|line| line.ok().flatten())
+        .and_then(|line| discovery::parse_version(&line)))
 }
 
 /// A stand-in for a byte source that has been taken, so the child struct stays whole.
@@ -656,6 +659,7 @@ struct ProbeConnection {
 
 impl ProbeConnection {
     async fn open(host: &HostContext, executable: &ExecutablePath) -> Result<Self> {
+        host.absolute_cwd()?;
         let transport = stdio::open(
             host,
             &StdioSpec::new([PROGRAM, "app-server"]),

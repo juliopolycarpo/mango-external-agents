@@ -51,8 +51,10 @@ on the wire)".
 `Harness::list_sessions` opens a short-lived app-server connection, initializes it, asks for a
 page and closes it without starting a thread. Canceling the picker request also kills that
 connection's child through the injected process control. A live `Session::list_sessions` reuses its own
-connection. Both paths require the host's authorized working directory as the `cwd` filter and
-refuse a query for another directory. The vendor's cursor, native id, title, preview and Unix
+connection. Both paths require an absolute, lexically normalized UTF-8 host working directory as
+the `cwd` filter and refuse a query for another directory. Codex refuses that host configuration
+before it launches `codex --version` or an app-server, without canonicalizing the path or reading
+the filesystem. The vendor's cursor, native id, title, preview and Unix
 second timestamps pass through when supplied. Rows with missing or foreign workspace paths are
 discarded even if the server returns them under the `cwd` filter. Before `thread/resume`, the
 harness calls `thread/read` with `includeTurns: false` and requires its native id and original
@@ -284,7 +286,8 @@ refused as `Error::UnsupportedTransport` before anything is spawned.
 `Capabilities::mcp_passthrough` is `true`. Host entries travel in the `config.mcp_servers` map
 on `thread/start` or `thread/resume`, the app-server's documented per-thread override. Stdio
 entries preserve command, arguments and server-only environment. Streamable HTTP entries preserve
-URL and literal headers. Invalid, duplicate or unsupported entries fail before launching Codex;
+URL and literal headers. The harness validates header names and values with the `http` crate before
+launching Codex. Invalid, duplicate or unsupported entries fail before launching Codex;
 the harness never edits the user's `config.toml` or adds server credentials to the Codex child's
 environment. Servers the user configured with `codex mcp` remain available to the vendor.
 
