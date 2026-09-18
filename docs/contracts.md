@@ -220,13 +220,17 @@ from discovery can pass a `DiscoveryReceipt` on the `OpenSession` that uses it, 
 forgets it. Nothing in the library stores one or looks one up, and there is no process-global
 cache.
 
-Before attaching the receipt, the host calls `bind_to_open` with fresh opaque measurements of the
-resolved executable, the actual allowlisted child environment, and every account or managed-policy
-fact that narrowed discovery. A recorded fingerprint without a fresh measurement is a refusal. The
-binding also records the full harness identity, selected effective transport, authorised workspace,
-and configuration, resume and MCP request fields. Opening compares all of them. A changed account
-or policy fingerprint therefore cannot make cached permission cells wider than the current host
-authorization.
+Immediately before each opening, the host calls `bind_to_open` with fresh opaque measurements of
+the resolved executable, the actual allowlisted child environment, and every account or
+managed-policy fact that narrowed discovery. Binding refuses a changed fingerprint or a recorded
+fingerprint without a current measurement. The binding also records the full harness identity,
+selected effective transport, authorised workspace, and configuration, resume and MCP request
+fields. Opening compares that context and checks the receipt's age.
+
+Opening cannot remeasure external state. The host must invalidate the receipt on observed
+executable, environment, account or policy changes, even within its freshness window. Cloning a
+bound receipt does not refresh that evidence. If state changes between binding and opening, the
+host must remeasure and bind again before using cached permissions.
 
 The library only compares fingerprints. It does not hash a binary, read an environment value or
 interpret an account policy. A host can use a binary hash, file metadata or a package version for
@@ -240,11 +244,15 @@ vouches for one binary cannot vouch for whichever one that turns out to be.
 ## Listing and account readings without a conversation
 
 `Harness::list_sessions` and `Harness::account_usage` are optional services for a host that needs
-data before opening a conversation. Both default to `Error::NotSupported`, and the shipped
-harnesses keep those defaults. The listing/account capability flags describe the corresponding
-session methods, not these independent services: Codex currently requires an open `Session` for
-`thread/list` and account usage. Hosts must handle a harness-level refusal even when its session
-capability is advertised. Neither surface reads a credential.
+data before opening a conversation. Both default to `Error::NotSupported`. Codex implements
+harness-level listing through a short-lived initialized app-server connection. ACP does the same
+when the peer advertises `session/list`. These picker connections never create a conversation,
+filter results to the authorised workspace, preserve vendor cursors, and close after the request.
+Claude does not expose listing on its documented headless interface.
+
+Harness-level account usage remains unsupported. The capability flags describe the corresponding
+session methods, so callers must still handle a harness-level refusal when a session capability is
+advertised. Neither service reads a credential.
 
 ## Protected types, justified individually
 

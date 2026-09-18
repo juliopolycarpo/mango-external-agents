@@ -267,8 +267,9 @@ pub struct DiscoveryReceipt {
     /// An opaque fingerprint of account and managed-policy facts observed by the probe.
     ///
     /// A host computes this from every authentication or policy fact that narrowed discovery's
-    /// permission matrix. Reuse requires a new matching measurement, so a receipt cannot widen a
-    /// permission after an account or administrator policy changed.
+    /// permission matrix. The host must remeasure immediately before each opening and invalidate
+    /// this receipt when an account or administrator policy changes. Binding compares the supplied
+    /// evidence; the library cannot detect external changes after that comparison.
     pub authorization_fingerprint: Option<String>,
     /// When the probe ran.
     pub observed_at: SystemTime,
@@ -422,7 +423,10 @@ impl DiscoveryReceipt {
     /// selected effective transport, the host-authorised workspace and every request field that
     /// can change the opening. It also requires current executable, child-environment and
     /// authorization measurements to match the probe's recorded fingerprints. The receipt can
-    /// then travel on exactly that [`OpenSession`](crate::OpenSession).
+    /// then travel on exactly that [`OpenSession`](crate::OpenSession). Bind immediately before
+    /// each opening, including when reusing a cloned receipt. If measured state changes between
+    /// binding and opening, discard the binding and measure again. Opening checks the request and
+    /// age but does not remeasure external account, executable or policy state.
     ///
     /// The environment measurement covers the output of
     /// [`HostContext::child_environment`](crate::HostContext::child_environment), including this
