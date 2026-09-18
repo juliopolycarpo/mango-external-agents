@@ -32,6 +32,16 @@ let host = HostContext::builder()
 
    Hosts without a spawner of their own take `TokioLauncher` from the `launcher-tokio` feature.
 
+   **Implement `ProcessControl::interrupt` if you want cancellation to be recoverable.** It has a
+   default body returning `InterruptOutcome::Unsupported`, and `TokioLauncher` returns the same off
+   Unix, so a launcher that does not override it makes every `Session::cancel` a forced
+   termination. The Claude harness records a forced termination as nonresumable — the vendor
+   documents that resuming would continue the turn the kill left unfinished, so the harness refuses
+   instead — and from then on `start_turn` returns `Error::Cancelled` for the life of that session.
+   With a graceful interrupt the same cancel reports `StopOutcome::Interrupted` and the session
+   keeps its native continuation. On Unix this is `SIGINT` to the child's process group; on Windows
+   it is a console-specific port the host owns, which is why the library does not guess one.
+
 2. **An authorised working directory.** `HostContext::cwd` is a directory the host already
    authorised. The library never widens it and never chooses one.
 
