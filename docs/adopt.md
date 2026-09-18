@@ -167,6 +167,9 @@ The `testing` feature ships fakes that spawn nothing:
   reached a vendor child.
 - `FakeHarness` emits the shape a real harness emits, including an approval that waits for an
   answer, so a host's event mapping can be written before any vendor CLI exists.
+- `Announcer` makes a `FakeProcess` speak without being written to first, which is what a peer that
+  announces on its own initiative does — and the only way to reach what a session does about traffic
+  that arrives while it is waiting.
 - `ScriptedLink` drives a protocol client with no process behind it.
 - `RecordingBroker` and `FrozenClock` turn a policy decision and an event's timestamp into values
   a test can assert on.
