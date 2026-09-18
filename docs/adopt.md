@@ -156,6 +156,15 @@ Read the result through `Session::snapshot().configuration`, which keeps three r
 command-line flag is not a vendor-observed model — and an absent value on any of them means
 unknown, never read-only.
 
+An activity carries **content** as well as a title. `ActivityStarted`, `ActivityUpdated` and
+`ActivityCompleted` all carry an `ActivityContent`, so a plan arrives as steps with their own state,
+a diff as files with their own counts, and a tool's output as its own thing — a revision updates the
+steps rather than replacing a sentence, and a result keeps the files it touched. Render from those
+rather than from `detail`, which is one bounded line for a list view. What a vendor sent that has no
+field of its own is in `extensions`: a flat, scalar-only, capped, redacted map, observational in
+every case. Nothing read from it is executed. `docs/vendor-fields.md` lists, per vendor, which
+fields reach these types and which do not, with the reason and the test for each.
+
 A vendor that stops to ask a **question** rather than for an approval sends
 `EventKind::QuestionAsked`, answered through `Session::answer`. It grants nothing: no
 `PermissionBroker` is consulted about one, and `InteractionKind::grants_authority` is the field a
@@ -276,8 +285,9 @@ must not register the vendor's tools as application tools.
 Keep this mapping in the runtime adapter. The library does not depend on mangostudio's protocol
 or database types. Persist native session ids only for vendor resume; never feed the vendor's
 assistant output back into the host model's context as instructions. The `mea` host provides an
-executable example of `TokioLauncher`, terminal approval decisions and event consumption without
-the runtime's browser or database dependencies.
+executable example of `TokioLauncher`, terminal approval decisions, terminal question answers and
+event consumption without the runtime's browser or database dependencies. Its question path is the
+one worth copying: it reads `QuestionForm`, numbers the choices, and never touches the broker.
 
 On Windows, `TokioLauncher` also resolves installed `.ps1` entrypoints when native executable
 resolution fails. It searches only the supplied `PATH`, runs Windows PowerShell from the supplied
