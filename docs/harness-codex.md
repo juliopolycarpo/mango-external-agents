@@ -116,8 +116,11 @@ bounded cleanup path. Closing twice is harmless.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.
-Native activity restarts the host's `Limits::idle_timeout`; an outstanding approval pauses that
-clock because its `approval_timeout` is the deadline that governs Codex's blocked wait. Idle expiry
+Native activity restarts the host's `Limits::idle_timeout`, but only this turn's own: the connection
+also carries a subagent's thread, a detached review's, later frames for a turn already over, and
+account-level `rateLimits` updates that name no conversation at all, and none of those extend the
+deadline. An outstanding approval pauses that clock because its `approval_timeout` is the deadline
+that governs Codex's blocked wait. Idle expiry
 uses the same `turn/interrupt` and bounded process-reaping path as a dropped stream.
 The transcript has host-configured event, byte, and pending-request limits. Overflow commits a
 reserved `stream-overflow` terminal and drives shutdown instead of growing memory, silently losing
