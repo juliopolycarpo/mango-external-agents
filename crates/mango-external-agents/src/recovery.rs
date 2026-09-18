@@ -45,7 +45,7 @@ impl RequestFingerprint {
         // of file, for no extra distinguishing power — and reaching it at all would mean deriving
         // `Serialize` on the public `Attachment`, handing a host's ids, names and file contents to
         // any serialiser. That is precisely what its redacting `Debug` refuses to do.
-        writer.frame(&request.attachments.len().to_le_bytes());
+        writer.frame(&(request.attachments.len() as u64).to_le_bytes());
         for attachment in &request.attachments {
             writer.frame(attachment.id.as_bytes());
             writer.frame(attachment.name.as_bytes());
@@ -66,7 +66,7 @@ impl DigestWriter {
     /// Feeds one field, prefixed by its length, so a value cannot be split or joined differently
     /// by another arrangement of the same bytes.
     fn frame(&mut self, bytes: &[u8]) {
-        self.0.update(&bytes.len().to_le_bytes());
+        self.0.update(&(bytes.len() as u64).to_le_bytes());
         self.0.update(bytes);
     }
 }
