@@ -6,7 +6,7 @@
 //! tests cannot reach — that a turn ends exactly once, that an approval round trip lands, that a
 //! cancel carries its reason, and that closing twice is not an error.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -261,6 +261,66 @@ impl OpeningCatalogInterleavingAgent {
             }
             _ => vec![InterleavingConfigAgent::result(id, serde_json::json!({}))],
         }
+    }
+}
+
+/// A named ACP peer that holds a set-option response until close has claimed the session.
+#[derive(Clone)]
+struct HeldSetOptionAgent {
+    entered: Arc<AtomicBool>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl HeldSetOptionAgent {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            release: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    fn process(self) -> FakeProcess {
+        FakeProcess::responding(move |line| self.answer(line))
+    }
+
+    fn answer(&self, line: &str) -> Vec<String> {
+        let message: serde_json::Value =
+            serde_json::from_str(line).expect("expected harness JSON-RPC request");
+        let id = message["id"].clone();
+        let response = match message["method"].as_str() {
+            Some("initialize") => serde_json::json!({
+                "protocolVersion": 1,
+                "agentInfo": { "name": "held-option-fake", "version": "1" },
+                "agentCapabilities": {
+                    "promptCapabilities": { "image": true, "embeddedContext": true },
+                    "sessionCapabilities": {},
+                },
+                "authMethods": [],
+            }),
+            Some("session/new") => serde_json::json!({
+                "sessionId": "held-option-session",
+                "configOptions": [InterleavingConfigAgent::model_option("small")],
+            }),
+            Some("session/set_config_option") => {
+                self.entered.store(true, Ordering::Release);
+                let (lock, ready) = &*self.release;
+                let mut released = lock.lock().expect("expected set-option release gate");
+                while !*released {
+                    released = ready.wait(released).expect("expected release notification");
+                }
+                serde_json::json!({
+                    "configOptions": [InterleavingConfigAgent::model_option("large")],
+                })
+            }
+            _ => serde_json::json!({}),
+        };
+        vec![InterleavingConfigAgent::result(id, response)]
+    }
+
+    fn release(&self) {
+        let (lock, ready) = &*self.release;
+        *lock.lock().expect("expected set-option release gate") = true;
+        ready.notify_all();
     }
 }
 
@@ -3141,6 +3201,100 @@ async fn opening_a_loaded_session_keeps_a_newer_catalog_notification() {
         .close(CloseReason::Requested)
         .await
         .expect("expected cleanup");
+}
+
+/// A configuration request begun after close is refused before ACP receives an option change.
+#[tokio::test]
+async fn a_configuration_request_after_close_is_not_submitted() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_config_options(vec![InterleavingConfigAgent::model_option("small")])
+            .process(),
+    );
+    let session = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("closed-config"))
+        .await
+        .expect("expected the fake session to open");
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+    let writes_before = launcher.written();
+    let error = session
+        .configure(ConfigurationPatch::new().model(ConfigurationChange::Set(String::from("large"))))
+        .await
+        .expect_err("expected the closed session to refuse configuration");
+    assert!(matches!(error, Error::Closed { subject: "session" }));
+    assert_eq!(
+        launcher.written(),
+        writes_before,
+        "expected no set-config-option request after close"
+    );
+}
+
+/// A response released after close claims the session cannot publish a new accepted setting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn closing_during_a_held_config_response_refuses_the_late_acceptance() {
+    let agent = HeldSetOptionAgent::new();
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.clone().process());
+    let opened = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("held-config"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+    let accepted_before = session.snapshot().configuration.accepted.clone();
+    let configuring = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .configure(
+                    ConfigurationPatch::new()
+                        .model(ConfigurationChange::Set(String::from("large"))),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !agent.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the agent to hold a set-option response");
+    let closing = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move { session.close(CloseReason::Requested).await }
+    });
+    let claimed = tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(
+            session.snapshot().status,
+            SessionStatus::Closing | SessionStatus::Closed
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    agent.release();
+    claimed.expect("expected close to claim the session without waiting for configuration");
+    let error = configuring
+        .await
+        .expect("expected the configuration task")
+        .expect_err("expected close to refuse the late configuration acceptance");
+    assert!(
+        matches!(error.cause(), Error::Closed { subject: "session" }),
+        "expected a typed close refusal, received {error:?}"
+    );
+    closing
+        .await
+        .expect("expected close task")
+        .expect("expected close");
+    assert_eq!(
+        session.snapshot().configuration.accepted,
+        accepted_before,
+        "expected no accepted setting to publish after close claimed the session"
+    );
 }
 
 /// Accepted ACP defaults survive a later prompt whose request leaves configuration at `keep`.

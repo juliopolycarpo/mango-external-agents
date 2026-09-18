@@ -167,9 +167,23 @@ impl AcpSession {
     ///
     /// Whatever the agent answered.
     pub(crate) async fn set_mode(&self, mode_id: &str) -> Result<()> {
-        self.request(
+        let Some(lifecycle) = self.lifecycle.begin_start() else {
+            return Err(Error::Closed { subject: "session" });
+        };
+        let sent = self
+            .connection
+            .connection()
+            .send_request(SetSessionModeRequest::new(
+                self.native_session_id.clone(),
+                String::from(mode_id),
+            ));
+        drop(lifecycle);
+        client::await_sent(
+            &self.connection,
+            &self.profile,
+            self.host.limits().request_timeout,
             "session/set_mode",
-            SetSessionModeRequest::new(self.native_session_id.clone(), String::from(mode_id)),
+            sent,
         )
         .await
         .map(|_| ())
@@ -184,6 +198,9 @@ impl AcpSession {
         patch: ConfigurationPatch,
     ) -> Result<ConfigurationOutcome> {
         let _configuration = self.configuration_gate.lock().await;
+        if self.lifecycle.is_closed() {
+            return Err(Error::Closed { subject: "session" });
+        }
         if self.connection_state.turn().is_some() {
             return Err(Error::Protocol {
                 expected: String::from(
@@ -374,7 +391,7 @@ impl AcpSession {
         }
 
         let state =
-            self.publish_catalog_configuration(&requested, &accepted, catalog, catalog_revision);
+            self.publish_catalog_configuration(&requested, &accepted, catalog, catalog_revision)?;
         let outcome = ConfigurationOutcome::applied(state, applied);
         if rejected.is_empty() {
             Ok(outcome)
@@ -404,17 +421,29 @@ impl AcpSession {
                 });
             }
         };
-        let response_revision = self.connection_state.catalog_snapshot().1;
-        let response = self
-            .request(
-                "session/set_config_option",
-                SetSessionConfigOptionRequest::new(
-                    self.native_session_id.clone(),
-                    String::from(id.as_str()),
-                    value,
-                ),
-            )
-            .await?;
+        let Some(lifecycle) = self.lifecycle.begin_start() else {
+            return Err(Error::Closed { subject: "session" });
+        };
+        let (response_revision, sent) = self.connection_state.with_catalog_revision(|revision| {
+            let sent =
+                self.connection
+                    .connection()
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        self.native_session_id.clone(),
+                        String::from(id.as_str()),
+                        value,
+                    ));
+            (revision, sent)
+        });
+        drop(lifecycle);
+        let response = client::await_sent(
+            &self.connection,
+            &self.profile,
+            self.host.limits().request_timeout,
+            "session/set_config_option",
+            sent,
+        )
+        .await?;
         let catalog = catalog_from_options(&response.config_options);
         let (current_catalog, current_revision) = self.connection_state.catalog_snapshot();
         if current_revision != response_revision {
@@ -436,14 +465,17 @@ impl AcpSession {
         accepted: &Configuration,
         catalog: ConfigurationCatalog,
         catalog_revision: u64,
-    ) -> ConfigurationState {
+    ) -> Result<ConfigurationState> {
+        let Some(_lifecycle) = self.lifecycle.begin_start() else {
+            return Err(Error::Closed { subject: "session" });
+        };
         self.connection_state.accept_configuration(accepted.clone());
-        self.connection_state.publish_response_configuration(
+        Ok(self.connection_state.publish_response_configuration(
             catalog_revision,
             catalog,
             requested.clone(),
             accepted.clone(),
-        )
+        ))
     }
 
     /// Publishes every setting confirmed before a vendor explicitly refuses a later option.
@@ -458,7 +490,7 @@ impl AcpSession {
             &progress.accepted,
             progress.catalog,
             progress.catalog_revision,
-        );
+        )?;
         if !matches!(error.cause(), Error::Vendor(_)) {
             return Err(error);
         }
