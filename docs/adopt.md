@@ -107,7 +107,8 @@ already logged into with the vendor's own CLI.
   without creating a conversation. Harness-level account usage remains unsupported.
   Codex and ACP require an absolute, lexically normalized UTF-8 workspace. The host can call
   `HostContext::absolute_cwd` to check it before a request; the library never resolves a relative
-  workspace through its own process directory or filesystem.
+  workspace through its own process directory or filesystem. A single trailing directory separator
+  is omitted from the returned identity; absolute roots remain intact.
 - `Harness::open_session` → a `Box<dyn Session>`. A host that has just probed can bind that result
   to one `OpenSession` after it remeasures the executable, allowlisted child environment and every
   account or managed-policy fact that narrowed discovery. `bind_to_open` records the full harness

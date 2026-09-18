@@ -1615,7 +1615,10 @@ async fn harness_listing_is_workspace_bound_before_any_conversation_opens() {
     assert_eq!(page.sessions.len(), 1);
     assert_eq!(
         page.sessions[0].workspace_path.as_deref(),
-        host.cwd().to_str()
+        Some(
+            host.absolute_cwd()
+                .expect("expected a normalized workspace")
+        )
     );
     assert!(
         page.sessions[0].updated_at.is_some(),
@@ -1637,7 +1640,11 @@ async fn harness_listing_is_workspace_bound_before_any_conversation_opens() {
         .find(|line| line.contains("\"session/list\""))
         .map(|line| serde_json::from_str(line).expect("expected JSON-RPC"))
         .expect("expected session/list request");
-    assert_eq!(list["params"]["cwd"], host.cwd().display().to_string());
+    assert_eq!(
+        list["params"]["cwd"],
+        host.absolute_cwd()
+            .expect("expected a normalized workspace")
+    );
 }
 
 /// A caller cannot use an ACP picker to query a directory the host did not authorize.

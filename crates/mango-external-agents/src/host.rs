@@ -282,7 +282,8 @@ impl HostContext {
     ///
     /// Use this for vendor protocols that return absolute workspace identities. Validation never
     /// resolves a relative path, follows symlinks or reads the filesystem. The host supplies the
-    /// exact path the vendor should retain.
+    /// exact path the vendor should retain. One trailing directory separator is removed from
+    /// non-root paths, including the temporary-directory paths supplied by macOS and Windows.
     ///
     /// # Errors
     ///
@@ -309,13 +310,21 @@ impl HostContext {
                 received: String::from("a relative workspace path"),
             });
         }
-        let components = self.cwd.components();
-        if components.clone().any(|component| {
+        let mut components = self.cwd.components();
+        let normalized = components.clone().collect::<PathBuf>();
+        let text = if self.cwd.file_name().is_some() {
+            text.strip_suffix(std::path::MAIN_SEPARATOR)
+                .filter(|trimmed| std::ffi::OsStr::new(trimmed) == normalized.as_os_str())
+                .unwrap_or(text)
+        } else {
+            text
+        };
+        if components.any(|component| {
             matches!(
                 component,
                 std::path::Component::CurDir | std::path::Component::ParentDir
             )
-        }) || components.collect::<PathBuf>().as_os_str() != self.cwd.as_os_str()
+        }) || normalized.as_os_str() != std::ffi::OsStr::new(text)
         {
             return Err(Error::HostConfiguration {
                 expected: EXPECTED,
@@ -635,6 +644,31 @@ mod tests {
     }
 
     #[test]
+    fn absolute_cwd_normalizes_a_directory_separator_and_preserves_roots() {
+        let absolute = std::env::temp_dir().join("workspace");
+        let mut host = context();
+        host.cwd = std::path::PathBuf::from(format!(
+            "{}{}",
+            absolute.display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(
+            host.absolute_cwd()
+                .expect("expected a directory with a trailing separator"),
+            absolute.to_str().expect("expected a UTF-8 workspace")
+        );
+        host.cwd = absolute
+            .ancestors()
+            .last()
+            .expect("expected an absolute root")
+            .to_path_buf();
+        assert_eq!(
+            host.absolute_cwd().expect("expected an absolute root"),
+            host.cwd.to_str().expect("expected a UTF-8 root")
+        );
+    }
+
+    #[test]
     fn absolute_cwd_refuses_relative_and_ambiguous_paths_without_naming_them() {
         let absolute = std::env::temp_dir().join("workspace-secret-canary");
         let paths = [
@@ -652,8 +686,9 @@ mod tests {
                 std::path::MAIN_SEPARATOR
             )),
             std::path::PathBuf::from(format!(
-                "{}{}",
+                "{}{}{}",
                 absolute.display(),
+                std::path::MAIN_SEPARATOR,
                 std::path::MAIN_SEPARATOR
             )),
         ];
