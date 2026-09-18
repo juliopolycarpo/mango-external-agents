@@ -131,11 +131,23 @@ pub enum ThreadItem {
     Plan {
         /// The item's own id.
         id: String,
-        /// The plan.
+        /// The plan, as the vendor's own freeform prose.
+        ///
+        /// At the pinned schema version there is no step array here, only this one string — a
+        /// reader expecting `PlanStep`-shaped structure will not find it on this item. Splitting
+        /// `text` on newlines or numbering to invent steps would be this harness reading a
+        /// structure into vendor prose that the app-server never sent.
         #[serde(default)]
         text: String,
     },
     /// A subagent the vendor started.
+    ///
+    /// The pinned schema's `ThreadItem` property union also lists `agentThreadId`,
+    /// `senderThreadId` and `receiverThreadIds` — but that union is flattened across every item
+    /// family (`collabAgentToolCall` among them), not broken out per variant, so it cannot say
+    /// which family actually carries them. Nothing here claims one for `SubAgentActivity` without
+    /// that confirmation; a thread id invented on the wrong family would be worse than the field
+    /// staying absent.
     SubAgentActivity {
         /// The item's own id.
         id: String,
