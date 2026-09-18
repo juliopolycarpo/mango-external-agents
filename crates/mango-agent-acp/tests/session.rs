@@ -1016,7 +1016,7 @@ async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() 
         .await
         .expect("expected a turn");
 
-    // The channel holds one event and nobody has read it, so `close`'s terminal cannot be sent yet.
+    // The transcript budget is full. Its reserved terminal must still be observable after close.
     session
         .close(CloseReason::Shutdown)
         .await
@@ -1033,13 +1033,10 @@ async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() 
         "expected exactly one terminal, received {events:?}"
     );
     assert!(
-        events.iter().any(|kind| matches!(
-            kind,
-            EventKind::Cancelled {
-                reason: CancelReason::Shutdown
-            }
-        )),
-        "expected the close's own reason, received {events:?}"
+        events
+            .iter()
+            .any(|kind| matches!(kind, EventKind::Error { .. })),
+        "expected the overflow terminal to survive close, received {events:?}"
     );
 }
 

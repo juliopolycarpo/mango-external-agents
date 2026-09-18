@@ -425,7 +425,8 @@ impl Session for AcpSession {
             // The prompt is already on the wire. Preserve its owned stream rather than returning an
             // error that discards the only place its terminal can be reported, then stop the peer
             // before releasing this generation for another ACP prompt.
-            self.connection.shutdown(CancelReason::Shutdown).await;
+            self.connection.begin_shutdown(CancelReason::Shutdown);
+            self.connection.wait_shutdown().await;
             if let Some((turn, _, _)) = self.connection_state.prepare_terminal_matching(&handle)
                 && turn.finish()
             {
@@ -537,17 +538,18 @@ impl Session for AcpSession {
                 Some(Err(error)) => {
                     if let Some(reason) = cancel_reason {
                         let _ = turn.sink.cancel(reason).await;
-                        return;
-                    }
-                    let message = if agent_client_protocol::is_incoming_transport_closed(&error) {
-                        with_stderr(&error.message, control.as_ref())
                     } else {
-                        error.message.clone()
-                    };
-                    let _ = turn
-                        .sink
-                        .fail(link_failure(format!("{}: {message}", profile.id)))
-                        .await;
+                        let message = if agent_client_protocol::is_incoming_transport_closed(&error)
+                        {
+                            with_stderr(&error.message, control.as_ref())
+                        } else {
+                            error.message.clone()
+                        };
+                        let _ = turn
+                            .sink
+                            .fail(link_failure(format!("{}: {message}", profile.id)))
+                            .await;
+                    }
                 }
             }
             state.release_turn_matching(&handle);
@@ -610,7 +612,8 @@ impl Session for AcpSession {
             lifecycle.close()
         };
         if !claimed {
-            self.connection.shutdown(reason.into()).await;
+            self.connection.begin_shutdown(reason.into());
+            self.connection.wait_shutdown().await;
             self.session_state.set_status(SessionStatus::Closed);
             return Ok(());
         }
@@ -620,6 +623,15 @@ impl Session for AcpSession {
             self.connection_state.begin_cancellation(reason.into());
             self.connection_state.turn()
         };
+        // This owned, bounded guard survives a dropped `close` future. A normal close starts the
+        // same shutdown immediately after the ACP handshake; an abandoned one reaches it after the
+        // host's teardown stage instead of leaving the child alive indefinitely.
+        let deferred_shutdown = Arc::clone(&self.connection);
+        let shutdown_timeout = self.host.limits().shutdown_timeout;
+        tokio::spawn(async move {
+            tokio::time::sleep(shutdown_timeout).await;
+            deferred_shutdown.begin_shutdown(reason.into());
+        });
 
         // Every question the agent is still waiting on is withdrawn first, while the transport is
         // still up: an unanswered one would leave the agent waiting for a client that has gone.
@@ -644,7 +656,8 @@ impl Session for AcpSession {
             self.connection_state.withdraw_pending();
         }
 
-        self.connection.shutdown(reason.into()).await;
+        self.connection.begin_shutdown(reason.into());
+        self.connection.wait_shutdown().await;
 
         if let Some(handle) = ending
             && let Some((turn, _, closing)) =

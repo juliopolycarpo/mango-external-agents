@@ -852,6 +852,8 @@ pub(crate) struct ConnectionHandle {
     /// bound its own wind-down, and the session's lifecycle watcher has to observe the same event
     /// without competing for it.
     driver_done: mango_external_agents::CancelToken,
+    shutdown_started: AtomicBool,
+    shutdown_complete: mango_external_agents::CancelToken,
 }
 
 impl std::fmt::Debug for ConnectionHandle {
@@ -946,10 +948,29 @@ pub(crate) async fn drive(
         driver: Mutex::new(Some(driver)),
         limits: state.limits,
         driver_done,
+        shutdown_started: AtomicBool::new(false),
+        shutdown_complete: mango_external_agents::CancelToken::new(),
     })
 }
 
 impl ConnectionHandle {
+    /// Starts bounded shutdown in an owned task so dropping the initiating session future cannot
+    /// abandon the child. Later callers join the same completion signal.
+    pub(crate) fn begin_shutdown(self: &Arc<Self>, reason: mango_external_agents::CancelReason) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let connection = Arc::clone(self);
+        tokio::spawn(async move {
+            connection.shutdown(reason).await;
+            connection.shutdown_complete.cancel();
+        });
+    }
+
+    /// Waits for the shutdown task started by [`Self::begin_shutdown`].
+    pub(crate) async fn wait_shutdown(&self) {
+        self.shutdown_complete.cancelled().await;
+    }
     /// The connection, for a request a session method sends.
     ///
     /// Calls from a session method run outside the dispatch loop, which is the condition
