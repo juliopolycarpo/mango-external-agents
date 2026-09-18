@@ -67,7 +67,9 @@ would end the host's turn twice.
 **Conversation events and approvals retain thread and native-turn ownership.** Delayed events
 cannot finish a replacement turn. Reviews explicitly account for the early `turn/started` id
 differing from the review response. Child-thread events remain excluded until the shared API
-can represent parent-child activity and approval ownership.
+can represent parent-child activity and approval ownership. A terminal or an explicitly refused
+`turn/start` clears every owner-bound marker before it releases admission, so a cancellation reaper
+or a delayed request id cannot affect a replacement turn.
 
 ## Sessions, turns and steering
 
@@ -211,8 +213,10 @@ not run yet. Publication is bounded and nonblocking, so an approval audit cannot
 app-server reply or restart its deadline. On expiry, on a cancel and on a close, every waiting
 question is answered `decline` — never `cancel`, which would stop a turn a deadline has no business
 stopping. `serverRequest/resolved` releases a question the server stopped waiting on, so the task
-composing a reply does not outlive the question. This is client-side timing only: it adds no
-app-server method or wire field beyond the existing [documented surface][readme].
+composing a reply does not outlive the question. The same notification after this client replied
+confirms that answer and consumes its bounded acknowledgement; it cannot become an early marker
+that spends capacity for a later approval. This is client-side timing only: it adds no app-server
+method or wire field beyond the existing [documented surface][readme].
 
 Every other server-initiated request is refused with a JSON-RPC error rather than left hanging:
 

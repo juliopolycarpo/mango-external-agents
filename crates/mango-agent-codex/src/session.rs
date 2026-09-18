@@ -183,16 +183,12 @@ pub(crate) struct Shared {
     teardown_complete: AtomicBool,
     teardown_failed: AtomicBool,
     teardown_done: Notify,
-    /// Questions the server stopped waiting on before this side had registered them.
-    ///
-    /// A `serverRequest/resolved` is read off the same pipe as the request it resolves, and the
-    /// task composing the answer runs beside the pump rather than inside it — so the release can
-    /// win the race against the registration. Without this the waiter it was meant to free would
-    /// sit out the whole approval deadline before answering a question nobody is asking.
-    ///
-    /// Emptied with the questions themselves, because that is their lifetime: a turn that ends
-    /// settles everything it was waiting on.
-    resolved_early: Mutex<HashMap<String, Arc<()>>>,
+    /// Request-id state for messages whose request task and resolution notification race on the
+    /// same connection. Both classifications share one lock so a normal confirmation cannot be
+    /// recorded as an early resolution while its answer is being remembered.
+    resolution_markers: Mutex<ResolutionMarkers>,
+    #[cfg(test)]
+    resolution_marker_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
 }
 
 impl Shared {
@@ -216,7 +212,9 @@ impl Shared {
             teardown_complete: AtomicBool::new(false),
             teardown_failed: AtomicBool::new(false),
             teardown_done: Notify::new(),
-            resolved_early: Mutex::new(HashMap::new()),
+            resolution_markers: Mutex::new(ResolutionMarkers::default()),
+            #[cfg(test)]
+            resolution_marker_gate: Mutex::new(None),
         }
     }
 
@@ -317,6 +315,21 @@ impl Shared {
             }
             changed.await;
         }
+    }
+
+    /// Seals the session only if this owner still holds admission at the point an abandoned-turn
+    /// reaper must escalate. The turn lock also guards `begin`, so a replacement cannot enter the
+    /// gap between this check and the shutdown request.
+    async fn seal_owner_for_shutdown(&self, owner: &Arc<()>) -> bool {
+        let turn = self.turn.lock().await;
+        if !turn
+            .as_ref()
+            .is_some_and(|active| !active.finishing && Arc::ptr_eq(&active.owner, owner))
+        {
+            return false;
+        }
+        self.stop_new_work();
+        true
     }
 
     /// Asks Codex to stop one owned turn without ever naming a replacement turn.
@@ -542,6 +555,64 @@ struct PendingEntry {
     answer: oneshot::Sender<Answer>,
 }
 
+/// An approval answer awaiting the app-server notification that confirms the request ended.
+struct AnsweredResolution {
+    request_key: String,
+    owner: Arc<()>,
+}
+
+/// Resolution state owned by the active native turn.
+#[derive(Default)]
+struct ResolutionMarkers {
+    /// Questions the server stopped waiting on before this side registered them.
+    early: HashMap<String, Arc<()>>,
+    /// Answers this side returned while their matching confirmation is still in flight.
+    answered: VecDeque<AnsweredResolution>,
+}
+
+#[cfg(test)]
+/// A test-only barrier that holds one reply-marker transition while a confirmation queues behind it.
+struct ResolutionMarkerGate {
+    entered: AtomicBool,
+    entered_notice: Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl ResolutionMarkerGate {
+    fn closed() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            entered_notice: Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    async fn wait_until_entered(&self) {
+        loop {
+            let notice = self.entered_notice.notified();
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            notice.await;
+        }
+    }
+
+    async fn wait_for_release(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notice.notify_waiters();
+        self.release
+            .acquire()
+            .await
+            .expect("the test gate must stay open")
+            .forget();
+    }
+
+    fn open(&self) {
+        self.release.add_permits(1);
+    }
+}
+
 /// How a waiting question was settled.
 enum Answer {
     /// Somebody chose.
@@ -652,21 +723,39 @@ impl Shared {
 
     /// Releases admission only after the terminal claimed above is visible to the host.
     async fn release_terminal(&self, owner: &Arc<()>) {
+        self.release_owned_turn(owner, true).await;
+    }
+
+    /// Releases a start that the app-server explicitly refused before it became a native turn.
+    async fn release_refused_start(&self, owner: &Arc<()>) {
+        self.release_owned_turn(owner, false).await;
+    }
+
+    /// Removes one owned admission slot, wakes every waiter on that owner and drops every
+    /// request-id marker tied to it. Terminal commitment and explicit start refusal are the only
+    /// two paths that may free admission without tearing down the whole session.
+    async fn release_owned_turn(&self, owner: &Arc<()>, terminal_committed: bool) {
         let watchers = {
             let mut turn = self.turn.lock().await;
-            if turn
-                .as_ref()
-                .is_some_and(|active| active.finishing && Arc::ptr_eq(&active.owner, owner))
-            {
-                turn.take().map(|mut active| {
-                    (
-                        active.abandonment_watcher.take(),
-                        active.idle_watcher.take(),
-                    )
-                })
-            } else {
-                None
+            let owns_expected_state = turn.as_ref().is_some_and(|active| {
+                Arc::ptr_eq(&active.owner, owner) && active.finishing == terminal_committed
+            });
+            if !owns_expected_state {
+                return;
             }
+            let mut markers = self.resolution_markers.lock().await;
+            markers
+                .early
+                .retain(|_, marker_owner| !Arc::ptr_eq(marker_owner, owner));
+            markers
+                .answered
+                .retain(|marker| !Arc::ptr_eq(&marker.owner, owner));
+            turn.take().map(|mut active| {
+                (
+                    active.abandonment_watcher.take(),
+                    active.idle_watcher.take(),
+                )
+            })
         };
         self.turn_finished.notify_waiters();
         if let Some((abandonment, idle)) = watchers {
@@ -843,6 +932,57 @@ impl Shared {
         }
         for (route, event) in audits {
             let _ = self.emit_for(&route, event).await;
+        }
+    }
+
+    /// Remembers an answer only until Codex confirms the server request ended.
+    ///
+    /// The confirmation can race the answer task between its pending-map removal and this call.
+    /// In that case it already left an early marker, which this consumes instead of retaining a
+    /// second marker. The acknowledgement ledger is bounded even if a future server omits the
+    /// confirmation, so a long-running turn cannot retain an unbounded history of answers.
+    async fn remember_answered_resolution(&self, request_key: &str, owner: &Arc<()>) {
+        let turn = self.turn.lock().await;
+        if !turn
+            .as_ref()
+            .is_some_and(|active| !active.finishing && Arc::ptr_eq(&active.owner, owner))
+        {
+            return;
+        }
+        let mut markers = self.resolution_markers.lock().await;
+        #[cfg(test)]
+        self.wait_for_resolution_marker_gate().await;
+        if markers
+            .early
+            .remove(request_key)
+            .is_some_and(|early_owner| Arc::ptr_eq(&early_owner, owner))
+        {
+            return;
+        }
+        markers.answered.retain(|marker| {
+            marker.request_key != request_key || !Arc::ptr_eq(&marker.owner, owner)
+        });
+        let capacity = self.resolution_marker_capacity();
+        while markers.answered.len() >= capacity {
+            markers.answered.pop_front();
+        }
+        markers.answered.push_back(AnsweredResolution {
+            request_key: request_key.to_owned(),
+            owner: Arc::clone(owner),
+        });
+    }
+
+    /// The answer ledger must remain bounded independently of active server requests.
+    fn resolution_marker_capacity(&self) -> usize {
+        self.host.limits().max_pending_requests.max(1)
+    }
+
+    #[cfg(test)]
+    /// Holds a reply-marker transition only when a focused race test installed a gate.
+    async fn wait_for_resolution_marker_gate(&self) {
+        let gate = self.resolution_marker_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.wait_for_release().await;
         }
     }
 
@@ -1116,11 +1256,16 @@ impl PeerHandler for CodexHandler {
             });
         };
 
-        match self.decide(pending, &id, route, now).await {
-            Some(decision) => ServerRequestOutcome::Answer(
-                serde_json::to_value(ApprovalResponse { decision })
-                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
-            ),
+        match self.decide(pending, &id, route.clone(), now).await {
+            Some(decision) => {
+                self.shared
+                    .remember_answered_resolution(&id.key(), &route.owner)
+                    .await;
+                ServerRequestOutcome::Answer(
+                    serde_json::to_value(ApprovalResponse { decision })
+                        .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+                )
+            }
             // The server already stopped waiting, so the frame is discarded on its side. Something
             // has to be returned, and a refusal is the answer that grants nothing.
             None => ServerRequestOutcome::Answer(Value::Object(serde_json::Map::new())),
@@ -1213,22 +1358,25 @@ impl CodexHandler {
 
         // And the server may already have stopped waiting, in a race this side cannot see from
         // the outside: the release is read off the same pipe and runs beside this task.
-        if let Some(early_route) = self.shared.resolved_early.lock().await.remove(&id.key()) {
-            if Arc::ptr_eq(&early_route, &route.owner) {
-                let mut pending_entries = self.shared.pending.lock().await;
-                if pending_entries
-                    .get(&request_id)
-                    .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
-                {
-                    pending_entries.remove(&request_id);
-                }
-                return None;
+        let request_key = id.key();
+        let early_route = self
+            .shared
+            .resolution_markers
+            .lock()
+            .await
+            .early
+            .remove(&request_key);
+        if let Some(early_route) = early_route
+            && Arc::ptr_eq(&early_route, &route.owner)
+        {
+            let mut pending_entries = self.shared.pending.lock().await;
+            if pending_entries
+                .get(&request_id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
+            {
+                pending_entries.remove(&request_id);
             }
-            self.shared
-                .resolved_early
-                .lock()
-                .await
-                .insert(id.key(), early_route);
+            return None;
         }
 
         // `serverRequest/resolved` can land between consuming an early marker and this point. It
@@ -1476,37 +1624,51 @@ impl CodexHandler {
 
     /// Releases the question the server says it is no longer waiting on.
     async fn release_resolved(&self, request_key: &str, route: &ActiveTurnRoute) -> bool {
-        let mut pending = self.shared.pending.lock().await;
-        let Some(id) = pending
-            .iter()
-            .find(|(_, entry)| {
-                entry.request_key == request_key && Arc::ptr_eq(&entry.route.owner, &route.owner)
-            })
-            .map(|(id, _)| id.clone())
-        else {
-            // Nothing registered under it yet. Either this is somebody else's question, or the
-            // task that will register it has not reached the map — and it checks here for exactly
-            // this, rather than waiting out a deadline on a question already withdrawn.
-            drop(pending);
-            let mut early = self.shared.resolved_early.lock().await;
-            if let Some(existing_route) = early.get(request_key) {
-                return Arc::ptr_eq(existing_route, &route.owner);
-            }
-            if early.len() >= self.shared.host.limits().max_pending_requests {
-                return false;
-            }
-            early.insert(request_key.to_owned(), Arc::clone(&route.owner));
-            return true;
+        let entry = {
+            let mut pending = self.shared.pending.lock().await;
+            let id = pending
+                .iter()
+                .find(|(_, entry)| {
+                    entry.request_key == request_key
+                        && Arc::ptr_eq(&entry.route.owner, &route.owner)
+                })
+                .map(|(id, _)| id.clone());
+            id.and_then(|id| pending.remove(&id))
         };
-        if pending
-            .get(&id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
-            && let Some(entry) = pending.remove(&id)
-        {
+        if let Some(entry) = entry {
             let _ = entry.answer.send(Answer::ResolvedByTheServer);
-            drop(pending);
             self.shared.signal_idle_change();
+            return true;
         }
+
+        // Nothing registered or answered under it yet. Either this is somebody else's question,
+        // or the task that will register it has not reached the map — and it checks the marker
+        // after registration rather than waiting out a deadline on a question already withdrawn.
+        // Keeping the turn lock while classifying the marker means terminal cleanup cannot clear
+        // this owner and a late notification cannot recreate its marker afterwards.
+        let turn = self.shared.turn.lock().await;
+        if !turn
+            .as_ref()
+            .is_some_and(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
+        {
+            return true;
+        }
+        let mut markers = self.shared.resolution_markers.lock().await;
+        if let Some(position) = markers.answered.iter().position(|marker| {
+            marker.request_key == request_key && Arc::ptr_eq(&marker.owner, &route.owner)
+        }) {
+            let _ = markers.answered.remove(position);
+            return true;
+        }
+        if let Some(existing_owner) = markers.early.get(request_key) {
+            return Arc::ptr_eq(existing_owner, &route.owner);
+        }
+        if markers.early.len() >= self.shared.resolution_marker_capacity() {
+            return false;
+        }
+        markers
+            .early
+            .insert(request_key.to_owned(), Arc::clone(&route.owner));
         true
     }
 }
@@ -1621,13 +1783,19 @@ impl CodexSession {
         match interrupted {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
-                Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
-                let _ = Self::wait_for_shutdown(&shared).await;
-                return Err(error);
+                if shared.seal_owner_for_shutdown(&owner).await {
+                    Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
+                    let _ = Self::wait_for_shutdown(&shared).await;
+                    return Err(error);
+                }
+                return Ok(());
             }
             Err(_) => {
-                Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
-                return Self::wait_for_shutdown(&shared).await;
+                if shared.seal_owner_for_shutdown(&owner).await {
+                    Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
+                    return Self::wait_for_shutdown(&shared).await;
+                }
+                return Ok(());
             }
         }
         if tokio::time::timeout(limits.shutdown_timeout, shared.wait_for_turn_end(&owner))
@@ -1636,8 +1804,11 @@ impl CodexSession {
         {
             return Ok(());
         }
-        Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
-        Self::wait_for_shutdown(&shared).await
+        if shared.seal_owner_for_shutdown(&owner).await {
+            Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
+            return Self::wait_for_shutdown(&shared).await;
+        }
+        Ok(())
     }
 
     /// Closes the connection and reaps its child after native cancellation did not settle it.
@@ -1967,16 +2138,11 @@ impl CodexSession {
                     ));
                 }
                 // The turn never started, so the stream it would have written to is closed here
-                // rather than left for a `turn/completed` that will never come. Nothing to
-                // interrupt either. The slot may already belong to a later start if the server
-                // announced this turn's completion before returning this error.
-                let mut turn = self.shared.turn.lock().await;
-                if turn
-                    .as_ref()
-                    .is_some_and(|active| Arc::ptr_eq(&active.owner, &owner))
-                {
-                    turn.take();
-                }
+                // rather than left for a `turn/completed` that will never come. Nothing can be
+                // interrupted either. Releasing through the shared owner path wakes a
+                // cancellation reaper that was already waiting for this admission slot.
+                self.shared.release_refused_start(&owner).await;
+                start_guard.disarm();
                 return Err(error.with_dispatch(Dispatch::Accepted));
             }
         };
@@ -2522,7 +2688,6 @@ mod tests {
     use mango_external_agents::Attachment;
     use mango_external_agents::error::VendorError;
 
-    use mango_external_agents::HostContext;
     use mango_external_agents::event::{EventKind, TurnId};
     use mango_external_agents::jsonrpc::PeerTermination;
     use mango_external_agents::session::{
@@ -2530,9 +2695,11 @@ mod tests {
     };
     use mango_external_agents::stream::EventSink;
     use mango_external_agents::testing::FakeLauncher;
+    use mango_external_agents::{HostContext, Limits};
 
     use super::{
-        ActiveTurn, CodexHandler, Shared, StopState, base64, data_url, supports_image_mime_type,
+        ActiveTurn, Answer, CodexHandler, ResolutionMarkerGate, Shared, StopState, base64,
+        data_url, supports_image_mime_type,
     };
     use crate::reducer::Outcome;
     use mango_external_agents::jsonrpc::PeerHandler;
@@ -2586,6 +2753,75 @@ mod tests {
             host,
             mango_external_agents::SessionId::new("chat-1"),
         ))
+    }
+
+    /// A direct-handler host with a deliberately tight request budget.
+    fn shared_with_pending_limit(max_pending_requests: usize) -> Arc<Shared> {
+        let host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd("/workspace")
+            .client_info("mango-test", "0.0.1")
+            .limits(Limits {
+                max_pending_requests,
+                ..Limits::default()
+            })
+            .build()
+            .expect("expected a host");
+        Arc::new(Shared::new(
+            host,
+            mango_external_agents::SessionId::new("chat-1"),
+        ))
+    }
+
+    /// Reproduces the map removal that `Session::respond` performs before the server confirms it.
+    async fn answer_waiting_approval(shared: &Shared) {
+        loop {
+            let entry = {
+                let mut pending = shared.pending.lock().await;
+                let id = pending.keys().next().cloned();
+                id.and_then(|id| pending.remove(&id))
+            };
+            if let Some(entry) = entry {
+                let decision = entry.pending.refusal();
+                let option_id = decision.option_id().to_owned();
+                assert!(
+                    entry
+                        .answer
+                        .send(Answer::Chosen {
+                            decision,
+                            option_id,
+                            source: mango_external_agents::DecisionSource::User,
+                            reported: false,
+                        })
+                        .is_ok(),
+                    "expected the handler to still await the host answer"
+                );
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Sends one approval through the direct handler and answers it like `Session::respond`.
+    async fn request_and_answer(shared: &Arc<Shared>, native_turn_id: &str, request_id: u8) {
+        let request_shared = Arc::clone(shared);
+        let native_turn_id = native_turn_id.to_owned();
+        let request = tokio::spawn(async move {
+            CodexHandler {
+                shared: request_shared,
+            }
+            .on_request(
+                String::from("item/commandExecution/requestApproval"),
+                serde_json::json!({
+                    "threadId": "thread-1", "turnId": native_turn_id,
+                    "itemId": format!("item-{request_id}"), "command": "pwd"
+                }),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(request_id)),
+            )
+            .await
+        });
+        answer_waiting_approval(shared).await;
+        let _ = request.await.expect("expected the approval request task");
     }
 
     /// Installs a turn the way `begin` does, and hands back the stream a host would hold.
@@ -3065,7 +3301,7 @@ mod tests {
             .await;
 
         assert!(
-            shared.resolved_early.lock().await.is_empty(),
+            shared.resolution_markers.lock().await.early.is_empty(),
             "expected a foreign resolution not to affect this session's approval lifecycle"
         );
     }
@@ -3081,9 +3317,9 @@ mod tests {
         };
         let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
         {
-            let mut early = shared.resolved_early.lock().await;
+            let mut markers = shared.resolution_markers.lock().await;
             for index in 0..shared.host.limits().max_pending_requests {
-                early.insert(index.to_string(), Arc::new(()));
+                markers.early.insert(index.to_string(), Arc::new(()));
             }
         }
 
@@ -3099,6 +3335,236 @@ mod tests {
         assert!(
             shared.is_shutting_down(),
             "expected overflow to poison the session rather than lose a resolution"
+        );
+    }
+
+    /// The server confirms every host answer with `serverRequest/resolved`. Those confirmations
+    /// must not consume the early-resolution budget while a long turn keeps asking questions.
+    #[tokio::test]
+    async fn normal_resolutions_do_not_accumulate_during_one_long_turn() {
+        let shared = shared_with_pending_limit(1);
+        shared.adopt_thread(String::from("thread-1"));
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+
+        for request_id in [0, 1] {
+            request_and_answer(&shared, "vendor-turn-1", request_id).await;
+            handler
+                .on_notification(
+                    String::from("serverRequest/resolved"),
+                    serde_json::json!({"threadId": "thread-1", "requestId": request_id}),
+                )
+                .await;
+        }
+
+        assert!(
+            !shared.is_shutting_down(),
+            "expected normal resolution traffic to leave capacity for later approvals"
+        );
+        assert!(
+            shared.resolution_markers.lock().await.early.is_empty(),
+            "expected host answers to leave no early-resolution tombstones"
+        );
+    }
+
+    /// Confirmed answers from a completed turn leave the next turn's bounded request budget free.
+    #[tokio::test]
+    async fn normal_resolutions_do_not_spend_the_next_turns_budget() {
+        let shared = shared_with_pending_limit(1);
+        shared.adopt_thread(String::from("thread-1"));
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let (_turn_id, _first) = running(&shared, "vendor-turn-1").await;
+
+        request_and_answer(&shared, "vendor-turn-1", 0).await;
+        handler
+            .on_notification(
+                String::from("serverRequest/resolved"),
+                serde_json::json!({"threadId": "thread-1", "requestId": 0}),
+            )
+            .await;
+        handler
+            .on_notification(
+                String::from("turn/completed"),
+                serde_json::json!({
+                    "threadId": "thread-1",
+                    "turn": {"id": "vendor-turn-1", "status": "completed"}
+                }),
+            )
+            .await;
+        let (_turn_id, _second) = running(&shared, "vendor-turn-2").await;
+
+        request_and_answer(&shared, "vendor-turn-2", 1).await;
+        handler
+            .on_notification(
+                String::from("serverRequest/resolved"),
+                serde_json::json!({"threadId": "thread-1", "requestId": 1}),
+            )
+            .await;
+
+        let markers = shared.resolution_markers.lock().await;
+        assert!(
+            !shared.is_shutting_down(),
+            "expected a completed normal answer not to spend the next turn's request budget"
+        );
+        assert!(
+            markers.early.is_empty() && markers.answered.is_empty(),
+            "expected normal resolutions to leave no cross-turn markers"
+        );
+    }
+
+    /// The answer task and its confirmation run independently. Their shared marker transition
+    /// must leave neither an early tombstone nor an acknowledgement behind.
+    #[tokio::test]
+    async fn an_answer_and_its_confirmation_share_one_marker_transition() {
+        let shared = shared_with_pending_limit(1);
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+        let gate = ResolutionMarkerGate::closed();
+        *shared.resolution_marker_gate.lock().await = Some(Arc::clone(&gate));
+
+        let request_shared = Arc::clone(&shared);
+        let request = tokio::spawn(async move {
+            CodexHandler {
+                shared: request_shared,
+            }
+            .on_request(
+                String::from("item/commandExecution/requestApproval"),
+                serde_json::json!({
+                    "threadId": "thread-1", "turnId": "vendor-turn-1", "itemId": "item-1",
+                    "command": "pwd"
+                }),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(0)),
+            )
+            .await
+        });
+        answer_waiting_approval(&shared).await;
+        gate.wait_until_entered().await;
+
+        let resolution_shared = Arc::clone(&shared);
+        let resolution = tokio::spawn(async move {
+            CodexHandler {
+                shared: resolution_shared,
+            }
+            .on_notification(
+                String::from("serverRequest/resolved"),
+                serde_json::json!({"threadId": "thread-1", "requestId": 0}),
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !resolution.is_finished(),
+            "expected the confirmation to queue behind the reply-marker transition"
+        );
+
+        gate.open();
+        let _ = request.await.expect("expected the approval request task");
+        resolution
+            .await
+            .expect("expected the confirmation task to finish");
+
+        let markers = shared.resolution_markers.lock().await;
+        assert!(
+            markers.early.is_empty() && markers.answered.is_empty(),
+            "expected one atomic transition to consume both sides of the race"
+        );
+    }
+
+    /// A missing confirmation from a future server build cannot turn the acknowledgement ledger
+    /// into unbounded per-turn history.
+    #[tokio::test]
+    async fn unconfirmed_answers_keep_a_bounded_acknowledgement_ledger() {
+        let shared = shared_with_pending_limit(1);
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+
+        for request_id in [0, 1] {
+            request_and_answer(&shared, "vendor-turn-1", request_id).await;
+        }
+
+        assert_eq!(
+            shared.resolution_markers.lock().await.answered.len(),
+            1,
+            "expected the acknowledgement ledger to retain at most the configured request budget"
+        );
+        assert!(
+            !shared.is_shutting_down(),
+            "expected a missing confirmation not to poison the active turn"
+        );
+    }
+
+    /// Terminal cleanup owns all request-id markers. Otherwise an old marker with a reused id
+    /// keeps the mutex while the next handler tries to restore it, deadlocking that approval.
+    #[tokio::test(start_paused = true)]
+    async fn terminal_cleanup_removes_early_markers_before_a_request_id_is_reused() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let (_turn_id, _first) = running(&shared, "vendor-turn-1").await;
+        let first_owner = shared
+            .active_turn_route()
+            .await
+            .expect("expected a first route")
+            .owner;
+        shared
+            .resolution_markers
+            .lock()
+            .await
+            .early
+            .insert(String::from("0"), Arc::clone(&first_owner));
+        handler
+            .on_notification(
+                String::from("turn/completed"),
+                serde_json::json!({
+                    "threadId": "thread-1",
+                    "turn": {"id": "vendor-turn-1", "status": "completed"}
+                }),
+            )
+            .await;
+        let (_turn_id, _second) = running(&shared, "vendor-turn-2").await;
+
+        shared
+            .remember_answered_resolution("late-first", &first_owner)
+            .await;
+        let markers = shared.resolution_markers.lock().await;
+        assert!(
+            markers.early.is_empty() && markers.answered.is_empty(),
+            "expected a released owner not to record a marker after its replacement started"
+        );
+        drop(markers);
+
+        let request_shared = Arc::clone(&shared);
+        let request = tokio::spawn(async move {
+            CodexHandler {
+                shared: request_shared,
+            }
+            .on_request(
+                String::from("item/commandExecution/requestApproval"),
+                serde_json::json!({
+                    "threadId": "thread-1", "turnId": "vendor-turn-2", "itemId": "item-2",
+                    "command": "pwd"
+                }),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(0)),
+            )
+            .await
+        });
+        answer_waiting_approval(&shared).await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), request)
+                .await
+                .is_ok(),
+            "expected the old marker to be gone before the replacement checks it"
+        );
+        assert!(
+            shared.resolution_markers.lock().await.early.is_empty(),
+            "expected terminal cleanup to remove the completed turn's markers"
         );
     }
 

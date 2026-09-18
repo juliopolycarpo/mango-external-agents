@@ -1392,6 +1392,75 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
     );
 }
 
+/// A cancellation that raced a start has a reaper waiting for the start owner's admission slot.
+/// An explicit refusal releases that slot, so the reaper must wake and leave a replacement alone.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_start_that_is_later_refused_does_not_shutdown_its_replacement() {
+    let transcript = Transcript::load("turn");
+    let server = Arc::new(DelayedFirstStartServer {
+        answer: DelayedStartAnswer::Error,
+        complete_before_answer: false,
+        thread_id: transcript
+            .thread_id()
+            .expect("expected the recording to name its thread"),
+        first_request_id: std::sync::Mutex::new(None),
+        starts: AtomicUsize::new(0),
+    });
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| server.respond(frame)));
+    let mut limits = replay_limits();
+    limits.shutdown_timeout = std::time::Duration::from_secs(1);
+    let (host, _) = with_launcher_limits(Arc::clone(&launcher), None, limits);
+    let session: Arc<dyn Session> = Arc::from(
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session"),
+    );
+
+    let first_session = Arc::clone(&session);
+    let first = tokio::spawn(async move {
+        first_session
+            .start_turn(TurnRequest::new("turn-1", "one"))
+            .await
+    });
+    wait_for_turn_start(&launcher).await;
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected pre-acknowledgement cancellation to latch");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    session
+        .refresh_account_usage()
+        .await
+        .expect("expected the trigger request to release the held refusal");
+    first
+        .await
+        .expect("expected the first start task")
+        .expect_err("expected the held start refusal");
+
+    let replacement = session
+        .start_turn(TurnRequest::new("turn-2", "two"))
+        .await
+        .expect("expected the refused start to release admission");
+    tokio::time::advance(limits.shutdown_timeout).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        replacement.terminal_status().is_none(),
+        "expected the first owner's expired reaper not to cancel the replacement"
+    );
+    drop(replacement);
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup after the ownership check");
+}
+
 /// Dropping the library stream abandons its owner. The harness interrupts the native turn and
 /// frees admission after that terminal commits; a host that wants a browser disconnect to be only
 /// a UI event keeps this stream in its own supervisor instead of dropping it.
