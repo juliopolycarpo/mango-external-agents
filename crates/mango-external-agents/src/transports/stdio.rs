@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::host::HostContext;
 use crate::link::{Link, LinkReceiver, LinkSender};
-use crate::process::{ByteSink, LineStream, ProcessControl};
+use crate::process::{ByteSink, LineStream, ProcessCleanupGuard, ProcessControl};
 use crate::transport::{ExecutablePath, StdioSpec};
 
 /// A spawned child, as a link and the handle that ends it.
@@ -69,23 +69,11 @@ pub async fn open(
         .await?;
 
     let Some(stdin) = child.stdin.take() else {
-        let control = child.control;
-        let limits = *host.limits();
+        let cleanup =
+            ProcessCleanupGuard::new(child.control, *host.limits(), crate::CancelReason::Shutdown);
         // The caller may abandon this refusal while the injected process control is pending.
         // A detached task retains cleanup ownership and every shutdown stage stays bounded.
-        tokio::spawn(async move {
-            crate::process::stop_process_with_limits(
-                control.as_ref(),
-                crate::CancelReason::Shutdown,
-                &limits,
-            )
-            .await
-        })
-        .await
-        .map_err(|_| Error::Launch {
-            program: program.to_owned(),
-            message: String::from("child input pipe missing and cleanup task did not complete"),
-        })??;
+        cleanup.finish().await?;
         return Err(Error::Launch {
             program: program.to_owned(),
             message: String::from("a child without a writable stdin"),
@@ -145,6 +133,7 @@ mod tests {
     use crate::testing::{FakeLauncher, FakeProcess};
     use crate::transport::{ExecutablePath, StdioSpec};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A host launcher that returns a live child without the requested input pipe.
     struct MissingStdinLauncher(Arc<FakeLauncher>);
@@ -163,6 +152,7 @@ mod tests {
         inner: Arc<FakeLauncher>,
         kill_started: Arc<tokio::sync::Notify>,
         release_kill: Arc<tokio::sync::Notify>,
+        kill_claims: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -174,6 +164,7 @@ mod tests {
                 inner: child.control,
                 kill_started: Arc::clone(&self.kill_started),
                 release_kill: Arc::clone(&self.release_kill),
+                kill_claims: Arc::clone(&self.kill_claims),
             });
             Ok(child)
         }
@@ -183,6 +174,7 @@ mod tests {
         inner: Arc<dyn ProcessControl>,
         kill_started: Arc<tokio::sync::Notify>,
         release_kill: Arc<tokio::sync::Notify>,
+        kill_claims: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -200,6 +192,7 @@ mod tests {
         }
 
         async fn kill(&self, reason: crate::CancelReason) -> crate::Result<()> {
+            self.kill_claims.fetch_add(1, Ordering::AcqRel);
             self.kill_started.notify_one();
             self.release_kill.notified().await;
             self.inner.kill(reason).await
@@ -283,11 +276,13 @@ mod tests {
         launcher.push(FakeProcess::responding(|_| Vec::new()));
         let kill_started = Arc::new(tokio::sync::Notify::new());
         let release_kill = Arc::new(tokio::sync::Notify::new());
+        let kill_claims = Arc::new(AtomicUsize::new(0));
         let host = HostContext::builder()
             .launcher(Arc::new(HeldMissingStdinLauncher {
                 inner: Arc::clone(&launcher),
                 kill_started: Arc::clone(&kill_started),
                 release_kill: Arc::clone(&release_kill),
+                kill_claims: Arc::clone(&kill_claims),
             }))
             .cwd(std::env::temp_dir())
             .client_info("test-host", "0.0.0")
@@ -315,6 +310,11 @@ mod tests {
         })
         .await
         .expect("expected aborted open to retain child cleanup ownership");
+        assert_eq!(
+            kill_claims.load(Ordering::Acquire),
+            1,
+            "expected aborting cleanup to retain one process-tree termination claim"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -322,11 +322,15 @@ mod tests {
         let launcher = Arc::new(FakeLauncher::new());
         launcher.push(FakeProcess::responding(|_| Vec::new()));
         let deadline = std::time::Duration::from_secs(2);
+        let kill_started = Arc::new(tokio::sync::Notify::new());
+        let release_kill = Arc::new(tokio::sync::Notify::new());
+        let kill_claims = Arc::new(AtomicUsize::new(0));
         let host = HostContext::builder()
             .launcher(Arc::new(HeldMissingStdinLauncher {
                 inner: Arc::clone(&launcher),
-                kill_started: Arc::new(tokio::sync::Notify::new()),
-                release_kill: Arc::new(tokio::sync::Notify::new()),
+                kill_started,
+                release_kill: Arc::clone(&release_kill),
+                kill_claims,
             }))
             .cwd(std::env::temp_dir())
             .client_info("test-host", "0.0.0")
@@ -347,9 +351,26 @@ mod tests {
         )
         .await
         .expect("expected missing-stdin cleanup to respect the host deadline");
+        let error = result.expect_err("expected the missing input pipe to be refused");
         assert!(
-            matches!(result, Err(Error::Timeout { after, .. }) if after == deadline),
-            "expected a typed cleanup timeout, received {result:?}"
+            matches!(error.cause(), Error::Timeout { after, .. } if *after == deadline),
+            "expected a typed cleanup timeout, received {error:?}"
+        );
+        let control = error
+            .cleanup_control()
+            .expect("expected the host to retain a cleanup control after the timeout");
+        release_kill.notify_one();
+        crate::process::stop_process_with_limits(
+            control.as_ref(),
+            crate::CancelReason::Shutdown,
+            host.limits(),
+        )
+        .await
+        .expect("expected the host to recover and reap the child");
+        assert_eq!(
+            launcher.live_children(),
+            0,
+            "expected the recovered cleanup control to reap its child"
         );
     }
 

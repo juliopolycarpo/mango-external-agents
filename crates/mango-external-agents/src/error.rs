@@ -7,11 +7,13 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::harness::Capability;
 use crate::identity::HarnessId;
 use crate::operation::Dispatch;
+use crate::process::ProcessControl;
 use crate::redact;
 use crate::transport::TransportKind;
 
@@ -191,6 +193,18 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// An operation failed after it started a child whose bounded cleanup did not complete.
+    ///
+    /// `control` is the host-owned handle for that child. It may already have received a kill
+    /// request; the host retains it so it can reconcile or retry process-tree cleanup after
+    /// inspecting `source`. Diagnostic formatting deliberately omits the handle.
+    CleanupRequired {
+        /// The child whose cleanup still needs host ownership.
+        control: Arc<dyn ProcessControl>,
+        /// The typed cleanup failure that prevented the operation from completing.
+        source: Box<Error>,
+    },
+
     /// The vendor answered with a failure of its own.
     Vendor(VendorError),
 
@@ -363,6 +377,7 @@ impl fmt::Display for Error {
         match self {
             Self::Busy => formatter.write_str("expected an idle session, received an active turn"),
             Self::Operation { source, .. } => source.fmt(formatter),
+            Self::CleanupRequired { source, .. } => source.fmt(formatter),
             Self::Vendor(error) => error.fmt(formatter),
             Self::NotSupported { capability } => write!(
                 formatter,
@@ -438,6 +453,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Operation { source, .. } => Some(source.as_ref()),
+            Self::CleanupRequired { source, .. } => Some(source.as_ref()),
             Self::Vendor(error) => Some(error),
             _ => None,
         }
@@ -464,6 +480,7 @@ impl Error {
         match self {
             Self::Busy => true,
             Self::Operation { source, .. } => source.retryable(),
+            Self::CleanupRequired { .. } => false,
             Self::Vendor(error) => error.retryable,
             _ => false,
         }
@@ -497,6 +514,7 @@ impl Error {
     pub fn dispatch(&self) -> Dispatch {
         match self {
             Self::Operation { dispatch, .. } => *dispatch,
+            Self::CleanupRequired { source, .. } => source.dispatch(),
             // The same error category can occur before or after submission. Only the caller
             // at that boundary can establish certainty; an unannotated error proves neither.
             _ => Dispatch::AcceptanceUnknown,
@@ -531,8 +549,23 @@ impl Error {
     /// ```
     pub fn cause(&self) -> &Self {
         match self {
-            Self::Operation { source, .. } => source.cause(),
+            Self::Operation { source, .. } | Self::CleanupRequired { source, .. } => source.cause(),
             cause => cause,
+        }
+    }
+
+    /// Clones the child control a host must use to reconcile failed bounded cleanup.
+    ///
+    /// An error can retain this handle under an [`Operation`](Self::Operation) annotation, so the
+    /// lookup crosses that annotation. The control may already have received a kill request;
+    /// callers must still wait for or retry their own bounded cleanup before treating the child as
+    /// reaped.
+    #[must_use]
+    pub fn cleanup_control(&self) -> Option<Arc<dyn ProcessControl>> {
+        match self {
+            Self::Operation { source, .. } => source.cleanup_control(),
+            Self::CleanupRequired { control, .. } => Some(Arc::clone(control)),
+            _ => None,
         }
     }
 }
@@ -557,11 +590,65 @@ pub const fn jsonrpc_code_is_retryable(code: i64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{CODE_MAX_LENGTH, Error, ErrorCode, VendorError, jsonrpc_code_is_retryable};
     use crate::harness::Capability;
     use crate::operation::Dispatch;
+    use crate::process::{ExitStatus, ProcessControl};
+
+    /// A process control retained only to prove an error hands it back unchanged.
+    struct UnreapedControl;
+
+    #[async_trait::async_trait]
+    impl ProcessControl for UnreapedControl {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+
+        async fn wait(&self) -> crate::Result<ExitStatus> {
+            Err(Error::Closed {
+                subject: "test process",
+            })
+        }
+
+        async fn kill(&self, _reason: crate::CancelReason) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cleanup_required_retains_its_cause_and_control_under_dispatch() {
+        let control: Arc<dyn ProcessControl> = Arc::new(UnreapedControl);
+        let cleanup = Error::CleanupRequired {
+            control: Arc::clone(&control),
+            source: Box::new(Error::Timeout {
+                operation: String::from("process reaping"),
+                after: Duration::from_secs(2),
+            }),
+        };
+        let source = std::error::Error::source(&cleanup)
+            .and_then(|source| source.downcast_ref::<Error>())
+            .expect("expected the typed cleanup source");
+        assert!(matches!(source, Error::Timeout { .. }));
+        assert_eq!(cleanup.to_string(), source.to_string());
+
+        let error = cleanup.with_dispatch(Dispatch::Accepted);
+        assert_eq!(error.dispatch(), Dispatch::Accepted);
+        assert!(!error.retryable());
+        assert!(matches!(error.cause(), Error::Timeout { .. }));
+        assert!(Arc::ptr_eq(
+            &control,
+            &error
+                .cleanup_control()
+                .expect("expected a cleanup control under the dispatch annotation")
+        ));
+    }
 
     #[test]
     fn reserved_jsonrpc_codes_are_not_retryable() {

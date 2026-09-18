@@ -184,6 +184,115 @@ pub async fn stop_process_with_limits(
     stop_process_bounded(control, reason, limits.kill_grace, limits.shutdown_timeout).await
 }
 
+/// Owns bounded process cleanup until it succeeds or hands the control back to the host.
+///
+/// A caller creates this after launch and calls [`finish`](Self::finish) when its short-lived
+/// operation is done. It captures that operation's Tokio runtime, so dropping it from another
+/// thread starts the same bounded cleanup while the captured runtime remains alive. A failed
+/// cleanup returns [`Error::CleanupRequired`], retaining the control for host reconciliation
+/// rather than losing the only process handle.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(
+/// #     control: std::sync::Arc<dyn mango_external_agents::ProcessControl>,
+/// #     limits: mango_external_agents::Limits,
+/// # ) -> mango_external_agents::Result<()> {
+/// use mango_external_agents::{CancelReason, ProcessCleanupGuard};
+///
+/// let cleanup = ProcessCleanupGuard::new(control, limits, CancelReason::Shutdown);
+/// cleanup.finish().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct ProcessCleanupGuard {
+    control: Arc<dyn ProcessControl>,
+    limits: crate::Limits,
+    reason: CancelReason,
+    runtime: tokio::runtime::Handle,
+    worker: Option<tokio::task::JoinHandle<Result<StopOutcome>>>,
+    active: bool,
+}
+
+impl ProcessCleanupGuard {
+    /// Starts owning cleanup for `control`.
+    ///
+    /// The guard does not interrupt the child until [`finish`](Self::finish) or drop, so callers
+    /// may keep using its pipes while they hold the guard.
+    #[must_use]
+    pub fn new(
+        control: Arc<dyn ProcessControl>,
+        limits: crate::Limits,
+        reason: CancelReason,
+    ) -> Self {
+        Self {
+            control,
+            limits,
+            reason,
+            runtime: tokio::runtime::Handle::current(),
+            worker: None,
+            active: true,
+        }
+    }
+
+    /// Waits for bounded cleanup and returns a recoverable error when it did not complete.
+    ///
+    /// The cleanup worker is started before this await. Cancelling this future therefore detaches
+    /// the bounded worker, which retains a clone of the control while the runtime is alive.
+    pub async fn finish(mut self) -> Result<StopOutcome> {
+        self.begin();
+        let Some(worker) = self.worker.take() else {
+            self.active = false;
+            return Err(self.required(Error::Closed {
+                subject: "process cleanup worker",
+            }));
+        };
+        // Dropping an awaited JoinHandle detaches its already-started worker. Mark that fact before
+        // awaiting so cancellation of `finish` cannot start a second process-tree cleanup.
+        self.active = false;
+        match worker.await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(source)) => Err(self.required(source)),
+            Err(_) => Err(self.required(Error::Closed {
+                subject: "process cleanup task",
+            })),
+        }
+    }
+
+    /// Transfers the child control to a long-lived owner without starting cleanup.
+    #[must_use]
+    pub fn into_control(mut self) -> Arc<dyn ProcessControl> {
+        self.active = false;
+        Arc::clone(&self.control)
+    }
+
+    fn required(&self, source: Error) -> Error {
+        Error::CleanupRequired {
+            control: Arc::clone(&self.control),
+            source: Box::new(source),
+        }
+    }
+
+    fn begin(&mut self) {
+        if !self.active || self.worker.is_some() {
+            return;
+        }
+        let control = Arc::clone(&self.control);
+        let limits = self.limits;
+        let reason = self.reason;
+        self.worker = Some(self.runtime.spawn(async move {
+            stop_process_with_limits(control.as_ref(), reason, &limits).await
+        }));
+    }
+}
+
+impl Drop for ProcessCleanupGuard {
+    fn drop(&mut self) {
+        self.begin();
+    }
+}
+
 async fn stop_process_bounded(
     control: &dyn ProcessControl,
     reason: CancelReason,

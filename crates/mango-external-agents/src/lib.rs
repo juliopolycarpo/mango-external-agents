@@ -77,7 +77,7 @@ pub use permission::{
 };
 pub use process::{
     ByteSink, ByteSource, ExitStatus, InterruptOutcome, LaunchSpec, LineLimits, LineStream,
-    ManagedProcess, ProcessControl, ProcessLauncher, StderrTail, StopOutcome,
+    ManagedProcess, ProcessCleanupGuard, ProcessControl, ProcessLauncher, StderrTail, StopOutcome,
 };
 pub use recovery::{RecoveryAction, RecoveryRecord, RequestFingerprint};
 pub use registry::HarnessRegistry;
