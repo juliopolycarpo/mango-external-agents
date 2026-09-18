@@ -69,7 +69,23 @@ pub async fn open(
         .await?;
 
     let Some(stdin) = child.stdin.take() else {
-        let _ = child.control.kill(crate::CancelReason::Shutdown).await;
+        let control = child.control;
+        let limits = *host.limits();
+        // The caller may abandon this refusal while the injected process control is pending.
+        // A detached task retains cleanup ownership and every shutdown stage stays bounded.
+        tokio::spawn(async move {
+            crate::process::stop_process_with_limits(
+                control.as_ref(),
+                crate::CancelReason::Shutdown,
+                &limits,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| Error::Launch {
+            program: program.to_owned(),
+            message: String::from("child input pipe missing and cleanup task did not complete"),
+        })??;
         return Err(Error::Launch {
             program: program.to_owned(),
             message: String::from("a child without a writable stdin"),
@@ -125,7 +141,7 @@ mod tests {
     use crate::env::EnvSource;
     use crate::error::Error;
     use crate::host::HostContext;
-    use crate::process::{LaunchSpec, ManagedProcess, ProcessLauncher};
+    use crate::process::{ExitStatus, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher};
     use crate::testing::{FakeLauncher, FakeProcess};
     use crate::transport::{ExecutablePath, StdioSpec};
     use std::sync::Arc;
@@ -139,6 +155,54 @@ mod tests {
             let mut child = self.0.spawn(spec).await?;
             child.stdin = None;
             Ok(child)
+        }
+    }
+
+    /// Holds process-tree cleanup after launch returned an invalid pipe set.
+    struct HeldMissingStdinLauncher {
+        inner: Arc<FakeLauncher>,
+        kill_started: Arc<tokio::sync::Notify>,
+        release_kill: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for HeldMissingStdinLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> crate::Result<ManagedProcess> {
+            let mut child = self.inner.spawn(spec).await?;
+            child.stdin = None;
+            child.control = Arc::new(HeldProcessControl {
+                inner: child.control,
+                kill_started: Arc::clone(&self.kill_started),
+                release_kill: Arc::clone(&self.release_kill),
+            });
+            Ok(child)
+        }
+    }
+
+    struct HeldProcessControl {
+        inner: Arc<dyn ProcessControl>,
+        kill_started: Arc<tokio::sync::Notify>,
+        release_kill: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for HeldProcessControl {
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.inner.stderr_tail()
+        }
+
+        async fn wait(&self) -> crate::Result<ExitStatus> {
+            self.inner.wait().await
+        }
+
+        async fn kill(&self, reason: crate::CancelReason) -> crate::Result<()> {
+            self.kill_started.notify_one();
+            self.release_kill.notified().await;
+            self.inner.kill(reason).await
         }
     }
 
@@ -210,6 +274,82 @@ mod tests {
             launcher.live_children(),
             0,
             "expected the failed transport to reap its child"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_missing_stdin_refusal_does_not_abandon_child_cleanup() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let kill_started = Arc::new(tokio::sync::Notify::new());
+        let release_kill = Arc::new(tokio::sync::Notify::new());
+        let host = HostContext::builder()
+            .launcher(Arc::new(HeldMissingStdinLauncher {
+                inner: Arc::clone(&launcher),
+                kill_started: Arc::clone(&kill_started),
+                release_kill: Arc::clone(&release_kill),
+            }))
+            .cwd(std::env::temp_dir())
+            .client_info("test-host", "0.0.0")
+            .build()
+            .expect("expected a host");
+        let opening = tokio::spawn(async move {
+            open(
+                &host,
+                &StdioSpec::new(["codex", "app-server"]),
+                &ExecutablePath::default(),
+                &[],
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), kill_started.notified())
+            .await
+            .expect("expected cleanup to reach process-tree termination");
+        opening.abort();
+        let _ = opening.await;
+        release_kill.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while launcher.live_children() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected aborted open to retain child cleanup ownership");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_stdin_cleanup_obeys_the_host_shutdown_deadline() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let deadline = std::time::Duration::from_secs(2);
+        let host = HostContext::builder()
+            .launcher(Arc::new(HeldMissingStdinLauncher {
+                inner: Arc::clone(&launcher),
+                kill_started: Arc::new(tokio::sync::Notify::new()),
+                release_kill: Arc::new(tokio::sync::Notify::new()),
+            }))
+            .cwd(std::env::temp_dir())
+            .client_info("test-host", "0.0.0")
+            .limits(crate::Limits {
+                shutdown_timeout: deadline,
+                ..crate::Limits::default()
+            })
+            .build()
+            .expect("expected a host");
+        let result = tokio::time::timeout(
+            deadline * 2,
+            open(
+                &host,
+                &StdioSpec::new(["codex", "app-server"]),
+                &ExecutablePath::default(),
+                &[],
+            ),
+        )
+        .await
+        .expect("expected missing-stdin cleanup to respect the host deadline");
+        assert!(
+            matches!(result, Err(Error::Timeout { after, .. }) if after == deadline),
+            "expected a typed cleanup timeout, received {result:?}"
         );
     }
 
