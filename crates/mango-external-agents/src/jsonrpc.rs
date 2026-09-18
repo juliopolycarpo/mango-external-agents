@@ -423,9 +423,14 @@ impl Drop for PendingCall {
             pending.remove(&self.id);
             return;
         }
+        // Off a runtime there is nothing to spawn onto, and `tokio::spawn` would panic inside a
+        // `Drop`. A close or a dying pump fails the entry that is left behind either way.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         let state = Arc::clone(&self.state);
         let id = self.id.clone();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             state.pending.lock().await.remove(&id);
         });
     }
@@ -1937,5 +1942,33 @@ mod tests {
         );
 
         client.close().await.expect("expected a clean close");
+    }
+
+    /// A request future can be dropped somewhere no runtime is entered.
+    ///
+    /// A host that holds an in-flight `Client::request` in a struct, or that returns from
+    /// `block_on` still owning one, drops it on a plain thread. `PendingCall::drop` has to clean
+    /// its correlation entry from there without `tokio::spawn`, which panics off a runtime — and a
+    /// panic raised inside `Drop` during an unwind aborts the process.
+    #[tokio::test]
+    async fn dropping_a_request_off_a_runtime_cleans_up_without_panicking() {
+        let link = ScriptedLink::new();
+        let client = Client::connect(
+            link.into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::default(),
+        );
+        let state = Arc::clone(&client.state);
+        // Held for the whole drop, so the guard's `try_lock` fails and it has to take the
+        // deferred path. Without this the fast path succeeds and the test proves nothing.
+        let held = state.pending.lock().await;
+        let guard = super::PendingCall {
+            state: Arc::clone(&state),
+            id: String::from("1"),
+        };
+        std::thread::spawn(move || drop(guard))
+            .join()
+            .expect("expected dropping a request off a runtime not to panic");
+        drop(held);
     }
 }
