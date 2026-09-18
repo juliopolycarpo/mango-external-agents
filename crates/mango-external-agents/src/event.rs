@@ -572,6 +572,8 @@ impl fmt::Debug for Activity {
             .field("kind", &self.kind)
             .field("has_title", &!self.title.is_empty())
             .field("has_detail", &self.detail.is_some())
+            .field("content", &self.content)
+            .field("extension_count", &self.extensions.len())
             .field("truncated", &self.truncated)
             .finish()
     }
@@ -1218,6 +1220,13 @@ mod tests {
             kind: ActivityKind::Command,
             title: String::from("activity-title-secret"),
             detail: Some(String::from("activity-detail-secret")),
+            content: Some(ActivityContent::Diff {
+                files: vec![FileChange::new("activity-path-secret")],
+            }),
+            extensions: crate::extension::Extensions::new().with(
+                "sandbox",
+                crate::extension::ExtensionValue::text("ext-secret"),
+            ),
             truncated: false,
             ..Activity::default()
         };
@@ -1256,6 +1265,8 @@ mod tests {
                 "activity-name-secret",
                 "activity-title-secret",
                 "activity-detail-secret",
+                "activity-path-secret",
+                "ext-secret",
                 "update-title-secret",
                 "update-detail-secret",
                 "plan-step-secret",
