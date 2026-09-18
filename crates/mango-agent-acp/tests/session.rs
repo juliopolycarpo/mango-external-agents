@@ -6,6 +6,7 @@
 //! tests cannot reach — that a turn ends exactly once, that an approval round trip lands, that a
 //! cancel carries its reason, and that closing twice is not an error.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -15,7 +16,8 @@ use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, Rec
 use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
     Configuration, ConfigurationChange, ConfigurationOptionId, ConfigurationPatch,
-    ConfigurationValue, DecisionSource, Dispatch, Error, EventKind, Harness, HostContext, Limits,
+    ConfigurationValue, DecisionSource, Dispatch, Error, EventKind, ExitStatus, Harness,
+    HostContext, Limits,
     ManagedProcess, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, Session,
     SessionStatus, SessionSubscription, TurnRequest, TurnStream, VendorInfo,
 };
@@ -49,6 +51,7 @@ fn host(launcher: &FakeLauncher) -> HostContext {
 struct CapturingLauncher {
     inner: FakeLauncher,
     control: Arc<Mutex<Option<Arc<dyn ProcessControl>>>>,
+    kills: Arc<AtomicUsize>,
 }
 
 impl CapturingLauncher {
@@ -63,6 +66,36 @@ impl CapturingLauncher {
             .clone()
             .expect("expected picker child")
     }
+
+    fn kill_count(&self) -> usize {
+        self.kills.load(Ordering::Acquire)
+    }
+}
+
+/// Counts the cleanup calls made to an injected child control.
+struct CountingProcessControl {
+    inner: Arc<dyn ProcessControl>,
+    kills: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for CountingProcessControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.kills.fetch_add(1, Ordering::AcqRel);
+        self.inner.kill(reason).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -71,9 +104,13 @@ impl ProcessLauncher for CapturingLauncher {
         &self,
         spec: mango_external_agents::LaunchSpec,
     ) -> mango_external_agents::Result<ManagedProcess> {
-        let process = self.inner.spawn(spec).await?;
-        *self.control.lock().expect("expected captured child state") =
-            Some(Arc::clone(&process.control));
+        let mut process = self.inner.spawn(spec).await?;
+        let control: Arc<dyn ProcessControl> = Arc::new(CountingProcessControl {
+            inner: Arc::clone(&process.control),
+            kills: Arc::clone(&self.kills),
+        });
+        *self.control.lock().expect("expected captured child state") = Some(Arc::clone(&control));
+        process.control = control;
         Ok(process)
     }
 }
@@ -1283,6 +1320,37 @@ async fn aborting_harness_listing_shuts_down_its_short_lived_child() {
         .await
         .expect("expected the dropped picker scope to kill its child")
         .expect("expected child cleanup to succeed");
+    assert_eq!(
+        launcher.kill_count(),
+        1,
+        "expected the cancellation guard to ask the injected control to kill exactly once"
+    );
+}
+
+/// An explicit listing cleanup disarms its drop guard after the one child kill.
+#[tokio::test]
+async fn completed_harness_listing_kills_its_short_lived_child_once() {
+    let launcher = CapturingLauncher::default();
+    launcher.push(FakeAcpAgent::new().listing_sessions().process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .build()
+        .expect("expected a host");
+    AcpHarness::new(profile())
+        .list_sessions(&host, Default::default())
+        .await
+        .expect("expected a listing");
+    tokio::time::timeout(Duration::from_secs(4), launcher.child().wait())
+        .await
+        .expect("expected the picker child to exit")
+        .expect("expected child cleanup to succeed");
+    assert_eq!(
+        launcher.kill_count(),
+        1,
+        "expected explicit cleanup not to be repeated from ConnectionShutdownGuard::drop"
+    );
 }
 
 /// Rows outside the host workspace and malformed timestamps never reach a picker as local sessions.

@@ -469,11 +469,13 @@ impl Harness for AcpHarness {
             accepted_axes(&configuration),
             session_state.clone(),
         ));
+        let cleanup = client::DriveShutdownGuard::from_launched(&launched);
         let connection = Arc::new(
             client::drive(
                 launched,
                 Arc::clone(&connection_state),
                 host.client_info().name.clone(),
+                cleanup,
             )
             .await?,
         );
@@ -664,9 +666,11 @@ impl Harness for AcpHarness {
             Configuration::unknown(),
             snapshot,
         ));
-        let connection =
-            Arc::new(client::drive(launched, state, host.client_info().name.clone()).await?);
-        let connection = client::ConnectionShutdownGuard::new(connection);
+        let cleanup = client::DriveShutdownGuard::from_launched(&launched);
+        let connection = Arc::new(
+            client::drive(launched, state, host.client_info().name.clone(), cleanup).await?,
+        );
+        let mut connection = client::ConnectionShutdownGuard::new(connection);
         let page = async {
             let handshake = self.initialize(connection.connection(), host).await?;
             crate::session::list_sessions(

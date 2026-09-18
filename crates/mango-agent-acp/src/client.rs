@@ -56,6 +56,66 @@ use crate::permission;
 use crate::reducer::{Reducer, SessionFact};
 use crate::transport::LaunchedAgent;
 
+#[cfg(test)]
+struct DriveStartupHold {
+    control: Arc<dyn ProcessControl>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    reached: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+static DRIVE_STARTUP_HOLD: Mutex<Option<DriveStartupHold>> = Mutex::new(None);
+
+/// Holds the next driver before it creates the connection task.
+///
+/// The unit test uses this to cancel `drive` in the window where a launched child has no
+/// `ConnectionHandle` yet.
+#[cfg(test)]
+fn hold_next_drive_startup(
+    control: Arc<dyn ProcessControl>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    *DRIVE_STARTUP_HOLD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(DriveStartupHold {
+        control,
+        release: release_rx,
+        reached: reached_tx,
+    });
+    (release, reached)
+}
+
+#[cfg(test)]
+async fn wait_for_drive_startup_hold(child: &DriveShutdownGuard) {
+    let hold = {
+        let mut pending = DRIVE_STARTUP_HOLD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|hold| Arc::ptr_eq(&hold.control, child.control()))
+        {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    let Some(DriveStartupHold {
+        control: _,
+        release,
+        reached,
+    }) = hold
+    else {
+        return;
+    };
+    let _ = reached.send(());
+    let _ = release.await;
+}
+
 /// Whether a host's answer reached the agent, or arrived after the question was already settled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Answered {
@@ -923,6 +983,8 @@ fn standing_refusal(
 pub(crate) struct ConnectionHandle {
     connection: ConnectionTo<Agent>,
     control: Arc<dyn ProcessControl>,
+    /// Ensures every shutdown path asks the child to end at most once.
+    child_killed: AtomicBool,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>>,
     /// Host-owned bounds for tearing down the dispatch loop and child process.
@@ -1025,34 +1087,86 @@ impl Drop for RequestAbandonment {
     }
 }
 
+/// Reaps a child if cancellation drops `drive` before it can return a connection handle.
+pub(crate) struct DriveShutdownGuard {
+    control: Option<Arc<dyn ProcessControl>>,
+}
+
+impl DriveShutdownGuard {
+    /// Claims a launched child before the asynchronous connection driver is first polled.
+    pub(crate) fn from_launched(launched: &LaunchedAgent) -> Self {
+        Self {
+            control: Some(Arc::clone(&launched.control)),
+        }
+    }
+
+    fn disarm(&mut self) -> Arc<dyn ProcessControl> {
+        self.control
+            .take()
+            .expect("drive guard owns the child until a connection handle exists")
+    }
+
+    #[cfg(test)]
+    fn control(&self) -> &Arc<dyn ProcessControl> {
+        self.control
+            .as_ref()
+            .expect("drive guard owns the child until a connection handle exists")
+    }
+}
+
+impl Drop for DriveShutdownGuard {
+    fn drop(&mut self) {
+        let Some(control) = self.control.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = control
+                    .kill(mango_external_agents::CancelReason::Shutdown)
+                    .await;
+            });
+        }
+    }
+}
+
 /// Owns a short-lived connection until its request completes or the caller cancels it.
 ///
 /// Listing has no session handle that could close the child later. This guard makes cancellation of
 /// that picker request take the same shutdown path as an explicit close.
 pub(crate) struct ConnectionShutdownGuard {
-    connection: Arc<ConnectionHandle>,
+    connection: Option<Arc<ConnectionHandle>>,
 }
 
 impl ConnectionShutdownGuard {
     /// Starts a scope that ends the connection when it leaves the async call.
     pub(crate) fn new(connection: Arc<ConnectionHandle>) -> Self {
-        Self { connection }
+        Self {
+            connection: Some(connection),
+        }
     }
 
     /// The live connection while the scope remains active.
     pub(crate) fn connection(&self) -> &ConnectionHandle {
-        &self.connection
+        self.connection
+            .as_deref()
+            .expect("connection exists until an explicit shutdown completes")
     }
 
     /// Ends the child before the normal scope exit.
-    pub(crate) async fn shutdown(&self, reason: mango_external_agents::CancelReason) {
-        self.connection.shutdown(reason).await;
+    pub(crate) async fn shutdown(&mut self, reason: mango_external_agents::CancelReason) {
+        let Some(connection) = self.connection.as_ref() else {
+            return;
+        };
+        connection.shutdown(reason).await;
+        self.connection.take();
     }
 }
 
 impl Drop for ConnectionShutdownGuard {
     fn drop(&mut self) {
-        let connection = Arc::clone(&self.connection);
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 connection
@@ -1090,8 +1204,12 @@ pub(crate) async fn drive(
     launched: LaunchedAgent,
     state: Arc<SessionState>,
     client_name: String,
+    mut child: DriveShutdownGuard,
 ) -> Result<ConnectionHandle> {
-    let LaunchedAgent { transport, control } = launched;
+    #[cfg(test)]
+    wait_for_drive_startup_hold(&child).await;
+
+    let LaunchedAgent { transport, .. } = launched;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1158,13 +1276,17 @@ pub(crate) async fn drive(
         };
         return Err(Error::Vendor(link_failure(with_stderr(
             shape,
-            control.as_ref(),
+            child
+                .control
+                .as_deref()
+                .expect("drive guard owns the child before a handle exists"),
         ))));
     };
 
     Ok(ConnectionHandle {
         connection,
-        control,
+        control: child.disarm(),
+        child_killed: AtomicBool::new(false),
         shutdown: Mutex::new(Some(shutdown_tx)),
         driver: Mutex::new(Some(driver)),
         limits: state.limits,
@@ -1280,6 +1402,7 @@ impl ConnectionHandle {
         let process = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
         process?;
         Ok(())
+
     }
 }
 
@@ -1361,14 +1484,46 @@ mod connection_tests;
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-    use mango_external_agents::testing::FakeLauncher;
+    use mango_external_agents::testing::{FakeLauncher, FakeProcess};
     use mango_external_agents::{
-        AttemptId, Configuration, Error, EventSink, HarnessIdentity, HostContext, SessionIds,
+        AttemptId, CancelReason, Configuration, Error, EventSink, ExitStatus, HarnessIdentity,
+        HostContext, LaunchSpec, ProcessControl, ProcessLauncher, Result, SessionIds,
         SessionSnapshot, TransportKind, TransportSelection, TurnId,
     };
 
-    use super::{CancelReason, PermissionLevel, RequestAdmission, SessionId, SessionState};
+    use super::{
+        DriveShutdownGuard, PermissionLevel, RequestAdmission, SessionId, SessionState, drive,
+        hold_next_drive_startup,
+    };
+
+    /// A process control that records how many cleanup claims reach the injected child.
+    struct CountingProcessControl {
+        inner: Arc<dyn ProcessControl>,
+        kills: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for CountingProcessControl {
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.inner.stderr_tail()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            self.inner.wait().await
+        }
+
+        async fn kill(&self, reason: CancelReason) -> Result<()> {
+            self.kills.fetch_add(1, Ordering::AcqRel);
+            self.inner.kill(reason).await
+        }
+    }
 
     /// A bare core session state, for the connection-level state under test to publish facts into.
     fn core_state() -> mango_external_agents::SessionState {
@@ -1545,6 +1700,53 @@ mod tests {
                 }
             ),
             "received {closed:?}"
+        );
+    }
+
+    /// Cancelling `drive` before its connection task exists still reaps the child it was handed.
+    #[tokio::test]
+    async fn a_cancelled_driver_startup_kills_its_injected_child_once() {
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let (state, host) = state();
+        let mut process = launcher
+            .spawn(LaunchSpec {
+                argv: vec![String::from("fake-acp")],
+                cwd: host.cwd().to_path_buf(),
+                env: Default::default(),
+                stdin: true,
+                hide_window: true,
+            })
+            .await
+            .expect("expected the fake child to launch");
+        let kills = Arc::new(AtomicUsize::new(0));
+        let control: Arc<dyn ProcessControl> = Arc::new(CountingProcessControl {
+            inner: Arc::clone(&process.control),
+            kills: Arc::clone(&kills),
+        });
+        process.control = Arc::clone(&control);
+        let launched = crate::transport::frame(process, &host).expect("expected framed child");
+        let cleanup = DriveShutdownGuard::from_launched(&launched);
+        let (_release, reached) = hold_next_drive_startup(Arc::clone(&control));
+        let task = tokio::spawn(drive(
+            launched,
+            Arc::new(state),
+            String::from("acp-client-tests"),
+            cleanup,
+        ));
+        reached
+            .await
+            .expect("expected the driver to stop before connection startup");
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), control.wait())
+            .await
+            .expect("expected cancellation to reap the held-startup child")
+            .expect("expected child cleanup to succeed");
+        assert_eq!(
+            kills.load(Ordering::Acquire),
+            1,
+            "expected the pre-drive guard to claim cleanup exactly once"
         );
     }
 }
