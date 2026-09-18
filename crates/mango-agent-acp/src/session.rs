@@ -477,22 +477,19 @@ impl Session for AcpSession {
             // The prompt is already on the wire. Preserve its owned stream rather than returning an
             // error that discards the only place its terminal can be reported, then stop the peer
             // before releasing this generation for another ACP prompt.
+            //
+            // Detached before the first await rather than run inline: this function's future
+            // belongs to the caller, and a caller that drops it at `wait_shutdown` would take the
+            // terminal commit and the slot release down with it. The shutdown itself proceeds in
+            // its own task either way, so what such a drop actually left behind was an installed
+            // turn on a live session — every later prompt refused as `Busy`, on a stream whose
+            // terminal nobody would ever write.
             self.connection.begin_shutdown(CancelReason::Shutdown);
-            let cleanup_error = self.connection.wait_shutdown().await.err();
-            if let Some((turn, _, _)) = self.connection_state.prepare_terminal_matching(&handle)
-                && turn.finish()
-            {
-                let message = cleanup_error.map_or_else(
-                    || {
-                        String::from(
-                            "ACP session/cancel could not be queued after prompt admission",
-                        )
-                    },
-                    |error| format!("ACP process cleanup failed: {error}"),
-                );
-                let _ = turn.sink.fail(link_failure(message)).await;
-                self.connection_state.release_turn_matching(&handle);
-            }
+            detach_retry_cancel_cleanup(
+                Arc::clone(&self.connection),
+                Arc::clone(&self.connection_state),
+                handle,
+            );
             return Ok(stream.with_dispatch(Dispatch::AcceptanceUnknown));
         }
 
@@ -740,6 +737,35 @@ impl Session for AcpSession {
 
 /// Completes the one close operation after it has claimed the session lifecycle.
 ///
+/// Settles a prompt whose follow-up `session/cancel` could not be queued, in a task of its own.
+///
+/// The prompt is already on the wire and owns a stream, so its terminal has exactly one place to
+/// go — and the peer is being shut down underneath it. Both halves of that ending, the terminal
+/// commit and the release of the ACP prompt slot, must survive a caller that drops the
+/// [`Session::start_turn`] future it was returned from; a slot left installed would refuse every
+/// later prompt as [`Error::Busy`] on a session whose terminal never came.
+fn detach_retry_cancel_cleanup(
+    connection: Arc<ConnectionHandle>,
+    state: Arc<client::SessionState>,
+    handle: client::TurnHandle,
+) {
+    tokio::spawn(async move {
+        let cleanup_error = connection.wait_shutdown().await.err();
+        let Some((turn, _, _)) = state.prepare_terminal_matching(&handle) else {
+            return;
+        };
+        if !turn.finish() {
+            return;
+        }
+        let message = cleanup_error.map_or_else(
+            || String::from("ACP session/cancel could not be queued after prompt admission"),
+            |error| format!("ACP process cleanup failed: {error}"),
+        );
+        let _ = turn.sink.fail(link_failure(message)).await;
+        state.release_turn_matching(&handle);
+    });
+}
+
 /// The task owns all awaits so dropping any caller's [`Session::close`] future cannot strand a
 /// native turn, a child process, or the observable session status.
 #[allow(
