@@ -227,7 +227,9 @@ impl ReceiptRequestContext {
     }
 
     fn matches(&self, request: &crate::OpenSession) -> bool {
-        self == &Self::from_open_request(request)
+        self.configuration == request.configuration
+            && self.resume == request.resume
+            && self.mcp_servers == request.mcp_servers
     }
 }
 
