@@ -48,13 +48,11 @@ use crate::protocol::requests::{
 };
 use crate::reducer::{self, Outcome};
 
-/// A turn was asked for while one was already running.
-///
-/// The app-server takes `turn/start` on a live turn as a steer — its own documentation says
-/// `turnTrigger` is "ignored when this request steers an already-active turn". A host that meant a
-/// new turn would receive a stream that never gets a `turn/completed` of its own, so this is
-/// refused before the call is made. Retryable: the running turn will end.
 /// The session or the connection would not take a call.
+///
+/// A turn asked for while one is already running is not this code: the app-server takes
+/// `turn/start` on a live turn as a steer, so admission refuses it as [`Error::Busy`] before the
+/// call is made.
 pub const CALL_FAILED: ErrorCode = ErrorCode::from_static("codex-call-failed");
 
 /// Native ids retained after terminal frames so a delayed old frame cannot attach while the next
