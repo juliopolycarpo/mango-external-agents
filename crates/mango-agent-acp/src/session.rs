@@ -8,7 +8,6 @@
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, ListSessionsRequest, PromptRequest,
@@ -31,12 +30,6 @@ use mango_external_agents::{
 use crate::client::{self, ConnectionHandle, link_failure, with_stderr};
 use crate::profile::AcpProfile;
 use crate::{content, reducer};
-
-/// How long a `session/close` is given before the transport is torn down anyway.
-///
-/// Short on purpose: closing is the call a host makes when it is already shutting down, and an agent
-/// that will not answer must not hold that open. Ending the transport ends the session either way.
-const CLOSE_GRACE: Duration = Duration::from_secs(3);
 
 /// One conversation with one ACP agent.
 pub struct AcpSession {
@@ -252,6 +245,31 @@ pub(crate) fn refuse_unsupported_reset(patch: &ConfigurationPatch) -> Result<()>
     mango_external_agents::configuration::refuse_unsupported_reset(patch)
 }
 
+/// Marks one owned prompt as cancelled and asks the agent to stop it.
+///
+/// The start gate keeps this notification behind the prompt it belongs to. A stream-drop or
+/// transcript-overflow path may call it before a host calls `Session::cancel`; only the first caller
+/// records a reason and writes the notification.
+fn request_native_cancel(
+    state: &client::SessionState,
+    connection: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    session_id: AcpSessionId,
+    reason: CancelReason,
+) -> bool {
+    let _starting = state.lock_turn_start();
+    if !state.begin_cancellation(reason) {
+        return true;
+    }
+    if connection
+        .send_notification(CancelNotification::new(session_id))
+        .is_ok()
+    {
+        return true;
+    }
+    state.record_cancel_failure("ACP session/cancel could not be queued");
+    false
+}
+
 #[async_trait::async_trait]
 impl Session for AcpSession {
     fn state(&self) -> &mango_external_agents::SessionState {
@@ -271,12 +289,12 @@ impl Session for AcpSession {
         )
         .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
-        let (sink, events) = EventSink::new(
+        let (sink, events) = EventSink::with_limits(
             self.session_state.snapshot().ids.session_id.clone(),
             request.turn_id.clone(),
             request.attempt,
             Arc::clone(self.host.clock()),
-            self.host.limits().turn_channel_capacity,
+            self.host.limits(),
         );
         // A configuration update and the single ACP prompt slot are one transaction. A second
         // caller must not merge from an old snapshot while this one accepts its settings, then win
@@ -327,6 +345,11 @@ impl Session for AcpSession {
             if let Some((turn, _, _)) = self.connection_state.end_turn_matching(&handle) {
                 let _ = turn.finish();
             }
+            if self.lifecycle.is_closed() {
+                return Err(
+                    Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
+                );
+            }
             return Err(error.with_dispatch(Dispatch::NotSubmitted));
         }
 
@@ -373,14 +396,75 @@ impl Session for AcpSession {
             (sent, retry_cancel_error)
         };
 
+        let stream = TurnStream::accepted(
+            request.turn_id,
+            request.attempt,
+            native_turn_id.clone(),
+            events,
+        );
+        if retry_cancel_error.is_some() {
+            // The prompt is already on the wire. Preserve its owned stream rather than returning an
+            // error that discards the only place its terminal can be reported, then stop the peer
+            // before releasing this generation for another ACP prompt.
+            self.connection.shutdown(CancelReason::Shutdown).await;
+            if let Some((turn, _, _)) = self.connection_state.end_turn_matching(&handle)
+                && turn.finish()
+            {
+                let _ = turn
+                    .sink
+                    .fail(link_failure(String::from(
+                        "ACP session/cancel could not be queued after prompt admission",
+                    )))
+                    .await;
+            }
+            return Ok(stream.with_dispatch(Dispatch::AcceptanceUnknown));
+        }
+
         let state = Arc::clone(&self.connection_state);
-        let connection = Arc::clone(&self.connection);
+        let outgoing = self.connection.connection().clone();
+        let control = Arc::clone(self.connection.control());
+        let driver_done = self.connection.driver_done().clone();
+        let limits = *self.host.limits();
+        let native_session_id = self.native_session_id.clone();
         let profile = Arc::clone(&self.profile);
         // Spawned rather than awaited: the response *is* the turn's end, and a host that could not
         // read its events until then would receive the whole turn at once or not at all.
         // `block_task` is sound here for the same reason — this task is not the dispatch loop.
         tokio::spawn(async move {
-            let outcome = sent.block_task().await;
+            let mut prompt = Box::pin(sent.block_task());
+            let outcome = tokio::select! {
+                outcome = &mut prompt => Some(outcome),
+                () = handle.sink.closed() => {
+                    if request_native_cancel(&state, &outgoing, native_session_id.clone(), CancelReason::Requested) {
+                        tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
+                    } else {
+                        None
+                    }
+                },
+                () = handle.sink.terminated() => {
+                    if request_native_cancel(&state, &outgoing, native_session_id.clone(), CancelReason::Requested) {
+                        tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
+                    } else {
+                        None
+                    }
+                },
+                () = handle.cancellation.cancelled() => {
+                    // `cancel` records a failed notification while it holds this gate. Wait until
+                    // that synchronous write has settled before deciding the stream's outcome.
+                    let _starting = state.lock_turn_start();
+                    drop(_starting);
+                    tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
+                },
+                () = driver_done.cancelled() => None,
+            };
+            if outcome.is_none() {
+                let _ = mango_external_agents::process::stop_process_with_limits(
+                    control.as_ref(),
+                    CancelReason::Shutdown,
+                    &limits,
+                )
+                .await;
+            }
             // Matched, not taken: a `close` may have ended this turn already, and a *later* turn may
             // have started since, so an unconditional take would terminate a conversation that is not
             // this prompt's.
@@ -392,6 +476,7 @@ impl Session for AcpSession {
             if !turn.finish() {
                 return;
             }
+            let cancel_failure = state.take_cancel_failure();
             if turn.approvals.flush(&turn.sink).await.is_err() {
                 return;
             }
@@ -401,16 +486,30 @@ impl Session for AcpSession {
                 }
             }
             match outcome {
-                Ok(response) if reducer::was_cancelled(response.stop_reason) => {
+                None => {
+                    if let Some(message) = cancel_failure {
+                        let _ = turn.sink.fail(link_failure(message)).await;
+                    } else if !turn.sink.is_terminal() {
+                        let _ = turn
+                            .sink
+                            .cancel(cancel_reason.unwrap_or(CancelReason::Requested))
+                            .await;
+                    }
+                }
+                Some(Ok(response)) if reducer::was_cancelled(response.stop_reason) => {
                     let reason = cancel_reason.unwrap_or(CancelReason::Requested);
                     let _ = turn.sink.cancel(reason).await;
                 }
-                Ok(_) => {
+                Some(Ok(_)) => {
                     let _ = turn.sink.complete().await;
                 }
-                Err(error) => {
+                Some(Err(error)) => {
+                    if let Some(reason) = cancel_reason {
+                        let _ = turn.sink.cancel(reason).await;
+                        return;
+                    }
                     let message = if agent_client_protocol::is_incoming_transport_closed(&error) {
-                        with_stderr(&error.message, connection.control().as_ref())
+                        with_stderr(&error.message, control.as_ref())
                     } else {
                         error.message.clone()
                     };
@@ -422,16 +521,7 @@ impl Session for AcpSession {
             }
         });
 
-        if let Some(error) = retry_cancel_error {
-            return Err(error.with_dispatch(Dispatch::AcceptanceUnknown));
-        }
-
-        Ok(TurnStream::accepted(
-            request.turn_id,
-            request.attempt,
-            native_turn_id,
-            events,
-        ))
+        Ok(stream)
     }
 
     async fn respond(&self, response: PermissionResponse) -> Result<()> {
@@ -461,13 +551,19 @@ impl Session for AcpSession {
         // is queued to the transport and the agent reports the outcome on the prompt response. The
         // start guard holds new prompts back until this notification is queued, so it cannot cancel
         // a later ACP prompt on the same session.
-        self.connection
+        let result = self
+            .connection
             .connection()
             .send_notification(CancelNotification::new(self.native_session_id.clone()))
             .map_err(|_| Error::Link {
                 peer: format!("ACP agent {}", self.profile.id),
                 message: String::from("a link that could not carry session/cancel"),
-            })
+            });
+        if result.is_err() {
+            self.connection_state
+                .record_cancel_failure("ACP session/cancel could not be queued");
+        }
+        result
     }
 
     async fn close(&self, reason: CloseReason) -> Result<()> {
@@ -482,32 +578,20 @@ impl Session for AcpSession {
             self.session_state.set_status(SessionStatus::Closing);
             let _starting = self.connection_state.lock_turn_start();
             self.connection_state.begin_cancellation(reason.into());
-            self.connection_state.end_turn()
+            self.connection_state.turn()
         };
 
         // Every question the agent is still waiting on is withdrawn first, while the transport is
         // still up: an unanswered one would leave the agent waiting for a client that has gone.
         //
-        // Ordering is load-bearing. The turn is ended and marked finished *first*, before the
-        // `session/close` handshake, because that handshake awaits the agent for up to `CLOSE_GRACE`
-        // — and a turn still live across it is a window in which the agent can raise a fresh
-        // `session/request_permission` that this library would park, or worse hand to a broker that
-        // answers `Allow`. Granting a permission while the session is being torn down is backwards in
-        // general and absurd under `CloseReason::ConsentRevoked`, where the machine's owner has just
-        // withdrawn the permission to run the agent at all.
-        //
-        // Taken out in a statement of its own: an `if let` scrutinee's guard lives through the body,
-        // so cancelling under it would hold the turn lock across an `emit` that a host which stopped
-        // reading parks indefinitely — and the calls waiting on that lock are the ones a host uses
-        // to get out of it.
-        let terminal = ending
-            .as_ref()
-            .is_some_and(super::client::TurnHandle::finish);
+        // Keep the owner installed through the close handshake and process shutdown. A prompt task
+        // that completes during either phase can then settle its own stream; otherwise close claims
+        // the same generation only after no native work can still report against it.
         self.connection_state.withdraw_pending();
 
         if self.agent_capabilities.session_capabilities.close.is_some() {
             let _ = tokio::time::timeout(
-                CLOSE_GRACE,
+                self.host.limits().shutdown_timeout,
                 self.request(
                     "session/close",
                     CloseSessionRequest::new(self.native_session_id.clone()),
@@ -520,32 +604,24 @@ impl Session for AcpSession {
             self.connection_state.withdraw_pending();
         }
 
-        if let Some(turn) = ending
-            && terminal
+        self.connection.shutdown(reason.into()).await;
+
+        if let Some(handle) = ending
+            && let Some((turn, _, closing)) = self.connection_state.end_turn_matching(&handle)
+            && turn.finish()
         {
             // The same debts the prompt's own task settles: an open reasoning block and an unfinished
             // plan activity. A turn cut short by a close owes them just as much as one that ran out.
-            let closing = self.connection_state.finish_reducing();
-            // Spawned rather than awaited under a timeout. `close` must not hang on a host that
-            // stopped reading its own stream — but a timeout that *dropped* this future would send
-            // nothing at all: `mpsc::Sender::send` is cancel-safe, so abandoning it mid-send loses the
-            // value, and the host would get a stream that just ends with no `Cancelled` and no
-            // `Completed`. The core's conformance suite requires exactly one terminal. Spawned, the
-            // terminal lands the moment the host reads, or is dropped when the host drops the stream.
-            tokio::spawn(async move {
-                if turn.approvals.flush(&turn.sink).await.is_err() {
-                    return;
-                }
-                for kind in closing {
-                    if turn.sink.emit(kind).await.is_err() {
-                        return;
-                    }
-                }
-                let _ = turn.sink.cancel(reason.into()).await;
-            });
+            // Core terminal commitment reserves delivery independently of transcript capacity, so
+            // close can settle its owned stream here without leaving a task behind for a reader that
+            // may never resume.
+            let _ = turn.approvals.flush(&turn.sink).await;
+            for kind in closing {
+                let _ = turn.sink.emit(kind).await;
+            }
+            let _ = turn.sink.cancel(reason.into()).await;
         }
 
-        self.connection.shutdown(reason.into()).await;
         self.session_state.set_status(SessionStatus::Closed);
         Ok(())
     }

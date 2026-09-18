@@ -15,14 +15,13 @@
 //! future is `Send`, so nothing here needs a `LocalSet` or a thread of its own, and a
 //! `ConnectionTo<Agent>` sits inside a `Session` trait object directly.
 //!
-//! # Why handlers hold the dispatch loop
+//! # Why handlers leave the dispatch loop promptly
 //!
-//! The loop runs one handler to completion before the next message, so a notification handler that
-//! awaits [`EventSink::emit`] on a full channel stops the agent being read — which is exactly the
-//! backpressure the core's bounded turn channel exists to apply. The permission handler is the
-//! opposite case: it must *not* wait for an answer, because the answer arrives through
-//! [`Session::respond`](mango_external_agents::Session::respond) on another task. It parks the
-//! agent's [`Responder`] in a map and returns, and answering is a synchronous send.
+//! The loop runs one handler to completion before the next message. [`EventSink::emit`] therefore
+//! only reserves bounded transcript capacity and returns; an overflow owns a terminal outcome
+//! instead of parking ACP dispatch behind a slow host. Permission callbacks likewise park their
+//! responder and move broker deliberation to a bounded task, because an answer may arrive through
+//! [`Session::respond`](mango_external_agents::Session::respond) on another task.
 //!
 //! No lock in this module is held across an await. [`Reducer`] is pure, so the events for one frame
 //! are computed under the guard and emitted after it drops.
@@ -46,6 +45,7 @@ use mango_external_agents::permission::{
 use mango_external_agents::session::CancelReason;
 use mango_external_agents::{
     Clock, Error, EventSink, HostContext, ProcessControl, Result, VendorError,
+    process::stop_process_with_limits,
 };
 
 use crate::approval_events::ApprovalEvents;
@@ -87,6 +87,8 @@ pub(crate) struct TurnHandle {
     /// task; resuming afterwards would put the rest of that frame's events *after* the terminal,
     /// which the core's conformance suite refuses. Checked before every emit.
     finished: Arc<AtomicBool>,
+    /// Wakes the prompt owner when native cancellation starts.
+    pub(crate) cancellation: mango_external_agents::CancelToken,
     pub(crate) approvals: Arc<ApprovalEvents>,
 }
 
@@ -109,7 +111,7 @@ struct PendingApproval {
 }
 
 impl PendingApproval {
-    /// Register only a question that is answerable or has already reached its deadline.
+    /// Registers the host-facing announcement once the question becomes answerable.
     fn announce(&mut self) {
         if self.announced {
             return;
@@ -197,6 +199,8 @@ pub(crate) struct SessionState {
     /// the response coming back. Flattening it would report a shutdown or a withdrawn consent as
     /// "you stopped this turn".
     cancel_reason: Mutex<Option<CancelReason>>,
+    /// A cancellation notification that could not reach the agent.
+    cancel_failure: Mutex<Option<String>>,
     /// Touched only by the notification handler, which the dispatch loop runs one at a time.
     reducer: Mutex<Reducer>,
     /// Questions the agent is waiting on, keyed by [`SessionState::mint_approval_id`]'s id.
@@ -242,6 +246,7 @@ impl SessionState {
             turn_start: Mutex::new(()),
             generations: AtomicU64::new(0),
             cancel_reason: Mutex::new(None),
+            cancel_failure: Mutex::new(None),
             reducer: Mutex::new(Reducer::new()),
             pending: Mutex::new(HashMap::new()),
             next_approval: AtomicU64::new(0),
@@ -272,12 +277,7 @@ impl SessionState {
     ) -> Result<TurnHandle> {
         let mut turn = self.lock_turn();
         if turn.is_some() {
-            return Err(Error::Protocol {
-                expected: String::from(
-                    "no turn in flight: ACP v1 runs one session/prompt at a time",
-                ),
-                received: String::from("a turn that has not ended"),
-            });
+            return Err(Error::Busy);
         }
         // A question belongs to a turn, and a turn that is starting has none. Anything still parked
         // here outlived the turn it was asked under and would otherwise be answerable during this one.
@@ -293,11 +293,16 @@ impl SessionState {
             level,
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
             finished: Arc::new(AtomicBool::new(false)),
+            cancellation: mango_external_agents::CancelToken::new(),
             approvals: Arc::new(ApprovalEvents::default()),
         };
         *turn = Some(handle.clone());
         *self.lock_reducer() = Reducer::new();
         *self.lock_cancel_reason() = None;
+        *self
+            .cancel_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         drop(turn);
         for responder in stale {
             let _ = responder.respond(permission::cancelled());
@@ -328,15 +333,15 @@ impl SessionState {
     /// cannot be parked after this drains and an already parked request cannot be allowed after this
     /// call starts. The first reason wins because it is the action a host initiated first.
     pub(crate) fn begin_cancellation(&self, reason: CancelReason) -> bool {
-        let turn = self.lock_turn();
-        if turn.is_none() {
+        let turn = self.lock_turn().clone();
+        let Some(turn) = turn else {
             return false;
-        }
+        };
         let mut cancelling = self.lock_cancel_reason();
         cancelling.get_or_insert(reason);
         let pending = self.take_pending_responders();
         drop(cancelling);
-        drop(turn);
+        turn.cancellation.cancel();
         for responder in pending {
             let _ = responder.respond(permission::cancelled());
         }
@@ -346,6 +351,22 @@ impl SessionState {
     /// Whether the current prompt has been cancelled before its wire request was sent.
     pub(crate) fn is_cancelling(&self) -> bool {
         self.lock_cancel_reason().is_some()
+    }
+
+    /// Records a failed cancellation write for the prompt owner to publish on its owned stream.
+    pub(crate) fn record_cancel_failure(&self, message: impl Into<String>) {
+        *self
+            .cancel_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(message.into());
+    }
+
+    /// Takes the cancellation write failure once the matching prompt owns terminal delivery.
+    pub(crate) fn take_cancel_failure(&self) -> Option<String> {
+        self.cancel_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// The running turn, if there is one.
@@ -358,13 +379,6 @@ impl SessionState {
         self.lock_turn()
             .as_ref()
             .is_some_and(|current| current.generation == handle.generation)
-    }
-
-    /// Ends whatever turn is running, whoever it belongs to.
-    ///
-    /// For `close`, which ends the session and therefore every turn in it.
-    pub(crate) fn end_turn(&self) -> Option<TurnHandle> {
-        self.lock_turn().take()
     }
 
     /// Ends this turn, and only this turn.
@@ -415,11 +429,6 @@ impl SessionState {
         }
     }
 
-    /// The events that close out a turn: the other half of an open reasoning block.
-    pub(crate) fn finish_reducing(&self) -> Vec<EventKind> {
-        self.lock_reducer().finish()
-    }
-
     /// Withdraws every question still waiting.
     ///
     /// Called wherever a turn ends, not only on `close`, because a question cannot outlive the turn it
@@ -462,7 +471,13 @@ impl SessionState {
             pending.responder.respond(permission::cancelled())?;
             return Ok(false);
         }
-        self.lock_pending().insert(id, pending);
+        let mut parked = self.lock_pending();
+        if parked.len() >= self.limits.max_pending_requests {
+            drop(parked);
+            pending.responder.respond(permission::cancelled())?;
+            return Ok(false);
+        }
+        parked.insert(id, pending);
         Ok(true)
     }
 
@@ -515,9 +530,9 @@ impl SessionState {
         pending.announce();
         let Some(option_id) = pending.expiry_option.as_ref() else {
             cancelling.get_or_insert(CancelReason::Timeout);
-            self.withdraw_pending();
             let sent = pending.connection.send_notification(pending.cancel);
             pending.responder.respond(permission::cancelled())?;
+            self.withdraw_pending();
             sent?;
             return Ok(Answered::AlreadyResolved);
         };
@@ -636,14 +651,12 @@ impl SessionState {
 
 /// One `session/update` notification, reduced and emitted.
 ///
-/// Never fails the handler, and — deliberately — never ends the turn. A host that dropped its
-/// `TurnStream` has closed the sink, not finished the `session/prompt` that is still in flight, so
-/// freeing the turn slot here would let a second prompt onto a wire that has no way to tell two turns
-/// apart, and would hand this turn's completion task a *later* turn's handle to terminate. The slot is
-/// the prompt's to release; a closed sink simply makes every later frame fail fast.
+/// Never fails the handler. A closed or overflowed sink wakes the prompt owner, which cancels native
+/// work before it releases this generation; freeing the slot here would let a second prompt onto a
+/// wire that has no way to tell two turns apart. The nonblocking sink makes later frames fail fast.
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
-    // Cloned out from under its lock before the first emit: a handler parked on a full channel must
-    // not be holding the lock that `cancel` and `close` need to unpark it.
+    // Cloned out from under its lock before the first emit, so cancellation and close can always
+    // claim their generation while a callback is reducing a frame.
     let Some(turn) = state.turn() else {
         return;
     };
@@ -654,8 +667,8 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
         state.apply_fact(fact);
     }
     for kind in events {
-        // Re-checked each time round: this handler can be parked on a full channel while `close`
-        // emits the terminal on another task, and resuming would put the rest of this frame after it.
+        // Re-checked each time round: close can commit the terminal after reduction, and no later
+        // event may follow it.
         if turn.is_finished() || turn.sink.emit(kind).await.is_err() {
             return;
         }
@@ -743,36 +756,45 @@ async fn on_request_permission(
 
     expire_pending(state, &turn, id.clone(), deadline, done);
 
-    // Decided before the host is told, so a policy the host already installed does not race the
-    // interface the host would otherwise render. The dispatch loop is held while the broker thinks,
-    // which is correct: the agent is waiting on this question either way.
-    //
-    // The level decides *whether* the broker is asked at all, and that is the whole point. A
-    // read-only session must never reach `broker_response`, because a policy answering `Allow` there
-    // becomes an allowing option id on the wire — so the one level that exists to grant nothing would
-    // grant. When a read-only session cannot refuse (the agent offered no refusing option) the answer
-    // is nobody's but a person's, which is what leaving `decided` empty arranges.
-    let decided = match turn.level {
-        Some(PermissionLevel::ReadOnly) => standing_refusal(&question),
-        Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => deadline
-            .run(broker_response(state.broker.as_ref(), &question))
-            .await
-            .flatten(),
-    };
-
-    state.announce_pending(&id, decided.is_none());
-    if turn.approvals.flush(&turn.sink).await.is_err() {
-        return state.withdraw_pending_by_id(&id);
-    }
-    if let Some(decision) = decided {
-        state.respond_pending(
-            &id,
-            permission::selected(&decision.option_id),
-            decision.source,
-        )?;
-        let _ = turn.approvals.flush(&turn.sink).await;
-    }
+    resolve_pending(Arc::clone(state), turn, id, question, deadline);
     Ok(())
+}
+
+/// Resolves one parked permission away from ACP's serialized dispatch loop.
+///
+/// The pending-map admission cap limits these tasks. `ApprovalDeadline::run` bounds policy work,
+/// so a broker that never decides cannot keep an orphan task after the request expires.
+fn resolve_pending(
+    state: Arc<SessionState>,
+    turn: TurnHandle,
+    id: String,
+    question: mango_external_agents::PermissionRequest,
+    deadline: ApprovalDeadline,
+) {
+    tokio::spawn(async move {
+        let decided = match turn.level {
+            Some(PermissionLevel::ReadOnly) => standing_refusal(&question),
+            Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => deadline
+                .run(broker_response(state.broker.as_ref(), &question))
+                .await
+                .flatten(),
+        };
+        if !state.announce_pending(&id, decided.is_none()) {
+            return;
+        }
+        if turn.approvals.flush(&turn.sink).await.is_err() {
+            let _ = state.withdraw_pending_by_id(&id);
+            return;
+        }
+        if let Some(decision) = decided {
+            let _ = state.respond_pending(
+                &id,
+                permission::selected(&decision.option_id),
+                decision.source,
+            );
+            let _ = turn.approvals.flush(&turn.sink).await;
+        }
+    });
 }
 
 /// Starts enforcement before broker deliberation or event backpressure can park the handler.
@@ -823,6 +845,8 @@ pub(crate) struct ConnectionHandle {
     control: Arc<dyn ProcessControl>,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>>,
+    /// Host-owned bounds for tearing down the dispatch loop and child process.
+    limits: mango_external_agents::Limits,
     /// Fires once the dispatch loop is over, whichever way it ended.
     ///
     /// Separate from `driver` because both are needed at once: `shutdown` takes the join handle to
@@ -921,6 +945,7 @@ pub(crate) async fn drive(
         control,
         shutdown: Mutex::new(Some(shutdown_tx)),
         driver: Mutex::new(Some(driver)),
+        limits: state.limits,
         driver_done,
     })
 }
@@ -969,16 +994,19 @@ impl ConnectionHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(driver) = driver {
-            // Bounded: an agent that never releases the transport must not hold a close open.
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, driver).await;
+        if let Some(mut driver) = driver {
+            let exited = tokio::time::timeout(self.limits.shutdown_timeout, &mut driver)
+                .await
+                .is_ok();
+            let _ = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
+            if !exited {
+                let _ = tokio::time::timeout(self.limits.shutdown_timeout, &mut driver).await;
+            }
+            return;
         }
-        let _ = self.control.kill(reason).await;
+        let _ = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
     }
 }
-
-/// How long the dispatch loop is given to wind down before the child is ended anyway.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Sends one request under the host's own deadline and maps whatever came back.
 ///
@@ -1182,7 +1210,9 @@ mod tests {
         let first = state
             .begin_turn(sink(&host, "turn-1"), Some(PermissionLevel::Default))
             .expect("expected the first turn");
-        state.end_turn();
+        state
+            .end_turn_matching(&first)
+            .expect("expected the installed handle to end");
 
         assert!(
             !state.can_submit_prompt(&first),

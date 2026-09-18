@@ -5,7 +5,7 @@ official [`agent-client-protocol`][sdk] crate. What differs between agents is no
 the argv, the version string, the login command and the documents a host's disclosure links, and those
 live in a **profile**. Adding an agent is a table entry, not a new harness.
 
-Facts here were read on 2026-09-13 against the pages linked inline. Re-verify before relying on them.
+Facts here were read on 2026-09-17 against the pages linked inline. Re-verify before relying on them.
 
 [acp]: https://agentclientprotocol.com/protocol/overview
 [sdk]: https://crates.io/crates/agent-client-protocol
@@ -58,12 +58,14 @@ signal, with the whole thing on one spawned task per session.
 This works because 2.1.0's connection is `Send`: `ConnectTo` is `Send + 'static`, its future is `Send`,
 and `ConnectionTo<Agent>` is `Clone + Send + Sync`. No `LocalSet` and no thread per session.
 
-Handlers hold the dispatch loop, which is load-bearing in both directions:
+Handlers leave the dispatch loop promptly:
 
-- A `session/update` handler awaiting `EventSink::emit` on a full channel stops the agent being read.
-  That **is** the backpressure the core's bounded turn channel exists to apply.
+- A `session/update` handler reserves bounded transcript capacity and returns. If the transcript
+  budget is exhausted, the stream commits its terminal error and the prompt owner cancels native work;
+  dispatch never waits for a host to read.
 - A `session/request_permission` handler must not wait for an answer, because the answer arrives
-  through `Session::respond` on another task. It parks the agent's responder and returns.
+  through `Session::respond` on another task. It parks the agent's responder and returns; broker
+  deliberation is a separately bounded callback, capped by `Limits::max_pending_requests`.
 
 Every request except `session/prompt` is bounded by `Limits::request_timeout` and fails with
 `Error::Timeout` naming the method. The prompt is a turn and may take as long as the agent needs.
@@ -72,10 +74,11 @@ Every request except `session/prompt` is bounded by `Limits::request_timeout` an
 
 One `session/prompt` in flight per session. The response *is* the turn's end, so two prompts would race
 for one stream of updates with nothing on the wire to tell them apart; a second is refused with
-`Error::Protocol` rather than queued. The slot belongs to the prompt: a host that drops its
-`TurnStream` closes the sink but does not finish the prompt, so the slot stays taken until the agent
-answers or the session closes — and each turn carries a generation, so a prompt that answers late can
-only ever end its own turn.
+`Error::Busy` rather than queued. The slot belongs to the prompt. Dropping its `TurnStream`, an
+overflow, or an explicit cancel first sends ACP's `session/cancel`, waits for `Limits::kill_grace`,
+then escalates through the host's process control if the prompt remains live. The owner remains
+installed until that native work can no longer report, and each turn carries a generation so a late
+prompt can only ever end its own turn.
 
 `start_turn` and `close` share the core lifecycle gate while they synchronously claim the prompt slot
 or close the session. The gate is released before every await, so a close either sees a claimed prompt
@@ -333,16 +336,16 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 
 ## Sessions
 
-| Method                  | Behaviour                                                                                                                       |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `start_turn`            | `session/prompt`; one in flight                                                                                                 |
-| `respond`               | answers one parked `session/request_permission`; an answer to an already-settled question is accepted and sends nothing further |
-| `cancel`                | withdraws every pending question, then `session/cancel`, recording the host's reason first                                      |
-| `close`                 | idempotent: withdraws every pending question, sends `session/close` when advertised, ends the turn, then ends the child         |
-| `steer`                 | `Error::NotSupported`                                                                                                           |
-| `list_sessions`         | `session/list` when `sessionCapabilities.list`, else `Error::NotSupported`                                                      |
-| `start_review`          | `Error::NotSupported`                                                                                                           |
-| `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                    |
+| Method                  | Behaviour                                                                                                                        |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `start_turn`            | `session/prompt`; one in flight                                                                                                  |
+| `respond`               | answers one parked `session/request_permission`; an answer to an already-settled question is accepted and sends nothing further  |
+| `cancel`                | withdraws every pending question, then `session/cancel`, recording the host's reason first                                       |
+| `close`                 | idempotent: withdraws every pending question, sends `session/close` when advertised, ends the child, then settles the owned turn |
+| `steer`                 | `Error::NotSupported`                                                                                                            |
+| `list_sessions`         | `session/list` when `sessionCapabilities.list`, else `Error::NotSupported`                                                       |
+| `start_review`          | `Error::NotSupported`                                                                                                            |
+| `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                     |
 
 A resume against an agent that does not advertise `loadSession` is `Error::Protocol` under
 `ResumeMode::Strict`, and a fresh conversation with `SessionSnapshot::fallback_reason` set otherwise.
@@ -369,12 +372,6 @@ never going to work.
   agent. This harness sends an empty `session/new.mcpServers` and reports `mcp_passthrough: false`.
 - **No model selection.** ACP v1 has no surface for one, so a `Configuration` naming a model or a
   reasoning effort is refused rather than silently ignored, and `model_catalog` is never reported.
-- **A host that drops a `TurnStream` mid-turn stops reading, and nothing else.** No `session/cancel` is
-  sent, so the agent finishes its turn at its own pace and the turn slot stays taken until it answers
-  or the session closes — which means a further `start_turn` is refused in the meantime. That is the
-  honest reading of a closed channel: the host abandoned the *events*, not the work, and the core has
-  no signal that distinguishes the two. Sending the agent's own cancel there needs a drop hook on
-  `TurnStream`, and `Session::cancel` is the call that does it today.
 - **Public OpenCode contract capture.** `mea capture --harness acp --profile opencode` records the
   installed CLI's version and its v1 `initialize` answer under `fixtures/acp/opencode/contract/`.
   It sends no `authenticate` or `session/new` request. The capture keeps each auth method's `type`,

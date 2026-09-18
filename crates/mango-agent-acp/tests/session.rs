@@ -685,7 +685,8 @@ async fn cancellation_withdraws_a_permission_that_arrives_after_cancel() {
 }
 
 /// ACP v1 runs one `session/prompt` at a time: the response *is* the turn's end, so two prompts would
-/// race for one stream of updates with nothing on the wire to tell them apart.
+/// race for one stream of updates with nothing on the wire to tell them apart. The refusal is typed
+/// as busy, so a host can wait for the owned turn instead of treating active work as malformed input.
 #[tokio::test]
 async fn a_second_turn_is_refused_while_one_is_in_flight() {
     let (session, _launcher) = open(
@@ -703,10 +704,7 @@ async fn a_second_turn_is_refused_while_one_is_in_flight() {
         .await
         .expect_err("expected a refusal, received a second turn");
 
-    assert!(
-        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
-        "received {error:?}"
-    );
+    assert!(matches!(error.cause(), Error::Busy), "received {error:?}");
 }
 
 #[tokio::test]
@@ -1189,10 +1187,7 @@ async fn a_dropped_turn_stream_does_not_free_the_slot_while_the_prompt_is_in_fli
     }
 
     let error = refusal(session.start_turn(TurnRequest::new("turn-2", "two")).await);
-    assert!(
-        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
-        "received {error:?}"
-    );
+    assert!(matches!(error.cause(), Error::Busy), "received {error:?}");
 }
 
 /// A rejected concurrent turn has not run, so its overrides cannot become the defaults a later turn
@@ -1215,10 +1210,7 @@ async fn a_rejected_concurrent_turn_does_not_change_the_inherited_configuration(
             )
             .await,
     );
-    assert!(
-        matches!(error.cause(), Error::Protocol { expected, .. } if expected.contains("one session/prompt")),
-        "received {error:?}"
-    );
+    assert!(matches!(error.cause(), Error::Busy), "received {error:?}");
     assert_eq!(
         session.snapshot().configuration.accepted,
         Configuration::unknown().with_level(PermissionLevel::Default),
@@ -1682,6 +1674,184 @@ fn recording_host(launcher: &KillRecordingLauncher) -> HostContext {
         .client_info("mea-tests", "0.1.0")
         .build()
         .expect("expected a host")
+}
+
+fn bounded_recording_host(launcher: &KillRecordingLauncher) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+/// A launcher whose pipe refuses just `session/cancel`, after the prompt was accepted.
+#[derive(Clone)]
+struct CancelFailingLauncher {
+    inner: FakeLauncher,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CancelFailingLauncher {
+    fn new(inner: FakeLauncher) -> Self {
+        Self {
+            inner,
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for CancelFailingLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        let mut process = self.inner.spawn(spec).await?;
+        if let Some(stdin) = process.stdin.take() {
+            process.stdin = Some(Box::new(CancelFailingSink {
+                inner: stdin,
+                attempts: Arc::clone(&self.attempts),
+            }));
+        }
+        Ok(process)
+    }
+}
+
+struct CancelFailingSink {
+    inner: Box<dyn mango_external_agents::ByteSink>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSink for CancelFailingSink {
+    async fn write_all(&mut self, bytes: &[u8]) -> mango_external_agents::Result<()> {
+        if bytes
+            .windows(b"session/cancel".len())
+            .any(|window| window == b"session/cancel")
+        {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            return Err(Error::Link {
+                peer: String::from("fake ACP agent"),
+                message: String::from("the test pipe rejected session/cancel"),
+            });
+        }
+        self.inner.write_all(bytes).await
+    }
+
+    async fn close(&mut self) -> mango_external_agents::Result<()> {
+        self.inner.close().await
+    }
+}
+
+fn cancel_failing_host(launcher: &CancelFailingLauncher) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+/// A prompt already submitted has an owned stream even if its subsequent cancel notification fails.
+#[tokio::test]
+async fn a_failed_cancel_after_prompt_acceptance_keeps_the_owned_terminal_stream() {
+    let inner = FakeLauncher::new();
+    inner.push(
+        FakeAcpAgent::new()
+            .asking_for_approval(Approval::Once)
+            .process(),
+    );
+    let launcher = CancelFailingLauncher::new(inner.clone());
+    let session = AcpHarness::new(profile())
+        .open_session(&cancel_failing_host(&launcher), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected an accepted prompt stream");
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("queueing a notification is asynchronous");
+    let events = drain(&mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the accepted stream to own the cancellation outcome, received {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::Cancelled {
+                reason: CancelReason::Requested
+            }
+        )),
+        "expected the host cancellation reason before the terminal, received {events:?}"
+    );
+    assert_eq!(
+        launcher.attempts(),
+        1,
+        "expected one failed cancellation write"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected session cleanup");
+    assert_eq!(
+        inner.live_children(),
+        0,
+        "expected bounded cleanup after cancellation failure"
+    );
+}
+
+/// Dropping the stream actively cancels the native turn, then reaps a peer that ignores cancellation.
+#[tokio::test]
+async fn a_dropped_stream_reaps_an_agent_that_ignores_native_cancellation() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let launcher = KillRecordingLauncher::new(inner.clone());
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &bounded_recording_host(&launcher),
+            OpenSession::new("chat-1"),
+        )
+        .await
+        .expect("expected a session");
+
+    let turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected a turn");
+    drop(turn);
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while inner.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected cancellation escalation to reap the agent");
+    assert!(
+        launcher.kills() >= 1,
+        "expected the host process control to terminate the ignoring agent"
+    );
 }
 
 /// A failed `open_session` must not leave an agent running with nothing driving it. The dispatch loop
