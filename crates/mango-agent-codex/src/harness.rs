@@ -67,14 +67,15 @@ const CAPABILITIES: Capabilities = Capabilities {
     structured_streaming: true,
     reasoning_stream: true,
     interactive_approvals: true,
-    // Neither is implemented yet: the app-server has no documented question surface distinct from
-    // an approval, and settings can only be changed by opening a new turn, not mid-session.
-    questions: false,
+    // Driven via `item/tool/requestUserInput`, which the pinned build's own schema marks
+    // EXPERIMENTAL.
+    questions: true,
     resume: true,
     model_catalog: true,
     // Not enumerated: `mea capture` has not yet been run against a settings-listing surface, and an
     // empty catalog is the honest answer until one is.
     configuration_catalog: false,
+    // Settings can only be changed by opening a new turn, not mid-session.
     session_configuration: false,
     images: true,
     usage_reporting: true,

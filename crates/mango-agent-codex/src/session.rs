@@ -18,7 +18,11 @@ use mango_external_agents::configuration::{
 };
 use mango_external_agents::error::{Error, ErrorCode, Result, VendorError};
 use mango_external_agents::event::{EventKind, SessionId, TurnId};
-use mango_external_agents::interaction::InteractionId;
+use mango_external_agents::interaction::{
+    Interaction, InteractionId, InteractionKind, Question, QuestionForm, QuestionId,
+    QuestionOption, QuestionOptionId, QuestionOutcome, QuestionRequest, QuestionResponse,
+    UnsupportedQuestion,
+};
 use mango_external_agents::jsonrpc::{
     Client, JsonRpcError, PeerHandler, PeerTermination, RequestId, ServerRequestOutcome,
 };
@@ -38,7 +42,11 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify, oneshot, watch};
 
 use crate::approvals::{self, PendingApproval};
-use crate::protocol::approvals::{ApprovalDecisionValue, ApprovalResponse, ServerRequest};
+use crate::protocol::approvals::{
+    McpServerElicitationRequestResponse, ServerAnswer, ServerRequest, ToolRequestUserInputAnswer,
+    ToolRequestUserInputOption, ToolRequestUserInputParams, ToolRequestUserInputQuestion,
+    ToolRequestUserInputResponse,
+};
 use crate::protocol::method;
 use crate::protocol::notifications::Notification;
 use crate::protocol::requests::{
@@ -166,6 +174,12 @@ pub(crate) struct Shared {
     turn: Mutex<Option<ActiveTurn>>,
     recent_completed_turns: Mutex<VecDeque<String>>,
     pending: Mutex<HashMap<InteractionId, PendingEntry>>,
+    /// Question rounds the server is waiting on.
+    ///
+    /// Separate from [`Shared::pending`]: a question grants no authority, so it never touches a
+    /// [`PermissionBroker`](mango_external_agents::PermissionBroker), and its wire answer takes a
+    /// different shape than any approval's.
+    pending_questions: Mutex<HashMap<InteractionId, PendingQuestion>>,
     /// Whether this connection can accept more work.
     ///
     /// A start request that times out may already be running at the vendor, so its active slot
@@ -205,6 +219,7 @@ impl Shared {
             turn: Mutex::new(None),
             recent_completed_turns: Mutex::new(VecDeque::new()),
             pending: Mutex::new(HashMap::new()),
+            pending_questions: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
             terminated: mango_external_agents::CancelToken::new(),
             turn_finished: Notify::new(),
@@ -243,9 +258,19 @@ impl Shared {
         self.idle_changes.send_replace(next);
     }
 
-    /// Whether the owner has an approval whose deadline, rather than idle time, governs it.
+    /// Whether the owner has an approval or a question round whose own deadline, rather than idle
+    /// time, governs it.
     async fn approval_is_pending_for(&self, owner: &Arc<()>) -> bool {
-        self.pending
+        let approval_pending = self
+            .pending
+            .lock()
+            .await
+            .values()
+            .any(|entry| Arc::ptr_eq(&entry.route.owner, owner));
+        if approval_pending {
+            return true;
+        }
+        self.pending_questions
             .lock()
             .await
             .values()
@@ -556,6 +581,23 @@ struct PendingEntry {
     answer: oneshot::Sender<Answer>,
 }
 
+/// One round of questions the server is waiting on.
+///
+/// Not a [`PendingEntry`]: a question grants no authority, so it carries no
+/// [`PermissionBroker`](mango_external_agents::PermissionBroker) race and no vendor decision — only
+/// the bounded [`QuestionRequest`] a host was shown and the answer channel that settles it.
+struct PendingQuestion {
+    /// The JSON-RPC id the server will match the answer to, in the shape it arrived.
+    request_key: String,
+    /// The turn that owns the server request and its host-visible prompt.
+    route: ActiveTurnRoute,
+    /// The bounded round a host was actually shown.
+    request: QuestionRequest,
+    /// The request's original wall-clock expiry, translated once for every later wait.
+    deadline: ApprovalDeadline,
+    answer: oneshot::Sender<QuestionAnswer>,
+}
+
 /// An approval answer awaiting the app-server notification that confirms the request ended.
 struct AnsweredResolution {
     request_key: String,
@@ -618,12 +660,30 @@ impl ResolutionMarkerGate {
 enum Answer {
     /// Somebody chose.
     Chosen {
-        decision: ApprovalDecisionValue,
+        decision: ServerAnswer,
         option_id: String,
         source: DecisionSource,
         /// Whether the caller that settled this question already recorded its audit event.
         reported: bool,
     },
+    /// The server stopped waiting on its own, so nothing needs sending.
+    ResolvedByTheServer,
+}
+
+/// How a waiting round of questions was settled.
+enum QuestionAnswer {
+    /// A host answered through [`Session::answer`].
+    Answered(QuestionResponse),
+    /// [`Session::answer`] arrived after this round's own deadline had already passed, whether or
+    /// not [`CodexHandler::decide_question`]'s own wait had noticed yet.
+    Expired,
+    /// The turn or session ended before anybody answered.
+    ///
+    /// Sent by the owner-scoped cancellation [`Shared::release_pending_for`] performs when a turn
+    /// ends while a round is still open. A plain deadline never sends this:
+    /// [`CodexHandler::decide_question`] notices its own expiry locally instead, the same way
+    /// [`CodexHandler::expire`] does for an approval.
+    Cancelled,
     /// The server stopped waiting on its own, so nothing needs sending.
     ResolvedByTheServer,
 }
@@ -934,6 +994,43 @@ impl Shared {
         for (route, event) in audits {
             let _ = self.emit_for(&route, event).await;
         }
+        self.release_pending_questions_for(owner).await;
+    }
+
+    /// Settles every question round the server is still waiting on.
+    ///
+    /// This function only ever runs as part of [`Shared::release_pending_for`], which every one of
+    /// its callers reaches for cancellation — so the outcome is always
+    /// [`QuestionOutcome::Cancelled`], never an expiry: a deadline is [`CodexHandler::decide_question`]'s
+    /// own concern, noticed locally rather than delivered here.
+    async fn release_pending_questions_for(&self, owner: Option<&Arc<()>>) {
+        let waiting = {
+            let mut pending = self.pending_questions.lock().await;
+            let matching: Vec<InteractionId> = pending
+                .iter()
+                .filter(|(_, entry)| {
+                    owner.is_none_or(|owner| Arc::ptr_eq(&entry.route.owner, owner))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            matching
+                .into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        self.signal_idle_change();
+        for entry in waiting {
+            let _ = entry.answer.send(QuestionAnswer::Cancelled);
+            let _ = self
+                .emit_for(
+                    &entry.route,
+                    EventKind::QuestionResolved {
+                        interaction_id: entry.request.interaction.id.clone(),
+                        outcome: QuestionOutcome::Cancelled,
+                    },
+                )
+                .await;
+        }
     }
 
     /// Remembers an answer only until Codex confirms the server request ended.
@@ -1010,6 +1107,85 @@ impl Shared {
 /// What the app-server says, and what this client says back.
 pub(crate) struct CodexHandler {
     shared: Arc<Shared>,
+}
+
+/// A round's questions, in the core's neutral shape.
+///
+/// `required` is a round-level fact on the wire (`isBlocking`), not a per-question one, so every
+/// question in the round carries the same value.
+fn to_questions(params: &ToolRequestUserInputParams) -> Vec<Question> {
+    params
+        .questions
+        .iter()
+        .map(|question| to_question(question, params.is_blocking))
+        .collect()
+}
+
+/// One question, in the core's neutral shape.
+///
+/// `isOther` is deliberately not read here: the neutral contract has no arm for "one of these, or
+/// write your own", so a round that sets it is presented as its declared choices and the extra
+/// path is not advertised.
+fn to_question(question: &ToolRequestUserInputQuestion, required: bool) -> Question {
+    let form = match question
+        .options
+        .as_ref()
+        .filter(|options| !options.is_empty())
+    {
+        Some(options) => QuestionForm::Choice {
+            options: options.iter().map(to_question_option).collect(),
+            multi_select: false,
+        },
+        None => QuestionForm::FreeText { placeholder: None },
+    };
+    let built = Question::new(
+        QuestionId::new(question.id.clone()),
+        question.question.clone(),
+        form,
+    )
+    .with_detail(question.header.clone());
+    if required { built.required() } else { built }
+}
+
+/// One choice, in the core's neutral shape.
+///
+/// The vendor gives a choice no id of its own — only a label — so the label is what this harness
+/// offers as the option's native identity, and what an answer echoes back.
+fn to_question_option(option: &ToolRequestUserInputOption) -> QuestionOption {
+    let built = QuestionOption::new(QuestionOptionId::new(option.label.clone()))
+        .with_label(option.label.clone());
+    match option.description.as_deref() {
+        Some(description) => built.with_description(description),
+        None => built,
+    }
+}
+
+/// A host's answers, in the shape `item/tool/requestUserInput` takes on the wire.
+fn to_wire_answers(response: &QuestionResponse) -> ToolRequestUserInputResponse {
+    let answers = response
+        .answers
+        .iter()
+        .map(|answer| {
+            let values = match &answer.value {
+                mango_external_agents::interaction::AnswerValue::Chosen { option_ids } => {
+                    option_ids.iter().map(ToString::to_string).collect()
+                }
+                mango_external_agents::interaction::AnswerValue::Text { text } => {
+                    vec![text.clone()]
+                }
+                mango_external_agents::interaction::AnswerValue::Declined => Vec::new(),
+                // `AnswerValue` is `#[non_exhaustive]`: an arm the core adds later is refused
+                // elsewhere (`QuestionRequest::validate` rejects an answer shape a question never
+                // declared), so nothing reaches this match that is not one of the three above.
+                _ => Vec::new(),
+            };
+            (
+                answer.question_id.to_string(),
+                ToolRequestUserInputAnswer { answers: values },
+            )
+        })
+        .collect();
+    ToolRequestUserInputResponse { answers }
 }
 
 #[async_trait::async_trait]
@@ -1231,8 +1407,42 @@ impl PeerHandler for CodexHandler {
             });
         }
 
-        // One read, reused in `decide`: a second `host.now()` call to build the deadline would let
-        // a host clock that moved backward between the two reads extend the monotonic approval
+        // An MCP elicitation is an arbitrary JSON-schema form this library does not render — see
+        // `UnsupportedQuestion::ArbitraryForm` and the scope note in `docs/contracts.md`. Answered
+        // immediately and natively: no pending registration, no broker, no `QuestionAsked` — a
+        // form is never put to a host.
+        if let ServerRequest::McpElicitation(params) = &request {
+            let _ = self
+                .shared
+                .emit_for(
+                    &route,
+                    EventKind::QuestionResolved {
+                        interaction_id: InteractionId::new(
+                            params
+                                .elicitation_id
+                                .clone()
+                                .unwrap_or_else(|| id.key().to_string()),
+                        ),
+                        outcome: QuestionOutcome::Refused {
+                            reason: UnsupportedQuestion::ArbitraryForm,
+                        },
+                    },
+                )
+                .await;
+            // No pending entry was ever registered for this answer, so a later
+            // `serverRequest/resolved` for it would otherwise find nothing in either map and
+            // spend an early-resolution marker on a question already settled.
+            self.shared
+                .remember_answered_resolution(&id.key(), &route.owner)
+                .await;
+            return ServerRequestOutcome::Answer(
+                serde_json::to_value(McpServerElicitationRequestResponse::decline())
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+            );
+        }
+
+        // One read, reused below: a second `host.now()` call to build the deadline would let a
+        // host clock that moved backward between the two reads extend the monotonic approval
         // window past what `expires_at` advertised.
         let now = self.shared.host.now();
         let expires_at = match self.shared.host.limits().approval_expires_at(now) {
@@ -1245,6 +1455,26 @@ impl PeerHandler for CodexHandler {
                 });
             }
         };
+
+        if let ServerRequest::RequestUserInput(params) = &request {
+            return match self
+                .decide_question(params, &id, route.clone(), now, expires_at)
+                .await
+            {
+                Some(answer) => {
+                    self.shared
+                        .remember_answered_resolution(&id.key(), &route.owner)
+                        .await;
+                    ServerRequestOutcome::Answer(
+                        serde_json::to_value(answer)
+                            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+                    )
+                }
+                // The server already stopped waiting, so the frame is discarded on its side.
+                None => ServerRequestOutcome::Answer(Value::Object(serde_json::Map::new())),
+            };
+        }
+
         let Some(pending) = approvals::to_request(
             &request,
             route.operation(self.shared.session_id.clone()),
@@ -1258,14 +1488,11 @@ impl PeerHandler for CodexHandler {
         };
 
         match self.decide(pending, &id, route.clone(), now).await {
-            Some(decision) => {
+            Some(answer) => {
                 self.shared
                     .remember_answered_resolution(&id.key(), &route.owner)
                     .await;
-                ServerRequestOutcome::Answer(
-                    serde_json::to_value(ApprovalResponse { decision })
-                        .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
-                )
+                ServerRequestOutcome::Answer(answer.to_wire())
             }
             // The server already stopped waiting, so the frame is discarded on its side. Something
             // has to be returned, and a refusal is the answer that grants nothing.
@@ -1288,7 +1515,7 @@ impl CodexHandler {
         id: &RequestId,
         route: ActiveTurnRoute,
         now: SystemTime,
-    ) -> Option<ApprovalDecisionValue> {
+    ) -> Option<ServerAnswer> {
         let request = pending.request.clone();
         let request_id = request.id().clone();
         if !self.shared.approval_route_is_admissible(&route).await {
@@ -1538,7 +1765,7 @@ impl CodexHandler {
         pending: &PendingApproval,
         route: &ActiveTurnRoute,
         request_id: &InteractionId,
-    ) -> Option<ApprovalDecisionValue> {
+    ) -> Option<ServerAnswer> {
         match answer {
             Answer::Chosen {
                 decision,
@@ -1592,7 +1819,7 @@ impl CodexHandler {
         pending: &PendingApproval,
         route: &ActiveTurnRoute,
         request_id: &InteractionId,
-    ) -> ApprovalDecisionValue {
+    ) -> ServerAnswer {
         let decision = pending.refusal();
         // The deadline chose this, not a person or a policy — the audit trail says so.
         self.resolved(
@@ -1623,6 +1850,237 @@ impl CodexHandler {
             .await;
     }
 
+    /// Puts one round of questions to a host, and waits.
+    ///
+    /// Mirrors [`CodexHandler::decide`] without the broker race: a question grants no authority,
+    /// so a [`PermissionBroker`](mango_external_agents::PermissionBroker) is never consulted about
+    /// one. Returns `None` when the server resolved the round itself while this was waiting.
+    async fn decide_question(
+        &self,
+        params: &ToolRequestUserInputParams,
+        id: &RequestId,
+        route: ActiveTurnRoute,
+        now: SystemTime,
+        expires_at: SystemTime,
+    ) -> Option<ToolRequestUserInputResponse> {
+        let request_id = InteractionId::new(params.item_id.clone());
+
+        // A round asking for a credential is refused whole, and no part of it is ever put to a
+        // host: a password typed into a box labelled "answer" is a password in a host's
+        // transcript.
+        if params.questions.iter().any(|question| question.is_secret) {
+            self.question_resolved(
+                &route,
+                &request_id,
+                QuestionOutcome::Refused {
+                    reason: UnsupportedQuestion::SecretCollection,
+                },
+            )
+            .await;
+            return Some(ToolRequestUserInputResponse::none());
+        }
+
+        if !self.shared.approval_route_is_admissible(&route).await {
+            return Some(ToolRequestUserInputResponse::none());
+        }
+        // Shared with `decide`: every later await must reuse this deadline, or a full event
+        // channel would restart the host's timer.
+        let Some(deadline) = ApprovalDeadline::new(expires_at, now) else {
+            return Some(ToolRequestUserInputResponse::none());
+        };
+
+        let interaction = Interaction::new(
+            request_id.clone(),
+            InteractionKind::Question,
+            self.shared.session_id.clone(),
+            expires_at,
+        )
+        .during(route.operation(self.shared.session_id.clone()));
+        let request = QuestionRequest::new(interaction, to_questions(params));
+        // A round the core refuses to bound is a round nobody can render, refused on its own
+        // rather than behind a turn that waits.
+        let bounded = match request.normalized() {
+            Ok(bounded) => bounded,
+            Err(_) => return Some(ToolRequestUserInputResponse::none()),
+        };
+
+        // Registered before it is announced, for the same reason as `decide`: a host answering the
+        // instant it sees the event must find something waiting.
+        let (answer, waiting) = oneshot::channel();
+        {
+            let mut pending = self.shared.pending_questions.lock().await;
+            if pending.contains_key(&request_id) {
+                return Some(ToolRequestUserInputResponse::none());
+            }
+            if pending.len() >= self.shared.host.limits().max_pending_requests {
+                return Some(ToolRequestUserInputResponse::none());
+            }
+            pending.insert(
+                request_id.clone(),
+                PendingQuestion {
+                    request_key: id.key(),
+                    route: route.clone(),
+                    request: bounded.clone(),
+                    deadline,
+                    answer,
+                },
+            );
+        }
+        if !self.shared.approval_route_is_admissible(&route).await {
+            let removed = self
+                .shared
+                .pending_questions
+                .lock()
+                .await
+                .remove(&request_id);
+            if removed
+                .as_ref()
+                .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
+            {
+                self.question_resolved(&route, &request_id, QuestionOutcome::Cancelled)
+                    .await;
+            }
+            self.shared.signal_idle_change();
+            return Some(ToolRequestUserInputResponse::none());
+        }
+        self.shared.signal_idle_change();
+
+        // The server may already have stopped waiting, in a race this side cannot see from the
+        // outside: the release is read off the same pipe and runs beside this task.
+        let request_key = id.key();
+        let early_route = self
+            .shared
+            .resolution_markers
+            .lock()
+            .await
+            .early
+            .remove(&request_key);
+        if let Some(early_route) = early_route
+            && Arc::ptr_eq(&early_route, &route.owner)
+        {
+            let mut pending = self.shared.pending_questions.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
+            {
+                pending.remove(&request_id);
+            }
+            return None;
+        }
+        if !self
+            .shared
+            .pending_questions
+            .lock()
+            .await
+            .get(&request_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.route.owner, &route.owner))
+        {
+            return None;
+        }
+
+        let emitted = self
+            .shared
+            .emit_for(
+                &route,
+                EventKind::QuestionAsked {
+                    request: bounded.clone(),
+                },
+            )
+            .await;
+        if matches!(emitted, Err(Error::LimitExceeded { .. })) {
+            self.shared
+                .poison(VendorError::new(
+                    CALL_FAILED,
+                    "expected room for a bounded Codex question, received transcript overflow",
+                ))
+                .await;
+            return Some(ToolRequestUserInputResponse::none());
+        }
+
+        // Three ways this ends: somebody answers, the deadline the request already carries
+        // passes, or the host is going away. None of them grant anything.
+        let settled = tokio::select! {
+            biased;
+            () = self.shared.host.cancel().cancelled() => None,
+            answer = waiting => answer.ok(),
+            () = deadline.wait() => None,
+        };
+
+        let removed = self
+            .shared
+            .pending_questions
+            .lock()
+            .await
+            .remove(&request_id);
+        if removed
+            .as_ref()
+            .is_some_and(|entry| !Arc::ptr_eq(&entry.route.owner, &route.owner))
+        {
+            if let Some(entry) = removed {
+                self.shared
+                    .pending_questions
+                    .lock()
+                    .await
+                    .insert(request_id.clone(), entry);
+            }
+            return None;
+        }
+
+        match settled {
+            Some(QuestionAnswer::Answered(response)) => {
+                self.question_resolved(
+                    &route,
+                    &request_id,
+                    QuestionOutcome::Answered {
+                        answers: response.answers.clone(),
+                    },
+                )
+                .await;
+                Some(to_wire_answers(&response))
+            }
+            Some(QuestionAnswer::Expired) => {
+                self.question_resolved(&route, &request_id, QuestionOutcome::Expired)
+                    .await;
+                Some(ToolRequestUserInputResponse::none())
+            }
+            Some(QuestionAnswer::Cancelled) => {
+                self.question_resolved(&route, &request_id, QuestionOutcome::Cancelled)
+                    .await;
+                Some(ToolRequestUserInputResponse::none())
+            }
+            Some(QuestionAnswer::ResolvedByTheServer) => None,
+            None => {
+                // Nobody answered: the shared deadline elapsed, or the host is going away.
+                let outcome = if self.shared.host.cancel().is_cancelled() {
+                    QuestionOutcome::Cancelled
+                } else {
+                    QuestionOutcome::Expired
+                };
+                self.question_resolved(&route, &request_id, outcome).await;
+                Some(ToolRequestUserInputResponse::none())
+            }
+        }
+    }
+
+    async fn question_resolved(
+        &self,
+        route: &ActiveTurnRoute,
+        request_id: &InteractionId,
+        outcome: QuestionOutcome,
+    ) {
+        self.shared.signal_idle_change();
+        let _ = self
+            .shared
+            .emit_for(
+                route,
+                EventKind::QuestionResolved {
+                    interaction_id: request_id.clone(),
+                    outcome,
+                },
+            )
+            .await;
+    }
+
     /// Releases the question the server says it is no longer waiting on.
     async fn release_resolved(&self, request_key: &str, route: &ActiveTurnRoute) -> bool {
         let entry = {
@@ -1638,6 +2096,23 @@ impl CodexHandler {
         };
         if let Some(entry) = entry {
             let _ = entry.answer.send(Answer::ResolvedByTheServer);
+            self.shared.signal_idle_change();
+            return true;
+        }
+
+        let question_entry = {
+            let mut pending = self.shared.pending_questions.lock().await;
+            let id = pending
+                .iter()
+                .find(|(_, entry)| {
+                    entry.request_key == request_key
+                        && Arc::ptr_eq(&entry.route.owner, &route.owner)
+                })
+                .map(|(id, _)| id.clone());
+            id.and_then(|id| pending.remove(&id))
+        };
+        if let Some(entry) = question_entry {
+            let _ = entry.answer.send(QuestionAnswer::ResolvedByTheServer);
             self.shared.signal_idle_change();
             return true;
         }
@@ -2450,6 +2925,67 @@ impl Session for CodexSession {
             })
             .map_err(|_| Error::Closed {
                 subject: "approval",
+            })
+    }
+
+    async fn answer(&self, response: QuestionResponse) -> Result<()> {
+        self.require_capability(mango_external_agents::Capability::Questions)?;
+        let Some(route) = self.shared.active_turn_route().await else {
+            return Err(Error::Protocol {
+                expected: String::from("an active turn that owns this question round"),
+                received: response.interaction_id.to_string(),
+            });
+        };
+        let current_operation = route.operation(self.shared.session_id.clone());
+
+        let mut pending = self.shared.pending_questions.lock().await;
+        let Some(entry) = pending.get(&response.interaction_id) else {
+            drop(pending);
+            return Err(Error::Protocol {
+                expected: String::from("a question round this session is still waiting on"),
+                received: response.interaction_id.to_string(),
+            });
+        };
+        // A stale answer for an attempt the host has already replaced is answering work that no
+        // longer exists, and applying it would mutate the attempt that replaced it.
+        let entry_operation = entry.route.operation(self.shared.session_id.clone());
+        if entry_operation.is_superseded_by(&current_operation) {
+            drop(pending);
+            return Err(Error::Protocol {
+                expected: String::from("an answer to the current attempt's question round"),
+                received: String::from("an answer naming a superseded attempt"),
+            });
+        }
+        if entry.deadline.is_elapsed() {
+            // Taken and sent regardless of whether `decide_question`'s own wait has noticed yet:
+            // its select is biased toward this channel, so a round still waiting settles as an
+            // expiry here instead of on its own timer; a round that already gave up simply drops
+            // the send.
+            let entry = pending
+                .remove(&response.interaction_id)
+                .expect("checked present under the same lock above");
+            drop(pending);
+            let _ = entry.answer.send(QuestionAnswer::Expired);
+            return Err(Error::Protocol {
+                expected: String::from("a question round whose deadline has not expired"),
+                received: response.interaction_id.to_string(),
+            });
+        }
+        if let Err(error) = entry.request.validate(&response) {
+            drop(pending);
+            return Err(error);
+        }
+        let entry = pending
+            .remove(&response.interaction_id)
+            .expect("checked present under the same lock above");
+        drop(pending);
+
+        self.shared.signal_idle_change();
+        entry
+            .answer
+            .send(QuestionAnswer::Answered(response))
+            .map_err(|_| Error::Closed {
+                subject: "question",
             })
     }
 

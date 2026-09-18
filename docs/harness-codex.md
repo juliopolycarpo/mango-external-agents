@@ -247,13 +247,70 @@ confirms that answer and consumes its bounded acknowledgement; it cannot become 
 that spends capacity for a later approval. This is client-side timing only: it adds no app-server
 method or wire field beyond the existing [documented surface][readme].
 
+### Permissions
+
+`item/permissions/requestApproval` is a third approval family: a permission profile the agent asks
+to be granted, not a command or a file change. It drives through the same
+`PermissionRequest`/`PermissionBroker` path as the two families above, with three options mirroring
+the scopes the vendor's own `PermissionGrantScope` declares:
+
+| Option id       | Effect | Scope     | Answers with                                    |
+| --------------- | ------ | --------- | ----------------------------------------------- |
+| `grant:turn`    | Allow  | `Turn`    | `{"permissions": <echoed>, "scope": "turn"}`    |
+| `grant:session` | Allow  | `Session` | `{"permissions": <echoed>, "scope": "session"}` |
+| `deny`          | Reject | `Once`    | `{"permissions": {}}`                           |
+
+`permissions` always travels back exactly as the request carried it: this harness never
+synthesises, widens or narrows a permission profile, and the only alternative to granting exactly
+what was asked is granting nothing. `strictAutoReview` is never set — it asks the vendor to change
+how it reviews later requests on its own, a standing instruction this library has no basis to give.
+
+### Questions
+
+`item/tool/requestUserInput` is not an approval: answering it tells the agent something and
+authorises nothing, so it drives through `QuestionRequest`/`Session::answer` and a
+`PermissionBroker` is never consulted about one. The pinned build's own schema marks this surface
+**EXPERIMENTAL**.
+
+| Wire field                      | Core shape                                                  |
+| ------------------------------- | ----------------------------------------------------------- |
+| `id`                            | `QuestionId`                                                |
+| `question`                      | prompt                                                      |
+| `header`                        | detail                                                      |
+| `isBlocking` (round-level)      | `required`, on every question in the round                  |
+| `options` non-empty             | `QuestionForm::Choice`, each option's own `label` as its id |
+| `options` absent, null or empty | `QuestionForm::FreeText`                                    |
+
+`isOther` is not offered: the neutral question contract has no arm for "one of these, or write your
+own", so a round that sets it is presented as its declared choices only. A round where any question
+sets `isSecret` is refused whole and natively — the wire answer is `{"answers": {}}`, the event is
+`QuestionResolved` with `UnsupportedQuestion::SecretCollection` — and no part of it, blocking or
+not, ever reaches the host: a password typed into a box labelled "answer" is a password in a
+host's transcript. `autoResolutionMs` is declared but documented as deprecated and not read; the
+deadline is the same `Limits::approval_timeout` every approval shares. An unanswered round
+resolves exactly once, at that deadline, at a cancelled turn or session, or at a validated answer
+from `Session::answer` — whichever is first.
+
+### MCP elicitations
+
+`mcpServer/elicitation/request` asks the client to fill in an arbitrary JSON-schema form on an MCP
+server's behalf. This library renders no form — see `UnsupportedQuestion::ArbitraryForm` and the
+scope note in `docs/contracts.md` — so it answers `{"action": "decline"}` immediately and natively,
+never `cancel`: the vendor's own documentation is that `decline` lets the turn continue while
+`cancel` ends it, and refusing to render a form this library does not own is not a reason to end
+somebody's turn. None of the request's own fields (`message`, `requestedSchema`, `content`,
+`serverName`, `url`) are ever deserialised, so none of them can reach a host-visible event or a
+log. A `QuestionResolved` event carrying `UnsupportedQuestion::ArbitraryForm` records that the
+vendor asked and this library said no; no `QuestionAsked` is ever emitted for one, because a form
+is never put to a host.
+
 Every other server-initiated request is refused with a JSON-RPC error rather than left hanging:
 
-| Request                                                                                                                                                                        | Refusal                                                 |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
-| `item/tool/call`                                                                                                                                                               | Vendor tools never enter the host's tool registry       |
-| `account/chatgptAuthTokens/refresh`                                                                                                                                            | This library reads, stores and forwards no vendor token |
-| `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `attestation/generate`, the v1 `execCommandApproval` / `applyPatchApproval` | No answer in the neutral approval contract              |
+| Request                                                                     | Refusal                                                 |
+| --------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `item/tool/call`                                                            | Vendor tools never enter the host's tool registry       |
+| `account/chatgptAuthTokens/refresh`                                         | This library reads, stores and forwards no vendor token |
+| `attestation/generate`, the v1 `execCommandApproval` / `applyPatchApproval` | No answer in the neutral approval contract              |
 
 ## Auth, without reading a credential
 
