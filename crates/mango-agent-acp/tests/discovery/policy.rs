@@ -273,9 +273,10 @@ async fn fallback_starts_new_when_the_agent_does_not_advertise_load_session() {
 async fn session_load_uses_the_hosts_authorized_working_directory() {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(FakeAcpAgent::new().process());
+    let workspace = std::env::temp_dir().join("authorized-workspace");
     let host = HostContext::builder()
         .launcher(launcher.clone())
-        .cwd("/authorized/workspace")
+        .cwd(&workspace)
         .client_info("discovery-tests", "0.1.0")
         .build()
         .expect("expected a host");
@@ -298,7 +299,7 @@ async fn session_load_uses_the_hosts_authorized_working_directory() {
         .expect("expected session/load");
     assert_eq!(
         request["params"]["cwd"],
-        serde_json::json!("/authorized/workspace"),
+        serde_json::json!(workspace),
         "expected the current host directory rather than a saved remote context"
     );
     session
