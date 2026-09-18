@@ -310,11 +310,14 @@ impl EventSink {
     ///
     /// For example, a failed native prompt calls this before releasing its attempt slot.
     pub async fn fail(&self, error: VendorError) -> Result<()> {
+        let event = self.event(EventKind::Error { error })?;
+        let EventKind::Error { error } = &event.kind else {
+            unreachable!("normalized error event")
+        };
         let status = TerminalStatus::Failed {
             code: error.code.clone(),
         };
-        self.buffer
-            .finish(vec![self.event(EventKind::Error { error })?], status)
+        self.buffer.finish(vec![event], status)
     }
 
     /// Commits successful completion once without waiting for the consumer.
@@ -484,6 +487,31 @@ mod tests {
         drop(events);
         observer.closed().await;
         assert!(observer.is_closed());
+    }
+
+    #[tokio::test]
+    async fn reserved_failure_and_status_do_not_retain_an_unbounded_error_code() {
+        let (sink, mut events) = sink(1);
+        sink.fail(crate::VendorError::new(
+            crate::ErrorCode::new("x".repeat(1_000_000)),
+            "failure",
+        ))
+        .await
+        .expect("terminal");
+        let Some(super::TerminalStatus::Failed { code }) = events.terminal_status() else {
+            panic!("expected failed status")
+        };
+        assert!(
+            code.as_str().len() <= 1024,
+            "expected a bounded terminal status code"
+        );
+        let EventKind::Error { error } = events.recv().await.expect("terminal").kind else {
+            panic!("expected error")
+        };
+        assert!(
+            error.code.as_str().len() <= 1024,
+            "expected a bounded terminal event code"
+        );
     }
 
     #[tokio::test]

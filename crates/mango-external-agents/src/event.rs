@@ -998,7 +998,9 @@ fn normalize_commands(commands: Vec<Command>) -> Vec<Command> {
 /// text rather than refused like the ids that get echoed back.
 fn normalize_error(error: VendorError) -> VendorError {
     VendorError {
-        code: error.code,
+        code: crate::ErrorCode::new(
+            normalize::bound_text(error.code.as_str(), TextLimit::VendorId).text,
+        ),
         message: normalize::bound_text(&error.message, TextLimit::ErrorMessage).text,
         request_id: error
             .request_id
