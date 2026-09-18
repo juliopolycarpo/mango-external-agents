@@ -731,6 +731,93 @@ async fn opening_a_session_adopts_the_thread_the_server_opened() {
     assert!(!session.snapshot().resumed);
 }
 
+/// A pinned app-server resume error, with the captured handshake and new-thread answer.
+/// The fake owns the error injection so each test can assert the wire consequence.
+struct ResumeErrorServer {
+    message: String,
+}
+
+impl ResumeErrorServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake").as_process_intercepting(move |frame| {
+            (frame["method"] == "thread/resume").then(|| {
+                vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "error": {"code": -32600, "message": self.message},
+                    })
+                    .to_string(),
+                ]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn fallback_starts_fresh_only_after_the_pinned_missing_rollout_result() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let missing = "01a09ca7-cd7c-7312-8569-205578cada28";
+    launcher.push(
+        ResumeErrorServer {
+            message: format!("no rollout found for thread id {missing}"),
+        }
+        .process(),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+
+    let session = CodexHarness::new()
+        .open_session(
+            &host,
+            OpenSession::new("chat-1")
+                .resuming(missing, mango_external_agents::ResumeMode::Fallback),
+        )
+        .await
+        .expect("expected a conclusive missing rollout to start a new thread");
+
+    assert!(!session.snapshot().resumed);
+    assert!(session.snapshot().fallback_reason.is_some());
+    assert_ne!(session.ids().native_session_id, missing);
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/start"))
+    );
+}
+
+#[tokio::test]
+async fn fallback_preserves_an_unrelated_resume_failure_without_starting_fresh() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let missing = "01a09ca7-cd7c-7312-8569-205578cada28";
+    launcher.push(
+        ResumeErrorServer {
+            message: String::from("failed to load configuration"),
+        }
+        .process(),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+
+    let error = CodexHarness::new()
+        .open_session(
+            &host,
+            OpenSession::new("chat-1")
+                .resuming(missing, mango_external_agents::ResumeMode::Fallback),
+        )
+        .await;
+
+    assert!(
+        error.is_err(),
+        "expected the configuration failure to be returned"
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/start")),
+        "expected no fresh conversation after a configuration failure"
+    );
+}
+
 /// The recorded turn: a command runs, the answer streams, usage and quota arrive, the turn ends.
 #[tokio::test]
 async fn a_recorded_turn_replays_as_a_turn_that_ends_exactly_once() {
@@ -2866,6 +2953,43 @@ async fn listing_the_vendors_own_sessions_asks_for_a_bounded_page() {
             "expected every row to name a conversation a host could adopt"
         );
     }
+}
+
+#[tokio::test]
+async fn listing_without_a_user_conversation_uses_only_the_authorized_workspace() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let page = CodexHarness::new()
+        .list_sessions(&host, SessionQuery::default())
+        .await
+        .expect("expected a picker page before any conversation is open");
+
+    assert!(!page.sessions.is_empty());
+    assert!(page.next_cursor.is_some());
+    let written = launcher.written();
+    assert!(written.iter().any(|line| line.contains("thread/list")));
+    assert!(!written.iter().any(|line| line.contains("thread/start")));
+    let list = written
+        .iter()
+        .find(|line| line.contains("thread/list"))
+        .expect("expected a list request");
+    let frame: serde_json::Value = serde_json::from_str(list).expect("expected a JSON request");
+    assert_eq!(frame["params"]["cwd"], "/workspace");
+    assert_eq!(frame["params"]["limit"], 50);
+}
+
+#[tokio::test]
+async fn listing_a_different_workspace_is_refused_before_spawning() {
+    let (host, launcher) = host_replaying(&[]);
+    let query = SessionQuery {
+        workspace_path: Some("/another-workspace".into()),
+        ..SessionQuery::default()
+    };
+    let result = CodexHarness::new().list_sessions(&host, query).await;
+    assert!(
+        result.is_err(),
+        "expected a workspace authorization refusal"
+    );
+    assert!(launcher.launches().is_empty(), "expected no child process");
 }
 
 /// The recorded `account/rateLimits/read`.

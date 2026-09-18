@@ -39,17 +39,18 @@ on the wire)".
 | `account/rateLimits/read`       | `Session::refresh_account_usage`       |
 | `model/list`                    | `Discovery::models`                    |
 | `thread/start`, `thread/resume` | `Harness::open_session`                |
-| `thread/list`                   | `Session::list_sessions`               |
+| `thread/list`                   | Session and harness-level listing      |
 | `turn/start`                    | `Session::start_turn`                  |
 | `turn/steer`                    | `Session::steer`                       |
 | `turn/interrupt`                | `Session::cancel`                      |
 | `review/start`                  | `Session::start_review`                |
 
-Listing and account usage are session-scoped in this adapter: they use the open session's
-app-server connection. Its advertised `session_listing` and `account_usage` capabilities refer to
-the `Session` methods above. The separate `Harness::list_sessions` and `Harness::account_usage`
-services remain `Error::NotSupported`; this adapter does not launch a short-lived app-server for
-a picker before opening a conversation.
+`Harness::list_sessions` opens a short-lived app-server connection, initializes it, asks for a
+page and closes it without starting a thread. A live `Session::list_sessions` reuses its own
+connection. Both paths require the host's authorized working directory as the `cwd` filter and
+refuse a query for another directory. The vendor's cursor, native id, title, preview and Unix
+second timestamps pass through when supplied. Account usage remains session-scoped; the separate
+`Harness::account_usage` service returns `Error::NotSupported`.
 
 `clientInfo.name` is always the host's own name, from `HostContext::client_info`. The README says
 this identifies the client to OpenAI's compliance logging platform, so writing anything else would
@@ -76,7 +77,12 @@ or a delayed request id cannot affect a replacement turn.
 One long-lived `codex app-server` per session. `thread/start` opens a conversation;
 `thread/resume` continues one, with `excludeTurns: true` — the vendor keeps the transcript it
 wrote, and this library never replays one into anybody's context. `ResumeMode::Fallback` starts a
-new thread and records why in `SessionSnapshot::fallback_reason`.
+new thread only when the pinned app-server returns `-32600` with the exact
+`no rollout found for thread id <requested id>` result. It records that reason in
+`SessionSnapshot::fallback_reason` and exposes the new native id. The same error code can also
+mean configuration failure, so other refusals, timeouts and broken connections remain errors.
+This distinction follows the pinned [thread resume error mapping][resume-error] and is covered by
+fake app-server tests for both outcomes.
 
 `turn/start` on a live turn is taken by the app-server as a **steer** — its own documentation says
 `turnTrigger` is "ignored when this request steers an already-active turn". A host that meant a new
@@ -346,4 +352,5 @@ this tool letting an agent out of its sandbox, checked into the repository.
 Compliance posture: see [compliance.md](compliance.md).
 
 [readme]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md
+[resume-error]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/src/request_processors/thread_processor.rs
 [app-server]: https://learn.chatgpt.com/docs/app-server

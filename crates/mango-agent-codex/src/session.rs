@@ -2588,37 +2588,7 @@ impl Session for CodexSession {
     }
 
     async fn list_native_sessions(&self, query: SessionQuery) -> Result<SessionPage> {
-        let params = ThreadListParams {
-            cursor: query.cursor,
-            limit: query.limit,
-            cwd: query
-                .workspace_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-        };
-        let page: ThreadListResponse = self.client.request(method::THREAD_LIST, params).await?;
-        Ok(SessionPage {
-            sessions: page
-                .data
-                .into_iter()
-                .map(|thread| NativeSession {
-                    native_session_id: thread.id,
-                    // The vendor has no title of its own for most threads; `preview` is the first
-                    // user message, which is what its own picker shows.
-                    title: thread.name.filter(|name| !name.is_empty()),
-                    preview: Some(thread.preview).filter(|preview| !preview.is_empty()),
-                    workspace_path: thread.cwd,
-                    updated_at: thread.updated_at.and_then(|seconds| {
-                        u64::try_from(seconds).ok().and_then(|seconds| {
-                            std::time::SystemTime::UNIX_EPOCH
-                                .checked_add(std::time::Duration::from_secs(seconds))
-                        })
-                    }),
-                })
-                .collect(),
-            next_cursor: page.next_cursor,
-            truncated: false,
-        })
+        list_threads(&self.client, &self.shared.host, query).await
     }
 
     async fn refresh_account_usage(&self) -> Result<AccountUsage> {
@@ -2634,6 +2604,57 @@ impl Session for CodexSession {
             }),
         })
     }
+}
+
+/// Lists only conversations in the host's authorized workspace, on a live or probe connection.
+pub(crate) async fn list_threads(
+    client: &Client,
+    host: &HostContext,
+    query: SessionQuery,
+) -> Result<SessionPage> {
+    validate_list_workspace(host, &query)?;
+    let params = ThreadListParams {
+        cursor: query.cursor,
+        limit: query.limit,
+        cwd: Some(host.cwd().to_string_lossy().into_owned()),
+    };
+    let page: ThreadListResponse = client.request(method::THREAD_LIST, params).await?;
+    Ok(SessionPage {
+        sessions: page
+            .data
+            .into_iter()
+            .map(|thread| NativeSession {
+                native_session_id: thread.id,
+                // A title may be absent; the preview is the first user message when supplied.
+                title: thread.name.filter(|name| !name.is_empty()),
+                preview: Some(thread.preview).filter(|preview| !preview.is_empty()),
+                workspace_path: thread.cwd,
+                updated_at: thread.updated_at.and_then(|seconds| {
+                    u64::try_from(seconds).ok().and_then(|seconds| {
+                        std::time::SystemTime::UNIX_EPOCH
+                            .checked_add(std::time::Duration::from_secs(seconds))
+                    })
+                }),
+            })
+            .collect(),
+        next_cursor: page.next_cursor,
+        truncated: false,
+    })
+}
+
+/// Refuses a remote or unrelated workspace before any list request or probe launch.
+pub(crate) fn validate_list_workspace(host: &HostContext, query: &SessionQuery) -> Result<()> {
+    if query
+        .workspace_path
+        .as_ref()
+        .is_some_and(|path| path != host.cwd())
+    {
+        return Err(Error::HostConfiguration {
+            expected: "a session-list workspace equal to the host's authorized directory",
+            received: String::from("a different workspace path"),
+        });
+    }
+    Ok(())
 }
 
 impl Drop for CodexSession {

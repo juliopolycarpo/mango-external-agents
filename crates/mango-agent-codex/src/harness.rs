@@ -15,9 +15,9 @@ use mango_external_agents::harness::{
 use mango_external_agents::identity::HarnessIdentity;
 use mango_external_agents::jsonrpc::{Client, ClientOptions};
 use mango_external_agents::permission::PermissionMatrix;
-use mango_external_agents::process::LaunchSpec;
+use mango_external_agents::process::{LaunchSpec, ProcessControl};
 use mango_external_agents::session::{
-    OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason,
+    OpenSession, ResumeMode, Session, SessionIds, SessionPage, SessionQuery, resume_fallback_reason,
 };
 use mango_external_agents::state::{SessionSnapshot, SessionState, TransportSelection};
 use mango_external_agents::transport::{ExecutablePath, StdioSpec, TransportKind};
@@ -261,6 +261,18 @@ impl Harness for CodexHarness {
             transport.control,
         )))
     }
+
+    async fn list_native_sessions(
+        &self,
+        host: &HostContext,
+        query: SessionQuery,
+    ) -> Result<SessionPage> {
+        crate::session::validate_list_workspace(host, &query)?;
+        let connection = ProbeConnection::open(host, &self.executable).await?;
+        let page = crate::session::list_threads(&connection.client, host, query).await;
+        connection.close().await;
+        page
+    }
 }
 
 /// Handshake, gate, auth and the thread itself.
@@ -328,7 +340,10 @@ async fn open_thread(
                 .await
             {
                 Ok(response) => (response, true, None),
-                Err(error) if resume.mode == ResumeMode::Fallback => {
+                Err(error)
+                    if resume.mode == ResumeMode::Fallback
+                        && missing_rollout(&error, &resume.native_session_id) =>
+                {
                     let reason = resume_fallback_reason(method::THREAD_RESUME, &error);
                     (
                         start_thread(client, &cwd, &requested_model, vendor).await?,
@@ -414,6 +429,15 @@ async fn open_thread(
     ))
 }
 
+/// The pinned app-server uses this exact invalid-request response when its thread store has no
+/// rollout for the requested id. The same JSON-RPC code also covers configuration failures, so
+/// matching the code alone would create a different conversation after an unrelated refusal.
+fn missing_rollout(error: &Error, native_session_id: &str) -> bool {
+    matches!(error.cause(), Error::Vendor(vendor)
+        if vendor.vendor_code.as_deref() == Some("-32600")
+            && vendor.message == format!("no rollout found for thread id {native_session_id}"))
+}
+
 async fn start_thread(
     client: &Client,
     cwd: &str,
@@ -495,64 +519,93 @@ async fn probe_app_server(
     executable: &ExecutablePath,
 ) -> (AuthState, Vec<Model>) {
     let unknown = (AuthState::Unknown, Vec::new());
-    let Ok(transport) = stdio::open(
-        host,
-        &StdioSpec::new([PROGRAM, "app-server"]),
-        executable,
-        VENDOR_ENVIRONMENT_KEYS,
-    )
-    .await
-    else {
+    let Ok(connection) = ProbeConnection::open(host, executable).await else {
         return unknown;
     };
 
-    let client = Client::connect(
-        transport.link,
-        Arc::new(Silent),
-        ClientOptions::new(PEER_NAME)
-            .with_code_prefix(CODE_PREFIX)
-            .without_version_header()
-            .with_limits(host.limits()),
+    let account: AccountReadResponse = connection
+        .client
+        .request(method::ACCOUNT_READ, empty_params())
+        .await
+        .unwrap_or_default();
+    let models: ModelListResponse = connection
+        .client
+        .request(method::MODEL_LIST, ModelListParams { limit: None })
+        .await
+        .unwrap_or_default();
+    let probed = (
+        discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
+        models
+            .data
+            .into_iter()
+            .filter(|model| !model.hidden)
+            .map(to_model)
+            .collect(),
     );
-
-    let handshake: Result<InitializeResponse> = client
-        .request(
-            method::INITIALIZE,
-            InitializeParams {
-                client_info: client_info(host.client_info()),
-                capabilities: None,
-            },
-        )
-        .await;
-    let probed = if handshake.is_ok() {
-        let _ = client.notify(method::INITIALIZED, empty_params()).await;
-        let account: AccountReadResponse = client
-            .request(method::ACCOUNT_READ, empty_params())
-            .await
-            .unwrap_or_default();
-        let models: ModelListResponse = client
-            .request(method::MODEL_LIST, ModelListParams { limit: None })
-            .await
-            .unwrap_or_default();
-        (
-            discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
-            models
-                .data
-                .into_iter()
-                .filter(|model| !model.hidden)
-                .map(to_model)
-                .collect(),
-        )
-    } else {
-        unknown
-    };
-
-    let _ = client.close().await;
-    let _ = transport
-        .control
-        .kill(mango_external_agents::CancelReason::Shutdown)
-        .await;
+    connection.close().await;
     probed
+}
+
+/// One bounded app-server connection for pre-conversation read-only services.
+struct ProbeConnection {
+    client: Client,
+    control: Arc<dyn ProcessControl>,
+}
+
+impl ProbeConnection {
+    async fn open(host: &HostContext, executable: &ExecutablePath) -> Result<Self> {
+        let transport = stdio::open(
+            host,
+            &StdioSpec::new([PROGRAM, "app-server"]),
+            executable,
+            VENDOR_ENVIRONMENT_KEYS,
+        )
+        .await?;
+        let client = Client::connect(
+            transport.link,
+            Arc::new(Silent),
+            ClientOptions::new(PEER_NAME)
+                .with_code_prefix(CODE_PREFIX)
+                .without_version_header()
+                .with_limits(host.limits()),
+        );
+        let connection = Self {
+            client,
+            control: transport.control,
+        };
+        let handshake: Result<InitializeResponse> = connection
+            .client
+            .request(
+                method::INITIALIZE,
+                InitializeParams {
+                    client_info: client_info(host.client_info()),
+                    capabilities: None,
+                },
+            )
+            .await;
+        let result = match handshake {
+            Ok(_) => {
+                connection
+                    .client
+                    .notify(method::INITIALIZED, empty_params())
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            connection.close().await;
+            return Err(error);
+        }
+        Ok(connection)
+    }
+
+    async fn close(self) {
+        let _ = self.client.close().await;
+        let _ = self
+            .control
+            .kill(mango_external_agents::CancelReason::Shutdown)
+            .await;
+    }
 }
 
 fn to_model(model: crate::protocol::requests::Model) -> Model {
