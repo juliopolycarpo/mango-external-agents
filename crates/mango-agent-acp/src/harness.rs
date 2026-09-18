@@ -471,7 +471,7 @@ impl Harness for AcpHarness {
             accepted_axes(&configuration),
             session_state.clone(),
         ));
-        let cleanup = client::DriveShutdownGuard::from_launched(&launched);
+        let cleanup = client::DriveShutdownGuard::from_launched(&launched, *host.limits());
         let connection = Arc::new(
             client::drive(
                 launched,
@@ -481,22 +481,28 @@ impl Harness for AcpHarness {
             )
             .await?,
         );
+        // Opening has no session yet to own cleanup. Keep the live connection in a scope so a
+        // caller dropping `open_session` while initialize, new, load, or configuration is pending
+        // still closes the dispatch loop and reaps the child.
+        let mut connection = client::ConnectionShutdownGuard::new(connection);
 
         // Every failure from here on ends the child. A `Err` returned with the connection still up
         // would leave an agent running with nothing driving it: the dispatch loop only winds down
         // when the shutdown channel drops, so the process would outlive the call that started it by
         // however long the drop took to reach it.
         let opened = match self
-            .handshake_and_open(&connection, &connection_state, host, &request)
+            .handshake_and_open(connection.connection(), &connection_state, host, &request)
             .await
         {
             Ok(opened) => opened,
             Err(error) => {
-                connection.begin_shutdown(mango_external_agents::CancelReason::Requested);
-                let _ = connection.wait_shutdown().await;
+                connection
+                    .shutdown(mango_external_agents::CancelReason::Requested)
+                    .await?;
                 return Err(error);
             }
         };
+        let connection = connection.release();
         let (handshake, opened) = opened;
 
         session_state.set_native_session_id(opened.session_id.to_string());
@@ -557,9 +563,9 @@ impl Harness for AcpHarness {
             // Closing the session rather than the connection alone: a session that exists on the
             // agent's side and is about to be dropped on ours is a session to end, and `close` is
             // what withdraws its pending questions and ends the child.
-            let _ = session
+            session
                 .close(mango_external_agents::CloseReason::Requested)
-                .await;
+                .await?;
             return Err(error);
         }
 
@@ -573,16 +579,16 @@ impl Harness for AcpHarness {
             let outcome = match session.configure_session(options).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    let _ = session
+                    session
                         .close(mango_external_agents::CloseReason::Requested)
-                        .await;
+                        .await?;
                     return Err(error);
                 }
             };
             if !outcome.is_complete() {
-                let _ = session
+                session
                     .close(mango_external_agents::CloseReason::Requested)
-                    .await;
+                    .await?;
                 return Err(Error::HostConfiguration {
                     expected: "every requested ACP session configuration option to be supported",
                     received: String::from("a configuration option the agent did not accept"),
@@ -625,12 +631,13 @@ impl Harness for AcpHarness {
                 // Dropping the last session handle releases the ACP closure before this watcher
                 // wakes, so no `ConnectionHandle` remains to own the host process control. The
                 // watcher then becomes the last owner and applies the same bounded cleanup.
-                child_reaper.reap(mango_external_agents::CancelReason::Shutdown).await
+                child_reaper
+                    .reap(mango_external_agents::CancelReason::Shutdown)
+                    .await
             };
             if cleanup.is_ok() {
                 closing_state.set_status(mango_external_agents::SessionStatus::Closed);
             }
-
         });
         Ok(Box::new(session))
     }
@@ -665,7 +672,7 @@ impl Harness for AcpHarness {
             Configuration::unknown(),
             snapshot,
         ));
-        let cleanup = client::DriveShutdownGuard::from_launched(&launched);
+        let cleanup = client::DriveShutdownGuard::from_launched(&launched, *host.limits());
         let connection = Arc::new(
             client::drive(launched, state, host.client_info().name.clone(), cleanup).await?,
         );
@@ -682,10 +689,13 @@ impl Harness for AcpHarness {
             .await
         }
         .await;
-        connection
+        let cleanup = connection
             .shutdown(mango_external_agents::CancelReason::Requested)
             .await;
-        page
+        match cleanup {
+            Err(cleanup) => Err(cleanup),
+            Ok(()) => page,
+        }
     }
 }
 
@@ -809,7 +819,8 @@ impl AcpHarness {
         }
 
         let (catalog_revision, sent) = connection_state.with_catalog_revision(|revision| {
-            let sent = client::submit(connection,
+            let sent = client::submit(
+                connection,
                 LoadSessionRequest::new(
                     AcpSessionId::new(resume.native_session_id.clone()),
                     cwd.clone(),
@@ -859,7 +870,10 @@ impl AcpHarness {
         mcp_servers: Vec<AcpMcpServer>,
     ) -> Result<Opened> {
         let (catalog_revision, sent) = connection_state.with_catalog_revision(|revision| {
-            let sent = client::submit(connection, NewSessionRequest::new(cwd).mcp_servers(mcp_servers));
+            let sent = client::submit(
+                connection,
+                NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
+            );
             (revision, sent)
         });
         let response = client::await_sent(

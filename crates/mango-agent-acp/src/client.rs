@@ -46,8 +46,8 @@ use mango_external_agents::permission::{
 };
 use mango_external_agents::session::CancelReason;
 use mango_external_agents::{
-    Clock, Error, EventSink, HostContext, ProcessControl, Result, VendorError,
-    process::stop_process_with_limits,
+    Clock, Error, EventSink, HostContext, Limits, ProcessCleanupGuard, ProcessControl, Result,
+    VendorError, process::stop_process_with_limits,
 };
 
 use crate::approval_events::ApprovalEvents;
@@ -1158,10 +1158,15 @@ impl ChildReaper {
             });
         }
         self.done.cancelled().await;
-        self.result.lock().unwrap_or_else(PoisonError::into_inner)
+        self.result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .unwrap_or_else(|| Err(String::from("ACP child cleanup ended without an outcome")))
-            .map_err(|message| Error::Vendor(link_failure(message)))
+            .map_err(|message| Error::CleanupRequired {
+                control: Arc::clone(&self.control),
+                source: Box::new(Error::Vendor(link_failure(message))),
+            })
     }
 }
 
@@ -1176,43 +1181,44 @@ impl Drop for ReapCompletion {
 
 /// Reaps a child if cancellation drops `drive` before it can return a connection handle.
 pub(crate) struct DriveShutdownGuard {
-    control: Option<Arc<dyn ProcessControl>>,
+    control: Arc<dyn ProcessControl>,
+    cleanup: Option<ProcessCleanupGuard>,
 }
 
 impl DriveShutdownGuard {
     /// Claims a launched child before the asynchronous connection driver is first polled.
-    pub(crate) fn from_launched(launched: &LaunchedAgent) -> Self {
+    pub(crate) fn from_launched(launched: &LaunchedAgent, limits: Limits) -> Self {
+        let control = Arc::clone(&launched.control);
         Self {
-            control: Some(Arc::clone(&launched.control)),
+            cleanup: Some(ProcessCleanupGuard::new(
+                Arc::clone(&control),
+                limits,
+                mango_external_agents::CancelReason::Shutdown,
+            )),
+            control,
         }
     }
 
     fn disarm(&mut self) -> Arc<dyn ProcessControl> {
-        self.control
+        self.cleanup
             .take()
             .expect("drive guard owns the child until a connection handle exists")
+            .into_control()
+    }
+
+    /// Completes pre-handle cleanup before `drive` reports a connection-start failure.
+    async fn finish(mut self) -> Result<()> {
+        self.cleanup
+            .take()
+            .expect("drive guard owns the child until cleanup completes")
+            .finish()
+            .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
     fn control(&self) -> &Arc<dyn ProcessControl> {
-        self.control
-            .as_ref()
-            .expect("drive guard owns the child until a connection handle exists")
-    }
-}
-
-impl Drop for DriveShutdownGuard {
-    fn drop(&mut self) {
-        let Some(control) = self.control.take() else {
-            return;
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = control
-                    .kill(mango_external_agents::CancelReason::Shutdown)
-                    .await;
-            });
-        }
+        &self.control
     }
 }
 
@@ -1233,19 +1239,34 @@ impl ConnectionShutdownGuard {
     }
 
     /// The live connection while the scope remains active.
-    pub(crate) fn connection(&self) -> &ConnectionHandle {
+    pub(crate) fn connection(&self) -> &Arc<ConnectionHandle> {
         self.connection
-            .as_deref()
+            .as_ref()
             .expect("connection exists until an explicit shutdown completes")
     }
 
     /// Ends the child before the normal scope exit.
-    pub(crate) async fn shutdown(&mut self, reason: mango_external_agents::CancelReason) {
+    pub(crate) async fn shutdown(
+        &mut self,
+        reason: mango_external_agents::CancelReason,
+    ) -> Result<()> {
         let Some(connection) = self.connection.as_ref() else {
-            return;
+            return Ok(());
         };
-        connection.shutdown(reason).await;
+        // A dropped request can already have claimed shutdown through `RequestAbandonment`.
+        // Always join that owned operation instead of running a second direct cleanup that could
+        // race its driver and obscure the outcome from this explicit scope owner.
+        connection.begin_shutdown(reason);
+        let result = connection.wait_shutdown().await;
         self.connection.take();
+        result
+    }
+
+    /// Hands ownership to a session that will close the connection later.
+    pub(crate) fn release(mut self) -> Arc<ConnectionHandle> {
+        self.connection
+            .take()
+            .expect("connection exists until ownership moves to a session")
     }
 }
 
@@ -1254,12 +1275,10 @@ impl Drop for ConnectionShutdownGuard {
         let Some(connection) = self.connection.take() else {
             return;
         };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                connection
-                    .shutdown(mango_external_agents::CancelReason::Shutdown)
-                    .await;
-            });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Drop has no caller to receive a cleanup failure. Explicit owners use `shutdown`,
+            // which preserves its result for them instead.
+            connection.begin_shutdown(mango_external_agents::CancelReason::Shutdown);
         }
     }
 }
@@ -1361,13 +1380,9 @@ pub(crate) async fn drive(
             Ok(Ok(())) => "a connection that closed before it opened",
             Err(_) => "a connection task that did not finish",
         };
-        return Err(Error::Vendor(link_failure(with_stderr(
-            shape,
-            child
-                .control
-                .as_deref()
-                .expect("drive guard owns the child before a handle exists"),
-        ))));
+        let error = Error::Vendor(link_failure(with_stderr(shape, child.control.as_ref())));
+        child.finish().await?;
+        return Err(error);
     };
 
     let control = child.disarm();
@@ -1424,10 +1439,11 @@ impl ConnectionHandle {
                     "the ACP shutdown task ended without an outcome",
                 ))
             });
-        result.map_err(|message| {
-            Error::Vendor(link_failure(format!(
+        result.map_err(|message| Error::CleanupRequired {
+            control: Arc::clone(&self.child_reaper.control),
+            source: Box::new(Error::Vendor(link_failure(format!(
                 "ACP connection cleanup failed: {message}"
-            )))
+            )))),
         })
     }
     /// The connection, for a request a session method sends.
@@ -1494,7 +1510,6 @@ impl ConnectionHandle {
             }
         }
         self.child_reaper.reap(reason).await
-
     }
 }
 
@@ -1563,7 +1578,11 @@ pub(crate) async fn await_sent<Response>(
 where
     Response: Send,
 {
-    let SubmittedRequest { sent, _permit, mut abandonment } = submitted;
+    let SubmittedRequest {
+        sent,
+        _permit,
+        mut abandonment,
+    } = submitted;
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
         return Err(Error::Timeout {
@@ -1615,9 +1634,9 @@ mod tests {
 
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
     use mango_external_agents::{
-        AttemptId, CancelReason, Configuration, Error, EventSink, ExitStatus, HarnessIdentity,
-        HostContext, LaunchSpec, ProcessControl, ProcessLauncher, Result, SessionIds,
-        SessionSnapshot, TransportKind, TransportSelection, TurnId,
+        AttemptId, ByteSink, ByteSource, CancelReason, Configuration, Error, EventSink, ExitStatus,
+        HarnessIdentity, HostContext, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
+        Result, SessionIds, SessionSnapshot, TransportKind, TransportSelection, TurnId,
     };
 
     use super::{
@@ -1637,6 +1656,18 @@ mod tests {
         release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         completed: AtomicBool,
     }
+
+    /// A process control whose first bounded cleanup fails and whose next one succeeds.
+    struct RetryableCleanupControl {
+        failed_once: AtomicBool,
+        kills: AtomicUsize,
+    }
+
+    /// A child stdout that fails before ACP can hand `drive` a connection handle.
+    struct FailingStartupSource;
+
+    /// The unused writable half of a deliberately broken startup transport.
+    struct InertStartupSink;
 
     #[async_trait::async_trait]
     impl ProcessControl for HeldKillProcessControl {
@@ -1670,6 +1701,53 @@ mod tests {
                 let _ = release.await;
             }
             self.completed.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for RetryableCleanupControl {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            Ok(ExitStatus::default())
+        }
+
+        async fn kill(&self, _reason: CancelReason) -> Result<()> {
+            self.kills.fetch_add(1, Ordering::AcqRel);
+            if self.failed_once.swap(false, Ordering::AcqRel) {
+                return Err(Error::Launch {
+                    program: String::from("fake ACP agent"),
+                    message: String::from("the first cleanup attempt failed"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for FailingStartupSource {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            Err(Error::Link {
+                peer: String::from("fake ACP agent"),
+                message: String::from("the startup pipe failed"),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSink for InertStartupSink {
+        async fn write_all(&mut self, _bytes: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<()> {
             Ok(())
         }
     }
@@ -1895,7 +1973,7 @@ mod tests {
         });
         process.control = Arc::clone(&control);
         let launched = crate::transport::frame(process, &host).expect("expected framed child");
-        let cleanup = DriveShutdownGuard::from_launched(&launched);
+        let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
         let (_release, reached) = hold_next_drive_startup(Arc::clone(&control));
         let task = tokio::spawn(drive(
             launched,
@@ -1916,6 +1994,107 @@ mod tests {
             kills.load(Ordering::Acquire),
             1,
             "expected the pre-drive guard to claim cleanup exactly once"
+        );
+    }
+
+    /// A pre-handle failure has no session owner, so its explicit bounded cleanup must return the
+    /// host's control when the first stop attempt fails.
+    #[tokio::test]
+    async fn a_failed_pre_handle_cleanup_returns_control_for_host_recovery() {
+        let concrete = Arc::new(RetryableCleanupControl {
+            failed_once: AtomicBool::new(true),
+            kills: AtomicUsize::new(0),
+        });
+        let control: Arc<dyn ProcessControl> = concrete.clone();
+        let cleanup = DriveShutdownGuard {
+            control: control.clone(),
+            cleanup: Some(mango_external_agents::ProcessCleanupGuard::new(
+                control.clone(),
+                mango_external_agents::Limits::default(),
+                CancelReason::Shutdown,
+            )),
+        };
+
+        let error = cleanup
+            .finish()
+            .await
+            .expect_err("expected the first pre-handle cleanup attempt to fail");
+        assert!(
+            matches!(error, Error::CleanupRequired { .. }),
+            "expected a recoverable cleanup error, received {error:?}"
+        );
+        let recovered = error
+            .cleanup_control()
+            .expect("expected the failed drive cleanup to retain its process control");
+        mango_external_agents::process::stop_process_with_limits(
+            recovered.as_ref(),
+            CancelReason::Shutdown,
+            &mango_external_agents::Limits::default(),
+        )
+        .await
+        .expect("expected host cleanup retry to reap the child");
+        assert!(
+            Arc::ptr_eq(&control, &recovered),
+            "expected recovery to retain the originally launched control"
+        );
+        assert_eq!(
+            concrete.kills.load(Ordering::Acquire),
+            2,
+            "expected one failed guard cleanup and one host retry"
+        );
+    }
+
+    /// A transport that fails before ACP opens a connection has no session owner. `drive` must
+    /// explicitly finish bounded cleanup and return its recovery control instead of the link error.
+    #[tokio::test]
+    async fn a_drive_startup_failure_returns_control_for_host_recovery() {
+        let (state, host) = state();
+        let concrete = Arc::new(RetryableCleanupControl {
+            failed_once: AtomicBool::new(true),
+            kills: AtomicUsize::new(0),
+        });
+        let control: Arc<dyn ProcessControl> = concrete.clone();
+        let launched = crate::transport::frame(
+            ManagedProcess {
+                stdout: Box::new(FailingStartupSource),
+                stdin: Some(Box::new(InertStartupSink)),
+                control: control.clone(),
+            },
+            &host,
+        )
+        .expect("expected a framed startup transport");
+        let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
+
+        let error = drive(
+            launched,
+            Arc::new(state),
+            String::from("acp-client-tests"),
+            cleanup,
+        )
+        .await
+        .expect_err("expected the startup transport to fail before connection ownership");
+        assert!(
+            matches!(error, Error::CleanupRequired { .. }),
+            "expected cleanup recovery to take precedence, received {error:?}"
+        );
+        let recovered = error
+            .cleanup_control()
+            .expect("expected a recovery control after failed startup cleanup");
+        mango_external_agents::process::stop_process_with_limits(
+            recovered.as_ref(),
+            CancelReason::Shutdown,
+            host.limits(),
+        )
+        .await
+        .expect("expected host recovery to reap the startup child");
+        assert!(
+            Arc::ptr_eq(&control, &recovered),
+            "expected drive to retain the launched child control"
+        );
+        assert_eq!(
+            concrete.kills.load(Ordering::Acquire),
+            2,
+            "expected one failed drive cleanup and one host retry"
         );
     }
 

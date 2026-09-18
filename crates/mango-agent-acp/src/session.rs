@@ -61,7 +61,14 @@ pub struct AcpSession {
 pub(crate) struct CloseState {
     started: AtomicBool,
     done: mango_external_agents::CancelToken,
-    result: Mutex<Option<std::result::Result<(), String>>>,
+    result: Mutex<Option<std::result::Result<(), CloseFailure>>>,
+}
+
+/// Cloneable cleanup evidence shared by every waiter on the same close operation.
+#[derive(Clone)]
+struct CloseFailure {
+    message: String,
+    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
 }
 
 impl Default for CloseState {
@@ -86,7 +93,10 @@ impl CloseState {
 
     fn finish(&self, result: Result<()>) {
         *self.result.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(result.map_err(|error| error.to_string()));
+            Some(result.map_err(|error| CloseFailure {
+                message: error.to_string(),
+                control: error.cleanup_control(),
+            }));
         self.done.cancel();
     }
 
@@ -96,11 +106,24 @@ impl CloseState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .unwrap_or_else(|| Err(String::from("the ACP close task ended without an outcome")))
-            .map_err(|message| {
-                Error::Vendor(link_failure(format!(
-                    "ACP session cleanup failed: {message}"
-                )))
+            .unwrap_or_else(|| {
+                Err(CloseFailure {
+                    message: String::from("the ACP close task ended without an outcome"),
+                    control: None,
+                })
+            })
+            .map_err(|failure| {
+                let source = Error::Vendor(link_failure(format!(
+                    "ACP session cleanup failed: {}",
+                    failure.message
+                )));
+                match failure.control {
+                    Some(control) => Error::CleanupRequired {
+                        control,
+                        source: Box::new(source),
+                    },
+                    None => source,
+                }
             })
     }
 }
@@ -181,13 +204,10 @@ impl AcpSession {
         let Some(lifecycle) = self.lifecycle.begin_start() else {
             return Err(Error::Closed { subject: "session" });
         };
-        let sent = self
-            .connection
-            .connection()
-            .send_request(SetSessionModeRequest::new(
-                self.native_session_id.clone(),
-                String::from(mode_id),
-            ));
+        let sent = client::submit(
+            &self.connection,
+            SetSessionModeRequest::new(self.native_session_id.clone(), String::from(mode_id)),
+        )?;
         drop(lifecycle);
         client::await_sent(
             &self.connection,
@@ -460,17 +480,18 @@ impl AcpSession {
         let Some(lifecycle) = self.lifecycle.begin_start() else {
             return Err(Error::Closed { subject: "session" });
         };
-        let (response_revision, sent) = self.connection_state.with_catalog_revision(|revision| {
-            let sent =
-                self.connection
-                    .connection()
-                    .send_request(SetSessionConfigOptionRequest::new(
+        let (response_revision, sent) =
+            self.connection_state.with_catalog_revision(|revision| {
+                client::submit(
+                    &self.connection,
+                    SetSessionConfigOptionRequest::new(
                         self.native_session_id.clone(),
                         String::from(id.as_str()),
                         value,
-                    ));
-            (revision, sent)
-        });
+                    ),
+                )
+                .map(|sent| (revision, sent))
+            })?;
         drop(lifecycle);
         let response = client::await_sent(
             &self.connection,
@@ -540,28 +561,6 @@ impl AcpSession {
         // set would only create another unverified state. Keep the confirmed partial state instead.
         Ok(ConfigurationOutcome::applied(state, progress.applied)
             .rejecting(progress.rejected, Rollback::NotAttempted))
-    }
-
-    /// Sends one request under the host's deadline.
-    ///
-    /// Everything but `session/prompt`, which is a turn and stays unbounded.
-    async fn request<Request>(
-        &self,
-        method: &'static str,
-        request: Request,
-    ) -> Result<Request::Response>
-    where
-        Request: agent_client_protocol::JsonRpcRequest,
-        Request::Response: Send,
-    {
-        client::send(
-            &self.connection,
-            &self.profile,
-            self.host.limits().request_timeout,
-            method,
-            request,
-        )
-        .await
     }
 
     /// The configuration one turn runs under, refusing what ACP v1 has no surface for.
@@ -673,7 +672,7 @@ pub(crate) fn accepted_axes(configuration: &Configuration) -> Configuration {
 
 /// Lists only conversations in the workspace the current host authorized.
 pub(crate) async fn list_sessions(
-    connection: &ConnectionHandle,
+    connection: &Arc<ConnectionHandle>,
     profile: &AcpProfile,
     host: &HostContext,
     capabilities: &AgentCapabilities,

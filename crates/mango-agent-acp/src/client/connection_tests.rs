@@ -75,8 +75,9 @@ async fn drive_fake_agent(process: FakeProcess) -> (Arc<ConnectionHandle>, FakeL
     )
     .await
     .expect("transport");
+    let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
     let connection = Arc::new(
-        drive(launched, state, String::from("bounded-acp-tests"))
+        drive(launched, state, String::from("bounded-acp-tests"), cleanup)
             .await
             .expect("driver"),
     );

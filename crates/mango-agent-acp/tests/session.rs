@@ -16,9 +16,10 @@ use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, Rec
 use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
     Configuration, ConfigurationChange, ConfigurationOptionId, ConfigurationPatch,
-    ConfigurationValue, DecisionSource, Dispatch, Error, EventKind, ExitStatus, Harness, HostContext, Limits,
-    ManagedProcess, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, ResumeMode,
-    Session, SessionStatus, SessionSubscription, TurnRequest, TurnStream, VendorInfo,
+    ConfigurationValue, DecisionSource, Dispatch, Error, EventKind, ExitStatus, Harness,
+    HostContext, Limits, ManagedProcess, OpenSession, PermissionLevel, ProcessControl,
+    ProcessLauncher, ResumeMode, Session, SessionStatus, SessionSubscription, TurnRequest,
+    TurnStream, VendorInfo,
 };
 
 const VENDOR: VendorInfo = VendorInfo {
@@ -1400,6 +1401,166 @@ async fn an_abandoned_generic_request_closes_admission_and_reaps_the_silent_peer
     .expect("expected abandoned request cleanup to reap the silent peer");
 }
 
+/// Cancelling the opening future while `session/new` owns the reply slot must end the child: no
+/// session handle exists yet to do that cleanup later.
+#[tokio::test]
+async fn abandoning_open_while_session_new_is_held_reaps_the_child() {
+    let agent = HeldRequestAgent::new("session/new");
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process());
+    let host = host(&launcher);
+    let opening = tokio::spawn(async move {
+        AcpHarness::new(profile())
+            .open_session(&host, OpenSession::new("held-new"))
+            .await
+    });
+
+    agent.wait_until_entered().await;
+    opening.abort();
+    let _ = opening.await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected cancellation before session ownership to reap the child");
+}
+
+/// A held resume request has the same opening ownership gap as `session/new`; cancelling it must
+/// not leave an agent process running without a session handle.
+#[tokio::test]
+async fn abandoning_open_while_session_load_is_held_reaps_the_child() {
+    let agent = HeldRequestAgent::new("session/load");
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process());
+    let host = host(&launcher);
+    let opening = tokio::spawn(async move {
+        AcpHarness::new(profile())
+            .open_session(
+                &host,
+                OpenSession::new("held-load").resuming("previous", ResumeMode::Strict),
+            )
+            .await
+    });
+
+    agent.wait_until_entered().await;
+    opening.abort();
+    let _ = opening.await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected cancellation before resumed-session ownership to reap the child");
+}
+
+/// `session/set_config_option` is generic ACP bookkeeping, so abandoning it must seal admission
+/// and own teardown instead of releasing its reply slot for a later request to consume.
+#[tokio::test]
+async fn abandoning_a_held_config_option_request_reaps_the_child() {
+    let agent = HeldRequestAgent::new("session/set_config_option");
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process());
+    let opened = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("held-config-option"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+    let configuring = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .configure(
+                    ConfigurationPatch::new()
+                        .model(ConfigurationChange::Set(String::from("large"))),
+                )
+                .await
+        }
+    });
+
+    agent.wait_until_entered().await;
+    configuring.abort();
+    let _ = configuring.await;
+
+    let error = session
+        .configure(ConfigurationPatch::new().model(ConfigurationChange::Set(String::from("large"))))
+        .await
+        .expect_err("abandonment must close later configuration admission");
+    assert!(
+        matches!(
+            error.cause(),
+            Error::Closed {
+                subject: "ACP connection"
+            }
+        ),
+        "received {error:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected abandoned configuration cleanup to reap the child");
+}
+
+/// A held `session/set_mode` shares the generic request owner and must close the connection when
+/// its caller abandons the configuration future.
+#[tokio::test]
+async fn abandoning_a_held_mode_request_reaps_the_child() {
+    let agent = HeldRequestAgent::new("session/set_mode");
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process());
+    let profile = Arc::new(
+        AcpProfile::custom("fake", ["fake-acp", "acp"], VENDOR).with_modes(SessionModeIds {
+            full_access: Some("code"),
+            ..SessionModeIds::UNKNOWN
+        }),
+    );
+    let opened = AcpHarness::new(profile)
+        .open_session(&host(&launcher), OpenSession::new("held-mode"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+    let configuring = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .configure(at_level(PermissionLevel::FullAccess))
+                .await
+        }
+    });
+
+    agent.wait_until_entered().await;
+    configuring.abort();
+    let _ = configuring.await;
+
+    let error = session
+        .configure(at_level(PermissionLevel::FullAccess))
+        .await
+        .expect_err("abandonment must close later mode admission");
+    assert!(
+        matches!(
+            error.cause(),
+            Error::Closed {
+                subject: "ACP connection"
+            }
+        ),
+        "received {error:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected abandoned mode cleanup to reap the child");
+}
+
 /// ACP v1 has no page-size request field, so an oversized reply cannot be cut without losing
 /// rows behind the agent's cursor.
 #[tokio::test]
@@ -1622,6 +1783,76 @@ async fn completed_harness_listing_kills_its_short_lived_child_once() {
         1,
         "expected explicit cleanup not to be repeated from ConnectionShutdownGuard::drop"
     );
+}
+
+/// A picker has no session handle to retain a failed child cleanup. If its request also failed,
+/// cleanup recovery takes priority so the host receives the control needed to reap that child.
+#[tokio::test]
+async fn a_failed_picker_cleanup_returns_recovery_control_before_the_listing_error() {
+    let inner = FakeLauncher::new();
+    inner.push(RefusingListingAgent::process());
+    let launcher = RecoverableCleanupLauncher::new(inner.clone());
+    let host = recoverable_cleanup_host(&launcher);
+
+    let error = refusal(
+        AcpHarness::new(profile())
+            .list_sessions(&host, Default::default())
+            .await,
+    );
+    assert!(
+        matches!(error, Error::CleanupRequired { .. }),
+        "expected the recoverable cleanup failure, received {error:?}"
+    );
+    let control = error
+        .cleanup_control()
+        .expect("expected a host recovery control for the failed picker cleanup");
+    mango_external_agents::process::stop_process_with_limits(
+        control.as_ref(),
+        CancelReason::Shutdown,
+        host.limits(),
+    )
+    .await
+    .expect("expected the host retry to reap the picker child");
+    assert_eq!(
+        inner.live_children(),
+        0,
+        "expected no child after the host recovered picker cleanup"
+    );
+}
+
+#[tokio::test]
+async fn repeated_failed_session_closes_preserve_the_same_recovery_control() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().process());
+    let launcher = RecoverableCleanupLauncher::new(inner.clone());
+    let host = recoverable_cleanup_host(&launcher);
+    let session = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("recover-close"))
+        .await
+        .expect("expected a session");
+    let first = session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect_err("expected the first cleanup attempt to fail");
+    let control = first
+        .cleanup_control()
+        .expect("expected session close to retain its recovery control");
+    let repeated = session
+        .close(CloseReason::Requested)
+        .await
+        .expect_err("expected repeated close to retain the first failure");
+    let repeated_control = repeated
+        .cleanup_control()
+        .expect("expected repeated close to retain its recovery control");
+    assert!(Arc::ptr_eq(&control, &repeated_control));
+    mango_external_agents::process::stop_process_with_limits(
+        control.as_ref(),
+        CancelReason::Shutdown,
+        host.limits(),
+    )
+    .await
+    .expect("expected host recovery to reap the child");
+    assert_eq!(inner.live_children(), 0);
 }
 
 /// Ordinary close and the connection watcher share one claim on the injected child.
@@ -2599,6 +2830,23 @@ struct GatedLauncher {
     fail_kill: bool,
 }
 
+/// A launcher whose first cleanup attempt fails but whose returned control can reap the same child
+/// when the host retries. It models an OS cleanup failure without making recovery impossible.
+#[derive(Clone)]
+struct RecoverableCleanupLauncher {
+    inner: FakeLauncher,
+    fail_next_kill: Arc<AtomicBool>,
+}
+
+impl RecoverableCleanupLauncher {
+    fn new(inner: FakeLauncher) -> Self {
+        Self {
+            inner,
+            fail_next_kill: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
 /// An ACP peer that completes setup but deliberately never answers `session/list`.
 struct SilentListingAgent;
 
@@ -2632,6 +2880,122 @@ impl SilentListingAgent {
                 _ => Vec::new(),
             }
         })
+    }
+}
+
+/// A picker peer that rejects `session/list`, so a cleanup failure can prove it is not hidden by
+/// the request failure that started shutdown.
+struct RefusingListingAgent;
+
+impl RefusingListingAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            let request: serde_json::Value =
+                serde_json::from_str(line).expect("expected harness JSON-RPC request");
+            let id = request["id"].clone();
+            let response = match request["method"].as_str() {
+                Some("initialize") => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {
+                        "protocolVersion": 1,
+                        "agentInfo": { "name": "refusing-listing", "version": "1" },
+                        "agentCapabilities": {
+                            "loadSession": true,
+                            "promptCapabilities": { "image": false, "embeddedContext": false },
+                            "sessionCapabilities": { "list": {} },
+                        },
+                        "authMethods": [],
+                    }
+                }),
+                Some("session/list") => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32001, "message": "listing rejected" }
+                }),
+                _ => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            };
+            vec![response.to_string()]
+        })
+    }
+}
+
+/// A named ACP peer that accepts setup and then leaves one generic request unanswered.
+///
+/// It gives cancellation tests a concrete pending reply in the SDK, rather than relying on a timer
+/// or an inline closure that might accidentally answer a different request.
+#[derive(Clone)]
+struct HeldRequestAgent {
+    method: &'static str,
+    entered: Arc<AtomicBool>,
+}
+
+impl HeldRequestAgent {
+    fn new(method: &'static str) -> Self {
+        Self {
+            method,
+            entered: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn process(&self) -> FakeProcess {
+        let agent = self.clone();
+        FakeProcess::responding(move |line| agent.answer(line))
+    }
+
+    fn answer(&self, line: &str) -> Vec<String> {
+        let request: serde_json::Value =
+            serde_json::from_str(line).expect("expected harness JSON-RPC request");
+        let Some(id) = request.get("id").cloned() else {
+            return Vec::new();
+        };
+        let method = request["method"].as_str();
+        if method == Some(self.method) {
+            self.entered.store(true, Ordering::Release);
+            return Vec::new();
+        }
+        let response = match method {
+            Some("initialize") => serde_json::json!({
+                "protocolVersion": 1,
+                "agentInfo": { "name": "held-request-fake", "version": "1" },
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "promptCapabilities": { "image": true, "embeddedContext": true },
+                    "sessionCapabilities": {},
+                },
+                "authMethods": [],
+            }),
+            Some("session/new") => serde_json::json!({
+                "sessionId": "held-request-session",
+                "modes": {
+                    "currentModeId": "plan",
+                    "availableModes": [
+                        { "id": "plan", "name": "Plan" },
+                        { "id": "code", "name": "Code" }
+                    ]
+                },
+                "configOptions": [InterleavingConfigAgent::model_option("small")],
+            }),
+            Some("session/load") => serde_json::json!({
+                "modes": {
+                    "currentModeId": "plan",
+                    "availableModes": [
+                        { "id": "plan", "name": "Plan" },
+                        { "id": "code", "name": "Code" }
+                    ]
+                },
+                "configOptions": [InterleavingConfigAgent::model_option("small")],
+            }),
+            _ => serde_json::json!({}),
+        };
+        vec![InterleavingConfigAgent::result(id, response)]
+    }
+
+    async fn wait_until_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !self.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the held request to enter the ACP SDK");
     }
 }
 
@@ -2673,11 +3037,33 @@ impl mango_external_agents::ProcessLauncher for GatedLauncher {
     }
 }
 
+#[async_trait::async_trait]
+impl ProcessLauncher for RecoverableCleanupLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<ManagedProcess> {
+        let mut process = self.inner.spawn(spec).await?;
+        process.control = Arc::new(FailOnceCleanupControl {
+            inner: Arc::clone(&process.control),
+            fail_next_kill: Arc::clone(&self.fail_next_kill),
+        });
+        Ok(process)
+    }
+}
+
 struct GatedControl {
     inner: Arc<dyn mango_external_agents::ProcessControl>,
     kill_started: CancelToken,
     release_kill: CancelToken,
     fail_kill: bool,
+}
+
+/// The first termination request reports a typed host-launch error; every later one reaches the
+/// fake process so a caller holding `Error::cleanup_control` can reconcile the child.
+struct FailOnceCleanupControl {
+    inner: Arc<dyn ProcessControl>,
+    fail_next_kill: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -2701,6 +3087,31 @@ impl mango_external_agents::ProcessControl for GatedControl {
             return Err(Error::Launch {
                 program: String::from("fake ACP agent"),
                 message: String::from("the test process refused termination"),
+            });
+        }
+        self.inner.kill(reason).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for FailOnceCleanupControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        if self.fail_next_kill.swap(false, Ordering::AcqRel) {
+            return Err(Error::Launch {
+                program: String::from("fake ACP agent"),
+                message: String::from("the first test cleanup attempt failed"),
             });
         }
         self.inner.kill(reason).await
@@ -2752,6 +3163,20 @@ fn bounded_recording_host(launcher: &KillRecordingLauncher) -> HostContext {
 }
 
 fn gated_host(launcher: &GatedLauncher) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+fn recoverable_cleanup_host(launcher: &RecoverableCleanupLauncher) -> HostContext {
     HostContext::builder()
         .launcher(Arc::new(launcher.clone()))
         .cwd(std::env::temp_dir())
