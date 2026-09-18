@@ -20,6 +20,7 @@ pub mod normalize;
 pub mod operation;
 pub mod permission;
 pub mod process;
+pub mod recovery;
 pub mod redact;
 pub mod registry;
 pub mod session;
@@ -77,6 +78,7 @@ pub use process::{
     ByteSink, ByteSource, ExitStatus, InterruptOutcome, LaunchSpec, LineLimits, LineStream,
     ManagedProcess, ProcessControl, ProcessLauncher, StderrTail, StopOutcome,
 };
+pub use recovery::{RecoveryAction, RecoveryRecord, RequestFingerprint};
 pub use registry::HarnessRegistry;
 pub use session::{
     AccountUsage, Attachment, AttachmentKind, CancelReason, CloseReason, McpServer, McpTransport,
@@ -88,7 +90,7 @@ pub use state::{
     SessionRevision, SessionSnapshot, SessionState, SessionStatus, SessionSubscription,
     TransportSelection,
 };
-pub use stream::{EventSink, ReviewStream, TurnStream};
+pub use stream::{EventReceiver, EventSink, ReviewStream, TerminalStatus, TurnStream};
 pub use transport::{AcpSpec, ExecutablePath, StdioSpec, TransportKind, TransportSpec, WsSpec};
 
 /// Semantic version of this crate, kept in lockstep with every workspace crate.

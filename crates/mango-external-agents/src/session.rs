@@ -479,7 +479,7 @@ pub enum AttachmentKind {
 ///
 /// Bytes rather than base64: a harness encodes for its own dialect, and a host that already has
 /// the bytes should not have to encode them for a wire it cannot see.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Attachment {
     /// The host's own id for it.
     pub id: String,
