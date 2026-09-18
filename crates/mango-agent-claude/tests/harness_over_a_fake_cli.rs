@@ -451,6 +451,142 @@ mod opening_a_session {
     }
 
     #[tokio::test]
+    async fn a_fresh_usable_help_surface_recovers_a_missing_surface_receipt_gate() {
+        let mut missing_flag_help = String::from(HELP_2_1_270);
+        missing_flag_help = missing_flag_help.replace(
+            "  --include-partial-messages",
+            "  --omitted-partial-messages",
+        );
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(&missing_flag_help));
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        assert!(
+            matches!(discovery.gate, GateVerdict::MissingRequiredSurface { .. }),
+            "expected the incomplete initial help surface to be gated, received {:?}",
+            discovery.gate
+        );
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+
+        launcher.set_help(HELP_2_1_270);
+        let before = launcher.launches().len();
+        harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .expect("expected the refreshed complete help surface to open a session");
+
+        let launches = launcher.launches();
+        assert_eq!(
+            launches[before..]
+                .iter()
+                .map(|launch| launch.argv.as_slice())
+                .collect::<Vec<_>>(),
+            vec![["claude", "--help"]],
+            "expected opening to reuse receipt facts and refresh only help, received {launches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_usable_help_surface_recovers_a_version_fallback_receipt_gate() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version("2.1.200 (Claude Code)")
+                .with_help("not Claude help"),
+        );
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        assert!(
+            matches!(discovery.gate, GateVerdict::VersionTooOld { .. }),
+            "expected unreadable help to fall back to the version gate, received {:?}",
+            discovery.gate
+        );
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+
+        launcher.set_help(HELP_2_1_270);
+        let before = launcher.launches().len();
+        harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .expect("expected usable fresh help to supersede the version fallback");
+
+        let launches = launcher.launches();
+        assert_eq!(
+            launches[before..]
+                .iter()
+                .map(|launch| launch.argv.as_slice())
+                .collect::<Vec<_>>(),
+            vec![["claude", "--help"]],
+            "expected opening to refresh only help, received {launches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_fresh_help_surface_keeps_a_version_fallback_receipt_gate() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version("2.1.200 (Claude Code)")
+                .with_help("not Claude help"),
+        );
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+
+        let error = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .map(|_| ())
+            .expect_err("expected unreadable fresh help to retain the version fallback");
+        assert!(
+            matches!(error.cause(), Error::VersionGate { .. }),
+            "expected the version fallback refusal, received {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_invalidated_bound_receipt_runs_no_additional_probe() {
         let launcher = Arc::new(FakeClaudeCli::new());
         let clock = Arc::new(FrozenClock::default());

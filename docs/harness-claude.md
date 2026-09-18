@@ -37,6 +37,16 @@ wrapper banner can include its own semver, so discovery reads the semver from th
 identifies Claude Code rather than accepting the first semver in all stdout. A single bare version
 remains accepted for the documented compact form.
 
+Anthropic's [CLI reference](https://code.claude.com/docs/en/cli-reference.md#cli-flags) cautions
+that `claude --help` does not list every supported flag. This harness deliberately applies the
+runtime gate only to the fixed argv it drives, each measured in the pinned 2.1.270 capture and
+documented on the linked CLI and headless references. If a later build omits one of those required
+flags from `--help`, opening refuses it even when the published reference still lists the flag.
+The conservative limitation avoids treating a changed help grammar as proof that an untested child
+will accept every argument. It can be relaxed only with a documented feature-detection surface or
+a new pinned capture that demonstrates the exact argv; an arbitrary version-based fallback would
+send an unverified flag after a user submitted a turn.
+
 Two later builds change behaviour without changing what this harness may pass, so they are
 recorded rather than gated on:
 

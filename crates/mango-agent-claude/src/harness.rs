@@ -199,13 +199,14 @@ impl ClaudeHarness {
             .as_deref()
             .and_then(version::parse);
         let refusal = match receipt.discovery.gate {
-            GateVerdict::VersionTooOld { .. } => Some(SurveyRefusal::VersionTooOld),
-            GateVerdict::MissingRequiredSurface { .. } => {
-                Some(SurveyRefusal::MissingRequiredSurface)
-            }
-            GateVerdict::Usable | GateVerdict::Unknown => {
-                classify_surface(surface.as_ref(), version.as_ref())
-            }
+            // Help describes the argv grammar, not a durable capability fact. Reclassify every
+            // installed receipt against the fresh surface: a prior missing-flag or version
+            // fallback can reflect incomplete probe output, while `classify_surface` retains the
+            // stored version floor when fresh help remains unreadable.
+            GateVerdict::VersionTooOld { .. }
+            | GateVerdict::MissingRequiredSurface { .. }
+            | GateVerdict::Usable
+            | GateVerdict::Unknown => classify_surface(surface.as_ref(), version.as_ref()),
             _ => Some(SurveyRefusal::UnreadableHelp),
         };
         let account_kind = match receipt.discovery.auth {
