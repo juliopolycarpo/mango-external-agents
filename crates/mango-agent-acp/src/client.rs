@@ -703,6 +703,12 @@ impl SessionState {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn lock_catalog_revision(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.catalog_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn lock_reducer(&self) -> std::sync::MutexGuard<'_, Reducer> {
         self.reducer.lock().unwrap_or_else(PoisonError::into_inner)
     }
