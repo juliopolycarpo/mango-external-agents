@@ -159,8 +159,8 @@ impl fmt::Debug for ThreadStartParams {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ThreadStartParams")
-            .field("cwd", &self.cwd)
-            .field("model", &self.model)
+            .field("cwd_bytes", &self.cwd.len())
+            .field("has_model", &self.model.is_some())
             .field("approval_policy", &self.approval_policy)
             .field("sandbox", &self.sandbox)
             .field("approvals_reviewer", &self.approvals_reviewer)
@@ -201,9 +201,9 @@ impl fmt::Debug for ThreadResumeParams {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ThreadResumeParams")
-            .field("thread_id", &self.thread_id)
-            .field("cwd", &self.cwd)
-            .field("model", &self.model)
+            .field("thread_id_bytes", &self.thread_id.len())
+            .field("cwd_bytes", &self.cwd.len())
+            .field("has_model", &self.model.is_some())
             .field("approval_policy", &self.approval_policy)
             .field("sandbox", &self.sandbox)
             .field("approvals_reviewer", &self.approvals_reviewer)
@@ -214,7 +214,7 @@ impl fmt::Debug for ThreadResumeParams {
 }
 
 /// Reads native metadata without loading transcript turns into the response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadReadParams {
     /// The native conversation the host intends to resume.
@@ -223,12 +223,33 @@ pub struct ThreadReadParams {
     pub include_turns: bool,
 }
 
+impl fmt::Debug for ThreadReadParams {
+    /// Retains request shape without writing vendor thread ids into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadReadParams")
+            .field("thread_id_bytes", &self.thread_id.len())
+            .field("include_turns", &self.include_turns)
+            .finish()
+    }
+}
+
 /// The app-server's metadata-only thread answer.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadReadResponse {
     /// The thread identity and original workspace.
     pub thread: ThreadSummary,
+}
+
+impl fmt::Debug for ThreadReadResponse {
+    /// Retains the response shape without writing vendor thread metadata into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadReadResponse")
+            .field("thread", &self.thread)
+            .finish()
+    }
 }
 
 /// One conversation, as much of it as this harness reads.
@@ -236,7 +257,7 @@ pub struct ThreadReadResponse {
 /// The upstream `Thread` carries thirty members; the five kept here are the ones a session id, a
 /// picker row and a working-directory filter are built from. Everything else — the persisted
 /// turns above all — stays where the vendor wrote it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadSummary {
     /// The vendor's own handle.
@@ -255,8 +276,22 @@ pub struct ThreadSummary {
     pub updated_at: Option<i64>,
 }
 
+impl fmt::Debug for ThreadSummary {
+    /// Retains which thread metadata arrived without writing vendor or host values into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadSummary")
+            .field("id_bytes", &self.id.len())
+            .field("has_preview", &!self.preview.is_empty())
+            .field("has_name", &self.name.is_some())
+            .field("has_cwd", &self.cwd.is_some())
+            .field("has_updated_at", &self.updated_at.is_some())
+            .finish()
+    }
+}
+
 /// What opening or continuing a conversation answered with.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartResponse {
     /// The conversation itself.
@@ -273,6 +308,20 @@ pub struct ThreadStartResponse {
     /// The reviewer it actually routed to.
     #[serde(default)]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
+}
+
+impl fmt::Debug for ThreadStartResponse {
+    /// Retains which fields the server returned without writing vendor values into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadStartResponse")
+            .field("thread", &self.thread)
+            .field("has_model", &self.model.is_some())
+            .field("has_reasoning_effort", &self.reasoning_effort.is_some())
+            .field("approval_policy", &self.approval_policy)
+            .field("approvals_reviewer", &self.approvals_reviewer)
+            .finish()
+    }
 }
 
 /// One piece of a turn's input.
@@ -491,7 +540,7 @@ pub struct ReviewStartResponse {
 }
 
 /// Listing the conversations this machine already has.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListParams {
     /// Where to continue from.
@@ -505,8 +554,20 @@ pub struct ThreadListParams {
     pub cwd: Option<String>,
 }
 
+impl fmt::Debug for ThreadListParams {
+    /// Retains request shape without writing a vendor cursor or host workspace into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadListParams")
+            .field("has_cursor", &self.cursor.is_some())
+            .field("limit", &self.limit)
+            .field("has_cwd", &self.cwd.is_some())
+            .finish()
+    }
+}
+
 /// One page of them.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListResponse {
     /// The rows.
@@ -515,6 +576,17 @@ pub struct ThreadListResponse {
     /// Where the next page starts.
     #[serde(default)]
     pub next_cursor: Option<String>,
+}
+
+impl fmt::Debug for ThreadListResponse {
+    /// Retains page shape without writing rows or a vendor cursor into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadListResponse")
+            .field("thread_count", &self.data.len())
+            .field("has_next_cursor", &self.next_cursor.is_some())
+            .finish()
+    }
 }
 
 /// Asking which models this build accepts.
@@ -635,7 +707,9 @@ mod tests {
 
     use super::{
         Account, AccountReadResponse, AskForApproval, ClientInfo, InitializeParams, SandboxMode,
-        ThreadResumeParams, ThreadStartParams, TurnStartParams, TurnStatus, UserInput,
+        ThreadListParams, ThreadListResponse, ThreadReadParams, ThreadReadResponse,
+        ThreadResumeParams, ThreadStartParams, ThreadStartResponse, ThreadSummary, TurnStartParams,
+        TurnStatus, UserInput,
     };
 
     /// The handshake writes the host's own name and nothing it was not given.
@@ -710,6 +784,75 @@ mod tests {
 
         for rendered in [format!("{start:?}"), format!("{resume:?}")] {
             for secret in ["stdio-env-secret", "http-header-secret"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected {secret:?} to stay out of diagnostics, received {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thread_metadata_and_picker_debug_redact_vendor_and_workspace_values() {
+        let thread = ThreadSummary {
+            id: String::from("vendor-thread-secret"),
+            preview: String::from("preview-secret"),
+            name: Some(String::from("name-secret")),
+            cwd: Some(String::from("/host-workspace-secret")),
+            updated_at: Some(1_725_000_000),
+        };
+        let read = ThreadReadParams {
+            thread_id: String::from("vendor-thread-secret"),
+            include_turns: false,
+        };
+        let read_response = ThreadReadResponse {
+            thread: thread.clone(),
+        };
+        let start_response = ThreadStartResponse {
+            thread: thread.clone(),
+            model: Some(String::from("model-secret")),
+            reasoning_effort: Some(String::from("effort-secret")),
+            ..ThreadStartResponse::default()
+        };
+        let list = ThreadListParams {
+            cursor: Some(String::from("vendor-cursor-secret")),
+            limit: Some(10),
+            cwd: Some(String::from("/host-workspace-secret")),
+        };
+        let list_response = ThreadListResponse {
+            data: vec![thread],
+            next_cursor: Some(String::from("vendor-cursor-secret")),
+        };
+        let start = ThreadStartParams {
+            cwd: String::from("/host-workspace-secret"),
+            model: Some(String::from("model-secret")),
+            ..ThreadStartParams::default()
+        };
+        let resume = ThreadResumeParams {
+            thread_id: String::from("vendor-thread-secret"),
+            cwd: String::from("/host-workspace-secret"),
+            model: Some(String::from("model-secret")),
+            ..ThreadResumeParams::default()
+        };
+
+        for rendered in [
+            format!("{start:?}"),
+            format!("{resume:?}"),
+            format!("{read:?}"),
+            format!("{read_response:?}"),
+            format!("{start_response:?}"),
+            format!("{list:?}"),
+            format!("{list_response:?}"),
+        ] {
+            for secret in [
+                "vendor-thread-secret",
+                "preview-secret",
+                "name-secret",
+                "/host-workspace-secret",
+                "model-secret",
+                "effort-secret",
+                "vendor-cursor-secret",
+            ] {
                 assert!(
                     !rendered.contains(secret),
                     "expected {secret:?} to stay out of diagnostics, received {rendered}"
