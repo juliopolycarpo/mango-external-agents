@@ -202,7 +202,7 @@ impl ClaudeSession {
             record_stop(
                 &self.shared,
                 &taken.end,
-                matches!(outcome, Some(StopOutcome::Terminated)),
+                !matches!(outcome, Some(StopOutcome::Interrupted)),
                 reason,
                 false,
             );
@@ -351,7 +351,7 @@ impl Drop for AbandonedStart {
                 record_stop(
                     &shared,
                     &taken.end,
-                    matches!(outcome, Some(StopOutcome::Terminated)),
+                    !matches!(outcome, Some(StopOutcome::Interrupted)),
                     reason,
                     true,
                 );
@@ -435,7 +435,7 @@ fn spawn_teardown(shared: &Arc<Shared>, taken: TakenTurn, reason: CancelReason) 
                 record_stop(
                     &shared,
                     &taken.end,
-                    matches!(outcome, Some(StopOutcome::Terminated)),
+                    !matches!(outcome, Some(StopOutcome::Interrupted)),
                     reason,
                     false,
                 );
@@ -968,7 +968,7 @@ async fn pump(
                     record_stop(
                         &shared,
                         &taken.end,
-                        matches!(outcome, Some(StopOutcome::Terminated)),
+                        !matches!(outcome, Some(StopOutcome::Interrupted)),
                         CancelReason::Requested,
                         true,
                     );
@@ -983,7 +983,7 @@ async fn pump(
                     record_stop(
                         &shared,
                         &taken.end,
-                        matches!(outcome, Some(StopOutcome::Terminated)),
+                        !matches!(outcome, Some(StopOutcome::Interrupted)),
                         CancelReason::Shutdown,
                         false,
                     );
@@ -1029,7 +1029,7 @@ async fn pump(
                         record_stop(
                             &shared,
                             &taken.end,
-                            matches!(outcome, Some(StopOutcome::Terminated)),
+                            !matches!(outcome, Some(StopOutcome::Interrupted)),
                             CancelReason::Requested,
                             true,
                         );
@@ -1049,7 +1049,7 @@ async fn pump(
                         record_stop(
                             &shared,
                             &taken.end,
-                            matches!(outcome, Some(StopOutcome::Terminated)),
+                            !matches!(outcome, Some(StopOutcome::Interrupted)),
                             CancelReason::Requested,
                             true,
                         );
