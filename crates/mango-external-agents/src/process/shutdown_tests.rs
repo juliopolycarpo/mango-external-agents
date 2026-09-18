@@ -1,5 +1,6 @@
 use super::*;
 use crate::host::CancelToken;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -111,4 +112,30 @@ async fn host_limits_supply_the_interrupt_deadline() {
         StopOutcome::Terminated
     );
     assert_eq!(start.elapsed(), limits.kill_grace);
+}
+
+#[tokio::test]
+async fn a_cleanup_guard_dropped_off_runtime_uses_its_captured_runtime() {
+    let process = Arc::new(ControlledProcess {
+        interrupt: InterruptOutcome::Unsupported,
+        exit_on_interrupt: false,
+        exits: CancelToken::new(),
+        kills: AtomicUsize::new(0),
+    });
+    let control: Arc<dyn ProcessControl> = process.clone();
+    let cleanup =
+        ProcessCleanupGuard::new(control, crate::Limits::default(), CancelReason::Shutdown);
+    let dropped = std::thread::spawn(move || drop(cleanup));
+    assert!(
+        dropped.join().is_ok(),
+        "expected off-runtime drop not to panic"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while process.kills.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the captured runtime to claim bounded cleanup once");
 }

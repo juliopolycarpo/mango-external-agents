@@ -1233,6 +1233,11 @@ pub enum SettingRejection {
         /// What the vendor said, bounded.
         detail: String,
     },
+    /// The harness refused it before submission, in its own words.
+    RefusedByHarness {
+        /// Why the harness cannot safely encode the requested setting, bounded.
+        detail: String,
+    },
 }
 
 impl fmt::Debug for SettingRejection {
@@ -1244,12 +1249,13 @@ impl fmt::Debug for SettingRejection {
             Self::ResetNotSupported => "ResetNotSupported",
             Self::NotChangeableAfterOpen => "NotChangeableAfterOpen",
             Self::RefusedByVendor { .. } => "RefusedByVendor",
+            Self::RefusedByHarness { .. } => "RefusedByHarness",
         })
     }
 }
 
 impl SettingRejection {
-    /// This reason with its vendor-written text bounded.
+    /// This reason with its explanatory detail bounded.
     #[must_use]
     pub fn normalized(self) -> Self {
         match self {
@@ -1257,6 +1263,9 @@ impl SettingRejection {
                 received: normalize::bound_text(&received, TextLimit::Detail).text,
             },
             Self::RefusedByVendor { detail } => Self::RefusedByVendor {
+                detail: normalize::bound_text(&detail, TextLimit::Detail).text,
+            },
+            Self::RefusedByHarness { detail } => Self::RefusedByHarness {
                 detail: normalize::bound_text(&detail, TextLimit::Detail).text,
             },
             known => known,
@@ -1381,7 +1390,7 @@ mod tests {
         Configuration, ConfigurationCatalog, ConfigurationCategory, ConfigurationChange,
         ConfigurationOption, ConfigurationOptionId, ConfigurationOptionValue, ConfigurationPatch,
         ConfigurationSource, ConfigurationState, ConfigurationValue, ConfigurationValueType,
-        Rollback,
+        Rollback, SettingRejection,
     };
     use crate::error::Error;
     use crate::permission::{ApprovalRouting, PermissionLevel};
@@ -1441,6 +1450,26 @@ mod tests {
         let resetting = ConfigurationPatch::new().effort(ConfigurationChange::Reset);
         assert!(!resetting.is_empty());
         assert!(resetting.asks_for_a_reset());
+    }
+
+    /// A local policy refusal has a distinct public origin and receives the same bounded-detail
+    /// normalization as a vendor's refusal.
+    #[test]
+    fn a_harness_refusal_is_bounded_and_never_claims_to_be_vendor_authored() {
+        let detail = "x".repeat(20_000);
+        let rejection = SettingRejection::RefusedByHarness {
+            detail: detail.clone(),
+        }
+        .normalized();
+        assert_eq!(format!("{rejection:?}"), "RefusedByHarness");
+        let SettingRejection::RefusedByHarness { detail: normalized } = rejection else {
+            panic!("expected a harness-authored refusal");
+        };
+        assert!(
+            normalized.len() < detail.len(),
+            "expected a bounded detail, received {} bytes",
+            normalized.len()
+        );
     }
 
     /// A harness without vendor-native settings must refuse every active native axis, including a

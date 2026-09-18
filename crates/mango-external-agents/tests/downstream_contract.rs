@@ -45,6 +45,21 @@ struct AcmeHarness {
     descriptor: HarnessDescriptor,
 }
 
+/// A launcher the receipt-contract test never reaches.
+struct RefusingLauncher;
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for RefusingLauncher {
+    async fn spawn(
+        &self,
+        _spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        Err(Error::Closed {
+            subject: "test launcher",
+        })
+    }
+}
+
 impl AcmeHarness {
     fn new() -> Self {
         Self {
@@ -642,12 +657,14 @@ fn a_discovery_receipt_states_its_own_identity_and_freshness() {
     assert!(!receipt.is_fresh(observed - Duration::from_secs(1)));
 
     let descriptor = AcmeHarness::new();
+    let host = mango_external_agents::HostContext::builder()
+        .launcher(Arc::new(RefusingLauncher))
+        .cwd("/workspace")
+        .client_info("downstream-test", "0.0.0")
+        .build()
+        .expect("expected a host");
     let error = receipt
-        .verify_for(
-            descriptor.descriptor(),
-            observed,
-            &OpenSession::new("chat-1"),
-        )
+        .verify_for(descriptor.descriptor(), &host, &OpenSession::new("chat-1"))
         .expect_err("expected a receipt for another harness to be refused");
     assert!(
         error

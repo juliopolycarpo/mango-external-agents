@@ -966,7 +966,9 @@ dependencies = [
  "agent-client-protocol",
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "futures",
+ "http",
  "mango-external-agents",
  "serde_json",
  "tokio",
@@ -990,6 +992,7 @@ name = "mango-agent-codex"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "http",
  "mango-external-agents",
  "serde",
  "serde_json",

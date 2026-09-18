@@ -4,7 +4,7 @@ use super::*;
 use mango_external_agents::{ConfigurationOptionId, ConfigurationValue, Dispatch};
 
 #[tokio::test]
-async fn native_open_settings_are_refused_before_launch() {
+async fn unknown_native_open_settings_are_refused_after_catalog_discovery() {
     let launcher = FakeLauncher::new();
     launcher.push(FakeAcpAgent::new().process());
     let error = refusal(
@@ -21,11 +21,19 @@ async fn native_open_settings_are_refused_before_launch() {
             .await,
     );
     assert!(
-        matches!(error.cause(), Error::Protocol { received, .. } if received.contains("vendor-setting"))
+        matches!(error.cause(), Error::HostConfiguration { expected, received }
+            if expected.contains("every requested ACP session configuration option")
+                && received.contains("agent did not accept"))
     );
-    assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
+    assert_eq!(error.dispatch(), Dispatch::AcceptanceUnknown);
     assert_eq!(launcher.live_children(), 0);
-    assert!(launcher.written().is_empty());
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("session/new")),
+        "expected the agent's catalog before the native option was rejected"
+    );
 }
 
 #[tokio::test]

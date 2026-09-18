@@ -119,6 +119,10 @@ fn copy_error(error: &Error) -> Error {
     match error {
         Error::Busy => Error::Busy,
         Error::Operation { dispatch, source } => copy_error(source).with_dispatch(*dispatch),
+        Error::CleanupRequired { control, source } => Error::CleanupRequired {
+            control: Arc::clone(control),
+            source: Box::new(copy_error(source)),
+        },
         Error::Vendor(error) => Error::Vendor(error.clone()),
         Error::NotSupported { capability } => Error::NotSupported {
             capability: *capability,
@@ -215,11 +219,17 @@ struct Mutable {
     /// False until a run has actually created the conversation on disk.
     ///
     /// Distinct from [`SessionSnapshot::resumed`](mango_external_agents::SessionSnapshot::resumed):
-    /// that records whether *opening* continued an existing conversation, and never changes again.
+    /// that records whether Claude confirmed the requested continuation after the first lazy turn.
     /// This records whether the CLI should be told `--resume` or `--session-id` on the *next* turn,
     /// which flips from false to true the first time a run actually writes the conversation to
     /// disk — including a session that opened fresh.
     established: bool,
+    /// A strict resume handle that has not yet been confirmed by this run's `system/init`.
+    ///
+    /// Opening Claude is deliberately lazy: no process exists until the first turn. The candidate
+    /// therefore has to reach that turn as `--resume`, while the public snapshot stays unconfirmed
+    /// until Claude echoes the exact handle it resumed.
+    resume_pending: bool,
     /// The turn now running, when one is.
     active: Option<ActiveTurn>,
     /// The `--mcp-config` file every turn loads, when the host configured servers.
@@ -283,29 +293,29 @@ pub struct ClaudeSession {
 impl ClaudeSession {
     /// Adopts a session id without starting anything.
     ///
-    /// A resume reference is checked for shape and then taken on trust — see
+    /// A strict resume reference is checked for shape and held as a candidate — see
     /// [`is_vendor_session_id`](crate::argv::is_vendor_session_id) for why the shape is checked at
-    /// all. Verifying that the conversation still *exists* would cost a process launch per open,
-    /// and a wrong guess is recoverable: a session Claude has forgotten fails at the first turn
-    /// with the vendor's own message rather than at a probe nobody asked for. That is why
-    /// [`ResumeMode`](mango_external_agents::ResumeMode) makes no difference here, and why
-    /// [`SessionSnapshot::fallback_reason`](mango_external_agents::SessionSnapshot::fallback_reason)
-    /// is always `None` — nothing was verified, so nothing fell back.
+    /// all. Opening remains lazy, so Claude itself can establish the reference only as it starts
+    /// the first turn. The opening snapshot stays unconfirmed until its `system/init` echoes the
+    /// same handle. `ResumeMode::Fallback` is refused before a session is built: the documented
+    /// headless surface names no conclusive cannot-resume signal that could safely authorize a
+    /// different conversation.
     ///
     /// `core_state` arrives already carrying the opening snapshot — see
-    /// [`ClaudeHarness::open_session`](crate::ClaudeHarness) — so `established` here starts at
-    /// whether that snapshot itself records a resumed conversation.
+    /// [`ClaudeHarness::open_session`](crate::ClaudeHarness) — while `established` stays false
+    /// until this session's first `system/init` proves a conversation exists.
     pub(crate) fn new(
         host: HostContext,
         executable: ExecutablePath,
         core_state: CoreSessionState,
         availability: ModeAvailability,
         surface: Option<CliSurface>,
+        resume_pending: bool,
         mcp_config: Option<ConfigFile>,
     ) -> Self {
-        let established = core_state.snapshot().resumed;
         let mutable = Mutable {
-            established,
+            established: false,
+            resume_pending,
             active: None,
             mcp_config: mcp_config.map(Arc::new),
             nonresumable: None,
@@ -785,11 +795,13 @@ fn record_stop_locked(
     reason: CancelReason,
     settled: bool,
 ) {
+    let mut owns_active_turn = false;
     let should_clear = if let Some(active) = state
         .active
         .as_mut()
         .filter(|active| std::ptr::eq(active.end.as_ref(), end))
     {
+        owns_active_turn = true;
         active.stopped = true;
         active.settled |= settled;
         active.settled
@@ -797,8 +809,9 @@ fn record_stop_locked(
         false
     };
     // This belongs in the same critical section as clearing the owner: otherwise a pump can
-    // retire the slot between the reap and its forced-stop taint.
-    if taint_continuation {
+    // retire the slot between the reap and its forced-stop taint. A stale cleanup must not taint
+    // the continuation a newer attempt now owns.
+    if owns_active_turn && taint_continuation {
         state.nonresumable = Some(reason);
     }
     if should_clear {
@@ -965,7 +978,7 @@ impl mango_external_agents::Session for ClaudeSession {
             .clone();
         let established = {
             let state = self.shared.lock();
-            state.established
+            state.established || state.resume_pending
         };
         let mcp_config = abandoned
             .mcp_lease
@@ -1517,15 +1530,35 @@ async fn pump(
         let Some(record) = StreamRecord::parse(&line) else {
             continue;
         };
+        if resume_confirmation_pending(&shared)
+            && !(record.kind() == Some("system") && record.subtype() == Some("init"))
+        {
+            match record.kind() {
+                Some(kind @ ("stream_event" | "assistant" | "user" | "result")) => {
+                    taint_unconfirmed_resume(&shared, &end);
+                    failure = Some(Error::Protocol {
+                        expected: String::from(
+                            "a system/init record confirming the requested Claude resume handle before conversation content or result",
+                        ),
+                        received: format!("a {kind} record before resume confirmation"),
+                    });
+                    break;
+                }
+                // Non-conversation notices say nothing about which history this process loaded.
+                _ => continue,
+            }
+        }
         let reduction = reducer.reduce(&record);
-        if let Some(init) = reduction.init {
-            apply_init(&shared, &end, init);
+        if let Some(init) = reduction.init
+            && let Err(error) = apply_init(&shared, &end, init)
+        {
+            failure = Some(error);
+            break;
         }
         let native_finished = reducer.finished();
         if native_finished {
-            // `sink.emit` awaits, so a cancellation can claim the owner while this result event
-            // is crossing the host boundary. Publishing the native finish first makes the shared
-            // teardown retain its resumable continuation policy; the later cancellation joins it.
+            // Publish native completion before the bounded event send so cancellation joins
+            // teardown without discarding the confirmed resumable continuation.
             let _ = start_terminal_teardown(&shared, &end, &control, true);
         }
         for event in reduction.events {
@@ -1552,6 +1585,14 @@ async fn pump(
         if native_finished {
             break;
         }
+    }
+
+    // An EOF, idle timeout, or broken link can end before any conversation record arrives. It is
+    // still a failed strict verification: cleanup only tells us that the child stopped, never
+    // which native history it had loaded. A caller-requested stop stays retryable because its
+    // explicit cancellation owns that decision rather than an unverifiable vendor transcript.
+    if end.get().is_none() && resume_confirmation_pending(&shared) {
+        taint_unconfirmed_resume(&shared, &end);
     }
 
     finish(
@@ -1651,18 +1692,29 @@ fn forget_reservation(shared: &Shared, end: &Arc<TurnEnd>) {
 /// account's own default; reading it as if it could establish one is actively unsafe, because a
 /// single turn at auto-review would then resolve the plain default level to `auto` for the rest of
 /// the session. A user who asked to be asked would stop being asked.
-fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) {
-    // Buffered output from a stopped attempt must not re-establish its native continuation after
-    // a retry has claimed the slot. Keep the admission check and each state publication under the
-    // mutable state lock so cancel's reset cannot be overtaken between the check and the write.
+fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) -> Result<()> {
+    // Validate ownership and publish state under the same lock so stale output cannot
+    // re-establish a continuation after cancellation or a retry.
     let mut state = shared.lock();
     if !state
         .active
         .as_ref()
         .is_some_and(|active| Arc::ptr_eq(&active.end, end))
     {
-        return;
+        return Ok(());
     }
+    let session_id = init.session_id;
+    let resumed = match confirm_session_id(shared, &mut state, session_id.as_deref()) {
+        Ok(resumed) => resumed,
+        Err(error) => {
+            // A strict resume that did not identify the requested conversation is unsound whether
+            // the host's cleanup later sends SIGINT or escalates. A graceful stop only says the
+            // process left cleanly; it cannot establish which history that process had loaded.
+            mark_unconfirmed_resume_nonresumable(&mut state, end);
+            return Err(error);
+        }
+    };
+
     if let Some(commands) = init.commands {
         shared
             .core_state
@@ -1677,19 +1729,95 @@ fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) {
             .set_configuration(configuration.with_observed(observed));
     }
 
-    let Some(session_id) = init.session_id else {
-        return;
+    let Some(session_id) = session_id else {
+        return Ok(());
     };
-    // The conversation exists either way — that is what the record proves, and it is what makes
-    // the next turn a `--resume`.
-    state.established = true;
+
     // Which handle it is followed under is a different question. This is the one value in this
     // file a vendor process chooses and a later argv carries, so it is vetted like the resume
     // reference a host supplies: a handle beginning with `-` would be read by the CLI's parser as
     // a flag rather than as `--resume`'s value. An unrecognisable echo leaves the minted id in
     // force, which is the id this run was asked to write and the better of the two guesses.
     if crate::argv::is_vendor_session_id(&session_id) {
-        shared.core_state.set_native_session_id(session_id);
+        if resumed {
+            // The native id and the resume outcome describe one vendor assertion. One state
+            // update keeps observers from seeing a confirmed resume paired with a stale handle.
+            shared.core_state.update(|snapshot| {
+                snapshot.resumed = true;
+                snapshot.ids.native_session_id = session_id;
+            });
+        } else {
+            shared.core_state.set_native_session_id(session_id);
+        }
+    }
+    Ok(())
+}
+
+/// Confirms this run's session identity before publishing any of its other state.
+///
+/// A fresh run creates its conversation once it has a valid id. A strict resume is stronger: the
+/// id must be the exact candidate the host supplied, otherwise Claude may have started a different
+/// conversation and the turn must fail rather than present its output as resumed history.
+fn confirm_session_id(
+    shared: &Shared,
+    state: &mut Mutable,
+    session_id: Option<&str>,
+) -> Result<bool> {
+    if !state.resume_pending {
+        if session_id.is_some() {
+            state.established = true;
+        }
+        return Ok(false);
+    }
+
+    let Some(session_id) = session_id else {
+        return Err(Error::Protocol {
+            expected: String::from("a system/init record with the requested Claude resume handle"),
+            received: String::from("a system/init record without a session handle"),
+        });
+    };
+    if !crate::argv::is_vendor_session_id(session_id) {
+        return Err(Error::Protocol {
+            expected: String::from("a system/init record with a UUID-shaped Claude resume handle"),
+            received: String::from("a system/init record with an invalid session handle"),
+        });
+    }
+    let expected = shared.core_state.snapshot().ids.native_session_id.clone();
+    if session_id != expected {
+        return Err(Error::Protocol {
+            expected: String::from(
+                "a system/init record confirming the requested Claude resume handle",
+            ),
+            received: String::from("a different Claude session handle"),
+        });
+    }
+    state.resume_pending = false;
+    state.established = true;
+    Ok(true)
+}
+
+/// Whether the next terminal vendor record still lacks strict-resume confirmation.
+fn resume_confirmation_pending(shared: &Shared) -> bool {
+    shared.lock().resume_pending
+}
+
+/// Refuses a later turn after the current strict-resume attempt could not prove its identity.
+///
+/// This is separate from forced-stop tainting. A graceful interrupt preserves an established
+/// Claude conversation, but it cannot turn an unverified resume into a verified one.
+fn taint_unconfirmed_resume(shared: &Shared, end: &TurnEnd) {
+    mark_unconfirmed_resume_nonresumable(&mut shared.lock(), end);
+}
+
+/// Records a strict-resume verification failure only while this attempt still owns the session.
+fn mark_unconfirmed_resume_nonresumable(state: &mut Mutable, end: &TurnEnd) {
+    if state.resume_pending
+        && state
+            .active
+            .as_ref()
+            .is_some_and(|active| std::ptr::eq(active.end.as_ref(), end))
+    {
+        state.nonresumable = Some(end.get().copied().unwrap_or(CancelReason::Shutdown));
     }
 }
 
@@ -1812,6 +1940,36 @@ mod tests {
         assert!(
             active.teardown.is_some(),
             "expected the stop reason and retained teardown to publish under one owner lock"
+        );
+    }
+
+    #[test]
+    fn a_stale_teardown_cannot_taint_a_newer_turns_continuation() {
+        let stale_end = Arc::new(TurnEnd::new());
+        let current_end = Arc::new(TurnEnd::new());
+        let mut state = Mutable::default();
+        state.active = Some(ActiveTurn {
+            end: Arc::clone(&current_end),
+            stop: CancelToken::new(),
+            control: None,
+            stopped: false,
+            settled: false,
+            teardown: None,
+        });
+
+        record_stop_locked(&mut state, &stale_end, true, CancelReason::Requested, true);
+
+        assert!(
+            state.nonresumable.is_none(),
+            "expected a stale teardown to leave the newer turn resumable, received {:?}",
+            state.nonresumable
+        );
+        assert!(
+            state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.end, &current_end)),
+            "expected the newer turn to remain active"
         );
     }
 

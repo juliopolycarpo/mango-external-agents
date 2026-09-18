@@ -7,20 +7,26 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, ListSessionsRequest, PromptRequest,
-    SessionId as AcpSessionId, SetSessionModeRequest,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOptions, SessionId as AcpSessionId, SetSessionConfigOptionRequest,
+    SetSessionModeRequest,
 };
 use mango_external_agents::configuration::{
-    Configuration, ConfigurationPatch, refuse_unsupported_native,
+    Configuration, ConfigurationCatalog, ConfigurationCategory, ConfigurationChange,
+    ConfigurationOption, ConfigurationOptionId, ConfigurationOptionValue, ConfigurationOutcome,
+    ConfigurationPatch, ConfigurationState, ConfigurationValue, ConfigurationValueType,
+    RejectedSetting, Rollback, SettingRejection,
 };
 use mango_external_agents::event::EventKind;
 use mango_external_agents::session::{
-    AccountUsage, CancelReason, CloseReason, NativeSession, Session, SessionIds, SessionPage,
-    SessionQuery, TurnRequest,
+    AccountUsage, CancelReason, CloseReason, NativeSession, SESSION_PAGE_LIMIT, Session,
+    SessionIds, SessionPage, SessionQuery, TurnRequest,
 };
 use mango_external_agents::state::SessionStatus;
 use mango_external_agents::{
@@ -44,6 +50,8 @@ pub struct AcpSession {
     connection: Arc<ConnectionHandle>,
     native_session_id: AcpSessionId,
     agent_capabilities: AgentCapabilities,
+    modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
+    configuration_gate: tokio::sync::Mutex<()>,
     lifecycle: Arc<SessionLifecycle>,
     /// The close owner records one result independently of the `close` future that started it.
     close: Arc<CloseState>,
@@ -53,7 +61,14 @@ pub struct AcpSession {
 pub(crate) struct CloseState {
     started: AtomicBool,
     done: mango_external_agents::CancelToken,
-    result: Mutex<Option<std::result::Result<(), String>>>,
+    result: Mutex<Option<std::result::Result<(), CloseFailure>>>,
+}
+
+/// Cloneable cleanup evidence shared by every waiter on the same close operation.
+#[derive(Clone)]
+struct CloseFailure {
+    message: String,
+    control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
 }
 
 impl Default for CloseState {
@@ -78,7 +93,10 @@ impl CloseState {
 
     fn finish(&self, result: Result<()>) {
         *self.result.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(result.map_err(|error| error.to_string()));
+            Some(result.map_err(|error| CloseFailure {
+                message: error.to_string(),
+                control: error.cleanup_control(),
+            }));
         self.done.cancel();
     }
 
@@ -88,13 +106,52 @@ impl CloseState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .unwrap_or_else(|| Err(String::from("the ACP close task ended without an outcome")))
-            .map_err(|message| {
-                Error::Vendor(link_failure(format!(
-                    "ACP session cleanup failed: {message}"
-                )))
+            .unwrap_or_else(|| {
+                Err(CloseFailure {
+                    message: String::from("the ACP close task ended without an outcome"),
+                    control: None,
+                })
+            })
+            .map_err(|failure| {
+                let source = Error::Vendor(link_failure(format!(
+                    "ACP session cleanup failed: {}",
+                    failure.message
+                )));
+                match failure.control {
+                    Some(control) => Error::CleanupRequired {
+                        control,
+                        source: Box::new(source),
+                    },
+                    None => source,
+                }
             })
     }
+}
+
+/// State accumulated while ACP applies a non-atomic configuration patch.
+struct ConfigurationProgress {
+    requested: Configuration,
+    accepted: Configuration,
+    catalog: ConfigurationCatalog,
+    catalog_revision: u64,
+    applied: Vec<ConfigurationOptionId>,
+    rejected: Vec<RejectedSetting>,
+}
+
+/// One complete catalog response, ordered against asynchronous ACP notifications.
+struct ConfigurationCatalogResponse {
+    catalog: ConfigurationCatalog,
+    revision: u64,
+}
+
+/// Native ids that address semantic ACP configuration instead of a vendor-specific setting.
+///
+/// ACP exposes model, reasoning and mode selectors in the same catalog as vendor-specific
+/// options. The first two map to neutral axes and mode controls the profile's permission matrix, so
+/// a native write would make the accepted configuration contradict what the agent actually runs.
+struct NativeSemanticTargets {
+    reserved: BTreeSet<ConfigurationOptionId>,
+    rejections: Vec<RejectedSetting>,
 }
 
 impl std::fmt::Debug for AcpSession {
@@ -121,6 +178,7 @@ impl AcpSession {
         connection: Arc<ConnectionHandle>,
         native_session_id: AcpSessionId,
         agent_capabilities: AgentCapabilities,
+        modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
     ) -> Self {
         Self {
             profile,
@@ -132,6 +190,8 @@ impl AcpSession {
             agent_capabilities,
             lifecycle: Arc::new(SessionLifecycle::default()),
             close: Arc::new(CloseState::default()),
+            modes,
+            configuration_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -141,34 +201,368 @@ impl AcpSession {
     ///
     /// Whatever the agent answered.
     pub(crate) async fn set_mode(&self, mode_id: &str) -> Result<()> {
-        self.request(
-            "session/set_mode",
+        let Some(lifecycle) = self.lifecycle.begin_start() else {
+            return Err(Error::Closed { subject: "session" });
+        };
+        let sent = client::submit(
+            &self.connection,
             SetSessionModeRequest::new(self.native_session_id.clone(), String::from(mode_id)),
+        )?;
+        drop(lifecycle);
+        client::await_sent(
+            &self.connection,
+            &self.profile,
+            self.host.limits().request_timeout,
+            "session/set_mode",
+            sent,
         )
         .await
         .map(|_| ())
     }
 
-    /// Sends one request under the host's deadline.
+    /// Applies one complete live configuration patch while no prompt is in flight.
     ///
-    /// Everything but `session/prompt`, which is a turn and stays unbounded.
-    async fn request<Request>(
+    /// ACP v1's `session/set_config_option` returns the whole option list after each request. The
+    /// response, rather than the request, is what updates the public catalog and observed state.
+    pub(crate) async fn configure_session(
         &self,
-        method: &'static str,
-        request: Request,
-    ) -> Result<Request::Response>
-    where
-        Request: agent_client_protocol::JsonRpcRequest,
-        Request::Response: Send,
-    {
-        client::send(
+        patch: ConfigurationPatch,
+    ) -> Result<ConfigurationOutcome> {
+        let _configuration = self.configuration_gate.lock().await;
+        if self.lifecycle.is_closed() {
+            return Err(Error::Closed { subject: "session" });
+        }
+        if self.connection_state.turn().is_some() {
+            return Err(Error::Protocol {
+                expected: String::from(
+                    "a configuration change between ACP session/prompt requests",
+                ),
+                received: String::from("an active session/prompt request"),
+            });
+        }
+
+        let mut rejected = reset_rejections(&patch);
+        let mut applied = Vec::new();
+        let mut accepted = self.connection_state.configuration();
+        let (mut catalog, mut catalog_revision) = self.connection_state.catalog_snapshot();
+        let semantic_targets = native_semantic_targets(&patch, &catalog);
+        rejected.extend(semantic_targets.rejections.clone());
+        let mut requested = self
+            .session_state
+            .snapshot()
+            .configuration
+            .requested
+            .clone();
+        requested = requested.patched(&patch);
+
+        for (axis, change) in [("model", &patch.model), ("effort", &patch.effort)] {
+            let ConfigurationChange::Set(value) = change else {
+                continue;
+            };
+            let category = match axis {
+                "model" => ConfigurationCategory::Model,
+                "effort" => ConfigurationCategory::ReasoningEffort,
+                _ => unreachable!("only the two declared axes are iterated"),
+            };
+            let Some(option) = unique_option_in(&catalog, &category) else {
+                rejected.push(RejectedSetting::new(
+                    ConfigurationOptionId::new(axis),
+                    SettingRejection::UnknownOption,
+                ));
+                continue;
+            };
+            let id = option.id.clone();
+            if matches!(patch.native.get(&id), Some(ConfigurationChange::Set(_))) {
+                rejected.push(RejectedSetting::new(
+                    ConfigurationOptionId::new(axis),
+                    SettingRejection::RefusedByHarness {
+                        detail: String::from(
+                            "the same ACP configuration option was also addressed as native",
+                        ),
+                    },
+                ));
+                continue;
+            }
+            let chosen = value.clone();
+            let value = ConfigurationValue::Text(value.clone());
+            if let Some(rejection) = validate_value(option, &value) {
+                rejected.push(RejectedSetting::new(id, rejection));
+                continue;
+            }
+            let response = match self.set_config_option(&id, value.clone()).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return self.option_failure_outcome(
+                        id,
+                        error,
+                        ConfigurationProgress {
+                            requested,
+                            accepted,
+                            catalog,
+                            catalog_revision,
+                            applied,
+                            rejected,
+                        },
+                    );
+                }
+            };
+            catalog = response.catalog;
+            catalog_revision = response.revision;
+            accepted = match axis {
+                "model" => accepted.with_model(chosen),
+                "effort" => accepted.with_effort(chosen),
+                _ => unreachable!("only the two declared axes are iterated"),
+            };
+            applied.push(id);
+        }
+
+        for (id, change) in &patch.native {
+            let ConfigurationChange::Set(value) = change else {
+                continue;
+            };
+            if semantic_targets.reserved.contains(id) {
+                continue;
+            }
+            let Some(option) = catalog.option(id) else {
+                rejected.push(RejectedSetting::new(
+                    id.clone(),
+                    SettingRejection::UnknownOption,
+                ));
+                continue;
+            };
+            if let Some(detail) = semantic_native_target(&option.category) {
+                rejected.push(RejectedSetting::new(
+                    id.clone(),
+                    SettingRejection::RefusedByHarness {
+                        detail: format!("native writes cannot target {detail}"),
+                    },
+                ));
+                continue;
+            }
+            if let Some(rejection) = validate_value(option, value) {
+                rejected.push(RejectedSetting::new(id.clone(), rejection));
+                continue;
+            }
+            let response = match self.set_config_option(id, value.clone()).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return self.option_failure_outcome(
+                        id.clone(),
+                        error,
+                        ConfigurationProgress {
+                            requested,
+                            accepted,
+                            catalog,
+                            catalog_revision,
+                            applied,
+                            rejected,
+                        },
+                    );
+                }
+            };
+            catalog = response.catalog;
+            catalog_revision = response.revision;
+            accepted = accepted.with_native(id.clone(), value.clone());
+            applied.push(id.clone());
+        }
+
+        // Modes predate config options and are still supported by ACP v1. They remain separate
+        // from the catalog because a profile, not a category label, establishes their permission
+        // meaning.
+        if let ConfigurationChange::Set(level) = patch.level {
+            let routing = match patch.routing {
+                ConfigurationChange::Set(routing) => routing,
+                _ => accepted
+                    .routing
+                    .unwrap_or(mango_external_agents::ApprovalRouting::User),
+            };
+            if !crate::profile::matrix(&self.profile.modes).supports(level, routing) {
+                rejected.push(RejectedSetting::new(
+                    ConfigurationOptionId::new("level"),
+                    SettingRejection::RefusedByHarness {
+                        detail: String::from(
+                            "the ACP profile cannot establish that permission level",
+                        ),
+                    },
+                ));
+            } else if let Some(mode) = self.profile.modes.for_level(level) {
+                let advertised = self.modes.as_ref().is_some_and(|modes| {
+                    modes
+                        .available_modes
+                        .iter()
+                        .any(|available| available.id.to_string() == mode)
+                });
+                if !advertised {
+                    rejected.push(RejectedSetting::new(
+                        ConfigurationOptionId::new("level"),
+                        SettingRejection::RefusedByHarness {
+                            detail: String::from(
+                                "the ACP agent did not advertise the configured mode",
+                            ),
+                        },
+                    ));
+                } else {
+                    if let Err(error) = self.set_mode(mode).await {
+                        return self.option_failure_outcome(
+                            ConfigurationOptionId::new("level"),
+                            error,
+                            ConfigurationProgress {
+                                requested,
+                                accepted,
+                                catalog,
+                                catalog_revision,
+                                applied,
+                                rejected,
+                            },
+                        );
+                    }
+                    accepted = accepted.with_level(level);
+                    applied.push(ConfigurationOptionId::new("level"));
+                }
+            } else {
+                accepted = accepted.with_level(level);
+                applied.push(ConfigurationOptionId::new("level"));
+            }
+        }
+        if let ConfigurationChange::Set(routing) = patch.routing {
+            let level = match patch.level {
+                ConfigurationChange::Set(level) => Some(level),
+                _ => accepted.level,
+            };
+            if level.is_some_and(|level| {
+                !crate::profile::matrix(&self.profile.modes).supports(level, routing)
+            }) {
+                rejected.push(RejectedSetting::new(
+                    ConfigurationOptionId::new("routing"),
+                    SettingRejection::RefusedByHarness {
+                        detail: String::from(
+                            "the ACP profile cannot establish that permission routing",
+                        ),
+                    },
+                ));
+            } else {
+                accepted = accepted.with_routing(routing);
+                applied.push(ConfigurationOptionId::new("routing"));
+            }
+        }
+
+        let state =
+            self.publish_catalog_configuration(&requested, &accepted, catalog, catalog_revision)?;
+        let outcome = ConfigurationOutcome::applied(state, applied);
+        if rejected.is_empty() {
+            Ok(outcome)
+        } else {
+            Ok(outcome.rejecting(rejected, Rollback::NotAttempted))
+        }
+    }
+
+    async fn set_config_option(
+        &self,
+        id: &ConfigurationOptionId,
+        value: ConfigurationValue,
+    ) -> Result<ConfigurationCatalogResponse> {
+        let value = match value {
+            ConfigurationValue::Text(value) => SessionConfigOptionValue::from(value.as_str()),
+            ConfigurationValue::Boolean(value) => SessionConfigOptionValue::from(value),
+            ConfigurationValue::Integer(value) => {
+                return Err(Error::Protocol {
+                    expected: String::from("an ACP v1 select id or boolean configuration value"),
+                    received: value.to_string(),
+                });
+            }
+            _ => {
+                return Err(Error::Protocol {
+                    expected: String::from("an ACP v1 select id or boolean configuration value"),
+                    received: String::from("an unknown configuration value type"),
+                });
+            }
+        };
+        let Some(lifecycle) = self.lifecycle.begin_start() else {
+            return Err(Error::Closed { subject: "session" });
+        };
+        let (response_revision, sent) =
+            self.connection_state.with_catalog_revision(|revision| {
+                client::submit(
+                    &self.connection,
+                    SetSessionConfigOptionRequest::new(
+                        self.native_session_id.clone(),
+                        String::from(id.as_str()),
+                        value,
+                    ),
+                )
+                .map(|sent| (revision, sent))
+            })?;
+        drop(lifecycle);
+        let response = client::await_sent(
             &self.connection,
             &self.profile,
             self.host.limits().request_timeout,
-            method,
-            request,
+            "session/set_config_option",
+            sent,
         )
-        .await
+        .await?;
+        let catalog = catalog_from_options(&response.config_options);
+        let (current_catalog, current_revision) = self.connection_state.catalog_snapshot();
+        if current_revision != response_revision {
+            return Ok(ConfigurationCatalogResponse {
+                catalog: current_catalog,
+                revision: current_revision,
+            });
+        }
+        Ok(ConfigurationCatalogResponse {
+            catalog,
+            revision: response_revision,
+        })
+    }
+
+    /// Publishes the configuration state confirmed before a later option request can fail.
+    fn publish_catalog_configuration(
+        &self,
+        requested: &Configuration,
+        accepted: &Configuration,
+        catalog: ConfigurationCatalog,
+        catalog_revision: u64,
+    ) -> Result<ConfigurationState> {
+        let Some(_lifecycle) = self.lifecycle.begin_start() else {
+            return Err(Error::Closed { subject: "session" });
+        };
+        self.connection_state.accept_configuration(accepted.clone());
+        Ok(self.connection_state.publish_response_configuration(
+            catalog_revision,
+            catalog,
+            requested.clone(),
+            accepted.clone(),
+        ))
+    }
+
+    /// Publishes every setting confirmed before a vendor explicitly refuses a later option.
+    fn option_failure_outcome(
+        &self,
+        option: ConfigurationOptionId,
+        error: Error,
+        mut progress: ConfigurationProgress,
+    ) -> Result<ConfigurationOutcome> {
+        let state = self.publish_catalog_configuration(
+            &progress.requested,
+            &progress.accepted,
+            progress.catalog,
+            progress.catalog_revision,
+        )?;
+        if !matches!(error.cause(), Error::Vendor(vendor)
+            if vendor.code.as_str() == "acp-request-failed" && vendor.vendor_code.is_some())
+        {
+            return Err(error);
+        }
+        progress.rejected.push(RejectedSetting::new(
+            option,
+            SettingRejection::RefusedByVendor {
+                detail: String::from("the ACP agent refused this configuration option"),
+            },
+        ));
+        // ACP v1 has no reset operation for a configuration option, so undoing an earlier accepted
+        // set would only create another unverified state. Keep the confirmed partial state instead.
+        Ok(ConfigurationOutcome::applied(state, progress.applied)
+            .rejecting(progress.rejected, Rollback::NotAttempted))
     }
 
     /// The configuration one turn runs under, refusing what ACP v1 has no surface for.
@@ -183,13 +577,33 @@ impl AcpSession {
         let base = self.connection_state.configuration();
         let configuration = match &request.configuration {
             Some(patch) => {
-                refuse_unsupported_native(patch)?;
                 refuse_unsupported_reset(patch)?;
                 base.patched(patch)
             }
             None => base,
         };
-        refuse_model_selection(&configuration)?;
+        // ACP configuration options are session-scoped. A turn cannot set them and report an
+        // accepted inherited value before `session/set_config_option` has run between turns.
+        if let Some(patch) = request.configuration.as_ref().filter(|patch| {
+            !patch.native.is_empty() || !patch.model.is_keep() || !patch.effort.is_keep()
+        }) {
+            let received = patch.native.keys().next().map_or_else(
+                || {
+                    if !patch.model.is_keep() {
+                        String::from("per-turn ACP model configuration")
+                    } else {
+                        String::from("per-turn ACP reasoning-effort configuration")
+                    }
+                },
+                |id| format!("per-turn ACP configuration patch for {}", id.as_str()),
+            );
+            return Err(Error::Protocol {
+                expected: String::from(
+                    "a configuration change through Session::configure between ACP turns",
+                ),
+                received,
+            });
+        }
         if let Some(level) = configuration.level {
             let routing = configuration
                 .routing
@@ -235,25 +649,18 @@ impl AcpSession {
 
     /// Publishes what this harness actually applied, next to what was asked.
     ///
-    /// `accepted` carries only the axes ACP mode selection can honour — level and routing — never
-    /// the full merged configuration: model and reasoning effort are refused upstream, and a
-    /// vendor-native option this harness has no catalog for is never encoded onto the wire, so
-    /// claiming either was "accepted" would be a claim this harness cannot back up.
+    /// `accepted` carries only settings that the session actually encoded.
     fn publish_configuration(&self, configuration: &Configuration) {
         let state = self.session_state.snapshot().configuration.clone();
         self.session_state.set_configuration(
             state
                 .with_requested(configuration.clone())
-                .with_accepted(accepted_axes(configuration)),
+                .with_accepted(configuration.clone()),
         );
     }
 }
 
-/// The subset of a [`Configuration`] this harness genuinely encodes: level, through
-/// `session/set_mode`, and routing, which decides locally who answers an approval. Everything else
-/// a patch could carry — model, reasoning effort, a vendor-native option — is refused before
-/// it reaches here; see
-/// [`AcpSession::publish_configuration`].
+/// The subset of a [`Configuration`] established outside the config-option service.
 pub(crate) fn accepted_axes(configuration: &Configuration) -> Configuration {
     let mut accepted = Configuration::unknown();
     if let Some(level) = configuration.level {
@@ -265,26 +672,75 @@ pub(crate) fn accepted_axes(configuration: &Configuration) -> Configuration {
     accepted
 }
 
-/// Refuses a configuration naming a model or a reasoning effort.
-///
-/// ACP v1 has no model-selection surface: `session/new` takes a working directory and MCP servers,
-/// and nothing else. Ignoring the field would leave a host believing it chose a model when the agent
-/// ran whatever it was configured with — so it is refused rather than dropped, which is also why
-/// [`Capabilities::model_catalog`](mango_external_agents::Capabilities) is never reported here.
-pub(crate) fn refuse_model_selection(configuration: &Configuration) -> Result<()> {
-    let chosen = configuration
-        .model
-        .as_deref()
-        .or(configuration.effort.as_deref());
-    match chosen {
-        None => Ok(()),
-        Some(value) => Err(Error::Protocol {
-            expected: String::from(
-                "no model or reasoning effort: ACP v1 has no model-selection surface",
-            ),
-            received: value.to_owned(),
-        }),
+/// Lists only conversations in the workspace the current host authorized.
+pub(crate) async fn list_sessions(
+    connection: &Arc<ConnectionHandle>,
+    profile: &AcpProfile,
+    host: &HostContext,
+    capabilities: &AgentCapabilities,
+    query: SessionQuery,
+) -> Result<SessionPage> {
+    if capabilities.session_capabilities.list.is_none() {
+        return Err(Error::not_supported(Capability::SessionListing));
     }
+    let workspace = host.absolute_cwd()?;
+    validate_listing_workspace(host, &query)?;
+    let limit = query.limit.unwrap_or(SESSION_PAGE_LIMIT);
+    let mut request = ListSessionsRequest::new().cwd(std::path::PathBuf::from(workspace));
+    if let Some(cursor) = query.cursor {
+        request = request.cursor(cursor);
+    }
+    let response = client::send(
+        connection,
+        profile,
+        host.limits().request_timeout,
+        "session/list",
+        request,
+    )
+    .await?;
+    let workspace = String::from(workspace);
+    let sessions: Vec<NativeSession> = response
+        .sessions
+        .into_iter()
+        .filter(|session| session.cwd == host.cwd())
+        .map(|session| NativeSession {
+            native_session_id: session.session_id.to_string(),
+            title: session.title,
+            preview: None,
+            workspace_path: Some(workspace.clone()),
+            updated_at: session
+                .updated_at
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+                .map(std::time::SystemTime::from),
+        })
+        .collect();
+    if sessions.len() > limit {
+        return Err(Error::LimitExceeded {
+            subject: "ACP session/list rows in one page",
+            limit,
+            received: sessions.len(),
+        });
+    }
+    Ok(SessionPage {
+        sessions,
+        next_cursor: response.next_cursor,
+        truncated: false,
+    })
+}
+
+/// Refuses a listing request that would widen the workspace the host authorized.
+pub(crate) fn validate_listing_workspace(host: &HostContext, query: &SessionQuery) -> Result<()> {
+    if query
+        .workspace_path
+        .as_ref()
+        .is_none_or(|path| path == host.cwd())
+    {
+        return Ok(());
+    }
+    Err(Error::HostConfiguration {
+        expected: "the host-authorized workspace for ACP session listing",
+        received: String::from("a different workspace path"),
+    })
 }
 
 /// Refuses a patch that asks to remove an override this harness has no way to remove.
@@ -325,10 +781,235 @@ fn request_native_cancel(
     false
 }
 
+/// Converts ACP's complete live option list into the core's catalog vocabulary.
+pub(crate) fn catalog_from_options(options: &[SessionConfigOption]) -> ConfigurationCatalog {
+    ConfigurationCatalog::new(options.iter().cloned().map(configuration_option).collect())
+        .normalized()
+}
+
+/// Converts one protocol option while retaining its agent-defined order and current value.
+fn configuration_option(option: SessionConfigOption) -> ConfigurationOption {
+    let id = ConfigurationOptionId::new(option.id.to_string());
+    let category = match option.category {
+        Some(SessionConfigOptionCategory::Model) => ConfigurationCategory::Model,
+        Some(SessionConfigOptionCategory::ThoughtLevel) => ConfigurationCategory::ReasoningEffort,
+        Some(SessionConfigOptionCategory::Mode) => ConfigurationCategory::Mode,
+        Some(SessionConfigOptionCategory::ModelConfig) => {
+            ConfigurationCategory::Other(String::from("model_config"))
+        }
+        Some(SessionConfigOptionCategory::Other(value)) => ConfigurationCategory::Other(value),
+        None => ConfigurationCategory::Other(String::from("uncategorized")),
+        _ => ConfigurationCategory::Other(String::from("unknown")),
+    };
+    let mut mapped = match option.kind {
+        SessionConfigKind::Select(select) => {
+            let current = ConfigurationValue::Text(select.current_value.to_string());
+            let values = select_values(select.options)
+                .into_iter()
+                .map(|value| {
+                    ConfigurationOptionValue::new(ConfigurationValue::Text(value.value.to_string()))
+                        .with_display_name(value.name)
+                        .with_description(value.description.unwrap_or_default())
+                })
+                .collect();
+            ConfigurationOption::new(id, category, ConfigurationValueType::Enumerated)
+                .with_name(option.name)
+                .with_current(current)
+                .with_values(values)
+        }
+        SessionConfigKind::Boolean(boolean) => {
+            ConfigurationOption::new(id, category, ConfigurationValueType::Boolean)
+                .with_name(option.name)
+                .with_current(ConfigurationValue::Boolean(boolean.current_value))
+        }
+        _ => ConfigurationOption::new(
+            id,
+            category,
+            ConfigurationValueType::Other(String::from("unknown")),
+        )
+        .with_name(option.name),
+    };
+    if let Some(description) = option.description {
+        mapped = mapped.with_description(description);
+    }
+    mapped
+}
+
+/// Flattens grouped selectors without changing the order within each group.
+fn select_values(
+    options: SessionConfigSelectOptions,
+) -> Vec<agent_client_protocol::schema::v1::SessionConfigSelectOption> {
+    match options {
+        SessionConfigSelectOptions::Ungrouped(values) => values,
+        SessionConfigSelectOptions::Grouped(groups) => {
+            groups.into_iter().flat_map(|group| group.options).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The values the agent currently reports under recognised semantic categories.
+pub(crate) fn configuration_from_catalog(catalog: &ConfigurationCatalog) -> Configuration {
+    let mut configuration = Configuration::unknown();
+    if let Some(option) = unique_option_in(catalog, &ConfigurationCategory::Model)
+        && let Some(ConfigurationValue::Text(value)) = &option.current
+    {
+        configuration = configuration.with_model(value.clone());
+    }
+    if let Some(option) = unique_option_in(catalog, &ConfigurationCategory::ReasoningEffort)
+        && let Some(ConfigurationValue::Text(value)) = &option.current
+    {
+        configuration = configuration.with_effort(value.clone());
+    }
+    for option in catalog.options() {
+        if matches!(
+            option.category,
+            ConfigurationCategory::Model | ConfigurationCategory::ReasoningEffort
+        ) {
+            continue;
+        }
+        if let Some(value) = &option.current {
+            configuration = configuration.with_native(option.id.clone(), value.clone());
+        }
+    }
+    configuration
+}
+
+/// Finds an unambiguous mapped option. ACP allows repeats, so a category alone cannot choose one.
+fn unique_option_in<'a>(
+    catalog: &'a ConfigurationCatalog,
+    category: &ConfigurationCategory,
+) -> Option<&'a ConfigurationOption> {
+    let mut matches = catalog
+        .options()
+        .iter()
+        .filter(|option| &option.category == category);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+/// Validates the scalar form and select membership before any request reaches an agent.
+fn validate_value(
+    option: &ConfigurationOption,
+    value: &ConfigurationValue,
+) -> Option<SettingRejection> {
+    let matches_kind = matches!(
+        (&option.value_type, value),
+        (
+            ConfigurationValueType::Enumerated,
+            ConfigurationValue::Text(_)
+        ) | (
+            ConfigurationValueType::Boolean,
+            ConfigurationValue::Boolean(_)
+        )
+    );
+    if !matches_kind {
+        return Some(SettingRejection::UnsupportedValue {
+            received: format!("{:?}", value.value_type()),
+        });
+    }
+    if option.value_type == ConfigurationValueType::Enumerated
+        && !option
+            .values
+            .iter()
+            .any(|candidate| candidate.value == *value)
+    {
+        return Some(SettingRejection::UnsupportedValue {
+            received: match value {
+                ConfigurationValue::Text(value) => value.clone(),
+                _ => String::from("a non-text select value"),
+            },
+        });
+    }
+    None
+}
+
+/// Refuses native patches that could side-step a semantic ACP configuration axis.
+///
+/// The catalog may expose `model`, `thought_level`, and `mode` as ordinary ids. The first two
+/// already have neutral host axes; the last controls permissions through the profile matrix. No
+/// native id is sent for those categories, including during session opening, because the resulting
+/// accepted state could otherwise claim a different model, effort, or permission level.
+fn native_semantic_targets(
+    patch: &ConfigurationPatch,
+    catalog: &ConfigurationCatalog,
+) -> NativeSemanticTargets {
+    let mut targets = NativeSemanticTargets {
+        reserved: BTreeSet::new(),
+        rejections: Vec::new(),
+    };
+    for (id, change) in &patch.native {
+        if !matches!(change, ConfigurationChange::Set(_)) {
+            continue;
+        }
+        let Some(option) = catalog.option(id) else {
+            continue;
+        };
+        let detail = semantic_native_target(&option.category);
+        let Some(detail) = detail else {
+            continue;
+        };
+        targets.reserved.insert(id.clone());
+        targets.rejections.push(RejectedSetting::new(
+            id.clone(),
+            SettingRejection::RefusedByHarness {
+                detail: format!("native writes cannot target {detail}"),
+            },
+        ));
+    }
+    targets
+}
+
+/// Why a catalog category cannot be changed through the native configuration map.
+fn semantic_native_target(category: &ConfigurationCategory) -> Option<&'static str> {
+    match category {
+        ConfigurationCategory::Model => Some("the ACP model axis"),
+        ConfigurationCategory::ReasoningEffort => Some("the ACP reasoning-effort axis"),
+        ConfigurationCategory::Mode => Some("the ACP profile permission matrix"),
+        _ => None,
+    }
+}
+
+/// Every reset is a refusal: ACP v1 only sets explicit current values.
+fn reset_rejections(patch: &ConfigurationPatch) -> Vec<RejectedSetting> {
+    let mut rejections = Vec::new();
+    for (id, reset) in [
+        (ConfigurationOptionId::new("model"), patch.model.is_reset()),
+        (
+            ConfigurationOptionId::new("effort"),
+            patch.effort.is_reset(),
+        ),
+        (ConfigurationOptionId::new("level"), patch.level.is_reset()),
+        (
+            ConfigurationOptionId::new("routing"),
+            patch.routing.is_reset(),
+        ),
+    ] {
+        if reset {
+            rejections.push(RejectedSetting::new(
+                id,
+                SettingRejection::ResetNotSupported,
+            ));
+        }
+    }
+    rejections.extend(
+        patch
+            .native
+            .iter()
+            .filter(|(_, change)| change.is_reset())
+            .map(|(id, _)| RejectedSetting::new(id.clone(), SettingRejection::ResetNotSupported)),
+    );
+    rejections
+}
+
 #[async_trait::async_trait]
 impl Session for AcpSession {
     fn state(&self) -> &mango_external_agents::SessionState {
         &self.session_state
+    }
+
+    async fn configure(&self, patch: ConfigurationPatch) -> Result<ConfigurationOutcome> {
+        self.configure_session(patch).await
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
@@ -349,6 +1030,7 @@ impl Session for AcpSession {
             &self.agent_capabilities.prompt_capabilities,
         )
         .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        let _configuration = self.configuration_gate.lock().await;
 
         let (sink, events) = EventSink::with_limits(
             self.session_state.snapshot().ids.session_id.clone(),
@@ -695,37 +1377,14 @@ impl Session for AcpSession {
     }
 
     async fn list_native_sessions(&self, query: SessionQuery) -> Result<SessionPage> {
-        if self.agent_capabilities.session_capabilities.list.is_none() {
-            return Err(Error::not_supported(Capability::SessionListing));
-        }
-        let mut request = ListSessionsRequest::new();
-        if let Some(cursor) = query.cursor {
-            request = request.cursor(cursor);
-        }
-        if let Some(path) = query.workspace_path {
-            request = request.cwd(path);
-        }
-        let response = self.request("session/list", request).await?;
-        Ok(SessionPage {
-            sessions: response
-                .sessions
-                .into_iter()
-                .map(|session| NativeSession {
-                    native_session_id: session.session_id.to_string(),
-                    title: session.title,
-                    // ACP v1 has no preview field: a row carries a title and a directory, and
-                    // inventing a preview would mean reading a transcript the library never reads.
-                    preview: None,
-                    workspace_path: Some(session.cwd.display().to_string()),
-                    // `updated_at` is an RFC 3339 string on the wire and a `SystemTime` in the core.
-                    // Parsing dates would mean a date crate for one optional field in a picker row,
-                    // so the field is left absent rather than guessed.
-                    updated_at: None,
-                })
-                .collect(),
-            next_cursor: response.next_cursor,
-            truncated: false,
-        })
+        list_sessions(
+            &self.connection,
+            &self.profile,
+            &self.host,
+            &self.agent_capabilities,
+            query,
+        )
+        .await
     }
 
     async fn refresh_account_usage(&self) -> Result<AccountUsage> {
@@ -855,34 +1514,11 @@ impl AcpSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{accepted_axes, refuse_model_selection, refuse_unsupported_reset};
+    use super::{accepted_axes, refuse_unsupported_reset};
     use mango_external_agents::configuration::{
         Configuration, ConfigurationChange, ConfigurationPatch,
     };
     use mango_external_agents::{ApprovalRouting, Error, PermissionLevel};
-
-    /// Dropping the field would leave a host believing it chose a model while the agent ran whatever
-    /// it was configured with, which is a silent disagreement rather than a refusal.
-    #[test]
-    fn a_configuration_naming_a_model_is_refused_rather_than_ignored() {
-        let error = refuse_model_selection(&Configuration::unknown().with_model("gpt-5-codex"))
-            .expect_err("expected a refusal, received acceptance");
-        let Error::Protocol { received, .. } = &error else {
-            panic!("received {error:?}");
-        };
-        assert_eq!(received, "gpt-5-codex");
-    }
-
-    #[test]
-    fn a_configuration_naming_a_reasoning_effort_is_refused_the_same_way() {
-        assert!(refuse_model_selection(&Configuration::unknown().with_effort("high")).is_err());
-    }
-
-    #[test]
-    fn a_configuration_that_only_chooses_a_level_and_a_routing_is_accepted() {
-        refuse_model_selection(&Configuration::unknown().with_level(PermissionLevel::Default))
-            .expect("expected acceptance, received a refusal");
-    }
 
     /// ACP has no vendor-side "put it back": neither the mode a session opens under nor the local
     /// routing decision can be un-set, so a reset is refused the same way everywhere it is asked.

@@ -6,6 +6,7 @@
 //! here is written speculatively, and an absent option is an absent member rather than a `null`.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -131,7 +132,7 @@ pub enum ApprovalsReviewer {
 }
 
 /// Opening a conversation.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartParams {
     /// The directory the host authorised.
@@ -148,10 +149,28 @@ pub struct ThreadStartParams {
     /// Who answers its prompts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
+    /// Request-scoped app-server config; never written to the user's config file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+impl fmt::Debug for ThreadStartParams {
+    /// Shows request metadata without exposing host-supplied MCP configuration values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadStartParams")
+            .field("cwd_bytes", &self.cwd.len())
+            .field("has_model", &self.model.is_some())
+            .field("approval_policy", &self.approval_policy)
+            .field("sandbox", &self.sandbox)
+            .field("approvals_reviewer", &self.approvals_reviewer)
+            .field("has_config", &self.config.is_some())
+            .finish()
+    }
 }
 
 /// Continuing one.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadResumeParams {
     /// The vendor's own handle for the conversation.
@@ -170,8 +189,67 @@ pub struct ThreadResumeParams {
     /// Who answers its prompts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
+    /// Request-scoped app-server config; never written to the user's config file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<BTreeMap<String, serde_json::Value>>,
     /// Metadata only: the transcript is the vendor's, and this harness never replays one.
     pub exclude_turns: bool,
+}
+
+impl fmt::Debug for ThreadResumeParams {
+    /// Shows request metadata without exposing host-supplied MCP configuration values.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadResumeParams")
+            .field("thread_id_bytes", &self.thread_id.len())
+            .field("cwd_bytes", &self.cwd.len())
+            .field("has_model", &self.model.is_some())
+            .field("approval_policy", &self.approval_policy)
+            .field("sandbox", &self.sandbox)
+            .field("approvals_reviewer", &self.approvals_reviewer)
+            .field("has_config", &self.config.is_some())
+            .field("exclude_turns", &self.exclude_turns)
+            .finish()
+    }
+}
+
+/// Reads native metadata without loading transcript turns into the response.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadParams {
+    /// The native conversation the host intends to resume.
+    pub thread_id: String,
+    /// Always false: workspace authorization needs only thread metadata.
+    pub include_turns: bool,
+}
+
+impl fmt::Debug for ThreadReadParams {
+    /// Retains request shape without writing vendor thread ids into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadReadParams")
+            .field("thread_id_bytes", &self.thread_id.len())
+            .field("include_turns", &self.include_turns)
+            .finish()
+    }
+}
+
+/// The app-server's metadata-only thread answer.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadResponse {
+    /// The thread identity and original workspace.
+    pub thread: ThreadSummary,
+}
+
+impl fmt::Debug for ThreadReadResponse {
+    /// Retains the response shape without writing vendor thread metadata into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadReadResponse")
+            .field("thread", &self.thread)
+            .finish()
+    }
 }
 
 /// One conversation, as much of it as this harness reads.
@@ -179,7 +257,7 @@ pub struct ThreadResumeParams {
 /// The upstream `Thread` carries thirty members; the five kept here are the ones a session id, a
 /// picker row and a working-directory filter are built from. Everything else — the persisted
 /// turns above all — stays where the vendor wrote it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadSummary {
     /// The vendor's own handle.
@@ -198,8 +276,22 @@ pub struct ThreadSummary {
     pub updated_at: Option<i64>,
 }
 
+impl fmt::Debug for ThreadSummary {
+    /// Retains which thread metadata arrived without writing vendor or host values into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadSummary")
+            .field("id_bytes", &self.id.len())
+            .field("has_preview", &!self.preview.is_empty())
+            .field("has_name", &self.name.is_some())
+            .field("has_cwd", &self.cwd.is_some())
+            .field("has_updated_at", &self.updated_at.is_some())
+            .finish()
+    }
+}
+
 /// What opening or continuing a conversation answered with.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartResponse {
     /// The conversation itself.
@@ -216,6 +308,20 @@ pub struct ThreadStartResponse {
     /// The reviewer it actually routed to.
     #[serde(default)]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
+}
+
+impl fmt::Debug for ThreadStartResponse {
+    /// Retains which fields the server returned without writing vendor values into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadStartResponse")
+            .field("thread", &self.thread)
+            .field("has_model", &self.model.is_some())
+            .field("has_reasoning_effort", &self.reasoning_effort.is_some())
+            .field("approval_policy", &self.approval_policy)
+            .field("approvals_reviewer", &self.approvals_reviewer)
+            .finish()
+    }
 }
 
 /// One piece of a turn's input.
@@ -434,7 +540,7 @@ pub struct ReviewStartResponse {
 }
 
 /// Listing the conversations this machine already has.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListParams {
     /// Where to continue from.
@@ -448,8 +554,20 @@ pub struct ThreadListParams {
     pub cwd: Option<String>,
 }
 
+impl fmt::Debug for ThreadListParams {
+    /// Retains request shape without writing a vendor cursor or host workspace into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadListParams")
+            .field("has_cursor", &self.cursor.is_some())
+            .field("limit", &self.limit)
+            .field("has_cwd", &self.cwd.is_some())
+            .finish()
+    }
+}
+
 /// One page of them.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListResponse {
     /// The rows.
@@ -458,6 +576,17 @@ pub struct ThreadListResponse {
     /// Where the next page starts.
     #[serde(default)]
     pub next_cursor: Option<String>,
+}
+
+impl fmt::Debug for ThreadListResponse {
+    /// Retains page shape without writing rows or a vendor cursor into diagnostics.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadListResponse")
+            .field("thread_count", &self.data.len())
+            .field("has_next_cursor", &self.next_cursor.is_some())
+            .finish()
+    }
 }
 
 /// Asking which models this build accepts.
@@ -574,9 +703,13 @@ pub fn empty_params() -> BTreeMap<String, serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         Account, AccountReadResponse, AskForApproval, ClientInfo, InitializeParams, SandboxMode,
-        ThreadStartParams, TurnStartParams, TurnStatus, UserInput,
+        ThreadListParams, ThreadListResponse, ThreadReadParams, ThreadReadResponse,
+        ThreadResumeParams, ThreadStartParams, ThreadStartResponse, ThreadSummary, TurnStartParams,
+        TurnStatus, UserInput,
     };
 
     /// The handshake writes the host's own name and nothing it was not given.
@@ -625,6 +758,107 @@ mod tests {
             frame.get("approvalsReviewer").is_none(),
             "expected no reviewer member, received {frame}"
         );
+    }
+
+    /// Per-thread MCP configuration can hold credentials, so diagnostics retain only its presence.
+    #[test]
+    fn thread_parameters_debug_redacts_mcp_values() {
+        let config = BTreeMap::from([(
+            String::from("mcp_servers"),
+            serde_json::json!({
+                "docs": {"env": {"DOCS_TOKEN": "stdio-env-secret"}},
+                "remote": {"http_headers": {"Authorization": "http-header-secret"}},
+            }),
+        )]);
+        let start = ThreadStartParams {
+            cwd: String::from("/workspace"),
+            config: Some(config.clone()),
+            ..ThreadStartParams::default()
+        };
+        let resume = ThreadResumeParams {
+            thread_id: String::from("thread-1"),
+            cwd: String::from("/workspace"),
+            config: Some(config),
+            ..ThreadResumeParams::default()
+        };
+
+        for rendered in [format!("{start:?}"), format!("{resume:?}")] {
+            for secret in ["stdio-env-secret", "http-header-secret"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected {secret:?} to stay out of diagnostics, received {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thread_metadata_and_picker_debug_redact_vendor_and_workspace_values() {
+        let thread = ThreadSummary {
+            id: String::from("vendor-thread-secret"),
+            preview: String::from("preview-secret"),
+            name: Some(String::from("name-secret")),
+            cwd: Some(String::from("/host-workspace-secret")),
+            updated_at: Some(1_725_000_000),
+        };
+        let read = ThreadReadParams {
+            thread_id: String::from("vendor-thread-secret"),
+            include_turns: false,
+        };
+        let read_response = ThreadReadResponse {
+            thread: thread.clone(),
+        };
+        let start_response = ThreadStartResponse {
+            thread: thread.clone(),
+            model: Some(String::from("model-secret")),
+            reasoning_effort: Some(String::from("effort-secret")),
+            ..ThreadStartResponse::default()
+        };
+        let list = ThreadListParams {
+            cursor: Some(String::from("vendor-cursor-secret")),
+            limit: Some(10),
+            cwd: Some(String::from("/host-workspace-secret")),
+        };
+        let list_response = ThreadListResponse {
+            data: vec![thread],
+            next_cursor: Some(String::from("vendor-cursor-secret")),
+        };
+        let start = ThreadStartParams {
+            cwd: String::from("/host-workspace-secret"),
+            model: Some(String::from("model-secret")),
+            ..ThreadStartParams::default()
+        };
+        let resume = ThreadResumeParams {
+            thread_id: String::from("vendor-thread-secret"),
+            cwd: String::from("/host-workspace-secret"),
+            model: Some(String::from("model-secret")),
+            ..ThreadResumeParams::default()
+        };
+
+        for rendered in [
+            format!("{start:?}"),
+            format!("{resume:?}"),
+            format!("{read:?}"),
+            format!("{read_response:?}"),
+            format!("{start_response:?}"),
+            format!("{list:?}"),
+            format!("{list_response:?}"),
+        ] {
+            for secret in [
+                "vendor-thread-secret",
+                "preview-secret",
+                "name-secret",
+                "/host-workspace-secret",
+                "model-secret",
+                "effort-secret",
+                "vendor-cursor-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "expected {secret:?} to stay out of diagnostics, received {rendered}"
+                );
+            }
+        }
     }
 
     /// Upstream spells this one member snake_case among camelCase siblings. Matching its spelling

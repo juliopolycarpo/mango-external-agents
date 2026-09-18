@@ -54,6 +54,8 @@ pub mod method {
     pub const THREAD_START: &str = "thread/start";
     /// Continues an existing one.
     pub const THREAD_RESUME: &str = "thread/resume";
+    /// Reads only native thread metadata before a resume.
+    pub const THREAD_READ: &str = "thread/read";
     /// Lists the conversations this machine already has.
     pub const THREAD_LIST: &str = "thread/list";
     /// Starts a turn.

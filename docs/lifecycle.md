@@ -18,6 +18,13 @@ has already started survives cancellation of its caller while the host runtime r
 The host must keep its runtime alive until shutdown completes and supply a launcher that contains
 and reaps its process trees.
 
+If bounded cleanup for a pre-session operation or a session close fails, the operation returns
+`Error::CleanupRequired`. Its typed source describes the cleanup failure and
+`Error::cleanup_control()` returns the host's `ProcessControl` handle. That handle may already
+have received `kill`; the host owns reconciliation and any bounded retry, including reaping the
+tree. The library does not retain a global cleanup registry or promise cleanup after the host
+runtime ends.
+
 These are different observations:
 
 | Observation                       | What it proves                                                                                                    |

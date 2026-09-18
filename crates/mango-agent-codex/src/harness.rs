@@ -3,6 +3,7 @@
 //! Stateless and shareable, as the trait requires. It holds a descriptor and, when the host
 //! resolved one, the path to the executable — nothing about any session, and no cached probe.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mango_external_agents::Dispatch;
@@ -15,9 +16,9 @@ use mango_external_agents::harness::{
 use mango_external_agents::identity::HarnessIdentity;
 use mango_external_agents::jsonrpc::{Client, ClientOptions};
 use mango_external_agents::permission::PermissionMatrix;
-use mango_external_agents::process::LaunchSpec;
+use mango_external_agents::process::{LaunchSpec, ProcessCleanupGuard};
 use mango_external_agents::session::{
-    OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason,
+    OpenSession, ResumeMode, Session, SessionIds, SessionPage, SessionQuery, resume_fallback_reason,
 };
 use mango_external_agents::state::{SessionSnapshot, SessionState, TransportSelection};
 use mango_external_agents::transport::{ExecutablePath, StdioSpec, TransportKind};
@@ -28,8 +29,8 @@ use crate::discovery::{self, LOGIN_HINT, PROGRAM};
 use crate::permissions::PermissionOverrides;
 use crate::protocol::requests::{
     AccountReadResponse, ApprovalsReviewer, ClientInfo, InitializeParams, InitializeResponse,
-    ModelListParams, ModelListResponse, ThreadResumeParams, ThreadStartParams, ThreadStartResponse,
-    empty_params,
+    ModelListParams, ModelListResponse, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
+    ThreadStartParams, ThreadStartResponse, ThreadSummary, empty_params,
 };
 use crate::protocol::schema::MINIMUM_CODEX_VERSION;
 use crate::protocol::{CODE_PREFIX, PEER_NAME, method};
@@ -60,9 +61,8 @@ const VENDOR_ENVIRONMENT_KEYS: &[&str] = &["CODEX_HOME"];
 
 /// What this harness could support, given a new enough CLI.
 ///
-/// Enabled features were checked against a running `codex app-server`. Host-supplied MCP
-/// configuration is not implemented; servers configured in the user's own `config.toml` or with
-/// `codex mcp` remain available to the vendor.
+/// Enabled features were checked against a running `codex app-server`. Host-supplied MCP entries
+/// use the documented per-thread `config` override, which does not edit the user's config file.
 const CAPABILITIES: Capabilities = Capabilities {
     structured_streaming: true,
     reasoning_stream: true,
@@ -83,7 +83,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     session_listing: true,
     native_review: true,
     account_usage: true,
-    mcp_passthrough: false,
+    mcp_passthrough: true,
     configuration: true,
 };
 
@@ -119,7 +119,7 @@ impl CodexHarness {
     ///
     /// let harness = CodexHarness::new();
     /// assert_eq!(harness.descriptor().id(), &HarnessId::codex());
-    /// assert!(!harness.descriptor().capabilities.capabilities().mcp_passthrough);
+    /// assert!(harness.descriptor().capabilities.capabilities().mcp_passthrough);
     /// ```
     #[must_use]
     pub fn new() -> Self {
@@ -167,7 +167,7 @@ impl Harness for CodexHarness {
     }
 
     async fn probe(&self, host: &HostContext) -> Result<Discovery> {
-        let version = match read_version(host, &self.executable).await {
+        let version = match read_version(host, &self.executable).await? {
             Some(version) => version,
             // Nothing answered `--version`, so nothing is installed as far as a probe can tell. An
             // executable the host resolved but cannot run is the same fact to a caller.
@@ -191,7 +191,7 @@ impl Harness for CodexHarness {
             });
         }
 
-        let (auth, models) = probe_app_server(host, &self.executable).await;
+        let (auth, models) = probe_app_server(host, &self.executable).await?;
         Ok(Discovery {
             executable: self.executable.get().cloned(),
             version: Some(version),
@@ -213,9 +213,18 @@ impl Harness for CodexHarness {
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         mango_external_agents::configuration::refuse_unsupported_native(&request.configuration)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        // No driven surface drops a host override back to config.toml defaults.
+        mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        let mcp_config =
+            crate::configuration::thread_override(&request.configuration, &request.mcp_servers)
+                .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let effective_transport = self
             .descriptor()
             .resolve_transport(request.transport)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        let cwd = host
+            .absolute_cwd()
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let executable = self.program_for(&request);
         let transport = stdio::open(
@@ -226,6 +235,11 @@ impl Harness for CodexHarness {
         )
         .await?;
 
+        let cleanup = ProcessCleanupGuard::new(
+            transport.control,
+            *host.limits(),
+            mango_external_agents::CancelReason::Shutdown,
+        );
         let shared = Arc::new(Shared::new(host.clone(), request.session_id.clone()));
         let client = Arc::new(Client::connect(
             transport.link,
@@ -240,16 +254,23 @@ impl Harness for CodexHarness {
 
         // Everything from here can fail, and every failure has to take the child with it: a
         // half-opened session leaves a `codex app-server` running with nobody holding its handle.
-        let opened = open_thread(host, &client, &request, effective_transport).await;
+        let opened = open_thread(
+            host,
+            &client,
+            &request,
+            effective_transport,
+            mcp_config,
+            cwd,
+        )
+        .await;
         let (state, thread_id) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 let _ = client.close().await;
-                let _ = transport
-                    .control
-                    .kill(mango_external_agents::CancelReason::Shutdown)
-                    .await;
-                return Err(error);
+                return match cleanup.finish().await {
+                    Ok(_) => Err(error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                };
             }
         };
 
@@ -258,8 +279,22 @@ impl Harness for CodexHarness {
             state,
             shared,
             client,
-            transport.control,
+            cleanup.into_control(),
         )))
+    }
+
+    async fn list_native_sessions(
+        &self,
+        host: &HostContext,
+        query: SessionQuery,
+    ) -> Result<SessionPage> {
+        crate::session::validate_list_workspace(host, &query)?;
+        let connection = ProbeConnection::open(host, &self.executable).await?;
+        let page = crate::session::list_threads(&connection.client, host, query).await;
+        match connection.close().await {
+            Ok(()) => page,
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -269,6 +304,8 @@ async fn open_thread(
     client: &Client,
     request: &OpenSession,
     effective_transport: TransportKind,
+    mcp_config: Option<BTreeMap<String, serde_json::Value>>,
+    cwd: &str,
 ) -> Result<(SessionState, String)> {
     let handshake: InitializeResponse = client
         .request(
@@ -281,17 +318,7 @@ async fn open_thread(
         .await?;
     client.notify(method::INITIALIZED, empty_params()).await?;
 
-    // The build that is running has just named itself in the handshake, so the gate costs nothing
-    // extra here. A user agent nobody could parse is not a refusal — the same reasoning as
-    // `GateVerdict::Unknown` — so the session goes on.
-    if let Some(version) = discovery::parse_user_agent_version(&handshake.user_agent)
-        && discovery::meets_minimum(&version, MINIMUM_CODEX_VERSION) == Some(false)
-    {
-        return Err(Error::VersionGate {
-            found: version,
-            minimum: String::from(MINIMUM_CODEX_VERSION),
-        });
-    }
+    require_supported_handshake_version(&handshake)?;
 
     let account: AccountReadResponse = client
         .request(method::ACCOUNT_READ, empty_params())
@@ -303,22 +330,21 @@ async fn open_thread(
         return Err(Error::AuthRequired { login_hint });
     }
 
-    // Codex has no "drop my override and fall back to config.toml" semantics on any surface this
-    // harness drives, so a patch asking for one is refused rather than reported as applied.
-    mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)?;
     let vendor = crate::permissions::overrides(&request.configuration);
-    let cwd = host.cwd().to_string_lossy().into_owned();
     let requested_model = request.configuration.model.set_value().cloned();
 
     let (response, resumed, fallback_reason) = match &request.resume {
         Some(resume) => {
+            let workspace_verified =
+                preflight_resume_workspace(client, &resume.native_session_id, cwd).await?;
             let params = ThreadResumeParams {
                 thread_id: resume.native_session_id.clone(),
-                cwd: cwd.clone(),
+                cwd: cwd.to_owned(),
                 model: requested_model.clone(),
                 approval_policy: vendor.approval_policy,
                 sandbox: vendor.sandbox,
                 approvals_reviewer: vendor.approvals_reviewer,
+                config: mcp_config.clone(),
                 // Metadata only. The vendor keeps the transcript it wrote, and this library never
                 // replays one into anybody's context.
                 exclude_turns: true,
@@ -327,11 +353,22 @@ async fn open_thread(
                 .request::<_, ThreadStartResponse>(method::THREAD_RESUME, params)
                 .await
             {
-                Ok(response) => (response, true, None),
-                Err(error) if resume.mode == ResumeMode::Fallback => {
+                Ok(response) if workspace_verified => (response, true, None),
+                Ok(_) => {
+                    return Err(Error::HostConfiguration {
+                        expected: "a Codex thread in the host's authorized workspace",
+                        received: String::from(
+                            "thread/read could not verify the original workspace",
+                        ),
+                    });
+                }
+                Err(error)
+                    if resume.mode == ResumeMode::Fallback
+                        && missing_rollout(&error, &resume.native_session_id) =>
+                {
                     let reason = resume_fallback_reason(method::THREAD_RESUME, &error);
                     (
-                        start_thread(client, &cwd, &requested_model, vendor).await?,
+                        start_thread(client, cwd, &requested_model, vendor, &mcp_config).await?,
                         false,
                         Some(reason),
                     )
@@ -340,24 +377,34 @@ async fn open_thread(
             }
         }
         None => (
-            start_thread(client, &cwd, &requested_model, vendor).await?,
+            start_thread(client, cwd, &requested_model, vendor, &mcp_config).await?,
             false,
             None,
         ),
     };
 
+    authorize_thread(
+        &response.thread,
+        request
+            .resume
+            .as_ref()
+            .filter(|_| resumed)
+            .map(|resume| resume.native_session_id.as_str()),
+        cwd,
+    )?;
     let thread_id = response.thread.id.clone();
     let ids = SessionIds {
         session_id: request.session_id.clone(),
         native_session_id: thread_id.clone(),
     };
 
-    // What this harness really put on the wire. `thread/start` and `thread/resume` have no
-    // `effort` field at all, so a patch asking for one at open time is honestly left out here
-    // rather than claimed as encoded.
+    // What this harness really put on the wire, after the app-server accepted the thread.
     let mut accepted = Configuration::unknown();
     if let Some(model) = &requested_model {
         accepted = accepted.with_model(model.clone());
+    }
+    if let Some(effort) = request.configuration.effort.set_value() {
+        accepted = accepted.with_effort(effort.clone());
     }
     if let Some(level) = request.configuration.level.set_value() {
         accepted = accepted.with_level(*level);
@@ -414,11 +461,90 @@ async fn open_thread(
     ))
 }
 
+/// Refuses an app-server that identified itself below this harness's pinned protocol floor.
+fn require_supported_handshake_version(handshake: &InitializeResponse) -> Result<()> {
+    // The build that is running has just named itself in the handshake, so the gate costs nothing
+    // extra here. A user agent nobody could parse is not a refusal — the same reasoning as
+    // `GateVerdict::Unknown` — so the connection goes on.
+    if let Some(version) = discovery::parse_user_agent_version(&handshake.user_agent)
+        && discovery::meets_minimum(&version, MINIMUM_CODEX_VERSION) == Some(false)
+    {
+        return Err(Error::VersionGate {
+            found: version,
+            minimum: String::from(MINIMUM_CODEX_VERSION),
+        });
+    }
+    Ok(())
+}
+
+/// The pinned app-server uses this exact invalid-request response when its thread store has no
+/// rollout for the requested id. The same JSON-RPC code also covers configuration failures, so
+/// matching the code alone would create a different conversation after an unrelated refusal.
+fn missing_rollout(error: &Error, native_session_id: &str) -> bool {
+    matches!(error.cause(), Error::Vendor(vendor)
+        if vendor.vendor_code.as_deref() == Some("-32600")
+            && vendor.message == format!("no rollout found for thread id {native_session_id}"))
+}
+
+/// Proves a native thread's original workspace before loading it for a resumed conversation.
+/// A missing read is left unverified; only the resume method can prove that fallback is safe.
+async fn preflight_resume_workspace(
+    client: &Client,
+    native_session_id: &str,
+    cwd: &str,
+) -> Result<bool> {
+    let read = client
+        .request::<_, ThreadReadResponse>(
+            method::THREAD_READ,
+            ThreadReadParams {
+                thread_id: native_session_id.to_owned(),
+                include_turns: false,
+            },
+        )
+        .await;
+    match read {
+        Ok(read) => {
+            authorize_thread(&read.thread, Some(native_session_id), cwd)?;
+            Ok(true)
+        }
+        Err(error) if thread_not_loaded(&error, native_session_id) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The pinned metadata-only read's missing-thread response, never a generic RPC failure.
+fn thread_not_loaded(error: &Error, native_session_id: &str) -> bool {
+    matches!(error.cause(), Error::Vendor(vendor)
+        if vendor.vendor_code.as_deref() == Some("-32600")
+            && vendor.message == format!("thread not loaded: {native_session_id}"))
+}
+
+/// Rejects a different identity or workspace before a handle can be exposed to the host.
+fn authorize_thread(thread: &ThreadSummary, expected_id: Option<&str>, cwd: &str) -> Result<()> {
+    if let Some(expected_id) = expected_id
+        && thread.id != expected_id
+    {
+        return Err(Error::HostConfiguration {
+            expected: "the requested Codex thread id",
+            received: String::from("a different native thread id"),
+        });
+    }
+    if thread.cwd.as_deref() != Some(cwd) {
+        return Err(Error::HostConfiguration {
+            expected: "a Codex thread in the host's authorized workspace",
+            received: String::from("a missing or different workspace"),
+        });
+    }
+    mango_external_agents::normalize::opaque_id(&thread.id, "native thread id")?;
+    Ok(())
+}
+
 async fn start_thread(
     client: &Client,
     cwd: &str,
     model: &Option<String>,
     vendor: PermissionOverrides,
+    mcp_config: &Option<BTreeMap<String, serde_json::Value>>,
 ) -> Result<ThreadStartResponse> {
     client
         .request(
@@ -429,6 +555,7 @@ async fn start_thread(
                 approval_policy: vendor.approval_policy,
                 sandbox: vendor.sandbox,
                 approvals_reviewer: vendor.approvals_reviewer,
+                config: mcp_config.clone(),
             },
         )
         .await
@@ -444,8 +571,9 @@ fn client_info(host: &HostClientInfo) -> ClientInfo {
 }
 
 /// Whatever `codex --version` printed, or nothing when it would not run.
-async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Option<String> {
-    let mut child = host
+async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Result<Option<String>> {
+    host.absolute_cwd()?;
+    let mut child = match host
         .launcher()
         .spawn(LaunchSpec {
             argv: vec![
@@ -458,21 +586,30 @@ async fn read_version(host: &HostContext, executable: &ExecutablePath) -> Option
             hide_window: true,
         })
         .await
-        .ok()?;
+    {
+        Ok(child) => child,
+        Err(error) if error.cleanup_control().is_some() => return Err(error),
+        Err(_) => return Ok(None),
+    };
 
     let mut lines = mango_external_agents::process::LineStream::new(
         std::mem::replace(&mut child.stdout, Box::new(NoBytes)),
         host.limits().line,
     );
+    let cleanup = ProcessCleanupGuard::new(
+        child.control,
+        *host.limits(),
+        mango_external_agents::CancelReason::Shutdown,
+    );
     // Bounded, because a probe must end. `codex --version` prints one line and exits, but a
     // binary that is not the one the host thinks it is may print nothing and sit there — and a
     // probe that waited on it would hang whatever called it, with no turn to cancel.
     let first = tokio::time::timeout(host.limits().request_timeout, lines.next_line()).await;
-    let _ = child
-        .control
-        .kill(mango_external_agents::CancelReason::Shutdown)
-        .await;
-    discovery::parse_version(&first.ok()?.ok().flatten()?)
+    cleanup.finish().await?;
+    Ok(first
+        .ok()
+        .and_then(|line| line.ok().flatten())
+        .and_then(|line| discovery::parse_version(&line)))
 }
 
 /// A stand-in for a byte source that has been taken, so the child struct stays whole.
@@ -493,66 +630,106 @@ impl mango_external_agents::process::ByteSource for NoBytes {
 async fn probe_app_server(
     host: &HostContext,
     executable: &ExecutablePath,
-) -> (AuthState, Vec<Model>) {
+) -> Result<(AuthState, Vec<Model>)> {
     let unknown = (AuthState::Unknown, Vec::new());
-    let Ok(transport) = stdio::open(
-        host,
-        &StdioSpec::new([PROGRAM, "app-server"]),
-        executable,
-        VENDOR_ENVIRONMENT_KEYS,
-    )
-    .await
-    else {
-        return unknown;
+    let connection = match ProbeConnection::open(host, executable).await {
+        Ok(connection) => connection,
+        Err(error) if error.cleanup_control().is_some() => return Err(error),
+        Err(_) => return Ok(unknown),
     };
 
-    let client = Client::connect(
-        transport.link,
-        Arc::new(Silent),
-        ClientOptions::new(PEER_NAME)
-            .with_code_prefix(CODE_PREFIX)
-            .without_version_header()
-            .with_limits(host.limits()),
+    let account: AccountReadResponse = connection
+        .client
+        .request(method::ACCOUNT_READ, empty_params())
+        .await
+        .unwrap_or_default();
+    let models: ModelListResponse = connection
+        .client
+        .request(method::MODEL_LIST, ModelListParams { limit: None })
+        .await
+        .unwrap_or_default();
+    let probed = (
+        discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
+        models
+            .data
+            .into_iter()
+            .filter(|model| !model.hidden)
+            .map(to_model)
+            .collect(),
     );
+    match connection.close().await {
+        Ok(()) => Ok(probed),
+        Err(error) if error.cleanup_control().is_some() => Err(error),
+        Err(_) => Ok(unknown),
+    }
+}
 
-    let handshake: Result<InitializeResponse> = client
-        .request(
-            method::INITIALIZE,
-            InitializeParams {
-                client_info: client_info(host.client_info()),
-                capabilities: None,
-            },
-        )
-        .await;
-    let probed = if handshake.is_ok() {
-        let _ = client.notify(method::INITIALIZED, empty_params()).await;
-        let account: AccountReadResponse = client
-            .request(method::ACCOUNT_READ, empty_params())
-            .await
-            .unwrap_or_default();
-        let models: ModelListResponse = client
-            .request(method::MODEL_LIST, ModelListParams { limit: None })
-            .await
-            .unwrap_or_default();
-        (
-            discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
-            models
-                .data
-                .into_iter()
-                .filter(|model| !model.hidden)
-                .map(to_model)
-                .collect(),
-        )
-    } else {
-        unknown
-    };
+/// One bounded app-server connection for pre-conversation read-only services.
+struct ProbeConnection {
+    client: Client,
+    cleanup: ProcessCleanupGuard,
+}
 
-    let _ = client.close().await;
-    let _ = transport
-        .control
-        .kill(mango_external_agents::CancelReason::Shutdown)
-        .await;
-    probed
+impl ProbeConnection {
+    async fn open(host: &HostContext, executable: &ExecutablePath) -> Result<Self> {
+        host.absolute_cwd()?;
+        let transport = stdio::open(
+            host,
+            &StdioSpec::new([PROGRAM, "app-server"]),
+            executable,
+            VENDOR_ENVIRONMENT_KEYS,
+        )
+        .await?;
+        let client = Client::connect(
+            transport.link,
+            Arc::new(Silent),
+            ClientOptions::new(PEER_NAME)
+                .with_code_prefix(CODE_PREFIX)
+                .without_version_header()
+                .with_limits(host.limits()),
+        );
+        let connection = Self {
+            client,
+            cleanup: ProcessCleanupGuard::new(
+                transport.control,
+                *host.limits(),
+                mango_external_agents::CancelReason::Shutdown,
+            ),
+        };
+        let handshake: Result<InitializeResponse> = connection
+            .client
+            .request(
+                method::INITIALIZE,
+                InitializeParams {
+                    client_info: client_info(host.client_info()),
+                    capabilities: None,
+                },
+            )
+            .await;
+        let result = match handshake {
+            Ok(handshake) => connection
+                .client
+                .notify(method::INITIALIZED, empty_params())
+                .await
+                .and_then(|()| require_supported_handshake_version(&handshake)),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            return match connection.close().await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error),
+            };
+        }
+        Ok(connection)
+    }
+
+    async fn close(self) -> Result<()> {
+        let client = self.client.close().await;
+        match self.cleanup.finish().await {
+            Ok(_) => client,
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn to_model(model: crate::protocol::requests::Model) -> Model {

@@ -319,7 +319,8 @@ pub struct OpenSession {
     pub executable: crate::transport::ExecutablePath,
     /// A probe the host already ran and is vouching for, so opening need not run it again.
     ///
-    /// Checked for identity and freshness against this request, never stored: see
+    /// Must be bound after current host measurements; opening checks its full identity, effective
+    /// transport, workspace, request context and freshness, then forgets it. See
     /// [`DiscoveryReceipt`].
     pub discovery: Option<DiscoveryReceipt>,
     /// MCP servers the vendor should load for this session.

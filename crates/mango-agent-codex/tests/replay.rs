@@ -22,10 +22,10 @@ use mango_external_agents::testing::{Announcer, FakeLauncher, FakeProcess};
 use mango_external_agents::{
     ApprovalRouting, CancelReason, Clock, CloseReason, ConfigurationChange, ConfigurationPatch,
     EnvSource, ExitStatus, Harness, HostContext, InterruptOutcome, LaunchSpec, ManagedProcess,
-    OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, Session, SessionQuery,
-    SessionStatus, SessionSubscription, Steer, TurnRequest,
+    McpServer, McpTransport, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher,
+    Session, SessionQuery, SessionStatus, SessionSubscription, Steer, TurnRequest,
 };
-use support::Transcript;
+use support::{Transcript, workspace_path};
 
 /// A test-controlled pause in a fake child operation.
 struct FakeGate {
@@ -74,6 +74,7 @@ struct GatedLauncher {
     inner: Arc<FakeLauncher>,
     kill_gate: Option<Arc<FakeGate>>,
     interrupt_write_gate: Option<Arc<FakeGate>>,
+    keep_child_alive_after_stdin_close: bool,
 }
 
 impl GatedLauncher {
@@ -86,7 +87,13 @@ impl GatedLauncher {
             inner,
             kill_gate,
             interrupt_write_gate,
+            keep_child_alive_after_stdin_close: false,
         }
+    }
+
+    fn keeping_child_alive_after_stdin_close(mut self) -> Self {
+        self.keep_child_alive_after_stdin_close = true;
+        self
     }
 }
 
@@ -102,6 +109,11 @@ impl ProcessLauncher for GatedLauncher {
                 }) as Box<dyn mango_external_agents::ByteSink>
             });
         }
+        if self.keep_child_alive_after_stdin_close {
+            child.stdin = child.stdin.take().map(|inner| {
+                Box::new(NonTerminatingStdin { inner }) as Box<dyn mango_external_agents::ByteSink>
+            });
+        }
         if let Some(gate) = &self.kill_gate {
             child.control = Arc::new(GatedProcessControl {
                 inner: child.control,
@@ -109,6 +121,68 @@ impl ProcessLauncher for GatedLauncher {
             });
         }
         Ok(child)
+    }
+}
+
+/// Keeps a fake child alive when its app-server link closes so kill ownership remains observable.
+struct NonTerminatingStdin {
+    inner: Box<dyn mango_external_agents::ByteSink>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSink for NonTerminatingStdin {
+    async fn write_all(&mut self, bytes: &[u8]) -> mango_external_agents::Result<()> {
+        self.inner.write_all(bytes).await
+    }
+
+    async fn close(&mut self) -> mango_external_agents::Result<()> {
+        Ok(())
+    }
+}
+
+/// Makes the app-server probe lose stdin and report a cleanup failure to its host.
+struct CleanupRequiredProbeLauncher {
+    inner: Arc<FakeLauncher>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for CleanupRequiredProbeLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> mango_external_agents::Result<ManagedProcess> {
+        let app_server = spec.argv.iter().any(|argument| argument == "app-server");
+        let mut child = self.inner.spawn(spec).await?;
+        if app_server {
+            child.stdin = None;
+            child.control = Arc::new(FailingProbeCleanup {
+                inner: child.control,
+            });
+        }
+        Ok(child)
+    }
+}
+
+/// Refuses forced termination so discovery has to return the host cleanup handle.
+struct FailingProbeCleanup {
+    inner: Arc<dyn ProcessControl>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for FailingProbeCleanup {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, _reason: CancelReason) -> mango_external_agents::Result<()> {
+        Err(mango_external_agents::Error::Closed {
+            subject: "test probe process",
+        })
     }
 }
 
@@ -589,7 +663,7 @@ fn host_context(
 ) -> HostContext {
     let mut builder = HostContext::builder()
         .launcher(launcher)
-        .cwd("/workspace")
+        .cwd(workspace_path())
         .client_info("mango-test", "0.0.1")
         .environment(EnvSource::from_pairs([
             ("PATH", "/usr/bin"),
@@ -674,7 +748,7 @@ async fn a_session_spawns_the_app_server_with_only_the_environment_it_documents(
 
     let launch = launcher.last_launch().expect("expected one launch");
     assert_eq!(launch.argv, vec!["codex", "app-server"]);
-    assert_eq!(launch.cwd.to_string_lossy(), "/workspace");
+    assert_eq!(launch.cwd, workspace_path());
     assert_eq!(
         launch.env.get("CODEX_HOME").map(String::as_str),
         Some("/home/user/.codex"),
@@ -729,6 +803,364 @@ async fn opening_a_session_adopts_the_thread_the_server_opened() {
     assert_eq!(session.ids().session_id.as_str(), "chat-1");
     assert_eq!(session.ids().native_session_id, expected);
     assert!(!session.snapshot().resumed);
+}
+
+#[tokio::test]
+async fn host_mcp_servers_use_the_thread_config_override_without_widening_the_child_environment() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let servers = vec![
+        McpServer {
+            name: String::from("docs"),
+            transport: McpTransport::Stdio {
+                command: String::from("docs-mcp"),
+                args: vec![String::from("--stdio")],
+                env: [(String::from("DOCS_KEY"), String::from("server-secret"))].into(),
+            },
+        },
+        McpServer {
+            name: String::from("remote"),
+            transport: McpTransport::Http {
+                url: String::from("https://example.com/mcp"),
+                headers: [(String::from("X-Docs-Key"), String::from("header-secret"))].into(),
+            },
+        },
+    ];
+    let _session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1").with_mcp_servers(servers))
+        .await
+        .expect("expected supported host MCP configuration");
+
+    let start = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("thread/start"))
+        .expect("expected a thread start");
+    let frame: serde_json::Value = serde_json::from_str(&start).expect("expected JSON");
+    let config = &frame["params"]["config"]["mcp_servers"];
+    assert_eq!(config["docs"]["command"], "docs-mcp");
+    assert_eq!(config["docs"]["args"], serde_json::json!(["--stdio"]));
+    assert_eq!(config["docs"]["env"]["DOCS_KEY"], "server-secret");
+    assert_eq!(config["remote"]["url"], "https://example.com/mcp");
+    assert_eq!(
+        config["remote"]["http_headers"]["X-Docs-Key"],
+        "header-secret"
+    );
+    let launch = launcher
+        .last_launch()
+        .expect("expected one app-server launch");
+    assert!(!launch.env.contains_key("DOCS_KEY"));
+    assert!(!launch.env.contains_key("CONNECTOR_SECRET"));
+}
+
+#[tokio::test]
+async fn opening_with_explicit_effort_applies_it_on_the_thread_and_reports_acceptance() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let mut request = OpenSession::new("chat-1");
+    request.configuration =
+        ConfigurationPatch::new().effort(ConfigurationChange::Set(String::from("high")));
+    let session = CodexHarness::new()
+        .open_session(&host, request)
+        .await
+        .expect("expected a supported per-thread effort override");
+
+    let start = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("thread/start"))
+        .expect("expected a thread start");
+    let frame: serde_json::Value = serde_json::from_str(&start).expect("expected JSON");
+    assert_eq!(frame["params"]["config"]["model_reasoning_effort"], "high");
+    assert_eq!(
+        session.snapshot().configuration.accepted.effort.as_deref(),
+        Some("high")
+    );
+}
+
+#[tokio::test]
+async fn malformed_explicit_effort_is_refused_before_opening_codex() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let mut request = OpenSession::new("chat-1");
+    request.configuration =
+        ConfigurationPatch::new().effort(ConfigurationChange::Set(String::from("high\nunsafe")));
+    let result = CodexHarness::new().open_session(&host, request).await;
+    assert!(
+        matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "a nonempty, bounded model or effort id without controls", .. })),
+        "expected a typed configuration refusal"
+    );
+    assert!(launcher.launches().is_empty(), "expected no vendor launch");
+}
+
+#[tokio::test]
+async fn malformed_turn_model_is_refused_without_submitting_a_prompt() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected an open thread");
+    let result = session
+        .start_turn(TurnRequest::new("turn-1", "hello").with_configuration(
+            ConfigurationPatch::new().model(ConfigurationChange::Set(String::from("bad\nmodel"))),
+        ))
+        .await;
+    assert!(
+        matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "a nonempty, bounded model or effort id without controls", .. }))
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("turn/start")),
+        "expected no prompt submission"
+    );
+}
+
+/// A pinned app-server resume error, with the captured handshake and new-thread answer.
+/// The fake owns the error injection so each test can assert the wire consequence.
+struct ResumeErrorServer {
+    message: String,
+}
+
+/// The captured thread answer, returned to a resume request with that request's id.
+struct ResumeSuccessServer {
+    read_workspace: String,
+    resume_id: Option<&'static str>,
+    resume_workspace: Option<String>,
+}
+
+impl ResumeSuccessServer {
+    fn process(self) -> FakeProcess {
+        let transcript = Transcript::load("handshake");
+        let result = transcript
+            .every_received()
+            .into_iter()
+            .find(|frame| frame.pointer("/result/thread/id").is_some())
+            .expect("expected the captured thread answer")
+            .clone();
+        transcript.as_process_intercepting(move |frame| {
+            if frame["method"] == "thread/read" {
+                return Some(vec![serde_json::json!({
+                    "id": frame["id"],
+                    "result": {"thread": {"id": frame["params"]["threadId"], "cwd": self.read_workspace}},
+                }).to_string()]);
+            }
+            (frame["method"] == "thread/resume").then(|| {
+                let mut answer = result.clone();
+                answer["id"] = frame["id"].clone();
+                if let Some(id) = self.resume_id {
+                    answer["result"]["thread"]["id"] = id.into();
+                }
+                if let Some(cwd) = self.resume_workspace.as_ref() {
+                    answer["result"]["thread"]["cwd"] = cwd.clone().into();
+                }
+                vec![answer.to_string()]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn resumed_codex_thread_receives_the_same_host_mcp_override() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        ResumeSuccessServer {
+            read_workspace: workspace_path().to_string_lossy().into_owned(),
+            resume_id: None,
+            resume_workspace: None,
+        }
+        .process(),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+    let native_id = Transcript::load("handshake")
+        .thread_id()
+        .expect("expected a captured thread id");
+    let session = CodexHarness::new()
+        .open_session(
+            &host,
+            OpenSession::new("chat-1")
+                .resuming(&native_id, mango_external_agents::ResumeMode::Strict)
+                .with_mcp_servers(vec![McpServer::stdio("docs", "docs-mcp")]),
+        )
+        .await
+        .expect("expected the host MCP override on resume");
+
+    assert!(session.snapshot().resumed);
+    let written = launcher.written();
+    assert!(!written.iter().any(|line| line.contains("thread/start")));
+    let read = written
+        .iter()
+        .find(|line| line.contains("thread/read"))
+        .expect("expected a metadata-only workspace preflight");
+    let read: serde_json::Value = serde_json::from_str(read).expect("expected JSON");
+    assert_eq!(read["params"]["threadId"], native_id);
+    assert_eq!(read["params"]["includeTurns"], false);
+    let resume = written
+        .iter()
+        .find(|line| line.contains("thread/resume"))
+        .expect("expected a resume request");
+    let frame: serde_json::Value = serde_json::from_str(resume).expect("expected JSON");
+    assert_eq!(frame["params"]["threadId"], native_id);
+    assert_eq!(
+        frame["params"]["config"]["mcp_servers"]["docs"]["command"],
+        "docs-mcp"
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_resume_workspace_is_refused_before_loading_a_thread_or_starting_fresh() {
+    for mode in [
+        mango_external_agents::ResumeMode::Strict,
+        mango_external_agents::ResumeMode::Fallback,
+    ] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(
+            ResumeSuccessServer {
+                read_workspace: String::from("/other/workspace"),
+                resume_id: None,
+                resume_workspace: None,
+            }
+            .process(),
+        );
+        let (host, launcher) = with_launcher(launcher, None);
+        let native_id = Transcript::load("handshake")
+            .thread_id()
+            .expect("expected a captured thread id");
+        let result = CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1").resuming(&native_id, mode))
+            .await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "a Codex thread in the host's authorized workspace", .. }))
+        );
+        let written = launcher.written();
+        assert!(written.iter().any(|line| line.contains("thread/read")));
+        assert!(!written.iter().any(|line| line.contains("thread/resume")));
+        assert!(!written.iter().any(|line| line.contains("thread/start")));
+    }
+}
+
+#[tokio::test]
+async fn resume_refuses_a_changed_identity_or_workspace_after_a_valid_preflight() {
+    for (changed_id, changed_cwd) in [
+        (Some("different-thread"), None),
+        (None, Some("/other/workspace")),
+    ] {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(
+            ResumeSuccessServer {
+                read_workspace: workspace_path().to_string_lossy().into_owned(),
+                resume_id: changed_id,
+                resume_workspace: changed_cwd.map(str::to_owned),
+            }
+            .process(),
+        );
+        let (host, launcher) = with_launcher(launcher, None);
+        let native_id = Transcript::load("handshake")
+            .thread_id()
+            .expect("expected a captured thread id");
+        let result = CodexHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1")
+                    .resuming(&native_id, mango_external_agents::ResumeMode::Strict),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { .. }))
+        );
+        assert!(
+            !launcher
+                .written()
+                .iter()
+                .any(|line| line.contains("turn/start")),
+            "expected no prompt after a changed resume answer"
+        );
+    }
+}
+
+impl ResumeErrorServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake").as_process_intercepting(move |frame| {
+            if frame["method"] == "thread/read" {
+                return Some(vec![serde_json::json!({
+                    "id": frame["id"],
+                    "error": {"code": -32600, "message": format!("thread not loaded: {}", frame["params"]["threadId"].as_str().unwrap_or_default())},
+                }).to_string()]);
+            }
+            (frame["method"] == "thread/resume").then(|| {
+                vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "error": {"code": -32600, "message": self.message},
+                    })
+                    .to_string(),
+                ]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn fallback_starts_fresh_only_after_the_pinned_missing_rollout_result() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let missing = "01a09ca7-cd7c-7312-8569-205578cada28";
+    launcher.push(
+        ResumeErrorServer {
+            message: format!("no rollout found for thread id {missing}"),
+        }
+        .process(),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+
+    let session = CodexHarness::new()
+        .open_session(
+            &host,
+            OpenSession::new("chat-1")
+                .resuming(missing, mango_external_agents::ResumeMode::Fallback),
+        )
+        .await
+        .expect("expected a conclusive missing rollout to start a new thread");
+
+    assert!(!session.snapshot().resumed);
+    assert!(session.snapshot().fallback_reason.is_some());
+    assert_ne!(session.ids().native_session_id, missing);
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/start"))
+    );
+}
+
+#[tokio::test]
+async fn fallback_preserves_an_unrelated_resume_failure_without_starting_fresh() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let missing = "01a09ca7-cd7c-7312-8569-205578cada28";
+    launcher.push(
+        ResumeErrorServer {
+            message: String::from("failed to load configuration"),
+        }
+        .process(),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+
+    let error = CodexHarness::new()
+        .open_session(
+            &host,
+            OpenSession::new("chat-1")
+                .resuming(missing, mango_external_agents::ResumeMode::Fallback),
+        )
+        .await;
+
+    assert!(
+        error.is_err(),
+        "expected the configuration failure to be returned"
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/start")),
+        "expected no fresh conversation after a configuration failure"
+    );
 }
 
 /// The recorded turn: a command runs, the answer streams, usage and quota arrive, the turn ends.
@@ -1015,6 +1447,89 @@ async fn aborting_a_close_future_leaves_its_owned_reaper_running() {
         .close(CloseReason::Shutdown)
         .await
         .expect("expected repeated close to observe the first close worker's result");
+}
+
+/// A timed-out session reaper leaves recovery with the host, including for later close callers.
+#[tokio::test(start_paused = true)]
+async fn failed_close_retains_one_cleanup_control_for_reconciliation() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("turn").as_process());
+    let kill_gate = FakeGate::closed();
+    let gated = Arc::new(
+        GatedLauncher::new(Arc::clone(&launcher), Some(Arc::clone(&kill_gate)), None)
+            .keeping_child_alive_after_stdin_close(),
+    );
+    let limits = mango_external_agents::Limits {
+        shutdown_timeout: std::time::Duration::from_secs(1),
+        ..replay_limits()
+    };
+    let host = host_context(
+        gated,
+        None,
+        limits,
+        mango_external_agents::CancelToken::new(),
+        None,
+    );
+    let session: Arc<dyn Session> = Arc::from(
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session"),
+    );
+
+    let closing_session = Arc::clone(&session);
+    let close = tokio::spawn(async move { closing_session.close(CloseReason::Shutdown).await });
+    kill_gate.wait_until_entered().await;
+    tokio::time::advance(limits.shutdown_timeout).await;
+
+    let error = close
+        .await
+        .expect("expected the close waiter to complete")
+        .expect_err("expected bounded cleanup to time out");
+    assert!(
+        matches!(
+            error.cause(),
+            mango_external_agents::Error::Timeout {
+                operation,
+                after,
+            } if operation == "process-tree termination" && *after == limits.shutdown_timeout
+        ),
+        "expected the bounded process cleanup timeout, received {error:?}"
+    );
+    let control = error
+        .cleanup_control()
+        .expect("expected the failed close to retain a cleanup control");
+
+    let repeated = session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect_err("expected the repeated close to observe the first cleanup failure");
+    let repeated_control = repeated
+        .cleanup_control()
+        .expect("expected a repeated close to retain the same cleanup control");
+    assert!(
+        Arc::ptr_eq(&control, &repeated_control),
+        "expected every close waiter to receive the same process control"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        1,
+        "expected the timed-out reaper to leave the child for host reconciliation"
+    );
+
+    kill_gate.open();
+    mango_external_agents::process::stop_process_with_limits(
+        control.as_ref(),
+        CancelReason::Shutdown,
+        host.limits(),
+    )
+    .await
+    .expect("expected the host to reconcile and reap the child");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected host reconciliation to reap the timed-out child"
+    );
 }
 
 /// Cancellation assigns its stop worker before the native interrupt write can wait. Dropping the
@@ -2555,7 +3070,7 @@ async fn app_server_eof_after_an_activity_fails_the_turn_without_waiting_for_a_t
                                 "id": "command-eof",
                                 "type": "commandExecution",
                                 "command": "sleep 60",
-                                "cwd": "/workspace",
+                                "cwd": workspace_path().to_string_lossy(),
                                 "status": "inProgress",
                             },
                         },
@@ -2868,6 +3383,336 @@ async fn listing_the_vendors_own_sessions_asks_for_a_bounded_page() {
     }
 }
 
+#[tokio::test]
+async fn listing_without_a_user_conversation_uses_only_the_authorized_workspace() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let page = CodexHarness::new()
+        .list_sessions(&host, SessionQuery::default())
+        .await
+        .expect("expected a picker page before any conversation is open");
+
+    assert!(!page.sessions.is_empty());
+    assert!(page.next_cursor.is_some());
+    let written = launcher.written();
+    assert!(written.iter().any(|line| line.contains("thread/list")));
+    assert!(!written.iter().any(|line| line.contains("thread/start")));
+    let list = written
+        .iter()
+        .find(|line| line.contains("thread/list"))
+        .expect("expected a list request");
+    let frame: serde_json::Value = serde_json::from_str(list).expect("expected a JSON request");
+    assert_eq!(
+        frame["params"]["cwd"],
+        workspace_path().to_string_lossy().into_owned()
+    );
+    assert_eq!(frame["params"]["limit"], 50);
+}
+
+/// A server that identifies an app-server older than the pinned protocol at initialization.
+struct OldProbeHandshakeServer;
+
+impl OldProbeHandshakeServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake").as_process_intercepting(|frame| {
+            (frame["method"] == "initialize").then(|| {
+                vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "result": {
+                            "userAgent": "codex/0.147.0 (Linux)",
+                            "platformOs": "linux",
+                        },
+                    })
+                    .to_string(),
+                ]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn picker_refuses_an_app_server_below_the_pinned_handshake_version() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(OldProbeHandshakeServer.process());
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+
+    let result = CodexHarness::new()
+        .list_sessions(&host, SessionQuery::default())
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ref error)
+                if matches!(
+                    error.cause(),
+                    mango_external_agents::Error::VersionGate {
+                        found,
+                        minimum,
+                    } if found == "0.147.0"
+                        && minimum == mango_agent_codex::MINIMUM_CODEX_VERSION
+                )
+        ),
+        "expected the handshake version gate, received {result:?}"
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/list")),
+        "expected no picker request after the version gate"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the probe child reaped"
+    );
+}
+
+/// A fake list answer that includes rows the host never authorized.
+struct MixedWorkspaceListServer;
+
+impl MixedWorkspaceListServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake").as_process_intercepting(|frame| {
+            (frame["method"] == "thread/list").then(|| {
+                vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "result": {
+                            "data": [
+                                {"id": "local", "cwd": frame["params"]["cwd"], "preview": "allowed"},
+                                {"id": "foreign", "cwd": "/private", "preview": "secret"},
+                                {"id": "unscoped", "preview": "unknown"},
+                            ],
+                            "nextCursor": null,
+                        },
+                    })
+                    .to_string(),
+                ]
+            })
+        })
+    }
+}
+
+/// A picker response that ignored the page size the host supplied.
+struct OversizedListServer;
+
+impl OversizedListServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake").as_process_intercepting(|frame| {
+            (frame["method"] == "thread/list").then(|| {
+                vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "result": {
+                            "data": [
+                                {"id": "first", "cwd": frame["params"]["cwd"]},
+                                {"id": "second", "cwd": frame["params"]["cwd"]},
+                            ],
+                            "nextCursor": "after-second",
+                        },
+                    })
+                    .to_string(),
+                ]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn listing_refuses_a_vendor_page_that_exceeds_the_requested_limit() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(OversizedListServer.process());
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+
+    let result = CodexHarness::new()
+        .list_sessions(
+            &host,
+            SessionQuery {
+                limit: Some(1),
+                ..SessionQuery::default()
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ref error)
+                if matches!(
+                    error.cause(),
+                    mango_external_agents::Error::LimitExceeded {
+                        subject: "sessions in a Codex thread/list response",
+                        limit: 1,
+                        received: 2,
+                    }
+                )
+        ),
+        "expected an over-limit response refusal, received {result:?}"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the picker child reaped"
+    );
+}
+
+#[tokio::test]
+async fn listing_discards_rows_outside_the_authorized_workspace() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(MixedWorkspaceListServer.process());
+    let (host, _) = with_launcher(launcher, None);
+    let page = CodexHarness::new()
+        .list_sessions(&host, SessionQuery::default())
+        .await
+        .expect("expected a filtered picker page");
+    assert_eq!(page.sessions.len(), 1);
+    assert_eq!(page.sessions[0].native_session_id, "local");
+    assert_eq!(page.sessions[0].preview.as_deref(), Some("allowed"));
+}
+
+/// A responsive app-server that leaves the picker request unanswered.
+struct UnansweredListServer;
+
+impl UnansweredListServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake")
+            .as_process_intercepting(|frame| (frame["method"] == "thread/list").then(Vec::new))
+    }
+}
+
+#[tokio::test]
+async fn canceling_a_picker_request_reaps_its_probe_child() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(UnansweredListServer.process());
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+    let task = tokio::spawn(async move {
+        CodexHarness::new()
+            .list_sessions(&host, SessionQuery::default())
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if launcher
+                .written()
+                .iter()
+                .any(|line| line.contains("thread/list"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the picker request to reach the fake app-server");
+    assert_eq!(launcher.live_children(), 1);
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if launcher.live_children() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected cancellation to kill the probe child");
+}
+
+#[tokio::test]
+async fn listing_a_different_workspace_is_refused_before_spawning() {
+    let (host, launcher) = host_replaying(&[]);
+    let query = SessionQuery {
+        workspace_path: Some("/another-workspace".into()),
+        ..SessionQuery::default()
+    };
+    let result = CodexHarness::new().list_sessions(&host, query).await;
+    assert!(
+        result.is_err(),
+        "expected a workspace authorization refusal"
+    );
+    assert!(launcher.launches().is_empty(), "expected no child process");
+}
+
+/// Codex receives the host working directory in every child launch and thread request. A relative
+/// or dotted path would let the child resolve it against ambient state, so reject it before any
+/// Codex child starts.
+#[tokio::test]
+async fn a_non_absolute_or_lexically_non_normalized_workspace_is_refused_before_spawning_codex() {
+    for cwd in [
+        std::path::PathBuf::from("relative-workspace"),
+        std::env::temp_dir()
+            .join("mango-agent-codex")
+            .join("..")
+            .join("workspace"),
+    ] {
+        let launcher = Arc::new(FakeLauncher::new());
+        let host = HostContext::builder()
+            .launcher(launcher.clone())
+            .cwd(cwd)
+            .client_info("mango-test", "0.0.1")
+            .environment(EnvSource::from_pairs([("PATH", "/usr/bin")]))
+            .build()
+            .expect("expected a host context that leaves Codex validation to the harness");
+
+        let results = [
+            CodexHarness::new()
+                .open_session(&host, OpenSession::new("chat-1"))
+                .await
+                .map(|_| ()),
+            CodexHarness::new()
+                .list_sessions(&host, SessionQuery::default())
+                .await
+                .map(|_| ()),
+            CodexHarness::new().discover(&host).await.map(|_| ()),
+        ];
+        for result in results {
+            assert!(
+                matches!(result, Err(ref error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "an absolute, lexically normalized UTF-8 workspace path", .. })),
+                "expected a typed workspace refusal, received {result:?}"
+            );
+        }
+        assert!(
+            launcher.launches().is_empty(),
+            "expected no Codex child for an unauthorized workspace"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_non_utf8_workspace_is_refused_before_opening_or_listing_codex() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let launcher = Arc::new(FakeLauncher::new());
+    let cwd = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/workspace/\xff".to_vec()));
+    let host = HostContext::builder()
+        .launcher(launcher.clone())
+        .cwd(cwd)
+        .client_info("mango-test", "0.0.1")
+        .environment(EnvSource::from_pairs([("PATH", "/usr/bin")]))
+        .build()
+        .expect("expected a host with an opaque Unix path");
+
+    for result in [
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .map(|_| ()),
+        CodexHarness::new()
+            .list_sessions(&host, SessionQuery::default())
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(error) if matches!(error.cause(), mango_external_agents::Error::HostConfiguration { expected: "an absolute, lexically normalized UTF-8 workspace path", .. }))
+        );
+    }
+    assert!(launcher.launches().is_empty());
+}
+
 /// The recorded `account/rateLimits/read`.
 #[tokio::test]
 async fn refreshing_account_usage_reports_the_windows_the_vendor_named() {
@@ -2912,7 +3757,10 @@ async fn the_configuration_a_host_chose_reaches_the_thread_as_three_settings() {
     assert_eq!(frame["params"]["sandbox"], "workspace-write");
     assert_eq!(frame["params"]["approvalPolicy"], "on-request");
     assert_eq!(frame["params"]["approvalsReviewer"], "auto_review");
-    assert_eq!(frame["params"]["cwd"], "/workspace");
+    assert_eq!(
+        frame["params"]["cwd"],
+        workspace_path().to_string_lossy().into_owned()
+    );
 }
 
 /// The old session-wide announcement rode the first turn's stream, so a first turn the server
@@ -3345,7 +4193,7 @@ async fn a_machine_with_no_codex_on_it_discovers_nothing_rather_than_failing() {
     let launcher = Arc::new(FakeLauncher::new());
     let host = HostContext::builder()
         .launcher(launcher)
-        .cwd("/workspace")
+        .cwd(workspace_path())
         .client_info("mango-test", "0.0.1")
         .build()
         .expect("expected a host");
@@ -3361,6 +4209,34 @@ async fn a_machine_with_no_codex_on_it_discovers_nothing_rather_than_failing() {
     assert!(!discovery.is_usable());
 }
 
+#[tokio::test]
+async fn a_probe_cleanup_failure_reaches_discovery_with_its_host_control() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(version_answer());
+    launcher.push(FakeProcess::responding(|_| Vec::new()));
+    let host = HostContext::builder()
+        .launcher(Arc::new(CleanupRequiredProbeLauncher {
+            inner: Arc::clone(&launcher),
+        }))
+        .cwd(workspace_path())
+        .client_info("mango-test", "0.0.1")
+        .build()
+        .expect("expected a host");
+
+    let error = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect_err("expected failed app-server cleanup to reach discovery");
+    assert!(
+        matches!(error, mango_external_agents::Error::CleanupRequired { .. }),
+        "expected cleanup-required rather than unknown discovery, received {error:?}"
+    );
+    assert!(
+        error.cleanup_control().is_some(),
+        "expected discovery to retain the host cleanup control"
+    );
+}
+
 /// An old build reports the gate verdict rather than crashing, and claims no capabilities.
 #[tokio::test]
 async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
@@ -3368,7 +4244,7 @@ async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
     launcher.push(FakeProcess::transcript(["codex-cli 0.147.0"]));
     let host = HostContext::builder()
         .launcher(launcher.clone())
-        .cwd("/workspace")
+        .cwd(workspace_path())
         .client_info("mango-test", "0.0.1")
         .build()
         .expect("expected a host");
@@ -3467,9 +4343,9 @@ async fn the_harness_passes_the_cores_conformance_suite() {
     );
 }
 
-/// Host MCP requests are unsupported on fresh and resumed Codex sessions.
+/// Invalid host MCP requests fail before either a fresh or resumed Codex session launches.
 #[tokio::test]
-async fn host_mcp_servers_are_refused_before_spawning_codex() {
+async fn invalid_host_mcp_servers_are_refused_before_spawning_codex() {
     for mode in [
         None,
         Some(mango_external_agents::ResumeMode::Strict),
@@ -3477,7 +4353,8 @@ async fn host_mcp_servers_are_refused_before_spawning_codex() {
     ] {
         let (host, launcher) = host_replaying(&["handshake"]);
         let request = OpenSession::new("chat-1").with_mcp_servers(vec![
-            mango_external_agents::McpServer::stdio("docs", "docs-mcp"),
+            McpServer::stdio("docs", "docs-mcp"),
+            McpServer::stdio("docs", "another-mcp"),
         ]);
 
         let request = match mode {
@@ -3489,21 +4366,21 @@ async fn host_mcp_servers_are_refused_before_spawning_codex() {
         assert_eq!(
             launcher.launches().len(),
             0,
-            "expected unsupported MCP configuration to be refused before spawning Codex"
+            "expected duplicate MCP names to be refused before spawning Codex"
         );
         let error = match result {
-            Ok(_) => panic!("expected the typed MCP passthrough refusal"),
+            Ok(_) => panic!("expected the typed MCP configuration refusal"),
             Err(error) => error,
         };
         assert!(
             matches!(
                 error.cause(),
                 mango_external_agents::Error::HostConfiguration {
-                    expected: "no MCP servers for a harness without MCP passthrough",
+                    expected: "unique MCP server names",
                     received,
-                } if received == "MCP server count 1"
+                } if received == "duplicate MCP server at index 1"
             ),
-            "expected the typed MCP passthrough refusal"
+            "expected the typed MCP configuration refusal"
         );
         assert_eq!(
             error.dispatch(),
@@ -3541,8 +4418,8 @@ async fn a_reset_requested_at_open_is_refused_rather_than_silently_dropped() {
     );
     assert_eq!(
         launcher.launches().len(),
-        1,
-        "expected the refusal before thread/start, not a vendor round trip"
+        0,
+        "expected the refusal before launching the vendor"
     );
     assert!(
         !launcher

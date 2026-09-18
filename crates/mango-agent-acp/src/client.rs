@@ -36,7 +36,9 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use mango_external_agents::approval::ApprovalDeadline;
-use mango_external_agents::configuration::Configuration;
+use mango_external_agents::configuration::{
+    Configuration, ConfigurationCatalog, ConfigurationState,
+};
 use mango_external_agents::event::{EventKind, SessionId};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
@@ -44,8 +46,8 @@ use mango_external_agents::permission::{
 };
 use mango_external_agents::session::CancelReason;
 use mango_external_agents::{
-    Clock, Error, EventSink, HostContext, ProcessControl, Result, VendorError,
-    process::stop_process_with_limits,
+    Clock, Error, EventSink, HostContext, Limits, ProcessCleanupGuard, ProcessControl, Result,
+    VendorError, process::stop_process_with_limits,
 };
 
 use crate::approval_events::ApprovalEvents;
@@ -53,6 +55,66 @@ use crate::error::vendor_error;
 use crate::permission;
 use crate::reducer::{Reducer, SessionFact};
 use crate::transport::LaunchedAgent;
+
+#[cfg(test)]
+struct DriveStartupHold {
+    control: Arc<dyn ProcessControl>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    reached: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+static DRIVE_STARTUP_HOLD: Mutex<Option<DriveStartupHold>> = Mutex::new(None);
+
+/// Holds the next driver before it creates the connection task.
+///
+/// The unit test uses this to cancel `drive` in the window where a launched child has no
+/// `ConnectionHandle` yet.
+#[cfg(test)]
+fn hold_next_drive_startup(
+    control: Arc<dyn ProcessControl>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    *DRIVE_STARTUP_HOLD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(DriveStartupHold {
+        control,
+        release: release_rx,
+        reached: reached_tx,
+    });
+    (release, reached)
+}
+
+#[cfg(test)]
+async fn wait_for_drive_startup_hold(child: &DriveShutdownGuard) {
+    let hold = {
+        let mut pending = DRIVE_STARTUP_HOLD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|hold| Arc::ptr_eq(&hold.control, child.control()))
+        {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    let Some(DriveStartupHold {
+        control: _,
+        release,
+        reached,
+    }) = hold
+    else {
+        return;
+    };
+    let _ = reached.send(());
+    let _ = release.await;
+}
 
 /// Whether a host's answer reached the agent, or arrived after the question was already settled.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +263,11 @@ pub(crate) struct SessionState {
     /// `None` on either permission axis leaves the vendor's own setting in force. Turning that
     /// absence into `ReadOnly` would alter an agent merely because a host omitted an override.
     configuration: Mutex<Configuration>,
+    /// Orders complete configuration catalogs from requests and notifications.
+    ///
+    /// A `config_option_update` can arrive before the response to `session/set_config_option` that
+    /// caused it. The later notification is authoritative, so a stale response must not replace it.
+    catalog_revision: Mutex<u64>,
     /// Serialises merging, accepting, and recording one turn's configuration.
     ///
     /// The prompt slot alone is not enough: a second caller could read the old inherited settings
@@ -259,6 +326,7 @@ impl SessionState {
             limits: *host.limits(),
             turn: Mutex::new(None),
             configuration: Mutex::new(configuration),
+            catalog_revision: Mutex::new(0),
             turn_start: Mutex::new(()),
             generations: AtomicU64::new(0),
             cancel_reason: Mutex::new(None),
@@ -330,6 +398,58 @@ impl SessionState {
     /// Records settings only after their turn won ACP's single prompt slot.
     pub(crate) fn accept_configuration(&self, configuration: Configuration) {
         *self.lock_configuration() = configuration;
+    }
+
+    /// The current complete catalog and its notification ordering token.
+    pub(crate) fn catalog_snapshot(&self) -> (ConfigurationCatalog, u64) {
+        let revision = self.lock_catalog_revision();
+        (self.core_state.snapshot().catalog.clone(), *revision)
+    }
+
+    /// Submits a synchronous request while holding its catalog-ordering baseline.
+    pub(crate) fn with_catalog_revision<ResultValue>(
+        &self,
+        submit: impl FnOnce(u64) -> ResultValue,
+    ) -> ResultValue {
+        let revision = self.lock_catalog_revision();
+        submit(*revision)
+    }
+
+    /// Publishes a request response unless a later catalog notification already won the order.
+    pub(crate) fn publish_response_configuration(
+        &self,
+        response_revision: u64,
+        response_catalog: ConfigurationCatalog,
+        requested: Configuration,
+        accepted: Configuration,
+    ) -> ConfigurationState {
+        self.with_response_catalog(response_revision, response_catalog, |catalog| {
+            let state = ConfigurationState::new(
+                requested,
+                accepted,
+                crate::session::configuration_from_catalog(&catalog),
+            );
+            self.core_state.update(|snapshot| {
+                snapshot.catalog = catalog;
+                snapshot.configuration = state.clone();
+            });
+            state
+        })
+    }
+
+    /// Publishes an opening catalog only when no newer session notification has won.
+    pub(crate) fn publish_lifecycle_catalog(
+        &self,
+        response_revision: u64,
+        response_catalog: ConfigurationCatalog,
+    ) {
+        self.with_response_catalog(response_revision, response_catalog, |catalog| {
+            let observed = crate::session::configuration_from_catalog(&catalog);
+            self.core_state.update(|snapshot| {
+                snapshot.catalog = catalog;
+                snapshot.configuration.observed = observed;
+            });
+        });
     }
 
     /// Guards one synchronous configuration merge and prompt-slot claim.
@@ -441,6 +561,16 @@ impl SessionState {
             SessionFact::Commands(commands) => self
                 .core_state
                 .set_commands(mango_external_agents::event::normalized_catalog(commands)),
+            SessionFact::ConfigurationOptions(options) => {
+                let catalog = crate::session::catalog_from_options(&options);
+                let observed = crate::session::configuration_from_catalog(&catalog);
+                let mut revision = self.lock_catalog_revision();
+                *revision = revision.wrapping_add(1);
+                self.core_state.update(|snapshot| {
+                    snapshot.catalog = catalog;
+                    snapshot.configuration.observed = observed;
+                });
+            }
         }
     }
 
@@ -652,6 +782,28 @@ impl SessionState {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn lock_catalog_revision(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.catalog_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn with_response_catalog<ResultValue>(
+        &self,
+        response_revision: u64,
+        response_catalog: ConfigurationCatalog,
+        update: impl FnOnce(ConfigurationCatalog) -> ResultValue,
+    ) -> ResultValue {
+        let mut revision = self.lock_catalog_revision();
+        let catalog = if *revision == response_revision {
+            *revision = revision.wrapping_add(1);
+            response_catalog
+        } else {
+            self.core_state.snapshot().catalog.clone()
+        };
+        update(catalog)
+    }
+
     fn lock_reducer(&self) -> std::sync::MutexGuard<'_, Reducer> {
         self.reducer.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -677,17 +829,18 @@ impl SessionState {
 /// work before it releases this generation; freeing the slot here would let a second prompt onto a
 /// wire that has no way to tell two turns apart. The nonblocking sink makes later frames fail fast.
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
-    // Cloned out from under its lock before the first emit, so cancellation and close can always
-    // claim their generation while a callback is reducing a frame.
-    let Some(turn) = state.turn() else {
-        return;
-    };
+    // Capture the current owner before reducing session facts. Facts may arrive between turns;
+    // their publication must not attach turn events to a newly admitted generation.
+    let turn = state.turn();
     let (events, facts) = state.reduce(notification);
     // Published before the turn events: a session fact is true the moment the agent announced it,
     // not only once a host has read every event that preceded it on this turn's own stream.
     for fact in facts {
         state.apply_fact(fact);
     }
+    let Some(turn) = turn else {
+        return;
+    };
     for kind in events {
         // Re-checked each time round: close can commit the terminal after reduction, and no later
         // event may follow it.
@@ -865,6 +1018,8 @@ fn standing_refusal(
 pub(crate) struct ConnectionHandle {
     connection: ConnectionTo<Agent>,
     control: Arc<dyn ProcessControl>,
+    /// The one owner shared with lifecycle watchers that may also need to reap the child.
+    child_reaper: ChildReaper,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>>,
     /// Host-owned bounds for tearing down the dispatch loop and child process.
@@ -967,6 +1122,167 @@ impl Drop for RequestAbandonment {
     }
 }
 
+/// Reaps one child once without letting cancellation abandon its launched kill task.
+#[derive(Clone)]
+pub(crate) struct ChildReaper {
+    control: Arc<dyn ProcessControl>,
+    claimed: Arc<AtomicBool>,
+    limits: Limits,
+    result: Arc<Mutex<Option<std::result::Result<(), String>>>>,
+    done: mango_external_agents::CancelToken,
+}
+
+impl ChildReaper {
+    fn new(control: Arc<dyn ProcessControl>, limits: Limits) -> Self {
+        Self {
+            control,
+            limits,
+            result: Arc::new(Mutex::new(None)),
+            claimed: Arc::new(AtomicBool::new(false)),
+            done: mango_external_agents::CancelToken::new(),
+        }
+    }
+
+    /// Starts bounded cleanup that outlives a caller cancelled while awaiting it.
+    pub(crate) async fn reap(&self, reason: mango_external_agents::CancelReason) -> Result<()> {
+        if !self.claimed.swap(true, Ordering::AcqRel) {
+            let control = Arc::clone(&self.control);
+            let done = self.done.clone();
+            let limits = self.limits;
+            let result = Arc::clone(&self.result);
+            tokio::spawn(async move {
+                let _complete = ReapCompletion(done);
+                let outcome = stop_process_with_limits(control.as_ref(), reason, &limits).await;
+                *result.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(outcome.map(|_| ()).map_err(|error| error.to_string()));
+            });
+        }
+        self.done.cancelled().await;
+        self.result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| Err(String::from("ACP child cleanup ended without an outcome")))
+            .map_err(|message| Error::CleanupRequired {
+                control: Arc::clone(&self.control),
+                source: Box::new(Error::Vendor(link_failure(message))),
+            })
+    }
+}
+
+/// Signals every competing reaper even if an injected process control panics.
+struct ReapCompletion(mango_external_agents::CancelToken);
+
+impl Drop for ReapCompletion {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Reaps a child if cancellation drops `drive` before it can return a connection handle.
+pub(crate) struct DriveShutdownGuard {
+    control: Arc<dyn ProcessControl>,
+    cleanup: Option<ProcessCleanupGuard>,
+}
+
+impl DriveShutdownGuard {
+    /// Claims a launched child before the asynchronous connection driver is first polled.
+    pub(crate) fn from_launched(launched: &LaunchedAgent, limits: Limits) -> Self {
+        let control = Arc::clone(&launched.control);
+        Self {
+            cleanup: Some(ProcessCleanupGuard::new(
+                Arc::clone(&control),
+                limits,
+                mango_external_agents::CancelReason::Shutdown,
+            )),
+            control,
+        }
+    }
+
+    fn disarm(&mut self) -> Arc<dyn ProcessControl> {
+        self.cleanup
+            .take()
+            .expect("drive guard owns the child until a connection handle exists")
+            .into_control()
+    }
+
+    /// Completes pre-handle cleanup before `drive` reports a connection-start failure.
+    async fn finish(mut self) -> Result<()> {
+        self.cleanup
+            .take()
+            .expect("drive guard owns the child until cleanup completes")
+            .finish()
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn control(&self) -> &Arc<dyn ProcessControl> {
+        &self.control
+    }
+}
+
+/// Owns a short-lived connection until its request completes or the caller cancels it.
+///
+/// Listing has no session handle that could close the child later. This guard makes cancellation of
+/// that picker request take the same shutdown path as an explicit close.
+pub(crate) struct ConnectionShutdownGuard {
+    connection: Option<Arc<ConnectionHandle>>,
+}
+
+impl ConnectionShutdownGuard {
+    /// Starts a scope that ends the connection when it leaves the async call.
+    pub(crate) fn new(connection: Arc<ConnectionHandle>) -> Self {
+        Self {
+            connection: Some(connection),
+        }
+    }
+
+    /// The live connection while the scope remains active.
+    pub(crate) fn connection(&self) -> &Arc<ConnectionHandle> {
+        self.connection
+            .as_ref()
+            .expect("connection exists until an explicit shutdown completes")
+    }
+
+    /// Ends the child before the normal scope exit.
+    pub(crate) async fn shutdown(
+        &mut self,
+        reason: mango_external_agents::CancelReason,
+    ) -> Result<()> {
+        let Some(connection) = self.connection.as_ref() else {
+            return Ok(());
+        };
+        // A dropped request can already have claimed shutdown through `RequestAbandonment`.
+        // Always join that owned operation instead of running a second direct cleanup that could
+        // race its driver and obscure the outcome from this explicit scope owner.
+        connection.begin_shutdown(reason);
+        let result = connection.wait_shutdown().await;
+        self.connection.take();
+        result
+    }
+
+    /// Hands ownership to a session that will close the connection later.
+    pub(crate) fn release(mut self) -> Arc<ConnectionHandle> {
+        self.connection
+            .take()
+            .expect("connection exists until ownership moves to a session")
+    }
+}
+
+impl Drop for ConnectionShutdownGuard {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Drop has no caller to receive a cleanup failure. Explicit owners use `shutdown`,
+            // which preserves its result for them instead.
+            connection.begin_shutdown(mango_external_agents::CancelReason::Shutdown);
+        }
+    }
+}
+
 impl std::fmt::Debug for ConnectionHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -994,8 +1310,12 @@ pub(crate) async fn drive(
     launched: LaunchedAgent,
     state: Arc<SessionState>,
     client_name: String,
+    mut child: DriveShutdownGuard,
 ) -> Result<ConnectionHandle> {
-    let LaunchedAgent { transport, control } = launched;
+    #[cfg(test)]
+    wait_for_drive_startup_hold(&child).await;
+
+    let LaunchedAgent { transport, .. } = launched;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1060,15 +1380,17 @@ pub(crate) async fn drive(
             Ok(Ok(())) => "a connection that closed before it opened",
             Err(_) => "a connection task that did not finish",
         };
-        return Err(Error::Vendor(link_failure(with_stderr(
-            shape,
-            control.as_ref(),
-        ))));
+        let error = Error::Vendor(link_failure(with_stderr(shape, child.control.as_ref())));
+        child.finish().await?;
+        return Err(error);
     };
 
+    let control = child.disarm();
+    let child_reaper = ChildReaper::new(Arc::clone(&control), state.limits);
     Ok(ConnectionHandle {
         connection,
         control,
+        child_reaper,
         shutdown: Mutex::new(Some(shutdown_tx)),
         driver: Mutex::new(Some(driver)),
         limits: state.limits,
@@ -1117,10 +1439,11 @@ impl ConnectionHandle {
                     "the ACP shutdown task ended without an outcome",
                 ))
             });
-        result.map_err(|message| {
-            Error::Vendor(link_failure(format!(
+        result.map_err(|message| Error::CleanupRequired {
+            control: Arc::clone(&self.child_reaper.control),
+            source: Box::new(Error::Vendor(link_failure(format!(
                 "ACP connection cleanup failed: {message}"
-            )))
+            )))),
         })
     }
     /// The connection, for a request a session method sends.
@@ -1135,6 +1458,11 @@ impl ConnectionHandle {
     /// The child, for diagnostics and for ending it.
     pub(crate) fn control(&self) -> &Arc<dyn ProcessControl> {
         &self.control
+    }
+
+    /// The shared owner a watcher can use without retaining a connection clone.
+    pub(crate) fn child_reaper(&self) -> ChildReaper {
+        self.child_reaper.clone()
     }
 
     /// Fires once the dispatch loop is over, whichever way it ended.
@@ -1181,9 +1509,7 @@ impl ConnectionHandle {
                 }
             }
         }
-        let process = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
-        process?;
-        Ok(())
+        self.child_reaper.reap(reason).await
     }
 }
 
@@ -1212,13 +1538,51 @@ where
     Request: agent_client_protocol::JsonRpcRequest,
     Request::Response: Send,
 {
-    // `ConnectionTo::send_request` enters ACP's own unbounded task queue immediately. Acquire
-    // before constructing that request so a host's pending-request budget remains an admission
-    // bound rather than merely a bound on responses we happened to await.
-    let (_permit, sent) = connection
+    let sent = submit(connection, request)?;
+    await_sent(connection, profile, timeout, method, sent).await
+}
+
+/// A request admitted before submission, with cleanup owned until its response arrives.
+pub(crate) struct SubmittedRequest<'a, Response> {
+    sent: agent_client_protocol::SentRequest<Response>,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    abandonment: RequestAbandonment,
+}
+
+/// Submits synchronously so callers can bind catalog revision and request admission together.
+pub(crate) fn submit<Request>(
+    connection: &Arc<ConnectionHandle>,
+    request: Request,
+) -> Result<SubmittedRequest<'_, Request::Response>>
+where
+    Request: agent_client_protocol::JsonRpcRequest,
+{
+    let (permit, sent) = connection
         .requests
         .submit(|| connection.connection().send_request(request))?;
-    let mut abandonment = RequestAbandonment::new(Arc::clone(connection));
+    Ok(SubmittedRequest {
+        sent,
+        _permit: permit,
+        abandonment: RequestAbandonment::new(Arc::clone(connection)),
+    })
+}
+
+/// Awaits an admitted request already submitted under a synchronous lifecycle claim.
+pub(crate) async fn await_sent<Response>(
+    connection: &ConnectionHandle,
+    profile: &crate::profile::AcpProfile,
+    timeout: Duration,
+    method: &'static str,
+    submitted: SubmittedRequest<'_, Response>,
+) -> Result<Response>
+where
+    Response: Send,
+{
+    let SubmittedRequest {
+        sent,
+        _permit,
+        mut abandonment,
+    } = submitted;
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
         return Err(Error::Timeout {
@@ -1264,15 +1628,149 @@ mod connection_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use mango_external_agents::testing::FakeLauncher;
+    use mango_external_agents::testing::{FakeLauncher, FakeProcess};
     use mango_external_agents::{
-        AttemptId, Configuration, Error, EventSink, HarnessIdentity, HostContext, SessionIds,
-        SessionSnapshot, TransportKind, TransportSelection, TurnId,
+        AttemptId, ByteSink, ByteSource, CancelReason, Configuration, Error, EventSink, ExitStatus,
+        HarnessIdentity, HostContext, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
+        Result, SessionIds, SessionSnapshot, TransportKind, TransportSelection, TurnId,
     };
 
-    use super::{CancelReason, PermissionLevel, RequestAdmission, SessionId, SessionState};
+    use super::{
+        DriveShutdownGuard, PermissionLevel, RequestAdmission, SessionId, SessionState, drive,
+        hold_next_drive_startup,
+    };
+
+    /// A process control that records how many cleanup claims reach the injected child.
+    struct CountingProcessControl {
+        inner: Arc<dyn ProcessControl>,
+        kills: Arc<AtomicUsize>,
+    }
+
+    /// A named process control whose kill waits until the test releases it.
+    struct HeldKillProcessControl {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        completed: AtomicBool,
+    }
+
+    /// A process control whose first bounded cleanup fails and whose next one succeeds.
+    struct RetryableCleanupControl {
+        failed_once: AtomicBool,
+        kills: AtomicUsize,
+    }
+
+    /// A child stdout that fails before ACP can hand `drive` a connection handle.
+    struct FailingStartupSource;
+
+    /// The unused writable half of a deliberately broken startup transport.
+    struct InertStartupSink;
+
+    #[async_trait::async_trait]
+    impl ProcessControl for HeldKillProcessControl {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            Ok(ExitStatus::default())
+        }
+
+        async fn kill(&self, _reason: CancelReason) -> Result<()> {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            self.completed.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for RetryableCleanupControl {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::new()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            Ok(ExitStatus::default())
+        }
+
+        async fn kill(&self, _reason: CancelReason) -> Result<()> {
+            self.kills.fetch_add(1, Ordering::AcqRel);
+            if self.failed_once.swap(false, Ordering::AcqRel) {
+                return Err(Error::Launch {
+                    program: String::from("fake ACP agent"),
+                    message: String::from("the first cleanup attempt failed"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for FailingStartupSource {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            Err(Error::Link {
+                peer: String::from("fake ACP agent"),
+                message: String::from("the startup pipe failed"),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSink for InertStartupSink {
+        async fn write_all(&mut self, _bytes: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for CountingProcessControl {
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.inner.stderr_tail()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            self.inner.wait().await
+        }
+
+        async fn kill(&self, reason: CancelReason) -> Result<()> {
+            self.kills.fetch_add(1, Ordering::AcqRel);
+            self.inner.kill(reason).await
+        }
+    }
 
     /// A bare core session state, for the connection-level state under test to publish facts into.
     fn core_state() -> mango_external_agents::SessionState {
@@ -1450,5 +1948,184 @@ mod tests {
             ),
             "received {closed:?}"
         );
+    }
+
+    /// Cancelling `drive` before its connection task exists still reaps the child it was handed.
+    #[tokio::test]
+    async fn a_cancelled_driver_startup_kills_its_injected_child_once() {
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let (state, host) = state();
+        let mut process = launcher
+            .spawn(LaunchSpec {
+                argv: vec![String::from("fake-acp")],
+                cwd: host.cwd().to_path_buf(),
+                env: Default::default(),
+                stdin: true,
+                hide_window: true,
+            })
+            .await
+            .expect("expected the fake child to launch");
+        let kills = Arc::new(AtomicUsize::new(0));
+        let control: Arc<dyn ProcessControl> = Arc::new(CountingProcessControl {
+            inner: Arc::clone(&process.control),
+            kills: Arc::clone(&kills),
+        });
+        process.control = Arc::clone(&control);
+        let launched = crate::transport::frame(process, &host).expect("expected framed child");
+        let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
+        let (_release, reached) = hold_next_drive_startup(Arc::clone(&control));
+        let task = tokio::spawn(drive(
+            launched,
+            Arc::new(state),
+            String::from("acp-client-tests"),
+            cleanup,
+        ));
+        reached
+            .await
+            .expect("expected the driver to stop before connection startup");
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), control.wait())
+            .await
+            .expect("expected cancellation to reap the held-startup child")
+            .expect("expected child cleanup to succeed");
+        assert_eq!(
+            kills.load(Ordering::Acquire),
+            1,
+            "expected the pre-drive guard to claim cleanup exactly once"
+        );
+    }
+
+    /// A pre-handle failure has no session owner, so its explicit bounded cleanup must return the
+    /// host's control when the first stop attempt fails.
+    #[tokio::test]
+    async fn a_failed_pre_handle_cleanup_returns_control_for_host_recovery() {
+        let concrete = Arc::new(RetryableCleanupControl {
+            failed_once: AtomicBool::new(true),
+            kills: AtomicUsize::new(0),
+        });
+        let control: Arc<dyn ProcessControl> = concrete.clone();
+        let cleanup = DriveShutdownGuard {
+            control: control.clone(),
+            cleanup: Some(mango_external_agents::ProcessCleanupGuard::new(
+                control.clone(),
+                mango_external_agents::Limits::default(),
+                CancelReason::Shutdown,
+            )),
+        };
+
+        let error = cleanup
+            .finish()
+            .await
+            .expect_err("expected the first pre-handle cleanup attempt to fail");
+        assert!(
+            matches!(error, Error::CleanupRequired { .. }),
+            "expected a recoverable cleanup error, received {error:?}"
+        );
+        let recovered = error
+            .cleanup_control()
+            .expect("expected the failed drive cleanup to retain its process control");
+        mango_external_agents::process::stop_process_with_limits(
+            recovered.as_ref(),
+            CancelReason::Shutdown,
+            &mango_external_agents::Limits::default(),
+        )
+        .await
+        .expect("expected host cleanup retry to reap the child");
+        assert!(
+            Arc::ptr_eq(&control, &recovered),
+            "expected recovery to retain the originally launched control"
+        );
+        assert_eq!(
+            concrete.kills.load(Ordering::Acquire),
+            2,
+            "expected one failed guard cleanup and one host retry"
+        );
+    }
+
+    /// A transport that fails before ACP opens a connection has no session owner. `drive` must
+    /// explicitly finish bounded cleanup and return its recovery control instead of the link error.
+    #[tokio::test]
+    async fn a_drive_startup_failure_returns_control_for_host_recovery() {
+        let (state, host) = state();
+        let concrete = Arc::new(RetryableCleanupControl {
+            failed_once: AtomicBool::new(true),
+            kills: AtomicUsize::new(0),
+        });
+        let control: Arc<dyn ProcessControl> = concrete.clone();
+        let launched = crate::transport::frame(
+            ManagedProcess {
+                stdout: Box::new(FailingStartupSource),
+                stdin: Some(Box::new(InertStartupSink)),
+                control: control.clone(),
+            },
+            &host,
+        )
+        .expect("expected a framed startup transport");
+        let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
+
+        let error = drive(
+            launched,
+            Arc::new(state),
+            String::from("acp-client-tests"),
+            cleanup,
+        )
+        .await
+        .expect_err("expected the startup transport to fail before connection ownership");
+        assert!(
+            matches!(error, Error::CleanupRequired { .. }),
+            "expected cleanup recovery to take precedence, received {error:?}"
+        );
+        let recovered = error
+            .cleanup_control()
+            .expect("expected a recovery control after failed startup cleanup");
+        mango_external_agents::process::stop_process_with_limits(
+            recovered.as_ref(),
+            CancelReason::Shutdown,
+            host.limits(),
+        )
+        .await
+        .expect("expected host recovery to reap the startup child");
+        assert!(
+            Arc::ptr_eq(&control, &recovered),
+            "expected drive to retain the launched child control"
+        );
+        assert_eq!(
+            concrete.kills.load(Ordering::Acquire),
+            2,
+            "expected one failed drive cleanup and one host retry"
+        );
+    }
+
+    /// Cancelling a shutdown waiter cannot cancel the child kill it already submitted.
+    #[tokio::test]
+    async fn a_cancelled_reaper_wait_keeps_the_submitted_kill_running() {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let held = Arc::new(HeldKillProcessControl {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+            completed: AtomicBool::new(false),
+        });
+        let control: Arc<dyn ProcessControl> = held.clone();
+        let reaper = super::ChildReaper::new(control, mango_external_agents::Limits::default());
+        let task = tokio::spawn({
+            let reaper = reaper.clone();
+            async move { reaper.reap(CancelReason::Shutdown).await }
+        });
+        entered.await.expect("expected the kill task to start");
+        task.abort();
+        let _ = task.await;
+        release
+            .send(())
+            .expect("expected the held kill to remain owned");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !held.completed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the detached kill to complete after its waiter was cancelled");
     }
 }

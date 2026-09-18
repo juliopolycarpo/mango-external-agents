@@ -20,8 +20,8 @@
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Plan, PlanEntryStatus, SessionUpdate, StopReason, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    ContentBlock, ContentChunk, Plan, PlanEntryStatus, SessionConfigOption, SessionUpdate,
+    StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use mango_external_agents::event::{
     Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, EventKind,
@@ -48,6 +48,8 @@ pub const PLAN_CALL_ID: &str = "acp:plan";
 pub enum SessionFact {
     /// The agent announced its slash-command catalog.
     Commands(Vec<Command>),
+    /// The agent replaced its complete live configuration catalog.
+    ConfigurationOptions(Vec<SessionConfigOption>),
 }
 
 /// Turns one agent's frames into events, remembering only what a frame alone cannot say.
@@ -174,11 +176,14 @@ impl Reducer {
                 }],
                 Vec::new(),
             ),
+            SessionUpdate::ConfigOptionUpdate(update) => (
+                Vec::new(),
+                vec![SessionFact::ConfigurationOptions(update.config_options)],
+            ),
             // Session state rather than transcript, and the `#[non_exhaustive]` tail: an agent that
             // sends an update from a draft feature this build did not opt into is not a failed turn.
             SessionUpdate::UserMessageChunk(_)
             | SessionUpdate::CurrentModeUpdate(_)
-            | SessionUpdate::ConfigOptionUpdate(_)
             | SessionUpdate::SessionInfoUpdate(_)
             | _ => (Vec::new(), Vec::new()),
         }

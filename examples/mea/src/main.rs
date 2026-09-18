@@ -18,7 +18,7 @@ use std::sync::Arc;
 use mango_external_agents::launcher::TokioLauncher;
 use mango_external_agents::{
     ApprovalRouting, AuthState, ConfigurationChange, EnvSource, ExecutablePath, HarnessId,
-    HarnessRegistry, HostContext, OpenSession, TurnRequest,
+    HarnessRegistry, HostContext, OpenSession, TransportSelection, TurnRequest,
 };
 use options::HarnessChoice;
 
@@ -152,6 +152,9 @@ fn describe(discovery: &mango_external_agents::Discovery) -> String {
         GateVerdict::NotInstalled => String::from("missing"),
         GateVerdict::VersionTooOld { found, minimum } => {
             format!("gated      {found} is older than {minimum}")
+        }
+        GateVerdict::MissingRequiredSurface { expected, received } => {
+            format!("gated      expected {expected}; received {received}")
         }
         GateVerdict::Usable => match &discovery.version {
             Some(version) => format!("installed  {version}"),
@@ -343,6 +346,7 @@ async fn turn(options: &Options) -> Result<(), String> {
         .await
         .map_err(|e| refusal(&e))?;
     eprintln!("session: {}", session.ids().native_session_id);
+    eprintln!("{}", transport_report(session.snapshot().transport));
 
     turn::run_with_format(
         session.as_ref(),
@@ -369,6 +373,18 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
         HarnessChoice::Acp(profile) => capture::acp(&out, &workspace.path, profile.as_str()).await,
     };
     result.map_err(|error| error.to_string())
+}
+
+/// The carrier requested by the host and the one the open session actually uses.
+/// Example: `transport_report(TransportSelection::new(None, TransportKind::Stdio))` names stdio.
+fn transport_report(selection: TransportSelection) -> String {
+    let requested = selection
+        .requested
+        .map_or_else(|| String::from("default"), |kind| kind.to_string());
+    format!(
+        "transport: requested {requested}; effective {}",
+        selection.effective
+    )
 }
 
 /// A session id nobody has to be able to reproduce.
@@ -408,14 +424,29 @@ mod tests {
 
     use super::{
         HarnessChoice, Options, acp_profile_ids, describe, discover_with, harness_lines, refusal,
-        registry, run,
+        registry, run, transport_report,
     };
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{
         CapabilityCeiling, ConfigurationVerdict, Discovery, EnvSource, Error, GateVerdict, Harness,
         HarnessDescriptor, HarnessId, HarnessIdentity, HarnessRegistry, HostContext, OpenSession,
-        PermissionLevel, PermissionMatrix, ProfileId, Result, Session, TransportKind, VendorInfo,
+        PermissionLevel, PermissionMatrix, ProfileId, Result, Session, TransportKind,
+        TransportSelection, VendorInfo,
     };
+
+    #[test]
+    fn the_turn_report_names_requested_and_effective_transport() {
+        let selected = TransportSelection::new(Some(TransportKind::Acp), TransportKind::Acp);
+        assert_eq!(
+            transport_report(selected),
+            "transport: requested acp; effective acp"
+        );
+        let defaulted = TransportSelection::new(None, TransportKind::Stdio);
+        assert_eq!(
+            transport_report(defaulted),
+            "transport: requested default; effective stdio"
+        );
+    }
 
     /// The one field `mea` reads off the typed error rather than out of its diagnostic.
     ///
@@ -724,5 +755,20 @@ mod tests {
             ..Discovery::not_installed()
         };
         assert!(describe(&unknown).starts_with("unknown"));
+    }
+
+    #[test]
+    fn a_missing_required_surface_reports_a_known_gate() {
+        let discovery = Discovery {
+            gate: GateVerdict::MissingRequiredSurface {
+                expected: "a required launch flag",
+                received: "the flag was absent from help",
+            },
+            ..Discovery::not_installed()
+        };
+        assert_eq!(
+            describe(&discovery),
+            "gated      expected a required launch flag; received the flag was absent from help"
+        );
     }
 }

@@ -215,17 +215,27 @@ See [turn ownership and recovery](lifecycle.md) for admission, abandonment and m
 
 ## Discovery receipts are a seam, not a cache
 
-`Harness::probe` may not memoise — how fresh an answer has to be is the host's decision. A host
-that has just drawn a picker from a probe already has the answer, so `DiscoveryReceipt` lets it say
-so: it travels on the `OpenSession` that uses it, is checked for harness identity, executable
-identity and freshness, and is then forgotten. Nothing in this library stores one or looks one up,
-and there is no process-global cache.
+`Harness::probe` may not memoise. The host decides freshness. A host that has just filled a picker
+from discovery can pass a `DiscoveryReceipt` on the `OpenSession` that uses it, then the library
+forgets it. Nothing in the library stores one or looks one up, and there is no process-global
+cache.
 
-The executable and environment fingerprints are opaque and host-computed, and `verify_for`
-deliberately does **not** check them: measuring what the executable looks like *now* is something
-only the host can do. A host that wants the check measures again at open time and calls
-`DiscoveryReceipt::describes`, which compares the two for equality and never interprets either — so
-a host that hashes the binary, reads its mtime or records a package version all work.
+Immediately before each opening, the host calls `bind_to_open` with fresh opaque measurements of
+the resolved executable, the actual allowlisted child environment, and every account or
+managed-policy fact that narrowed discovery. Binding refuses a changed fingerprint or a recorded
+fingerprint without a current measurement. The binding also records the full harness identity,
+selected effective transport, authorised workspace, and configuration, resume and MCP request
+fields. Opening compares that context and checks the receipt's age.
+
+Opening cannot remeasure external state. The host must invalidate the receipt on observed
+executable, environment, account or policy changes, even within its freshness window. Cloning a
+bound receipt does not refresh that evidence. If state changes between binding and opening, the
+host must remeasure and bind again before using cached permissions.
+
+The library only compares fingerprints. It does not hash a binary, read an environment value or
+interpret an account policy. A host can use a binary hash, file metadata or a package version for
+the executable fingerprint. Receipt bindings and measurements do not implement serialization, and
+their debug output and errors report only whether evidence was present or changed.
 
 A receipt for a resolved executable also refuses a request that names none. The launcher would
 resolve the program name off `PATH`, which may answer with a different file, and a receipt that
@@ -234,11 +244,15 @@ vouches for one binary cannot vouch for whichever one that turns out to be.
 ## Listing and account readings without a conversation
 
 `Harness::list_sessions` and `Harness::account_usage` are optional services for a host that needs
-data before opening a conversation. Both default to `Error::NotSupported`, and the shipped
-harnesses keep those defaults. The listing/account capability flags describe the corresponding
-session methods, not these independent services: Codex currently requires an open `Session` for
-`thread/list` and account usage. Hosts must handle a harness-level refusal even when its session
-capability is advertised. Neither surface reads a credential.
+data before opening a conversation. Both default to `Error::NotSupported`. Codex implements
+harness-level listing through a short-lived initialized app-server connection. ACP does the same
+when the peer advertises `session/list`. These picker connections never create a conversation,
+filter results to the authorised workspace, preserve vendor cursors, and close after the request.
+Claude does not expose listing on its documented headless interface.
+
+Harness-level account usage remains unsupported. The capability flags describe the corresponding
+session methods, so callers must still handle a harness-level refusal when a session capability is
+advertised. Neither service reads a credential.
 
 ## Protected types, justified individually
 

@@ -5,13 +5,15 @@
 //! moment the child is up: a CLI that waits for input otherwise holds the probe open until the
 //! timeout, and a probe that timed out is indistinguishable from a binary that is not there.
 //!
-//! Every failure lands on `None`. That is deliberate and is not the same as "the binary has no
-//! options": a spawn that failed, a CLI that printed to stderr or a wrapper that swallowed the
-//! output must not look like a vendor that removed everything. Callers read `None` as "not
-//! established" and fall back rather than narrowing.
+//! Ordinary probe failures land on `None`. That is deliberate and is not the same as "the binary
+//! has no options": a spawn that failed, a CLI that printed to stderr or a wrapper that swallowed
+//! the output must not look like a vendor that removed everything. `Error::CleanupRequired` is the
+//! exception: the host must receive its process control rather than silently losing a child it has
+//! to reconcile. Callers read `None` as "not established" and fall back rather than narrowing.
 
 use mango_external_agents::{
-    CancelReason, ExecutablePath, HostContext, StdioSpec, transports::stdio,
+    CancelReason, ExecutablePath, HostContext, ProcessCleanupGuard, Result, StdioSpec,
+    transports::stdio,
 };
 
 use crate::pinned::{PROBE_TIMEOUT, VENDOR_ENVIRONMENT_KEYS};
@@ -24,19 +26,24 @@ pub async fn output(
     host: &HostContext,
     executable: &ExecutablePath,
     arguments: &[&str],
-) -> Option<String> {
+) -> Result<Option<String>> {
     let mut argv = vec![String::from(PROGRAM)];
     argv.extend(arguments.iter().map(|argument| String::from(*argument)));
 
-    let transport = stdio::open(
+    let transport = match stdio::open(
         host,
         &StdioSpec::new(argv),
         executable,
         VENDOR_ENVIRONMENT_KEYS,
     )
     .await
-    .ok()?;
-    let control = transport.control;
+    {
+        Ok(transport) => transport,
+        Err(error) if error.cleanup_control().is_some() => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let cleanup =
+        ProcessCleanupGuard::new(transport.control, *host.limits(), CancelReason::Shutdown);
     let (mut sender, mut receiver) = transport.link.split();
     // A probe reads and never writes.
     let _ = sender.close().await;
@@ -51,11 +58,14 @@ pub async fn output(
     .await;
 
     // Nothing this harness starts outlives the call that started it, including a probe that
-    // answered promptly and then declined to exit.
-    let _ = control.kill(CancelReason::Shutdown).await;
+    // answered promptly and then declined to exit. A caller cancelled while reading drops the
+    // guard, which starts the same bounded cleanup worker.
+    cleanup.finish().await?;
 
-    let lines = lines.ok()?;
-    (!lines.is_empty()).then(|| lines.join("\n"))
+    let Some(lines) = lines.ok() else {
+        return Ok(None);
+    };
+    Ok((!lines.is_empty()).then(|| lines.join("\n")))
 }
 
 #[cfg(test)]
@@ -85,7 +95,9 @@ mod tests {
         launcher.push(FakeProcess::transcript(["2.1.270 (Claude Code)"]));
         let host = host(Arc::clone(&launcher));
 
-        let printed = output(&host, &ExecutablePath::default(), &["--version"]).await;
+        let printed = output(&host, &ExecutablePath::default(), &["--version"])
+            .await
+            .expect("expected a completed probe");
         assert_eq!(printed.as_deref(), Some("2.1.270 (Claude Code)"));
 
         let launch = launcher.last_launch().expect("expected a launch");
@@ -99,7 +111,9 @@ mod tests {
         let host = host(Arc::clone(&launcher));
 
         assert_eq!(
-            output(&host, &ExecutablePath::default(), &["--help"]).await,
+            output(&host, &ExecutablePath::default(), &["--help"])
+                .await
+                .expect("expected a completed probe"),
             None
         );
     }
@@ -110,7 +124,9 @@ mod tests {
         let host = host(Arc::clone(&launcher));
 
         assert_eq!(
-            output(&host, &ExecutablePath::default(), &["--version"]).await,
+            output(&host, &ExecutablePath::default(), &["--version"])
+                .await
+                .expect("expected an unavailable probe"),
             None,
             "expected a launcher refusal to read as unestablished rather than to fail the probe"
         );
@@ -122,7 +138,9 @@ mod tests {
         launcher.push(FakeProcess::transcript(["2.1.270 (Claude Code)"]));
         let host = host(Arc::clone(&launcher));
 
-        output(&host, &ExecutablePath::default(), &["--version"]).await;
+        output(&host, &ExecutablePath::default(), &["--version"])
+            .await
+            .expect("expected a completed probe");
 
         let launch = launcher.last_launch().expect("expected a launch");
         assert_eq!(launch.env.get("PATH").map(String::as_str), Some("/usr/bin"));
@@ -149,7 +167,8 @@ mod tests {
             &ExecutablePath::resolved("/opt/claude/bin/claude"),
             &["--version"],
         )
-        .await;
+        .await
+        .expect("expected a completed probe");
 
         let launch = launcher.last_launch().expect("expected a launch");
         assert_eq!(launch.argv[0], "/opt/claude/bin/claude");

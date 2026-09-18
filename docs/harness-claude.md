@@ -26,11 +26,26 @@ stream-json output" —
 without it fails at startup.
 
 **The flag surface is the gate; the version is the fallback.** `claude --help` is parsed for the
-flags and vocabularies this harness depends on, and the pin only decides when that parse produced
-nothing usable. A repackaged or backported build that has everything a turn passes stays usable;
-an at-pin build that lost a flag is refused before a session opens. A `--help` that yielded
-neither the permission modes nor any required flag reads as "the probe failed", never as "the
-binary has no options".
+flags and vocabularies this harness depends on. A repackaged or backported build that has every
+flag a turn passes stays usable, even below the pin. Discovery reports a parsed surface missing one
+of those flags as `GateVerdict::MissingRequiredSurface`; opening returns `Error::Protocol` with a
+static expected shape and no raw help text. A `--help` that yielded neither the permission modes
+nor any required flag is unreadable, never "a binary with no options": a parsed old version then
+reports `GateVerdict::VersionTooOld`, while a current or unreadable version reports
+`GateVerdict::Unknown` and opening returns a distinct safe `Error::Protocol` refusal. A multi-line
+wrapper banner can include its own semver, so discovery reads the semver from the line that
+identifies Claude Code rather than accepting the first semver in all stdout. A single bare version
+remains accepted for the documented compact form.
+
+Anthropic's [CLI reference](https://code.claude.com/docs/en/cli-reference.md#cli-flags) cautions
+that `claude --help` does not list every supported flag. This harness deliberately applies the
+runtime gate only to the fixed argv it drives, each measured in the pinned 2.1.270 capture and
+documented on the linked CLI and headless references. If a later build omits one of those required
+flags from `--help`, opening refuses it even when the published reference still lists the flag.
+The conservative limitation avoids treating a changed help grammar as proof that an untested child
+will accept every argument. It can be relaxed only with a documented feature-detection surface or
+a new pinned capture that demonstrates the exact argv; an arbitrary version-based fallback would
+send an unverified flag after a user submitted a turn.
 
 Two later builds change behaviour without changing what this harness may pass, so they are
 recorded rather than gated on:
@@ -119,13 +134,27 @@ id, and each turn spawns, streams and reaps its own child.
   `session_id` other than the one `--session-id` proposed, and from then on that is the only handle
   `--resume` accepts — so it is the one a host persists. The opening snapshot remains available to
   the host that retained it when the session was opened.
-- **Resume is vetted for shape, never verified for existence.** Verifying that a conversation is
-  still there would cost a process launch per open, and a wrong guess is recoverable: a session the
-  vendor has forgotten fails at the first turn with the vendor's own message. `ResumeMode::Fallback`
-  therefore behaves exactly like `Strict`, and `SessionSnapshot::fallback_reason` is always `None` —
-  nothing was verified, so nothing fell back. Implementing a real fallback means retrying a failed
-  first turn under a fresh id, and that waits for a stable signal to key off (today the only one is
-  vendor prose).
+- **Strict resume is lazy and confirmed.** Opening does not launch a process, so the requested UUID
+  remains an unverified candidate in `Session::ids()` while `SessionSnapshot::resumed` is false.
+  The first turn passes it to `--resume`; only `system/init` echoing that exact UUID confirms the
+  resumed snapshot. A missing, invalid or different id ends that turn with a protocol error instead
+  of presenting another conversation as the requested history. Conversation content or a result
+  before that confirmation is refused without emitting it. Later valid `system/init` ids still
+  replace the active handle, because they are vendor-issued identities for a conversation this
+  session already established.
+
+  A failed strict verification, including a stream that ends before `system/init` without a host
+  cancellation, leaves the session nonresumable even when native cleanup finishes through the
+  host's graceful-interrupt path. Graceful cleanup establishes that the child exited; it cannot
+  establish that the child had loaded the requested history. The next turn is refused before a new
+  Claude process starts.
+
+  **Fallback is explicitly unsupported.** The documented headless surface supplies no separate
+  resume operation or conclusive cannot-resume result. Retrying any failed first turn under a new
+  UUID could turn an authentication, transport or acceptance-unknown failure into a silent fresh
+  chat. `ResumeMode::Fallback` therefore returns `Error::HostConfiguration` before probes, scratch
+  files or a child process are created. It can be implemented only when the vendor supplies a
+  recognized signal that safely authorizes a new conversation.
 
   The *shape* is checked, and that is a different question. A resume reference goes on the command
   line as `--resume <value>`, and an argv array stops shell injection but not **argument**
@@ -274,6 +303,7 @@ An accepted `DiscoveryReceipt` reuses its version and authentication answers whe
 session, but re-runs `--help`. The receipt records normalized discovery facts, not the exact help
 grammar needed to decide current safe argv such as permission modes, effort levels and MCP support;
 inventing that grammar from a capability summary would risk passing an undeclared flag.
+A receipt that says the CLI was not installed retains the no-CLI launch refusal without probing it.
 
 `auth status` returns more personal data than any other vendor's status call — `email`, `orgId`,
 `orgName`, `projectsDirectory`, `subscriptionType`. **None of it leaves the parser.** Two facts do:
@@ -308,12 +338,13 @@ this library never runs.
 description are the whole catalog. Nothing is marked default, deliberately: the help declares no
 default, and naming one would put `--model` on every argv and override whatever default the account
 is on. A build that advertises no aliases reports no catalog at all, which is not the same as an
-empty one. An explicit model must fit Claude's documented identifier shape and an argv value
-position; an invalid value is refused before a child starts rather than omitted.
+empty one. An explicit model is an opaque vendor value: it is checked only for the documented argv
+value shape, never rejected merely because it is absent from a partial alias catalog. An invalid
+value is refused before a child starts rather than omitted or allowed to alter the CLI defaults.
 
 **Effort.** `--effort` is passed only for the exact level this build itself printed, and only when
 the host chose one. An explicit level that is unavailable after a downgrade is refused before a
-child starts, so the turn never silently falls back to another effort.
+child starts, so the turn never silently falls back to another effort or replaces accepted defaults.
 
 ## MCP passthrough
 
@@ -380,13 +411,6 @@ catalog an earlier run published.
   runs for minutes with the vendor emitting nothing, so a shorter cap does not describe a stalled
   child — it cuts a working turn. A host that wants a longer leash sets `Limits::idle_timeout`
   above the floor and gets it.
-
-## Known gaps
-
-- `GateVerdict::VersionTooOld` carries the version and the floor but has nowhere to name *which*
-  flag went missing, so a build refused for a missing flag reports an upgrade rather than the
-  specific cause. The fixture-backed surface test is what names it for a maintainer.
-- A real `ResumeMode::Fallback` is recorded above as a follow-up.
 
 Discovery exposes the account and build restrictions in `Discovery.permission_matrix`; the static
 `Harness::permission_matrix` is its upper bound. Hosts can use the probed matrix to disable

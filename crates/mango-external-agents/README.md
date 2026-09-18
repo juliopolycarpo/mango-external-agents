@@ -19,18 +19,19 @@ trait and no credential field on `HostContext`, so a host cannot pass one in eve
 
 ## A host, against the fakes
 
-The same shape against a real harness; only the two `testing` types change. This example is
-compiled and run as part of the test suite, so it cannot drift from the API.
+The same shape against a real harness; only the two `testing` types change. Enable the `testing`
+feature for this example. It is compiled and run by the test suite with that feature enabled.
 
 ```rust
+# #[cfg(feature = "testing")]
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # use std::sync::Arc;
 use mango_external_agents::testing::{FakeHarness, FakeLauncher};
 use mango_external_agents::{
     CloseReason, EventKind, Harness, HostContext, OpenSession, TurnRequest,
 };
 
-# #[tokio::main(flavor = "current_thread")]
-# async fn main() -> Result<(), Box<dyn std::error::Error>> {
 let host = HostContext::builder()
     .launcher(Arc::new(FakeLauncher::new()))
     .cwd(std::env::temp_dir())
@@ -65,6 +66,8 @@ assert!(session.snapshot().revision >= opened.revision);
 session.close(CloseReason::Requested).await?;
 # Ok(())
 # }
+# #[cfg(not(feature = "testing"))]
+# fn main() {}
 ```
 
 See [`docs/adopt.md`](https://github.com/juliopolycarpo/mango-external-agents/blob/main/docs/adopt.md)

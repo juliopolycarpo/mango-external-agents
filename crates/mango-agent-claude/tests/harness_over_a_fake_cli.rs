@@ -7,13 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mango_agent_claude::ClaudeHarness;
+use mango_external_agents::testing::FrozenClock;
 use mango_external_agents::{
     ApprovalRouting, AuthMode, AuthState, CancelReason, CancelToken, CloseReason, Configuration,
     ConfigurationChange, ConfigurationOptionId, ConfigurationPatch, ConfigurationValue,
-    DiscoveryReceipt, Dispatch, Error, EventKind, ExecutablePath, GateVerdict, Harness, HarnessId,
-    HostContext, InteractionId, LaunchSpec, Limits, LineLimits, ManagedProcess, OpenSession,
-    PermissionLevel, PermissionResponse, ProcessLauncher, Result, ResumeMode, Session,
-    SessionStatus, TurnRequest, TurnStream,
+    DiscoveryReceipt, DiscoveryReceiptMeasurements, Dispatch, Error, EventKind, ExecutablePath,
+    GateVerdict, Harness, HarnessId, HostContext, InteractionId, LaunchSpec, Limits, LineLimits,
+    ManagedProcess, OpenSession, PermissionLevel, PermissionResponse, ProcessControl,
+    ProcessLauncher, Result, ResumeMode, Session, SessionStatus, TurnRequest, TurnStream,
 };
 use support::{
     FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, SpawnGate, host,
@@ -94,8 +95,89 @@ impl ProcessLauncher for FailingTurnLauncher {
     }
 }
 
+/// Makes a probe's failed native cleanup visible to the harness caller.
+struct CleanupRequiredProbeLauncher {
+    inner: Arc<FakeClaudeCli>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for CleanupRequiredProbeLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        let mut child = self.inner.spawn(spec).await?;
+        child.stdin = None;
+        child.control = Arc::new(FailingProbeCleanup {
+            inner: child.control,
+        });
+        Ok(child)
+    }
+}
+
+/// Refuses forced termination so the host must retain its process control.
+struct FailingProbeCleanup {
+    inner: Arc<dyn ProcessControl>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for FailingProbeCleanup {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> Result<mango_external_agents::ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, _reason: CancelReason) -> Result<()> {
+        Err(Error::Closed {
+            subject: "test probe process",
+        })
+    }
+}
+
 mod discovery {
     use super::*;
+
+    #[tokio::test]
+    async fn propagates_probe_cleanup_required_through_discovery_and_opening() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let host = host_under(
+            Arc::new(CleanupRequiredProbeLauncher {
+                inner: Arc::clone(&launcher),
+            }),
+            Limits::default(),
+        );
+
+        let discovery = ClaudeHarness::new().discover(&host).await;
+        let error = discovery.expect_err("expected failed probe cleanup to reach discovery");
+        assert!(
+            matches!(error, Error::CleanupRequired { .. }),
+            "expected the cleanup-required error rather than an unavailable discovery, received {error:?}"
+        );
+        assert!(
+            error.cleanup_control().is_some(),
+            "expected discovery to retain the host cleanup control"
+        );
+
+        let opening = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await;
+        let error = match opening {
+            Ok(_) => panic!("expected failed probe cleanup to reach opening"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, Error::CleanupRequired { .. }),
+            "expected the cleanup-required error rather than a launch refusal, received {error:?}"
+        );
+        assert!(
+            error.cleanup_control().is_some(),
+            "expected opening to retain the host cleanup control"
+        );
+    }
 
     #[tokio::test]
     async fn reads_the_binary_rather_than_the_pin() {
@@ -131,6 +213,65 @@ mod discovery {
         );
     }
 
+    #[tokio::test]
+    async fn cold_discovery_runs_each_documented_probe_once() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        ClaudeHarness::new()
+            .discover(&host(Arc::clone(&launcher)))
+            .await
+            .expect("expected discovery");
+
+        let probes: Vec<Vec<String>> = launcher
+            .launches()
+            .into_iter()
+            .map(|launch| launch.argv)
+            .collect();
+        assert_eq!(
+            probes,
+            vec![
+                vec![String::from("claude"), String::from("--version")],
+                vec![String::from("claude"), String::from("--help")],
+                vec![
+                    String::from("claude"),
+                    String::from("auth"),
+                    String::from("status"),
+                ],
+            ],
+            "expected one launch for each documented non-secret probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_only_capabilities_the_documented_surface_supports() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let discovery = ClaudeHarness::new()
+            .discover(&host(launcher))
+            .await
+            .expect("expected discovery");
+        let capabilities = discovery.capabilities.capabilities();
+
+        assert!(capabilities.structured_streaming);
+        assert!(capabilities.reasoning_stream);
+        assert!(capabilities.resume);
+        assert!(capabilities.cancellation);
+        assert!(capabilities.usage_reporting);
+        assert!(capabilities.configuration);
+        assert!(capabilities.model_catalog);
+        assert!(
+            !capabilities.mcp_passthrough,
+            "expected this captured help surface not to promise --mcp-config"
+        );
+        assert!(!capabilities.interactive_approvals);
+        assert!(!capabilities.questions);
+        assert!(!capabilities.images);
+        assert!(!capabilities.steering);
+        assert!(!capabilities.session_listing);
+        assert!(!capabilities.native_review);
+        assert!(!capabilities.account_usage);
+        assert!(!capabilities.configuration_catalog);
+        assert!(!capabilities.session_configuration);
+    }
+
     /// A wrapper script's preamble is not the version, and neither is the whole of stdout.
     ///
     /// `--version` reaches the harness as every line joined together, because the token that is a
@@ -156,7 +297,7 @@ mod discovery {
 
     /// The same rule where there is no version to key off: one line, not the whole banner.
     #[tokio::test]
-    async fn refuses_an_unreadable_build_without_quoting_its_whole_stdout_back() {
+    async fn leaves_an_unreadable_version_and_help_probe_unknown_without_quoting_stdout() {
         let launcher = Arc::new(
             FakeClaudeCli::new()
                 .with_version("claude: this build is a repackage\nno version here\n")
@@ -171,12 +312,11 @@ mod discovery {
             discovery.version.as_deref(),
             Some("claude: this build is a repackage")
         );
-        let GateVerdict::VersionTooOld { found, .. } = &discovery.gate else {
-            panic!("expected a refusal, received {:?}", discovery.gate);
-        };
-        assert!(
-            !found.contains('\n'),
-            "expected one line in the refusal, received {found:?}"
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected an unreadable probe not to claim an old version, received {:?}",
+            discovery.gate
         );
     }
 
@@ -201,7 +341,7 @@ mod discovery {
     }
 
     #[tokio::test]
-    async fn refuses_a_build_that_lost_a_flag_every_turn_passes() {
+    async fn marks_a_build_missing_a_required_flag_unknown_rather_than_too_old() {
         let stripped = support::DEFAULT_HELP.replace("--forward-subagent-text", "--forward-txt");
         let launcher = Arc::new(FakeClaudeCli::new().with_help(&stripped));
         let discovery = ClaudeHarness::new()
@@ -209,10 +349,12 @@ mod discovery {
             .await
             .expect("expected a discovery");
 
-        assert!(
-            matches!(discovery.gate, GateVerdict::VersionTooOld { ref minimum, .. } if minimum == "2.1.211"),
-            "received {:?}",
-            discovery.gate
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::MissingRequiredSurface {
+                expected: "a Claude --help surface declaring every required launch flag",
+                received: "one or more required flags were absent",
+            }
         );
         assert!(!discovery.is_usable());
         assert_eq!(
@@ -308,16 +450,70 @@ mod opening_a_session {
     use super::*;
 
     #[tokio::test]
+    async fn a_not_installed_receipt_keeps_the_no_cli_refusal_without_probing() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(
+            HarnessId::claude(),
+            mango_external_agents::Discovery::not_installed(),
+            host.now(),
+        )
+        .with_executable_fingerprint("no-cli")
+        .with_environment_fingerprint("same-environment")
+        .with_authorization_fingerprint("same-authorization")
+        .bind_to_open(
+            harness.descriptor(),
+            &host,
+            &request,
+            DiscoveryReceiptMeasurements::new()
+                .with_executable_fingerprint("no-cli")
+                .with_environment_fingerprint("same-environment")
+                .with_authorization_fingerprint("same-authorization"),
+        )
+        .expect("expected current receipt evidence to match");
+
+        let error = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .map(|_| ())
+            .expect_err("expected a no-CLI refusal");
+        assert!(
+            matches!(error.cause(), Error::Launch { .. }),
+            "expected the no-CLI launch refusal, received {error:?}"
+        );
+        assert!(launcher.launches().is_empty(), "expected no vendor probe");
+    }
+
+    #[tokio::test]
     async fn a_fresh_receipt_reuses_the_version_and_auth_answers_but_rechecks_help() {
         let launcher = Arc::new(FakeClaudeCli::new());
         let harness = ClaudeHarness::new();
         let host = host(Arc::clone(&launcher));
         let discovery = harness.discover(&host).await.expect("expected a discovery");
         let before = launcher.launches().len();
-        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now());
+        let mut request = OpenSession::new("chat-1");
+        if let Some(executable) = &discovery.executable {
+            request = request.with_executable(ExecutablePath::resolved(executable.clone()));
+        }
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
 
         harness
-            .open_session(&host, OpenSession::new("chat-1").with_discovery(receipt))
+            .open_session(&host, request.with_discovery(receipt))
             .await
             .expect("expected the fresh receipt to open a session");
 
@@ -332,6 +528,232 @@ mod opening_a_session {
             reused[0].argv[1..],
             ["--help"],
             "expected the exact argv surface to be refreshed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_usable_help_surface_recovers_a_missing_surface_receipt_gate() {
+        let mut missing_flag_help = String::from(HELP_2_1_270);
+        missing_flag_help = missing_flag_help.replace(
+            "  --include-partial-messages",
+            "  --omitted-partial-messages",
+        );
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(&missing_flag_help));
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        assert!(
+            matches!(discovery.gate, GateVerdict::MissingRequiredSurface { .. }),
+            "expected the incomplete initial help surface to be gated, received {:?}",
+            discovery.gate
+        );
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+
+        launcher.set_help(HELP_2_1_270);
+        let before = launcher.launches().len();
+        harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .expect("expected the refreshed complete help surface to open a session");
+
+        let launches = launcher.launches();
+        assert_eq!(
+            launches[before..]
+                .iter()
+                .map(|launch| launch.argv.as_slice())
+                .collect::<Vec<_>>(),
+            vec![["claude", "--help"]],
+            "expected opening to reuse receipt facts and refresh only help, received {launches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_usable_help_surface_recovers_a_version_fallback_receipt_gate() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version("2.1.200 (Claude Code)")
+                .with_help("not Claude help"),
+        );
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        assert!(
+            matches!(discovery.gate, GateVerdict::VersionTooOld { .. }),
+            "expected unreadable help to fall back to the version gate, received {:?}",
+            discovery.gate
+        );
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+
+        launcher.set_help(HELP_2_1_270);
+        let before = launcher.launches().len();
+        harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .expect("expected usable fresh help to supersede the version fallback");
+
+        let launches = launcher.launches();
+        assert_eq!(
+            launches[before..]
+                .iter()
+                .map(|launch| launch.argv.as_slice())
+                .collect::<Vec<_>>(),
+            vec![["claude", "--help"]],
+            "expected opening to refresh only help, received {launches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_fresh_help_surface_keeps_a_version_fallback_receipt_gate() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version("2.1.200 (Claude Code)")
+                .with_help("not Claude help"),
+        );
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+
+        let error = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .map(|_| ())
+            .expect_err("expected unreadable fresh help to retain the version fallback");
+        assert!(
+            matches!(error.cause(), Error::VersionGate { .. }),
+            "expected the version fallback refusal, received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalidated_bound_receipt_runs_no_additional_probe() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let clock = Arc::new(FrozenClock::default());
+        let host_launcher: Arc<dyn mango_external_agents::ProcessLauncher> = launcher.clone();
+        let host_clock: Arc<dyn mango_external_agents::Clock> = clock.clone();
+        let host = HostContext::builder()
+            .launcher(host_launcher)
+            .cwd(std::env::temp_dir())
+            .scratch(std::env::temp_dir())
+            .environment(mango_external_agents::EnvSource::from_pairs([
+                ("PATH", "/usr/bin"),
+                ("CLAUDE_CONFIG_DIR", "/home/ada/.claude"),
+            ]))
+            .client_info("mea-tests", "0.0.0")
+            .clock(host_clock)
+            .build()
+            .expect("expected a host");
+        let harness = ClaudeHarness::new();
+        let discovery = harness.discover(&host).await.expect("expected discovery");
+        let before = launcher.launches().len();
+        let request = OpenSession::new("chat-1");
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("fake-claude")
+            .with_environment_fingerprint("fake-environment")
+            .with_authorization_fingerprint("fake-authorization")
+            .valid_for(Duration::ZERO)
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("fake-claude")
+                    .with_environment_fingerprint("fake-environment")
+                    .with_authorization_fingerprint("fake-authorization"),
+            )
+            .expect("expected current receipt measurements to bind");
+
+        clock.advance(Duration::from_secs(1));
+        let error = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await
+            .map(drop)
+            .expect_err("expected the stale receipt to be refused");
+
+        assert!(
+            matches!(error.cause(), Error::HostConfiguration { .. }),
+            "expected a typed stale-receipt refusal, received {error:?}"
+        );
+        assert_eq!(
+            launcher.launches().len(),
+            before,
+            "expected receipt invalidation before any fresh vendor probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_receipt_fingerprint_runs_no_additional_probe() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+        let discovery = harness.discover(&host).await.expect("expected discovery");
+        let before = launcher.launches().len();
+        let request = OpenSession::new("chat-1");
+        let error = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("probed-fake-claude")
+            .with_environment_fingerprint("fake-environment")
+            .with_authorization_fingerprint("fake-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("changed-fake-claude")
+                    .with_environment_fingerprint("fake-environment")
+                    .with_authorization_fingerprint("fake-authorization"),
+            )
+            .expect_err("expected a changed executable fingerprint to refuse receipt reuse");
+
+        assert!(
+            matches!(error, Error::HostConfiguration { .. }),
+            "expected a typed changed-fingerprint refusal, received {error:?}"
+        );
+        assert_eq!(
+            launcher.launches().len(),
+            before,
+            "expected receipt invalidation before any additional vendor probe"
         );
     }
 
@@ -356,23 +778,252 @@ mod opening_a_session {
     }
 
     #[tokio::test]
-    async fn adopts_a_resume_reference_at_face_value() {
+    async fn refuses_fallback_resume_without_a_conclusive_vendor_signal() {
         let launcher = Arc::new(FakeClaudeCli::new());
         let host = host(Arc::clone(&launcher));
-        for mode in [ResumeMode::Strict, ResumeMode::Fallback] {
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1")
+                    .resuming("22222222-3333-4444-5555-666666666666", ResumeMode::Fallback),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected fallback resume to be refused");
+
+        assert!(
+            matches!(error.cause(), Error::HostConfiguration { .. }),
+            "expected a typed refusal, received {error:?}"
+        );
+        assert!(
+            launcher.turn_argvs().is_empty(),
+            "expected no turn launch, received {:?}",
+            launcher.turn_argvs()
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected fallback to be refused before a probe, received {:?}",
+            launcher.launches()
+        );
+    }
+
+    #[tokio::test]
+    async fn opens_a_strict_resume_as_unverified_until_the_vendor_starts_a_turn() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1")
+                    .resuming("22222222-3333-4444-5555-666666666666", ResumeMode::Strict),
+            )
+            .await
+            .expect("expected strict resume to defer vendor confirmation");
+
+        assert!(
+            !session.snapshot().resumed,
+            "expected opening to remain unverified until Claude emits system/init"
+        );
+        assert_eq!(
+            session.ids().native_session_id,
+            "22222222-3333-4444-5555-666666666666"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirms_a_strict_resume_only_when_system_init_echoes_its_handle() {
+        let native_session_id = "22222222-3333-4444-5555-666666666666";
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&format!(
+            r#"{{"type":"system","subtype":"init","session_id":"{native_session_id}"}}
+{{"type":"result","is_error":false}}"#
+        ))));
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").resuming(native_session_id, ResumeMode::Strict),
+            )
+            .await
+            .expect("expected a strict resume session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        assert_eq!(drain(&mut turn).await.last(), Some(&EventKind::Completed));
+        assert!(session.snapshot().resumed);
+        assert_eq!(session.ids().native_session_id, native_session_id);
+        assert_eq!(
+            value_after(&launcher.turn_argvs()[0], "--resume"),
+            Some(native_session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_a_strict_resume_when_system_init_names_a_different_conversation() {
+        let requested = "22222222-3333-4444-5555-666666666666";
+        let different = "33333333-4444-5555-6666-777777777777";
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&format!(
+            r#"{{"type":"system","subtype":"init","session_id":"{different}"}}
+{{"type":"result","is_error":false}}"#
+        ))));
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").resuming(requested, ResumeMode::Strict),
+            )
+            .await
+            .expect("expected a strict resume session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        let events = drain(&mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { .. })),
+            "expected a failed strict resume, received {events:?}"
+        );
+        assert!(!session.snapshot().resumed);
+        assert_eq!(session.ids().native_session_id, requested);
+    }
+
+    #[tokio::test]
+    async fn strict_resume_does_not_emit_content_before_identity_confirmation() {
+        let requested = "22222222-3333-4444-5555-666666666666";
+        let different = "33333333-4444-5555-6666-777777777777";
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&format!(
+            r#"{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"text"}}}}}}
+{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"foreign content"}}}}}}
+{{"type":"system","subtype":"init","session_id":"{different}"}}
+{{"type":"result","is_error":false}}"#
+        ))));
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").resuming(requested, ResumeMode::Strict),
+            )
+            .await
+            .expect("expected a strict resume session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        let events = drain(&mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { .. })),
+            "expected a terminal protocol failure, received {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                EventKind::TurnStarted { .. } | EventKind::Error { .. }
+            )),
+            "expected no unconfirmed vendor content, received {events:?}"
+        );
+        assert!(!session.snapshot().resumed);
+    }
+
+    #[tokio::test]
+    async fn fails_a_strict_resume_that_ends_without_identity_confirmation() {
+        let requested = "22222222-3333-4444-5555-666666666666";
+        let launcher = Arc::new(
+            FakeClaudeCli::new().with_turn(Run::replaying(r#"{"type":"result","is_error":false}"#)),
+        );
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").resuming(requested, ResumeMode::Strict),
+            )
+            .await
+            .expect("expected a strict resume session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        assert!(
+            matches!(drain(&mut turn).await.last(), Some(EventKind::Error { .. })),
+            "expected a terminal confirmation failure"
+        );
+        assert!(!session.snapshot().resumed);
+        assert_eq!(session.ids().native_session_id, requested);
+    }
+
+    #[tokio::test]
+    async fn strict_resume_verification_failure_is_nonresumable_after_a_graceful_cleanup() {
+        let requested = "22222222-3333-4444-5555-666666666666";
+        let different = "33333333-4444-5555-6666-777777777777";
+        let failures = [
+            (
+                "a different init handle",
+                Run::replaying(&format!(
+                    r#"{{"type":"system","subtype":"init","session_id":"{different}"}}"#
+                )),
+            ),
+            (
+                "content before init",
+                Run::replaying(
+                    r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}"#,
+                ),
+            ),
+            (
+                "a result without init",
+                Run::replaying(r#"{"type":"result","is_error":false}"#),
+            ),
+            ("an ended stream without init", Run::exiting(0)),
+        ];
+
+        for (label, run) in failures {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_graceful_interrupt()
+                    .with_turn(run),
+            );
+            let host = host(Arc::clone(&launcher));
             let session = ClaudeHarness::new()
                 .open_session(
                     &host,
-                    OpenSession::new("chat-1")
-                        .resuming("22222222-3333-4444-5555-666666666666", mode),
+                    OpenSession::new("chat-1").resuming(requested, ResumeMode::Strict),
                 )
                 .await
-                .expect("expected a session");
-            assert!(session.snapshot().resumed);
-            assert_eq!(session.snapshot().fallback_reason, None);
+                .expect("expected a strict resume session");
+
+            let mut turn = session
+                .start_turn(TurnRequest::new("turn-1", "continue"))
+                .await
+                .expect("expected the deferred resume to start");
+            assert!(
+                matches!(drain(&mut turn).await.last(), Some(EventKind::Error { .. })),
+                "expected {label} to fail strict resume verification"
+            );
             assert_eq!(
-                session.ids().native_session_id,
-                "22222222-3333-4444-5555-666666666666"
+                launcher.graceful_interrupts(),
+                1,
+                "expected {label} to reach the graceful cleanup path"
+            );
+
+            let error = session
+                .start_turn(TurnRequest::new("turn-2", "must not continue"))
+                .await
+                .expect_err("expected strict resume verification failure to taint continuation");
+            assert!(
+                matches!(
+                    error.cause(),
+                    Error::Cancelled {
+                        reason: CancelReason::Shutdown
+                    }
+                ),
+                "expected {label} to refuse continuation, received {error:?}"
+            );
+            assert_eq!(
+                launcher.turn_argvs().len(),
+                1,
+                "expected {label} to refuse before spawning another Claude turn"
             );
         }
     }
@@ -436,12 +1087,11 @@ mod opening_a_session {
     }
 
     #[tokio::test]
-    async fn refuses_a_build_too_old_to_drive_before_a_turn_is_spawned() {
-        let stripped = support::DEFAULT_HELP.replace("--forward-subagent-text", "--forward-txt");
+    async fn refuses_an_old_build_when_its_help_surface_is_unreadable_before_a_turn_is_spawned() {
         let launcher = Arc::new(
             FakeClaudeCli::new()
                 .with_version("2.1.150 (Claude Code)")
-                .with_help(&stripped),
+                .with_help("not Claude help"),
         );
         let error = ClaudeHarness::new()
             .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
@@ -453,6 +1103,58 @@ mod opening_a_session {
             matches!(error.cause(), Error::VersionGate { minimum, .. } if minimum == "2.1.211"),
             "received {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn distinguishes_a_missing_required_flag_from_an_old_version_before_a_turn_is_spawned() {
+        let stripped = support::DEFAULT_HELP.replace("--forward-subagent-text", "--forward-txt");
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(&stripped));
+        let error = ClaudeHarness::new()
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
+            .await
+            .map(drop)
+            .expect_err("expected the missing documented flag to be refused");
+
+        assert!(
+            matches!(
+                error.cause(),
+                Error::Protocol { expected, received }
+                    if expected == "a Claude --help surface declaring every required launch flag"
+                        && received == "one or more required flags were absent"
+            ),
+            "expected a distinct safe missing-flag refusal, received {error:?}"
+        );
+        assert!(launcher.turn_argvs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn distinguishes_an_unreadable_help_probe_from_a_missing_flag_before_a_turn_is_spawned() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help("Authorization: Bearer probe-output-must-not-reach-diagnostics"),
+        );
+        let error = ClaudeHarness::new()
+            .open_session(&host(Arc::clone(&launcher)), OpenSession::new("chat-1"))
+            .await
+            .map(drop)
+            .expect_err("expected an unreadable help probe to be refused");
+
+        assert!(
+            matches!(
+                error.cause(),
+                Error::Protocol { expected, received }
+                    if expected == "a readable Claude --help launch surface"
+                        && received == "unreadable vendor output"
+            ),
+            "expected a distinct safe unreadable-probe refusal, received {error:?}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("probe-output-must-not-reach-diagnostics"),
+            "expected raw help output to stay out of diagnostics, received {error:?}"
+        );
+        assert!(launcher.turn_argvs().is_empty());
     }
 
     #[tokio::test]
@@ -586,6 +1288,7 @@ mod a_turn {
         for configuration in cases {
             let launcher = Arc::new(FakeClaudeCli::new());
             let session = open(&launcher).await;
+            let before = session.snapshot().configuration.clone();
             let error = session
                 .start_turn(
                     TurnRequest::new("turn-1", "use the explicit settings")
@@ -602,6 +1305,11 @@ mod a_turn {
                 launcher.turn_argvs().is_empty(),
                 "expected no turn launch, received {:?}",
                 launcher.turn_argvs()
+            );
+            assert_eq!(
+                session.snapshot().configuration,
+                before,
+                "expected a refused explicit configuration not to replace accepted defaults"
             );
         }
     }

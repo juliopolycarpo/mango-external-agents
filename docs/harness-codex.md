@@ -8,12 +8,12 @@ vendor's current documentation before relying on them.
 
 ## The executable and the version gate
 
-|                   |                                                                              |
-| ----------------- | ---------------------------------------------------------------------------- |
-| Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name    |
-| Arguments         | `app-server`, and nothing else                                               |
-| Version read from | `codex --version` for a probe; the handshake's own `userAgent` for a session |
-| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`              |
+|                   |                                                                                                     |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
+| Executable        | `codex`, resolved by the host (`OpenSession::with_executable`) or by name                           |
+| Arguments         | `app-server`, and nothing else                                                                      |
+| Version read from | `codex --version` for discovery; the handshake's own `userAgent` for a session or picker connection |
+| Minimum version   | `0.154.0` (`MINIMUM_CODEX_VERSION`), which is also `vendor/PIN`                                     |
 
 The floor is the pinned build rather than something older. The app-server's item families and its
 `thread/`–`turn/` method names changed shape inside the 0.15x series, so a lower floor would be a
@@ -23,6 +23,8 @@ app-server is spawned for it.
 
 A `--version` line nobody can parse is `GateVerdict::Unknown`, not a refusal: a CLI that changed
 the shape of its version output has not stopped working, and the host may still choose to try.
+The session and short-lived picker connection also apply that same floor to a parseable handshake
+`userAgent` before they send a thread request, then clean up the child on a refusal.
 
 ## The documented surface this harness drives
 
@@ -39,17 +41,28 @@ on the wire)".
 | `account/rateLimits/read`       | `Session::refresh_account_usage`       |
 | `model/list`                    | `Discovery::models`                    |
 | `thread/start`, `thread/resume` | `Harness::open_session`                |
-| `thread/list`                   | `Session::list_sessions`               |
+| `thread/read`                   | Metadata-only resume workspace check   |
+| `thread/list`                   | Session and harness-level listing      |
 | `turn/start`                    | `Session::start_turn`                  |
 | `turn/steer`                    | `Session::steer`                       |
 | `turn/interrupt`                | `Session::cancel`                      |
 | `review/start`                  | `Session::start_review`                |
 
-Listing and account usage are session-scoped in this adapter: they use the open session's
-app-server connection. Its advertised `session_listing` and `account_usage` capabilities refer to
-the `Session` methods above. The separate `Harness::list_sessions` and `Harness::account_usage`
-services remain `Error::NotSupported`; this adapter does not launch a short-lived app-server for
-a picker before opening a conversation.
+`Harness::list_sessions` opens a short-lived app-server connection, initializes it, asks for a
+page and closes it without starting a thread. Canceling the picker request also kills that
+connection's child through the injected process control. A live `Session::list_sessions` reuses its own
+connection. Both paths require an absolute, lexically normalized UTF-8 host working directory as
+the `cwd` filter and refuse a query for another directory. Codex refuses that host configuration
+before it launches `codex --version` or an app-server, without canonicalizing the path or reading
+the filesystem. The vendor's cursor, native id, title, preview and Unix
+second timestamps pass through when supplied. Rows with missing or foreign workspace paths are
+discarded even if the server returns them under the `cwd` filter. Before `thread/resume`, the
+harness calls `thread/read` with `includeTurns: false` and requires its native id and original
+working directory to match the request and the host's authorised directory. It checks the resume
+response again before exposing the handle. A `thread/read` absence alone never authorises a fresh
+fallback: the pinned `thread/resume` missing-rollout result must still confirm that outcome.
+Account usage remains session-scoped; the separate
+`Harness::account_usage` service returns `Error::NotSupported`.
 
 `clientInfo.name` is always the host's own name, from `HostContext::client_info`. The README says
 this identifies the client to OpenAI's compliance logging platform, so writing anything else would
@@ -76,7 +89,12 @@ or a delayed request id cannot affect a replacement turn.
 One long-lived `codex app-server` per session. `thread/start` opens a conversation;
 `thread/resume` continues one, with `excludeTurns: true` — the vendor keeps the transcript it
 wrote, and this library never replays one into anybody's context. `ResumeMode::Fallback` starts a
-new thread and records why in `SessionSnapshot::fallback_reason`.
+new thread only when the pinned app-server returns `-32600` with the exact
+`no rollout found for thread id <requested id>` result. It records that reason in
+`SessionSnapshot::fallback_reason` and exposes the new native id. The same error code can also
+mean configuration failure, so other refusals, timeouts and broken connections remain errors.
+This distinction follows the pinned [thread resume error mapping][resume-error] and is covered by
+fake app-server tests for both outcomes.
 
 `turn/start` on a live turn is taken by the app-server as a **steer** — its own documentation says
 `turnTrigger` is "ignored when this request steers an already-active turn". A host that meant a new
@@ -114,7 +132,8 @@ events. A dropped library `TurnStream` is owner abandonment: the harness refuses
 sends `turn/interrupt`, waits through the host's graceful-turn bound, and closes and reaps the
 app-server if the turn will not settle. A browser disconnect that should leave work running must
 therefore retain the stream in a host supervisor. Dropping the owning session follows the same
-bounded cleanup path. Closing twice is harmless.
+bounded cleanup path. Closing twice waits for the first reaper; if it cannot reap the child, each
+caller receives the same `Error::CleanupRequired` control for host reconciliation.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.
@@ -173,6 +192,16 @@ left at `keep` retains the last host selection, or the user's Codex defaults if 
 selection.
 Native reviews inherit the same current settings. Hosts use the shared `Session` trait and need
 no Codex-specific permission state machine.
+
+An explicit opening effort uses `config.model_reasoning_effort` on `thread/start` or
+`thread/resume`, alongside any host MCP entries. The [pinned protocol][thread-protocol] declares
+the request-scoped `config` field and the [official config reference][config-reference] names this
+key. Opening and per-turn model/effort IDs must be nonempty, bounded and free of control
+characters. Opaque model IDs remain valid without membership in a static catalog. The harness
+reports an effort as accepted only after the app-server accepts the thread; any effort the
+response reports stays separately observed.
+An isolated 0.154.0 app-server probe returned `reasoningEffort: high` for a
+`config.model_reasoning_effort: high` thread start and wrote no `config.toml`.
 
 ## Approvals
 
@@ -255,17 +284,20 @@ refused as `Error::UnsupportedTransport` before anything is spawned.
 
 ## MCP
 
-`Capabilities::mcp_passthrough` is `false`. The harness does not implement host-supplied MCP
-configuration. A nonempty `OpenSession::mcp_servers` is refused as
-`Error::NotSupported { capability: Capability::McpPassthrough }` before any process is launched,
-including on resume. Configure servers in the user's own
-`~/.codex/config.toml` or with `codex mcp`. Calls to those servers still render as
-`ActivityKind::Mcp`.
+`Capabilities::mcp_passthrough` is `true`. Host entries travel in the `config.mcp_servers` map
+on `thread/start` or `thread/resume`, the app-server's documented per-thread override. Stdio
+entries preserve command, arguments and server-only environment. Streamable HTTP entries preserve
+URL and literal headers. The harness validates header names and values with the `http` crate before
+launching Codex. Invalid, duplicate or unsupported entries fail before launching Codex;
+the harness never edits the user's `config.toml` or adds server credentials to the Codex child's
+environment. Servers the user configured with `codex mcp` remain available to the vendor.
 
-The pinned schema includes a `config` map on both `thread/start` and `thread/resume`. Mapping
-the core's MCP configuration through that override is a follow-up. It needs validation of server
-names and transports, schema coverage, and a real captured start/resume before the capability can
-be advertised. See the [app-server documentation][readme] for configuration overrides.
+The `config` field is declared on both requests by the [pinned protocol][thread-protocol], and
+the field names follow the [official config reference][config-reference]. A 0.154.0 app-server
+probe with an isolated `CODEX_HOME` accepted a stdio `config.mcp_servers` override at
+`thread/start` and wrote no persistent `config.toml`. Fake app-server tests cover both start and
+resume mapping, header and environment separation, and pre-spawn refusals. MCP tool calls still
+render as `ActivityKind::Mcp`.
 
 ## Environment
 
@@ -336,7 +368,6 @@ this tool letting an agent out of its sandbox, checked into the repository.
 ## Known gaps
 
 - No websocket or unix-socket transport (see above).
-- No MCP passthrough (see above).
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
@@ -346,4 +377,7 @@ this tool letting an agent out of its sandbox, checked into the repository.
 Compliance posture: see [compliance.md](compliance.md).
 
 [readme]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md
+[resume-error]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/src/request_processors/thread_processor.rs
+[thread-protocol]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+[config-reference]: https://developers.openai.com/codex/config-reference
 [app-server]: https://learn.chatgpt.com/docs/app-server

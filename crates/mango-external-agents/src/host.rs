@@ -278,6 +278,64 @@ impl HostContext {
         &self.cwd
     }
 
+    /// Returns the workspace text only when its path is absolute and lexically normalized.
+    ///
+    /// Use this for vendor protocols that return absolute workspace identities. Validation never
+    /// resolves a relative path, follows symlinks or reads the filesystem. The host supplies the
+    /// exact path the vendor should retain. One trailing directory separator is removed from
+    /// non-root paths, including the temporary-directory paths supplied by macOS and Windows.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HostConfiguration`] for relative, non-UTF-8 or non-normalized paths.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn example(host: &mango_external_agents::HostContext) -> mango_external_agents::Result<()> {
+    /// let workspace = host.absolute_cwd()?;
+    /// assert!(std::path::Path::new(workspace).is_absolute());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn absolute_cwd(&self) -> Result<&str> {
+        const EXPECTED: &str = "an absolute, lexically normalized UTF-8 workspace path";
+        let text = self.cwd.to_str().ok_or_else(|| Error::HostConfiguration {
+            expected: EXPECTED,
+            received: String::from("a non-UTF-8 workspace path"),
+        })?;
+        if !self.cwd.is_absolute() {
+            return Err(Error::HostConfiguration {
+                expected: EXPECTED,
+                received: String::from("a relative workspace path"),
+            });
+        }
+        let mut components = self.cwd.components();
+        let normalized = components.clone().collect::<PathBuf>();
+        let text = if self.cwd.file_name().is_some() {
+            text.strip_suffix(std::path::MAIN_SEPARATOR)
+                .filter(|trimmed| std::ffi::OsStr::new(trimmed) == normalized.as_os_str())
+                .unwrap_or(text)
+        } else {
+            text
+        };
+        if components.any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }) || normalized.as_os_str() != std::ffi::OsStr::new(text)
+        {
+            return Err(Error::HostConfiguration {
+                expected: EXPECTED,
+                received: String::from(
+                    "a workspace path with dot components or redundant separators",
+                ),
+            });
+        }
+        Ok(text)
+    }
+
     /// The host-owned directory available for scoped artifacts a child must read.
     ///
     /// The host creates and authorises this directory, including any sandbox or container mapping
@@ -572,6 +630,92 @@ mod tests {
                 }
             ),
             "expected an approval-timeout configuration refusal, received {error:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_cwd_preserves_an_authorised_path_without_filesystem_access() {
+        let mut host = context();
+        host.cwd = std::env::temp_dir().join("mea-workspace-does-not-need-to-exist");
+        assert_eq!(
+            host.absolute_cwd().expect("expected an absolute workspace"),
+            host.cwd.to_str().expect("expected UTF-8 test path")
+        );
+    }
+
+    #[test]
+    fn absolute_cwd_normalizes_a_directory_separator_and_preserves_roots() {
+        let absolute = std::env::temp_dir().join("workspace");
+        let mut host = context();
+        host.cwd = std::path::PathBuf::from(format!(
+            "{}{}",
+            absolute.display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(
+            host.absolute_cwd()
+                .expect("expected a directory with a trailing separator"),
+            absolute.to_str().expect("expected a UTF-8 workspace")
+        );
+        host.cwd = absolute
+            .ancestors()
+            .last()
+            .expect("expected an absolute root")
+            .to_path_buf();
+        assert_eq!(
+            host.absolute_cwd().expect("expected an absolute root"),
+            host.cwd.to_str().expect("expected a UTF-8 root")
+        );
+    }
+
+    #[test]
+    fn absolute_cwd_refuses_relative_and_ambiguous_paths_without_naming_them() {
+        let absolute = std::env::temp_dir().join("workspace-secret-canary");
+        let paths = [
+            std::path::PathBuf::from("workspace-secret-canary"),
+            absolute.join(".."),
+            std::path::PathBuf::from(format!(
+                "{}{}.",
+                absolute.display(),
+                std::path::MAIN_SEPARATOR
+            )),
+            std::path::PathBuf::from(format!(
+                "{}{}{}child",
+                absolute.display(),
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            )),
+            std::path::PathBuf::from(format!(
+                "{}{}{}",
+                absolute.display(),
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            )),
+        ];
+        for path in paths {
+            let mut host = context();
+            host.cwd = path;
+            let error = host
+                .absolute_cwd()
+                .expect_err("expected noncanonical workspace refusal");
+            assert!(
+                matches!(error, Error::HostConfiguration { .. }),
+                "received {error:?}"
+            );
+            assert!(!format!("{error:?}").contains("workspace-secret-canary"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_cwd_refuses_non_utf8_identity_without_lossy_conversion() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut host = context();
+        host.cwd =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/workspace-\xff".to_vec()));
+        assert!(
+            matches!(host.absolute_cwd(), Err(Error::HostConfiguration { .. })),
+            "expected an exact UTF-8 workspace refusal"
         );
     }
 

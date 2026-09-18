@@ -145,6 +145,7 @@ mod tests {
                 method::INITIALIZE,
                 method::THREAD_START,
                 method::THREAD_RESUME,
+                method::THREAD_READ,
                 method::THREAD_LIST,
                 method::TURN_START,
                 method::TURN_STEER,
@@ -207,6 +208,7 @@ mod tests {
                 "approvalPolicy",
                 "sandbox",
                 "approvalsReviewer",
+                "config",
             ],
         );
         assert_declares(
@@ -218,9 +220,12 @@ mod tests {
                 "approvalPolicy",
                 "sandbox",
                 "excludeTurns",
+                "config",
             ],
         );
         assert_declares("Thread", &["id", "preview", "name", "cwd", "updatedAt"]);
+        assert_declares("ThreadReadParams", &["threadId", "includeTurns"]);
+        assert_declares("ThreadReadResponse", &["thread"]);
         assert_declares("ThreadListParams", &["cursor", "limit", "cwd"]);
         assert_declares("ThreadListResponse", &["data", "nextCursor"]);
     }

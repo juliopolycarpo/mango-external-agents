@@ -451,6 +451,17 @@
         "nextCursor"
       ]
     },
+    "ThreadReadParams": {
+      "properties": [
+        "includeTurns",
+        "threadId"
+      ]
+    },
+    "ThreadReadResponse": {
+      "properties": [
+        "thread"
+      ]
+    },
     "ThreadResumeParams": {
       "properties": [
         "approvalPolicy",
@@ -662,6 +673,7 @@
       "model/list",
       "review/start",
       "thread/list",
+      "thread/read",
       "thread/resume",
       "thread/start",
       "turn/interrupt",

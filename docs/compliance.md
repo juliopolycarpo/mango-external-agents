@@ -9,7 +9,10 @@ Facts were read on 2026-09-12; re-verify against the vendor's current page befor
 ## Invariants for every harness
 
 - **No login handling.** The library never authenticates a vendor, never opens a browser, never
-  stores, reads, copies or forwards a token, and offers no "log in through mango-external-agents".
+  stores, reads, copies or forwards a vendor login token, and offers no "log in through mango-external-agents".
+  A host may explicitly supply MCP server headers or environment values through the documented
+  session configuration surface; those values are not vendor login credentials and never enter
+  the vendor child's ambient environment or diagnostics.
   It reuses whatever the user already logged into with the vendor's own CLI. Discovery may report
   that state (`LoggedIn { mode }`, `LoggedOut`, `Unknown`) only from a non-secret vendor surface;
   when the only way to know would be reading a credential file, the answer is `Unknown` and the
@@ -110,6 +113,8 @@ whose terms apply. No logos, no wordmarks, nothing implying an official or endor
 own VS Code extension on. JSON-RPC over newline-delimited JSON. `clientInfo.name` is always the
 host's name, passed through `HostContext`. Read on 2026-09-13 against `codex-cli 0.154.0`;
 `docs/harness-codex.md` lists every method driven and the document each follows.
+Host-configured MCP servers use the app-server's per-thread `config` override on
+`thread/start` and `thread/resume`; no persistent Codex configuration is edited.
 
 **Posture:** OpenAI has publicly welcomed third-party harnesses on subscriptions (press coverage,
 2026-02); this is cited as reported, not as a licence term. What the vendor *does* document is the
@@ -158,8 +163,8 @@ what was and was not found.
 
 **What this harness does not do:**
 
-- **No login.** `authenticate` is never sent, no browser is opened, and no credential is read, stored
-  or forwarded. `AuthState` is always `Unknown` for every ACP agent, because ACP's `initialize` reports
+- **No login.** `authenticate` is never sent, no browser is opened, and no vendor login credential is
+  read, stored or forwarded. `AuthState` is always `Unknown` for every ACP agent, because ACP's `initialize` reports
   which auth *methods* exist and has no field for whether anyone is signed in. A signed-out agent
   surfaces as `session/new` answering `-32000`, which becomes `Error::AuthRequired` carrying the
   agent's own login command as text for a person to run.
@@ -170,8 +175,11 @@ what was and was not found.
 - **No host filesystem or terminal for the agent.** `clientCapabilities.fs` and `.terminal` are
   declined, so a vendor-initiated file or terminal request is answered with a JSON-RPC error and never
   executed. Every agent here uses its own tools instead.
-- **No MCP servers.** `session/new.mcpServers` is sent empty; nothing is attached that a host did not
-  configure. Nonempty `OpenSession::mcp_servers` is refused before launching the agent.
+- **Host-configured MCP servers only.** `session/new.mcpServers` and `session/load.mcpServers` carry
+  only the servers the host explicitly supplied. Stdio command, arguments and server-only
+  environment follow ACP v1 session setup; HTTP endpoints and headers are used only when the agent
+  advertises `mcpCapabilities.http`. Malformed entries are refused before launch, and the library
+  does not edit persistent agent configuration. See [ACP session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
 
 **Per profile.** Every agent below documents its own ACP mode, and for none of them was a statement
 about third-party harnesses found either way — "not found" is the finding, not "permitted".

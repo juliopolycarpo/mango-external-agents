@@ -36,6 +36,36 @@ const CEILING: Capabilities = Capabilities {
     ..probed_capabilities()
 };
 
+/// The documented help shape that proves every argv this harness builds is accepted.
+const REQUIRED_LAUNCH_SURFACE: &str =
+    "a Claude --help surface declaring every required launch flag";
+
+/// A safe summary of parsed help that omitted one or more required flags.
+const MISSING_REQUIRED_LAUNCH_FLAG: &str = "one or more required flags were absent";
+
+/// Why the launch surface could not establish a driveable Claude build.
+#[derive(Clone, Copy)]
+enum SurveyRefusal {
+    VersionTooOld,
+    MissingRequiredSurface,
+    UnreadableHelp,
+}
+
+/// Classifies a help probe without treating a changed or unreadable surface as a version claim.
+fn classify_surface(
+    surface: Option<&CliSurface>,
+    version: Option<&semver::Version>,
+) -> Option<SurveyRefusal> {
+    let Some(surface) = surface else {
+        return if version.is_some_and(|version| !version::is_supported(Some(version))) {
+            Some(SurveyRefusal::VersionTooOld)
+        } else {
+            Some(SurveyRefusal::UnreadableHelp)
+        };
+    };
+    (!surface.missing_required_flags().is_empty()).then_some(SurveyRefusal::MissingRequiredSurface)
+}
+
 /// Claude Code, driven through its documented headless surface.
 ///
 /// Stateless and shareable: it holds no session, caches no discovery and spawns nothing of its own.
@@ -93,38 +123,38 @@ impl ClaudeHarness {
     }
 
     /// Everything the three probes established, in one pass.
-    async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Survey {
-        let Some(banner) = probe::output(host, executable, &["--version"]).await else {
-            return Survey::default();
+    async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Result<Survey> {
+        let Some(banner) = probe::output(host, executable, &["--version"]).await? else {
+            return Ok(Survey::default());
         };
         let version = version::parse(&banner);
         let surface = probe::output(host, executable, &["--help"])
-            .await
+            .await?
             .map(|help| CliSurface::parse(&help))
             .filter(CliSurface::is_usable);
 
         // A build that cannot be driven is not asked who is signed in: the answer would be true and
         // useless, and it costs a third process launch to learn.
-        if let Some(refusal) = CliSurface::refusal(surface.as_ref(), version.as_ref()) {
-            return Survey {
+        if let Some(refusal) = classify_surface(surface.as_ref(), version.as_ref()) {
+            return Ok(Survey {
                 banner: Some(banner),
                 version,
                 refusal: Some(refusal),
                 ..Survey::default()
-            };
+            });
         }
 
         // Neither read depends on the other's result: one is a process boot, the other a file read.
         let (authentication, auto_mode_disabled_by_policy) = tokio::join!(
             async {
-                probe::output(host, executable, &["auth", "status"])
-                    .await
-                    .map_or_else(Authentication::unknown, |stdout| {
-                        auth::parse_status(&stdout)
-                    })
+                let stdout = probe::output(host, executable, &["auth", "status"]).await?;
+                Ok::<Authentication, Error>(stdout.map_or_else(Authentication::unknown, |stdout| {
+                    auth::parse_status(&stdout)
+                }))
             },
             read_auto_mode_policy(host)
         );
+        let authentication = authentication?;
         let availability = ModeAvailability {
             account_kind: authentication.kind,
             auto_mode_disabled_by_policy,
@@ -134,14 +164,14 @@ impl ClaudeHarness {
                 .cloned(),
         };
 
-        Survey {
+        Ok(Survey {
             banner: Some(banner),
             version,
             refusal: None,
             authentication,
             availability,
             surface,
-        }
+        })
     }
 
     /// Reuses a host-vouched probe where its public record is sufficient, while re-reading the
@@ -151,13 +181,16 @@ impl ClaudeHarness {
         host: &HostContext,
         executable: &ExecutablePath,
         receipt: Option<&mango_external_agents::DiscoveryReceipt>,
-    ) -> Survey {
+    ) -> Result<Survey> {
         let Some(receipt) = receipt else {
             return self.survey(host, executable).await;
         };
+        if matches!(receipt.discovery.gate, GateVerdict::NotInstalled) {
+            return Ok(Survey::default());
+        }
 
         let surface = probe::output(host, executable, &["--help"])
-            .await
+            .await?
             .map(|help| CliSurface::parse(&help))
             .filter(CliSurface::is_usable);
         let version = receipt
@@ -166,11 +199,15 @@ impl ClaudeHarness {
             .as_deref()
             .and_then(version::parse);
         let refusal = match receipt.discovery.gate {
-            GateVerdict::NotInstalled | GateVerdict::VersionTooOld { .. } => Some(String::new()),
-            GateVerdict::Usable | GateVerdict::Unknown => {
-                CliSurface::refusal(surface.as_ref(), version.as_ref())
-            }
-            _ => Some(String::new()),
+            // Help describes the argv grammar, not a durable capability fact. Reclassify every
+            // installed receipt against the fresh surface: a prior missing-flag or version
+            // fallback can reflect incomplete probe output, while `classify_surface` retains the
+            // stored version floor when fresh help remains unreadable.
+            GateVerdict::VersionTooOld { .. }
+            | GateVerdict::MissingRequiredSurface { .. }
+            | GateVerdict::Usable
+            | GateVerdict::Unknown => classify_surface(surface.as_ref(), version.as_ref()),
+            _ => Some(SurveyRefusal::UnreadableHelp),
         };
         let account_kind = match receipt.discovery.auth {
             AuthState::LoggedIn {
@@ -194,7 +231,7 @@ impl ClaudeHarness {
                 .cloned(),
         };
 
-        Survey {
+        Ok(Survey {
             banner: receipt
                 .discovery
                 .version
@@ -208,7 +245,7 @@ impl ClaudeHarness {
             },
             availability,
             surface,
-        }
+        })
     }
 }
 
@@ -218,7 +255,7 @@ struct Survey {
     banner: Option<String>,
     version: Option<semver::Version>,
     /// Why this build cannot be driven, when it cannot.
-    refusal: Option<String>,
+    refusal: Option<SurveyRefusal>,
     authentication: Authentication,
     availability: ModeAvailability,
     surface: Option<CliSurface>,
@@ -298,20 +335,28 @@ impl Harness for ClaudeHarness {
     }
 
     async fn probe(&self, host: &HostContext) -> Result<Discovery> {
-        let survey = self.survey(host, &self.executable).await;
+        let survey = self.survey(host, &self.executable).await?;
         if !survey.installed() {
             return Ok(Discovery::not_installed());
         }
 
         let executable = self.executable.get().cloned();
-        if survey.refusal.is_some() {
-            return Ok(Discovery {
-                executable,
-                version: survey.reported(),
-                gate: GateVerdict::VersionTooOld {
+        if let Some(refusal) = survey.refusal {
+            let gate = match refusal {
+                SurveyRefusal::VersionTooOld => GateVerdict::VersionTooOld {
                     found: survey.found(),
                     minimum: String::from(MINIMUM_VERSION),
                 },
+                SurveyRefusal::MissingRequiredSurface => GateVerdict::MissingRequiredSurface {
+                    expected: REQUIRED_LAUNCH_SURFACE,
+                    received: MISSING_REQUIRED_LAUNCH_FLAG,
+                },
+                SurveyRefusal::UnreadableHelp => GateVerdict::Unknown,
+            };
+            return Ok(Discovery {
+                executable,
+                version: survey.reported(),
+                gate,
                 auth: AuthState::Unknown,
                 capabilities: Capabilities::none().into(),
                 permission_matrix: permissions::matrix(&survey.availability),
@@ -352,6 +397,8 @@ impl Harness for ClaudeHarness {
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        Self::refuse_unsupported_fallback(&request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
         // This is a host authorization check, not a fact a vendor can answer. Prepare the file
         // before the first probe so a missing or inaccessible scratch location never starts a
@@ -370,9 +417,16 @@ impl Harness for ClaudeHarness {
             ConfigFile::write(&request.mcp_servers, scratch).await?
         });
         let executable = self.executable_for(&request);
-        let survey = self
+        let survey = match self
             .survey_for_open(host, &executable, request.discovery.as_ref())
-            .await;
+            .await
+        {
+            Ok(survey) => survey,
+            Err(error) => {
+                crate::mcp::release_off_worker(mcp_config.take()).await;
+                return Err(error);
+            }
+        };
 
         // Every refusal below owns the artifact written above, and removing it is a synchronous
         // `remove_dir_all` against the host's own scratch root. Gathered into one call so a failed
@@ -392,6 +446,7 @@ impl Harness for ClaudeHarness {
             SessionState::new(std::sync::Arc::clone(host.clock()), opened.snapshot),
             opened.availability,
             opened.surface,
+            opened.resume_pending,
             mcp_config.take(),
         )))
     }
@@ -402,6 +457,8 @@ struct OpenedSession {
     snapshot: SessionSnapshot,
     availability: ModeAvailability,
     surface: Option<CliSurface>,
+    /// A strict resume's candidate handle, confirmed only after `system/init`.
+    resume_pending: bool,
 }
 
 impl ClaudeHarness {
@@ -422,10 +479,20 @@ impl ClaudeHarness {
                 message: String::from("a CLI that reported no version"),
             });
         }
-        if survey.refusal.is_some() {
-            return Err(Error::VersionGate {
-                found: survey.found(),
-                minimum: String::from(MINIMUM_VERSION),
+        if let Some(refusal) = survey.refusal {
+            return Err(match refusal {
+                SurveyRefusal::VersionTooOld => Error::VersionGate {
+                    found: survey.found(),
+                    minimum: String::from(MINIMUM_VERSION),
+                },
+                SurveyRefusal::MissingRequiredSurface => Error::Protocol {
+                    expected: String::from(REQUIRED_LAUNCH_SURFACE),
+                    received: String::from(MISSING_REQUIRED_LAUNCH_FLAG),
+                },
+                SurveyRefusal::UnreadableHelp => Error::Protocol {
+                    expected: String::from("a readable Claude --help launch surface"),
+                    received: String::from("unreadable vendor output"),
+                },
             });
         }
         if let AuthState::LoggedOut { login_hint } = &survey.authentication.state {
@@ -445,7 +512,7 @@ impl ClaudeHarness {
                 mango_external_agents::Capability::McpPassthrough,
             ));
         }
-        let resumed = request.resume.is_some();
+        let resume_pending = request.resume.is_some();
         let native_session_id = match &request.resume {
             // Vetted rather than taken on trust, and before anything touches the disk. The
             // reference goes on the command line as `--resume <value>`, and a stored one
@@ -490,16 +557,31 @@ impl ClaudeHarness {
         .with_capabilities(SessionCapabilities::new(capabilities))
         .with_configuration(configuration_state)
         .with_catalog(ConfigurationCatalog::empty());
-        let snapshot = if resumed {
-            snapshot.resumed()
-        } else {
-            snapshot
-        };
-
         Ok(OpenedSession {
             snapshot,
             availability: survey.availability,
             surface: survey.surface,
+            resume_pending,
+        })
+    }
+
+    /// Refuses fallback before any probe or temporary MCP artifact is created.
+    ///
+    /// Claude's documented headless mode has no separate resume operation or typed
+    /// cannot-resume result. Retrying a failed first turn under a new id could hide an auth,
+    /// transport or acceptance-unknown failure as a fresh conversation, so only strict resume is
+    /// sound until the vendor publishes a conclusive signal.
+    fn refuse_unsupported_fallback(request: &OpenSession) -> Result<()> {
+        if request
+            .resume
+            .as_ref()
+            .is_none_or(|resume| resume.mode != mango_external_agents::ResumeMode::Fallback)
+        {
+            return Ok(());
+        }
+        Err(Error::HostConfiguration {
+            expected: "a strict Claude resume; the documented headless surface does not provide a conclusive cannot-resume signal for fallback",
+            received: String::from("fallback resume"),
         })
     }
 }

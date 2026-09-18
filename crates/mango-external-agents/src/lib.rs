@@ -39,7 +39,8 @@ pub use configuration::{
 };
 pub use content::{ActivityContent, FileChange, FileChangeKind, PlanStep, PlanStepStatus};
 pub use discovery::{
-    AuthMode, AuthState, Discovery, DiscoveryReceipt, GateVerdict, Model, ReasoningEffort,
+    AuthMode, AuthState, Discovery, DiscoveryReceipt, DiscoveryReceiptMeasurements, GateVerdict,
+    Model, ReasoningEffort,
 };
 pub use env::EnvSource;
 pub use error::{Error, ErrorCode, Result, VendorError};
@@ -76,7 +77,7 @@ pub use permission::{
 };
 pub use process::{
     ByteSink, ByteSource, ExitStatus, InterruptOutcome, LaunchSpec, LineLimits, LineStream,
-    ManagedProcess, ProcessControl, ProcessLauncher, StderrTail, StopOutcome,
+    ManagedProcess, ProcessCleanupGuard, ProcessControl, ProcessLauncher, StderrTail, StopOutcome,
 };
 pub use recovery::{RecoveryAction, RecoveryRecord, RequestFingerprint};
 pub use registry::HarnessRegistry;

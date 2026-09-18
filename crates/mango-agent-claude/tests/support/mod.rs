@@ -197,6 +197,11 @@ impl FakeClaudeCli {
         self
     }
 
+    /// Changes the next `--help` probe, as an installed CLI can change between discovery and open.
+    pub fn set_help(&self, help: &str) {
+        *lock(&self.help) = String::from(help);
+    }
+
     /// Answers `auth status` with this.
     #[must_use]
     pub fn with_auth(self, status: &str) -> Self {
