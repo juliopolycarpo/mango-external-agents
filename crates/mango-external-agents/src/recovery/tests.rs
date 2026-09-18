@@ -152,3 +152,49 @@ fn proven_absence_allows_only_a_new_attempt_of_the_original_request() {
             .is_err()
     );
 }
+
+/// An attachment whose fields are fed raw and adjacent.
+///
+/// Deliberately minimal: the collisions below are between neighbouring fields, so anything the
+/// digest writes between them would hide the very ambiguity under test.
+fn adjacent(id: &str, name: &str, bytes: &[u8]) -> Attachment {
+    Attachment {
+        id: id.into(),
+        name: name.into(),
+        mime_type: String::new(),
+        kind: AttachmentKind::Text,
+        bytes: bytes.to_vec(),
+    }
+}
+
+fn fingerprint_of(attachments: Vec<Attachment>) -> RequestFingerprint {
+    RequestFingerprint::of(&TurnRequest::new("logical", "prompt").with_attachments(attachments))
+        .expect("fingerprint")
+}
+
+/// A byte moved from an attachment's id into its name must change the fingerprint.
+///
+/// Ids, names, media types and file contents are fed to the digest raw rather than through JSON,
+/// so nothing in the encoding itself says where one field stops. Without a length prefix per
+/// field, `("ab", "c")` and `("a", "bc")` hash the same bytes and `RecoveryRecord::validate`
+/// accepts a retry describing a different file as the original request.
+#[test]
+fn a_byte_moved_between_two_attachment_fields_changes_the_fingerprint() {
+    assert_ne!(
+        fingerprint_of(vec![adjacent("ab", "c", b"")]),
+        fingerprint_of(vec![adjacent("a", "bc", b"")])
+    );
+}
+
+/// One attachment's contents must not be able to absorb the next attachment's id.
+///
+/// The same ambiguity across the boundary between two attachments: unframed, one set's trailing
+/// bytes and the next set's leading id are one run of bytes, and a retry that rebalanced them
+/// would validate.
+#[test]
+fn a_byte_moved_across_the_attachment_boundary_changes_the_fingerprint() {
+    assert_ne!(
+        fingerprint_of(vec![adjacent("", "", b"xy"), adjacent("z", "", b"")]),
+        fingerprint_of(vec![adjacent("", "", b"x"), adjacent("yz", "", b"")])
+    );
+}

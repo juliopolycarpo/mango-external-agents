@@ -31,19 +31,28 @@ impl RequestFingerprint {
     /// ```
     pub fn of(request: &TurnRequest) -> Result<Self> {
         let mut writer = DigestWriter(ring::digest::Context::new(&ring::digest::SHA256));
-        serde_json::to_writer(
-            &mut writer,
-            &(
-                "mea-request-v1",
-                &request.input,
-                &request.attachments,
-                &request.configuration,
-            ),
-        )
-        .map_err(|_| Error::HostConfiguration {
+        let unserializable = || Error::HostConfiguration {
             expected: "serializable turn content",
             received: String::from("unserializable turn content"),
-        })?;
+        };
+        serde_json::to_writer(
+            &mut writer,
+            &("mea-request-v1", &request.input, &request.configuration),
+        )
+        .map_err(|_| unserializable())?;
+        // Attachment content goes in raw and length-framed rather than through JSON. A `Vec<u8>`
+        // serialises as an array of decimal integers — three to four bytes of digest input per byte
+        // of file, for no extra distinguishing power — and reaching it at all would mean deriving
+        // `Serialize` on the public `Attachment`, handing a host's ids, names and file contents to
+        // any serialiser. That is precisely what its redacting `Debug` refuses to do.
+        writer.frame(&request.attachments.len().to_le_bytes());
+        for attachment in &request.attachments {
+            writer.frame(attachment.id.as_bytes());
+            writer.frame(attachment.name.as_bytes());
+            writer.frame(attachment.mime_type.as_bytes());
+            serde_json::to_writer(&mut writer, &attachment.kind).map_err(|_| unserializable())?;
+            writer.frame(&attachment.bytes);
+        }
         let digest = writer.0.finish();
         let mut bytes = [0; 32];
         bytes.copy_from_slice(digest.as_ref());
@@ -52,6 +61,16 @@ impl RequestFingerprint {
 }
 
 struct DigestWriter(ring::digest::Context);
+
+impl DigestWriter {
+    /// Feeds one field, prefixed by its length, so a value cannot be split or joined differently
+    /// by another arrangement of the same bytes.
+    fn frame(&mut self, bytes: &[u8]) {
+        self.0.update(&bytes.len().to_le_bytes());
+        self.0.update(bytes);
+    }
+}
+
 impl Write for DigestWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.update(bytes);
