@@ -21,16 +21,16 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ClientCapabilities, FileSystemCapabilities, Implementation,
-    InitializeRequest, LoadSessionRequest, NewSessionRequest, SessionId as AcpSessionId,
-    SessionModeState,
+    AgentCapabilities, ClientCapabilities, EnvVariable, FileSystemCapabilities, HttpHeader,
+    Implementation, InitializeRequest, LoadSessionRequest, McpServer as AcpMcpServer,
+    McpServerHttp, McpServerStdio, NewSessionRequest, SessionId as AcpSessionId, SessionModeState,
 };
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
 };
 use mango_external_agents::permission::PermissionMatrix;
 use mango_external_agents::session::{
-    OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason,
+    McpServer, McpTransport, OpenSession, ResumeMode, Session, SessionIds, resume_fallback_reason,
 };
 use mango_external_agents::state::{SessionSnapshot, TransportSelection};
 use mango_external_agents::transport::TransportKind;
@@ -42,7 +42,10 @@ use mango_external_agents::{
 
 use crate::client::{self, SessionState};
 use crate::profile::{AcpProfile, matrix};
-use crate::session::{AcpSession, accepted_axes, refuse_model_selection, refuse_unsupported_reset};
+use crate::session::{
+    AcpSession, accepted_axes, catalog_from_options, configuration_from_catalog,
+    refuse_unsupported_reset,
+};
 use crate::transport;
 use crate::version::{self, Comparison};
 
@@ -67,11 +70,10 @@ const TRANSPORTS: &[TransportKind] = &[TransportKind::Acp];
 ///   [`refuse_model_selection`].
 /// * **No native review and no account usage.** Neither exists on the v1 surface. `usage_update`
 ///   reports a session's context window, which is thread usage rather than plan quota.
-/// * **No MCP passthrough yet.** Host-supplied servers are refused before launch. The harness sends
-///   an empty `session/new.mcpServers` list.
-/// * **No questions and no mid-session or catalogued configuration.** ACP v1 has a documented
-///   session-config-options surface, but wiring it up is a later PR's job — see
-///   [`Discovery::configuration_catalog`], which this harness reports empty rather than half-built.
+/// * **MCP passthrough.** ACP v1 requires stdio MCP support. HTTP is sent only after the agent
+///   advertises it at initialization.
+/// * **Session configuration.** ACP reports the catalog after opening and after every setting
+///   change, so it is a live session service rather than an opening-only command-line setting.
 fn ceiling() -> Capabilities {
     Capabilities {
         structured_streaming: true,
@@ -82,7 +84,10 @@ fn ceiling() -> Capabilities {
         usage_reporting: true,
         cancellation: true,
         session_listing: true,
+        configuration_catalog: true,
+        session_configuration: true,
         configuration: true,
+        mcp_passthrough: true,
         ..Capabilities::none()
     }
 }
@@ -190,6 +195,45 @@ impl AcpHarness {
     }
 }
 
+/// Maps only MCP transports the current agent has established it can connect to.
+fn map_mcp_servers(
+    request: &[McpServer],
+    capabilities: &AgentCapabilities,
+) -> Result<Vec<AcpMcpServer>> {
+    request
+        .iter()
+        .map(|server| match &server.transport {
+            McpTransport::Stdio { command, args, env } => Ok(AcpMcpServer::Stdio(
+                McpServerStdio::new(server.name.clone(), command)
+                    .args(args.clone())
+                    .env(
+                        env.iter()
+                            .map(|(name, value)| EnvVariable::new(name.clone(), value.clone()))
+                            .collect(),
+                    ),
+            )),
+            McpTransport::Http { url, headers } if capabilities.mcp_capabilities.http => {
+                Ok(AcpMcpServer::Http(
+                    McpServerHttp::new(server.name.clone(), url).headers(
+                        headers
+                            .iter()
+                            .map(|(name, value)| HttpHeader::new(name.clone(), value.clone()))
+                            .collect(),
+                    ),
+                ))
+            }
+            McpTransport::Http { .. } => Err(Error::HostConfiguration {
+                expected: "an ACP agent advertising mcpCapabilities.http for an HTTP MCP server",
+                received: String::from("an HTTP MCP server"),
+            }),
+            _ => Err(Error::HostConfiguration {
+                expected: "a stable ACP v1 MCP transport (stdio, or advertised HTTP)",
+                received: String::from("an unsupported MCP transport"),
+            }),
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl Harness for AcpHarness {
     fn descriptor(&self) -> &HarnessDescriptor {
@@ -226,9 +270,8 @@ impl Harness for AcpHarness {
             capabilities: DiscoveredCapabilities::new(ceiling()),
             permission_matrix: self.permission_matrix(),
             models: Vec::new(),
-            // ACP v1's session-config-options surface is not wired up yet; see `ceiling`'s own docs.
-            // Empty is the honest answer for "not enumerated here", a different statement from a
-            // catalog whose rows are all unsupported.
+            // The catalog is negotiated by `session/new` or `session/load`; discovery does not open
+            // a conversation merely to populate a picker.
             configuration_catalog: ConfigurationCatalog::empty(),
         })
     }
@@ -240,13 +283,9 @@ impl Harness for AcpHarness {
     ) -> Result<Box<dyn Session>> {
         self.validate_open_session(host, &request)
             .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
-        mango_external_agents::configuration::refuse_unsupported_native(&request.configuration)
-            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
         refuse_unsupported_reset(&request.configuration)
             .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
         let configuration = request.configuration.requested();
-        refuse_model_selection(&configuration)
-            .map_err(|error| error.with_dispatch(mango_external_agents::Dispatch::NotSubmitted))?;
         let matrix = self.permission_matrix();
         let routing = configuration
             .routing
@@ -310,7 +349,7 @@ impl Harness for AcpHarness {
         let connection_state = Arc::new(SessionState::new(
             session_id,
             host,
-            configuration.clone(),
+            accepted_axes(&configuration),
             session_state.clone(),
         ));
         let connection = Arc::new(
@@ -366,6 +405,17 @@ impl Harness for AcpHarness {
         let cleanup_limits = *host.limits();
         let closing_state = session_state.clone();
 
+        let catalog = opened
+            .config_options
+            .as_deref()
+            .map(catalog_from_options)
+            .unwrap_or_else(ConfigurationCatalog::empty);
+        let observed = configuration_from_catalog(&catalog);
+        session_state.update(|snapshot| {
+            snapshot.catalog = catalog;
+            snapshot.configuration.observed = observed;
+        });
+
         let session = AcpSession::new(
             Arc::clone(&self.profile),
             host.clone(),
@@ -391,6 +441,30 @@ impl Harness for AcpHarness {
                 .close(mango_external_agents::CloseReason::Requested)
                 .await;
             return Err(error);
+        }
+
+        if !request.configuration.is_empty() {
+            let outcome = match session
+                .configure_session(request.configuration.clone())
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = session
+                        .close(mango_external_agents::CloseReason::Requested)
+                        .await;
+                    return Err(error);
+                }
+            };
+            if !outcome.is_complete() {
+                let _ = session
+                    .close(mango_external_agents::CloseReason::Requested)
+                    .await;
+                return Err(Error::HostConfiguration {
+                    expected: "every requested ACP session configuration option to be supported",
+                    received: String::from("a configuration option the agent did not accept"),
+                });
+            }
         }
 
         // An agent can die without anyone calling `close`: it exits, or its transport fails.
@@ -455,6 +529,7 @@ struct Opened {
     resumed: bool,
     fallback_reason: Option<String>,
     modes: Option<SessionModeState>,
+    config_options: Option<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>,
 }
 
 impl AcpHarness {
@@ -536,20 +611,15 @@ impl AcpHarness {
         handshake: &Handshake,
         cwd: std::path::PathBuf,
     ) -> Result<Opened> {
+        let mcp_servers = map_mcp_servers(&request.mcp_servers, &handshake.capabilities)?;
         let Some(resume) = &request.resume else {
-            return self.new_session(connection, host, cwd).await;
+            return self.new_session(connection, host, cwd, mcp_servers).await;
         };
 
         if !handshake.capabilities.load_session {
-            if resume.mode == ResumeMode::Strict {
-                return Err(Error::not_supported(
-                    mango_external_agents::Capability::Resume,
-                ));
-            }
-            let mut opened = self.new_session(connection, host, cwd).await?;
-            opened.fallback_reason =
-                Some(String::from("this agent does not advertise session/load"));
-            return Ok(opened);
+            return Err(Error::not_supported(
+                mango_external_agents::Capability::Resume,
+            ));
         }
 
         let loaded = self
@@ -560,7 +630,8 @@ impl AcpHarness {
                 LoadSessionRequest::new(
                     AcpSessionId::new(resume.native_session_id.clone()),
                     cwd.clone(),
-                ),
+                )
+                .mcp_servers(mcp_servers.clone()),
             )
             .await;
         match loaded {
@@ -569,16 +640,18 @@ impl AcpHarness {
                 resumed: true,
                 fallback_reason: None,
                 modes: loaded.modes,
+                config_options: loaded.config_options,
             }),
             Err(error) if resume.mode == ResumeMode::Strict => Err(error),
             // Fallback: a fresh conversation, and the host is told why rather than left to notice
             // that its history disappeared.
-            Err(error) => {
+            Err(error) if resume_failure_is_conclusive(&error) => {
                 let reason = resume_fallback_reason("session/load", &error);
-                let mut opened = self.new_session(connection, host, cwd).await?;
+                let mut opened = self.new_session(connection, host, cwd, mcp_servers).await?;
                 opened.fallback_reason = Some(reason);
                 Ok(opened)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -587,16 +660,22 @@ impl AcpHarness {
         connection: &Arc<client::ConnectionHandle>,
         host: &HostContext,
         cwd: std::path::PathBuf,
+        mcp_servers: Vec<AcpMcpServer>,
     ) -> Result<Opened> {
-        // Host-supplied MCP servers were refused before launch; none are attached here.
         let response = self
-            .request(connection, host, "session/new", NewSessionRequest::new(cwd))
+            .request(
+                connection,
+                host,
+                "session/new",
+                NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
+            )
             .await?;
         Ok(Opened {
             session_id: response.session_id,
             resumed: false,
             fallback_reason: None,
             modes: response.modes,
+            config_options: response.config_options,
         })
     }
 
@@ -665,6 +744,18 @@ impl AcpHarness {
         }
         Ok(Some(String::from(wanted)))
     }
+}
+
+/// ACP reserves `-32000` for authentication. This harness recognizes `-32002` only as the
+/// established stale-session reply used by the pinned agent profiles; every transport, timeout,
+/// authentication, malformed response, and retryable vendor failure remains a failed resume.
+fn resume_failure_is_conclusive(error: &Error) -> bool {
+    matches!(
+        error.cause(),
+        Error::Vendor(vendor)
+            if vendor.request_id.as_deref() == Some("session/load")
+                && vendor.vendor_code.as_deref() == Some("-32002")
+    )
 }
 
 /// Runs the profile's version argv and returns what it printed.
@@ -763,20 +854,20 @@ mod tests {
         assert!(!ceiling.native_review);
         assert!(!ceiling.account_usage);
         assert!(
-            !ceiling.mcp_passthrough,
-            "nothing on OpenSession carries MCP servers to pass through"
+            ceiling.mcp_passthrough,
+            "ACP v1 carries MCP servers on session setup"
         );
         assert!(
             !ceiling.questions,
             "no vendor surface asks a question distinct from a permission"
         );
         assert!(
-            !ceiling.session_configuration,
-            "configure() is not implemented on this harness"
+            ceiling.session_configuration,
+            "ACP v1 sets live session config options"
         );
         assert!(
-            !ceiling.configuration_catalog,
-            "the session-config-options surface is a later PR's job"
+            ceiling.configuration_catalog,
+            "ACP v1 returns a live option catalog"
         );
         assert!(ceiling.within(&Capabilities::all()));
         assert!(

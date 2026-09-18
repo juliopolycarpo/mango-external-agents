@@ -17,18 +17,19 @@ the wire this crate speaks is the one the specification documents as stable. An 
 `initialize` answers a different `protocolVersion` is refused before a session exists — negotiating
 down would mean sending v1 messages to an agent that answered something else.
 
-| What      | Method                                                                  | Reference                                                                    |
-| --------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Handshake | `initialize` (`protocolVersion: 1`, `clientCapabilities`, `clientInfo`) | [initialization](https://agentclientprotocol.com/protocol/v1/initialization) |
-| Open      | `session/new` with the host's authorised working directory              | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)   |
-| Resume    | `session/load`, when `agentCapabilities.loadSession`                    | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)   |
-| Turn      | `session/prompt`, whose response is the turn's end                      | [prompt turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)       |
-| Stream    | `session/update` notifications                                          | [prompt turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)       |
-| Approvals | `session/request_permission`                                            | [tool calls](https://agentclientprotocol.com/protocol/v1/tool-calls)         |
-| Cancel    | `session/cancel`                                                        | [prompt turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)       |
-| Level     | `session/set_mode`, when the profile knows a mode id                    | [session modes](https://agentclientprotocol.com/protocol/v1/session-modes)   |
-| Listing   | `session/list`, when `sessionCapabilities.list`                         | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)   |
-| Close     | `session/close`, when `sessionCapabilities.close`                       | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)   |
+| What          | Method                                                                  | Reference                                                                                    |
+| ------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Handshake     | `initialize` (`protocolVersion: 1`, `clientCapabilities`, `clientInfo`) | [initialization](https://agentclientprotocol.com/protocol/v1/initialization)                 |
+| Open          | `session/new` with the host's authorised working directory              | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)                   |
+| Resume        | `session/load`, when `agentCapabilities.loadSession`                    | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)                   |
+| Turn          | `session/prompt`, whose response is the turn's end                      | [prompt turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)                       |
+| Stream        | `session/update` notifications                                          | [prompt turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)                       |
+| Approvals     | `session/request_permission`                                            | [tool calls](https://agentclientprotocol.com/protocol/v1/tool-calls)                         |
+| Cancel        | `session/cancel`                                                        | [prompt turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)                       |
+| Level         | `session/set_mode`, when the profile knows a mode id                    | [session modes](https://agentclientprotocol.com/protocol/v1/session-modes)                   |
+| Configuration | `session/set_config_option`; complete `configOptions` replies           | [session config options](https://agentclientprotocol.com/protocol/v1/session-config-options) |
+| Listing       | `session/list`, when `sessionCapabilities.list`                         | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)                   |
+| Close         | `session/close`, when `sessionCapabilities.close`                       | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)                   |
 
 `authenticate` is **never sent**. See [Auth](#auth).
 
@@ -112,17 +113,18 @@ already running.
 
 ### What a `session/update` becomes
 
-| ACP                                                                  | Event                                                                                 |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `agent_message_chunk` (text)                                         | `TextDelta`                                                                           |
-| `agent_thought_chunk`                                                | `ReasoningStarted` / `ReasoningDelta` / `ReasoningEnded`                              |
-| `user_message_chunk`                                                 | dropped — it is the host's own prompt echoed back                                     |
-| `tool_call`                                                          | `ActivityStarted`, plus `ActivityCompleted` when it already carries a terminal status |
-| `tool_call_update`                                                   | `ActivityUpdated`, or `ActivityCompleted` on `completed`/`failed`                     |
-| `plan`                                                               | `ActivityStarted`/`ActivityUpdated` under one synthetic call id                       |
-| `available_commands_update`                                          | session state, not a turn event — the snapshot's `commands`, names bare               |
-| `usage_update`                                                       | `ThreadUsage`, with `size` as the context window                                      |
-| `current_mode_update`, `config_option_update`, `session_info_update` | dropped — session state, not transcript                                               |
+| ACP                                          | Event                                                                                 |
+| -------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `agent_message_chunk` (text)                 | `TextDelta`                                                                           |
+| `agent_thought_chunk`                        | `ReasoningStarted` / `ReasoningDelta` / `ReasoningEnded`                              |
+| `user_message_chunk`                         | dropped — it is the host's own prompt echoed back                                     |
+| `tool_call`                                  | `ActivityStarted`, plus `ActivityCompleted` when it already carries a terminal status |
+| `tool_call_update`                           | `ActivityUpdated`, or `ActivityCompleted` on `completed`/`failed`                     |
+| `plan`                                       | `ActivityStarted`/`ActivityUpdated` under one synthetic call id                       |
+| `available_commands_update`                  | session state, not a turn event — the snapshot's `commands`, names bare               |
+| `usage_update`                               | `ThreadUsage`, with `size` as the context window                                      |
+| `current_mode_update`, `session_info_update` | dropped — session state, not transcript                                               |
+| `config_option_update`                       | replaces the live configuration catalog and observed values                           |
 
 ACP calls them tool calls; they arrive as *activity* because nothing in this library may reach a host's
 tool registry. The reasoning pair is synthesised: ACP streams thought chunks with no start or end
@@ -170,12 +172,19 @@ explicit selection, later turns inherit it until another accepted override repla
 `Session::snapshot().configuration.accepted` reports that current selection. A rejected turn cannot
 change it.
 
-Native option `Set` and `Reset` patches are refused before launch or prompt submission: this
-adapter has no native configuration catalog or mapping. `Keep` remains a no-op. A turn's local
-settings become inherited only when `session/prompt` enters the SDK, under the same gate that
-excludes close; reserving a turn handle alone does not accept its patch. The
-[v1 prompt lifecycle](https://agentclientprotocol.com/protocol/v1/prompt-turn) defines the prompt
-response as completion, so the adapter does not wait for that response to publish local acceptance.
+ACP v1 returns `configOptions` from `session/new`, `session/load`, and every
+`session/set_config_option` response. The harness retains that complete agent-ordered catalog and
+its current values. It maps the unambiguous `model` and `thought_level` categories to the neutral
+model and effort axes; all other options retain their agent ids as native settings. A host changes
+them through `Session::configure` between turns. Each setting request waits for the agent's full
+response before the accepted and observed readings move. Model changes therefore refresh a
+model-dependent effort catalog before an effort request is sent.
+
+`Reset` is rejected as `ResetNotSupported`, because stable ACP v1 sets explicit values and defines
+no return-to-default operation. A value of the wrong scalar type, a select value outside the current
+catalog, an absent option, or an ambiguous semantic category is rejected precisely and is never
+sent. Per-turn model, effort, and native changes are refused because ACP makes them session-scoped.
+`Keep` remains a no-op.
 
 A per-turn level is compared to the session's **by mode**, and any pair whose mode differs from the one
 the session was opened under is refused in both directions. Narrowing looks harmless and is not: a turn
@@ -364,8 +373,11 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 | `start_review`          | `Error::NotSupported`                                                                                                            |
 | `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                     |
 
-A resume against an agent that does not advertise `loadSession` is `Error::Protocol` under
-`ResumeMode::Strict`, and a fresh conversation with `SessionSnapshot::fallback_reason` set otherwise.
+A resume against an agent that does not advertise `loadSession` is an explicit `Resume` refusal in
+both modes. `ResumeMode::Fallback` opens a new conversation only after the pinned profiles'
+conclusive stale-session reply (`session/load` code `-32002`), then records the typed fallback
+reason. Authentication, timeout, link, malformed-response, and other vendor failures do not grant
+permission to create a different conversation.
 
 `NativeSession::updated_at` is left absent even when `session/list` returns one: it is an RFC 3339
 string on the wire and a `SystemTime` in the core, and a date crate for one optional picker field is not
@@ -385,10 +397,16 @@ never going to work.
 
 ## Known caveats
 
-- **No MCP passthrough.** `OpenSession::mcp_servers` is refused when nonempty, before launching the
-  agent. This harness sends an empty `session/new.mcpServers` and reports `mcp_passthrough: false`.
-- **No model selection.** ACP v1 has no surface for one, so a `Configuration` naming a model or a
-  reasoning effort is refused rather than silently ignored, and `model_catalog` is never reported.
+- **MCP passthrough.** `OpenSession::mcp_servers` maps to `session/new.mcpServers` and
+  `session/load.mcpServers`. Stdio preserves the host's name, command, arguments, and server-only
+  environment. HTTP preserves name, endpoint, and headers only when `initialize` advertised
+  `mcpCapabilities.http`; a request without that capability is refused before either lifecycle call.
+  ACP-over-HTTP remains unrelated and unsupported.
+- **Model selection.** ACP v1's documented session configuration surface carries model and
+  reasoning selectors when an agent offers them. The harness never invents a static model catalog;
+  it exposes the live negotiated catalog and refuses a model or effort mapping that is missing or
+  ambiguous.
+
 - **Public OpenCode contract capture.** `mea capture --harness acp --profile opencode` records the
   installed CLI's version and its v1 `initialize` answer under `fixtures/acp/opencode/contract/`.
   It sends no `authenticate` or `session/new` request. The capture keeps each auth method's `type`,

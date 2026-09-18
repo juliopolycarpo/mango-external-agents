@@ -1,40 +1,38 @@
 use super::*;
 
 #[tokio::test]
-async fn unsupported_host_mcp_servers_are_refused_before_launch() {
+async fn stdio_mcp_servers_are_sent_on_session_new() {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(FakeAcpAgent::new().process());
     let mut request = mango_external_agents::OpenSession::new("mcp");
     request
         .mcp_servers
         .push(mango_external_agents::McpServer::stdio("docs", "docs-mcp"));
-    let result = AcpHarness::builtin("cursor")
+    let session = AcpHarness::builtin("cursor")
         .expect("expected Cursor profile")
         .open_session(&host(launcher.clone()), request)
-        .await;
-    match result {
-        Err(error) => {
-            assert!(matches!(error.cause(), Error::HostConfiguration {
-                expected: "no MCP servers for a harness without MCP passthrough",
-                received,
-            } if received == "MCP server count 1"));
-            assert_eq!(
-                error.dispatch(),
-                mango_external_agents::Dispatch::NotSubmitted
-            );
-        }
-        Ok(session) => {
-            session
-                .close(CloseReason::Requested)
-                .await
-                .expect("expected close");
-            panic!("expected an unsupported MCP configuration, received an opened session");
-        }
-    }
-    assert!(
-        launcher.launches().is_empty(),
-        "expected refusal before launch"
+        .await
+        .expect("expected the ACP session to open");
+    let request = launcher
+        .written()
+        .into_iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(&line).expect("expected JSON-RPC"))
+        .find(|message| message.get("method") == Some(&serde_json::json!("session/new")))
+        .expect("expected session/new");
+    assert_eq!(
+        request["params"]["mcpServers"],
+        serde_json::json!([{
+            "name": "docs",
+            "command": "docs-mcp",
+            "args": [],
+            "env": [],
+        }]),
+        "expected the supported stdio MCP server on session/new"
     );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
 }
 
 #[tokio::test]
@@ -59,6 +57,47 @@ async fn strict_resume_is_a_typed_refusal_when_the_agent_does_not_advertise_it()
         ),
         "expected the advertised missing resume capability"
     );
+}
+
+/// A resumed remote session runs under the directory the current host authorized.
+///
+/// Its saved ACP id is opaque history, not authority to reuse the directory from a prior hub.
+#[tokio::test]
+async fn session_load_uses_the_hosts_authorized_working_directory() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(FakeAcpAgent::new().process());
+    let host = HostContext::builder()
+        .launcher(launcher.clone())
+        .cwd("/authorized/workspace")
+        .client_info("discovery-tests", "0.1.0")
+        .build()
+        .expect("expected a host");
+    let session = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(
+            &host,
+            mango_external_agents::OpenSession::new("resume").resuming(
+                "remote-agent-session",
+                mango_external_agents::ResumeMode::Strict,
+            ),
+        )
+        .await
+        .expect("expected the saved ACP session to load");
+    let request = launcher
+        .written()
+        .into_iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(&line).expect("expected JSON-RPC"))
+        .find(|message| message.get("method") == Some(&serde_json::json!("session/load")))
+        .expect("expected session/load");
+    assert_eq!(
+        request["params"]["cwd"],
+        serde_json::json!("/authorized/workspace"),
+        "expected the current host directory rather than a saved remote context"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
 }
 
 /// A fallback resume starts a fresh conversation, and the host is told why.

@@ -441,6 +441,14 @@ impl SessionState {
             SessionFact::Commands(commands) => self
                 .core_state
                 .set_commands(mango_external_agents::event::normalized_catalog(commands)),
+            SessionFact::ConfigurationOptions(options) => {
+                let catalog = crate::session::catalog_from_options(&options);
+                let observed = crate::session::configuration_from_catalog(&catalog);
+                self.core_state.update(|snapshot| {
+                    snapshot.catalog = catalog;
+                    snapshot.configuration.observed = observed;
+                });
+            }
         }
     }
 
@@ -677,17 +685,18 @@ impl SessionState {
 /// work before it releases this generation; freeing the slot here would let a second prompt onto a
 /// wire that has no way to tell two turns apart. The nonblocking sink makes later frames fail fast.
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
-    // Cloned out from under its lock before the first emit, so cancellation and close can always
-    // claim their generation while a callback is reducing a frame.
-    let Some(turn) = state.turn() else {
-        return;
-    };
+    // Capture the current owner before reducing session facts. Facts may arrive between turns;
+    // their publication must not attach turn events to a newly admitted generation.
+    let turn = state.turn();
     let (events, facts) = state.reduce(notification);
     // Published before the turn events: a session fact is true the moment the agent announced it,
     // not only once a host has read every event that preceded it on this turn's own stream.
     for fact in facts {
         state.apply_fact(fact);
     }
+    let Some(turn) = turn else {
+        return;
+    };
     for kind in events {
         // Re-checked each time round: close can commit the terminal after reduction, and no later
         // event may follow it.

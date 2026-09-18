@@ -14,9 +14,10 @@ use mango_agent_acp::{AcpHarness, AcpProfile, SessionModeIds};
 use mango_external_agents::testing::{FakeLauncher, FakeProcess, FrozenClock, RecordingBroker};
 use mango_external_agents::{
     ApprovalRouting, BrokerDecision, CancelReason, CancelToken, Capability, Clock, CloseReason,
-    Configuration, ConfigurationChange, ConfigurationPatch, DecisionSource, Dispatch, Error,
-    EventKind, Harness, HostContext, Limits, OpenSession, PermissionLevel, Session, SessionStatus,
-    SessionSubscription, TurnRequest, TurnStream, VendorInfo,
+    Configuration, ConfigurationChange, ConfigurationOptionId, ConfigurationPatch,
+    ConfigurationValue, DecisionSource, Dispatch, Error, EventKind, Harness, HostContext, Limits,
+    OpenSession, PermissionLevel, Session, SessionStatus, SessionSubscription, TurnRequest,
+    TurnStream, VendorInfo,
 };
 
 const VENDOR: VendorInfo = VendorInfo {
@@ -2503,6 +2504,155 @@ async fn a_probe_reads_the_version_the_agent_printed_and_never_claims_a_login_st
         missing.gate,
         mango_external_agents::GateVerdict::NotInstalled
     );
+}
+
+/// ACP returns the full live catalog after opening and after every `session/set_config_option`.
+///
+/// The session must preserve the agent's order and use the response to update both its catalog and
+/// observed configuration. Before the configuration service existed, `configure` returned
+/// `NotSupported` here even though the pinned v1 schema had this method.
+#[tokio::test]
+async fn a_live_acp_catalog_is_applied_between_turns_and_reports_current_values() {
+    let agent = FakeAcpAgent::new().with_config_options(vec![
+        serde_json::json!({
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": "small",
+            "options": [
+                { "value": "small", "name": "Small" },
+                { "value": "large", "name": "Large" }
+            ]
+        }),
+        serde_json::json!({
+            "id": "thought",
+            "name": "Thought level",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "low",
+            "options": [
+                { "value": "low", "name": "Low" },
+                { "value": "high", "name": "High" }
+            ]
+        }),
+        serde_json::json!({
+            "id": "web-search",
+            "name": "Web search",
+            "type": "boolean",
+            "currentValue": false
+        }),
+    ]);
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process());
+    let session = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("chat-configuration"))
+        .await
+        .expect("expected the fake session to open");
+
+    assert_eq!(session.snapshot().catalog.options().len(), 3);
+    assert_eq!(
+        session.snapshot().configuration.observed.model.as_deref(),
+        Some("small")
+    );
+    assert_eq!(
+        session.snapshot().configuration.observed.effort.as_deref(),
+        Some("low")
+    );
+
+    let outcome = session
+        .configure(
+            ConfigurationPatch::new()
+                .model(ConfigurationChange::Set(String::from("large")))
+                .effort(ConfigurationChange::Set(String::from("high")))
+                .native(
+                    ConfigurationOptionId::new("web-search"),
+                    ConfigurationChange::Set(ConfigurationValue::Boolean(true)),
+                ),
+        )
+        .await
+        .expect("expected supported ACP options to be set between turns");
+
+    assert!(outcome.is_complete());
+    let state = session.snapshot();
+    assert_eq!(state.configuration.accepted.model.as_deref(), Some("large"));
+    assert_eq!(state.configuration.accepted.effort.as_deref(), Some("high"));
+    assert_eq!(
+        state
+            .configuration
+            .accepted
+            .native
+            .get(&ConfigurationOptionId::new("web-search")),
+        Some(&ConfigurationValue::Boolean(true))
+    );
+    assert_eq!(
+        state.configuration.observed.model.as_deref(),
+        Some("large"),
+        "expected the response catalog to report the final model, sent {:?}",
+        launcher.written()
+    );
+    assert_eq!(state.configuration.observed.effort.as_deref(), Some("high"));
+    assert_eq!(
+        state
+            .configuration
+            .observed
+            .native
+            .get(&ConfigurationOptionId::new("web-search")),
+        Some(&ConfigurationValue::Boolean(true))
+    );
+}
+
+/// ACP can replace its complete configuration catalog while a session is live.
+///
+/// The update is session state, so it must reach the snapshot without becoming turn transcript.
+#[tokio::test]
+async fn a_config_option_update_replaces_the_live_catalog_and_observed_values() {
+    let initial = serde_json::json!({
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": "small",
+        "options": [{ "value": "small", "name": "Small" }]
+    });
+    let updated = serde_json::json!({
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": "large",
+        "options": [{ "value": "large", "name": "Large" }]
+    });
+    let agent = FakeAcpAgent::new()
+        .with_config_options(vec![initial])
+        .with_updates(vec![serde_json::json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [updated]
+        })]);
+    let (session, _) = open(agent, ConfigurationPatch::new()).await;
+
+    let mut turn = session
+        .start_turn(TurnRequest::new("catalog-update", "hello"))
+        .await
+        .expect("expected a turn");
+    let events = drain(&mut turn).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EventKind::TextDelta { .. })),
+        "expected the catalog update to stay out of the transcript, received {events:?}"
+    );
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot.catalog.options().len(), 1);
+    assert_eq!(
+        snapshot.configuration.observed.model.as_deref(),
+        Some("large"),
+        "expected the replacement catalog to be visible"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
 }
 
 /// The contract a host is entitled to assume, run against the real harness.
