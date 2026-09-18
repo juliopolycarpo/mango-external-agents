@@ -2628,6 +2628,15 @@ pub(crate) async fn list_threads(
         cwd: Some(cwd.to_owned()),
     };
     let page: ThreadListResponse = client.request(method::THREAD_LIST, params).await?;
+    if let Some(limit) = query.limit
+        && page.data.len() > limit
+    {
+        return Err(Error::LimitExceeded {
+            subject: "sessions in a Codex thread/list response",
+            limit,
+            received: page.data.len(),
+        });
+    }
     Ok(SessionPage {
         sessions: page
             .data

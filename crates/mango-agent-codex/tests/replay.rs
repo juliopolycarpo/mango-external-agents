@@ -3335,6 +3335,69 @@ impl MixedWorkspaceListServer {
     }
 }
 
+/// A picker response that ignored the page size the host supplied.
+struct OversizedListServer;
+
+impl OversizedListServer {
+    fn process(self) -> FakeProcess {
+        Transcript::load("handshake").as_process_intercepting(|frame| {
+            (frame["method"] == "thread/list").then(|| {
+                vec![
+                    serde_json::json!({
+                        "id": frame["id"],
+                        "result": {
+                            "data": [
+                                {"id": "first", "cwd": "/workspace"},
+                                {"id": "second", "cwd": "/workspace"},
+                            ],
+                            "nextCursor": "after-second",
+                        },
+                    })
+                    .to_string(),
+                ]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn listing_refuses_a_vendor_page_that_exceeds_the_requested_limit() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(OversizedListServer.process());
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+
+    let result = CodexHarness::new()
+        .list_sessions(
+            &host,
+            SessionQuery {
+                limit: Some(1),
+                ..SessionQuery::default()
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ref error)
+                if matches!(
+                    error.cause(),
+                    mango_external_agents::Error::LimitExceeded {
+                        subject: "sessions in a Codex thread/list response",
+                        limit: 1,
+                        received: 2,
+                    }
+                )
+        ),
+        "expected an over-limit response refusal, received {result:?}"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the picker child reaped"
+    );
+}
+
 #[tokio::test]
 async fn listing_discards_rows_outside_the_authorized_workspace() {
     let launcher = Arc::new(FakeLauncher::new());
