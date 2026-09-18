@@ -151,14 +151,12 @@ impl CancelToken {
 /// The caps the library reads a vendor under.
 ///
 /// Every one of them exists because the vendor is a third-party process whose output is not the
-/// host's to trust: a slow reader must slow the vendor rather than grow memory, a long line must
-/// be refused rather than allocated, and a stalled call must end rather than hold a turn open.
+/// host's to trust: a stalled reader must trigger bounded pressure handling, a long line must
+/// be refused, and a stalled call must end rather than hold a turn open forever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// How many events one turn's channel holds before the vendor is made to wait.
-    ///
-    /// The whole point of a bound: a host that stops reading stops the vendor, instead of the
-    /// library buffering a runaway stream until the process dies.
+    /// How many payload events one turn holds before reporting overflow and stopping native work.
+    /// Interaction events have a separate count reserve within the shared byte budget.
     pub turn_channel_capacity: usize,
     /// Maximum serialized payload bytes queued per turn, excluding its reserved terminal.
     pub turn_buffer_bytes: usize,

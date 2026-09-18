@@ -64,6 +64,7 @@ impl Write for DigestWriter {
 
 /// The next safe action for a supervisor holding the logical operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecoveryAction {
     /// Nothing was submitted. The supervisor may submit its current attempt once.
     Submit,

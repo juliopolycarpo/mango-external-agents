@@ -33,10 +33,9 @@ pub struct TurnStream {
 impl TurnStream {
     /// The stream of an attempt the vendor accepted.
     ///
-    /// [`Dispatch::Accepted`] is the only honest verdict here: the vendor answered with a handle,
-    /// so the work is running. A dispatch that did not get this far never produces a stream — it
-    /// produces an [`Error`], whose [`Error::dispatch`](crate::Error::dispatch) says how far it
-    /// got.
+    /// Sets [`Dispatch::Accepted`] when the vendor acknowledged the attempt. A harness that
+    /// retains uncertain native work uses [`Self::with_dispatch`] to mark `AcceptanceUnknown`
+    /// while preserving this owned observation channel. Neither state authorizes replay.
     pub fn accepted(
         turn_id: TurnId,
         attempt: AttemptId,
@@ -131,6 +130,7 @@ impl std::fmt::Debug for TurnStream {
 
 /// The logical terminal outcome, independent of transcript delivery and process reaping.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TerminalStatus {
     /// Native work completed successfully.
     Completed,
@@ -215,8 +215,8 @@ impl std::fmt::Debug for EventSink {
 impl EventSink {
     /// A sink and the receiver its events arrive on.
     ///
-    /// `capacity` is how many events may wait unread before [`EventSink::emit`] stops returning
-    /// until the host reads one.
+    /// `capacity` bounds unread payload events. Overflow fails explicitly without blocking a
+    /// protocol callback. Use [`Self::with_limits`] to also configure byte and interaction budgets.
     ///
     /// The attempt is carried so every event this sink stamps names the dispatch it came from. A
     /// sink built per attempt is what makes a late event from an abandoned one recognisable.

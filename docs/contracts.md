@@ -207,6 +207,12 @@ whether work was submitted. `Error::cause()` exposes the original typed error fo
 `AcceptanceUnknown` is deliberately not "probably fine": that reading is the one that runs a turn
 twice. A surface that cannot be reconciled must not be blindly re-executed.
 
+`RequestFingerprint` validates exact logical request content across attempts. `RecoveryRecord`
+rejects changed input and stale results, distinguishes observation from reconciliation, and permits
+a newer submission only after proof of non-submission. The host owns ID uniqueness and durable
+storage. `TurnStream::terminal_status()` exposes completion without draining the transcript.
+See [turn ownership and recovery](lifecycle.md) for admission, abandonment and memory budgets.
+
 ## Discovery receipts are a seam, not a cache
 
 `Harness::probe` may not memoise — how fresh an answer has to be is the host's decision. A host

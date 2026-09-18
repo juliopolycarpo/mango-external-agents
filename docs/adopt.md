@@ -69,9 +69,10 @@ let host = HostContext::builder()
 
 7. **A cancellation token, a clock and the caps**, all with defaults: `CancelToken` for shutdown,
    `Clock` for the instant an event is stamped with, and `Limits` for the turn channel's capacity
-   (1,024 events), the line and buffer caps, the stderr tail, the request timeout, the approval
-   timeout and the kill grace. Request timeouts bound individual protocol calls; approval timeouts
-   leave room for a person or host policy to decide. Harnesses read them back through
+   (1,024 payload events and 8 MiB), pending requests, line and buffer caps, stderr tail, request,
+   approval and idle timeouts, graceful interruption and shutdown deadlines. Request timeouts bound
+   individual protocol calls; approval timeouts leave room for a person or host policy to decide.
+   Harnesses read them back through
    `host.limits()`, and a host constructing `TokioLauncher` hands it the same ones with
    `TokioLauncher::with_limits`, so one setting governs a bound wherever it is enforced.
 
@@ -108,7 +109,9 @@ already logged into with the vendor's own CLI.
   reconfigured on an open session. Most vendors cannot set several options atomically, so the
   outcome says which axes landed, which were refused and why, and what became of the rest.
 - `Session::start_turn` → a `TurnStream`: a bounded channel of `AgentEvent` read through `recv()`.
-  A host that stops reading slows the vendor instead of growing the library's memory.
+  Overflow commits an explicit failure and stops native work. Terminal status remains observable
+  without draining the stream. Keep this owner in the supervisor across browser disconnects;
+  dropping it requests cancellation. See [turn ownership and recovery](lifecycle.md).
 - `AgentEvent { session_id, turn_id, attempt, at, kind }`. The `kind` is turn-scoped, always:
   turn started, text and reasoning deltas with their block markers, the activity lifecycle,
   approval requested and resolved, question asked and resolved, usage, thread usage, account
