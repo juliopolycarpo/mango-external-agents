@@ -1531,6 +1531,7 @@ async fn pump(
         {
             match record.kind() {
                 Some(kind @ ("stream_event" | "assistant" | "user" | "result")) => {
+                    taint_unconfirmed_resume(&shared, &end);
                     failure = Some(Error::Protocol {
                         expected: String::from(
                             "a system/init record confirming the requested Claude resume handle before conversation content or result",
@@ -1580,6 +1581,14 @@ async fn pump(
         if native_finished {
             break;
         }
+    }
+
+    // An EOF, idle timeout, or broken link can end before any conversation record arrives. It is
+    // still a failed strict verification: cleanup only tells us that the child stopped, never
+    // which native history it had loaded. A caller-requested stop stays retryable because its
+    // explicit cancellation owns that decision rather than an unverifiable vendor transcript.
+    if end.get().is_none() && resume_confirmation_pending(&shared) {
+        taint_unconfirmed_resume(&shared, &end);
     }
 
     finish(
@@ -1691,7 +1700,16 @@ fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) -> Result<()> 
         return Ok(());
     }
     let session_id = init.session_id;
-    let resumed = confirm_session_id(shared, &mut state, session_id.as_deref())?;
+    let resumed = match confirm_session_id(shared, &mut state, session_id.as_deref()) {
+        Ok(resumed) => resumed,
+        Err(error) => {
+            // A strict resume that did not identify the requested conversation is unsound whether
+            // the host's cleanup later sends SIGINT or escalates. A graceful stop only says the
+            // process left cleanly; it cannot establish which history that process had loaded.
+            mark_unconfirmed_resume_nonresumable(&mut state, end);
+            return Err(error);
+        }
+    };
 
     if let Some(commands) = init.commands {
         shared
@@ -1736,7 +1754,11 @@ fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) -> Result<()> 
 /// A fresh run creates its conversation once it has a valid id. A strict resume is stronger: the
 /// id must be the exact candidate the host supplied, otherwise Claude may have started a different
 /// conversation and the turn must fail rather than present its output as resumed history.
-fn confirm_session_id(shared: &Shared, state: &mut Mutable, session_id: Option<&str>) -> Result<bool> {
+fn confirm_session_id(
+    shared: &Shared,
+    state: &mut Mutable,
+    session_id: Option<&str>,
+) -> Result<bool> {
     if !state.resume_pending {
         if session_id.is_some() {
             state.established = true;
@@ -1773,6 +1795,26 @@ fn confirm_session_id(shared: &Shared, state: &mut Mutable, session_id: Option<&
 /// Whether the next terminal vendor record still lacks strict-resume confirmation.
 fn resume_confirmation_pending(shared: &Shared) -> bool {
     shared.lock().resume_pending
+}
+
+/// Refuses a later turn after the current strict-resume attempt could not prove its identity.
+///
+/// This is separate from forced-stop tainting. A graceful interrupt preserves an established
+/// Claude conversation, but it cannot turn an unverified resume into a verified one.
+fn taint_unconfirmed_resume(shared: &Shared, end: &TurnEnd) {
+    mark_unconfirmed_resume_nonresumable(&mut shared.lock(), end);
+}
+
+/// Records a strict-resume verification failure only while this attempt still owns the session.
+fn mark_unconfirmed_resume_nonresumable(state: &mut Mutable, end: &TurnEnd) {
+    if state.resume_pending
+        && state
+            .active
+            .as_ref()
+            .is_some_and(|active| std::ptr::eq(active.end.as_ref(), end))
+    {
+        state.nonresumable = Some(end.get().copied().unwrap_or(CancelReason::Shutdown));
+    }
 }
 
 /// One user message, as `--input-format stream-json` takes it.

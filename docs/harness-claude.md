@@ -143,6 +143,12 @@ id, and each turn spawns, streams and reaps its own child.
   replace the active handle, because they are vendor-issued identities for a conversation this
   session already established.
 
+  A failed strict verification, including a stream that ends before `system/init` without a host
+  cancellation, leaves the session nonresumable even when native cleanup finishes through the
+  host's graceful-interrupt path. Graceful cleanup establishes that the child exited; it cannot
+  establish that the child had loaded the requested history. The next turn is refused before a new
+  Claude process starts.
+
   **Fallback is explicitly unsupported.** The documented headless surface supplies no separate
   resume operation or conclusive cannot-resume result. Retrying any failed first turn under a new
   UUID could turn an authentication, transport or acceptance-unknown failure into a silent fresh
@@ -405,7 +411,6 @@ catalog an earlier run published.
   runs for minutes with the vendor emitting nothing, so a shorter cap does not describe a stalled
   child — it cuts a working turn. A host that wants a longer leash sets `Limits::idle_timeout`
   above the floor and gets it.
-
 
 Discovery exposes the account and build restrictions in `Discovery.permission_matrix`; the static
 `Harness::permission_matrix` is its upper bound. Hosts can use the probed matrix to disable

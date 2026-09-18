@@ -873,6 +873,80 @@ mod opening_a_session {
         assert_eq!(session.ids().native_session_id, requested);
     }
 
+    #[tokio::test]
+    async fn strict_resume_verification_failure_is_nonresumable_after_a_graceful_cleanup() {
+        let requested = "22222222-3333-4444-5555-666666666666";
+        let different = "33333333-4444-5555-6666-777777777777";
+        let failures = [
+            (
+                "a different init handle",
+                Run::replaying(&format!(
+                    r#"{{"type":"system","subtype":"init","session_id":"{different}"}}"#
+                )),
+            ),
+            (
+                "content before init",
+                Run::replaying(
+                    r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}"#,
+                ),
+            ),
+            (
+                "a result without init",
+                Run::replaying(r#"{"type":"result","is_error":false}"#),
+            ),
+            ("an ended stream without init", Run::exiting(0)),
+        ];
+
+        for (label, run) in failures {
+            let launcher = Arc::new(
+                FakeClaudeCli::new()
+                    .with_graceful_interrupt()
+                    .with_turn(run),
+            );
+            let host = host(Arc::clone(&launcher));
+            let session = ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").resuming(requested, ResumeMode::Strict),
+                )
+                .await
+                .expect("expected a strict resume session");
+
+            let mut turn = session
+                .start_turn(TurnRequest::new("turn-1", "continue"))
+                .await
+                .expect("expected the deferred resume to start");
+            assert!(
+                matches!(drain(&mut turn).await.last(), Some(EventKind::Error { .. })),
+                "expected {label} to fail strict resume verification"
+            );
+            assert_eq!(
+                launcher.graceful_interrupts(),
+                1,
+                "expected {label} to reach the graceful cleanup path"
+            );
+
+            let error = session
+                .start_turn(TurnRequest::new("turn-2", "must not continue"))
+                .await
+                .expect_err("expected strict resume verification failure to taint continuation");
+            assert!(
+                matches!(
+                    error.cause(),
+                    Error::Cancelled {
+                        reason: CancelReason::Shutdown
+                    }
+                ),
+                "expected {label} to refuse continuation, received {error:?}"
+            );
+            assert_eq!(
+                launcher.turn_argvs().len(),
+                1,
+                "expected {label} to refuse before spawning another Claude turn"
+            );
+        }
+    }
+
     /// At face value is not the same as unvetted.
     ///
     /// The reference goes on the command line as `--resume <value>`, and an argv array stops shell
