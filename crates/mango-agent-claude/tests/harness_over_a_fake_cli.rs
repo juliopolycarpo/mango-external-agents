@@ -356,25 +356,142 @@ mod opening_a_session {
     }
 
     #[tokio::test]
-    async fn adopts_a_resume_reference_at_face_value() {
+    async fn refuses_fallback_resume_without_a_conclusive_vendor_signal() {
         let launcher = Arc::new(FakeClaudeCli::new());
         let host = host(Arc::clone(&launcher));
-        for mode in [ResumeMode::Strict, ResumeMode::Fallback] {
-            let session = ClaudeHarness::new()
-                .open_session(
-                    &host,
-                    OpenSession::new("chat-1")
-                        .resuming("22222222-3333-4444-5555-666666666666", mode),
-                )
-                .await
-                .expect("expected a session");
-            assert!(session.snapshot().resumed);
-            assert_eq!(session.snapshot().fallback_reason, None);
-            assert_eq!(
-                session.ids().native_session_id,
-                "22222222-3333-4444-5555-666666666666"
-            );
-        }
+        let error = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1")
+                    .resuming("22222222-3333-4444-5555-666666666666", ResumeMode::Fallback),
+            )
+            .await
+            .map(drop)
+            .expect_err("expected fallback resume to be refused");
+
+        assert!(
+            matches!(error.cause(), Error::HostConfiguration { .. }),
+            "expected a typed refusal, received {error:?}"
+        );
+        assert!(
+            launcher.turn_argvs().is_empty(),
+            "expected no turn launch, received {:?}",
+            launcher.turn_argvs()
+        );
+        assert!(
+            launcher.launches().is_empty(),
+            "expected fallback to be refused before a probe, received {:?}",
+            launcher.launches()
+        );
+    }
+
+    #[tokio::test]
+    async fn opens_a_strict_resume_as_unverified_until_the_vendor_starts_a_turn() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1")
+                    .resuming("22222222-3333-4444-5555-666666666666", ResumeMode::Strict),
+            )
+            .await
+            .expect("expected strict resume to defer vendor confirmation");
+
+        assert!(
+            !session.snapshot().resumed,
+            "expected opening to remain unverified until Claude emits system/init"
+        );
+        assert_eq!(
+            session.ids().native_session_id,
+            "22222222-3333-4444-5555-666666666666"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirms_a_strict_resume_only_when_system_init_echoes_its_handle() {
+        let native_session_id = "22222222-3333-4444-5555-666666666666";
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&format!(
+            r#"{{"type":"system","subtype":"init","session_id":"{native_session_id}"}}
+{{"type":"result","is_error":false}}"#
+        ))));
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").resuming(native_session_id, ResumeMode::Strict),
+            )
+            .await
+            .expect("expected a strict resume session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        assert_eq!(drain(&mut turn).await.last(), Some(&EventKind::Completed));
+        assert!(session.snapshot().resumed);
+        assert_eq!(session.ids().native_session_id, native_session_id);
+        assert_eq!(
+            value_after(&launcher.turn_argvs()[0], "--resume"),
+            Some(native_session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_a_strict_resume_when_system_init_names_a_different_conversation() {
+        let requested = "22222222-3333-4444-5555-666666666666";
+        let different = "33333333-4444-5555-6666-777777777777";
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&format!(
+            r#"{{"type":"system","subtype":"init","session_id":"{different}"}}
+{{"type":"result","is_error":false}}"#
+        ))));
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").resuming(requested, ResumeMode::Strict),
+            )
+            .await
+            .expect("expected a strict resume session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        let events = drain(&mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { .. })),
+            "expected a failed strict resume, received {events:?}"
+        );
+        assert!(!session.snapshot().resumed);
+        assert_eq!(session.ids().native_session_id, requested);
+    }
+
+    #[tokio::test]
+    async fn fails_a_strict_resume_that_ends_without_identity_confirmation() {
+        let requested = "22222222-3333-4444-5555-666666666666";
+        let launcher = Arc::new(
+            FakeClaudeCli::new().with_turn(Run::replaying(r#"{"type":"result","is_error":false}"#)),
+        );
+        let host = host(Arc::clone(&launcher));
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").resuming(requested, ResumeMode::Strict),
+            )
+            .await
+            .expect("expected a strict resume session");
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "continue"))
+            .await
+            .expect("expected the deferred resume to start");
+        assert!(
+            matches!(drain(&mut turn).await.last(), Some(EventKind::Error { .. })),
+            "expected a terminal confirmation failure"
+        );
+        assert!(!session.snapshot().resumed);
+        assert_eq!(session.ids().native_session_id, requested);
     }
 
     /// At face value is not the same as unvetted.

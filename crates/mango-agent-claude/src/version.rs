@@ -22,9 +22,10 @@ pub fn minimum() -> Version {
 
 /// Pulls the version out of a `claude --version` line.
 ///
-/// The CLI prints `2.1.270 (Claude Code)`, so the line is scanned for the first token that is a
+/// The CLI prints `2.1.270 (Claude Code)`, so its line is scanned for the first token that is a
 /// version rather than parsed whole. A leading `v` is tolerated because a repackaged build may add
-/// one.
+/// one. A wrapper can print its own version first, so only a line that identifies Claude Code is
+/// considered; accepting the first semver token in all of stdout can gate the wrong executable.
 ///
 /// `None` means "not established", and callers must treat that as neither "old enough" nor "new
 /// enough" — an unknown version is the one case where both answers are wrong.
@@ -39,7 +40,29 @@ pub fn minimum() -> Version {
 /// assert!(parse("command not found").is_none());
 /// ```
 pub fn parse(raw: &str) -> Option<Version> {
-    raw.split_whitespace()
+    let mut lines = raw.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next()?;
+    let second = lines.next();
+    if second.is_none() {
+        return parse_version_tokens(first);
+    }
+    std::iter::once(first)
+        .chain(second)
+        .chain(lines)
+        .find_map(parse_claude_line)
+}
+
+/// Parses a banner line that identifies Claude Code.
+fn parse_claude_line(line: &str) -> Option<Version> {
+    if !line.to_ascii_lowercase().contains("claude code") {
+        return None;
+    }
+    parse_version_tokens(line)
+}
+
+/// Reads the first semver token from one already-selected version line.
+fn parse_version_tokens(line: &str) -> Option<Version> {
+    line.split_whitespace()
         .find_map(|token| Version::parse(token.strip_prefix('v').unwrap_or(token)).ok())
 }
 
@@ -82,6 +105,15 @@ mod tests {
         assert_eq!(
             parse("2.1.226 (Claude Code)").expect("expected a version"),
             semver::Version::new(2, 1, 226)
+        );
+    }
+
+    #[test]
+    fn ignores_an_unrelated_wrapper_version_before_the_claude_banner() {
+        let banner = "npm 11.4.2\nClaude Code v2.1.270";
+        assert_eq!(
+            parse(banner).expect("expected Claude Code's version"),
+            semver::Version::new(2, 1, 270)
         );
     }
 

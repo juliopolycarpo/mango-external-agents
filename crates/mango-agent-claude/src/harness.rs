@@ -352,6 +352,8 @@ impl Harness for ClaudeHarness {
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         mango_external_agents::configuration::refuse_unsupported_reset(&request.configuration)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        Self::refuse_unsupported_fallback(&request)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
 
         // This is a host authorization check, not a fact a vendor can answer. Prepare the file
         // before the first probe so a missing or inaccessible scratch location never starts a
@@ -392,6 +394,7 @@ impl Harness for ClaudeHarness {
             SessionState::new(std::sync::Arc::clone(host.clock()), opened.snapshot),
             opened.availability,
             opened.surface,
+            opened.resume_pending,
             mcp_config.take(),
         )))
     }
@@ -402,6 +405,8 @@ struct OpenedSession {
     snapshot: SessionSnapshot,
     availability: ModeAvailability,
     surface: Option<CliSurface>,
+    /// A strict resume's candidate handle, confirmed only after `system/init`.
+    resume_pending: bool,
 }
 
 impl ClaudeHarness {
@@ -445,7 +450,7 @@ impl ClaudeHarness {
                 mango_external_agents::Capability::McpPassthrough,
             ));
         }
-        let resumed = request.resume.is_some();
+        let resume_pending = request.resume.is_some();
         let native_session_id = match &request.resume {
             // Vetted rather than taken on trust, and before anything touches the disk. The
             // reference goes on the command line as `--resume <value>`, and a stored one
@@ -490,16 +495,31 @@ impl ClaudeHarness {
         .with_capabilities(SessionCapabilities::new(capabilities))
         .with_configuration(configuration_state)
         .with_catalog(ConfigurationCatalog::empty());
-        let snapshot = if resumed {
-            snapshot.resumed()
-        } else {
-            snapshot
-        };
-
         Ok(OpenedSession {
             snapshot,
             availability: survey.availability,
             surface: survey.surface,
+            resume_pending,
+        })
+    }
+
+    /// Refuses fallback before any probe or temporary MCP artifact is created.
+    ///
+    /// Claude's documented headless mode has no separate resume operation or typed
+    /// cannot-resume result. Retrying a failed first turn under a new id could hide an auth,
+    /// transport or acceptance-unknown failure as a fresh conversation, so only strict resume is
+    /// sound until the vendor publishes a conclusive signal.
+    fn refuse_unsupported_fallback(request: &OpenSession) -> Result<()> {
+        if request
+            .resume
+            .as_ref()
+            .is_none_or(|resume| resume.mode != mango_external_agents::ResumeMode::Fallback)
+        {
+            return Ok(());
+        }
+        Err(Error::HostConfiguration {
+            expected: "a strict Claude resume; the documented headless surface does not provide a conclusive cannot-resume signal for fallback",
+            received: String::from("fallback resume"),
         })
     }
 }
