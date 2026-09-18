@@ -207,6 +207,7 @@ mod tests {
                 "approvalPolicy",
                 "sandbox",
                 "approvalsReviewer",
+                "config",
             ],
         );
         assert_declares(
@@ -218,6 +219,7 @@ mod tests {
                 "approvalPolicy",
                 "sandbox",
                 "excludeTurns",
+                "config",
             ],
         );
         assert_declares("Thread", &["id", "preview", "name", "cwd", "updatedAt"]);

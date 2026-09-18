@@ -261,17 +261,19 @@ refused as `Error::UnsupportedTransport` before anything is spawned.
 
 ## MCP
 
-`Capabilities::mcp_passthrough` is `false`. The harness does not implement host-supplied MCP
-configuration. A nonempty `OpenSession::mcp_servers` is refused as
-`Error::NotSupported { capability: Capability::McpPassthrough }` before any process is launched,
-including on resume. Configure servers in the user's own
-`~/.codex/config.toml` or with `codex mcp`. Calls to those servers still render as
-`ActivityKind::Mcp`.
+`Capabilities::mcp_passthrough` is `true`. Host entries travel in the `config.mcp_servers` map
+on `thread/start` or `thread/resume`, the app-server's documented per-thread override. Stdio
+entries preserve command, arguments and server-only environment. Streamable HTTP entries preserve
+URL and literal headers. Invalid, duplicate or unsupported entries fail before launching Codex;
+the harness never edits the user's `config.toml` or adds server credentials to the Codex child's
+environment. Servers the user configured with `codex mcp` remain available to the vendor.
 
-The pinned schema includes a `config` map on both `thread/start` and `thread/resume`. Mapping
-the core's MCP configuration through that override is a follow-up. It needs validation of server
-names and transports, schema coverage, and a real captured start/resume before the capability can
-be advertised. See the [app-server documentation][readme] for configuration overrides.
+The `config` field is declared on both requests by the [pinned protocol][thread-protocol], and
+the field names follow the [official config reference][config-reference]. A 0.154.0 app-server
+probe with an isolated `CODEX_HOME` accepted a stdio `config.mcp_servers` override at
+`thread/start` and wrote no persistent `config.toml`. Fake app-server tests cover both start and
+resume mapping, header and environment separation, and pre-spawn refusals. MCP tool calls still
+render as `ActivityKind::Mcp`.
 
 ## Environment
 
@@ -353,4 +355,6 @@ Compliance posture: see [compliance.md](compliance.md).
 
 [readme]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md
 [resume-error]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/src/request_processors/thread_processor.rs
+[thread-protocol]: https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+[config-reference]: https://developers.openai.com/codex/config-reference
 [app-server]: https://learn.chatgpt.com/docs/app-server

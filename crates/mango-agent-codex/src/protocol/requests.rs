@@ -148,6 +148,9 @@ pub struct ThreadStartParams {
     /// Who answers its prompts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
+    /// Request-scoped app-server config; never written to the user's config file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// Continuing one.
@@ -170,6 +173,9 @@ pub struct ThreadResumeParams {
     /// Who answers its prompts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals_reviewer: Option<ApprovalsReviewer>,
+    /// Request-scoped app-server config; never written to the user's config file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<BTreeMap<String, serde_json::Value>>,
     /// Metadata only: the transcript is the vendor's, and this harness never replays one.
     pub exclude_turns: bool,
 }

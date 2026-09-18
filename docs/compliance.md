@@ -110,6 +110,8 @@ whose terms apply. No logos, no wordmarks, nothing implying an official or endor
 own VS Code extension on. JSON-RPC over newline-delimited JSON. `clientInfo.name` is always the
 host's name, passed through `HostContext`. Read on 2026-09-13 against `codex-cli 0.154.0`;
 `docs/harness-codex.md` lists every method driven and the document each follows.
+Host-configured MCP servers use the app-server's per-thread `config` override on
+`thread/start` and `thread/resume`; no persistent Codex configuration is edited.
 
 **Posture:** OpenAI has publicly welcomed third-party harnesses on subscriptions (press coverage,
 2026-02); this is cited as reported, not as a licence term. What the vendor *does* document is the

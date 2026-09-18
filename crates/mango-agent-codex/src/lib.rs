@@ -4,6 +4,7 @@ pub mod activity;
 pub mod approvals;
 pub mod discovery;
 pub mod harness;
+mod mcp;
 pub mod permissions;
 pub mod protocol;
 pub mod rate_limits;

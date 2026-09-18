@@ -22,8 +22,8 @@ use mango_external_agents::testing::{Announcer, FakeLauncher, FakeProcess};
 use mango_external_agents::{
     ApprovalRouting, CancelReason, Clock, CloseReason, ConfigurationChange, ConfigurationPatch,
     EnvSource, ExitStatus, Harness, HostContext, InterruptOutcome, LaunchSpec, ManagedProcess,
-    OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, Session, SessionQuery,
-    SessionStatus, SessionSubscription, Steer, TurnRequest,
+    McpServer, McpTransport, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher, Session,
+    SessionQuery, SessionStatus, SessionSubscription, Steer, TurnRequest,
 };
 use support::Transcript;
 
@@ -731,10 +731,112 @@ async fn opening_a_session_adopts_the_thread_the_server_opened() {
     assert!(!session.snapshot().resumed);
 }
 
+#[tokio::test]
+async fn host_mcp_servers_use_the_thread_config_override_without_widening_the_child_environment() {
+    let (host, launcher) = host_replaying(&["handshake"]);
+    let servers = vec![
+        McpServer {
+            name: String::from("docs"),
+            transport: McpTransport::Stdio {
+                command: String::from("docs-mcp"),
+                args: vec![String::from("--stdio")],
+                env: [(String::from("DOCS_KEY"), String::from("server-secret"))].into(),
+            },
+        },
+        McpServer {
+            name: String::from("remote"),
+            transport: McpTransport::Http {
+                url: String::from("https://example.com/mcp"),
+                headers: [(String::from("X-Docs-Key"), String::from("header-secret"))].into(),
+            },
+        },
+    ];
+    let _session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1").with_mcp_servers(servers))
+        .await
+        .expect("expected supported host MCP configuration");
+
+    let start = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("thread/start"))
+        .expect("expected a thread start");
+    let frame: serde_json::Value = serde_json::from_str(&start).expect("expected JSON");
+    let config = &frame["params"]["config"]["mcp_servers"];
+    assert_eq!(config["docs"]["command"], "docs-mcp");
+    assert_eq!(config["docs"]["args"], serde_json::json!(["--stdio"]));
+    assert_eq!(config["docs"]["env"]["DOCS_KEY"], "server-secret");
+    assert_eq!(config["remote"]["url"], "https://example.com/mcp");
+    assert_eq!(
+        config["remote"]["http_headers"]["X-Docs-Key"],
+        "header-secret"
+    );
+    let launch = launcher
+        .last_launch()
+        .expect("expected one app-server launch");
+    assert!(!launch.env.contains_key("DOCS_KEY"));
+    assert!(!launch.env.contains_key("CONNECTOR_SECRET"));
+}
+
 /// A pinned app-server resume error, with the captured handshake and new-thread answer.
 /// The fake owns the error injection so each test can assert the wire consequence.
 struct ResumeErrorServer {
     message: String,
+}
+
+/// The captured thread answer, returned to a resume request with that request's id.
+struct ResumeSuccessServer;
+
+impl ResumeSuccessServer {
+    fn process(self) -> FakeProcess {
+        let transcript = Transcript::load("handshake");
+        let result = transcript
+            .every_received()
+            .into_iter()
+            .find(|frame| frame.pointer("/result/thread/id").is_some())
+            .expect("expected the captured thread answer")
+            .clone();
+        transcript.as_process_intercepting(move |frame| {
+            (frame["method"] == "thread/resume").then(|| {
+                let mut answer = result.clone();
+                answer["id"] = frame["id"].clone();
+                vec![answer.to_string()]
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn resumed_codex_thread_receives_the_same_host_mcp_override() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(ResumeSuccessServer.process());
+    let (host, launcher) = with_launcher(launcher, None);
+    let native_id = Transcript::load("handshake")
+        .thread_id()
+        .expect("expected a captured thread id");
+    let session = CodexHarness::new()
+        .open_session(
+            &host,
+            OpenSession::new("chat-1")
+                .resuming(&native_id, mango_external_agents::ResumeMode::Strict)
+                .with_mcp_servers(vec![McpServer::stdio("docs", "docs-mcp")]),
+        )
+        .await
+        .expect("expected the host MCP override on resume");
+
+    assert!(session.snapshot().resumed);
+    let written = launcher.written();
+    assert!(!written.iter().any(|line| line.contains("thread/start")));
+    let resume = written
+        .iter()
+        .find(|line| line.contains("thread/resume"))
+        .expect("expected a resume request");
+    let frame: serde_json::Value = serde_json::from_str(resume).expect("expected JSON");
+    assert_eq!(frame["params"]["threadId"], native_id);
+    assert_eq!(
+        frame["params"]["config"]["mcp_servers"]["docs"]["command"],
+        "docs-mcp"
+    );
 }
 
 impl ResumeErrorServer {
@@ -3591,9 +3693,9 @@ async fn the_harness_passes_the_cores_conformance_suite() {
     );
 }
 
-/// Host MCP requests are unsupported on fresh and resumed Codex sessions.
+/// Invalid host MCP requests fail before either a fresh or resumed Codex session launches.
 #[tokio::test]
-async fn host_mcp_servers_are_refused_before_spawning_codex() {
+async fn invalid_host_mcp_servers_are_refused_before_spawning_codex() {
     for mode in [
         None,
         Some(mango_external_agents::ResumeMode::Strict),
@@ -3601,7 +3703,8 @@ async fn host_mcp_servers_are_refused_before_spawning_codex() {
     ] {
         let (host, launcher) = host_replaying(&["handshake"]);
         let request = OpenSession::new("chat-1").with_mcp_servers(vec![
-            mango_external_agents::McpServer::stdio("docs", "docs-mcp"),
+            McpServer::stdio("docs", "docs-mcp"),
+            McpServer::stdio("docs", "another-mcp"),
         ]);
 
         let request = match mode {
@@ -3613,21 +3716,21 @@ async fn host_mcp_servers_are_refused_before_spawning_codex() {
         assert_eq!(
             launcher.launches().len(),
             0,
-            "expected unsupported MCP configuration to be refused before spawning Codex"
+            "expected duplicate MCP names to be refused before spawning Codex"
         );
         let error = match result {
-            Ok(_) => panic!("expected the typed MCP passthrough refusal"),
+            Ok(_) => panic!("expected the typed MCP configuration refusal"),
             Err(error) => error,
         };
         assert!(
             matches!(
                 error.cause(),
                 mango_external_agents::Error::HostConfiguration {
-                    expected: "no MCP servers for a harness without MCP passthrough",
+                    expected: "unique MCP server names",
                     received,
-                } if received == "MCP server count 1"
+                } if received == "duplicate MCP server at index 1"
             ),
-            "expected the typed MCP passthrough refusal"
+            "expected the typed MCP configuration refusal"
         );
         assert_eq!(
             error.dispatch(),

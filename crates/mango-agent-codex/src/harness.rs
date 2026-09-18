@@ -3,6 +3,7 @@
 //! Stateless and shareable, as the trait requires. It holds a descriptor and, when the host
 //! resolved one, the path to the executable — nothing about any session, and no cached probe.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mango_external_agents::Dispatch;
@@ -60,9 +61,8 @@ const VENDOR_ENVIRONMENT_KEYS: &[&str] = &["CODEX_HOME"];
 
 /// What this harness could support, given a new enough CLI.
 ///
-/// Enabled features were checked against a running `codex app-server`. Host-supplied MCP
-/// configuration is not implemented; servers configured in the user's own `config.toml` or with
-/// `codex mcp` remain available to the vendor.
+/// Enabled features were checked against a running `codex app-server`. Host-supplied MCP entries
+/// use the documented per-thread `config` override, which does not edit the user's config file.
 const CAPABILITIES: Capabilities = Capabilities {
     structured_streaming: true,
     reasoning_stream: true,
@@ -83,7 +83,7 @@ const CAPABILITIES: Capabilities = Capabilities {
     session_listing: true,
     native_review: true,
     account_usage: true,
-    mcp_passthrough: false,
+    mcp_passthrough: true,
     configuration: true,
 };
 
@@ -119,7 +119,7 @@ impl CodexHarness {
     ///
     /// let harness = CodexHarness::new();
     /// assert_eq!(harness.descriptor().id(), &HarnessId::codex());
-    /// assert!(!harness.descriptor().capabilities.capabilities().mcp_passthrough);
+    /// assert!(harness.descriptor().capabilities.capabilities().mcp_passthrough);
     /// ```
     #[must_use]
     pub fn new() -> Self {
@@ -213,6 +213,8 @@ impl Harness for CodexHarness {
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         mango_external_agents::configuration::refuse_unsupported_native(&request.configuration)
             .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        let mcp_config = crate::mcp::override_for(&request.mcp_servers)
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let effective_transport = self
             .descriptor()
             .resolve_transport(request.transport)
@@ -240,7 +242,7 @@ impl Harness for CodexHarness {
 
         // Everything from here can fail, and every failure has to take the child with it: a
         // half-opened session leaves a `codex app-server` running with nobody holding its handle.
-        let opened = open_thread(host, &client, &request, effective_transport).await;
+        let opened = open_thread(host, &client, &request, effective_transport, mcp_config).await;
         let (state, thread_id) = match opened {
             Ok(opened) => opened,
             Err(error) => {
@@ -281,6 +283,7 @@ async fn open_thread(
     client: &Client,
     request: &OpenSession,
     effective_transport: TransportKind,
+    mcp_config: Option<BTreeMap<String, serde_json::Value>>,
 ) -> Result<(SessionState, String)> {
     let handshake: InitializeResponse = client
         .request(
@@ -331,6 +334,7 @@ async fn open_thread(
                 approval_policy: vendor.approval_policy,
                 sandbox: vendor.sandbox,
                 approvals_reviewer: vendor.approvals_reviewer,
+                config: mcp_config.clone(),
                 // Metadata only. The vendor keeps the transcript it wrote, and this library never
                 // replays one into anybody's context.
                 exclude_turns: true,
@@ -346,7 +350,7 @@ async fn open_thread(
                 {
                     let reason = resume_fallback_reason(method::THREAD_RESUME, &error);
                     (
-                        start_thread(client, &cwd, &requested_model, vendor).await?,
+                        start_thread(client, &cwd, &requested_model, vendor, &mcp_config).await?,
                         false,
                         Some(reason),
                     )
@@ -355,7 +359,7 @@ async fn open_thread(
             }
         }
         None => (
-            start_thread(client, &cwd, &requested_model, vendor).await?,
+            start_thread(client, &cwd, &requested_model, vendor, &mcp_config).await?,
             false,
             None,
         ),
@@ -443,6 +447,7 @@ async fn start_thread(
     cwd: &str,
     model: &Option<String>,
     vendor: PermissionOverrides,
+    mcp_config: &Option<BTreeMap<String, serde_json::Value>>,
 ) -> Result<ThreadStartResponse> {
     client
         .request(
@@ -453,6 +458,7 @@ async fn start_thread(
                 approval_policy: vendor.approval_policy,
                 sandbox: vendor.sandbox,
                 approvals_reviewer: vendor.approvals_reviewer,
+                config: mcp_config.clone(),
             },
         )
         .await
