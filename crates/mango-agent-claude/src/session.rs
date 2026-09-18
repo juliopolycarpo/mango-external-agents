@@ -16,6 +16,7 @@
 //!   stream end and writes the terminal pair. Two tasks racing to emit a terminal is the one defect
 //!   a host cannot work around.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -60,6 +61,115 @@ struct ActiveTurn {
     /// The terminal result has committed, or its receiver was abandoned. A reaped process alone
     /// cannot admit a replacement while its old stream still owns the terminal transition.
     settled: bool,
+    teardown: Option<Arc<Teardown>>,
+}
+
+struct Teardown {
+    result: Mutex<Option<std::result::Result<(), Arc<Error>>>>,
+    done: tokio::sync::Notify,
+    worker_started: AtomicBool,
+}
+
+impl Teardown {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            done: tokio::sync::Notify::new(),
+            worker_started: AtomicBool::new(false),
+        }
+    }
+
+    async fn wait(&self) -> Result<()> {
+        loop {
+            let notified = self.done.notified();
+            if let Some(result) = self
+                .result
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                return match result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(copy_error(error)),
+                };
+            }
+            notified.await;
+        }
+    }
+
+    fn starts_worker(&self) -> bool {
+        !self.worker_started.swap(true, Ordering::AcqRel)
+    }
+
+    fn finish(&self, result: Result<()>) {
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(result.map_err(Arc::new));
+        self.done.notify_waiters();
+    }
+}
+
+/// Reconstructs the result a second close or cancel observes after the first caller has consumed
+/// it. `Error` deliberately has no `Clone` because it may wrap another error, so teardown owns the
+/// first value and makes a typed copy for each waiter.
+fn copy_error(error: &Error) -> Error {
+    match error {
+        Error::Busy => Error::Busy,
+        Error::Operation { dispatch, source } => copy_error(source).with_dispatch(*dispatch),
+        Error::Vendor(error) => Error::Vendor(error.clone()),
+        Error::NotSupported { capability } => Error::NotSupported {
+            capability: *capability,
+        },
+        Error::UnsupportedTransport { harness, transport } => Error::UnsupportedTransport {
+            harness: harness.clone(),
+            transport: *transport,
+        },
+        Error::VersionGate { found, minimum } => Error::VersionGate {
+            found: found.clone(),
+            minimum: minimum.clone(),
+        },
+        Error::AuthRequired { login_hint } => Error::AuthRequired {
+            login_hint: login_hint.clone(),
+        },
+        Error::Launch { program, message } => Error::Launch {
+            program: program.clone(),
+            message: message.clone(),
+        },
+        Error::Link { peer, message } => Error::Link {
+            peer: peer.clone(),
+            message: message.clone(),
+        },
+        Error::LimitExceeded {
+            subject,
+            limit,
+            received,
+        } => Error::LimitExceeded {
+            subject,
+            limit: *limit,
+            received: *received,
+        },
+        Error::InvalidVendorValue { field, received } => Error::InvalidVendorValue {
+            field,
+            received: received.clone(),
+        },
+        Error::Protocol { expected, received } => Error::Protocol {
+            expected: expected.clone(),
+            received: received.clone(),
+        },
+        Error::Timeout { operation, after } => Error::Timeout {
+            operation: operation.clone(),
+            after: *after,
+        },
+        Error::Cancelled { reason } => Error::Cancelled { reason: *reason },
+        Error::Closed { subject } => Error::Closed { subject },
+        Error::HostConfiguration { expected, received } => Error::HostConfiguration {
+            expected,
+            received: received.clone(),
+        },
+        _ => Error::HostConfiguration {
+            expected: "a replayable Claude teardown failure",
+            received: String::from("an error variant this harness does not retain"),
+        },
+    }
 }
 
 /// An active attempt synchronously claimed for teardown.
@@ -70,6 +180,17 @@ struct ActiveTurn {
 struct TakenTurn {
     end: Arc<TurnEnd>,
     control: Option<Arc<dyn mango_external_agents::ProcessControl>>,
+}
+
+/// The synchronous part of a close transition, before its durable worker starts.
+enum CloseClaim {
+    Existing(Option<Arc<Teardown>>),
+    New {
+        close: Arc<Teardown>,
+        active: Option<Arc<Teardown>>,
+        taken: Option<TakenTurn>,
+        mcp_config: crate::mcp::Prepared<Arc<ConfigFile>>,
+    },
 }
 
 /// Everything about a session that changes after it is opened and that
@@ -97,6 +218,8 @@ struct Mutable {
     /// prompt. The harness never silently selects a different native id for a strict session;
     /// callers receive an explicit refusal until they open a fresh session themselves.
     nonresumable: Option<CancelReason>,
+    /// The one close worker that owns the session artifact and publishes its final state.
+    close_teardown: Option<Arc<Teardown>>,
 }
 
 impl Drop for Mutable {
@@ -172,6 +295,7 @@ impl ClaudeSession {
             active: None,
             mcp_config: mcp_config.map(Arc::new),
             nonresumable: None,
+            close_teardown: None,
         };
         Self {
             shared: Arc::new(Shared {
@@ -195,8 +319,13 @@ impl ClaudeSession {
     async fn stop_active_turn(&self, reason: CancelReason) -> Result<()> {
         let taken = request_stop(&mut self.shared.lock(), reason);
         let Some(taken) = taken else {
-            return Ok(());
+            return wait_existing_teardown(&self.shared).await;
         };
+        // A reservation with no control has no native process yet. Its start guard owns the child
+        // if one arrives; claiming it stopped here would free or taint the wrong lifecycle.
+        if taken.control.is_none() {
+            return Ok(());
+        }
         await_durable_stop(Arc::clone(&self.shared), taken, reason, false).await
     }
 }
@@ -209,23 +338,161 @@ async fn await_durable_stop(
     reason: CancelReason,
     settled: bool,
 ) -> Result<()> {
-    let limits = *shared.host.limits();
-    tokio::spawn(async move {
-        let outcome = end_turn(taken.control, reason, &limits).await?;
+    let teardown = install_teardown(&shared, &taken.end);
+    start_teardown(&shared, &teardown.state, taken, reason, settled);
+    teardown.state.wait().await
+}
+
+struct InstalledTeardown {
+    state: Arc<Teardown>,
+}
+fn install_teardown(shared: &Shared, end: &TurnEnd) -> InstalledTeardown {
+    let mut state = shared.lock();
+    let active = state
+        .active
+        .as_mut()
+        .filter(|a| std::ptr::eq(a.end.as_ref(), end))
+        .expect("active teardown owner");
+    if let Some(existing) = &active.teardown {
+        return InstalledTeardown {
+            state: Arc::clone(existing),
+        };
+    }
+    let created = Arc::new(Teardown::new());
+    active.teardown = Some(Arc::clone(&created));
+    InstalledTeardown { state: created }
+}
+async fn wait_existing_teardown(shared: &Shared) -> Result<()> {
+    let teardown = {
+        let state = shared.lock();
+        state
+            .active
+            .as_ref()
+            .and_then(|a| a.teardown.as_ref())
+            .cloned()
+    };
+    match teardown {
+        Some(t) => t.wait().await,
+        None => Ok(()),
+    }
+}
+
+/// Detaches a stop before a caller reaches its first await. One owner can start the native work;
+/// every other caller waits on its retained outcome.
+fn start_teardown(
+    shared: &Arc<Shared>,
+    teardown: &Arc<Teardown>,
+    taken: TakenTurn,
+    reason: CancelReason,
+    settled: bool,
+) {
+    if !teardown.starts_worker() {
+        return;
+    }
+    let shared_for_worker = Arc::clone(shared);
+    let teardown_for_worker = Arc::clone(teardown);
+    spawn_owned(shared, async move {
+        run_teardown(
+            &shared_for_worker,
+            &teardown_for_worker,
+            taken,
+            reason,
+            settled,
+        )
+        .await;
+    });
+}
+
+/// Performs exactly one bounded native stop for a claimed child and retains its typed outcome.
+async fn run_teardown(
+    shared: &Shared,
+    teardown: &Teardown,
+    taken: TakenTurn,
+    reason: CancelReason,
+    settled: bool,
+) {
+    let outcome = end_turn(taken.control, reason, shared.host.limits()).await;
+    if let Ok(outcome) = outcome {
         record_stop(
-            &shared,
+            shared,
             &taken.end,
             !matches!(outcome, Some(StopOutcome::Interrupted)),
             reason,
             settled,
         );
-        Ok(())
-    })
-    .await
-    .map_err(|_| Error::Launch {
-        program: String::from(PROGRAM),
-        message: String::from("the Claude teardown worker was cancelled"),
-    })?
+    }
+    teardown.finish(outcome.map(drop));
+}
+
+/// Starts an already-installed close teardown when a start that was pending at close finally
+/// receives its child. The worker survives the start caller that happens to observe it.
+fn start_late_teardown(
+    shared: &Arc<Shared>,
+    end: &Arc<TurnEnd>,
+    control: Arc<dyn mango_external_agents::ProcessControl>,
+    reason: CancelReason,
+    settled: bool,
+) -> Option<Arc<Teardown>> {
+    let teardown = {
+        let state = shared.lock();
+        state
+            .active
+            .as_ref()
+            .filter(|active| Arc::ptr_eq(&active.end, end))
+            .and_then(|active| active.teardown.as_ref())
+            .cloned()
+    }?;
+    start_teardown(
+        shared,
+        &teardown,
+        TakenTurn {
+            end: Arc::clone(end),
+            control: Some(control),
+        },
+        reason,
+        settled,
+    );
+    Some(teardown)
+}
+
+/// Releases a close waiting on a launcher that failed before it returned a child. No native work
+/// existed, so this must not set `stopped` or taint the resumable Claude conversation.
+fn finish_unstarted_teardown(shared: &Shared, end: &Arc<TurnEnd>) {
+    let teardown = {
+        let state = shared.lock();
+        state
+            .active
+            .as_ref()
+            .filter(|active| Arc::ptr_eq(&active.end, end))
+            .and_then(|active| active.teardown.as_ref())
+            .cloned()
+    };
+    if let Some(teardown) = teardown
+        && teardown.starts_worker()
+    {
+        teardown.finish(Ok(()));
+    }
+}
+
+/// Completes one close after its active child and MCP artifact are both gone.
+async fn run_close_teardown(
+    shared: &Shared,
+    close: &Teardown,
+    active: Option<Arc<Teardown>>,
+    mut mcp_config: crate::mcp::Prepared<Arc<ConfigFile>>,
+) {
+    let native = match active {
+        Some(teardown) => teardown.wait().await,
+        None => Ok(()),
+    };
+    let result = match native {
+        Ok(()) => crate::mcp::remove_on_close(mcp_config.take()).await,
+        Err(error) => Err(error),
+    };
+    if result.is_ok() {
+        shared.core_state.set_status(SessionStatus::Closed);
+    }
+    close.finish(result);
 }
 
 impl Drop for ClaudeSession {
@@ -350,7 +617,6 @@ impl Drop for AbandonedStart {
         let Some(taken) = taken else {
             return;
         };
-        let limits = *self.shared.host.limits();
         let shared = Arc::clone(&self.shared);
         let reason = taken.end.get().copied().unwrap_or(CancelReason::Requested);
         let lease = self.mcp_lease.take();
@@ -362,7 +628,18 @@ impl Drop for AbandonedStart {
                 },
                 None => owned_control.or(taken.control),
             };
-            let outcome = end_turn(control, reason, &limits).await;
+            let Some(control) = control else {
+                finish_unstarted_teardown(&shared, &taken.end);
+                crate::mcp::release_off_worker(lease).await;
+                return;
+            };
+            if start_late_teardown(&shared, &taken.end, Arc::clone(&control), reason, true)
+                .is_some()
+            {
+                crate::mcp::release_off_worker(lease).await;
+                return;
+            }
+            let outcome = end_turn(Some(control), reason, shared.host.limits()).await;
             crate::mcp::release_off_worker(lease).await;
             if let Ok(outcome) = outcome {
                 record_stop(
@@ -569,6 +846,7 @@ impl mango_external_agents::Session for ClaudeSession {
                 control: None,
                 stopped: false,
                 settled: false,
+                teardown: None,
             });
             // The reservation and this clone share the same critical section. A close that wins
             // after it can release the session's reference, but this attempt still owns the file
@@ -628,6 +906,7 @@ impl mango_external_agents::Session for ClaudeSession {
             Ok(argv) => argv,
             Err(error) => {
                 abandoned.disarm();
+                finish_unstarted_teardown(&self.shared, &end);
                 forget_reservation(&self.shared, &end);
                 // A close that won the race already released the session's own reference, which
                 // makes this lease the last one and its drop the `remove_dir_all`. Off the worker,
@@ -655,6 +934,7 @@ impl mango_external_agents::Session for ClaudeSession {
             // this call made above, and only if a stop has not already taken it.
             Err(error) => {
                 abandoned.disarm();
+                finish_unstarted_teardown(&self.shared, &end);
                 forget_reservation(&self.shared, &end);
                 crate::mcp::release_off_worker(mcp_lease.take()).await;
                 crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
@@ -697,6 +977,7 @@ impl mango_external_agents::Session for ClaudeSession {
                     control: Some(Arc::clone(&control)),
                     stopped: false,
                     settled: false,
+                    teardown: None,
                 });
                 None
             } else {
@@ -704,6 +985,26 @@ impl mango_external_agents::Session for ClaudeSession {
             }
         };
         if let Some(reason) = stopped {
+            if let Some(teardown) =
+                start_late_teardown(&self.shared, &end, Arc::clone(&control), reason, true)
+            {
+                // The close worker owns the session lease until this detached native stop reports
+                // success. These start-local clones can leave now without exposing the file to a
+                // child that is still in the stop gate.
+                crate::mcp::release_off_worker(mcp_lease.take()).await;
+                crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
+                teardown
+                    .wait()
+                    .await
+                    .map_err(|error| error.with_dispatch(Dispatch::Accepted))?;
+                abandoned.disarm();
+                return Err((if self.shared.lifecycle.is_closed() {
+                    Error::Closed { subject: "session" }
+                } else {
+                    Error::Cancelled { reason }
+                })
+                .with_dispatch(Dispatch::Accepted));
+            }
             let outcome =
                 stop_process_with_limits(control.as_ref(), reason, self.shared.host.limits()).await;
             // After the kill, never before: the child read `--mcp-config` at startup. And off the
@@ -868,53 +1169,68 @@ impl mango_external_agents::Session for ClaudeSession {
     }
 
     async fn close(&self, reason: CloseReason) -> Result<()> {
-        // Idempotent: a close racing a cancel, or two closes from different tasks, must not fail
-        // the second caller. Both takes happen under the guard; nothing slow happens under it.
-        let (control, mut mcp_config) = {
+        // The first close installs a durable worker before either caller can await. Later closes
+        // observe that worker's result instead of reporting success while its child still runs.
+        let claim = {
             let mut lifecycle = self.shared.lifecycle.lock();
             if !lifecycle.close() {
-                return Ok(());
-            }
-            let mut state = self.shared.lock();
-            let control = request_stop(&mut state, CancelReason::from(reason))
-                .or_else(|| active_turn(&state));
-            // In the same cancellation-safe owner the open and the turn use: the kill below is a
-            // `ProcessControl` call that can take as long as the host's escalation grace, and a
-            // caller that gives up on the close in that window would otherwise drop this on the
-            // async worker. There is no second chance at it either — the lifecycle is already
-            // closed, so a following close returns before reaching here.
-            (control, crate::mcp::Prepared::new(state.mcp_config.take()))
-        };
-        // Closing is visible while teardown is still in flight. A host that sees `Closed` may
-        // release its own resources, so publishing it before the child and its MCP artifact are
-        // actually handled lies about the session's lifetime.
-        self.shared.core_state.set_status(SessionStatus::Closing);
-        let stopped = match control {
-            Some(taken) => {
-                await_durable_stop(
-                    Arc::clone(&self.shared),
+                CloseClaim::Existing(self.shared.lock().close_teardown.as_ref().cloned())
+            } else {
+                let mut state = self.shared.lock();
+                let taken = request_stop(&mut state, CancelReason::from(reason))
+                    .or_else(|| active_turn(&state));
+                let active = state.active.as_mut().map(|turn| {
+                    Arc::clone(
+                        turn.teardown
+                            .get_or_insert_with(|| Arc::new(Teardown::new())),
+                    )
+                });
+                let close = Arc::new(Teardown::new());
+                state.close_teardown = Some(Arc::clone(&close));
+                CloseClaim::New {
+                    close,
+                    active,
                     taken,
-                    CancelReason::from(reason),
-                    false,
-                )
-                .await
+                    mcp_config: crate::mcp::Prepared::new(state.mcp_config.take()),
+                }
             }
-            None => Ok(()),
         };
-        // The session releases its reference here. A start still awaiting a child holds its own
-        // `Arc` until it releases it just before its post-release ownership check, and that check
-        // sees this close and kills the child it launched. Either order is safe: whichever
-        // reference goes last removes the file, and the child it was written for is being killed
-        // by one of the two paths. Off the lock, and off the async worker: removing
-        // the directory is a synchronous filesystem call against the host's own scratch root.
-        // Reported rather than swallowed: this close promised the session's resources were
-        // released, and the file holds the `env` and `headers` a host configured its servers with.
-        let cleanup = crate::mcp::remove_on_close(mcp_config.take()).await;
-        // A failed removal still concludes this session. The error reports the artifact left on
-        // disk, but no later session operation can make progress against a lifecycle the close
-        // transition already claimed.
-        self.shared.core_state.set_status(SessionStatus::Closed);
-        stopped.and(cleanup)
+        let (close, active, taken, mcp_config) = match claim {
+            CloseClaim::Existing(Some(teardown)) => return teardown.wait().await,
+            CloseClaim::Existing(None) => return Ok(()),
+            CloseClaim::New {
+                close,
+                active,
+                taken,
+                mcp_config,
+            } => (close, active, taken, mcp_config),
+        };
+        self.shared.core_state.set_status(SessionStatus::Closing);
+        // A launcher still in flight owns no native child for this close to wait on. Its start
+        // guard will hand the late child to the installed worker. Returning lets the host release
+        // its start gate, while a later close waits on that same worker rather than claiming done.
+        let waits_for_late_spawn = taken.as_ref().is_some_and(|turn| turn.control.is_none());
+        if let (Some(active), Some(taken)) = (&active, taken)
+            && taken.control.is_some()
+        {
+            start_teardown(
+                &self.shared,
+                active,
+                taken,
+                CancelReason::from(reason),
+                false,
+            );
+        }
+        let shared = Arc::clone(&self.shared);
+        let close_for_worker = Arc::clone(&close);
+        spawn_owned(&self.shared, async move {
+            run_close_teardown(&shared, &close_for_worker, active, mcp_config).await;
+        });
+        if waits_for_late_spawn {
+            Ok(())
+        } else {
+            close.wait().await
+        }
     }
 }
 

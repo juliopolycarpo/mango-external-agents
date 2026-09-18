@@ -2331,6 +2331,79 @@ mod cancelling_and_closing {
         drain(&mut next).await;
     }
 
+    #[tokio::test]
+    async fn aborting_cancel_after_native_teardown_starts_still_reaps_the_child() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let cancelling = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.cancel(CancelReason::Requested).await }
+        });
+        stop.wait_for_spawn().await;
+        cancelling.abort();
+        let _ = cancelling.await;
+        stop.release();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while launcher.a_child_is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(
+            "expected the abandoned cancellation worker to reap its child without another call",
+        );
+        drop(turn);
+    }
+
+    #[tokio::test]
+    async fn a_second_close_waits_for_the_abandoned_close_workers_result() {
+        let launcher =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let stop = launcher.gate_turn_stops();
+        let session = shared(&launcher).await;
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let closing = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.close(CloseReason::Requested).await }
+        });
+        stop.wait_for_spawn().await;
+        closing.abort();
+        let _ = closing.await;
+
+        let repeated = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.close(CloseReason::Shutdown).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !repeated.is_finished(),
+            "expected a repeated close to wait for the active teardown"
+        );
+
+        stop.release();
+        repeated
+            .await
+            .expect("expected the repeated close task to finish")
+            .expect("expected the durable close worker to report native cleanup");
+        assert!(
+            launcher.all_children_ended(),
+            "expected the abandoned close worker to reap its child"
+        );
+        drop(turn);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_stop_reports_failure_and_retains_the_turn_owner() {
         let launcher =
