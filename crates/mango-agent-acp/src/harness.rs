@@ -329,9 +329,8 @@ impl Harness for AcpHarness {
         let opened = match self.handshake_and_open(&connection, host, &request).await {
             Ok(opened) => opened,
             Err(error) => {
-                connection
-                    .shutdown(mango_external_agents::CancelReason::Requested)
-                    .await;
+                connection.begin_shutdown(mango_external_agents::CancelReason::Requested);
+                let _ = connection.wait_shutdown().await;
                 return Err(error);
             }
         };
@@ -362,7 +361,9 @@ impl Harness for AcpHarness {
         // only once every refusal below is behind us.
         let watched = connection.connection().clone();
         let driver_done = connection.driver_done().clone();
+        let watched_connection = Arc::downgrade(&connection);
         let orphan = Arc::clone(connection.control());
+        let cleanup_limits = *host.limits();
         let closing_state = session_state.clone();
 
         let session = AcpSession::new(
@@ -374,6 +375,7 @@ impl Harness for AcpHarness {
             opened.session_id,
             handshake.capabilities,
         );
+        let close = session.close_state();
 
         // Set only when the profile knows the agent's own id for the level *and* the agent
         // advertised it. A mode this agent never offered is a refusal rather than a request it would
@@ -406,23 +408,37 @@ impl Harness for AcpHarness {
         // session's own `SessionState` would, through a parked question's connection clone, which
         // is why the pending questions a teardown owes are not settled from here.
         //
-        // Safe on the ordinary close path too: `close` has already published `Closed` by the time
-        // the loop winds down, and `set_status` is monotonic.
+        // An explicit close has its own task which owns terminal settlement and status publication.
+        // This watcher is only the no-close path where a peer disappeared on its own.
         tokio::spawn(async move {
             tokio::select! {
                 () = watched.incoming_closed() => {}
                 () = driver_done.cancelled() => {}
             }
-            // `Closing` first, and the child ended before `Closed`, because `Closed` says nothing
-            // more will happen on this session. Neither signal implies the agent has exited: a
-            // clean EOF closes the incoming half while the process may still be running, and this
-            // is the only path that will reap it when no `close` is coming. `close` does its own
-            // teardown; the second `kill` that costs is tracked, not papered over here.
+            if close.is_started() {
+                return;
+            }
+            // `Closing` first, and `Closed` only after the owned connection cleanup succeeds:
+            // neither EOF nor a dead dispatch loop proves the agent process is gone.
             closing_state.set_status(mango_external_agents::SessionStatus::Closing);
-            let _ = orphan
-                .kill(mango_external_agents::CancelReason::Shutdown)
-                .await;
-            closing_state.set_status(mango_external_agents::SessionStatus::Closed);
+            let cleanup = if let Some(connection) = watched_connection.upgrade() {
+                connection.begin_shutdown(mango_external_agents::CancelReason::Shutdown);
+                connection.wait_shutdown().await
+            } else {
+                // Dropping the last session handle releases the ACP closure before this watcher
+                // wakes, so no `ConnectionHandle` remains to own the host process control. The
+                // watcher then becomes the last owner and applies the same bounded cleanup.
+                mango_external_agents::process::stop_process_with_limits(
+                    orphan.as_ref(),
+                    mango_external_agents::CancelReason::Shutdown,
+                    &cleanup_limits,
+                )
+                .await
+                .map(|_| ())
+            };
+            if cleanup.is_ok() {
+                closing_state.set_status(mango_external_agents::SessionStatus::Closed);
+            }
         });
         Ok(Box::new(session))
     }

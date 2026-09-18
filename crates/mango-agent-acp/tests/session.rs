@@ -1040,6 +1040,140 @@ async fn closing_a_turn_nobody_is_reading_still_delivers_exactly_one_terminal() 
     );
 }
 
+/// The close operation owns its shutdown and terminal work after it claims the lifecycle. Dropping
+/// the initiating future at a blocked process kill must not leave the session stuck in `Closing`.
+#[tokio::test]
+async fn a_dropped_close_finishes_cleanup_status_and_the_owned_turn() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let launcher = GatedLauncher::new(inner.clone(), false);
+    let opened = AcpHarness::new(profile())
+        .open_session(&gated_host(&launcher), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "keep working"))
+        .await
+        .expect("expected a turn");
+
+    let closing = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::Shutdown).await })
+    };
+    launcher.wait_for_kill().await;
+    closing.abort();
+    launcher.release();
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while session.snapshot().status != SessionStatus::Closed || inner.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the owned close task to finish after its caller was dropped");
+
+    let events = drain(&mut turn).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, EventKind::Completed | EventKind::Error { .. }))
+            .count(),
+        1,
+        "expected one terminal after the dropped close, received {events:?}"
+    );
+}
+
+/// A second close is a joiner, not a second cleanup attempt or an early success while the first
+/// close is still waiting for the host process control.
+#[tokio::test]
+async fn concurrent_closes_wait_for_and_share_one_cleanup_result() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let launcher = GatedLauncher::new(inner, false);
+    let opened = AcpHarness::new(profile())
+        .open_session(&gated_host(&launcher), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+
+    let first = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::Shutdown).await })
+    };
+    launcher.wait_for_kill().await;
+    let mut second = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::Requested).await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut second)
+            .await
+            .is_err(),
+        "a repeated close returned before the first cleanup completed"
+    );
+
+    launcher.release();
+    first
+        .await
+        .expect("expected first close task")
+        .expect("expected first close result");
+    second
+        .await
+        .expect("expected second close task")
+        .expect("expected second close result");
+    assert_eq!(session.snapshot().status, SessionStatus::Closed);
+}
+
+/// A failed process cleanup means the session remains stopping. Reporting `Closed` or allowing a
+/// later prompt would claim a child has gone away when the host said it did not.
+#[tokio::test]
+async fn a_failed_close_cleanup_returns_an_error_and_keeps_admission_closed() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeAcpAgent::new().never_finishing_turns().process());
+    let launcher = GatedLauncher::new(inner, true);
+    let opened = AcpHarness::new(profile())
+        .open_session(&gated_host(&launcher), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "keep working"))
+        .await
+        .expect("expected a turn");
+
+    let close = {
+        let launcher = launcher.clone();
+        let session = Arc::clone(&session);
+        let task = tokio::spawn(async move { session.close(CloseReason::Shutdown).await });
+        launcher.wait_for_kill().await;
+        launcher.release();
+        task.await.expect("expected close task")
+    };
+    assert!(
+        close.is_err(),
+        "expected failed process cleanup, received {close:?}"
+    );
+    assert_eq!(session.snapshot().status, SessionStatus::Closing);
+    let events = drain(&mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Error { .. })),
+        "expected failed cleanup to settle the owned turn, received {events:?}"
+    );
+    let refused = session
+        .start_turn(TurnRequest::new("turn-2", "must not run"))
+        .await
+        .expect_err("a stopping session must reject new work");
+    assert!(
+        matches!(refused.cause(), Error::Closed { subject: "session" }),
+        "received {refused:?}"
+    );
+    assert!(
+        session.close(CloseReason::Requested).await.is_err(),
+        "a repeated close must return the first cleanup failure"
+    );
+}
+
 /// `close` awaits `session/close` for up to its grace period, and a turn still live across that wait is
 /// a window in which the agent can ask for permission. Nothing may grant one while the session is being
 /// torn down — least of all under `ConsentRevoked`, where the machine's owner has just withdrawn the
@@ -1697,6 +1831,90 @@ struct RecordingControl {
     killed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// A launcher whose process cleanup waits at a test-controlled gate.
+///
+/// Keeping the gate in `ProcessControl::kill` makes the test exercise the real ACP connection
+/// shutdown path, including the point at which a caller might drop its `close` future.
+#[derive(Clone)]
+struct GatedLauncher {
+    inner: FakeLauncher,
+    kill_started: CancelToken,
+    release_kill: CancelToken,
+    fail_kill: bool,
+}
+
+impl GatedLauncher {
+    fn new(inner: FakeLauncher, fail_kill: bool) -> Self {
+        Self {
+            inner,
+            kill_started: CancelToken::new(),
+            release_kill: CancelToken::new(),
+            fail_kill,
+        }
+    }
+
+    async fn wait_for_kill(&self) {
+        self.kill_started.cancelled().await;
+    }
+
+    fn release(&self) {
+        self.release_kill.cancel();
+    }
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessLauncher for GatedLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
+        let process = self.inner.spawn(spec).await?;
+        Ok(mango_external_agents::ManagedProcess {
+            control: Arc::new(GatedControl {
+                inner: process.control,
+                kill_started: self.kill_started.clone(),
+                release_kill: self.release_kill.clone(),
+                fail_kill: self.fail_kill,
+            }),
+            ..process
+        })
+    }
+}
+
+struct GatedControl {
+    inner: Arc<dyn mango_external_agents::ProcessControl>,
+    kill_started: CancelToken,
+    release_kill: CancelToken,
+    fail_kill: bool,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ProcessControl for GatedControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<mango_external_agents::ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.kill_started.cancel();
+        self.release_kill.cancelled().await;
+        if self.fail_kill {
+            return Err(Error::Launch {
+                program: String::from("fake ACP agent"),
+                message: String::from("the test process refused termination"),
+            });
+        }
+        self.inner.kill(reason).await
+    }
+}
+
 #[async_trait::async_trait]
 impl mango_external_agents::ProcessControl for RecordingControl {
     fn pid(&self) -> Option<u32> {
@@ -1728,6 +1946,20 @@ fn recording_host(launcher: &KillRecordingLauncher) -> HostContext {
 }
 
 fn bounded_recording_host(launcher: &KillRecordingLauncher) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+fn gated_host(launcher: &GatedLauncher) -> HostContext {
     HostContext::builder()
         .launcher(Arc::new(launcher.clone()))
         .cwd(std::env::temp_dir())

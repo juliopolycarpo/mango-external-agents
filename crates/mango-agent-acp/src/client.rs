@@ -854,6 +854,38 @@ pub(crate) struct ConnectionHandle {
     driver_done: mango_external_agents::CancelToken,
     shutdown_started: AtomicBool,
     shutdown_complete: mango_external_agents::CancelToken,
+    /// The one teardown outcome every close waiter observes. `Error` is intentionally reduced to
+    /// its diagnostic-safe summary here because the core error is not cloneable and a second close
+    /// must still report the first cleanup failure rather than inventing success.
+    shutdown_result: Mutex<Option<std::result::Result<(), String>>>,
+    /// Bounds non-turn ACP requests before they enter the SDK's unbounded pending-request queue.
+    /// A prompt has its own single-turn admission in `SessionState` and does not use this permit.
+    requests: RequestAdmission,
+}
+
+/// Admission in front of ACP's unbounded SDK request queue.
+struct RequestAdmission {
+    permits: tokio::sync::Semaphore,
+    limit: usize,
+}
+
+impl RequestAdmission {
+    fn new(limit: usize) -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(limit),
+            limit,
+        }
+    }
+
+    fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.permits
+            .try_acquire()
+            .map_err(|_| Error::LimitExceeded {
+                subject: "outstanding ACP requests",
+                limit: self.limit,
+                received: self.limit.saturating_add(1),
+            })
+    }
 }
 
 impl std::fmt::Debug for ConnectionHandle {
@@ -950,6 +982,8 @@ pub(crate) async fn drive(
         driver_done,
         shutdown_started: AtomicBool::new(false),
         shutdown_complete: mango_external_agents::CancelToken::new(),
+        shutdown_result: Mutex::new(None),
+        requests: RequestAdmission::new(state.limits.max_pending_requests),
     })
 }
 
@@ -962,14 +996,36 @@ impl ConnectionHandle {
         }
         let connection = Arc::clone(self);
         tokio::spawn(async move {
-            connection.shutdown(reason).await;
+            let result = connection
+                .shutdown(reason)
+                .await
+                .map_err(|error| error.to_string());
+            *connection
+                .shutdown_result
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(result);
             connection.shutdown_complete.cancel();
         });
     }
 
     /// Waits for the shutdown task started by [`Self::begin_shutdown`].
-    pub(crate) async fn wait_shutdown(&self) {
+    pub(crate) async fn wait_shutdown(&self) -> Result<()> {
         self.shutdown_complete.cancelled().await;
+        let result = self
+            .shutdown_result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| {
+                Err(String::from(
+                    "the ACP shutdown task ended without an outcome",
+                ))
+            });
+        result.map_err(|message| {
+            Error::Vendor(link_failure(format!(
+                "ACP connection cleanup failed: {message}"
+            )))
+        })
     }
     /// The connection, for a request a session method sends.
     ///
@@ -1000,7 +1056,7 @@ impl ConnectionHandle {
     /// Closing the connection first is what lets a well-behaved agent see its stdin end and exit on
     /// its own; the kill is the escalation for one that does not, and it is the launcher's own —
     /// this only asks, with the reason.
-    pub(crate) async fn shutdown(&self, reason: mango_external_agents::CancelReason) {
+    pub(crate) async fn shutdown(&self, reason: mango_external_agents::CancelReason) -> Result<()> {
         let signal = self
             .shutdown
             .lock()
@@ -1014,17 +1070,29 @@ impl ConnectionHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(mut driver) = driver {
-            let exited = tokio::time::timeout(self.limits.shutdown_timeout, &mut driver)
-                .await
-                .is_ok();
-            let _ = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
-            if !exited {
-                let _ = tokio::time::timeout(self.limits.shutdown_timeout, &mut driver).await;
+        let driver_error = if let Some(mut driver) = driver {
+            match tokio::time::timeout(self.limits.shutdown_timeout, &mut driver).await {
+                Ok(Ok(Ok(()))) => None,
+                // The transport commonly reports its own close as an error. The driver has still
+                // joined, and process cleanup is the fact that decides whether teardown succeeded.
+                Ok(Ok(Err(_)) | Err(_)) => None,
+                Err(_) => {
+                    driver.abort();
+                    let _ = driver.await;
+                    Some(String::from(
+                        "the ACP connection driver did not stop before the shutdown deadline",
+                    ))
+                }
             }
-            return;
+        } else {
+            None
+        };
+        let process = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
+        process?;
+        if let Some(message) = driver_error {
+            return Err(Error::Vendor(link_failure(message)));
         }
-        let _ = stop_process_with_limits(self.control.as_ref(), reason, &self.limits).await;
+        Ok(())
     }
 }
 
@@ -1053,6 +1121,10 @@ where
     Request: agent_client_protocol::JsonRpcRequest,
     Request::Response: Send,
 {
+    // `ConnectionTo::send_request` enters ACP's own unbounded task queue immediately. Acquire
+    // before constructing that request so a host's pending-request budget remains an admission
+    // bound rather than merely a bound on responses we happened to await.
+    let _permit = connection.requests.acquire()?;
     let sent = connection.connection().send_request(request);
     let answered = tokio::time::timeout(timeout, sent.block_task()).await;
     let Ok(answered) = answered else {
@@ -1099,11 +1171,11 @@ mod tests {
 
     use mango_external_agents::testing::FakeLauncher;
     use mango_external_agents::{
-        AttemptId, Configuration, EventSink, HarnessIdentity, HostContext, SessionIds,
+        AttemptId, Configuration, Error, EventSink, HarnessIdentity, HostContext, SessionIds,
         SessionSnapshot, TransportKind, TransportSelection, TurnId,
     };
 
-    use super::{CancelReason, PermissionLevel, SessionId, SessionState};
+    use super::{CancelReason, PermissionLevel, RequestAdmission, SessionId, SessionState};
 
     /// A bare core session state, for the connection-level state under test to publish facts into.
     fn core_state() -> mango_external_agents::SessionState {
@@ -1240,5 +1312,33 @@ mod tests {
             !state.can_submit_prompt(&first),
             "an ended handle must not retain authority to submit a prompt"
         );
+    }
+
+    /// A generic request must acquire admission before the ACP SDK can queue it, and releasing the
+    /// completed request's RAII permit must admit the next caller.
+    #[test]
+    fn generic_request_admission_is_bounded_and_releases_after_completion() {
+        let admission = RequestAdmission::new(1);
+        let first = admission
+            .acquire()
+            .expect("expected the first request permit");
+        let refused = admission
+            .acquire()
+            .expect_err("expected the second outstanding request to be refused");
+        assert!(
+            matches!(
+                refused,
+                Error::LimitExceeded {
+                    subject: "outstanding ACP requests",
+                    limit: 1,
+                    received: 2,
+                }
+            ),
+            "received {refused:?}"
+        );
+        drop(first);
+        let _next = admission
+            .acquire()
+            .expect("expected the completed request to release admission");
     }
 }

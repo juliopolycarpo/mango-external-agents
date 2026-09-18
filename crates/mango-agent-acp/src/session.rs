@@ -7,7 +7,8 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, ListSessionsRequest, PromptRequest,
@@ -43,7 +44,57 @@ pub struct AcpSession {
     connection: Arc<ConnectionHandle>,
     native_session_id: AcpSessionId,
     agent_capabilities: AgentCapabilities,
-    lifecycle: SessionLifecycle,
+    lifecycle: Arc<SessionLifecycle>,
+    /// The close owner records one result independently of the `close` future that started it.
+    close: Arc<CloseState>,
+}
+
+/// Shared completion for the one close task a session admits.
+pub(crate) struct CloseState {
+    started: AtomicBool,
+    done: mango_external_agents::CancelToken,
+    result: Mutex<Option<std::result::Result<(), String>>>,
+}
+
+impl Default for CloseState {
+    fn default() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            done: mango_external_agents::CancelToken::new(),
+            result: Mutex::new(None),
+        }
+    }
+}
+
+impl CloseState {
+    fn claim(&self) -> bool {
+        !self.started.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether an explicit session close already owns teardown.
+    pub(crate) fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    fn finish(&self, result: Result<()>) {
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(result.map_err(|error| error.to_string()));
+        self.done.cancel();
+    }
+
+    async fn wait(&self) -> Result<()> {
+        self.done.cancelled().await;
+        self.result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| Err(String::from("the ACP close task ended without an outcome")))
+            .map_err(|message| {
+                Error::Vendor(link_failure(format!(
+                    "ACP session cleanup failed: {message}"
+                )))
+            })
+    }
 }
 
 impl std::fmt::Debug for AcpSession {
@@ -79,7 +130,8 @@ impl AcpSession {
             connection,
             native_session_id,
             agent_capabilities,
-            lifecycle: SessionLifecycle::default(),
+            lifecycle: Arc::new(SessionLifecycle::default()),
+            close: Arc::new(CloseState::default()),
         }
     }
 
@@ -426,22 +478,27 @@ impl Session for AcpSession {
             // error that discards the only place its terminal can be reported, then stop the peer
             // before releasing this generation for another ACP prompt.
             self.connection.begin_shutdown(CancelReason::Shutdown);
-            self.connection.wait_shutdown().await;
+            let cleanup_error = self.connection.wait_shutdown().await.err();
             if let Some((turn, _, _)) = self.connection_state.prepare_terminal_matching(&handle)
                 && turn.finish()
             {
-                let _ = turn
-                    .sink
-                    .fail(link_failure(String::from(
-                        "ACP session/cancel could not be queued after prompt admission",
-                    )))
-                    .await;
+                let message = cleanup_error.map_or_else(
+                    || {
+                        String::from(
+                            "ACP session/cancel could not be queued after prompt admission",
+                        )
+                    },
+                    |error| format!("ACP process cleanup failed: {error}"),
+                );
+                let _ = turn.sink.fail(link_failure(message)).await;
                 self.connection_state.release_turn_matching(&handle);
             }
             return Ok(stream.with_dispatch(Dispatch::AcceptanceUnknown));
         }
 
         let state = Arc::clone(&self.connection_state);
+        let connection = Arc::clone(&self.connection);
+        let lifecycle = Arc::clone(&self.lifecycle);
         let outgoing = self.connection.connection().clone();
         let control = Arc::clone(self.connection.control());
         let driver_done = self.connection.driver_done().clone();
@@ -479,16 +536,16 @@ impl Session for AcpSession {
                 () = driver_done.cancelled() => None,
             };
             let cleanup_error = if outcome.is_none() || matches!(outcome, Some(Err(_))) {
-                mango_external_agents::process::stop_process_with_limits(
-                    control.as_ref(),
-                    CancelReason::Shutdown,
-                    &limits,
-                )
-                .await
-                .err()
+                connection.begin_shutdown(CancelReason::Shutdown);
+                connection.wait_shutdown().await.err()
             } else {
                 None
             };
+            // Once `close` owns this session, its task also owns the terminal and the status. A
+            // prompt response racing the close handshake must not publish a competing outcome.
+            if lifecycle.is_closed() {
+                return;
+            }
             // Matched, not taken: a `close` may have ended this turn already, and a *later* turn may
             // have started since, so an unconditional take would terminate a conversation that is not
             // this prompt's.
@@ -611,75 +668,33 @@ impl Session for AcpSession {
             let mut lifecycle = self.lifecycle.lock();
             lifecycle.close()
         };
-        if !claimed {
-            self.connection.begin_shutdown(reason.into());
-            self.connection.wait_shutdown().await;
-            self.session_state.set_status(SessionStatus::Closed);
-            return Ok(());
+        if claimed && self.close.claim() {
+            let close = Arc::clone(&self.close);
+            let state = Arc::clone(&self.connection_state);
+            let session_state = self.session_state.clone();
+            let connection = Arc::clone(&self.connection);
+            let profile = Arc::clone(&self.profile);
+            let native_session_id = self.native_session_id.clone();
+            let capabilities = self.agent_capabilities.clone();
+            let limits = *self.host.limits();
+            tokio::spawn(async move {
+                finish_close(
+                    close,
+                    state,
+                    session_state,
+                    connection,
+                    profile,
+                    native_session_id,
+                    capabilities,
+                    limits,
+                    reason,
+                )
+                .await;
+            });
         }
-        let ending = {
-            self.session_state.set_status(SessionStatus::Closing);
-            let _starting = self.connection_state.lock_turn_start();
-            self.connection_state.begin_cancellation(reason.into());
-            self.connection_state.turn()
-        };
-        // This owned, bounded guard survives a dropped `close` future. A normal close starts the
-        // same shutdown immediately after the ACP handshake; an abandoned one reaches it after the
-        // host's teardown stage instead of leaving the child alive indefinitely.
-        let deferred_shutdown = Arc::clone(&self.connection);
-        let shutdown_timeout = self.host.limits().shutdown_timeout;
-        tokio::spawn(async move {
-            tokio::time::sleep(shutdown_timeout).await;
-            deferred_shutdown.begin_shutdown(reason.into());
-        });
-
-        // Every question the agent is still waiting on is withdrawn first, while the transport is
-        // still up: an unanswered one would leave the agent waiting for a client that has gone.
-        //
-        // Keep the owner installed through the close handshake and process shutdown. A prompt task
-        // that completes during either phase can then settle its own stream; otherwise close claims
-        // the same generation only after no native work can still report against it.
-        self.connection_state.withdraw_pending();
-
-        if self.agent_capabilities.session_capabilities.close.is_some() {
-            let _ = tokio::time::timeout(
-                self.host.limits().shutdown_timeout,
-                self.request(
-                    "session/close",
-                    CloseSessionRequest::new(self.native_session_id.clone()),
-                ),
-            )
-            .await;
-            // Anything the agent asked during the handshake. `on_request_permission` answers such a
-            // question itself once the turn is finished, so this is the belt to that braces: nothing
-            // may be left parked when the transport goes.
-            self.connection_state.withdraw_pending();
-        }
-
-        self.connection.begin_shutdown(reason.into());
-        self.connection.wait_shutdown().await;
-
-        if let Some(handle) = ending
-            && let Some((turn, _, closing)) =
-                self.connection_state.prepare_terminal_matching(&handle)
-        {
-            // The same debts the prompt's own task settles: an open reasoning block and an unfinished
-            // plan activity. A turn cut short by a close owes them just as much as one that ran out.
-            // Core terminal commitment reserves delivery independently of transcript capacity, so
-            // close can settle its owned stream here without leaving a task behind for a reader that
-            // may never resume.
-            if turn.finish() {
-                let _ = turn.approvals.flush(&turn.sink).await;
-                for kind in closing {
-                    let _ = turn.sink.emit(kind).await;
-                }
-                let _ = turn.sink.cancel(reason.into()).await;
-            }
-            self.connection_state.release_turn_matching(&handle);
-        }
-
-        self.session_state.set_status(SessionStatus::Closed);
-        Ok(())
+        // A later close cannot report success until it has observed the first owner's result. The
+        // lifecycle gate above keeps new prompt admission closed even when that result is failure.
+        self.close.wait().await
     }
 
     async fn list_native_sessions(&self, query: SessionQuery) -> Result<SessionPage> {
@@ -723,11 +738,92 @@ impl Session for AcpSession {
     }
 }
 
+/// Completes the one close operation after it has claimed the session lifecycle.
+///
+/// The task owns all awaits so dropping any caller's [`Session::close`] future cannot strand a
+/// native turn, a child process, or the observable session status.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one owned close operation needs its session facts"
+)]
+async fn finish_close(
+    close: Arc<CloseState>,
+    state: Arc<client::SessionState>,
+    session_state: mango_external_agents::SessionState,
+    connection: Arc<ConnectionHandle>,
+    profile: Arc<AcpProfile>,
+    native_session_id: AcpSessionId,
+    capabilities: AgentCapabilities,
+    limits: mango_external_agents::Limits,
+    reason: CloseReason,
+) {
+    session_state.set_status(SessionStatus::Closing);
+    let ending = {
+        let _starting = state.lock_turn_start();
+        state.begin_cancellation(reason.into());
+        state.turn()
+    };
+    // Pending questions are a protocol debt, including questions raised while `session/close` is
+    // in flight. Withdraw them before and after the bounded handshake.
+    state.withdraw_pending();
+    if capabilities.session_capabilities.close.is_some() {
+        let _ = tokio::time::timeout(
+            limits.shutdown_timeout,
+            client::send(
+                connection.as_ref(),
+                profile.as_ref(),
+                limits.request_timeout,
+                "session/close",
+                CloseSessionRequest::new(native_session_id),
+            ),
+        )
+        .await;
+        state.withdraw_pending();
+    }
+
+    connection.begin_shutdown(reason.into());
+    let result = connection.wait_shutdown().await;
+    if let Some(handle) = ending
+        && let Some((turn, _, closing)) = state.prepare_terminal_matching(&handle)
+    {
+        // Terminal commitment is reserved in the core stream, so neither a full transcript nor a
+        // dropped initiating close future can prevent this task from settling its owned turn.
+        if turn.finish() {
+            let _ = turn.approvals.flush(&turn.sink).await;
+            for kind in closing {
+                let _ = turn.sink.emit(kind).await;
+            }
+            match &result {
+                Ok(()) => {
+                    let _ = turn.sink.cancel(reason.into()).await;
+                }
+                Err(error) => {
+                    let _ = turn
+                        .sink
+                        .fail(link_failure(format!("ACP process cleanup failed: {error}")))
+                        .await;
+                }
+            }
+        }
+        state.release_turn_matching(&handle);
+    }
+
+    if result.is_ok() {
+        session_state.set_status(SessionStatus::Closed);
+    }
+    close.finish(result);
+}
+
 impl AcpSession {
     /// The two ids, for a caller holding a concrete session.
     #[must_use]
     pub fn session_ids(&self) -> SessionIds {
         self.session_state.snapshot().ids.clone()
+    }
+
+    /// Shares explicit-close ownership with the connection-loss watcher.
+    pub(crate) fn close_state(&self) -> Arc<CloseState> {
+        Arc::clone(&self.close)
     }
 }
 
