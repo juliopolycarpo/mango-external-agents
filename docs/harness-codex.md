@@ -3,7 +3,7 @@
 Drives the `codex` CLI a user already installed, through `codex app-server` — the interface OpenAI
 documents for rich clients and uses for its own VS Code extension.
 
-Facts on this page were read on 2026-09-13 against `codex-cli 0.154.0`. Re-verify against the
+Facts on this page were read on 2026-09-17 against `codex-cli 0.154.0`. Re-verify against the
 vendor's current documentation before relying on them.
 
 ## The executable and the version gate
@@ -78,8 +78,9 @@ new thread and records why in `SessionSnapshot::fallback_reason`.
 
 `turn/start` on a live turn is taken by the app-server as a **steer** — its own documentation says
 `turnTrigger` is "ignored when this request steers an already-active turn". A host that meant a new
-turn would hold a stream that never gets a `turn/completed` of its own, so a second turn is refused
-before the call is made, as a retryable `codex-turn-already-running`.
+turn would hold a stream that never gets a `turn/completed` of its own, so admission is one locked
+transition and a genuinely live attempt receives the retryable typed `Error::Busy` refusal before
+anything reaches the vendor.
 
 `turn/steer` carries `expectedTurnId` as a precondition. A steer naming a turn that is not the one
 running is refused here rather than landing on whatever turn happens to be live; the app-server's
@@ -100,19 +101,31 @@ request; `UserInput` has no general-purpose file arm.
 
 Cancelling before `turn/start` answers records the request and keeps the vendor's turn slot
 occupied. The returned handle is interrupted as soon as it arrives; another start is refused
-until the vendor completes or the start fails. Late start responses only update their own
-start attempt, even if a host reuses a `TurnId`. This follows the vendor's requirement to name
-the active turn in `turn/interrupt` and `turn/steer`.
+until the vendor completes or the start fails. A transport failure after submission returns a
+`TurnStream` marked `Dispatch::AcceptanceUnknown`, rather than claiming the turn never started;
+the host retains that handle to reconcile or cancel it. Late start responses only update their own
+start attempt, even if a host reuses a `TurnId`. This follows the vendor's requirement to name the
+active turn in `turn/interrupt` and `turn/steer`.
 
-Ambiguous start failures retain the slot until completion or shutdown. Malformed terminal frames
-fail their addressed turn; an unrouteable terminal closes the session. Connection loss and host
-shutdown terminate active streams, release approvals and reap the process. RPC responses settle
-independently of the bounded notification queue; queue overflow closes the connection instead of
-growing memory or silently dropping lifecycle events.
+The slot is released when Codex commits its native terminal, before the host drains buffered
+events. A dropped library `TurnStream` is owner abandonment: the harness refuses pending approvals,
+sends `turn/interrupt`, waits through the host's graceful-turn bound, and closes and reaps the
+app-server if the turn will not settle. A browser disconnect that should leave work running must
+therefore retain the stream in a host supervisor. Dropping the owning session follows the same
+bounded cleanup path. Closing twice is harmless.
 
-Native reviews reject steering with `TurnNotSteerable`. Closing offers the cancellation marker
-and completion atomically within a bounded grace period. A one-event channel can carry only the
-completion; a stalled consumer never receives a cancellation marker without its terminal.
+Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
+Connection loss and host shutdown terminate active streams, release approvals and reap the process.
+Native activity restarts the host's `Limits::idle_timeout`; an outstanding approval pauses that
+clock because its `approval_timeout` is the deadline that governs Codex's blocked wait. Idle expiry
+uses the same `turn/interrupt` and bounded process-reaping path as a dropped stream.
+The transcript has host-configured event, byte, and pending-request limits. Overflow commits a
+reserved `stream-overflow` terminal and drives shutdown instead of growing memory, silently losing
+an approval, or blocking cancellation on an unread consumer.
+
+Native reviews reject steering with `TurnNotSteerable`. Cancellation and close retain the host's
+reason when they win the terminal race; when Codex completed first, its completed outcome remains
+the one terminal fact.
 
 ## The permission matrix
 
@@ -191,8 +204,8 @@ A question has the host's `Limits::approval_timeout` deadline, because the app-s
 of its own and blocks until the client replies. Its `expires_at` is translated once into the core
 `ApprovalDeadline`, so event backpressure cannot restart the timer and broker deliberation and a
 host response share the same deadline; a late host choice is refused even if the expiry waiter has
-not run yet. Backpressure may delay the app-server reply while an approval audit waits
-for the host stream, as for all turn events. On expiry, on a cancel and on a close, every waiting
+not run yet. Publication is bounded and nonblocking, so an approval audit cannot delay the
+app-server reply or restart its deadline. On expiry, on a cancel and on a close, every waiting
 question is answered `decline` — never `cancel`, which would stop a turn a deadline has no business
 stopping. `serverRequest/resolved` releases a question the server stopped waiting on, so the task
 composing a reply does not outlive the question. This is client-side timing only: it adds no

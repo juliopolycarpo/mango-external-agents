@@ -26,7 +26,7 @@ use mango_external_agents::operation::{AttemptId, Dispatch, OperationRef};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionResponse, broker_response,
 };
-use mango_external_agents::process::ProcessControl;
+use mango_external_agents::process::{ProcessControl, stop_process_with_limits};
 use mango_external_agents::session::{
     ATTACHMENT_MAX_BYTES, AccountUsage, CancelReason, CloseReason, NativeSession, ReviewRequest,
     Session, SessionPage, SessionQuery, Steer, SteerOutcome, SteerRejection, TURN_MAX_ATTACHMENTS,
@@ -35,7 +35,7 @@ use mango_external_agents::session::{
 use mango_external_agents::state::{SessionState, SessionStatus};
 use mango_external_agents::stream::{EventSink, ReviewStream, TurnStream};
 use serde_json::Value;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot, watch};
 
 use crate::approvals::{self, PendingApproval};
 use crate::protocol::approvals::{ApprovalDecisionValue, ApprovalResponse, ServerRequest};
@@ -54,8 +54,6 @@ use crate::reducer::{self, Outcome};
 /// `turnTrigger` is "ignored when this request steers an already-active turn". A host that meant a
 /// new turn would receive a stream that never gets a `turn/completed` of its own, so this is
 /// refused before the call is made. Retryable: the running turn will end.
-pub const TURN_ALREADY_RUNNING: ErrorCode = ErrorCode::from_static("codex-turn-already-running");
-
 /// The session or the connection would not take a call.
 pub const CALL_FAILED: ErrorCode = ErrorCode::from_static("codex-call-failed");
 
@@ -64,10 +62,6 @@ pub const CALL_FAILED: ErrorCode = ErrorCode::from_static("codex-call-failed");
 /// A bound on a slow reader, not on a person: a host that is merely behind sees its turn end
 /// normally, and a host that has stopped reading sees the stream close instead.
 const TERMINAL_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// The client bounds peer questions at 256, so an equal cap retains every plausible early
-/// resolution while refusing an unbounded stream of unrelated resolution notices.
-const MAX_EARLY_RESOLUTIONS: usize = 256;
 
 /// Native ids retained after terminal frames so a delayed old frame cannot attach while the next
 /// start still waits for its response.
@@ -187,6 +181,10 @@ pub(crate) struct Shared {
     shutting_down: AtomicBool,
     /// Wakes the session-owned process reaper after an unexpected link termination.
     terminated: mango_external_agents::CancelToken,
+    /// Wakes an abandonment watcher after its owned native turn reaches a terminal outcome.
+    turn_finished: Notify,
+    /// Restarts the one active turn's idle period after a native frame or approval transition.
+    idle_changes: watch::Sender<u64>,
     /// Questions the server stopped waiting on before this side had registered them.
     ///
     /// A `serverRequest/resolved` is read off the same pipe as the request it resolves, and the
@@ -202,6 +200,7 @@ pub(crate) struct Shared {
 impl Shared {
     /// The state one connection's handler and session share, before a thread exists.
     pub(crate) fn new(host: HostContext, session_id: mango_external_agents::SessionId) -> Self {
+        let (idle_changes, _) = watch::channel(0_u64);
         Self {
             host,
             session_id,
@@ -212,6 +211,8 @@ impl Shared {
             pending: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
             terminated: mango_external_agents::CancelToken::new(),
+            turn_finished: Notify::new(),
+            idle_changes,
             resolved_early: Mutex::new(HashMap::new()),
         }
     }
@@ -234,6 +235,30 @@ impl Shared {
         self.shutting_down.load(Ordering::Acquire)
     }
 
+    /// Restarts idle accounting after progress the current native turn made.
+    fn signal_idle_change(&self) {
+        let next = self.idle_changes.borrow().wrapping_add(1);
+        self.idle_changes.send_replace(next);
+    }
+
+    /// Whether the owner has an approval whose deadline, rather than idle time, governs it.
+    async fn approval_is_pending_for(&self, owner: &Arc<()>) -> bool {
+        self.pending
+            .lock()
+            .await
+            .values()
+            .any(|entry| Arc::ptr_eq(&entry.route.owner, owner))
+    }
+
+    /// Whether this owner still has a running native turn whose idle deadline may fire.
+    async fn owner_is_active(&self, owner: &Arc<()>) -> bool {
+        self.turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| !active.finishing && Arc::ptr_eq(&active.owner, owner))
+    }
+
     /// Snapshots the active turn's owner and native id so notification routing remains bound to
     /// the start attempt even while its response is setting the native id.
     async fn active_turn_route(&self) -> Option<ActiveTurnRoute> {
@@ -241,6 +266,7 @@ impl Shared {
             .lock()
             .await
             .as_ref()
+            .filter(|active| !active.finishing)
             .map(|active| ActiveTurnRoute {
                 owner: Arc::clone(&active.owner),
                 turn_id: active.turn_id.clone(),
@@ -255,7 +281,80 @@ impl Shared {
             .lock()
             .await
             .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(&active.owner, &route.owner))
+            .is_some_and(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
+    }
+
+    /// Waits until this owner no longer occupies admission.
+    async fn wait_for_turn_end(&self, owner: &Arc<()>) {
+        loop {
+            let changed = self.turn_finished.notified();
+            if !self
+                .turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.owner, owner))
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Asks Codex to stop one owned turn without ever naming a replacement turn.
+    async fn cancel_owner(
+        &self,
+        client: &Client,
+        owner: Option<&Arc<()>>,
+        reason: CancelReason,
+    ) -> Result<bool> {
+        let Some((route, thread_id, native_turn_id, pending_start)) = ({
+            let mut turn = self.turn.lock().await;
+            turn.as_mut()
+                .filter(|active| {
+                    !active.finishing && owner.is_none_or(|owner| Arc::ptr_eq(&active.owner, owner))
+                })
+                .map(|active| {
+                    active.cancel_reason.get_or_insert(reason);
+                    let pending_start = active.native_turn_id.is_empty();
+                    if pending_start {
+                        active.cancel_before_start = true;
+                    }
+                    (
+                        ActiveTurnRoute {
+                            owner: Arc::clone(&active.owner),
+                            turn_id: active.turn_id.clone(),
+                            attempt: active.attempt,
+                            native_turn_id: active.native_turn_id.clone(),
+                        },
+                        self.thread_id().to_owned(),
+                        active.native_turn_id.clone(),
+                        pending_start,
+                    )
+                })
+        }) else {
+            return Ok(false);
+        };
+
+        self.release_pending(DecisionSource::Cancelled).await;
+        if !self.owns_active_turn(&route).await || pending_start {
+            return Ok(true);
+        }
+
+        let interrupt: Result<Value> = client
+            .request(
+                method::TURN_INTERRUPT,
+                TurnInterruptParams {
+                    thread_id,
+                    turn_id: native_turn_id,
+                },
+            )
+            .await;
+        match interrupt {
+            Ok(_) => Ok(true),
+            Err(error) if self.owns_active_turn(&route).await => Err(error),
+            Err(_) => Ok(true),
+        }
     }
 
     async fn recently_completed(&self, native_turn_id: &str) -> bool {
@@ -307,6 +406,70 @@ struct ActiveTurn {
     /// The server reports only that a turn was interrupted. Who asked, and why, is this side's
     /// knowledge — and "you stopped this turn" is a lie for a shutdown.
     cancel_reason: Option<CancelReason>,
+    /// Stops the native turn if the library stream owner is dropped before completion.
+    abandonment_watcher: Option<tokio::task::JoinHandle<()>>,
+    /// Stops a native turn that remains inactive past the host's configured deadline.
+    idle_watcher: Option<tokio::task::JoinHandle<()>>,
+    /// A terminal is being committed. Admission remains held until it is visible to the host.
+    finishing: bool,
+}
+
+/// The data needed to commit one terminal without holding the admission lock.
+struct TerminalClaim {
+    owner: Arc<()>,
+    sink: EventSink,
+    cancel_reason: Option<CancelReason>,
+}
+
+/// Cleans up admission when the caller drops `start_turn` before it can return a stream owner.
+struct StartGuard {
+    shared: Arc<Shared>,
+    client: Arc<Client>,
+    control: Arc<dyn ProcessControl>,
+    state: SessionState,
+    owner: Arc<()>,
+    armed: bool,
+}
+
+impl StartGuard {
+    fn new(
+        shared: Arc<Shared>,
+        client: Arc<Client>,
+        control: Arc<dyn ProcessControl>,
+        state: SessionState,
+        owner: Arc<()>,
+    ) -> Self {
+        Self {
+            shared,
+            client,
+            control,
+            state,
+            owner,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let client = Arc::clone(&self.client);
+        let control = Arc::clone(&self.control);
+        let state = self.state.clone();
+        let owner = Arc::clone(&self.owner);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                CodexSession::abandon_owner(shared, client, control, state, owner).await;
+            });
+        }
+    }
 }
 
 /// The identity one notification must retain from parsing through emission or completion.
@@ -372,31 +535,19 @@ enum PendingTake {
 impl Shared {
     /// Puts one event on the running turn's stream.
     ///
-    /// The sink is taken out from under the lock before it is used, and that is the whole point of
-    /// the extra statement. The turn channel is bounded: a host that stops reading parks this
-    /// `emit`, and parking while holding the turn lock would park every other caller of it —
-    /// `cancel`, `close`, the next `start_turn` — on a host that is never coming back. A close
-    /// that cannot return is worse than a turn that cannot be fed.
-    ///
-    /// A turn whose host has dropped the stream stays installed, and the event is dropped
-    /// instead. A closed sink refuses immediately and without parking, so there is nothing to save
-    /// by forgetting the turn — and forgetting it would open the trap the running-turn guard
-    /// exists to close: the vendor's turn runs on whether or not anybody is listening, and a free
-    /// slot would let the next `turn/start` out to be read as a steer of it. `turn/completed`
-    /// ends this turn, as it ends every other.
-    ///
-    /// A refusal is also not always a host that left. The core refuses an event it cannot bound —
-    /// a vendor id past the length limit — and losing the turn over one unrenderable event would
-    /// close a host's stream with no terminal at all.
-    async fn emit(&self, kind: EventKind) {
+    /// The bounded sink never waits for a reader. Its receiver's drop is observed separately by
+    /// the abandonment watcher, which stops the native turn instead of leaving it unowned.
+    async fn emit(&self, kind: EventKind) -> Result<()> {
         let sink = {
             let turn = self.turn.lock().await;
-            turn.as_ref().map(|active| active.sink.clone())
+            turn.as_ref()
+                .filter(|active| !active.finishing)
+                .map(|active| active.sink.clone())
         };
         let Some(sink) = sink else {
-            return;
+            return Ok(());
         };
-        let _ = sink.emit(kind).await;
+        sink.emit(kind).await
     }
 
     /// Wins the race to announce one attempt's acceptance.
@@ -417,7 +568,7 @@ impl Shared {
         let mut turn = self.turn.lock().await;
         let active = turn
             .as_mut()
-            .filter(|active| Arc::ptr_eq(&active.owner, owner));
+            .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, owner));
         let Some(active) = active else {
             return Ok(None);
         };
@@ -430,17 +581,86 @@ impl Shared {
     }
 
     /// Puts one event on the stream that still belongs to this start attempt.
-    async fn emit_for(&self, route: &ActiveTurnRoute, kind: EventKind) {
+    async fn emit_for(&self, route: &ActiveTurnRoute, kind: EventKind) -> Result<()> {
         let sink = {
             let turn = self.turn.lock().await;
             turn.as_ref()
-                .filter(|active| Arc::ptr_eq(&active.owner, &route.owner))
+                .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
                 .map(|active| active.sink.clone())
         };
         let Some(sink) = sink else {
-            return;
+            return Ok(());
         };
-        let _ = sink.emit(kind).await;
+        sink.emit(kind).await
+    }
+
+    /// Claims a turn's terminal while retaining admission until it is committed.
+    async fn claim_terminal(&self, owner: Option<&Arc<()>>) -> Option<TerminalClaim> {
+        let mut turn = self.turn.lock().await;
+        let active = turn.as_mut().filter(|active| {
+            !active.finishing && owner.is_none_or(|owner| Arc::ptr_eq(&active.owner, owner))
+        })?;
+        active.finishing = true;
+        Some(TerminalClaim {
+            owner: Arc::clone(&active.owner),
+            sink: active.sink.clone(),
+            cancel_reason: active.cancel_reason,
+        })
+    }
+
+    /// Releases admission only after the terminal claimed above is visible to the host.
+    async fn release_terminal(&self, owner: &Arc<()>) {
+        let watchers = {
+            let mut turn = self.turn.lock().await;
+            if turn
+                .as_ref()
+                .is_some_and(|active| active.finishing && Arc::ptr_eq(&active.owner, owner))
+            {
+                turn.take().map(|mut active| {
+                    (
+                        active.abandonment_watcher.take(),
+                        active.idle_watcher.take(),
+                    )
+                })
+            } else {
+                None
+            }
+        };
+        self.turn_finished.notify_waiters();
+        if let Some((abandonment, idle)) = watchers {
+            if let Some(watcher) = abandonment {
+                watcher.abort();
+            }
+            if let Some(watcher) = idle {
+                watcher.abort();
+            }
+        }
+    }
+
+    /// Commits the terminal before releasing the matching admission slot.
+    async fn commit_terminal(
+        &self,
+        claim: TerminalClaim,
+        events: Vec<EventKind>,
+        cancelled: Option<CancelReason>,
+        failure: Option<VendorError>,
+    ) {
+        for event in events {
+            let _ = claim.sink.emit(event).await;
+        }
+        let _ = match (failure, cancelled) {
+            (Some(failure), _) => claim.sink.fail(failure).await,
+            // The reason this side recorded wins over the server's bare "interrupted": a shutdown
+            // is not a person pressing stop, and the host is entitled to know which it was.
+            (None, Some(reason)) => {
+                claim
+                    .sink
+                    .cancel(claim.cancel_reason.unwrap_or(reason))
+                    .await
+            }
+            (None, None) => claim.sink.complete().await,
+        };
+        self.release_terminal(&claim.owner).await;
     }
 
     /// Ends the running turn, if there is one.
@@ -453,26 +673,11 @@ impl Shared {
         else {
             return;
         };
-        let Some(active) = self.turn.lock().await.take() else {
+        let Some(claim) = self.claim_terminal(None).await else {
             return;
         };
-        for event in events {
-            if active.sink.emit(event).await.is_err() {
-                return;
-            }
-        }
-        let _ = match (failure, cancelled) {
-            (Some(failure), _) => active.sink.fail(failure).await,
-            // The reason this side recorded wins over the server's bare "interrupted": a shutdown
-            // is not a person pressing stop, and the host is entitled to know which it was.
-            (None, Some(reason)) => {
-                active
-                    .sink
-                    .cancel(active.cancel_reason.unwrap_or(reason))
-                    .await
-            }
-            (None, None) => active.sink.complete().await,
-        };
+        self.commit_terminal(claim, events, cancelled, failure)
+            .await;
     }
 
     /// Ends the stream that still belongs to this start attempt.
@@ -490,18 +695,7 @@ impl Shared {
         else {
             return;
         };
-        let active = {
-            let mut turn = self.turn.lock().await;
-            if turn
-                .as_ref()
-                .is_some_and(|active| Arc::ptr_eq(&active.owner, &route.owner))
-            {
-                turn.take()
-            } else {
-                None
-            }
-        };
-        let Some(active) = active else {
+        let Some(claim) = self.claim_terminal(Some(&route.owner)).await else {
             return;
         };
         self.remember_completed(
@@ -510,29 +704,17 @@ impl Shared {
                 .unwrap_or(&route.native_turn_id),
         )
         .await;
-        for event in events {
-            if active.sink.emit(event).await.is_err() {
-                return;
-            }
-        }
-        let _ = match (failure, cancelled) {
-            (Some(failure), _) => active.sink.fail(failure).await,
-            (None, Some(reason)) => {
-                active
-                    .sink
-                    .cancel(active.cancel_reason.unwrap_or(reason))
-                    .await
-            }
-            (None, None) => active.sink.complete().await,
-        };
+        self.commit_terminal(claim, events, cancelled, failure)
+            .await;
     }
 
     /// Ends a turn because the host is shutting the session down.
     async fn cancel_active(&self, reason: CancelReason) {
-        let Some(active) = self.turn.lock().await.take() else {
+        let Some(claim) = self.claim_terminal(None).await else {
             return;
         };
-        let _ = tokio::time::timeout(TERMINAL_GRACE, active.sink.cancel_on_close(reason)).await;
+        let _ = claim.sink.cancel_on_close(reason).await;
+        self.release_terminal(&claim.owner).await;
     }
 
     /// Fails the active stream after the peer disappears without a terminal notification.
@@ -541,7 +723,7 @@ impl Shared {
             return;
         }
         self.release_pending(DecisionSource::Cancelled).await;
-        let Some(active) = self.turn.lock().await.take() else {
+        let Some(claim) = self.claim_terminal(None).await else {
             self.terminated.cancel();
             return;
         };
@@ -569,7 +751,8 @@ impl Shared {
         self.terminated.cancel();
         let failure =
             VendorError::new(CALL_FAILED, message).with_vendor_code("connection-terminated", true);
-        let _ = tokio::time::timeout(TERMINAL_GRACE, active.sink.fail(failure)).await;
+        let _ = tokio::time::timeout(TERMINAL_GRACE, claim.sink.fail(failure)).await;
+        self.release_terminal(&claim.owner).await;
     }
 
     /// Fails the active turn under a bound and wakes the reaper after an unrecoverable protocol
@@ -579,8 +762,9 @@ impl Shared {
             return;
         }
         self.release_pending(DecisionSource::Cancelled).await;
-        if let Some(active) = self.turn.lock().await.take() {
-            let _ = tokio::time::timeout(TERMINAL_GRACE, active.sink.fail(failure)).await;
+        if let Some(claim) = self.claim_terminal(None).await {
+            let _ = tokio::time::timeout(TERMINAL_GRACE, claim.sink.fail(failure)).await;
+            self.release_terminal(&claim.owner).await;
         }
         self.terminated.cancel();
     }
@@ -592,6 +776,7 @@ impl Shared {
     async fn release_pending(&self, source: DecisionSource) {
         let waiting: Vec<PendingEntry> =
             self.pending.lock().await.drain().map(|(_, e)| e).collect();
+        self.signal_idle_change();
         let deadline = tokio::time::Instant::now() + TERMINAL_GRACE;
         let mut audits = Vec::with_capacity(waiting.len());
         for entry in waiting {
@@ -616,7 +801,7 @@ impl Shared {
             else {
                 return;
             };
-            // A full host stream must not stop close, cancellation, or EOF recovery from
+            // A bounded host stream must not stop close, cancellation, or EOF recovery from
             // releasing every vendor request above. All audits share this one grace period.
             let _ = tokio::time::timeout(remaining, self.emit_for(&route, event)).await;
         }
@@ -633,6 +818,8 @@ impl Shared {
             return PendingTake::Missing;
         };
         if Arc::ptr_eq(&entry.route.owner, &route.owner) {
+            drop(pending);
+            self.signal_idle_change();
             return PendingTake::Taken;
         }
         pending.insert(request_id.clone(), entry);
@@ -732,6 +919,8 @@ impl PeerHandler for CodexHandler {
             }
         }
 
+        self.shared.signal_idle_change();
+
         let outcome = reducer::reduce_for_active_turn(
             &notification,
             self.shared.thread_id(),
@@ -741,10 +930,19 @@ impl PeerHandler for CodexHandler {
         match outcome {
             Outcome::Emit(events) => {
                 for event in events {
-                    if notification.requires_native_turn_match() {
-                        self.shared.emit_for(&active_route, event).await;
+                    let emitted = if notification.requires_native_turn_match() {
+                        self.shared.emit_for(&active_route, event).await
                     } else {
-                        self.shared.emit(event).await;
+                        self.shared.emit(event).await
+                    };
+                    if matches!(emitted, Err(Error::LimitExceeded { .. })) {
+                        self.shared
+                            .poison(VendorError::new(
+                                CALL_FAILED,
+                                "expected bounded Codex transcript publication, received overflow",
+                            ))
+                            .await;
+                        return;
                     }
                 }
             }
@@ -922,6 +1120,9 @@ impl CodexHandler {
             if pending_entries.contains_key(&request_id) {
                 return Some(pending.refusal());
             }
+            if pending_entries.len() >= self.shared.host.limits().max_pending_requests {
+                return Some(pending.refusal());
+            }
             pending_entries.insert(
                 request_id.clone(),
                 PendingEntry {
@@ -933,6 +1134,7 @@ impl CodexHandler {
                 },
             );
         }
+        self.shared.signal_idle_change();
 
         // And the server may already have stopped waiting, in a race this side cannot see from
         // the outside: the release is read off the same pipe and runs beside this task.
@@ -968,9 +1170,10 @@ impl CodexHandler {
             return None;
         }
 
-        // The stream deliberately backpressures the app-server. The deadline was created before
-        // this await, so a full stream may delay its reply but cannot restart the decision window.
-        self.shared
+        // The deadline is created before publication, so bounded publication cannot restart the
+        // decision window while the host catches up.
+        let emitted = self
+            .shared
             .emit_for(
                 &route,
                 EventKind::ApprovalRequested {
@@ -978,6 +1181,15 @@ impl CodexHandler {
                 },
             )
             .await;
+        if matches!(emitted, Err(Error::LimitExceeded { .. })) {
+            self.shared
+                .poison(VendorError::new(
+                    CALL_FAILED,
+                    "expected room for a bounded Codex approval, received transcript overflow",
+                ))
+                .await;
+            return Some(pending.refusal());
+        }
 
         let broker = deadline.run(broker_response(self.shared.host.broker(), &bounded));
         tokio::pin!(broker);
@@ -1152,7 +1364,9 @@ impl CodexHandler {
         request_id: &InteractionId,
         decision: ApprovalDecision,
     ) {
-        self.shared
+        self.shared.signal_idle_change();
+        let _ = self
+            .shared
             .emit_for(
                 route,
                 EventKind::ApprovalResolved {
@@ -1181,7 +1395,7 @@ impl CodexHandler {
             if let Some(existing_route) = early.get(request_key) {
                 return Arc::ptr_eq(existing_route, &route.owner);
             }
-            if early.len() == MAX_EARLY_RESOLUTIONS {
+            if early.len() >= self.shared.host.limits().max_pending_requests {
                 return false;
             }
             early.insert(request_key.to_owned(), Arc::clone(&route.owner));
@@ -1193,12 +1407,173 @@ impl CodexHandler {
             && let Some(entry) = pending.remove(&id)
         {
             let _ = entry.answer.send(Answer::ResolvedByTheServer);
+            drop(pending);
+            self.shared.signal_idle_change();
         }
         true
     }
 }
 
 impl CodexSession {
+    /// Stops one abandoned stream owner, preserving the session when Codex confirms its terminal.
+    async fn abandon_owner(
+        shared: Arc<Shared>,
+        client: Arc<Client>,
+        control: Arc<dyn ProcessControl>,
+        state: SessionState,
+        owner: Arc<()>,
+    ) {
+        Self::stop_owner(
+            shared,
+            client,
+            control,
+            state,
+            owner,
+            CancelReason::Requested,
+        )
+        .await;
+    }
+
+    /// Cancels one owned native turn and escalates only when its terminal does not arrive.
+    async fn stop_owner(
+        shared: Arc<Shared>,
+        client: Arc<Client>,
+        control: Arc<dyn ProcessControl>,
+        state: SessionState,
+        owner: Arc<()>,
+        reason: CancelReason,
+    ) {
+        if !shared.owner_is_active(&owner).await {
+            return;
+        }
+        let limits = *shared.host.limits();
+        let _ = tokio::time::timeout(
+            limits.kill_grace,
+            shared.cancel_owner(&client, Some(&owner), reason),
+        )
+        .await;
+        if tokio::time::timeout(limits.shutdown_timeout, shared.wait_for_turn_end(&owner))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        Self::shutdown_session(shared, client, control, state, reason).await;
+    }
+
+    /// Closes the connection and reaps its child after native cancellation did not settle it.
+    async fn shutdown_session(
+        shared: Arc<Shared>,
+        client: Arc<Client>,
+        control: Arc<dyn ProcessControl>,
+        state: SessionState,
+        reason: CancelReason,
+    ) {
+        state.set_status(SessionStatus::Closing);
+        shared.stop_new_work();
+        let limits = *shared.host.limits();
+        let _ = tokio::time::timeout(
+            limits.kill_grace,
+            shared.cancel_owner(&client, None, reason),
+        )
+        .await;
+        shared.release_pending(DecisionSource::Cancelled).await;
+        shared.cancel_active(reason).await;
+        let _ = tokio::time::timeout(limits.shutdown_timeout, client.close()).await;
+        let _ = stop_process_with_limits(&*control, reason, &limits).await;
+        state.set_status(SessionStatus::Closed);
+    }
+
+    /// Starts a watcher after a stream reaches its caller, making stream drop explicit ownership
+    /// abandonment rather than an invisible native turn.
+    async fn watch_stream_abandonment(&self, owner: Arc<()>, sink: EventSink) {
+        let shared = Arc::clone(&self.shared);
+        let client = Arc::clone(&self.client);
+        let control = Arc::clone(&self.control);
+        let state = self.state.clone();
+        let abandoned_owner = Arc::clone(&owner);
+        let watcher = tokio::spawn(async move {
+            sink.closed().await;
+            tokio::spawn(async move {
+                Self::abandon_owner(shared, client, control, state, abandoned_owner).await;
+            });
+        });
+        let idle_shared = Arc::clone(&self.shared);
+        let idle_client = Arc::clone(&self.client);
+        let idle_control = Arc::clone(&self.control);
+        let idle_state = self.state.clone();
+        let idle_owner = Arc::clone(&owner);
+        let idle_watcher = tokio::spawn(async move {
+            Self::watch_idle(
+                idle_shared,
+                idle_client,
+                idle_control,
+                idle_state,
+                idle_owner,
+            )
+            .await;
+        });
+        let mut turn = self.shared.turn.lock().await;
+        if let Some(active) = turn
+            .as_mut()
+            .filter(|active| Arc::ptr_eq(&active.owner, &owner))
+        {
+            active.abandonment_watcher = Some(watcher);
+            active.idle_watcher = Some(idle_watcher);
+        } else {
+            watcher.abort();
+            idle_watcher.abort();
+        }
+    }
+
+    /// Enforces the host's idle deadline, pausing while an approval owns the turn's wait phase.
+    async fn watch_idle(
+        shared: Arc<Shared>,
+        client: Arc<Client>,
+        control: Arc<dyn ProcessControl>,
+        state: SessionState,
+        owner: Arc<()>,
+    ) {
+        let mut changes = shared.idle_changes.subscribe();
+        let idle_timeout = shared.host.limits().idle_timeout;
+        loop {
+            if !shared.owner_is_active(&owner).await {
+                return;
+            }
+            if shared.approval_is_pending_for(&owner).await {
+                if changes.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(idle_timeout) => {
+                    if shared.owner_is_active(&owner).await
+                        && !shared.approval_is_pending_for(&owner).await
+                    {
+                        tokio::spawn(async move {
+                            Self::stop_owner(
+                                shared,
+                                client,
+                                control,
+                                state,
+                                owner,
+                                CancelReason::Timeout,
+                            )
+                            .await;
+                        });
+                    }
+                    return;
+                }
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// A session over a connection that is already pumping and already has a thread.
     pub(crate) fn new(
         state: SessionState,
@@ -1219,27 +1594,28 @@ impl CodexSession {
         let shutdown_watcher = tokio::spawn(async move {
             tokio::select! {
                 () = cancel.cancelled() => {
-                    // Published before the wind-down, so a subscriber sees the transition rather
-                    // than only its result. Monotonic, so a `close` racing this cannot walk it back.
-                    watcher_state.set_status(SessionStatus::Closing);
-                    if watcher_shared.stop_new_work() {
-                        watcher_shared
-                            .release_pending(DecisionSource::Cancelled)
-                            .await;
-                        watcher_shared.cancel_active(CancelReason::Shutdown).await;
-                    }
-                    let _ = watcher_client.close().await;
+                    Self::shutdown_session(
+                        watcher_shared,
+                        watcher_client,
+                        watcher_control,
+                        watcher_state,
+                        CancelReason::Shutdown,
+                    )
+                    .await;
                 }
                 () = terminated.cancelled() => {
                     // The connection is already gone; `connection_terminated` or `poison` failed
                     // the active turn before cancelling this token.
-                    watcher_state.set_status(SessionStatus::Closing);
+                    Self::shutdown_session(
+                        watcher_shared,
+                        watcher_client,
+                        watcher_control,
+                        watcher_state,
+                        CancelReason::Shutdown,
+                    )
+                    .await;
                 }
             }
-            let _ = watcher_control.kill(CancelReason::Shutdown).await;
-            // The child is released, so nothing more can happen on this session whichever branch
-            // ran. Reported even when the kill failed: no later operation can make progress.
-            watcher_state.set_status(SessionStatus::Closed);
         });
         let accepted = state.snapshot().configuration.accepted.clone();
         Self {
@@ -1279,12 +1655,12 @@ impl CodexSession {
             return Err(Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted));
         }
 
-        let (sink, events) = EventSink::new(
+        let (sink, events) = EventSink::with_limits(
             self.shared.session_id.clone(),
             turn_id.clone(),
             attempt,
             Arc::clone(self.shared.host.clock()),
-            self.shared.host.limits().turn_channel_capacity,
+            self.shared.host.limits(),
         );
         let owner = Arc::new(());
         let generation;
@@ -1294,15 +1670,7 @@ impl CodexSession {
             if turn.is_some() {
                 // Refused under the lock, so two callers racing cannot both find it free. The
                 // app-server would take the second as a steer of the first.
-                return Err(Error::Vendor(
-                    VendorError::new(
-                        TURN_ALREADY_RUNNING,
-                        "expected no turn to be running, received a request to start one while \
-                         another is live; the app-server would take it as a steer",
-                    )
-                    .with_vendor_code("turn-active", true),
-                )
-                .with_dispatch(Dispatch::NotSubmitted));
+                return Err(Error::Busy.with_dispatch(Dispatch::NotSubmitted));
             }
             // Installed before the call, because notifications for this turn can arrive before its
             // own response does.
@@ -1316,11 +1684,21 @@ impl CodexSession {
                 is_review: rpc_method == method::REVIEW_START,
                 cancel_before_start: false,
                 cancel_reason: None,
+                abandonment_watcher: None,
+                idle_watcher: None,
+                finishing: false,
             });
             let mut state = self.configuration.lock().await;
             state.next_generation += 1;
             generation = state.next_generation;
         }
+        let mut start_guard = StartGuard::new(
+            Arc::clone(&self.shared),
+            Arc::clone(&self.client),
+            Arc::clone(&self.control),
+            self.state.clone(),
+            Arc::clone(&owner),
+        );
 
         let answer: Result<R> = self.client.request(rpc_method, params).await;
         let (handle, extra) = match answer {
@@ -1331,7 +1709,14 @@ impl CodexSession {
                     // the app-server accepted the request. Keeping the slot occupied prevents
                     // the next start from becoming a steer of a vendor turn whose handle never
                     // reached this client.
-                    return Err(error.with_dispatch(Dispatch::AcceptanceUnknown));
+                    self.watch_stream_abandonment(Arc::clone(&owner), sink.clone())
+                        .await;
+                    start_guard.disarm();
+                    return Ok((
+                        TurnStream::accepted(turn_id, attempt, String::new(), events)
+                            .with_dispatch(Dispatch::AcceptanceUnknown),
+                        None,
+                    ));
                 }
                 // The turn never started, so the stream it would have written to is closed here
                 // rather than left for a `turn/completed` that will never come. Nothing to
@@ -1434,6 +1819,8 @@ impl CodexSession {
             self.interrupt(handle.id.clone()).await;
         }
 
+        self.watch_stream_abandonment(owner, sink).await;
+        start_guard.disarm();
         Ok((
             TurnStream::accepted(turn_id, attempt, native_turn_id, events),
             extra,
@@ -1604,6 +1991,7 @@ impl Session for CodexSession {
                 received: response.interaction_id.to_string(),
             });
         };
+        self.shared.signal_idle_change();
         if entry.deadline.is_elapsed() {
             let decision = entry.pending.refusal();
             let option_id = decision.option_id().to_owned();
@@ -1649,65 +2037,36 @@ impl Session for CodexSession {
     }
 
     async fn cancel(&self, reason: CancelReason) -> Result<()> {
-        let Some((route, thread_id, turn_id, pending_start)) = ({
-            let mut turn = self.shared.turn.lock().await;
-            turn.as_mut().map(|active| {
-                active.cancel_reason = Some(reason);
-                let pending_start = active.native_turn_id.is_empty();
-                if pending_start {
-                    active.cancel_before_start = true;
-                }
-                (
-                    ActiveTurnRoute {
-                        owner: Arc::clone(&active.owner),
-                        turn_id: active.turn_id.clone(),
-                        attempt: active.attempt,
-                        native_turn_id: active.native_turn_id.clone(),
-                    },
-                    self.shared.thread_id().to_owned(),
-                    active.native_turn_id.clone(),
-                    pending_start,
+        let grace = self.shared.host.limits().kill_grace;
+        let cancellation =
+            tokio::time::timeout(grace, self.shared.cancel_owner(&self.client, None, reason)).await;
+        match cancellation {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => {
+                Self::shutdown_session(
+                    Arc::clone(&self.shared),
+                    Arc::clone(&self.client),
+                    Arc::clone(&self.control),
+                    self.state.clone(),
+                    reason,
                 )
-            })
-        }) else {
-            // No turn to stop. Not an error: a host that cancels twice, or cancels a turn that
-            // just ended, has asked for a state that already holds.
-            return Ok(());
-        };
-
-        // Every question the server is waiting on is refused first. Interrupting a turn whose
-        // approval is still blocking would leave the server waiting on a prompt for a turn that is
-        // being stopped.
-        self.shared.release_pending(DecisionSource::Cancelled).await;
-
-        // Completion and the next start may race with approval cleanup. A cancel belongs only to
-        // the start attempt it observed, so it becomes a no-op once that owner no longer holds
-        // the slot rather than interrupting a replacement turn or surfacing its no-active error.
-        if !self.shared.owns_active_turn(&route).await {
-            return Ok(());
-        }
-
-        if pending_start {
-            // The turn's own handle had not come back when the slot was read, so there was nothing
-            // to name in an interrupt. Keep the slot occupied until `begin` receives the handle
-            // and interrupts it, or the start fails. The stream has not reached the caller yet;
-            // the vendor's completion supplies its one terminal after the interrupt.
-            return Ok(());
-        }
-
-        let interrupt: Result<Value> = self
-            .client
-            .request(
-                method::TURN_INTERRUPT,
-                TurnInterruptParams { thread_id, turn_id },
-            )
-            .await;
-        match interrupt {
-            Ok(_) => Ok(()),
-            Err(error) if self.shared.owns_active_turn(&route).await => Err(error),
-            // The owner ended while the interrupt was in flight. Its requested end has already
-            // happened, and an error from the former turn must not be reported for a replacement.
-            Err(_) => Ok(()),
+                .await;
+                Err(error)
+            }
+            Err(_) => {
+                Self::shutdown_session(
+                    Arc::clone(&self.shared),
+                    Arc::clone(&self.client),
+                    Arc::clone(&self.control),
+                    self.state.clone(),
+                    reason,
+                )
+                .await;
+                Err(Error::Timeout {
+                    operation: String::from("Codex native turn interruption"),
+                    after: grace,
+                })
+            }
         }
     }
 
@@ -1715,20 +2074,16 @@ impl Session for CodexSession {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.state.set_status(SessionStatus::Closing);
         self.shutdown_watcher.abort();
-        self.shared.stop_new_work();
-        self.shared.release_pending(DecisionSource::Cancelled).await;
-        // The turn ends here rather than on a notification: the connection is about to go, and a
-        // host holding a stream that will never terminate is worse than one told why it stopped.
-        // Nothing is interrupted here: the child is about to be killed, which stops every turn on
-        // it more thoroughly than a call could.
-        self.shared.cancel_active(CancelReason::from(reason)).await;
-
-        let closed = self.client.close().await;
-        let killed = self.control.kill(CancelReason::from(reason)).await;
-        self.state.set_status(SessionStatus::Closed);
-        closed.and(killed)
+        Self::shutdown_session(
+            Arc::clone(&self.shared),
+            Arc::clone(&self.client),
+            Arc::clone(&self.control),
+            self.state.clone(),
+            CancelReason::from(reason),
+        )
+        .await;
+        Ok(())
     }
 
     async fn steer(&self, steer: Steer) -> Result<SteerOutcome> {
@@ -1883,6 +2238,19 @@ impl Session for CodexSession {
 impl Drop for CodexSession {
     fn drop(&mut self) {
         self.shutdown_watcher.abort();
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let client = Arc::clone(&self.client);
+        let control = Arc::clone(&self.control);
+        let state = self.state.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                Self::shutdown_session(shared, client, control, state, CancelReason::Shutdown)
+                    .await;
+            });
+        }
     }
 }
 
@@ -1931,10 +2299,7 @@ mod tests {
     use mango_external_agents::stream::EventSink;
     use mango_external_agents::testing::FakeLauncher;
 
-    use super::{
-        ActiveTurn, CodexHandler, MAX_EARLY_RESOLUTIONS, Shared, base64, data_url,
-        supports_image_mime_type,
-    };
+    use super::{ActiveTurn, CodexHandler, Shared, base64, data_url, supports_image_mime_type};
     use crate::reducer::Outcome;
     use mango_external_agents::jsonrpc::PeerHandler;
 
@@ -2014,6 +2379,9 @@ mod tests {
             is_review: false,
             cancel_before_start: false,
             cancel_reason: None,
+            abandonment_watcher: None,
+            idle_watcher: None,
+            finishing: false,
         });
         (
             turn_id.clone(),
@@ -2035,7 +2403,7 @@ mod tests {
         let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
         drop(stream);
 
-        shared
+        let _ = shared
             .emit(EventKind::TextDelta {
                 text: String::from("nobody is reading this"),
             })
@@ -2270,6 +2638,66 @@ mod tests {
         );
     }
 
+    /// Completion retains admission until its terminal is committed, even when nobody drains it.
+    #[tokio::test]
+    async fn completion_commits_its_terminal_before_releasing_admission() {
+        let shared = shared();
+        let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
+        let route = shared
+            .active_turn_route()
+            .await
+            .expect("expected an active turn route");
+        let completed = Arc::clone(&shared);
+        let held_completion_log = shared.recent_completed_turns.lock().await;
+        let completion = tokio::spawn(async move {
+            completed
+                .finish_for(
+                    &route,
+                    Some("vendor-turn-1"),
+                    Outcome::Finish {
+                        events: Vec::new(),
+                        cancelled: None,
+                        failure: None,
+                    },
+                )
+                .await;
+        });
+
+        for _ in 0..100 {
+            if shared
+                .turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|active| active.finishing)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            shared.turn.lock().await.is_some(),
+            "expected a terminal in progress to retain admission"
+        );
+        assert!(
+            stream.terminal_status().is_none(),
+            "expected the held completion to keep the terminal uncommitted"
+        );
+
+        drop(held_completion_log);
+        completion
+            .await
+            .expect("expected completion task to finish");
+        assert!(
+            stream.terminal_status().is_some(),
+            "expected terminal status without consuming transcript events"
+        );
+        assert!(
+            shared.turn.lock().await.is_none(),
+            "expected admission release after terminal commitment"
+        );
+    }
+
     /// A delayed frame for the turn that just ended cannot claim the next start before its
     /// response gives that start a native id.
     #[tokio::test]
@@ -2377,7 +2805,7 @@ mod tests {
         let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
         {
             let mut early = shared.resolved_early.lock().await;
-            for index in 0..MAX_EARLY_RESOLUTIONS {
+            for index in 0..shared.host.limits().max_pending_requests {
                 early.insert(index.to_string(), Arc::new(()));
             }
         }

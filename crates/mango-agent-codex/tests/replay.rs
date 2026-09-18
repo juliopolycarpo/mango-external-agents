@@ -686,9 +686,8 @@ async fn a_second_turn_started_while_one_is_running_is_refused_rather_than_steer
         .expect_err("expected a refusal, received a second turn");
 
     assert!(
-        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
-                 if vendor.code.as_str() == "codex-turn-already-running"),
-        "expected the turn-already-running refusal, received {error:?}"
+        matches!(error.cause(), mango_external_agents::Error::Busy),
+        "expected a typed busy refusal, received {error:?}"
     );
     assert!(
         error.retryable(),
@@ -724,9 +723,8 @@ async fn a_cancelled_start_holds_the_slot_until_its_vendor_handle_arrives() {
         .await
         .expect_err("expected the unnamed vendor turn to keep the slot occupied");
     assert!(
-        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
-                 if vendor.code.as_str() == "codex-turn-already-running"),
-        "expected a running-turn refusal, received {error:?}"
+        matches!(error.cause(), mango_external_agents::Error::Busy),
+        "expected a typed busy refusal, received {error:?}"
     );
     assert_eq!(
         launcher
@@ -778,6 +776,41 @@ async fn a_cancelled_start_holds_the_slot_until_its_vendor_handle_arrives() {
     );
 }
 
+/// A caller that abandons `start_turn` before a handle exists cannot strand the admission slot or
+/// leave a hidden app-server process behind.
+#[tokio::test(start_paused = true)]
+async fn dropping_a_start_future_reaps_an_unacknowledged_attempt() {
+    let (session, launcher) =
+        open_with_delayed_first_start(DelayedStartAnswer::Success, false).await;
+    let starting_session = Arc::clone(&session);
+    let start = tokio::spawn(async move {
+        starting_session
+            .start_turn(TurnRequest::new("turn-abandoned", "one"))
+            .await
+    });
+    wait_for_turn_start(&launcher).await;
+
+    start.abort();
+    let _ = start.await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(replay_limits().shutdown_timeout).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected an abandoned pre-acknowledgement start to reap its app-server"
+    );
+    let error = session
+        .start_turn(TurnRequest::new("turn-after-abandonment", "two"))
+        .await
+        .expect_err("expected the reaped session to reject new work");
+    assert!(
+        matches!(error.cause(), mango_external_agents::Error::Closed { .. }),
+        "expected a closed session after bounded abandoned-start teardown, received {error:?}"
+    );
+}
+
 /// A timeout cannot prove the app-server rejected `turn/start`: it may have accepted it and lost
 /// its reply while the first event already fills the one-slot host stream. A second start must
 /// therefore stay local instead of becoming a vendor-side steer of the uninterruptible turn.
@@ -807,10 +840,13 @@ async fn an_ambiguous_start_timeout_on_a_full_one_slot_stream_cannot_become_a_st
     let first = session
         .start_turn(TurnRequest::new("turn-1", "one"))
         .await
-        .expect_err("expected the unanswered start to time out");
+        .expect("expected a recoverable acceptance-unknown stream");
     assert!(
-        matches!(first.cause(), mango_external_agents::Error::Timeout { .. }),
-        "expected an ambiguous timeout, received {first:?}"
+        matches!(
+            first.dispatch(),
+            mango_external_agents::Dispatch::AcceptanceUnknown
+        ),
+        "expected explicit acceptance uncertainty, received {first:?}"
     );
 
     let second = session
@@ -818,9 +854,8 @@ async fn an_ambiguous_start_timeout_on_a_full_one_slot_stream_cannot_become_a_st
         .await
         .expect_err("expected the ambiguous first turn to retain the slot");
     assert!(
-        matches!(second.cause(), mango_external_agents::Error::Vendor(vendor)
-            if vendor.code.as_str() == "codex-turn-already-running"),
-        "expected a local running-turn refusal, received {second:?}"
+        matches!(second.cause(), mango_external_agents::Error::Busy),
+        "expected a typed busy refusal, received {second:?}"
     );
     assert_eq!(
         launcher
@@ -865,13 +900,7 @@ async fn a_delayed_start_success_cannot_replace_the_live_turns_vendor_handle() {
                 .await
             {
                 Ok(turn) => break turn,
-                Err(error)
-                    if matches!(
-                        error.cause(),
-                        mango_external_agents::Error::Vendor(vendor)
-                            if vendor.code.as_str() == "codex-turn-already-running"
-                    ) =>
-                {
+                Err(error) if matches!(error.cause(), mango_external_agents::Error::Busy) => {
                     tokio::task::yield_now().await;
                 }
                 Err(error) => panic!("expected the replacement turn, received {error:?}"),
@@ -928,13 +957,7 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
                 .await
             {
                 Ok(turn) => break turn,
-                Err(error)
-                    if matches!(
-                        error.cause(),
-                        mango_external_agents::Error::Vendor(vendor)
-                            if vendor.code.as_str() == "codex-turn-already-running"
-                    ) =>
-                {
+                Err(error) if matches!(error.cause(), mango_external_agents::Error::Busy) => {
                     tokio::task::yield_now().await;
                 }
                 Err(error) => panic!("expected the replacement turn, received {error:?}"),
@@ -957,9 +980,8 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
         .await
         .expect_err("expected the live replacement to keep the slot");
     assert!(
-        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
-                 if vendor.code.as_str() == "codex-turn-already-running"),
-        "expected a running-turn refusal, received {error:?}"
+        matches!(error.cause(), mango_external_agents::Error::Busy),
+        "expected a typed busy refusal, received {error:?}"
     );
     assert_eq!(
         launcher
@@ -972,48 +994,239 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
     );
 }
 
-/// The same refusal, for a host that walked away rather than one that is waiting.
-///
-/// Dropping a `TurnStream` stops the host reading; it does not stop the vendor. The turn is still
-/// running inside `codex app-server`, so the slot has to stay claimed — a free one would let the
-/// next `turn/start` out, and the app-server reads that as a steer of the turn nobody is watching.
+/// Dropping the library stream abandons its owner. The harness interrupts the native turn and
+/// frees admission after that terminal commits; a host that wants a browser disconnect to be only
+/// a UI event keeps this stream in its own supervisor instead of dropping it.
 #[tokio::test]
-async fn a_turn_whose_host_stopped_reading_still_holds_the_slot_against_a_steer() {
-    let (session, launcher) = open("approval").await;
-    let mut first = session
-        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+async fn dropping_a_turn_stream_interrupts_it_and_releases_admission_without_drain() {
+    let transcript = Transcript::load("interrupt");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the recorded thread id");
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let responder_starts = Arc::clone(&starts);
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/start") => {
+                let number = responder_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec![
+                    serde_json::json!({
+                        "id": id,
+                        "result": {"turn": {"id": format!("vendor-turn-{number}")}},
+                    })
+                    .to_string(),
+                ])
+            }
+            Some("turn/interrupt") => Some(vec![
+                serde_json::json!({"id": id, "result": {}}).to_string(),
+                serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": {
+                            "id": frame.pointer("/params/turnId").cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                            "status": "interrupted",
+                        },
+                    },
+                })
+                .to_string(),
+            ]),
+            _ => None,
+        }
+    }));
+    let (host, launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+
+    let first = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected a running turn");
+    drop(first);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"turn/interrupt\""))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected native cancellation after stream abandonment");
+
+    let second = session
+        .start_turn(TurnRequest::new("turn-2", "two"))
+        .await
+        .expect(
+            "expected native completion to release admission without consuming the first stream",
+        );
+    drop(second);
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup after the ownership check");
+}
+
+/// An interrupt acknowledgement does not free admission before Codex sends its terminal frame.
+#[tokio::test]
+async fn a_native_interrupt_in_progress_keeps_admission_owned() {
+    let transcript = Transcript::load("interrupt");
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/start") => Some(vec![
+                serde_json::json!({
+                    "id": id,
+                    "result": {"turn": {"id": "interrupting-turn"}},
+                })
+                .to_string(),
+            ]),
+            Some("turn/interrupt") => Some(vec![
+                serde_json::json!({"id": id, "result": {}}).to_string(),
+            ]),
+            _ => None,
+        }
+    }));
+    let (host, _) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let _turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
         .await
         .expect("expected a turn");
-    let asked = await_approval(&mut first).await;
 
-    drop(first);
-    // One event onto the closed stream, which is what a host that left looks like from here.
-    let option_id = asked
-        .options
-        .iter()
-        .find(|option| option.effect == PermissionEffect::Reject)
-        .map(|option| option.id.clone())
-        .expect("expected a refusal among the recorded options");
     session
-        .respond(PermissionResponse::from_user(asked.id().clone(), option_id))
+        .cancel(CancelReason::Requested)
         .await
-        .expect("expected the refusal to reach the server");
-
-    let before = launcher.written().len();
+        .expect("expected the native interrupt acknowledgement");
     let error = session
         .start_turn(TurnRequest::new("turn-2", "two"))
         .await
-        .expect_err("expected a refusal, received a second turn on a live one");
+        .expect_err("expected the interrupting native turn to retain admission");
     assert!(
-        matches!(error.cause(), mango_external_agents::Error::Vendor(vendor)
-                 if vendor.code.as_str() == "codex-turn-already-running"),
-        "expected the turn-already-running refusal, received {error:?}"
+        matches!(error.cause(), mango_external_agents::Error::Busy),
+        "expected a typed busy refusal while native cancellation is in progress, received {error:?}"
     );
-    assert_eq!(
-        launcher.written().len(),
-        before,
-        "expected no turn/start to reach the vendor"
+
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected bounded cleanup after the admission check");
+}
+
+/// An inactive native turn cannot retain the host's process beyond its configured idle deadline.
+#[tokio::test(start_paused = true)]
+async fn an_idle_native_turn_is_cancelled_and_reaped_at_the_hosts_deadline() {
+    let transcript = Transcript::load("interrupt");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the recorded thread id");
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/start") => Some(vec![
+                serde_json::json!({
+                    "id": id,
+                    "result": {"turn": {"id": "idle-turn"}},
+                })
+                .to_string(),
+            ]),
+            Some("turn/interrupt") => Some(vec![
+                serde_json::json!({"id": id, "result": {}}).to_string(),
+                serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": {"id": "idle-turn", "status": "interrupted"},
+                    },
+                })
+                .to_string(),
+            ]),
+            _ => None,
+        }
+    }));
+    let mut limits = replay_limits();
+    limits.idle_timeout = std::time::Duration::from_secs(5);
+    let (host, launcher) = with_launcher_limits(launcher, None, limits);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "one"))
+        .await
+        .expect("expected an active turn");
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(limits.idle_timeout).await;
+    let events = drain(&mut turn).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::Cancelled {
+                reason: CancelReason::Timeout
+            }
+        )),
+        "expected the idle deadline to name its timeout reason, received {events:#?}"
     );
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"turn/interrupt\"") && line.contains("idle-turn")),
+        "expected idle expiry to interrupt the native turn"
+    );
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup after idle cancellation");
+}
+
+/// A pending approval has its own deadline and does not consume the turn's idle budget.
+#[tokio::test(start_paused = true)]
+async fn a_pending_approval_pauses_the_native_idle_deadline() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(Transcript::load("approval").as_process());
+    let mut limits = replay_limits();
+    limits.idle_timeout = std::time::Duration::from_secs(5);
+    let (host, launcher) = with_launcher_limits(launcher, None, limits);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+    await_approval(&mut turn).await;
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(limits.idle_timeout * 2).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"turn/interrupt\"")),
+        "expected the approval deadline to own this wait phase"
+    );
+
+    drop(turn);
+    drop(session);
 }
 
 /// Refusing a pending approval can complete the turn while cancellation's interrupt is in flight.
@@ -1109,7 +1322,8 @@ async fn a_question_is_answerable_the_instant_the_host_is_told_about_it() {
 async fn a_stalled_broker_is_refused_at_the_original_approval_deadline() {
     let broker = SlowBroker::new();
     let launcher = Arc::new(FakeLauncher::new());
-    launcher.push(Transcript::load("approval").as_process());
+    let transcript = Transcript::load("approval");
+    launcher.push(transcript.as_process());
     let (host, launcher) = with_launcher_and_clock(
         launcher,
         Some(broker),
@@ -1556,16 +1770,10 @@ async fn host_shutdown_publishes_the_lifecycle_its_watcher_drove() {
     );
 }
 
-/// The `Closing` half of the same wind-down, which the terminal assertions cannot see: a
-/// subscription coalesces, so the two transitions are only distinguishable while the watcher is
-/// actually parked between them.
-///
-/// An unread turn under a one-slot channel is that park — the same lever
-/// `a_host_that_stops_reading_cannot_stop_the_session_from_closing` pulls. The channel is full the
-/// instant `start_turn` returns, so `cancel_active`'s terminal parks on it until `TERMINAL_GRACE`,
-/// and paused time does not advance to that grace while this task is awake.
+/// A full unread transcript cannot delay terminal session publication: terminal events are
+/// reserved outside the payload budget and teardown never awaits the consumer.
 #[tokio::test(start_paused = true)]
-async fn the_watcher_publishes_closing_while_its_wind_down_is_still_parked() {
+async fn the_watcher_closes_without_waiting_for_an_unread_transcript() {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(Transcript::load("turn").as_process());
     let cancel = mango_external_agents::CancelToken::new();
@@ -1589,25 +1797,16 @@ async fn the_watcher_publishes_closing_while_its_wind_down_is_still_parked() {
         .start_turn(TurnRequest::new("turn-1", "run echo mango"))
         .await
         .expect("expected a turn");
-    // Twice, so the pump gets the thread and then reaches its park inside the emit.
+    // Let the pump fill the one-event payload budget.
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
 
     cancel.cancel();
 
-    let closing = lifecycle
-        .changed()
-        .await
-        .expect("expected the watcher to publish a change");
-    assert_eq!(
-        closing.status,
-        SessionStatus::Closing,
-        "expected Closing to be visible while the wind-down is still parked"
-    );
     assert_eq!(
         status_once_settled(&mut lifecycle).await,
         SessionStatus::Closed,
-        "expected the parked wind-down to still reach its terminal"
+        "expected teardown not to wait for transcript consumption"
     );
 }
 
@@ -1828,6 +2027,21 @@ async fn closing_twice_is_harmless_and_ends_the_child() {
         matches!(error.cause(), mango_external_agents::Error::Closed { .. }),
         "expected a closed-session refusal, received {error:?}"
     );
+}
+
+/// The session owns its app-server, so dropping the final session handle starts bounded cleanup.
+#[tokio::test]
+async fn dropping_the_owning_session_reaps_its_child() {
+    let (session, launcher) = open("turn").await;
+
+    drop(session);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the dropped session to reap its app-server");
 }
 
 /// A steer for a turn that is not the one running is refused here rather than landing on whatever
@@ -2209,7 +2423,7 @@ async fn successful_permission_overrides_become_observable_defaults() {
 }
 
 #[tokio::test]
-async fn explicit_close_preserves_the_hosts_cancellation_reason() {
+async fn explicit_close_never_relabels_a_vendor_terminal_that_already_won() {
     let (session, _) = open("approval").await;
     let mut stream = session
         .start_turn(TurnRequest::new("closing", "mango"))
@@ -2222,13 +2436,12 @@ async fn explicit_close_preserves_the_hosts_cancellation_reason() {
         .expect("session close");
     let events = drain(&mut stream).await;
     assert!(
-        events.iter().any(|event| matches!(
+        events.iter().all(|event| !matches!(
             event,
-            EventKind::Cancelled {
-                reason: CancelReason::ConsentRevoked
-            }
+            EventKind::Cancelled { reason }
+                if *reason != CancelReason::ConsentRevoked
         )),
-        "expected consent-revocation marker before the terminal, received {events:?}"
+        "expected a close marker to retain consent revocation, received {events:?}"
     );
     assert_eq!(
         events
@@ -2551,7 +2764,42 @@ async fn the_harness_passes_the_cores_conformance_suite() {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(version_answer());
     launcher.push(Transcript::load("handshake").as_process());
-    launcher.push(Transcript::load("approval").as_process());
+    let transcript = Transcript::load("approval");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the approval transcript to name its thread");
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let responder_starts = Arc::clone(&starts);
+    launcher.push(transcript.as_process_intercepting(move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/start")
+                if responder_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+            {
+                None
+            }
+            Some("turn/start") => Some(vec![
+                serde_json::json!({
+                    "id": id,
+                    "result": {"turn": {"id": "conformance-cancel"}},
+                })
+                .to_string(),
+            ]),
+            Some("turn/interrupt") => Some(vec![
+                serde_json::json!({"id": id, "result": {}}).to_string(),
+                serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": {"id": "conformance-cancel", "status": "interrupted"},
+                    },
+                })
+                .to_string(),
+            ]),
+            _ => None,
+        }
+    }));
     let (host, _) = with_launcher(launcher, None);
     let report = mango_external_agents::testing::conformance::run(
         &CodexHarness::new(),
