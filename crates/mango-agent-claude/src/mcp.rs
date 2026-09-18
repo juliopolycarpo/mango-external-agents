@@ -285,6 +285,20 @@ pub(crate) async fn remove_on_close(file: Option<std::sync::Arc<ConfigFile>>) ->
         })?
 }
 
+/// Keeps an MCP artifact on disk after native cleanup failed.
+///
+/// A still-running Claude child may read this file after a bounded process stop reports failure.
+/// Releasing the final `Arc` would remove it while that child is alive, so this deliberately leaks
+/// the close worker's lease. There is no safe bounded retry that can prove the child stopped; the
+/// host receives the cleanup failure and can remove the preserved artifact only after it has
+/// independently established that no child remains.
+pub(crate) fn preserve_after_failed_native_cleanup(mut file: Prepared<std::sync::Arc<ConfigFile>>) {
+    let Some(file) = file.take() else {
+        return;
+    };
+    std::mem::forget(file);
+}
+
 /// Releases a configuration artifact without running the host's filesystem on the async worker.
 ///
 /// Dropping the last reference removes the directory with a synchronous `remove_dir_all` against

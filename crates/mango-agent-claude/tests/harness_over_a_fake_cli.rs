@@ -1174,13 +1174,7 @@ mod a_turn {
         );
     }
 
-    /// `close` while a turn's process is still being spawned.
-    ///
-    /// `start_turn` reads `closed` before it awaits the spawn and assigns the turn after, so a
-    /// `close` that lands in between takes an `active` that is still `None`: it records nothing,
-    /// kills nothing, and removes the MCP file the child about to start was launched with. The
-    /// turn then arrives on a session that has already answered every other caller `Closed`, and
-    /// runs with nobody holding a handle to stop it.
+    /// `close` while a turn's process is still being spawned waits for the late child to stop.
     #[tokio::test]
     async fn refuses_a_turn_whose_session_closed_while_its_process_was_starting() {
         let launcher =
@@ -1199,11 +1193,16 @@ mod a_turn {
         });
 
         gate.wait_for_spawn().await;
-        session
-            .close(CloseReason::Requested)
-            .await
-            .expect("expected the close to succeed");
+        let closing = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.close(CloseReason::Requested).await }
+        });
         gate.release();
+
+        closing
+            .await
+            .expect("expected the close task to finish")
+            .expect("expected the close to succeed");
 
         let outcome = starting.await.expect("expected the task to finish");
         assert!(
@@ -2179,11 +2178,16 @@ mod mcp_passthrough {
         });
 
         gate.wait_for_spawn().await;
-        session
-            .close(CloseReason::Requested)
-            .await
-            .expect("expected a clean close");
+        let closing = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.close(CloseReason::Requested).await }
+        });
         gate.release();
+
+        closing
+            .await
+            .expect("expected the close task to finish")
+            .expect("expected a clean close");
 
         let outcome = starting.await.expect("expected the start task to finish");
         assert!(
@@ -2194,6 +2198,114 @@ mod mcp_passthrough {
             launcher.mcp_config_at_kill(),
             vec![true],
             "expected the spawned child to keep its MCP configuration until it was killed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_native_close_keeps_the_mcp_artifact_after_the_session_drops() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::stalling::<[String; 0], String>([])),
+        );
+        let stop = launcher.gate_turn_stops();
+        let host = host_under(
+            launcher.clone(),
+            Limits {
+                kill_grace: Duration::from_secs(1),
+                shutdown_timeout: Duration::from_secs(1),
+                ..Limits::default()
+            },
+        );
+        let session: Arc<dyn Session> = Arc::from(
+            ClaudeHarness::new()
+                .open_session(
+                    &host,
+                    OpenSession::new("chat-1").with_mcp_servers(servers()),
+                )
+                .await
+                .expect("expected a session"),
+        );
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let path = std::path::PathBuf::from(
+            value_after(&argv, "--mcp-config").expect("expected the config argument"),
+        );
+
+        let closing = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.close(CloseReason::Requested).await }
+        });
+        stop.wait_for_spawn().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let error = closing
+            .await
+            .expect("expected the close task to finish")
+            .expect_err("expected the bounded native cleanup to fail");
+        assert!(
+            matches!(error.cause(), Error::Timeout { .. }),
+            "received {error:?}"
+        );
+        assert_eq!(session.snapshot().status, SessionStatus::Closing);
+        assert!(
+            path.exists(),
+            "expected a live child to keep its MCP artifact after cleanup failed"
+        );
+
+        stop.release();
+        drop(turn);
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while launcher.a_child_is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the dropped session to finish its later native stop");
+        assert!(
+            path.exists(),
+            "expected the preserved artifact to outlive the failed close after session drop"
+        );
+        let _ = std::fs::remove_dir_all(
+            path.parent()
+                .expect("expected the config file to have a private directory"),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_artifact_removal_failure_still_closes_the_session() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(HELP_2_1_270));
+        let session = open_with_servers(&launcher).await;
+        session
+            .start_turn(TurnRequest::new("turn-1", "hello"))
+            .await
+            .expect("expected a turn");
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let path = std::path::PathBuf::from(
+            value_after(&argv, "--mcp-config").expect("expected the config argument"),
+        );
+        std::fs::remove_dir_all(
+            path.parent()
+                .expect("expected the config file to have a private directory"),
+        )
+        .expect("expected the test to remove the artifact first");
+
+        let error = session
+            .close(CloseReason::Requested)
+            .await
+            .expect_err("expected close to report the failed artifact removal");
+        assert!(
+            matches!(error.cause(), Error::HostConfiguration { .. }),
+            "received {error:?}"
+        );
+        assert_eq!(
+            session.snapshot().status,
+            SessionStatus::Closed,
+            "expected native cleanup to close the session despite artifact removal failure"
         );
     }
 

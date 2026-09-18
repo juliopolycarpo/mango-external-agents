@@ -486,12 +486,18 @@ async fn run_close_teardown(
         None => Ok(()),
     };
     let result = match native {
-        Ok(()) => crate::mcp::remove_on_close(mcp_config.take()).await,
-        Err(error) => Err(error),
+        Ok(()) => {
+            let result = crate::mcp::remove_on_close(mcp_config.take()).await;
+            // Close is terminal after native cleanup, even when the host's scratch mount refuses
+            // the final unlink. The typed error still tells the caller which resource remained.
+            shared.core_state.set_status(SessionStatus::Closed);
+            result
+        }
+        Err(error) => {
+            crate::mcp::preserve_after_failed_native_cleanup(mcp_config);
+            Err(error)
+        }
     };
-    if result.is_ok() {
-        shared.core_state.set_status(SessionStatus::Closed);
-    }
     close.finish(result);
 }
 
@@ -1206,10 +1212,6 @@ impl mango_external_agents::Session for ClaudeSession {
             } => (close, active, taken, mcp_config),
         };
         self.shared.core_state.set_status(SessionStatus::Closing);
-        // A launcher still in flight owns no native child for this close to wait on. Its start
-        // guard will hand the late child to the installed worker. Returning lets the host release
-        // its start gate, while a later close waits on that same worker rather than claiming done.
-        let waits_for_late_spawn = taken.as_ref().is_some_and(|turn| turn.control.is_none());
         if let (Some(active), Some(taken)) = (&active, taken)
             && taken.control.is_some()
         {
@@ -1226,11 +1228,7 @@ impl mango_external_agents::Session for ClaudeSession {
         spawn_owned(&self.shared, async move {
             run_close_teardown(&shared, &close_for_worker, active, mcp_config).await;
         });
-        if waits_for_late_spawn {
-            Ok(())
-        } else {
-            close.wait().await
-        }
+        close.wait().await
     }
 }
 
