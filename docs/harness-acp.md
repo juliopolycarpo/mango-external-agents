@@ -393,6 +393,9 @@ Harness-level listing creates a short-lived initialized connection and sends `se
 workspace before launch, and excludes returned rows whose `cwd` differs. Valid RFC 3339 `updatedAt`
 strings become `NativeSession::updated_at`; malformed or absent timestamps remain unknown. This
 follows ACP's [session setup](https://agentclientprotocol.com/protocol/v1/session-setup) contract.
+ACP v1 `session/list` has no page-size field. If an agent returns more workspace rows than the
+host requested, the call returns `LimitExceeded`: cutting that reply would skip rows when the
+agent's cursor resumes after its full page.
 
 ## Attachments
 

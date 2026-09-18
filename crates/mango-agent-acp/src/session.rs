@@ -24,8 +24,8 @@ use mango_external_agents::configuration::{
 };
 use mango_external_agents::event::EventKind;
 use mango_external_agents::session::{
-    AccountUsage, CancelReason, CloseReason, NativeSession, Session, SessionIds, SessionPage,
-    SessionQuery, TurnRequest,
+    AccountUsage, CancelReason, CloseReason, NativeSession, SESSION_PAGE_LIMIT, Session,
+    SessionIds, SessionPage, SessionQuery, TurnRequest,
 };
 use mango_external_agents::state::SessionStatus;
 use mango_external_agents::{
@@ -615,6 +615,7 @@ pub(crate) async fn list_sessions(
         return Err(Error::not_supported(Capability::SessionListing));
     }
     validate_listing_workspace(host, &query)?;
+    let limit = query.limit.unwrap_or(SESSION_PAGE_LIMIT);
     let mut request = ListSessionsRequest::new().cwd(host.cwd().to_path_buf());
     if let Some(cursor) = query.cursor {
         request = request.cursor(cursor);
@@ -628,22 +629,30 @@ pub(crate) async fn list_sessions(
     )
     .await?;
     let workspace = host.cwd().display().to_string();
+    let sessions: Vec<NativeSession> = response
+        .sessions
+        .into_iter()
+        .filter(|session| session.cwd == host.cwd())
+        .map(|session| NativeSession {
+            native_session_id: session.session_id.to_string(),
+            title: session.title,
+            preview: None,
+            workspace_path: Some(workspace.clone()),
+            updated_at: session
+                .updated_at
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+                .map(std::time::SystemTime::from),
+        })
+        .collect();
+    if sessions.len() > limit {
+        return Err(Error::LimitExceeded {
+            subject: "ACP session/list rows in one page",
+            limit,
+            received: sessions.len(),
+        });
+    }
     Ok(SessionPage {
-        sessions: response
-            .sessions
-            .into_iter()
-            .filter(|session| session.cwd == host.cwd())
-            .map(|session| NativeSession {
-                native_session_id: session.session_id.to_string(),
-                title: session.title,
-                preview: None,
-                workspace_path: Some(workspace.clone()),
-                updated_at: session
-                    .updated_at
-                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
-                    .map(std::time::SystemTime::from),
-            })
-            .collect(),
+        sessions,
         next_cursor: response.next_cursor,
         truncated: false,
     })

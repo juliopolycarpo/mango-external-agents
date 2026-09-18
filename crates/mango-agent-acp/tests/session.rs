@@ -1220,6 +1220,46 @@ async fn an_abandoned_generic_request_closes_admission_and_reaps_the_silent_peer
     .expect("expected abandoned request cleanup to reap the silent peer");
 }
 
+/// ACP v1 has no page-size request field, so an oversized reply cannot be cut without losing
+/// rows behind the agent's cursor.
+#[tokio::test]
+async fn listing_refuses_more_workspace_rows_than_the_host_requested() {
+    for (limit, received) in [(1, 2), (50, 51)] {
+        let launcher = FakeLauncher::new();
+        let host = host(&launcher);
+        let rows = (0..received)
+            .map(|index| {
+                serde_json::json!({
+                    "sessionId": format!("sess_{index}"),
+                    "cwd": host.cwd(),
+                })
+            })
+            .collect();
+        launcher.push(FakeAcpAgent::new().with_listed_sessions(rows).process());
+        let error = AcpHarness::new(profile())
+            .list_sessions(
+                &host,
+                mango_external_agents::SessionQuery {
+                    limit: Some(limit),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("expected an oversized ACP page to be refused without losing rows");
+        assert!(
+            matches!(
+                error.cause(),
+                Error::LimitExceeded {
+                    subject: "ACP session/list rows in one page",
+                    limit: actual_limit,
+                    received: actual_received,
+                } if *actual_limit == limit && *actual_received == received
+            ),
+            "expected a bounded-page refusal for {received} rows over limit {limit}, received {error:?}"
+        );
+    }
+}
+
 /// Picker listing uses a short-lived initialized ACP connection; it must never create a conversation.
 #[tokio::test]
 async fn harness_listing_is_workspace_bound_before_any_conversation_opens() {
