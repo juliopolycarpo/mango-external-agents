@@ -397,13 +397,23 @@ draws no difference between a call and the transcript item it produced, so the t
 `Write` call's `file_path`/`content` become a single-file `ActivityContent::Diff`, with `kind` left
 absent because `Write` also overwrites a file that already exists and nothing in the stream says
 which of the two happened; that mapping and the item id are both pinned by
-`fixtures/claude/transcripts/denied-write-turn.jsonl`. A closing `tool_result`'s own body becomes
+`fixtures/claude/transcripts/denied-write-turn.jsonl`. An `Edit` call's
+`file_path`/`old_string`/`new_string` become the same thing, and there `kind` **is** stated —
+`Modified` — because a stated before is what distinguishes a modification from a creation without
+guessing. Its key names come from a live headless run rather than from a fixture, which is weaker
+evidence and is why a reducer test pins the three literal names: a rename upstream fails there
+rather than silently producing a diff with no body. A closing `tool_result`'s own body becomes
 `ActivityContent::Output` on the `ActivityResult`, independent of a held `system/permission_denied`
-reason, which still wins the one-line `detail`. `Edit`, `MultiEdit`, `NotebookEdit`, `TodoWrite` and
-`ExitPlanMode` are not mapped: no captured transcript in this repo exercises them, and the pinned
-build's own `system/init.tools` list does not even enumerate `MultiEdit`, `TodoWrite` or
-`ExitPlanMode`. A `mea capture` of a turn that drives them is what would unblock the rest of this
-table.
+reason, which still wins the one-line `detail`.
+
+`MultiEdit`, `NotebookEdit`, `TodoWrite` and `ExitPlanMode` are **not** mapped: no captured
+transcript in this repo exercises them, and the pinned build's own `system/init.tools` list does not
+even enumerate the last three. `TodoWrite` is the expensive one — it is where a plan's steps live,
+so until it is captured a Claude plan reaches a host as an activity title rather than as
+`ActivityContent::Plan`, which is the one place this harness is behind the other two. A `mea
+capture` of a turn that drives these tools is what unblocks it; guessing their input keys from a
+published tool description would produce a mapping no test in this repository could hold to
+account.
 
 **Slash commands** are published by provenance. A build that states `terminal_slash_commands` is
 authoritative; one that does not publishes only the names whose origin the same record states — a

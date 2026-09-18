@@ -286,6 +286,17 @@ impl FileChange {
         self
     }
 
+    /// Carries the contents after the change, with nothing claimed about what happened to the file.
+    ///
+    /// For a vendor whose write tool both creates and overwrites: the body is a fact, and which of
+    /// the two it was is not one this library has. Use [`with_texts`](Self::with_texts) where the
+    /// vendor says whether there was a before.
+    #[must_use]
+    pub fn with_new_text(mut self, new: impl Into<String>) -> Self {
+        self.new_text = Some(new.into());
+        self
+    }
+
     /// Carries the contents the vendor sent on either side of the change.
     ///
     /// `None` for `old` is the vendor saying the file is new, which is the one kind this can be

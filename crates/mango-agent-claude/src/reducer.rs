@@ -720,29 +720,42 @@ fn summarize_tool_input(input: Option<&Value>) -> String {
 
 /// A file-editing tool call's own input, as a diff a host can render as one.
 ///
-/// Only `Write`'s `file_path`/`content` keys are mapped: they are the only ones evidenced by a
-/// fixture in this repository, `fixtures/claude/transcripts/denied-write-turn.jsonl`. `Edit`,
-/// `MultiEdit` and `NotebookEdit` are not — no captured transcript or existing test in this repo
-/// exercises them, and the pinned CLI's own `system/init.tools` list on both fixtures does not
-/// even enumerate `MultiEdit`, `TodoWrite` or `ExitPlanMode` — so their input keys are left
-/// unguessed rather than assumed from Anthropic's public tool descriptions, which this harness has
-/// no fixture to hold it to.
+/// Two tools, and the reason the list stops there is evidence rather than effort. `Write`'s
+/// `file_path`/`content` keys are evidenced by the captured transcript
+/// `fixtures/claude/transcripts/denied-write-turn.jsonl`. `Edit`'s `file_path`/`old_string`/
+/// `new_string` keys were read off a live headless run of the vendor CLI, which is weaker evidence
+/// — it is one build rather than the pin — and the test below pins the mapping to those exact key
+/// names so a rename fails here rather than silently producing an empty diff.
 ///
-/// `kind` is left absent on purpose: `Write` also overwrites a file that already exists, and
-/// nothing in this stream says which of the two happened for a given call.
+/// `MultiEdit`, `NotebookEdit`, `TodoWrite` and `ExitPlanMode` stay unmapped. No captured
+/// transcript in this repository exercises any of them, and the `system/init.tools` list on both
+/// fixtures does not even enumerate the last three, so their input keys would be assumed from a
+/// public tool description this harness has no capture to hold itself to. `TodoWrite` is the
+/// expensive one — it is where a plan's steps live — and it is owed a capture, not a guess.
+///
+/// `kind` is left absent for `Write` on purpose: it both creates a file and overwrites an existing
+/// one, and nothing in this stream says which happened for a given call. `Edit` states a before,
+/// so [`FileChange::with_texts`] reads it as a modification.
 fn file_change_content(name: &str, input: Option<&Value>) -> Option<ActivityContent> {
-    if name != "Write" {
-        return None;
-    }
     let Value::Object(fields) = input? else {
         return None;
     };
-    let path = fields.get("file_path")?.as_str()?;
-    let content = fields.get("content")?.as_str()?;
-    let mut change = FileChange::new(path);
     // Bounded before it is owned, on the same terms as `detail_for`: the sink normalises again,
     // but nothing here should hold a copy larger than what this module ever carries.
-    change.new_text = Some(head(content, DETAIL_CARRY_MAX_CHARS).to_owned());
+    let bounded = |key: &str| {
+        fields
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|text| head(text, DETAIL_CARRY_MAX_CHARS).to_owned())
+    };
+    let path = fields.get("file_path")?.as_str()?;
+    let change = match name {
+        "Write" => FileChange::new(path).with_new_text(bounded("content")?),
+        "Edit" => {
+            FileChange::new(path).with_texts(Some(bounded("old_string")?), bounded("new_string")?)
+        }
+        _ => return None,
+    };
     Some(ActivityContent::Diff {
         files: vec![change],
     })
@@ -1025,6 +1038,52 @@ mod tests {
             "expected no kind asserted for a Write, received {:?}",
             files[0].kind
         );
+    }
+
+    /// `Edit` states what was there before, which is the one thing that makes a modification
+    /// distinguishable from a creation without guessing. The literal keys are pinned here so a
+    /// rename upstream fails as a missing field rather than as a diff with no body.
+    #[test]
+    fn an_edit_calls_input_becomes_a_diff_that_keeps_both_sides() {
+        let mut reducer = TurnReducer::new();
+        let events = reduce(
+            &mut reducer,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Edit","input":{"replace_all":false,"file_path":"/work/repo/notes.txt","old_string":"line two","new_string":"LINE TWO"}}]}}"#,
+        );
+        let EventKind::ActivityStarted { activity, .. } =
+            events.first().expect("expected a started activity")
+        else {
+            panic!("expected an activity_started event, received {events:?}");
+        };
+        let Some(ActivityContent::Diff { files }) = &activity.content else {
+            panic!("expected diff content, received {:?}", activity.content);
+        };
+        assert_eq!(files.len(), 1, "received {files:?}");
+        assert_eq!(files[0].path, "/work/repo/notes.txt");
+        assert_eq!(files[0].old_text.as_deref(), Some("line two"));
+        assert_eq!(files[0].new_text.as_deref(), Some("LINE TWO"));
+        assert_eq!(
+            files[0].kind,
+            Some(mango_external_agents::FileChangeKind::Modified),
+            "a stated before is what makes this a modification rather than a guess"
+        );
+    }
+
+    /// An input missing a key this mapping needs produces no diff rather than a half one. A file
+    /// change naming a path with no body would render as an edit nobody can read.
+    #[test]
+    fn an_edit_missing_a_key_produces_no_diff_rather_than_an_empty_one() {
+        let mut reducer = TurnReducer::new();
+        let events = reduce(
+            &mut reducer,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_3","name":"Edit","input":{"file_path":"/work/repo/notes.txt"}}]}}"#,
+        );
+        let EventKind::ActivityStarted { activity, .. } =
+            events.first().expect("expected a started activity")
+        else {
+            panic!("expected an activity_started event, received {events:?}");
+        };
+        assert_eq!(activity.content, None, "received {:?}", activity.content);
     }
 
     /// The structured result body is the tool's own, independent of what closed the activity's
