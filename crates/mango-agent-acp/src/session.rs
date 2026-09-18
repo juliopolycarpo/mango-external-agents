@@ -735,8 +735,6 @@ impl Session for AcpSession {
     }
 }
 
-/// Completes the one close operation after it has claimed the session lifecycle.
-///
 /// Settles a prompt whose follow-up `session/cancel` could not be queued, in a task of its own.
 ///
 /// The prompt is already on the wire and owns a stream, so its terminal has exactly one place to
@@ -766,6 +764,8 @@ fn detach_retry_cancel_cleanup(
     });
 }
 
+/// Completes the one close operation after it has claimed the session lifecycle.
+///
 /// The task owns all awaits so dropping any caller's [`Session::close`] future cannot strand a
 /// native turn, a child process, or the observable session status.
 #[allow(
