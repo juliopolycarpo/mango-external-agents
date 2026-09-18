@@ -548,7 +548,9 @@ impl AcpSession {
             progress.catalog,
             progress.catalog_revision,
         )?;
-        if !matches!(error.cause(), Error::Vendor(_)) {
+        if !matches!(error.cause(), Error::Vendor(vendor)
+            if vendor.code.as_str() == "acp-request-failed" && vendor.vendor_code.is_some())
+        {
             return Err(error);
         }
         progress.rejected.push(RejectedSetting::new(

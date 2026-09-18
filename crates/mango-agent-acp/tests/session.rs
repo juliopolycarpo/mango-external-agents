@@ -1855,6 +1855,48 @@ async fn repeated_failed_session_closes_preserve_the_same_recovery_control() {
     assert_eq!(inner.live_children(), 0);
 }
 
+#[tokio::test]
+async fn a_lost_config_response_is_an_error_instead_of_a_vendor_refusal() {
+    let agent = HeldRequestAgent::new("session/set_config_option");
+    let agent_gone = CancelToken::new();
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process().ending_stdout_when(agent_gone.clone()));
+    let session: Arc<dyn Session> = Arc::from(
+        AcpHarness::new(profile())
+            .open_session(&host(&launcher), OpenSession::new("lost-config"))
+            .await
+            .expect("expected a session"),
+    );
+    let configuring = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .configure(
+                    ConfigurationPatch::new()
+                        .model(ConfigurationChange::Set(String::from("large"))),
+                )
+                .await
+        }
+    });
+    agent.wait_until_entered().await;
+    agent_gone.cancel();
+    let error = configuring
+        .await
+        .expect("expected configuration task")
+        .expect_err("expected a lost response to remain an error, not a conclusive refusal");
+    assert!(
+        matches!(error.cause(), Error::Vendor(vendor)
+        if vendor.code.as_str() == "acp-link-closed"),
+        "received {error:?}"
+    );
+    assert_eq!(error.dispatch(), Dispatch::AcceptanceUnknown);
+    assert_eq!(session.snapshot().configuration.accepted.model, None);
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
 /// Ordinary close and the connection watcher share one claim on the injected child.
 #[tokio::test]
 async fn closing_a_session_and_its_watcher_kills_the_child_once() {
