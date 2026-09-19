@@ -789,6 +789,15 @@ impl SupervisorInner {
     }
 
     /// Ends the vendor's own work when the host stops, rather than leaving it running.
+    ///
+    /// Returning early with no stream is **not** a hole, though it reads like one: it means the
+    /// stop won a `select!` against `Session::start_turn`, so what this host holds is a dropped
+    /// start future rather than a turn. `docs/lifecycle.md` makes that the sanctioned way to
+    /// abandon one — "dropping a start future, active stream or session abandons that ownership
+    /// and triggers cleanup" — and both shipped harnesses prove it
+    /// (`dropping_a_start_future_reaps_an_unacknowledged_attempt`,
+    /// `dropping_start_during_spawn_reaps_the_child_returned_after_abort`). Calling `cancel` here
+    /// instead would name a turn this host was never given a handle for.
     async fn abandon(&self, progress: &mut Progress, reason: CancelReason) {
         let Some(stream) = progress.stream.take() else {
             return;
