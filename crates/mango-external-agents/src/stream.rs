@@ -1,7 +1,8 @@
 //! Bounded turn transcripts with terminal commitment independent of reader progress.
 //!
-//! Payload overflow fails the stream explicitly. Control events have their own count reserve,
-//! and a terminal is retained outside that queue so shutdown never waits for the UI.
+//! Payload overflow fails the stream explicitly. Control events have their own count and byte
+//! reserves inside the turn budget, and a terminal is retained outside that queue so shutdown
+//! never waits for the UI.
 
 mod buffer;
 use buffer::Buffer;
@@ -457,10 +458,12 @@ mod tests {
     }
     use std::time::{Duration, SystemTime};
 
+    /// A 256-character delta serializes to 404 bytes, so 1 KiB holds one and refuses the second:
+    /// the interaction reserve takes half of a budget this small, leaving 512 bytes of payload.
     #[tokio::test]
     async fn byte_pressure_commits_a_terminal_and_never_exceeds_the_budget() {
         let limits = crate::Limits {
-            turn_buffer_bytes: 512,
+            turn_buffer_bytes: 1024,
             ..crate::Limits::default()
         };
         let (sink, mut events) = EventSink::with_limits(
@@ -475,7 +478,7 @@ mod tests {
         })
         .await
         .expect("first payload fits");
-        assert!(events.queued_bytes() <= 512);
+        assert!(events.queued_bytes() <= 1024);
         let result = sink
             .emit(EventKind::TextDelta {
                 text: "b".repeat(256),

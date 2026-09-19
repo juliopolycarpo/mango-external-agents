@@ -60,9 +60,18 @@ different conversation.
 ## Stream and pending-work budgets
 
 `EventSink::with_limits` uses the host's limits. The defaults per stream are 1,024 payload events
-and 8 MiB of serialized queued payload. Permission and question facts have a separate count
-reserve of twice `max_pending_requests`, 128 events by default, within that same byte budget.
-The queue preserves ordering between payload and interaction events.
+and 8 MiB of serialized queued bytes. Permission and question facts have a reserve of their own on
+both axes. The count reserve is twice `max_pending_requests`, 128 events by default. The byte
+reserve is that same count multiplied by the 8 KiB one interaction event is budgeted at, clamped
+to half `turn_buffer_bytes` so a small budget still leaves payload room: 1 MiB of the 8 MiB
+default, leaving payload 7 MiB.
+
+Payload may occupy at most `turn_buffer_bytes` less that reserve; an interaction event may use the
+payload area while it is free. The two together never exceed `turn_buffer_bytes`, which is the
+number a host sized its memory against and the number `EventReceiver::queued_bytes` reports
+against. Without the byte reserve a turn whose deltas had filled the budget could not queue the
+approval the vendor had just raised, so the host was never asked and the turn waited on an answer
+that could not arrive. The queue preserves ordering between payload and interaction events.
 
 Codex question settlement stays pending until `QuestionResolved` is published. Accepting an answer
 does not release that ownership: terminal cleanup publishes an accepted outcome before completing
@@ -76,7 +85,7 @@ hosts must bound those identifiers too.
 
 Structured content is bounded before it is queued, and a diff's file contents share one budget of
 their own (`DIFF_MAX_CONTENT_LENGTH`) — otherwise 256 per-file ceilings multiply out to megabytes in
-a single event against that same 8 MiB. A file past the budget keeps its row and loses its bodies,
+a single event against the 7 MiB that budget leaves payload. A file past the budget keeps its row and loses its bodies,
 and `truncated` says so. See [`contracts.md`](contracts.md).
 
 Exceeding a count or byte budget returns `LimitExceeded` and commits a `stream-overflow` failure.
