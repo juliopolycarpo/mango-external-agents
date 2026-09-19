@@ -64,13 +64,12 @@ jobs:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: scripts/check-versions.sh "$VERSION"
       - run: scripts/check.sh
-      - name: Verify all publishable packages
-        run: cargo publish --workspace --dry-run --locked
-      - name: Package contents
-        run: |
-          for crate in $CRATES; do
-            cargo package -p "$crate" --locked --list
-          done
+      # The same gate a maintainer runs before the tag exists. It wraps the workspace dry run and
+      # adds what that cannot answer: that the publishable set is still exactly $CRATES, and that
+      # every tarball carries its README and licence and no build, scratch or environment path.
+      # Running the bare dry run here instead would let a tag pass a check the gate rejects.
+      - name: Publication gate
+        run: scripts/check-publish.sh --list
 
   crates:
     name: Publish to crates.io

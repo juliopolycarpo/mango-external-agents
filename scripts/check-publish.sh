@@ -26,12 +26,17 @@ done
 # Publication order, not alphabetical order: core first, then the three harnesses that depend on
 # it. `cargo publish --workspace` resolves this itself, but naming it here is what makes the
 # per-crate packaging loop below meaningful when one of them fails.
-crates=(
-  mango-external-agents
-  mango-agent-claude
-  mango-agent-codex
-  mango-agent-acp
-)
+#
+# Read from the release workflow rather than repeated, so the list a tag publishes and the list
+# this gate checks cannot drift apart — which is the failure the gate exists to catch, and one it
+# would be unable to see with a copy of its own.
+read -r -a crates <<< "$(
+  sed -n 's/^  CRATES: //p' .github/workflows/release.yml
+)"
+if [ "${#crates[@]}" -eq 0 ]; then
+  echo "expected a 'CRATES:' list in .github/workflows/release.yml, received none" >&2
+  exit 1
+fi
 
 run() { echo "▶ $*"; "$@"; }
 
@@ -48,10 +53,12 @@ declared=$(
 )
 expected=$(printf '%s\n' "${crates[@]}" | sort)
 if [ "$declared" != "$expected" ]; then
+  # `sed` rather than `printf '  %s\n'`: both values are newline-separated lists in one variable,
+  # so printf indents the first entry and leaves the rest flush, which reads as a one-item list.
   echo "expected exactly these publishable crates:" >&2
-  printf '  %s\n' "$expected" >&2
+  printf '%s\n' "$expected" | sed 's/^/  /' >&2
   echo "received:" >&2
-  printf '  %s\n' "$declared" >&2
+  printf '%s\n' "$declared" | sed 's/^/  /' >&2
   echo "a new member either takes 'publish = false' or joins the lockstep set deliberately" >&2
   exit 1
 fi
