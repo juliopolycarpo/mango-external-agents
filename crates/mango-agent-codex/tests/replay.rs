@@ -5063,6 +5063,18 @@ async fn cancelling_the_turn_resolves_its_open_question_round_first() {
         "expected the round cancelled before the turn's terminal, received {events:#?}"
     );
 
+    // Exactly one, on the same terms as the expiry: the canceller reports the round and the
+    // waiter it wakes reports nothing, so a host closing its dialog on the first resolution is
+    // never handed a second identical one before the terminal.
+    let resolutions = events
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::QuestionResolved { .. }))
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "expected exactly one resolution, received {events:#?}"
+    );
+
     let answer = mid_turn_push_answer(&launcher);
     assert_eq!(answer["result"], serde_json::json!({"answers": {}}));
 }

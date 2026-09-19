@@ -683,7 +683,14 @@ enum QuestionAnswer {
     /// ends while a round is still open. A plain deadline never sends this:
     /// [`CodexHandler::decide_question`] notices its own expiry locally instead, the same way
     /// [`CodexHandler::expire`] does for an approval.
-    Cancelled,
+    Cancelled {
+        /// Whether the caller that settled this round already recorded its audit event.
+        ///
+        /// The same bit [`Answer::Chosen`] carries, for the same reason: the canceller publishes
+        /// the resolution itself so it lands before the turn's terminal, and the waiter it wakes
+        /// must not publish an identical second one.
+        reported: bool,
+    },
     /// The server stopped waiting on its own, so nothing needs sending.
     ResolvedByTheServer,
 }
@@ -1020,7 +1027,9 @@ impl Shared {
         };
         self.signal_idle_change();
         for entry in waiting {
-            let _ = entry.answer.send(QuestionAnswer::Cancelled);
+            let _ = entry
+                .answer
+                .send(QuestionAnswer::Cancelled { reported: true });
             let _ = self
                 .emit_for(
                     &entry.route,
@@ -2043,9 +2052,11 @@ impl CodexHandler {
                     .await;
                 Some(ToolRequestUserInputResponse::none())
             }
-            Some(QuestionAnswer::Cancelled) => {
-                self.question_resolved(&route, &request_id, QuestionOutcome::Cancelled)
-                    .await;
+            Some(QuestionAnswer::Cancelled { reported }) => {
+                if !reported {
+                    self.question_resolved(&route, &request_id, QuestionOutcome::Cancelled)
+                        .await;
+                }
                 Some(ToolRequestUserInputResponse::none())
             }
             Some(QuestionAnswer::ResolvedByTheServer) => None,
