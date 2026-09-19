@@ -66,6 +66,12 @@ reserve is that same count multiplied by the 8 KiB one interaction event is budg
 to half `turn_buffer_bytes` so a small budget still leaves payload room: 1 MiB of the 8 MiB
 default, leaving payload 7 MiB.
 
+The clamp is what a host tuning `turn_buffer_bytes` downward has to know about. Below twice the
+reserve it binds, and payload gets **half** of whatever the host configured — so a budget that
+comfortably held one event before the reserve existed can refuse it now, and the `LimitExceeded`
+names the derived payload cap rather than the number the host set. A host that wants a small turn
+budget should size it against the payload half, not the total.
+
 Payload may occupy at most `turn_buffer_bytes` less that reserve; an interaction event may use the
 payload area while it is free. The two together never exceed `turn_buffer_bytes`, which is the
 number a host sized its memory against and the number `EventReceiver::queued_bytes` reports

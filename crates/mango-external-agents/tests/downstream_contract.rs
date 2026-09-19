@@ -422,8 +422,6 @@ fn configuration_round_trips_without_collapsing_keep_set_and_reset() {
     assert_eq!(round_tripped, state);
 }
 
-/// A catalog keeps native ids, ordering and value types, and an unknown category does not take the
-/// known rows with it.
 /// The answer to `Session::configure`, pinned on the wire.
 ///
 /// It is the one configuration type a host both receives and persists — a runtime relays it to a
@@ -535,6 +533,8 @@ fn the_retry_contract_refuses_an_unsafe_replay_from_outside_this_crate() {
     );
 }
 
+/// A catalog keeps native ids, ordering and value types, and an unknown category does not take the
+/// known rows with it.
 #[test]
 fn a_configuration_catalog_survives_serialization_with_its_vendor_shape_intact() {
     let catalog = catalog().normalized();

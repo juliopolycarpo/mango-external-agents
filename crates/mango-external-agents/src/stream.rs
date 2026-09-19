@@ -399,6 +399,7 @@ mod tests {
     use crate::operation::{AttemptId, Dispatch};
     use crate::session::CancelReason;
     use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
 
     /// Nothing reaches a host after a turn's terminal, and the reason is structural.
     ///
@@ -456,7 +457,6 @@ mod tests {
             "expected the stream to end at its terminal, received {after:?}"
         );
     }
-    use std::time::{Duration, SystemTime};
 
     /// A 256-character delta serializes to 404 bytes, so 1 KiB holds one and refuses the second:
     /// the interaction reserve takes half of a budget this small, leaving 512 bytes of payload.

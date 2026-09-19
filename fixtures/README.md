@@ -62,7 +62,7 @@ the digest its manifest declares and the digest the file has, and it refuses a f
 directory which the manifest does not declare. It runs under `scripts/check.sh` with the rest of
 the suite; nothing has to be enabled for it.
 
-What that covers is the four `contract/` directories. The archival transcripts
+What that covers is the six `contract/` directories. The archival transcripts
 (`codex/*.jsonl`, `claude/transcripts/*.jsonl`) and the recorded help surfaces (`claude/help/`)
 carry no manifest and therefore no digest: they are read by the replaying fakes, and an edit to one
 shows up as a test that disagrees with the transcript rather than as an integrity failure. If such
@@ -79,7 +79,7 @@ cargo run -p mea -- digests --check    # the same verification, by hand
 ```
 
 That command reads the committed bytes and writes what they hash to. It never runs a vendor CLI
-and never touches a captured file, which is how the three contract manifests came to carry digests
+and never touches a captured file, which is how the three that predate the rule came to carry digests
 without a re-capture; the historical Claude manifest already carried its own, and `mea digests`
 leaves a manifest it agrees with untouched.
 
