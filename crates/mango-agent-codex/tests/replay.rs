@@ -3041,6 +3041,71 @@ async fn host_shutdown_marks_a_pending_approval_as_cancelled() {
     );
 }
 
+/// A host shutdown resolves an open question round exactly once, like a turn cancellation does.
+///
+/// The waiter's select is biased toward the host's cancel token, so on shutdown it takes the
+/// nobody-answered arm rather than the oneshot the canceller sent — the `reported` bit never gets
+/// looked at. Publishing from that arm regardless of whether this waiter still owned the round is
+/// how the double resolution comes back on the teardown path.
+#[tokio::test]
+async fn host_shutdown_resolves_an_open_question_round_exactly_once() {
+    let transcript = Transcript::load("turn");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the turn recording to name its thread");
+    let push = MidTurnPush::new(
+        thread_id.clone(),
+        "item/tool/requestUserInput",
+        serde_json::json!({
+            "threadId": thread_id,
+            "turnId": MID_TURN_PUSH_NATIVE_TURN_ID,
+            "itemId": "ask-1",
+            "isBlocking": false,
+            "questions": [{"id": "note", "header": "Note", "question": "Anything else?"}],
+        }),
+    );
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| push.respond(frame)));
+    let cancel = mango_external_agents::CancelToken::new();
+    let (host, _launcher) = with_launcher_limits_and_cancel(
+        launcher,
+        None,
+        mango_external_agents::Limits::default(),
+        cancel.clone(),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "do something"))
+        .await
+        .expect("expected a turn");
+    await_question(&mut turn).await;
+
+    cancel.cancel();
+    let events = drain(&mut turn).await;
+
+    let resolutions = events
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::QuestionResolved { .. }))
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "expected exactly one resolution on shutdown, received {events:#?}"
+    );
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Cancelled,
+                ..
+            }
+        )),
+        "expected shutdown to record the round as cancelled, received {events:#?}"
+    );
+}
+
 /// EOF after a live activity has no `turn/completed` to reduce, so it must still fail the stream.
 #[tokio::test]
 async fn app_server_eof_after_an_activity_fails_the_turn_without_waiting_for_a_timeout() {

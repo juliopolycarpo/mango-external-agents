@@ -2112,12 +2112,22 @@ impl CodexHandler {
             Some(QuestionAnswer::ResolvedByTheServer) => None,
             None => {
                 // Nobody answered: the shared deadline elapsed, or the host is going away.
-                let outcome = if self.shared.host.cancel().is_cancelled() {
-                    QuestionOutcome::Cancelled
-                } else {
-                    QuestionOutcome::Expired
-                };
-                self.question_resolved(&route, &request_id, outcome).await;
+                //
+                // Reported only by the waiter that still owned the round. The select above is
+                // biased toward the host's cancel token, so on a shutdown this arm is taken
+                // whatever the canceller sent and the `reported` bit below is never read; an
+                // empty slot means somebody else already took this round and published for it.
+                // A round the host answered in the same window is likewise not this task's to
+                // report — saying nothing is better than publishing `Cancelled` over an answer
+                // that landed.
+                if removed.is_some() {
+                    let outcome = if self.shared.host.cancel().is_cancelled() {
+                        QuestionOutcome::Cancelled
+                    } else {
+                        QuestionOutcome::Expired
+                    };
+                    self.question_resolved(&route, &request_id, outcome).await;
+                }
                 Some(ToolRequestUserInputResponse::none())
             }
         }
@@ -3912,6 +3922,75 @@ mod tests {
         assert!(
             shared.pending.lock().await.is_empty(),
             "expected a cancelled owner not to retain a broker-visible approval"
+        );
+    }
+
+    /// A shutdown that empties the round before the waiter is polled resolves it once.
+    ///
+    /// The waiting task's select is biased toward the host's cancel token, so once that token is
+    /// set the task takes the nobody-answered arm no matter what the canceller sent it — the
+    /// `reported` bit on `QuestionAnswer::Cancelled` is never read on this path. What separates
+    /// the two publishes is whether this waiter still owned the round: if the canceller already
+    /// took the slot, it already reported it.
+    ///
+    /// The schedule is forced rather than hoped for. `release_pending_for` empties the map before
+    /// its first real yield, so on a current-thread runtime the waiting task cannot be polled in
+    /// between, and the losing order is the one this test always runs.
+    #[tokio::test]
+    async fn a_shutdown_that_empties_the_round_first_resolves_it_exactly_once() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+        let owner = Arc::clone(
+            &shared
+                .turn
+                .lock()
+                .await
+                .as_ref()
+                .expect("expected an active turn")
+                .owner,
+        );
+
+        let waiting_shared = Arc::clone(&shared);
+        let waiter = tokio::spawn(async move {
+            CodexHandler {
+                shared: waiting_shared,
+            }
+            .on_request(
+                String::from("item/tool/requestUserInput"),
+                serde_json::json!({
+                    "threadId": "thread-1", "turnId": "vendor-turn-1", "itemId": "ask-1",
+                    "isBlocking": false,
+                    "questions": [{"id": "note", "header": "Note", "question": "Anything else?"}],
+                }),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            )
+            .await
+        });
+        while shared.pending_questions.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        shared.host.cancel().cancel();
+        shared
+            .release_pending_for(
+                Some(&owner),
+                mango_external_agents::DecisionSource::Cancelled,
+            )
+            .await;
+        let _ = waiter.await.expect("expected the question task to finish");
+
+        let mut resolutions = 0;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(10), stream.recv()).await
+        {
+            if matches!(event.kind, EventKind::QuestionResolved { .. }) {
+                resolutions += 1;
+            }
+        }
+        assert_eq!(
+            resolutions, 1,
+            "expected the shutdown to resolve the round exactly once"
         );
     }
 
