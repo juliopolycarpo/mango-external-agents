@@ -29,6 +29,19 @@ install at a version. Nothing re-records them, so their manifests carry `"reprod
 together with the two facts a reader is owed instead: `capturedFrom`, the version line the CLI
 printed, and `capturedAt`, the day. Routine drift checks leave them alone.
 
+`fixtures/acp/cursor/` and `fixtures/acp/grok/` are this class. They exist because those two
+profiles are the ones `mango-agent-acp` marks verified, and a claim a host is told to trust should
+rest on a file rather than on a source comment. Refreshing one means having the agent installed:
+
+```sh
+cargo run -p mea -- capture --harness acp --profile cursor --out fixtures/acp/cursor
+cargo run -p mea -- capture --harness acp --profile grok --out fixtures/acp/grok
+```
+
+Do that only when the agent is a version worth recording, and update the profile's
+`VerificationEvidence` in the same change — the record names a build and a day, and a capture that
+moved without it is a claim about the wrong one.
+
 **Historical sets, deliberately not regenerated.** A present-day command cannot reproduce their
 bytes, and that is the point of keeping them:
 
