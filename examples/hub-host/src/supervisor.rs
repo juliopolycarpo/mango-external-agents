@@ -324,6 +324,13 @@ impl Supervisor {
             terminal_came_from_hub: false,
         };
         loop {
+            // One of a **pair**. This catches a stop that landed while the last step was running;
+            // the one inside `back_off` catches a stop that lands while this loop is sleeping
+            // between attempts. Neither is redundant and neither covers the other in the case it
+            // was written for — but each *does* cover the other well enough that deleting one
+            // leaves the stop tests green, because the loop reaches the survivor on its next pass.
+            // So: do not delete one on the evidence of a passing suite. Delete both and the
+            // suite fails; that is what the coverage is actually proving.
             if let Some(reason) = self.stop.reason() {
                 self.abandon(&mut progress, reason).await;
                 return Ok(Settled::Stopped { reason });
@@ -346,6 +353,7 @@ impl Supervisor {
                 Step::Settled(settled) => return Ok(settled),
                 Step::Continue => {}
                 Step::Backoff(hint) => {
+                    // The second half of the pair described at the top of this loop.
                     if let Some(reason) = self.back_off(&mut progress, hint).await {
                         self.abandon(&mut progress, reason).await;
                         return Ok(Settled::Stopped { reason });
