@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hub_host::testing::{FakeHubApi, FakeVendorSession, HubCallKind, TurnAnswer};
-use hub_host::{Settled, Stop};
-use mango_external_agents::{CancelReason, TurnRequest};
+use hub_host::{Commit, Settled, Stop};
+use mango_external_agents::{CancelReason, TurnId, TurnRequest};
 
 /// More recoverable failures than any run will get through, so the supervisor is always backing
 /// off when the stop lands.
@@ -150,6 +150,95 @@ async fn a_stop_while_the_vendor_is_acknowledging_does_not_wait_out_the_deadline
         session.start_count(),
         0,
         "expected a turn the vendor never acknowledged not to count as started"
+    );
+}
+
+/// Aborting one operation must not take the session's remaining operations with it.
+///
+/// The supervisor keeps a record per logical turn and is built to drive more than one, so a single
+/// signal for its whole life makes that unusable: the first abort settles every later `run` — for
+/// any turn id, however unrelated — as stopped on the old reason, before it dispatches anything.
+#[tokio::test(start_paused = true)]
+async fn aborting_one_turn_leaves_the_session_able_to_run_the_next() {
+    let hub = Arc::new(FakeHubApi::new());
+    let session = FakeVendorSession::new().answering([TurnAnswer::CompleteWhenReleased]);
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let aborting = supervisor.abort_signal(&TurnId::new("turn-1"));
+    let running = tokio::spawn(async move {
+        let settled = supervisor.run(TurnRequest::new("turn-1", "ship it")).await;
+        (supervisor, settled)
+    });
+
+    common::until("the first turn to start", || session.start_count() == 1).await;
+    aborting.stop(CancelReason::Requested);
+    let (mut supervisor, first) = running.await.expect("expected the run task to finish");
+    let first = first.expect("expected the aborted operation to settle");
+    let second = supervisor
+        .run(TurnRequest::new("turn-2", "ship the next thing"))
+        .await
+        .expect("expected the second operation to settle");
+
+    assert_eq!(
+        first,
+        Settled::Stopped {
+            reason: CancelReason::Requested
+        }
+    );
+    assert_eq!(
+        second,
+        Settled::Committed {
+            terminal: common::COMPLETED,
+            commit: Commit::Recorded,
+        },
+        "expected an unrelated turn to run after the abort"
+    );
+    assert_eq!(
+        hub.count(HubCallKind::Reserve),
+        2,
+        "expected the second turn to be submitted, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        session.start_count(),
+        2,
+        "expected the second turn to reach the vendor"
+    );
+}
+
+/// Shutdown is the one that *is* session-wide, and stays that way.
+///
+/// The owner going away ends every operation this supervisor has left, which is the whole reason
+/// the injected signal is not replaced by the per-turn one.
+#[tokio::test(start_paused = true)]
+async fn an_owner_shutdown_stops_every_turn_the_session_has_left() {
+    let hub = Arc::new(FakeHubApi::new());
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    stop.stop(CancelReason::Shutdown);
+
+    let settled = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the operation to settle");
+
+    assert_eq!(
+        settled,
+        Settled::Stopped {
+            reason: CancelReason::Shutdown
+        }
+    );
+    assert_eq!(
+        hub.count(HubCallKind::Reserve),
+        0,
+        "expected a shut-down session to submit nothing, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        session.start_count(),
+        0,
+        "expected a shut-down session never to reach the vendor"
     );
 }
 

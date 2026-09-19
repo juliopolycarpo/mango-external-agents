@@ -94,8 +94,53 @@ enum Drained {
     Stopped,
 }
 
+/// The two signals one run answers to.
+///
+/// Shutdown is the session's: the owner going away ends every operation this supervisor has left,
+/// which is what makes it the right scope for the injected [`Stop`]. An abort is one logical
+/// turn's, and answering it with the session's signal is how a supervisor built to drive many
+/// turns becomes single-use — the first abort settles every later run, for any turn id, as stopped
+/// on that first reason before it dispatches anything.
+struct RunStop {
+    shutdown: Arc<Stop>,
+    turn: Arc<Stop>,
+}
+
+impl RunStop {
+    /// Why this run must end, if it must.
+    ///
+    /// The turn's own reason wins when both are pulled: it is the more specific of the two, and
+    /// the one a person reading an audit row asked for.
+    fn reason(&self) -> Option<CancelReason> {
+        self.turn.reason().or_else(|| self.shutdown.reason())
+    }
+
+    /// Resolves once either signal is pulled.
+    async fn stopped(&self) {
+        tokio::select! {
+            () = self.turn.stopped() => {}
+            () = self.shutdown.stopped() => {}
+        }
+    }
+
+    /// Waits out `delay`, ending early on either signal.
+    ///
+    /// The turn's signal goes through [`RetryPolicy::wait`] rather than a third arm here, so the
+    /// policy's own cancellation-aware wait stays the thing being exercised.
+    async fn wait(&self, policy: &RetryPolicy, delay: Duration) -> WaitOutcome {
+        tokio::select! {
+            // Biased for the same reason `RetryPolicy::wait` is: an already-pulled shutdown must
+            // not lose a coin toss against a zero delay.
+            biased;
+            () = self.shutdown.stopped() => WaitOutcome::Stopped,
+            outcome = policy.wait(delay, &self.turn) => outcome,
+        }
+    }
+}
+
 /// The mutable state of one `run`, kept out of the arms' parameter lists.
 struct Progress {
+    stop: RunStop,
     stream: Option<TurnStream>,
     /// Every recoverable failure this run has seen, never reset.
     ///
@@ -110,13 +155,20 @@ struct Progress {
 /// A host supervisor that drives one session's logical operations to a committed terminal.
 ///
 /// It owns the `Box<dyn Session>`, one [`RecoveryRecord`] per logical turn, the [`HubApi`] port
-/// and the [`Stop`] signal. Watchers get a [`TurnSubscriber`], never the
+/// and the [`Stop`] signals. Watchers get a [`TurnSubscriber`], never the
 /// [`TurnStream`]: dropping the stream is abandonment, and a
 /// browser must not be able to abandon an operation by closing a tab.
+///
+/// Stopping has two scopes, because the two questions are different. The injected [`Stop`] is the
+/// **session's**: the owner is going away and everything this supervisor has left is over.
+/// [`Supervisor::abort_signal`] hands back one **logical turn's**, for a stop button or a revoked
+/// consent that concerns a single operation. A supervisor with only the first cannot express the
+/// second — one abort ends the session for every turn id it has not run yet.
 pub struct Supervisor {
     inner: SupervisorInner,
     session_id: SessionId,
     records: HashMap<TurnId, LogicalTurn>,
+    aborts: HashMap<TurnId, Arc<Stop>>,
 }
 
 /// Everything the supervisor remembers about one logical turn between runs.
@@ -203,7 +255,54 @@ impl Supervisor {
             },
             session_id,
             records: HashMap::new(),
+            aborts: HashMap::new(),
         }
+    }
+
+    /// The abort signal for one logical turn, created the first time it is asked for.
+    ///
+    /// Taken **before** the run it belongs to: `run` borrows the supervisor exclusively, so the
+    /// handle a caller uses to stop one operation has to be in hand before that operation starts.
+    /// Pulling it ends that turn and nothing else; the session's own [`Stop`] is still what ends
+    /// everything.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use hub_host::testing::{FakeHubApi, FakeVendorSession, ScriptedJitter};
+    /// # use hub_host::{RetryPolicy, Stop, Supervisor};
+    /// # use mango_external_agents::{CancelReason, SystemClock, TurnId};
+    /// # use std::sync::Arc;
+    /// # use std::time::Duration;
+    /// # let policy = RetryPolicy::new(
+    /// #     Duration::from_millis(10),
+    /// #     Duration::from_secs(1),
+    /// #     Duration::from_secs(5),
+    /// #     Arc::new(ScriptedJitter::maximum()),
+    /// # );
+    /// # let mut supervisor = Supervisor::new(
+    /// #     Box::new(FakeVendorSession::new()),
+    /// #     Arc::new(FakeHubApi::new()),
+    /// #     policy,
+    /// #     Arc::new(Stop::new()),
+    /// #     Arc::new(SystemClock),
+    /// # );
+    /// let aborting = supervisor.abort_signal(&TurnId::new("turn-1"));
+    /// aborting.stop(CancelReason::Requested);
+    /// // Asking twice answers the same signal, so an abort cannot be pulled on a stale handle.
+    /// assert_eq!(
+    ///     supervisor.abort_signal(&TurnId::new("turn-1")).reason(),
+    ///     Some(CancelReason::Requested)
+    /// );
+    /// // A different logical turn is untouched.
+    /// assert!(supervisor.abort_signal(&TurnId::new("turn-2")).reason().is_none());
+    /// ```
+    pub fn abort_signal(&mut self, turn_id: &TurnId) -> Arc<Stop> {
+        Arc::clone(
+            self.aborts
+                .entry(turn_id.clone())
+                .or_insert_with(|| Arc::new(Stop::new())),
+        )
     }
 
     /// Attaches one watcher to everything this supervisor publishes.
@@ -353,6 +452,10 @@ impl Supervisor {
         // would be destroyed with it. The next run would then build a fresh one, dispatch a second
         // time under the same logical id, and reserve it with an attempt the Hub cannot tell from
         // the first.
+        let stop = RunStop {
+            shutdown: Arc::clone(&self.inner.stop),
+            turn: self.abort_signal(&request.turn_id),
+        };
         let turn = match self.records.entry(request.turn_id.clone()) {
             // Validated through the entry rather than after a removal: a refused reuse must not
             // also lose the record that refused it, or the next identical retry would start a
@@ -375,13 +478,19 @@ impl Supervisor {
                 reason: reason.clone(),
             });
         }
-        self.inner.drive(turn, &request).await
+        self.inner.drive(turn, &request, stop).await
     }
 }
 
 impl SupervisorInner {
-    async fn drive(&self, turn: &mut LogicalTurn, request: &TurnRequest) -> Result<Settled> {
+    async fn drive(
+        &self,
+        turn: &mut LogicalTurn,
+        request: &TurnRequest,
+        stop: RunStop,
+    ) -> Result<Settled> {
         let mut progress = Progress {
+            stop,
             stream: None,
             failures: 0,
             dispatched: false,
@@ -399,7 +508,7 @@ impl SupervisorInner {
             // one on the evidence of a passing suite. The exception is `submit`'s, whose absence
             // is visible as the full attempt deadline elapsing. Delete this one and `back_off`'s
             // and the suite fails; that is what the coverage is actually proving.
-            if let Some(reason) = self.stop.reason() {
+            if let Some(reason) = progress.stop.reason() {
                 self.abandon(&mut progress, reason).await;
                 return Ok(Settled::Stopped { reason });
             }
@@ -472,7 +581,7 @@ impl SupervisorInner {
         // rather than duplicating the abandon-and-settle it already does.
         let started = tokio::select! {
             biased;
-            () = self.stop.stopped() => return Ok(Step::Continue),
+            () = progress.stop.stopped() => return Ok(Step::Continue),
             started = tokio::time::timeout(
                 self.policy.attempt_deadline(),
                 self.session.start_turn(dispatched),
@@ -502,7 +611,7 @@ impl SupervisorInner {
         let Some(live) = progress.stream.as_mut() else {
             return self.observe_through_hub(record, progress).await;
         };
-        match self.drain(live).await {
+        match self.drain(live, &progress.stop).await {
             // The stop is handled at the top of the loop, which still holds the stream and so can
             // cancel the vendor's own work rather than just dropping it.
             Drained::Stopped => Ok(Step::Continue),
@@ -633,18 +742,18 @@ impl SupervisorInner {
         // a Hub echoing an elapsed `Retry-After` would be hammered at full rate.
         let remaining = hint.map(|hint| hint.remaining(self.clock.now()));
         let delay = self.policy.delay_for(progress.failures, remaining);
-        match self.policy.wait(delay, &self.stop).await {
+        match progress.stop.wait(&self.policy, delay).await {
             WaitOutcome::Elapsed => None,
-            WaitOutcome::Stopped => Some(self.stop.reason().unwrap_or(CancelReason::Requested)),
+            WaitOutcome::Stopped => Some(progress.stop.reason().unwrap_or(CancelReason::Requested)),
         }
     }
 
     /// Reads one turn's transcript, publishing as it goes.
-    async fn drain(&self, stream: &mut TurnStream) -> Drained {
+    async fn drain(&self, stream: &mut TurnStream, stop: &RunStop) -> Drained {
         loop {
             let next = tokio::select! {
                 biased;
-                () = self.stop.stopped() => return Drained::Stopped,
+                () = stop.stopped() => return Drained::Stopped,
                 event = stream.recv() => event,
             };
             let Some(event) = next else { break };
