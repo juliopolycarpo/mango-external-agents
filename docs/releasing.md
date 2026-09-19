@@ -37,10 +37,23 @@ stored in the repository or in CI.
 
 ## First release checklist
 
-Before publishing 0.1.0, run `scripts/check.sh` and `cargo publish --workspace --dry-run --locked`.
-The workspace dry run stages local crate dependencies, so it can verify all four packages before
-any of their names exist on crates.io. Inspect the packaged contents and verify each crate's docs
-with `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`.
+Before publishing 0.1.0, run `scripts/check.sh` and `scripts/check-publish.sh`, and verify each
+crate's docs with `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+--locked`.
+
+`scripts/check-publish.sh` is the same gate the release workflow runs on the tag, brought forward
+to any head. It wraps `cargo publish --workspace --dry-run --locked` — the workspace dry run stages
+local crate dependencies, so it verifies all four packages before any of their names exist on
+crates.io — and adds the two questions a dry run does not answer:
+
+- **Is the publishable set still exactly four?** A new workspace member that forgets
+  `publish = false` would otherwise join the lockstep release the first time somebody tags.
+- **Does each tarball carry what it owes and nothing else?** A crate is immutable once it lands, so
+  a missing README or licence, or a scratch directory that joined the package, costs a version
+  number rather than an edit. Pass `--list` to read each crate's packaged files in full.
+
+Run it on a clean tree: `cargo package --list` refuses to describe a package whose sources have
+uncommitted changes, and the script surfaces that refusal rather than reporting an empty package.
 
 Run `mea doctor` and a harmless `mea turn` against Claude, Codex and Cursor on the maintainer's
 Linux and Windows installations. Pinned CI covers Linux, macOS and Windows public contracts;
