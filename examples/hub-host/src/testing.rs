@@ -131,6 +131,15 @@ pub enum ReconcileAnswer {
 pub enum CommitAnswer {
     /// Record the terminal, idempotently by logical operation identity.
     Record,
+    /// Answer that an earlier call already recorded *this* terminal, whatever is offered now.
+    ///
+    /// The case a host cannot produce on its own, because the outcome the Hub kept may differ
+    /// from the one this run has in hand: an earlier attempt that ended `Failed` beats a later
+    /// one that ended `Completed`, and the host has to report what the Hub holds.
+    AlreadyRecorded {
+        /// The outcome the Hub is holding.
+        terminal: TerminalStatus,
+    },
     /// Fail the call.
     Fail(HubError),
 }
@@ -453,8 +462,12 @@ impl HubApi for FakeHubApi {
             .unwrap_or_else(PoisonError::into_inner)
             .pop_front()
             .unwrap_or(CommitAnswer::Record);
-        if let CommitAnswer::Fail(error) = answer {
-            return Err(error);
+        match answer {
+            CommitAnswer::Fail(error) => return Err(error),
+            CommitAnswer::AlreadyRecorded { terminal } => {
+                return Ok(Commit::AlreadyRecorded { terminal });
+            }
+            CommitAnswer::Record => {}
         }
         let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
         let id = logical(operation);

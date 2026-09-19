@@ -14,7 +14,9 @@ use hub_host::testing::{
     TurnAnswer,
 };
 use hub_host::{Commit, HubError, HubStatus, Reconciliation, Settled, Stop};
-use mango_external_agents::{AttemptId, Dispatch, Error, TerminalStatus, TurnId, TurnRequest};
+use mango_external_agents::{
+    AttemptId, Dispatch, Error, ErrorCode, TerminalStatus, TurnId, TurnRequest,
+};
 
 /// Long enough for the supervisor to reach the held turn, short enough to stay a test.
 const MID_TURN: Duration = Duration::from_millis(50);
@@ -384,6 +386,49 @@ async fn a_refused_commit_stays_refused_on_the_next_run() {
         session.start_count(),
         1,
         "expected the second run not to re-run work whose outcome the hub refused"
+    );
+}
+
+/// The outcome the Hub kept wins over the one this run has in hand.
+///
+/// `Commit::AlreadyRecorded` means an earlier call settled this logical operation, and the Hub is
+/// explicitly allowed to hold a different terminal from the one now being offered — an earlier
+/// attempt that ended `Failed` against a later one that ended `Completed`. Reporting the *local*
+/// value as `Settled::Committed` tells a host that ignores the `commit` field it produced an
+/// outcome that nobody recorded, which is the silent-success failure this whole file exists to
+/// prevent, on the commit path instead of the reserve path.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_the_hub_kept_wins_over_the_one_this_run_produced() {
+    let recorded = TerminalStatus::Failed {
+        code: ErrorCode::from_static("hub-recorded-failure"),
+    };
+    let hub = Arc::new(
+        FakeHubApi::new().committing([CommitAnswer::AlreadyRecorded {
+            terminal: recorded.clone(),
+        }]),
+    );
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+
+    let settled = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the operation to settle");
+
+    assert_eq!(
+        settled,
+        Settled::AlreadyCommitted {
+            terminal: recorded.clone()
+        },
+        "expected the hub's own terminal, not the {:?} this run produced",
+        common::COMPLETED
+    );
+    assert_eq!(
+        hub.count(HubCallKind::Commit),
+        1,
+        "expected exactly one commit, received the call sequence {:?}",
+        hub.sequence()
     );
 }
 

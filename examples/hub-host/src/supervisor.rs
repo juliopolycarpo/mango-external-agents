@@ -36,10 +36,16 @@ pub enum Settled {
     Committed {
         /// The outcome the vendor produced.
         terminal: TerminalStatus,
-        /// What the Hub did with it, which says whether this run or an earlier one recorded it.
+        /// What the Hub did with it. Always [`Commit::Recorded`]: a commit the Hub answered
+        /// [`Commit::AlreadyRecorded`] is [`Settled::AlreadyCommitted`] instead, because the
+        /// outcome to report is then the Hub's and not this run's.
         commit: Commit,
     },
-    /// The Hub already held the terminal, so the vendor work was consumed rather than re-run.
+    /// The Hub already held a terminal, so no outcome this run has in hand is the answer.
+    ///
+    /// Either the reconciliation found it before the vendor was asked again, or the commit did.
+    /// The terminal is always the **Hub's**, which a host may not assume equals the one it was
+    /// about to record: an earlier attempt that ended `Failed` outranks a later `Completed`.
     AlreadyCommitted {
         /// The outcome the Hub was holding.
         terminal: TerminalStatus,
@@ -573,7 +579,16 @@ impl SupervisorInner {
         }
         let operation = record.operation().clone();
         match self.bounded(self.hub.commit(&operation, &terminal)).await {
-            Ok(commit) => Ok(Step::Settled(Settled::Committed { terminal, commit })),
+            Ok(commit @ Commit::Recorded) => {
+                Ok(Step::Settled(Settled::Committed { terminal, commit }))
+            }
+            // The Hub kept an earlier call's outcome, and it is explicitly allowed to differ from
+            // the one this run is holding. Reporting the local value as `Committed` would tell a
+            // host that reads the terminal and ignores the `commit` field that it produced an
+            // outcome nobody recorded, so the Hub's own answer is what comes back.
+            Ok(Commit::AlreadyRecorded { terminal }) => {
+                Ok(Step::Settled(Settled::AlreadyCommitted { terminal }))
+            }
             Err(HubError::Refused { reason }) => Ok(Step::Settled(Settled::Refused { reason })),
             Err(error) => Ok(Step::Backoff(error.retry_hint())),
         }
