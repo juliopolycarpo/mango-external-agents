@@ -4,5 +4,10 @@
     "claude --version",
     "claude --help"
   ],
-  "reproducible": true
+  "reproducible": true,
+  "files": {
+    "cli-surface.json": "sha256:e07152b7a1fcf53dbf5689be6720cd4fc9b008d510ba5991d103f598d033a0b2",
+    "help.txt": "sha256:ae85d661e9c086f05637ebcd868f5702b477ff6e55e2e65b8ada7807cd51a4b6",
+    "version.json": "sha256:c156d1d8d4968e0f2d34f219fa0756e0104f2c2fa366551c719db7cd953f044e"
+  }
 }

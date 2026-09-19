@@ -1980,6 +1980,15 @@ mod tests {
         );
     }
 
+    /// A turn abandoned by a forced stop can finish its teardown after a newer turn has already
+    /// taken the slot. Letting that late report reach a slot it no longer owns poisons a healthy
+    /// session: `nonresumable` is session-wide, so every later `start_turn` answers `Cancelled`
+    /// forever and the only remedy left to a host is a fresh session and a lost conversation.
+    /// Releasing the slot is the same invariant seen from the other side — a stale report that
+    /// cleared it would admit a second turn beside the one still running.
+    ///
+    /// The owning attempt reporting the very same forced stop closes the test: without it the
+    /// ownership check could be proven by a taint that is never written at all.
     #[test]
     fn a_stale_teardown_cannot_taint_a_newer_turns_continuation() {
         let stale_end = Arc::new(TurnEnd::new());
@@ -2001,12 +2010,40 @@ mod tests {
             "expected a stale teardown to leave the newer turn resumable, received {:?}",
             state.nonresumable
         );
+        let slot = match state.active.as_ref() {
+            None => "a released slot",
+            Some(active) if Arc::ptr_eq(&active.end, &current_end) => "the newer turn",
+            Some(_) => "another owner",
+        };
         assert!(
             state
                 .active
                 .as_ref()
                 .is_some_and(|active| Arc::ptr_eq(&active.end, &current_end)),
-            "expected the newer turn to remain active"
+            "expected the newer turn to still own the slot, received {slot}"
+        );
+
+        // The same forced stop, differing only in which owner reports it.
+        record_stop_locked(
+            &mut state,
+            &current_end,
+            true,
+            CancelReason::Requested,
+            true,
+        );
+
+        assert_eq!(
+            state.nonresumable,
+            Some(CancelReason::Requested),
+            "expected the owning attempt's forced stop to taint the continuation, received {:?}",
+            state.nonresumable
+        );
+        // The other half of the same pointer check, and the one that keeps the assertion above
+        // honest: a `should_clear` stuck at `false` would leave a stopped, settled turn holding
+        // admission forever while every check here still passed.
+        assert!(
+            state.active.is_none(),
+            "expected the owning attempt's settled stop to release the slot, received one still held"
         );
     }
 

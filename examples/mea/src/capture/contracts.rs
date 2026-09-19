@@ -14,6 +14,8 @@ use mango_external_agents::transports::stdio;
 use mango_external_agents::{CancelReason, EnvSource, ExecutablePath, HostContext, StdioSpec};
 use serde_json::{Map, Value, json};
 
+pub mod manifest;
+
 /// The built-in ACP profile that the drift workflow installs on every operating system.
 pub const DEFAULT_ACP_CAPTURE_PROFILE: &str = "opencode";
 
@@ -107,13 +109,14 @@ async fn claude_with(host: &HostContext, out_dir: &Path) -> Result<()> {
         }),
     )?;
     write_json(&contract_dir(out_dir).join("cli-surface.json"), &surface)?;
-    write_json(
-        &contract_dir(out_dir).join("manifest.json"),
+    manifest::write(
+        &contract_dir(out_dir),
         &json!({
             "format": 1,
             "probes": ["claude --version", "claude --help"],
-            "reproducible": true,
+            "reproducible": manifest::is_reproducible("claude"),
         }),
+        &version,
     )
 }
 
@@ -158,17 +161,18 @@ async fn codex_contract_with(host: &HostContext, out_dir: &Path, workspace: &Pat
             "output": version,
         }),
     )?;
-    write_json(
-        &contract.join("manifest.json"),
+    manifest::write(
+        &contract,
         &json!({
             "format": 1,
             "probes": [
                 "codex --version",
                 "codex app-server generate-json-schema --out <workspace>/codex-schema"
             ],
-            "reproducible": true,
+            "reproducible": manifest::is_reproducible("codex"),
             "schemaFiles": ["initialize-params.schema.json", "initialize-response.schema.json"],
         }),
+        &version,
     )
 }
 
@@ -193,15 +197,16 @@ async fn acp_with(
             "output": version,
         }),
     )?;
-    write_json(
-        &contract.join("manifest.json"),
+    manifest::write(
+        &contract,
         &json!({
             "format": 1,
             "profile": profile.id.as_str(),
             "probe": "initialize",
-            "reproducible": true,
+            "reproducible": manifest::is_reproducible(profile.id.as_str()),
             "sessionOpened": false,
         }),
+        &version,
     )
 }
 

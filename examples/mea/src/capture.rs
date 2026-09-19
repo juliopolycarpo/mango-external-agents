@@ -24,7 +24,7 @@ use crate::redact;
 
 mod contracts;
 
-pub use contracts::{DEFAULT_ACP_CAPTURE_PROFILE, acp, claude, codex_contract};
+pub use contracts::{DEFAULT_ACP_CAPTURE_PROFILE, acp, claude, codex_contract, manifest};
 
 /// Which direction a recorded line went.
 ///

@@ -236,8 +236,16 @@ Some profiles need a note beyond the link:
 - **`claude-agent-acp` drives the user's own `claude`**, so the Claude Code section above applies
   unchanged. The package moved twice and the older `@zed-industries/claude-code-acp` is orphaned.
 
-Every profile except `cursor` and `grok` is `verified: false`: the entry is documented but nobody has driven the
-agent. A host can say so in its own interface.
+Only `cursor` and `grok` answer `AcpProfile::is_verified()`, and each carries two records: the live
+`tests/smoke.rs` run that earned it, and the `initialize` handshake captured beside it under
+`fixtures/acp/`. `opencode` carries the committed-capture record alone — its handshake was captured,
+no session was opened, and it is not verified. Every other entry is documented and nobody has driven
+the agent.
+
+Neither `cursor-agent` nor `grok` has a pinned installer in `scripts/install-vendor-cli.sh`, so their
+captures declare `reproducible: false` and name the build and the day instead. CI cannot reproduce
+them; they are a maintainer's record of one machine, held to the tree by their digests like every
+other capture. A host can say all of this in its own interface; see `docs/harness-acp.md`.
 
 **Quotes:** none of these vendors publishes an operative sentence about third-party harnesses for its
 ACP mode, so there is nothing to quote.

@@ -68,6 +68,8 @@ pub struct FakeHarness {
     asks_a_question: bool,
     rejects_answers: bool,
     publishes_session_updates: bool,
+    over_advertises: bool,
+    approval_before_question: bool,
 }
 
 impl Default for FakeHarness {
@@ -89,37 +91,64 @@ impl FakeHarness {
     /// assert_eq!(harness.descriptor().id(), &HarnessId::claude());
     /// ```
     pub fn new() -> Self {
-        Self {
-            descriptor: Arc::new(HarnessDescriptor {
-                identity: HarnessIdentity::claude(),
-                vendor: VENDOR,
-                capabilities: CapabilityCeiling::new(Capabilities {
-                    structured_streaming: true,
-                    interactive_approvals: true,
-                    questions: true,
-                    resume: true,
-                    usage_reporting: true,
-                    cancellation: true,
-                    steering: true,
-                    configuration: true,
-                    session_configuration: true,
-                    configuration_catalog: true,
-                    ..Capabilities::none()
-                }),
-                transports: &[TransportKind::Stdio],
-                vendor_environment_keys: &["FAKE_AGENT_CONFIG_DIR"],
-            }),
+        let mut harness = Self {
+            descriptor: Arc::new(Self::descriptor_for(true, false)),
             asks_for_approval: true,
             asks_a_question: false,
             rejects_answers: false,
             publishes_session_updates: true,
+            over_advertises: false,
+            approval_before_question: false,
+        };
+        harness.redeclare();
+        harness
+    }
+
+    /// The ceiling a fake that raises these interactions is entitled to declare.
+    ///
+    /// Split out because the declaration has to follow the behaviour: the conformance suite fails
+    /// a harness that advertises an interaction and then never raises one, so a fake hard-coding
+    /// `questions: true` while its turns ask nothing would be the first thing that suite caught.
+    fn descriptor_for(approvals: bool, questions: bool) -> HarnessDescriptor {
+        HarnessDescriptor {
+            identity: HarnessIdentity::claude(),
+            vendor: VENDOR,
+            capabilities: CapabilityCeiling::new(Capabilities {
+                structured_streaming: true,
+                interactive_approvals: approvals,
+                questions,
+                resume: true,
+                usage_reporting: true,
+                cancellation: true,
+                steering: true,
+                configuration: true,
+                session_configuration: true,
+                configuration_catalog: true,
+                ..Capabilities::none()
+            }),
+            transports: &[TransportKind::Stdio],
+            vendor_environment_keys: &["FAKE_AGENT_CONFIG_DIR"],
         }
+    }
+
+    /// Rebuilds the declaration from what this fake actually does on a turn.
+    ///
+    /// [`Self::advertising_an_interaction_it_never_raises`] is the one mode that deliberately
+    /// leaves the two out of step, because a suite check needs a harness it is supposed to fail.
+    fn redeclare(&mut self) {
+        let (approvals, questions) = if self.over_advertises || self.approval_before_question {
+            (true, true)
+        } else {
+            (self.asks_for_approval, self.asks_a_question)
+        };
+        self.descriptor = Arc::new(Self::descriptor_for(approvals, questions));
     }
 
     /// The same harness with turns that never ask for anything.
     #[must_use]
     pub fn without_approvals(mut self) -> Self {
         self.asks_for_approval = false;
+        self.redeclare();
         self
     }
 
@@ -132,6 +161,38 @@ impl FakeHarness {
     pub fn asking_a_question(mut self) -> Self {
         self.asks_a_question = true;
         self.asks_for_approval = false;
+        self.redeclare();
+        self
+    }
+
+    /// The same harness declaring both interactions, whose turn reaches the approval first.
+    ///
+    /// The ordinary shape for an agent that asks permission for a tool and only then asks the
+    /// person a clarifying question — and the case the conformance suite cannot judge, because it
+    /// stops reading a turn at the first approval rather than answering one. The suite is
+    /// supposed to record that as a limit of its own; this is the harness that proves it does.
+    #[must_use]
+    pub fn asking_for_approval_before_its_question(mut self) -> Self {
+        self.asks_for_approval = true;
+        self.asks_a_question = false;
+        self.approval_before_question = true;
+        self.redeclare();
+        self
+    }
+
+    /// The same harness declaring both interactions while its turns raise neither.
+    ///
+    /// The shape the conformance suite exists to fail: a descriptor is a promise a host plans
+    /// against, so a harness that advertises approvals or questions and then never produces one
+    /// leaves the suite with nothing to prove and the host with a capability it cannot use. It is
+    /// here for the same reason [`Self::without_session_updates`] is — a check that can only ever
+    /// pass is not a check.
+    #[must_use]
+    pub fn advertising_an_interaction_it_never_raises(mut self) -> Self {
+        self.asks_for_approval = false;
+        self.asks_a_question = false;
+        self.over_advertises = true;
+        self.redeclare();
         self
     }
 

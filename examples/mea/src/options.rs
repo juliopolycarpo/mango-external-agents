@@ -284,6 +284,53 @@ mod capture_tests {
     }
 }
 
+/// Fixture digest arguments. Example: `mea digests --out fixtures/claude`.
+#[derive(Parser)]
+#[command(name = "mea digests", disable_help_flag = true)]
+pub(crate) struct DigestOptions {
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    #[arg(long)]
+    pub check: bool,
+}
+
+impl DigestOptions {
+    /// Parses digest options without touching the tree. Example: `--out fixtures/codex`.
+    pub fn parse(arguments: &[String]) -> Result<Self, String> {
+        Self::try_parse_from(
+            std::iter::once("mea digests").chain(arguments.iter().map(String::as_str)),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// The fixture root to walk, the whole `fixtures` tree unless told otherwise.
+    pub fn root(&self) -> PathBuf {
+        self.out
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("fixtures"))
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    #[test]
+    fn digests_default_to_the_whole_fixture_tree() {
+        let options = DigestOptions::parse(&[]).expect("expected default digest options");
+        assert_eq!(options.root(), PathBuf::from("fixtures"));
+
+        assert!(!options.check);
+
+        let scoped =
+            DigestOptions::parse(&["--out".into(), "fixtures/codex".into(), "--check".into()])
+                .expect("expected a scoped digest root");
+        assert_eq!(scoped.root(), PathBuf::from("fixtures/codex"));
+        assert!(scoped.check);
+        assert!(DigestOptions::parse(&["--oot".into()]).is_err());
+    }
+}
+
 /// The fixture root for one captured profile. Example: ACP OpenCode lives in `fixtures/acp/opencode`.
 pub(crate) fn capture_output(kind: &HarnessChoice) -> PathBuf {
     let vendor = match kind {

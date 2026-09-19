@@ -325,17 +325,17 @@ offer boolean live configuration options. See [session configuration options](ht
 
 ## Profiles
 
-| Profile                        | ACP argv                             | Login                 | Verified            |
-| ------------------------------ | ------------------------------------ | --------------------- | ------------------- |
-| [`cursor`][p-cursor]           | `cursor-agent acp`                   | `cursor-agent login`  | **yes**, 2026-09-13 |
-| [`grok`][p-grok]               | `grok --no-auto-update agent stdio`  | `grok login`          | **yes**, 2026-09-13 |
-| [`opencode`][p-opencode]       | `opencode acp`                       | `opencode auth login` | no                  |
-| [`gemini`][p-gemini]           | `gemini --acp`                       | none; inside `gemini` | no                  |
-| [`copilot`][p-copilot]         | `copilot --acp`                      | `copilot login`       | no                  |
-| [`goose`][p-goose]             | `goose acp --with-builtin developer` | `goose configure`     | no                  |
-| [`codex-acp`][p-codex]         | `codex-acp`                          | `codex login`         | no                  |
-| [`claude-agent-acp`][p-claude] | `claude-agent-acp`                   | `claude auth login`   | no                  |
-| `custom`                       | the host's own argv                  | the host's own        | no                  |
+| Profile                        | ACP argv                             | Login                 | Evidence                       |
+| ------------------------------ | ------------------------------------ | --------------------- | ------------------------------ |
+| [`cursor`][p-cursor]           | `cursor-agent acp`                   | `cursor-agent login`  | **verified**, live, 2026-09-13 |
+| [`grok`][p-grok]               | `grok --no-auto-update agent stdio`  | `grok login`          | **verified**, live, 2026-09-13 |
+| [`opencode`][p-opencode]       | `opencode acp`                       | `opencode auth login` | captured handshake, 2026-09-17 |
+| [`gemini`][p-gemini]           | `gemini --acp`                       | none; inside `gemini` | none                           |
+| [`copilot`][p-copilot]         | `copilot --acp`                      | `copilot login`       | none                           |
+| [`goose`][p-goose]             | `goose acp --with-builtin developer` | `goose configure`     | none                           |
+| [`codex-acp`][p-codex]         | `codex-acp`                          | `codex login`         | none                           |
+| [`claude-agent-acp`][p-claude] | `claude-agent-acp`                   | `claude auth login`   | none                           |
+| `custom`                       | the host's own argv                  | the host's own        | whatever the host records      |
 
 [p-cursor]: https://cursor.com/docs/cli/acp
 [p-cursor-install]: https://cursor.com/docs/cli/installation
@@ -351,9 +351,33 @@ offer boolean live configuration options. See [session configuration options](ht
 `tests/smoke.rs` passed on 2026-09-13 against `cursor-agent` 2026.09.10-fd3934a and Grok 1.0.30.
 Each opened a session, returned `pong` and closed. Neither run sent ACP `authenticate`.
 
-`verified` says a profile was driven against the agent itself by `tests/smoke.rs`. Everything else is a
-documented entry that nobody has run; a host can say so in its own interface, and nothing here pretends
-otherwise.
+### What "verified" is evidence of
+
+`AcpProfile::is_verified()` says a profile was driven against the agent itself, and
+`AcpProfile::evidence` is the record behind that answer: a `VerificationEvidence` per check, naming the
+build (`agent_version`), the day (`checked_on`), what the check was (`method`) and where its result is
+in this repository (`source`). It is a list, because one agent can have been both driven live and
+captured. A profile test holds every entry to its shape and opens the path it names, so a claim whose
+evidence is not in the tree fails the suite — which is what a source comment could never do.
+
+Two methods, and they are not degrees of the same thing:
+
+- `VerificationMethod::LiveSession` — `tests/smoke.rs` drove the installed agent: a session opened,
+  answered and closed. Only this earns `is_verified()`.
+- `VerificationMethod::CommittedCapture` — a capture under `fixtures/` proves the handshake this
+  profile's argv produces, and nothing past it.
+
+`cursor` and `grok` carry one of each: the live run that earned verification, and the handshake
+captured beside it, so the capability set they are driven under is a file rather than a memory.
+`opencode` carries the second kind alone and is deliberately **not** verified. Its committed capture
+is an `initialize` probe whose manifest records `sessionOpened: false`; calling that verified would
+claim a session nobody opened. A profile with no evidence at all is a documented entry nobody has
+run; a host can say so in its own interface, and nothing here pretends otherwise.
+
+A capture is not automatically reproducible. `scripts/install-vendor-cli.sh` pins `claude`, `codex`
+and `opencode` and nothing else, so `fixtures/acp/cursor/` and `fixtures/acp/grok/` declare
+`reproducible: false` and record `capturedFrom` and `capturedAt` in place of a promise CI cannot
+keep. The digests hold them to the tree either way.
 
 ### Executable names and installation order
 
@@ -466,8 +490,9 @@ never going to work.
   it exposes the live negotiated catalog and refuses a model or effort mapping that is missing or
   ambiguous.
 
-- **Public OpenCode contract capture.** `mea capture --harness acp --profile opencode` records the
-  installed CLI's version and its v1 `initialize` answer under `fixtures/acp/opencode/contract/`.
+- **Public ACP contract captures.** `mea capture --harness acp --profile <id>` records the installed
+  CLI's version and its v1 `initialize` answer under `fixtures/acp/<id>/contract/` — committed today
+  for `opencode`, `cursor` and `grok`.
   It sends no `authenticate` or `session/new` request. The capture keeps each auth method's `type`,
   `id` and `name` and the shape of `agentCapabilities`, drops `_meta` extension objects, and
   replaces every string *value* inside `agentCapabilities` with `[REDACTED]` rather than guessing

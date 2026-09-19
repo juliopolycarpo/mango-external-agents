@@ -25,17 +25,18 @@ use mango_external_agents::{
     Activity, ActivityContent, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
     Answer, AnswerValue, ApprovalDecision, AttemptId, Capabilities, CapabilityCeiling, Command,
     Configuration, ConfigurationCatalog, ConfigurationCategory, ConfigurationChange,
-    ConfigurationOption, ConfigurationOptionId, ConfigurationOptionValue, ConfigurationPatch,
-    ConfigurationSource, ConfigurationState, ConfigurationValue, ConfigurationValueType,
-    DecisionSource, Discovery, DiscoveryReceipt, Dispatch, Error, ExtensionValue, Extensions,
-    FileChange, FileChangeKind, Harness, HarnessDescriptor, HarnessId, HarnessIdentity,
-    HarnessRegistry, Interaction, InteractionId, InteractionKind, McpServer, OpenSession,
-    OperationRef, PermissionEffect, PermissionLevel, PermissionOption, PermissionRequest,
-    PermissionRisk, PermissionScope, PlanStep, PlanStepStatus, ProfileId, ProtocolFamily, Question,
-    QuestionForm, QuestionId, QuestionOption, QuestionOptionId, QuestionRequest, QuestionResponse,
-    Session, SessionCapabilities, SessionId, SessionIds, SessionRevision, SessionSnapshot,
-    SessionState, SessionStatus, TransportKind, TransportSelection, TurnId, TurnRequest,
-    VendorInfo,
+    ConfigurationOption, ConfigurationOptionId, ConfigurationOptionValue, ConfigurationOutcome,
+    ConfigurationPatch, ConfigurationSource, ConfigurationState, ConfigurationValue,
+    ConfigurationValueType, DecisionSource, Discovery, DiscoveryReceipt, Dispatch, Error,
+    ExtensionValue, Extensions, FileChange, FileChangeKind, Harness, HarnessDescriptor, HarnessId,
+    HarnessIdentity, HarnessRegistry, Interaction, InteractionId, InteractionKind, McpServer,
+    OpenSession, OperationRef, PermissionEffect, PermissionLevel, PermissionOption,
+    PermissionRequest, PermissionRisk, PermissionScope, PlanStep, PlanStepStatus, ProfileId,
+    ProtocolFamily, Question, QuestionForm, QuestionId, QuestionOption, QuestionOptionId,
+    QuestionRequest, QuestionResponse, RecoveryAction, RecoveryRecord, RejectedSetting,
+    RequestFingerprint, Rollback, Session, SessionCapabilities, SessionId, SessionIds,
+    SessionRevision, SessionSnapshot, SessionState, SessionStatus, SettingRejection,
+    TerminalStatus, TransportKind, TransportSelection, TurnId, TurnRequest, VendorInfo,
 };
 
 /// A harness this crate has never heard of, written entirely against the public API.
@@ -419,6 +420,117 @@ fn configuration_round_trips_without_collapsing_keep_set_and_reset() {
         serde_json::from_value(serde_json::to_value(&state).expect("serializable state"))
             .expect("expected the state back");
     assert_eq!(round_tripped, state);
+}
+
+/// The answer to `Session::configure`, pinned on the wire.
+///
+/// It is the one configuration type a host both receives and persists — a runtime relays it to a
+/// browser, and a browser renders "two of three landed" from it. That makes its field names a
+/// contract, and until this test existed the only thing holding them was the struct definition.
+/// A rename here is a silent change of meaning at the far end of somebody's WebSocket.
+///
+/// The partial case is the one worth pinning rather than the happy one: `applied` and `rejected`
+/// are both `skip_serializing_if = "Vec::is_empty"`, so an outcome where everything landed encodes
+/// without either key, and a test built on that would never notice a rename of either.
+#[test]
+fn a_partial_configuration_outcome_survives_serialization_with_its_rollback_intact() {
+    let outcome = ConfigurationOutcome::applied(
+        ConfigurationState::unknown(),
+        vec![ConfigurationOptionId::new("model")],
+    )
+    .rejecting(
+        vec![RejectedSetting::new(
+            ConfigurationOptionId::new("effort"),
+            SettingRejection::ResetNotSupported,
+        )],
+        Rollback::NotAttempted,
+    );
+    assert!(
+        outcome.is_partial() && !outcome.is_complete(),
+        "expected a partial outcome to build, received {outcome:?}"
+    );
+
+    let encoded = serde_json::to_value(&outcome).expect("expected a serializable outcome");
+    assert_eq!(encoded["applied"][0], "model");
+    assert_eq!(encoded["rejected"][0]["option"], "effort");
+    assert_eq!(encoded["rejected"][0]["reason"], "reset-not-supported");
+    assert_eq!(
+        encoded["rollback"], "not-attempted",
+        "expected the rollback to say the rest was left applied, received {:?}",
+        encoded["rollback"]
+    );
+
+    let round_tripped: ConfigurationOutcome =
+        serde_json::from_value(encoded).expect("expected the outcome back");
+    assert_eq!(
+        round_tripped, outcome,
+        "expected an outcome to survive a round trip unchanged"
+    );
+}
+
+/// The retry contract, exercised from outside the crate that defines it.
+///
+/// `RecoveryRecord` is the only public type whose whole job is to **refuse** things, so a host
+/// that cannot reach its refusals from outside has no retry contract at all. Compiled here rather
+/// than only in the crate's own unit tests, because `#[non_exhaustive]` and private fields are
+/// inert inside the defining crate — and this is the surface a supervisor in another repository
+/// actually writes its loop against.
+#[test]
+fn the_retry_contract_refuses_an_unsafe_replay_from_outside_this_crate() {
+    let request = TurnRequest::new("turn-1", "say hello");
+    let mut record = RecoveryRecord::new(SessionId::new("chat-1"), &request)
+        .expect("expected a record for a serializable request");
+    assert_eq!(record.action(), RecoveryAction::Submit);
+
+    let operation = record.operation().clone();
+    record
+        .record_dispatch(&operation, Dispatch::AcceptanceUnknown)
+        .expect("expected the pre-dispatch certainty to be recorded");
+    assert_eq!(record.action(), RecoveryAction::Reconcile);
+    assert!(!Dispatch::AcceptanceUnknown.is_safe_to_replay());
+    assert!(Dispatch::AcceptanceUnknown.needs_reconciliation());
+
+    // The whole point: uncertain acceptance does not become a newer attempt on its own.
+    let retry = request.clone().as_attempt(AttemptId::new(2));
+    let refusal = record
+        .retry(&retry)
+        .map(drop)
+        .expect_err("expected an unreconciled replay to be refused");
+    assert!(
+        matches!(refusal, Error::HostConfiguration { .. }),
+        "expected a typed refusal naming the expected shape, received {refusal:?}"
+    );
+
+    // Native proof of absence is the only thing that unlocks it.
+    record
+        .reconcile_not_submitted(&operation)
+        .expect("expected proven non-submission to be recordable");
+    let advanced = record.retry(&retry).expect("expected the newer attempt");
+    assert_eq!(advanced.attempt, AttemptId::new(2));
+    assert!(operation.is_superseded_by(&advanced));
+
+    // Same logical turn, different content, is a different request and is refused.
+    let tampered = TurnRequest::new("turn-1", "say something else").as_attempt(AttemptId::new(3));
+    assert!(
+        record.validate(&tampered).is_err(),
+        "expected a reused logical id with changed content to be refused"
+    );
+    assert_ne!(
+        RequestFingerprint::of(&request).expect("expected a fingerprint"),
+        RequestFingerprint::of(&tampered).expect("expected a fingerprint"),
+        "expected different content to produce a different fingerprint"
+    );
+
+    record
+        .finish(&advanced, TerminalStatus::Completed)
+        .expect("expected the terminal to commit");
+    assert_eq!(record.action(), RecoveryAction::Finished);
+    assert!(
+        record
+            .retry(&request.clone().as_attempt(AttemptId::new(4)))
+            .is_err(),
+        "expected a committed terminal to end recovery"
+    );
 }
 
 /// A catalog keeps native ids, ordering and value types, and an unknown category does not take the

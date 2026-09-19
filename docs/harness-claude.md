@@ -320,6 +320,22 @@ grammar needed to decide current safe argv such as permission modes, effort leve
 inventing that grammar from a capability summary would risk passing an undeclared flag.
 A receipt that says the CLI was not installed retains the no-CLI launch refusal without probing it.
 
+What the receipt is worth, measured rather than claimed:
+
+| Sequence                                       | Vendor boots            |
+| ---------------------------------------------- | ----------------------- |
+| `discover`                                     | 3                       |
+| `open_session` with an accepted receipt        | 1                       |
+| `open_session` with no receipt                 | 3                       |
+| `open_session` with a stale or changed receipt | 0, plus a typed refusal |
+
+So a host that discovers and then opens without vouching for the result pays **six** boots before
+its first token, and one that passes a receipt pays four. `open_session` deliberately does not
+cache: the harness cannot know the executable, the environment or the account did not move between
+the two calls, and guessing is exactly what the receipt replaces. The numbers are asserted as exact
+counts in `tests/harness_over_a_fake_cli.rs`, so probe creep fails a test rather than quietly
+slowing a first token.
+
 `auth status` returns more personal data than any other vendor's status call — `email`, `orgId`,
 `orgName`, `projectsDirectory`, `subscriptionType`. **None of it leaves the parser.** Two facts do:
 whether somebody is signed in, and whether the account is a subscription, an API key or a cloud

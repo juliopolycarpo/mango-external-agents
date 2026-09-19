@@ -156,9 +156,15 @@ impl CancelToken {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// How many payload events one turn holds before reporting overflow and stopping native work.
-    /// Interaction events have a separate count reserve within the shared byte budget.
+    /// Interaction events have a count reserve of their own, twice [`Self::max_pending_requests`].
     pub turn_channel_capacity: usize,
-    /// Maximum serialized payload bytes queued per turn, excluding its reserved terminal.
+    /// Maximum serialized bytes queued per turn, excluding its reserved terminal.
+    ///
+    /// Payload and interaction events are budgeted apart within this one number. Interactions
+    /// hold a reserve of their count reserve times 8 KiB, clamped to half of this value — 1 MiB of
+    /// the 8 MiB default — so an approval raised while payload has filled the turn still reaches
+    /// the host that must answer it. Payload stops at this value less that reserve; the two
+    /// together never exceed it.
     pub turn_buffer_bytes: usize,
     /// Maximum in-flight protocol requests or approval callbacks per session.
     pub max_pending_requests: usize,

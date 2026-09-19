@@ -11,9 +11,23 @@
 //!
 //! # Verified and unverified
 //!
-//! [`AcpProfile::verified`] says whether the entry was checked against the agent actually running
-//! on a machine. An unverified profile is a documented guess: it is offered, and a host can say so
-//! in its own interface, but nothing here pretends a capture exists that does not.
+//! [`AcpProfile::is_verified`] says whether the entry was driven against the agent actually
+//! running on a machine, and [`AcpProfile::evidence`] says what backs that answer: which build was
+//! checked, on what day, how, and where the evidence is in this repository. A claim whose evidence
+//! was a source comment is a claim nobody can check, so the comment is the record.
+//!
+//! It is a list because one profile can hold more than one kind of evidence — a live run and a
+//! committed handshake are different facts about the same agent, and neither replaces the other.
+//! Three levels, and the difference between the last two is the whole reason this is a record
+//! rather than a flag:
+//!
+//! - **Verified** — [`VerificationMethod::LiveSession`]: `tests/smoke.rs` drove the installed
+//!   agent and a session opened, answered and closed. `cursor` and `grok` are the two.
+//! - **Captured** — [`VerificationMethod::CommittedCapture`]: a capture committed under
+//!   `fixtures/` proves the handshake this profile's argv produces and nothing past it. `opencode`
+//!   is the one, and it is *not* verified: its capture opened no session.
+//! - **Neither** — no evidence at all. A documented entry nobody has run. It is offered, a host
+//!   can say so in its own interface, and nothing here pretends otherwise.
 
 use std::sync::Arc;
 
@@ -59,6 +73,98 @@ impl SessionModeIds {
     }
 }
 
+/// How a profile's entry was checked against the agent it describes.
+///
+/// The two are not degrees of the same check. A live session is the agent doing the thing this
+/// library asks of it; a committed capture is its handshake, recorded, and says nothing about what
+/// happens after `initialize`. Only the first earns [`AcpProfile::is_verified`].
+///
+/// Closed against a third kind, of which there are already candidates: a captured *turn* rather
+/// than a handshake, a vendor's own documented statement, a third-party attestation. A host does
+/// not have to match on this at all — [`AcpProfile::is_verified`] is the boolean — so closing it
+/// costs nothing now and cannot be done at all once the crate is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VerificationMethod {
+    /// `tests/smoke.rs` drove the installed agent: a session opened, answered and closed.
+    LiveSession,
+    /// A capture committed under `fixtures/`, which proves the handshake and nothing past it.
+    CommittedCapture,
+}
+
+/// What backs a profile's claim about the agent it describes.
+///
+/// The fields are the questions somebody re-checking an entry has to answer anyway: against which
+/// build, on which day, how, and where they can read the result. A source comment answered them
+/// for a reader and for nobody else — no test could assert on it, and it drifted silently when the
+/// profile beside it changed.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_acp::VerificationMethod;
+///
+/// let cursor = mango_agent_acp::builtin_profile("cursor").expect("a built-in profile");
+/// let live = cursor.evidence.first().expect("cursor was driven against its own agent");
+/// assert_eq!(live.method, VerificationMethod::LiveSession);
+/// assert_eq!(live.agent_version, "2026.09.10-fd3934a");
+/// assert!(cursor.is_verified());
+///
+/// let opencode = mango_agent_acp::builtin_profile("opencode").expect("a built-in profile");
+/// let captured = opencode.evidence.first().expect("opencode has a committed capture");
+/// assert_eq!(captured.method, VerificationMethod::CommittedCapture);
+/// assert!(!opencode.is_verified(), "a handshake is not a session");
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VerificationEvidence {
+    /// The build that was checked, as the agent's own version surface prints it.
+    pub agent_version: &'static str,
+    /// The day the check ran, as `YYYY-MM-DD`.
+    pub checked_on: &'static str,
+    /// What the check was.
+    pub method: VerificationMethod,
+    /// Where the result is, as a path from the root of this repository.
+    pub source: &'static str,
+}
+
+impl VerificationEvidence {
+    /// One recorded check, for a host registering a profile of its own.
+    ///
+    /// The constructor exists because the struct is closed: a later field — who ran it, which
+    /// protocol version was negotiated — must not stop a host's own profile compiling. Every
+    /// argument is `&'static str` because a record is written in source beside the profile it
+    /// backs, never assembled at runtime from something a vendor said.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::{VerificationEvidence, VerificationMethod};
+    ///
+    /// let checked = VerificationEvidence::new(
+    ///     "1.4.2",
+    ///     "2026-09-19",
+    ///     VerificationMethod::LiveSession,
+    ///     "tests/my_agent_smoke.rs",
+    /// );
+    /// assert_eq!(checked.method, VerificationMethod::LiveSession);
+    /// ```
+    #[must_use]
+    pub const fn new(
+        agent_version: &'static str,
+        checked_on: &'static str,
+        method: VerificationMethod,
+        source: &'static str,
+    ) -> Self {
+        Self {
+            agent_version,
+            checked_on,
+            method,
+            source,
+        }
+    }
+}
+
 /// Everything about one ACP agent that is not the protocol.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpProfile {
@@ -89,8 +195,12 @@ pub struct AcpProfile {
     pub modes: SessionModeIds,
     /// Vendor-documented environment variables that survive the allowlist.
     pub vendor_environment_keys: &'static [&'static str],
-    /// Whether this entry was checked against the agent actually running.
-    pub verified: bool,
+    /// Every check anybody ran against the agent actually running, in the order they were added.
+    ///
+    /// Empty is a documented entry nobody has driven. Read the boolean through
+    /// [`is_verified`](AcpProfile::is_verified): evidence is not the same claim as verification,
+    /// because a committed handshake capture is evidence and is not a session.
+    pub evidence: Vec<VerificationEvidence>,
 }
 
 impl AcpProfile {
@@ -115,7 +225,8 @@ impl AcpProfile {
     ///
     /// let profile = AcpProfile::custom("in-house", ["my-agent", "--acp"], VENDOR);
     /// assert_eq!(profile.id.as_str(), "in-house");
-    /// assert!(!profile.verified);
+    /// assert!(!profile.is_verified());
+    /// assert!(profile.evidence.is_empty());
     /// ```
     pub fn custom<I, S>(id: impl Into<String>, argv: I, vendor: VendorInfo) -> Self
     where
@@ -144,7 +255,7 @@ impl AcpProfile {
             docs_url: ACP_PROTOCOL_DOCS,
             modes: SessionModeIds::UNKNOWN,
             vendor_environment_keys: &[],
-            verified: false,
+            evidence: Vec::new(),
         }
     }
 
@@ -191,11 +302,38 @@ impl AcpProfile {
         self
     }
 
-    /// Marks this entry as checked against the agent actually running.
+    /// Adds one check that was run against the agent this entry describes.
+    ///
+    /// Whether that check amounts to verification is [`VerificationMethod`]'s answer, not this
+    /// method's: a host supplying its own profile records what it actually did, and a committed
+    /// handshake stays a committed handshake. Called once per check, because an agent that was
+    /// both driven live and captured has two facts recorded against it rather than one.
     #[must_use]
-    pub fn verified(mut self) -> Self {
-        self.verified = true;
+    pub fn with_verification(mut self, evidence: VerificationEvidence) -> Self {
+        self.evidence.push(evidence);
         self
+    }
+
+    /// Whether this entry was driven against the agent actually running.
+    ///
+    /// True only for [`VerificationMethod::LiveSession`] — a session that opened, answered and
+    /// closed. A profile with a committed capture and nothing else answers `false`, because the
+    /// capture proves a handshake and a host's interface would be reporting a turn nobody drove.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let grok = mango_agent_acp::builtin_profile("grok").expect("a built-in profile");
+    /// assert!(grok.is_verified());
+    ///
+    /// let gemini = mango_agent_acp::builtin_profile("gemini").expect("a built-in profile");
+    /// assert!(!gemini.is_verified());
+    /// ```
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.evidence
+            .iter()
+            .any(|evidence| evidence.method == VerificationMethod::LiveSession)
     }
 
     /// The text a host shows somebody who has to sign in.
@@ -313,6 +451,9 @@ pub fn matrix(modes: &SessionModeIds) -> PermissionMatrix {
 /// The protocol's own documentation, for a profile with nothing more specific.
 pub const ACP_PROTOCOL_DOCS: &str = "https://agentclientprotocol.com/protocol/overview";
 
+/// The test that earns a profile [`VerificationMethod::LiveSession`], from the repository root.
+const SMOKE_TEST: &str = "crates/mango-agent-acp/tests/smoke.rs";
+
 /// Every profile this crate ships, in a stable order.
 ///
 /// # Example
@@ -380,9 +521,23 @@ fn cursor() -> AcpProfile {
         "https://cursor.com/docs/cli/acp",
     )
     .with_login_hint("cursor-agent login")
-    // Checked against `cursor-agent` 2026.09.10-fd3934a on 2026-09-13 by `tests/smoke.rs`:
-    // a session opened, answered pong and closed. No permission-mode mapping is claimed.
-    .verified()
+    // A session opened, answered pong and closed. No permission-mode mapping is claimed.
+    .with_verification(VerificationEvidence {
+        agent_version: "2026.09.10-fd3934a",
+        checked_on: "2026-09-13",
+        method: VerificationMethod::LiveSession,
+        source: SMOKE_TEST,
+    })
+    // The live run above was re-run on this day and the handshake it produced committed beside
+    // it, so the capability set this profile is driven under is a file rather than a memory.
+    // `reproducible: false` in its manifest: `cursor-agent` has no pinned installer here, so CI
+    // cannot reproduce this capture and it is read as a maintainer's record of one build.
+    .with_verification(VerificationEvidence {
+        agent_version: "2026.09.10-fd3934a",
+        checked_on: "2026-09-19",
+        method: VerificationMethod::CommittedCapture,
+        source: "fixtures/acp/cursor/contract",
+    })
 }
 
 /// Grok Build's documented ACP v1 command, with background updates disabled.
@@ -407,9 +562,23 @@ fn grok() -> AcpProfile {
     // initiative, and the session argv disables it for exactly that reason.
     .with_version_argv(["grok", "--no-auto-update", "--version"])
     .with_login_hint("grok login")
-    // `tests/smoke.rs` passed against Grok 1.0.30 on 2026-09-13 with the existing local login,
-    // without an ACP `authenticate` request. No permission-mode mapping is claimed.
-    .verified()
+    // The run used the existing local login and sent no ACP `authenticate` request. No
+    // permission-mode mapping is claimed.
+    .with_verification(VerificationEvidence {
+        agent_version: "1.0.30",
+        checked_on: "2026-09-13",
+        method: VerificationMethod::LiveSession,
+        source: SMOKE_TEST,
+    })
+    // Re-run on this day and its handshake committed, on the same terms as Cursor's above:
+    // no pinned installer, so the capture is a maintainer's record rather than a reproducible
+    // contract. `capturedFrom` keeps the whole `--version` line, banner included.
+    .with_verification(VerificationEvidence {
+        agent_version: "1.0.30",
+        checked_on: "2026-09-19",
+        method: VerificationMethod::CommittedCapture,
+        source: "fixtures/acp/grok/contract",
+    })
 }
 
 /// OpenCode in ACP mode.
@@ -427,6 +596,17 @@ fn opencode() -> AcpProfile {
         "https://opencode.ai/docs/acp/",
     )
     .with_login_hint("opencode auth login")
+    // Captured, not verified. `mea capture --harness acp --profile opencode` sent `initialize`
+    // and stopped there — the manifest beside it records `sessionOpened: false` — so this argv is
+    // proved to reach an ACP handshake and nothing is claimed about a turn.
+    // The capture records no date of its own, so the day it was committed is the one fact the
+    // tree holds.
+    .with_verification(VerificationEvidence {
+        agent_version: "1.18.30",
+        checked_on: "2026-09-17",
+        method: VerificationMethod::CommittedCapture,
+        source: "fixtures/acp/opencode/contract",
+    })
 }
 
 /// Gemini CLI in ACP mode.
@@ -558,7 +738,10 @@ mod tests {
         );
     }
 
-    use super::{AcpProfile, SessionModeIds, builtin_profile, builtin_profiles, matrix};
+    use super::{
+        AcpProfile, SMOKE_TEST, SessionModeIds, VerificationMethod, builtin_profile,
+        builtin_profiles, matrix,
+    };
     use mango_external_agents::permission::{ApprovalRouting, PermissionLevel, UnsupportedReason};
     use mango_external_agents::{ExecutablePath, VendorInfo};
 
@@ -628,14 +811,20 @@ mod tests {
         assert_eq!(ids.len(), count, "expected distinct ids, received {ids:?}");
     }
 
-    /// A profile claims `verified` only after `tests/smoke.rs` has been run against the agent itself.
-    /// Anything else would put a check in a host's interface that nobody performed, so this test is
-    /// the list — and it is what has to be updated when the next profile is driven for real.
+    /// A profile claims verification only after `tests/smoke.rs` has been run against the agent
+    /// itself. Anything else would put a check in a host's interface that nobody performed, so this
+    /// test is the list — and it is what has to be updated when the next profile is driven for real.
+    ///
+    /// The two lists are deliberately different lengths. `opencode` has a committed handshake and
+    /// no live run, so it is captured and **not** verified; `cursor` and `grok` now have both. A
+    /// capture proves the argv reaches an ACP handshake and nothing more, which is exactly why
+    /// promoting a profile on the strength of one would be the unevidenced claim this pair of
+    /// assertions exists to prevent.
     #[test]
     fn only_profiles_checked_against_a_real_agent_claim_to_be_verified() {
         let claimed: Vec<String> = builtin_profiles()
             .iter()
-            .filter(|profile| profile.verified)
+            .filter(|profile| profile.is_verified())
             .map(|profile| profile.id.to_string())
             .collect();
         assert_eq!(
@@ -643,6 +832,94 @@ mod tests {
             vec![String::from("cursor"), String::from("grok")],
             "expected only the profiles run against their own agent, received {claimed:?}"
         );
+
+        let captured: Vec<String> = builtin_profiles()
+            .iter()
+            .filter(|profile| {
+                profile
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.method == VerificationMethod::CommittedCapture)
+            })
+            .map(|profile| profile.id.to_string())
+            .collect();
+        assert_eq!(
+            captured,
+            vec![
+                String::from("cursor"),
+                String::from("grok"),
+                String::from("opencode"),
+            ],
+            "expected only the profiles with a committed handshake, received {captured:?}"
+        );
+    }
+
+    /// The rule the claim has to satisfy: a profile that says it was checked carries the record of
+    /// that check, and a record names a build, a day and a file somebody can open. An argv and a
+    /// source comment are not verified support — a comment is what this replaced, precisely because
+    /// no test could read one.
+    #[test]
+    fn a_profile_that_claims_a_check_carries_the_record_of_it() {
+        for profile in builtin_profiles() {
+            assert_eq!(
+                profile.is_verified(),
+                profile
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.method == VerificationMethod::LiveSession),
+                "expected verification to follow the evidence, received {:?} for {}",
+                profile.evidence,
+                profile.id
+            );
+            for evidence in &profile.evidence {
+                assert!(
+                    !evidence.agent_version.is_empty(),
+                    "expected the build that was checked, received none for {}",
+                    profile.id
+                );
+                assert!(
+                    is_iso_date(evidence.checked_on),
+                    "expected a YYYY-MM-DD date, received {:?} for {}",
+                    evidence.checked_on,
+                    profile.id
+                );
+                let names_its_own_kind = match evidence.method {
+                    VerificationMethod::LiveSession => evidence.source == SMOKE_TEST,
+                    VerificationMethod::CommittedCapture => {
+                        evidence.source.starts_with("fixtures/")
+                            && evidence.source.ends_with("contract")
+                    }
+                };
+                assert!(
+                    names_its_own_kind,
+                    "expected the evidence a {:?} check leaves behind, received {:?} for {}",
+                    evidence.method, evidence.source, profile.id
+                );
+                let path = repository_root().join(evidence.source);
+                assert!(
+                    path.exists(),
+                    "expected the evidence at {}, received no such path for {}",
+                    path.display(),
+                    profile.id
+                );
+            }
+        }
+    }
+
+    /// The repository root, from this crate's own manifest. Joined a segment at a time and never
+    /// canonicalised, for the reason `mango-agent-codex`'s fixture loader gives.
+    fn repository_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
+    fn is_iso_date(text: &str) -> bool {
+        let parts: Vec<&str> = text.split('-').collect();
+        parts.len() == 3
+            && [4, 2, 2].iter().zip(&parts).all(|(width, part)| {
+                part.len() == *width && part.bytes().all(|b| b.is_ascii_digit())
+            })
     }
 
     /// The npm shims are the two profiles where the obvious argv would have the library fetch a
@@ -695,7 +972,8 @@ mod tests {
         let profile = AcpProfile::custom("in-house", ["my-agent", "--acp"], VENDOR);
         assert_eq!(profile.version_argv, vec!["my-agent", "--version"]);
         assert_eq!(profile.login_hint, None);
-        assert!(!profile.verified);
+        assert!(profile.evidence.is_empty());
+        assert!(!profile.is_verified());
     }
 
     /// `argv[0]` is what the launcher spawns, so a path the host resolved has to win in both the

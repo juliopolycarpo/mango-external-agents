@@ -1909,6 +1909,120 @@ async fn a_delayed_start_error_cannot_evict_a_live_replacement_with_the_same_hos
     );
 }
 
+/// A server that accepts the turn it is asked to start and then immediately fails it.
+///
+/// The recording has no such conversation: every captured turn the server accepted, it also ran.
+struct AcceptedThenFailedServer {
+    thread_id: String,
+    started: AtomicBool,
+}
+
+impl AcceptedThenFailedServer {
+    const NATIVE_TURN_ID: &'static str = "accepted-then-failed";
+
+    fn respond(&self, frame: &serde_json::Value) -> Option<Vec<String>> {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        if method != Some("turn/start") || self.started.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        Some(vec![
+            serde_json::json!({
+                "id": id,
+                "result": {"turn": {"id": Self::NATIVE_TURN_ID}},
+            })
+            .to_string(),
+            serde_json::json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": self.thread_id,
+                    "turn": {
+                        "id": Self::NATIVE_TURN_ID,
+                        "status": "failed",
+                        "error": {"message": "upstream refused", "additionalDetails": "429"},
+                    },
+                },
+            })
+            .to_string(),
+        ])
+    }
+}
+
+/// A start the server accepted and then failed is not a start it refused.
+///
+/// A host's retry loop keys on that difference: `start_turn` returning `Ok` means the prompt
+/// reached the vendor, so the failure that follows arrives on the stream and the dispatch stays
+/// `Accepted` — replaying it is the host's decision, not a free one. The turn ends exactly once,
+/// on the failure itself, and `terminal_status` reports it without the transcript being read.
+#[tokio::test]
+async fn a_turn_the_server_accepted_and_then_failed_ends_once_on_that_failure() {
+    let transcript = Transcript::load("turn");
+    let server = Arc::new(AcceptedThenFailedServer {
+        thread_id: transcript
+            .thread_id()
+            .expect("expected the recording to name its thread"),
+        started: AtomicBool::new(false),
+    });
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| server.respond(frame)));
+    let (host, _launcher) = with_launcher(Arc::clone(&launcher), None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "do something"))
+        .await
+        .expect("expected the server's acceptance before its failure");
+
+    assert_eq!(
+        turn.dispatch(),
+        mango_external_agents::Dispatch::Accepted,
+        "expected an accepted start to stay accepted through its failure"
+    );
+    assert_eq!(
+        turn.native_turn_id(),
+        AcceptedThenFailedServer::NATIVE_TURN_ID,
+        "expected the accepted turn to carry the vendor's handle"
+    );
+
+    let events = drain(&mut turn).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "expected the acceptance announcement and then the failure, received {events:#?}"
+    );
+    assert!(
+        matches!(events[0], EventKind::TurnStarted { .. }),
+        "expected the accepted start to be announced, received {:#?}",
+        events[0]
+    );
+    assert!(
+        matches!(
+            &events[1],
+            EventKind::Error { error }
+                if error.code.as_str() == "codex-turn-failed"
+                    && error.message.contains("upstream refused")
+        ),
+        "expected the vendor's failure to end the turn, received {:#?}",
+        events[1]
+    );
+    assert!(
+        matches!(
+            turn.terminal_status(),
+            Some(mango_external_agents::TerminalStatus::Failed { code })
+                if code.as_str() == "codex-turn-failed"
+        ),
+        "expected the failure to be observable as the committed terminal, received {:?}",
+        turn.terminal_status()
+    );
+    assert!(
+        turn.recv().await.is_none(),
+        "expected nothing after the turn's one terminal"
+    );
+}
+
 /// A cancellation that raced a start has a reaper waiting for the start owner's admission slot.
 /// An explicit refusal releases that slot, so the reaper must wake and leave a replacement alone.
 #[tokio::test(start_paused = true)]

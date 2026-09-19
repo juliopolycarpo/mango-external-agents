@@ -6,6 +6,11 @@
 //! exactly once, every event names its turn, an approval can be answered, a cancelled turn still
 //! completes, closing twice is not an error, and every capability a harness did not declare
 //! refuses as [`Error::NotSupported`] rather than misbehaving.
+//!
+//! The suite holds a descriptor to its word in both directions. A capability a harness did not
+//! declare must refuse; a capability it **did** declare must be exercised by the fixture it is run
+//! against, or the check fails rather than skipping. See [`Outcome::Skipped`] for which absences
+//! are still honest skips.
 
 use std::time::Duration;
 
@@ -33,6 +38,13 @@ pub enum Outcome {
     ///
     /// A skip is not a pass. A harness whose fixture never produces an approval cannot prove it
     /// answers one, and saying so is more useful than a green tick.
+    ///
+    /// A skip is also not available for a capability the harness **declared**. A descriptor is a
+    /// promise a host plans against, so "it advertises approvals and this fixture raised none" is
+    /// a [`Self::Failed`], not a skip: the alternative is an advertised capability whose only
+    /// evidence is a check that never ran. What stays a skip is a limit of the *suite* or of the
+    /// vendor's own shape — no refusable option was offered, or the question asked is one no
+    /// automated suite may answer on a person's behalf.
     Skipped(String),
 }
 
@@ -296,7 +308,12 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
     // only the timeout would hide the reason for it.
     report.record(
         "an approval can be answered",
-        approval_outcome(answered.as_ref(), refusal),
+        approval_outcome(
+            answered.as_ref(),
+            refusal,
+            session.capabilities().has(Capability::InteractiveApprovals),
+            collected.is_err().then_some(options.turn_timeout),
+        ),
     );
 
     if collected.is_err() {
@@ -375,16 +392,36 @@ async fn decline_or_cancel(session: &dyn Session, request: &QuestionRequest) {
 /// Whether the approval round-trip held, given the question asked and what answering it returned.
 ///
 /// `None` for the refusal means no answer was ever sent — the vendor asked nothing, or offered no
-/// option this suite is willing to pick. Neither is a pass, and neither is a failure of the
-/// harness.
+/// option this suite is willing to pick. The two are not the same verdict. A vendor that offered
+/// no refusable option is a shape this suite cannot drive, so it is skipped. A harness that
+/// **declared** [`Capability::InteractiveApprovals`] and then raised nothing is a failure: its
+/// descriptor told the host to plan for an approval, and a skip would leave that promise with no
+/// evidence behind it at all.
 fn approval_outcome(
     asked: Option<&crate::permission::PermissionRequest>,
     refusal: Option<crate::error::Result<()>>,
+    declared: bool,
+    timed_out: Option<Duration>,
 ) -> Outcome {
     let Some(request) = asked else {
-        return Outcome::Skipped(String::from(
-            "this harness asked for no approval on this turn",
-        ));
+        // A turn nobody finished reading has not said whether it would have raised one, so the
+        // two absences are reported apart. Blaming the fixture for a timeout would be a statement
+        // about a stream this suite stopped listening to.
+        let received = match timed_out {
+            Some(budget) => format!("no approval within {budget:?}"),
+            None => String::from("a turn that raised none"),
+        };
+        return if declared {
+            Outcome::Failed(format!(
+                "expected a harness declaring interactive approvals to raise one on this turn, \
+                 received {received}: a declared capability needs a fixture that exercises it, \
+                 because a skip here would be the only evidence for it"
+            ))
+        } else {
+            Outcome::Skipped(format!(
+                "this harness asked for no approval on this turn: {received}"
+            ))
+        };
     };
     match refusal {
         Some(Ok(())) => Outcome::Passed,
@@ -607,8 +644,14 @@ async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
 ///
 /// The positive case, which the refusal check in [`check_optional_methods`] cannot stand in for: a
 /// harness that declared [`Capability::Questions`] and then cannot take an answer is exactly the
-/// harness whose turn never terminates. Skipped rather than passed when the harness declares the
-/// capability but this turn asked nothing — a skip says more than a green tick.
+/// harness whose turn never terminates.
+///
+/// Past the capability guard there is no skip left for the harness's own behaviour. A harness that
+/// declares questions and asks none on this turn **fails**: the declaration is what a host builds
+/// a prompt surface for, and accepting a skip would mean the capability's only evidence is a check
+/// that never ran. The skips that remain are the suite's own limits — a turn it could not start, a
+/// question no automated suite may answer for a person, and a turn that stopped at an approval,
+/// which is this suite's shortcut rather than a fact about the harness.
 async fn check_questions(session: &dyn Session, options: &Options, report: &mut Report) {
     const NAME: &str = "a question round-trips with the vendor's own ids";
 
@@ -640,6 +683,7 @@ async fn check_questions(session: &dyn Session, options: &Options, report: &mut 
     };
 
     let mut asked = None;
+    let mut stopped_at_an_approval = false;
     let collected = tokio::time::timeout(options.turn_timeout, async {
         while let Some(event) = turn.recv().await {
             let terminal = event.is_terminal();
@@ -648,11 +692,16 @@ async fn check_questions(session: &dyn Session, options: &Options, report: &mut 
                     asked = Some(request);
                     break;
                 }
-                // A turn that stopped at an approval is a turn that is not going to ask a
-                // question, and it will wait for an answer forever. Refuse it — never grant —
-                // and stop, rather than spending this check's whole budget on a stream that has
-                // already said what it is doing.
+                // A turn that stopped at an approval is waiting for an answer this check is not
+                // here to give. Refuse it — never grant — and stop, rather than spending the
+                // whole budget on a stream that has already said what it is doing.
+                //
+                // Stopping is a decision of *this suite*, so it is recorded as one: a harness
+                // that raises an approval before a question has not been shown to be unable to
+                // ask one, and failing it for a stream nobody read to the end would be the suite
+                // blaming a harness for its own shortcut.
                 EventKind::ApprovalRequested { request } => {
+                    stopped_at_an_approval = true;
                     if let Ok(response) = request.deny() {
                         let _ = session.respond(response).await;
                     }
@@ -668,12 +717,25 @@ async fn check_questions(session: &dyn Session, options: &Options, report: &mut 
     .await;
 
     let Some(request) = asked else {
-        let reason = if collected.is_err() {
-            format!("no question arrived within {:?}", options.turn_timeout)
+        // Three absences, and only one of them is the harness's fault.
+        let outcome = if stopped_at_an_approval {
+            Outcome::Skipped(String::from(
+                "this harness raised an approval before any question, and this suite stops \
+                 reading a turn at the first one rather than answering it",
+            ))
         } else {
-            String::from("this harness asked no question on this turn")
+            let received = if collected.is_err() {
+                format!("no question within {:?}", options.turn_timeout)
+            } else {
+                String::from("a turn that asked none")
+            };
+            Outcome::Failed(format!(
+                "expected a harness declaring questions to ask one on this turn, received \
+                 {received}: a declared capability needs a fixture that exercises it, because a \
+                 skip here would be the only evidence for it"
+            ))
         };
-        report.record(NAME, Outcome::Skipped(reason));
+        report.record(NAME, outcome);
         let _ = session.cancel(CancelReason::Requested).await;
         return;
     };
@@ -842,9 +904,17 @@ fn refuses_as_unsupported<T>(outcome: &crate::error::Result<T>, capability: Capa
 
 /// Whatever is already sitting behind the terminal, without waiting for more.
 ///
-/// Breaking at the terminal and stopping there is what made "nothing follows the terminal" a check
-/// that cannot fail: the loop never looks. An event already queued behind it is a turn that ended
-/// twice, or that kept talking afterwards, and it is exactly what a host would see.
+/// Not waiting is deliberate, and the reason is not the one an earlier comment here gave. The
+/// ordering is a **structural** invariant rather than a timing one: an [`EventReceiver`] can only
+/// be built by [`EventSink`], `Buffer::push` refuses once `finish` has set the status under the
+/// same lock, and `try_recv` empties the payload queue before it hands out the reserved terminal.
+/// So there is nothing a longer wait could surface — a late publisher is refused at the sink, not
+/// merely late. See `stream::tests::an_event_published_after_the_terminal_is_refused_and_the_stream_ends`,
+/// which pins that.
+///
+/// The drain stays because this is a public suite judging a `dyn Harness`, and because the sibling
+/// half of [`terminal_outcome`] — "exactly one terminal" — is not structural at all: a harness that
+/// drops its sink without committing one produces zero, and that is caught here.
 fn drain_queued(turn: &mut crate::stream::TurnStream, events: &mut Vec<AgentEvent>) {
     while let Ok(event) = turn.try_recv() {
         events.push(event);
@@ -1090,18 +1160,141 @@ mod tests {
         );
     }
 
-    /// A harness whose turns stop at an approval instead must not spend the check's whole budget
-    /// waiting for a question that is never coming — it says so and moves on.
+    /// A harness that declares no questions never reaches the question turn at all.
+    ///
+    /// The cheapest of the three outcomes, and the only one that is still a skip once the harness
+    /// has been held to its own descriptor: nothing was promised, so nothing is owed.
     #[tokio::test]
-    async fn a_harness_that_asks_for_approval_instead_skips_the_question_check_promptly() {
+    async fn a_harness_that_declares_no_questions_skips_the_question_check_at_the_guard() {
         let report = run(&FakeHarness::new(), &host(), Options::default()).await;
 
+        report.assert_passed();
         let skipped = report.skipped();
         assert!(
-            skipped
+            skipped.iter().any(|check| {
+                check.name == "a question round-trips with the vendor's own ids"
+                    && matches!(&check.outcome, Outcome::Skipped(why) if why.contains("does not declare questions"))
+            }),
+            "expected the question check to skip at the capability guard, received {skipped:?}"
+        );
+    }
+
+    /// The rule that makes a declaration mean something: advertise it, and the suite requires it.
+    ///
+    /// Without it, the cheapest way to make this suite green on a capability a harness cannot
+    /// really do is to declare it and ship a fixture that never exercises it — the check skips,
+    /// the report has no failures, and the only evidence for the advertised capability is a check
+    /// that never ran. A host reading that descriptor builds an approval prompt and a question
+    /// prompt it will never be able to use.
+    #[tokio::test]
+    async fn a_declared_interaction_the_fixture_never_raises_fails_rather_than_skipping() {
+        let report = run(
+            &FakeHarness::new().advertising_an_interaction_it_never_raises(),
+            &host(),
+            Options {
+                // The declared question never arrives, so this bounds the wait for an absence.
+                turn_timeout: std::time::Duration::from_millis(200),
+                ..Options::default()
+            },
+        )
+        .await;
+
+        for name in [
+            "an approval can be answered",
+            "a question round-trips with the vendor's own ids",
+        ] {
+            let check = report
+                .checks
                 .iter()
-                .any(|check| check.name == "a question round-trips with the vendor's own ids"),
-            "expected the question check to be skipped, received {skipped:?}"
+                .find(|check| check.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected {name:?} to have run, received {:#?}",
+                        report.checks
+                    )
+                });
+            let Outcome::Failed(message) = &check.outcome else {
+                panic!(
+                    "expected {name:?} to fail for a capability this harness declared and never \
+                     exercised, received {:?}",
+                    check.outcome
+                );
+            };
+            assert!(
+                message.contains("a declared capability needs a fixture that exercises it"),
+                "expected {name:?} to name the declaration as the reason, received {message:?}"
+            );
+        }
+
+        assert!(
+            report
+                .skipped()
+                .iter()
+                .all(|check| check.name != "an approval can be answered"
+                    && check.name != "a question round-trips with the vendor's own ids"),
+            "expected neither interaction check to be recorded as a skip, received {:?}",
+            report.skipped()
+        );
+    }
+
+    /// The suite's own shortcut is recorded as the suite's, not as the harness's fault.
+    ///
+    /// The question check stops reading a turn at the first approval, because a turn waiting on
+    /// one will wait forever and spending the whole budget on it proves nothing. That shortcut
+    /// means the suite never learns whether a question was coming — so reporting "this harness
+    /// declared questions and asked none" would be a statement about a stream it chose to stop
+    /// reading. It is the ordinary shape for an agent that asks permission for a tool and then
+    /// asks the person something about it.
+    #[tokio::test]
+    async fn a_turn_that_reaches_an_approval_first_skips_the_question_check_as_a_suite_limit() {
+        let report = run(
+            &FakeHarness::new().asking_for_approval_before_its_question(),
+            &host(),
+            Options::default(),
+        )
+        .await;
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "a question round-trips with the vendor's own ids")
+            .expect("expected the question check to have run");
+        assert!(
+            matches!(&check.outcome, Outcome::Skipped(why) if why.contains("raised an approval before any question")),
+            "expected the suite to name its own shortcut, received {:?}",
+            check.outcome
+        );
+        assert!(
+            report.failures().is_empty(),
+            "expected no failure for a shape the suite declined to read, received {:?}",
+            report.failures()
+        );
+    }
+
+    /// The other half of the same rule: a harness that declares nothing keeps its skips.
+    ///
+    /// Turning every absence into a failure would be the opposite mistake — a harness whose vendor
+    /// has no approval surface is not broken, and Claude Code is the real case.
+    #[tokio::test]
+    async fn a_harness_that_declares_neither_interaction_keeps_both_skips() {
+        let report = run(
+            &FakeHarness::new().without_approvals(),
+            &host(),
+            Options::default(),
+        )
+        .await;
+
+        report.assert_passed();
+        let skipped: Vec<&'static str> = report
+            .skipped()
+            .into_iter()
+            .map(|check| check.name)
+            .collect();
+        assert!(
+            skipped.contains(&"an approval can be answered")
+                && skipped.contains(&"a question round-trips with the vendor's own ids"),
+            "expected both interaction checks to skip for a harness that declares neither, \
+             received {skipped:?}"
         );
     }
 

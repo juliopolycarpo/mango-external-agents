@@ -107,12 +107,13 @@ async fn run(arguments: &[String]) -> Result<(), String> {
         "doctor" => doctor(&Options::parse(rest)?).await,
         "turn" => turn(&Options::parse(rest)?).await,
         "capture" => capture(rest).await,
+        "digests" => digests(rest),
         "help" | "--help" | "-h" => {
             print_banner();
             Ok(())
         }
         other => Err(format!(
-            "expected `discover`, `doctor`, `turn` or `capture`, received {other:?}"
+            "expected `discover`, `doctor`, `turn`, `capture` or `digests`, received {other:?}"
         )),
     }
 }
@@ -136,6 +137,9 @@ fn print_banner() {
         "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts]"
     );
     println!("       mea capture codex [--out DIR] [--workspace DIR] (archival transcripts)");
+    println!(
+        "       mea digests [--out DIR] [--check] (rewrite or verify capture manifest digests)"
+    );
     println!("ACP profiles: {}", acp_profile_ids().join(", "));
 }
 
@@ -374,6 +378,43 @@ async fn capture(arguments: &[String]) -> Result<(), String> {
         HarnessChoice::Acp(profile) => capture::acp(&out, &workspace.path, profile.as_str()).await,
     };
     result.map_err(|error| error.to_string())
+}
+
+/// Rewrites — or with `--check`, verifies — the file digests of every capture manifest.
+///
+/// This is how digests reach a capture nobody can re-run: it reads the committed files and writes
+/// what they hash to, so no vendor CLI is involved and no captured byte changes. `mea`'s own test
+/// suite runs the same verification over the committed tree, which is what `scripts/check.sh`
+/// executes; `--check` is that answer by hand, for one fixture root.
+fn digests(arguments: &[String]) -> Result<(), String> {
+    let options = options::DigestOptions::parse(arguments)?;
+    let root = options.root();
+    let manifests = capture::manifest::manifests(&root).map_err(|error| error.to_string())?;
+    if manifests.is_empty() {
+        return Err(format!(
+            "expected at least one {} under {}, received none",
+            capture::manifest::MANIFEST,
+            root.display()
+        ));
+    }
+    if options.check {
+        let disagreements: Vec<String> = manifests
+            .iter()
+            .filter_map(|path| capture::manifest::verify(path).err())
+            .map(|error| error.to_string())
+            .collect();
+        if !disagreements.is_empty() {
+            return Err(disagreements.join("\n"));
+        }
+        println!("{} capture manifests match their files", manifests.len());
+        return Ok(());
+    }
+    for path in manifests {
+        let rewritten = capture::manifest::refresh(&path).map_err(|error| error.to_string())?;
+        let state = if rewritten { "refreshed" } else { "current" };
+        println!("{state} {}", path.display());
+    }
+    Ok(())
 }
 
 /// The carrier requested by the host and the one the open session actually uses.

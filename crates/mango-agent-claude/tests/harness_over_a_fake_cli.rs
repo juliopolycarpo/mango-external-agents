@@ -486,6 +486,65 @@ mod opening_a_session {
         assert!(launcher.launches().is_empty(), "expected no vendor probe");
     }
 
+    /// What a receipt is worth, as a number rather than as a claim.
+    ///
+    /// Three probes cold, one on reuse. The comparison is the whole argument for
+    /// [`DiscoveryReceipt`]: a host that discovers and then opens without one pays the survey
+    /// twice, because `open_session` deliberately does not cache — the harness has no way to know
+    /// the executable, the environment or the account did not move between the two calls, and
+    /// guessing is what a receipt exists to replace.
+    ///
+    /// Asserted as exact counts, so probe creep shows up here as a failing number rather than as a
+    /// slower first token. The two halves are the evidence class `docs/adopt.md` records.
+    #[tokio::test]
+    async fn opening_without_a_receipt_pays_the_survey_twice() {
+        let launcher = Arc::new(FakeClaudeCli::new());
+        let harness = ClaudeHarness::new();
+        let host = host(Arc::clone(&launcher));
+
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        let cold = launcher.launches().len();
+        assert_eq!(
+            cold,
+            3,
+            "expected the three documented cold probes, received {:?}",
+            launcher
+                .launches()
+                .into_iter()
+                .map(|launch| launch.argv)
+                .collect::<Vec<_>>()
+        );
+
+        let mut request = OpenSession::new("chat-1");
+        if let Some(executable) = &discovery.executable {
+            request = request.with_executable(ExecutablePath::resolved(executable.clone()));
+        }
+        harness
+            .open_session(&host, request)
+            .await
+            .expect("expected a session to open without a receipt");
+
+        let launches = launcher.launches();
+        let unvouched = &launches[cold..];
+        assert_eq!(
+            unvouched.len(),
+            3,
+            "expected an unvouched opening to repeat the whole survey, received {:?}",
+            unvouched
+                .iter()
+                .map(|launch| launch.argv.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            unvouched
+                .iter()
+                .map(|launch| launch.argv[1..].join(" "))
+                .collect::<Vec<_>>(),
+            vec!["--version", "--help", "auth status"],
+            "expected the same three probes the cold survey ran"
+        );
+    }
+
     #[tokio::test]
     async fn a_fresh_receipt_reuses_the_version_and_auth_answers_but_rechecks_help() {
         let launcher = Arc::new(FakeClaudeCli::new());
