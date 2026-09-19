@@ -312,6 +312,7 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
             answered.as_ref(),
             refusal,
             session.capabilities().has(Capability::InteractiveApprovals),
+            collected.is_err().then_some(options.turn_timeout),
         ),
     );
 
@@ -400,17 +401,25 @@ fn approval_outcome(
     asked: Option<&crate::permission::PermissionRequest>,
     refusal: Option<crate::error::Result<()>>,
     declared: bool,
+    timed_out: Option<Duration>,
 ) -> Outcome {
     let Some(request) = asked else {
+        // A turn nobody finished reading has not said whether it would have raised one, so the
+        // two absences are reported apart. Blaming the fixture for a timeout would be a statement
+        // about a stream this suite stopped listening to.
+        let received = match timed_out {
+            Some(budget) => format!("no approval within {budget:?}"),
+            None => String::from("a turn that raised none"),
+        };
         return if declared {
-            Outcome::Failed(String::from(
+            Outcome::Failed(format!(
                 "expected a harness declaring interactive approvals to raise one on this turn, \
-                 received a turn that raised none: a declared capability needs a fixture that \
-                 exercises it, because a skip here would be the only evidence for it",
+                 received {received}: a declared capability needs a fixture that exercises it, \
+                 because a skip here would be the only evidence for it"
             ))
         } else {
-            Outcome::Skipped(String::from(
-                "this harness asked for no approval on this turn",
+            Outcome::Skipped(format!(
+                "this harness asked for no approval on this turn: {received}"
             ))
         };
     };
@@ -640,8 +649,9 @@ async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
 /// Past the capability guard there is no skip left for the harness's own behaviour. A harness that
 /// declares questions and asks none on this turn **fails**: the declaration is what a host builds
 /// a prompt surface for, and accepting a skip would mean the capability's only evidence is a check
-/// that never ran. The two skips that remain are the suite's own limits — a turn it could not
-/// start, and a question no automated suite may answer for a person.
+/// that never ran. The skips that remain are the suite's own limits — a turn it could not start, a
+/// question no automated suite may answer for a person, and a turn that stopped at an approval,
+/// which is this suite's shortcut rather than a fact about the harness.
 async fn check_questions(session: &dyn Session, options: &Options, report: &mut Report) {
     const NAME: &str = "a question round-trips with the vendor's own ids";
 
@@ -673,6 +683,7 @@ async fn check_questions(session: &dyn Session, options: &Options, report: &mut 
     };
 
     let mut asked = None;
+    let mut stopped_at_an_approval = false;
     let collected = tokio::time::timeout(options.turn_timeout, async {
         while let Some(event) = turn.recv().await {
             let terminal = event.is_terminal();
@@ -681,11 +692,16 @@ async fn check_questions(session: &dyn Session, options: &Options, report: &mut 
                     asked = Some(request);
                     break;
                 }
-                // A turn that stopped at an approval is a turn that is not going to ask a
-                // question, and it will wait for an answer forever. Refuse it — never grant —
-                // and stop, rather than spending this check's whole budget on a stream that has
-                // already said what it is doing.
+                // A turn that stopped at an approval is waiting for an answer this check is not
+                // here to give. Refuse it — never grant — and stop, rather than spending the
+                // whole budget on a stream that has already said what it is doing.
+                //
+                // Stopping is a decision of *this suite*, so it is recorded as one: a harness
+                // that raises an approval before a question has not been shown to be unable to
+                // ask one, and failing it for a stream nobody read to the end would be the suite
+                // blaming a harness for its own shortcut.
                 EventKind::ApprovalRequested { request } => {
+                    stopped_at_an_approval = true;
                     if let Ok(response) = request.deny() {
                         let _ = session.respond(response).await;
                     }
@@ -701,19 +717,25 @@ async fn check_questions(session: &dyn Session, options: &Options, report: &mut 
     .await;
 
     let Some(request) = asked else {
-        let received = if collected.is_err() {
-            format!("no question within {:?}", options.turn_timeout)
+        // Three absences, and only one of them is the harness's fault.
+        let outcome = if stopped_at_an_approval {
+            Outcome::Skipped(String::from(
+                "this harness raised an approval before any question, and this suite stops \
+                 reading a turn at the first one rather than answering it",
+            ))
         } else {
-            String::from("a turn that asked none")
-        };
-        report.record(
-            NAME,
+            let received = if collected.is_err() {
+                format!("no question within {:?}", options.turn_timeout)
+            } else {
+                String::from("a turn that asked none")
+            };
             Outcome::Failed(format!(
                 "expected a harness declaring questions to ask one on this turn, received \
                  {received}: a declared capability needs a fixture that exercises it, because a \
                  skip here would be the only evidence for it"
-            )),
-        );
+            ))
+        };
+        report.record(NAME, outcome);
         let _ = session.cancel(CancelReason::Requested).await;
         return;
     };
@@ -1212,6 +1234,40 @@ mod tests {
                     && check.name != "a question round-trips with the vendor's own ids"),
             "expected neither interaction check to be recorded as a skip, received {:?}",
             report.skipped()
+        );
+    }
+
+    /// The suite's own shortcut is recorded as the suite's, not as the harness's fault.
+    ///
+    /// The question check stops reading a turn at the first approval, because a turn waiting on
+    /// one will wait forever and spending the whole budget on it proves nothing. That shortcut
+    /// means the suite never learns whether a question was coming — so reporting "this harness
+    /// declared questions and asked none" would be a statement about a stream it chose to stop
+    /// reading. It is the ordinary shape for an agent that asks permission for a tool and then
+    /// asks the person something about it.
+    #[tokio::test]
+    async fn a_turn_that_reaches_an_approval_first_skips_the_question_check_as_a_suite_limit() {
+        let report = run(
+            &FakeHarness::new().asking_for_approval_before_its_question(),
+            &host(),
+            Options::default(),
+        )
+        .await;
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "a question round-trips with the vendor's own ids")
+            .expect("expected the question check to have run");
+        assert!(
+            matches!(&check.outcome, Outcome::Skipped(why) if why.contains("raised an approval before any question")),
+            "expected the suite to name its own shortcut, received {:?}",
+            check.outcome
+        );
+        assert!(
+            report.failures().is_empty(),
+            "expected no failure for a shape the suite declined to read, received {:?}",
+            report.failures()
         );
     }
 

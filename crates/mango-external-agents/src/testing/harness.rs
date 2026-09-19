@@ -69,6 +69,7 @@ pub struct FakeHarness {
     rejects_answers: bool,
     publishes_session_updates: bool,
     over_advertises: bool,
+    approval_before_question: bool,
 }
 
 impl Default for FakeHarness {
@@ -97,6 +98,7 @@ impl FakeHarness {
             rejects_answers: false,
             publishes_session_updates: true,
             over_advertises: false,
+            approval_before_question: false,
         };
         harness.redeclare();
         harness
@@ -134,7 +136,7 @@ impl FakeHarness {
     /// [`Self::advertising_an_interaction_it_never_raises`] is the one mode that deliberately
     /// leaves the two out of step, because a suite check needs a harness it is supposed to fail.
     fn redeclare(&mut self) {
-        let (approvals, questions) = if self.over_advertises {
+        let (approvals, questions) = if self.over_advertises || self.approval_before_question {
             (true, true)
         } else {
             (self.asks_for_approval, self.asks_a_question)
@@ -159,6 +161,21 @@ impl FakeHarness {
     pub fn asking_a_question(mut self) -> Self {
         self.asks_a_question = true;
         self.asks_for_approval = false;
+        self.redeclare();
+        self
+    }
+
+    /// The same harness declaring both interactions, whose turn reaches the approval first.
+    ///
+    /// The ordinary shape for an agent that asks permission for a tool and only then asks the
+    /// person a clarifying question — and the case the conformance suite cannot judge, because it
+    /// stops reading a turn at the first approval rather than answering one. The suite is
+    /// supposed to record that as a limit of its own; this is the harness that proves it does.
+    #[must_use]
+    pub fn asking_for_approval_before_its_question(mut self) -> Self {
+        self.asks_for_approval = true;
+        self.asks_a_question = false;
+        self.approval_before_question = true;
         self.redeclare();
         self
     }
