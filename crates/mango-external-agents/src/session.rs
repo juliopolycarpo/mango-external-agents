@@ -630,7 +630,15 @@ impl fmt::Debug for Steer {
 }
 
 /// Whether a steer landed.
+///
+/// Closed for the same reason [`SteerRejection`] beside it is: it is a **vendor's answer**, and
+/// what a vendor can answer is not this library's to fix. "Accepted" and "rejected" are the two
+/// shapes known today; a vendor that queues a steer behind the current tool call, or applies part
+/// of one, is answering a third thing. A host that had written an exhaustive `match` would stop
+/// compiling on the day that variant arrived, which is a worse outcome than a wildcard arm it
+/// wrote once.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SteerOutcome {
     /// The vendor took it.
     Accepted,
