@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use mango_external_agents::event::ActivityKind;
 use mango_external_agents::interaction::{Interaction, InteractionId, InteractionKind};
+use mango_external_agents::normalize::{self, TextLimit};
 use mango_external_agents::operation::OperationRef;
 use mango_external_agents::permission::{
     PermissionEffect, PermissionOption, PermissionRequest, PermissionRisk, PermissionScope,
@@ -215,25 +216,25 @@ fn build(
 
 /// The vendor asks whether the client will grant this permission profile.
 ///
-/// Three options, mirroring the scopes the vendor declares: a grant for the rest of the turn, a
-/// grant for the rest of the session, or a denial. Whichever is chosen, `permissions` travels back
-/// exactly as the request carried it — this harness never synthesises, widens or reshapes a
-/// permission profile; the only alternative to granting exactly what was asked is granting nothing.
+/// A completely displayable profile offers a turn grant, a session grant, or a denial. Other
+/// profiles offer only denial. A grant echoes the requested profile unchanged.
 fn from_permissions(
     params: &PermissionsRequestApprovalParams,
     operation: OperationRef,
     expires_at: SystemTime,
 ) -> PendingApproval {
-    let title = String::from("Grant the requested permissions");
-    // The profile leads the detail, ahead of the agent's own words. It is the authority a grant
-    // hands over, and `PermissionRequest::normalized` cuts a long detail from the end: put it
-    // second and a verbose reason could push the thing being granted out of what a host renders,
-    // which is the same hole from the other side. Echoed compactly and verbatim — this harness
-    // never reshapes a profile, and never hides one either.
+    // A grant is available only if the complete profile survives the host's display bounds.
+    // Check the same normalization used by PermissionRequest, including character stripping.
+    // Reasons and cwd follow the profile so their truncation cannot conceal granted authority.
+    let profile = format!("Grants {}", params.permissions);
+    let profile_visible = !normalize::bound_text(&profile, TextLimit::Detail).truncated;
+    let title = if profile_visible {
+        "Grant the requested permissions"
+    } else {
+        "Deny permissions that cannot be displayed completely"
+    };
     let mut lines: Vec<String> = Vec::with_capacity(3);
-    if !params.permissions.is_null() {
-        lines.push(format!("Grants {}", params.permissions));
-    }
+    lines.push(profile);
     if let Some(reason) = params.reason.as_deref() {
         lines.push(reason.to_owned());
     }
@@ -242,7 +243,7 @@ fn from_permissions(
     }
     let detail = (!lines.is_empty()).then(|| lines.join("\n\n"));
 
-    let options = vec![
+    let mut options = vec![
         PermissionOption::new("grant:turn", PermissionEffect::Allow)
             .with_label("Grant for this turn")
             .with_scope(PermissionScope::Turn),
@@ -253,7 +254,7 @@ fn from_permissions(
             .with_label("Deny")
             .with_scope(PermissionScope::Once),
     ];
-    let decisions: Vec<(String, ServerAnswer)> = vec![
+    let mut decisions: Vec<(String, ServerAnswer)> = vec![
         (
             String::from("grant:turn"),
             ServerAnswer::Permissions {
@@ -283,6 +284,10 @@ fn from_permissions(
         ),
     ];
     let refusal = decisions[2].1.clone();
+    if !profile_visible {
+        options.retain(|option| option.effect == PermissionEffect::Reject);
+        decisions.retain(|(id, _)| id == "deny");
+    }
 
     // Named by the item it gates, the same convention `build` uses for the two ordinary approval
     // families — not the JSON-RPC request id, which names the frame rather than the thing asked.
@@ -780,6 +785,85 @@ mod tests {
         assert!(
             bounded.truncated,
             "expected the over-long reason to be reported as cut"
+        );
+    }
+
+    #[test]
+    fn a_permissions_profile_that_cannot_be_displayed_completely_offers_only_denial() {
+        for path in [
+            "a".repeat(4_096),
+            String::from("/workspace/\u{202e}private"),
+        ] {
+            let request = ServerRequest::parse(
+                method::PERMISSIONS_APPROVAL,
+                json!({
+                    "threadId": "t", "turnId": "u", "itemId": "perm-1",
+                    "permissions": {
+                        "fileSystem": {"read": [path]},
+                        "network": {"enabled": true},
+                    },
+                }),
+            );
+            let pending = to_request(&request, now()).expect("expected a denial prompt");
+            let bounded = pending
+                .request
+                .clone()
+                .normalized()
+                .expect("bounded prompt");
+            assert!(
+                bounded.truncated,
+                "expected the profile display to be changed"
+            );
+            assert_eq!(
+                bounded
+                    .options
+                    .iter()
+                    .map(|option| option.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["deny"],
+                "expected denial only when normalization hides part of the granted authority"
+            );
+            assert!(pending.decision_for("grant:turn").is_none());
+            assert!(pending.decision_for("grant:session").is_none());
+            assert!(
+                bounded.allow().is_err(),
+                "expected a broker grant to be refused"
+            );
+            assert!(
+                bounded.deny().is_ok(),
+                "expected the denial to remain usable"
+            );
+            assert_eq!(pending.refusal().to_wire(), json!({"permissions": {}}));
+        }
+    }
+
+    #[test]
+    fn a_permissions_profile_at_the_display_limit_still_offers_grants() {
+        let empty = json!({"fileSystem": {"read": [""]}, "network": {"enabled": true}});
+        let overhead = format!("Grants {empty}").chars().count();
+        let request = ServerRequest::parse(
+            method::PERMISSIONS_APPROVAL,
+            json!({
+                "threadId": "t", "turnId": "u", "itemId": "perm-1",
+                "reason": "r".repeat(8_192),
+                "permissions": {
+                    "fileSystem": {"read": ["é".repeat(
+                        mango_external_agents::normalize::TextLimit::Detail.max_code_points() - overhead
+                    )]},
+                    "network": {"enabled": true},
+                },
+            }),
+        );
+        let pending = to_request(&request, now()).expect("expected a permission prompt");
+        assert!(pending.decision_for("grant:turn").is_some());
+        assert!(pending.decision_for("grant:session").is_some());
+        let bounded = pending.request.normalized().expect("bounded prompt");
+        assert!(bounded.truncated, "expected the reason to be removed");
+        assert!(
+            bounded
+                .detail
+                .expect("profile detail")
+                .ends_with(r#""network":{"enabled":true}}"#)
         );
     }
 
