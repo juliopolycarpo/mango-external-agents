@@ -16,8 +16,21 @@ without `authenticate` or `session/new`. CI compares only public artifacts: the 
 `contract/` directories and, for Codex, the separately regenerated schema inventory. It excludes
 archival transcripts and historical help.
 
-The following are historical captures. They are labelled because a present-day command cannot
-reproduce their bytes, and routine drift checks must leave them alone:
+## Three classes of fixture
+
+**Reproducible public contracts.** CI can install the CLI that produced them at the pin and record
+them again, so a difference is a vendor change and the drift lane says so. Their manifests carry
+`"reproducible": true`. The class is exactly the vendors `scripts/install-vendor-cli.sh` can
+install — `claude`, `codex` and `opencode` — and nothing else: `mea` derives the member from that
+list and a test compares the two, so a capture cannot claim a pin the installer does not have.
+
+**Labelled maintainer captures.** Recorded on a maintainer's machine against an agent CI cannot
+install at a version. Nothing re-records them, so their manifests carry `"reproducible": false`
+together with the two facts a reader is owed instead: `capturedFrom`, the version line the CLI
+printed, and `capturedAt`, the day. Routine drift checks leave them alone.
+
+**Historical sets, deliberately not regenerated.** A present-day command cannot reproduce their
+bytes, and that is the point of keeping them:
 
 - `claude/historical/contract/` contains the old `auth status` shape.
 - `claude/help/` covers versions before and after features the parser supports.
@@ -45,6 +58,9 @@ cargo run -p mea -- digests --check    # the same verification, by hand
 That command reads the committed bytes and writes what they hash to. It never runs a vendor CLI
 and never touches a captured file, which is why it is also how a historical capture — one no
 present-day command can reproduce — came to carry digests at all.
+
+A manifest that says `"reproducible": false` is held to `capturedFrom` and `capturedAt` by the same
+test: a capture nobody can re-record is worth keeping only if it says which build it came from.
 
 The historical Claude manifest additionally carries an aggregate `checksum` from the session that
 recorded it in 2026-09. Nothing in this repository can recompute it: it is not the digest of the

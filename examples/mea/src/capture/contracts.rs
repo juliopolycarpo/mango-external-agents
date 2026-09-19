@@ -114,8 +114,9 @@ async fn claude_with(host: &HostContext, out_dir: &Path) -> Result<()> {
         &json!({
             "format": 1,
             "probes": ["claude --version", "claude --help"],
-            "reproducible": true,
+            "reproducible": manifest::is_reproducible("claude"),
         }),
+        &version,
     )
 }
 
@@ -168,9 +169,10 @@ async fn codex_contract_with(host: &HostContext, out_dir: &Path, workspace: &Pat
                 "codex --version",
                 "codex app-server generate-json-schema --out <workspace>/codex-schema"
             ],
-            "reproducible": true,
+            "reproducible": manifest::is_reproducible("codex"),
             "schemaFiles": ["initialize-params.schema.json", "initialize-response.schema.json"],
         }),
+        &version,
     )
 }
 
@@ -201,9 +203,10 @@ async fn acp_with(
             "format": 1,
             "profile": profile.id.as_str(),
             "probe": "initialize",
-            "reproducible": true,
+            "reproducible": manifest::is_reproducible(profile.id.as_str()),
             "sessionOpened": false,
         }),
+        &version,
     )
 }
 

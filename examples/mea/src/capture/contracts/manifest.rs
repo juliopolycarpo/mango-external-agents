@@ -19,8 +19,33 @@ use serde_json::{Map, Value};
 /// The manifest member holding one digest per captured file.
 const FILES: &str = "files";
 
+/// The manifest member saying whether CI can record this capture again.
+const REPRODUCIBLE: &str = "reproducible";
+
+/// The manifest members a capture nobody can re-run owes a reader instead.
+const CAPTURED_FROM: &str = "capturedFrom";
+const CAPTURED_AT: &str = "capturedAt";
+
 /// The file that carries a capture directory's manifest.
 pub const MANIFEST: &str = "manifest.json";
+
+/// The vendors `scripts/install-vendor-cli.sh` can install at an exact version.
+///
+/// Reproducibility is not a property of a capture command; it is whether the drift lane can put
+/// the CLI that produced it back on a runner at the pin. That is exactly the set of vendors the
+/// installer knows, which is why `the_pinned_vendor_list_matches_the_installer` reads the script
+/// rather than trusting this list.
+const PINNED_VENDORS: &[&str] = &["claude", "codex", "opencode"];
+
+/// Whether a capture of `vendor` is one CI can record again.
+///
+/// `vendor` is the name the installer uses, which for an ACP agent is its profile id.
+///
+/// Example: `is_reproducible("opencode")` is true and `is_reproducible("cursor")` is false — the
+/// pin lane can install the first and not the second.
+pub fn is_reproducible(vendor: &str) -> bool {
+    PINNED_VENDORS.contains(&vendor)
+}
 
 /// `sha256:<hex>` over `bytes`, the spelling every manifest already uses.
 ///
@@ -99,18 +124,27 @@ pub fn digests(directory: &Path) -> Result<Map<String, Value>> {
 
 /// Writes `directory/manifest.json` from `fields`, plus the digest of every file beside it.
 ///
-/// Called last by each capture, once the files it describes have been written.
+/// Called last by each capture, once the files it describes have been written. `version` is the
+/// line the vendor CLI printed for this capture: a manifest whose `reproducible` member is false
+/// records it as `capturedFrom` with the day as `capturedAt`, because nobody can re-run that
+/// capture and the build and the date are what a reader is owed instead. The two names are the
+/// ones `fixtures/claude/historical/contract/manifest.json` already uses.
 ///
 /// # Examples
 ///
-/// `write(&contract, &json!({"format": 1}))` writes a manifest whose `files` member holds the
-/// digest of every other file in `contract`.
+/// `write(&contract, &json!({"format": 1, "reproducible": true}), "1.18.30")` writes a manifest
+/// whose `files` member holds the digest of every other file in `contract`.
 ///
 /// # Errors
 ///
 /// Returns an error when `fields` is not a JSON object, or when the directory cannot be read or
 /// written.
-pub fn write(directory: &Path, fields: &Value) -> Result<()> {
+pub fn write(directory: &Path, fields: &Value, version: &str) -> Result<()> {
+    write_on(directory, fields, version, &today())
+}
+
+/// [`write()`], with the day supplied rather than read from the clock.
+fn write_on(directory: &Path, fields: &Value, version: &str, today: &str) -> Result<()> {
     let mut members = fields
         .as_object()
         .cloned()
@@ -118,6 +152,13 @@ pub fn write(directory: &Path, fields: &Value) -> Result<()> {
             expected: "a manifest built from a JSON object",
             received: shape_of(fields),
         })?;
+    if members.get(REPRODUCIBLE) == Some(&Value::Bool(false)) {
+        members.insert(
+            String::from(CAPTURED_FROM),
+            Value::String(version.to_owned()),
+        );
+        members.insert(String::from(CAPTURED_AT), Value::String(today.to_owned()));
+    }
     members.insert(String::from(FILES), Value::Object(digests(directory)?));
     super::write_json(&directory.join(MANIFEST), &Value::Object(members))
 }
@@ -260,6 +301,66 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     })
 }
 
+/// Today in UTC, as `YYYY-MM-DD`.
+///
+/// A clock that cannot reach the epoch writes `1970-01-01` rather than stopping a capture: a date
+/// a reader can see is wrong is better than losing the recording that was just made.
+fn today() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_secs());
+    iso_date(seconds / 86_400)
+}
+
+/// The civil date `days` after 1970-01-01, as `YYYY-MM-DD`.
+///
+/// Howard Hinnant's `civil_from_days`, without its negative-era correction: `days` counts forward
+/// from the epoch, so the shifted day number is always positive.
+///
+/// Example: `iso_date(19_723)` is `2024-01-01`.
+fn iso_date(days: u64) -> String {
+    // Shift the epoch to 0000-03-01 so a leap day lands at the end of a four-century era.
+    let shifted = i64::try_from(days).unwrap_or_default() + 719_468;
+    let era = shifted / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_position + 2) / 5 + 1;
+    let month = if month_position < 10 {
+        month_position + 3
+    } else {
+        month_position - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// The vendors a copy of `scripts/install-vendor-cli.sh` can install, from its `vendor_repo` arms.
+///
+/// Reading the script is what keeps [`PINNED_VENDORS`] honest: a vendor added to the installer and
+/// not here would leave its captures stamped `reproducible: false` while CI reproduced them, and a
+/// vendor removed there would leave the opposite lie. It exists for that comparison and nothing
+/// else, so it is compiled only into the tests that make it.
+#[cfg(test)]
+fn installer_vendors(script: &str) -> Vec<String> {
+    script
+        .lines()
+        .skip_while(|line| !line.starts_with("vendor_repo()"))
+        .skip(1)
+        .take_while(|line| !line.starts_with('}'))
+        .filter_map(|line| line.trim().split_once(')').map(|(name, _)| name))
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// A JSON string's text, and the value itself for anything else a manifest should not hold.
 fn text_of(value: &Value) -> String {
     value
@@ -291,18 +392,22 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{MANIFEST, digests, manifests, refresh, sha256, verify, write};
+    use super::{
+        MANIFEST, PINNED_VENDORS, digests, installer_vendors, is_reproducible, iso_date, manifests,
+        refresh, sha256, today, verify, write, write_on,
+    };
 
     /// The repository root, from this crate's own manifest.
     ///
     /// Joined one segment at a time and never canonicalised, for the reason
     /// `tests/field_inventory.rs` gives: a `\\?\` verbatim path on Windows does not normalise a
     /// forward slash underneath it.
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    }
+
     fn fixtures() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("fixtures")
+        repository_root().join("fixtures")
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -343,16 +448,17 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(
-            found,
-            vec![
-                String::from("acp/opencode/contract/manifest.json"),
-                String::from("claude/contract/manifest.json"),
-                String::from("claude/historical/contract/manifest.json"),
-                String::from("codex/contract/manifest.json"),
-            ],
-            "expected the four committed capture manifests, received {found:?}"
-        );
+        for known in [
+            "acp/opencode/contract/manifest.json",
+            "claude/contract/manifest.json",
+            "claude/historical/contract/manifest.json",
+            "codex/contract/manifest.json",
+        ] {
+            assert!(
+                found.iter().any(|path| path == known),
+                "expected the committed capture {known}, received {found:?}"
+            );
+        }
 
         let failures: Vec<String> = manifests(&root)
             .expect("expected the committed fixture tree to be readable")
@@ -365,6 +471,148 @@ mod tests {
             "expected every committed fixture to match its manifest, received:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// A capture CI cannot record again owes a reader the two facts CI would otherwise re-derive:
+    /// which build produced it and when. Without them `reproducible: false` says only that nobody
+    /// can check the capture, which is the claim this file exists to stop making.
+    #[test]
+    fn a_capture_nobody_can_rerun_names_its_build_and_its_day() {
+        for path in manifests(&fixtures()).expect("expected the committed fixture tree") {
+            let document = std::fs::read_to_string(&path).expect("expected a manifest");
+            let parsed: Value = serde_json::from_str(&document).expect("expected a JSON manifest");
+            if parsed.get("reproducible") != Some(&Value::Bool(false)) {
+                continue;
+            }
+            for member in ["capturedFrom", "capturedAt"] {
+                assert!(
+                    parsed.get(member).and_then(Value::as_str).is_some(),
+                    "expected {member} in {}, received {parsed}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// The list that decides `reproducible`, against the script that makes it true. Two lists
+    /// nobody compares are how a capture ends up stamped reproducible by a lane that cannot
+    /// install the CLI which produced it.
+    #[test]
+    fn the_pinned_vendor_list_matches_the_installer_that_pins_them() {
+        let script = repository_root()
+            .join("scripts")
+            .join("install-vendor-cli.sh");
+        let text = std::fs::read_to_string(&script)
+            .unwrap_or_else(|error| panic!("expected {}, received {error}", script.display()));
+
+        let mut installed = installer_vendors(&text);
+        installed.sort();
+        let mut pinned: Vec<String> = PINNED_VENDORS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        pinned.sort();
+
+        assert_eq!(
+            installed,
+            pinned,
+            "expected the vendors {} installs, received {installed:?}",
+            script.display()
+        );
+        assert!(is_reproducible("opencode"));
+        assert!(
+            !is_reproducible("cursor"),
+            "expected an agent with no pinned install to be irreproducible"
+        );
+    }
+
+    /// The parse, against a script shaped like the real one: the `*)` fallback is not a vendor,
+    /// and neither is a case arm in the function below the one being read.
+    #[test]
+    fn only_the_vendor_arms_of_the_installer_are_read() {
+        let script = r#"#!/usr/bin/env bash
+usage() {
+  echo 'not a vendor'
+}
+vendor_repo() {
+  case "$1" in
+    claude) printf '%s\n' 'anthropics/claude-code' ;;
+    codex) printf '%s\n' 'openai/codex' ;;
+    *)
+      printf 'expected vendor claude or codex, received %s\n' "$1" >&2
+      return 2
+      ;;
+  esac
+}
+release_tag() {
+    later) printf 'not a vendor' ;;
+}
+"#;
+
+        assert_eq!(
+            installer_vendors(script),
+            vec![String::from("claude"), String::from("codex")]
+        );
+    }
+
+    /// The day a capture was taken is written into a fixture, so the conversion is pinned to dates
+    /// somebody can check rather than to whatever the machine's clock says today.
+    #[test]
+    fn a_day_count_becomes_the_civil_date_it_names() {
+        for (days, date) in [
+            (0, "1970-01-01"),
+            (1, "1970-01-02"),
+            (59, "1970-03-01"),
+            (11_688, "2002-01-01"),
+            (19_723, "2024-01-01"),
+            (20_716, "2026-09-20"),
+        ] {
+            assert_eq!(iso_date(days), date, "expected {date} for day {days}");
+        }
+        let now = today();
+        assert_eq!(now.len(), 10, "expected YYYY-MM-DD, received {now}");
+    }
+
+    /// The writer's half of the rule: a capture marked irreproducible records the version the CLI
+    /// printed and the day, in the names the historical manifest already uses, and a reproducible
+    /// one records neither — a date on it would be a fresh diff on every CI re-capture.
+    #[test]
+    fn writing_an_irreproducible_capture_records_its_build_and_its_day() {
+        let directory = temp_dir("provenance");
+        std::fs::write(directory.join("version.json"), "{}\n").expect("expected a captured file");
+
+        write_on(
+            &directory,
+            &json!({"format": 1, "profile": "cursor", "reproducible": false}),
+            "2026.09.10-fd3934a",
+            "2026-09-19",
+        )
+        .expect("expected a manifest");
+
+        let written = std::fs::read_to_string(directory.join(MANIFEST)).expect("expected it back");
+        let parsed: Value = serde_json::from_str(&written).expect("expected a JSON manifest");
+        assert_eq!(parsed["capturedFrom"], "2026.09.10-fd3934a");
+        assert_eq!(parsed["capturedAt"], "2026-09-19");
+        verify(&directory.join(MANIFEST)).expect("expected the digests to hold");
+
+        let reproducible = temp_dir("reproducible");
+        std::fs::write(reproducible.join("version.json"), "{}\n").expect("expected a capture");
+        write_on(
+            &reproducible,
+            &json!({"format": 1, "reproducible": true}),
+            "1.18.30",
+            "2026-09-19",
+        )
+        .expect("expected a manifest");
+        let current = std::fs::read_to_string(reproducible.join(MANIFEST)).expect("expected it");
+        let parsed: Value = serde_json::from_str(&current).expect("expected a JSON manifest");
+        assert!(
+            parsed.get("capturedAt").is_none(),
+            "expected no capture date on a manifest CI re-records, received {parsed}"
+        );
+
+        std::fs::remove_dir_all(directory).expect("expected temporary capture cleanup");
+        std::fs::remove_dir_all(reproducible).expect("expected temporary capture cleanup");
     }
 
     /// The historical Claude capture also carries an aggregate `checksum`, written by whatever
@@ -398,7 +646,12 @@ mod tests {
         let directory = temp_dir("changed");
         std::fs::write(directory.join("version.json"), "{\"output\":\"1.0.0\"}\n")
             .expect("expected a captured file");
-        write(&directory, &json!({"format": 1})).expect("expected a manifest");
+        write(
+            &directory,
+            &json!({"format": 1, "reproducible": true}),
+            "1.0.0",
+        )
+        .expect("expected a manifest");
         std::fs::write(directory.join("version.json"), "{\"output\":\"9.9.9\"}\n")
             .expect("expected an edited capture");
 
@@ -419,7 +672,12 @@ mod tests {
     fn a_file_no_manifest_declares_is_refused() {
         let directory = temp_dir("undeclared");
         std::fs::write(directory.join("version.json"), "{}\n").expect("expected a captured file");
-        write(&directory, &json!({"format": 1})).expect("expected a manifest");
+        write(
+            &directory,
+            &json!({"format": 1, "reproducible": true}),
+            "1.0.0",
+        )
+        .expect("expected a manifest");
         std::fs::write(directory.join("extra.json"), "{}\n").expect("expected a stray file");
 
         let error = verify(&directory.join(MANIFEST))
@@ -436,7 +694,12 @@ mod tests {
     fn a_declared_file_that_is_gone_is_refused() {
         let directory = temp_dir("missing");
         std::fs::write(directory.join("version.json"), "{}\n").expect("expected a captured file");
-        write(&directory, &json!({"format": 1})).expect("expected a manifest");
+        write(
+            &directory,
+            &json!({"format": 1, "reproducible": true}),
+            "1.0.0",
+        )
+        .expect("expected a manifest");
         std::fs::remove_file(directory.join("version.json")).expect("expected a removed capture");
 
         let error = verify(&directory.join(MANIFEST))
