@@ -66,11 +66,14 @@ the release PR is reviewed and merged; a passing PR does not prove a registry up
 **The tag must point at the commit the tarballs name.** Every published `.crate` carries a
 `.cargo_vcs_info.json` recording the commit it was packaged from. That value is immutable once the
 version lands, so tagging a later head — even one whose `crates/` tree is byte-identical — leaves
-the artifact pointing at a commit that is not the release. Read it back before tagging:
+the artifact pointing at a commit that is not the release. Read it back from the registry before
+tagging, not from `target/package/`: the local tarball only says what this working tree would
+upload, and the question is what the registry received.
 
 ```sh
-tar xzfO ~/.cargo/registry/cache/*/mango-external-agents-<version>.crate \
-  mango-external-agents-<version>/.cargo_vcs_info.json
+crate=mango-external-agents version=0.1.0
+curl -sSL "https://static.crates.io/crates/$crate/$crate-$version.crate" |
+  tar xzO "$crate-$version/.cargo_vcs_info.json"
 ```
 
 `mea` remains source-only and unpublished. No binaries are attached to v0.1 releases.
