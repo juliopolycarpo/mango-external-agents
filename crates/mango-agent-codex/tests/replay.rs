@@ -4773,6 +4773,17 @@ async fn a_permissions_decision_round_trips_its_scope() {
             .await;
 
         let request = await_approval(&mut turn).await;
+        // The authority a grant hands over is rendered before anybody can grant it: a host or a
+        // broker choosing `grant:turn` off the title and the agent's own reason alone would be
+        // granting a profile it was never shown.
+        let detail = request
+            .detail
+            .as_deref()
+            .expect("expected the requested profile in the detail");
+        assert!(
+            detail.contains(r#"{"fs":{"read":true}}"#),
+            "expected the requested profile in the detail, received {detail:?}"
+        );
         let response = request
             .respond(option_id, DecisionSource::User)
             .unwrap_or_else(|_| panic!("expected {option_id} among the offered options"));

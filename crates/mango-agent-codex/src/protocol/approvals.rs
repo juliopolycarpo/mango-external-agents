@@ -253,8 +253,9 @@ pub struct PermissionsRequestApprovalParams {
     /// The profile the agent is asking to be granted.
     ///
     /// Opaque to this harness on purpose: the only things ever done with it are echoing it back
-    /// verbatim on a grant and reporting it as the detail of a [`PermissionRequest`] a host
-    /// renders — never widened, narrowed or reshaped.
+    /// verbatim on a grant and rendering it, compactly and unchanged, at the head of the
+    /// [`PermissionRequest`] detail a host is shown before it can grant anything — never widened,
+    /// narrowed or reshaped.
     ///
     /// [`PermissionRequest`]: mango_external_agents::permission::PermissionRequest
     pub permissions: Value,

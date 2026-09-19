@@ -262,7 +262,10 @@ the scopes the vendor's own `PermissionGrantScope` declares:
 
 `permissions` always travels back exactly as the request carried it: this harness never
 synthesises, widens or narrows a permission profile, and the only alternative to granting exactly
-what was asked is granting nothing. `strictAutoReview` is never set — it asks the vendor to change
+what was asked is granting nothing. It is also what the request's detail leads with, compactly
+serialised and unchanged, ahead of the agent's own `reason` and `cwd`: a host or a broker offered
+`grant:turn` is offered exactly this profile, and a detail is cut from the end, so a verbose reason
+must not be able to push the authority being granted out of what is rendered. `strictAutoReview` is never set — it asks the vendor to change
 how it reviews later requests on its own, a standing instruction this library has no basis to give.
 
 ### Questions

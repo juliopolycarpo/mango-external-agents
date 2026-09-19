@@ -225,12 +225,22 @@ fn from_permissions(
     expires_at: SystemTime,
 ) -> PendingApproval {
     let title = String::from("Grant the requested permissions");
-    let detail = match (params.reason.as_deref(), params.cwd.as_deref()) {
-        (Some(reason), Some(cwd)) => Some(format!("{reason}\n\nin {cwd}")),
-        (Some(reason), None) => Some(reason.to_owned()),
-        (None, Some(cwd)) => Some(format!("in {cwd}")),
-        (None, None) => None,
-    };
+    // The profile leads the detail, ahead of the agent's own words. It is the authority a grant
+    // hands over, and `PermissionRequest::normalized` cuts a long detail from the end: put it
+    // second and a verbose reason could push the thing being granted out of what a host renders,
+    // which is the same hole from the other side. Echoed compactly and verbatim — this harness
+    // never reshapes a profile, and never hides one either.
+    let mut lines: Vec<String> = Vec::with_capacity(3);
+    if !params.permissions.is_null() {
+        lines.push(format!("Grants {}", params.permissions));
+    }
+    if let Some(reason) = params.reason.as_deref() {
+        lines.push(reason.to_owned());
+    }
+    if let Some(cwd) = params.cwd.as_deref() {
+        lines.push(format!("in {cwd}"));
+    }
+    let detail = (!lines.is_empty()).then(|| lines.join("\n\n"));
 
     let options = vec![
         PermissionOption::new("grant:turn", PermissionEffect::Allow)
@@ -725,6 +735,52 @@ mod tests {
                 .expect("expected a deny option")
         );
         assert_eq!(pending.refusal().to_wire(), json!({"permissions": {}}));
+    }
+
+    /// The profile a grant hands over leads the detail, so bounding cannot hide it.
+    ///
+    /// A detail is cut from its end. With the profile behind the agent's own words, an agent that
+    /// writes a long enough `reason` decides what a host sees of the authority it is about to be
+    /// offered — which is the concealment this ordering exists to stop.
+    #[test]
+    fn a_permissions_detail_leads_with_the_profile_however_long_the_reason_is() {
+        let request = ServerRequest::parse(
+            method::PERMISSIONS_APPROVAL,
+            json!({
+                "threadId": "t", "turnId": "u", "itemId": "perm-1",
+                "cwd": "/workspace", "reason": "y".repeat(8_192),
+                "permissions": {"fs": {"read": true}},
+            }),
+        );
+        let pending = to_request(&request, now()).expect("expected a question");
+        let detail = pending
+            .request
+            .detail
+            .as_deref()
+            .expect("expected a detail carrying the requested profile");
+        assert!(
+            detail.starts_with(r#"Grants {"fs":{"read":true}}"#),
+            "expected the profile at the head of the detail, received {:?}",
+            &detail[..detail.len().min(64)]
+        );
+
+        let bounded = pending
+            .request
+            .normalized()
+            .expect("expected the request to bound");
+        let bounded_detail = bounded
+            .detail
+            .as_deref()
+            .expect("expected the bounded detail to survive");
+        assert!(
+            bounded_detail.contains(r#"{"fs":{"read":true}}"#),
+            "expected the profile to survive bounding, received {:?}",
+            &bounded_detail[..bounded_detail.len().min(64)]
+        );
+        assert!(
+            bounded.truncated,
+            "expected the over-long reason to be reported as cut"
+        );
     }
 
     /// `deny` is offered as an ordinary refusal, not the standing-rule vocabulary the two ordinary
