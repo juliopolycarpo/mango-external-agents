@@ -3915,6 +3915,73 @@ mod tests {
         );
     }
 
+    /// An elicitation with no turn to belong to is still declined on the wire.
+    ///
+    /// The decline is what stops the app-server waiting; a missing correlation is not a reason to
+    /// hand it the JSON-RPC error this family exists to avoid. There is nothing to report it on,
+    /// so nothing is reported.
+    #[tokio::test]
+    async fn an_elicitation_outside_a_turn_is_declined_and_recorded_nowhere() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+
+        let outcome = handler
+            .on_request(
+                String::from("mcpServer/elicitation/request"),
+                serde_json::json!({
+                    "threadId": "thread-1",
+                    "mode": "url",
+                    "elicitationId": "elicit-1",
+                    "url": "https://example.test/form",
+                }),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            )
+            .await;
+
+        let mango_external_agents::jsonrpc::ServerRequestOutcome::Answer(answer) = outcome else {
+            panic!("expected a native decline outside a turn, received {outcome:?}");
+        };
+        assert_eq!(answer, serde_json::json!({"action": "decline"}));
+    }
+
+    /// An elicitation naming a turn other than the active one is declined without being recorded.
+    #[tokio::test]
+    async fn an_elicitation_for_another_turn_is_declined_without_an_event() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+
+        let outcome = handler
+            .on_request(
+                String::from("mcpServer/elicitation/request"),
+                serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "vendor-turn-2",
+                    "elicitationId": "elicit-1",
+                    "requestedSchema": {"type": "object"},
+                }),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            )
+            .await;
+
+        let mango_external_agents::jsonrpc::ServerRequestOutcome::Answer(answer) = outcome else {
+            panic!("expected a native decline for a foreign turn, received {outcome:?}");
+        };
+        assert_eq!(answer, serde_json::json!({"action": "decline"}));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), stream.recv())
+                .await
+                .is_err(),
+            "expected another turn's form to be recorded nowhere on this one"
+        );
+    }
+
     /// A resolution for a child thread cannot plant an early tombstone that later consumes a
     /// parent approval with the same JSON-RPC request id.
     #[tokio::test]
