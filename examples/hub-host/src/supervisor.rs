@@ -5,6 +5,7 @@
 //! backoff. This is that host half, written against nothing but the library's public API.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,14 +105,25 @@ struct Progress {
 /// [`TurnStream`]: dropping the stream is abandonment, and a
 /// browser must not be able to abandon an operation by closing a tab.
 pub struct Supervisor {
-    session: Box<dyn Session>,
+    inner: SupervisorInner,
     session_id: SessionId,
+    records: HashMap<TurnId, RecoveryRecord>,
+}
+
+/// Everything one run borrows immutably, split out so the records never leave the map.
+///
+/// The split *is* the cancellation safety. A `run` that took its record out of the map, drove it
+/// and put it back would hold the only copy on its own stack for the whole of every await, and a
+/// dropped future would take it with it. Borrowing `&self.inner` and `&mut self.records` as
+/// disjoint fields lets the loop mutate the record in place instead, so whatever it had recorded
+/// when the future was dropped is what the next run reads.
+struct SupervisorInner {
+    session: Box<dyn Session>,
     hub: Arc<dyn HubApi>,
     policy: RetryPolicy,
     stop: Arc<Stop>,
     clock: Arc<dyn Clock>,
     events: TurnBroadcast,
-    records: HashMap<TurnId, RecoveryRecord>,
 }
 
 impl Supervisor {
@@ -151,13 +163,15 @@ impl Supervisor {
     ) -> Self {
         let session_id = session.ids().session_id;
         Self {
-            session,
+            inner: SupervisorInner {
+                session,
+                hub,
+                policy,
+                stop,
+                clock,
+                events: TurnBroadcast::new(DEFAULT_EVENT_CAPACITY),
+            },
             session_id,
-            hub,
-            policy,
-            stop,
-            clock,
-            events: TurnBroadcast::new(DEFAULT_EVENT_CAPACITY),
             records: HashMap::new(),
         }
     }
@@ -191,7 +205,7 @@ impl Supervisor {
     /// assert_eq!(supervisor.subscriber_count(), 0);
     /// ```
     pub fn subscribe(&self) -> TurnSubscriber {
-        self.events.subscribe()
+        self.inner.events.subscribe()
     }
 
     /// How many watchers are attached right now.
@@ -220,7 +234,7 @@ impl Supervisor {
     /// assert_eq!(supervisor.subscriber_count(), 0);
     /// ```
     pub fn subscriber_count(&self) -> usize {
-        self.events.subscriber_count()
+        self.inner.events.subscriber_count()
     }
 
     /// What the record for this logical turn currently says, for a host persisting alongside it.
@@ -302,20 +316,29 @@ impl Supervisor {
     /// });
     /// ```
     pub async fn run(&mut self, request: TurnRequest) -> Result<Settled> {
-        // Validated before the record leaves the map: a refused reuse must not also lose the
-        // record that refused it, or the next identical retry would start a second operation.
-        if let Some(existing) = self.records.get(&request.turn_id) {
-            existing.validate(&request)?;
-        }
-        let mut record = match self.records.remove(&request.turn_id) {
-            Some(record) => record,
-            None => RecoveryRecord::new(self.session_id.clone(), &request)?,
+        // The record is reached through the map for the whole run and never moved out of it. A
+        // `run` future can be dropped at any await inside `drive` — a caller's deadline, a losing
+        // `select!` arm, a cancelled request handler — and a record living on this stack frame
+        // would be destroyed with it. The next run would then build a fresh one, dispatch a second
+        // time under the same logical id, and reserve it with an attempt the Hub cannot tell from
+        // the first.
+        let record = match self.records.entry(request.turn_id.clone()) {
+            // Validated through the entry rather than after a removal: a refused reuse must not
+            // also lose the record that refused it, or the next identical retry would start a
+            // second operation.
+            Entry::Occupied(occupied) => {
+                occupied.get().validate(&request)?;
+                occupied.into_mut()
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(RecoveryRecord::new(self.session_id.clone(), &request)?)
+            }
         };
-        let outcome = self.drive(&mut record, &request).await;
-        self.records.insert(request.turn_id.clone(), record);
-        outcome
+        self.inner.drive(record, &request).await
     }
+}
 
+impl SupervisorInner {
     async fn drive(&self, record: &mut RecoveryRecord, request: &TurnRequest) -> Result<Settled> {
         let mut progress = Progress {
             stream: None,

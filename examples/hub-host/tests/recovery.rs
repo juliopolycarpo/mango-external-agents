@@ -7,12 +7,16 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hub_host::testing::{
     FakeHubApi, FakeVendorSession, HubCallKind, ReconcileAnswer, ReserveAnswer, TurnAnswer,
 };
 use hub_host::{Commit, HubError, HubStatus, Reconciliation, Settled, Stop};
-use mango_external_agents::{AttemptId, Error, TerminalStatus, TurnId, TurnRequest};
+use mango_external_agents::{AttemptId, Dispatch, Error, TerminalStatus, TurnId, TurnRequest};
+
+/// Long enough for the supervisor to reach the held turn, short enough to stay a test.
+const MID_TURN: Duration = Duration::from_millis(50);
 
 /// A Hub that recorded the submission and then lost the answer on the way back.
 ///
@@ -252,5 +256,111 @@ async fn reusing_a_logical_turn_id_with_different_content_is_refused() {
         record.terminal(),
         Some(&TerminalStatus::Completed),
         "expected the first operation's committed terminal to survive the refusal"
+    );
+}
+
+/// Dropping the `run` future must not destroy the record that says the work already went out.
+///
+/// A caller with its own deadline, a `select!` that lost, a cancelled HTTP handler: any of them
+/// drops the future mid-turn. The record is the only thing standing between that and a second
+/// execution, so it belongs to the supervisor for the whole of every await, not to `run`'s stack
+/// frame. The resumed run reconciles the attempt that is already out there and makes no new
+/// reservation at all.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_run_keeps_the_record_that_says_the_work_went_out() {
+    let hub = Arc::new(FakeHubApi::new().reconciling([ReconcileAnswer::Answer(
+        Reconciliation::Answered(HubStatus::Committed {
+            terminal: TerminalStatus::Completed,
+        }),
+    )]));
+    let session = FakeVendorSession::new().answering([TurnAnswer::CompleteWhenReleased]);
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    let abandoned = tokio::time::timeout(MID_TURN, supervisor.run(request.clone())).await;
+
+    assert!(
+        abandoned.is_err(),
+        "expected the run future to be dropped while the turn was still open, received {abandoned:?}"
+    );
+    let record = supervisor
+        .record(&TurnId::new("turn-1"))
+        .expect("expected a cancelled run to leave its record with the supervisor");
+    assert_eq!(
+        record.dispatch(),
+        Dispatch::Accepted,
+        "expected the surviving record to remember the acknowledged dispatch"
+    );
+
+    let settled = supervisor
+        .run(request)
+        .await
+        .expect("expected the resumed operation to settle");
+
+    assert_eq!(
+        settled,
+        Settled::AlreadyCommitted {
+            terminal: common::COMPLETED
+        }
+    );
+    assert_eq!(
+        hub.count(HubCallKind::Reserve),
+        1,
+        "expected the resumed run to make no new reservation, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Reserve),
+        vec![AttemptId::FIRST],
+        "expected one attempt across both runs, not two reservations the hub cannot tell apart"
+    );
+    assert_eq!(
+        session.start_count(),
+        1,
+        "expected the vendor work to run exactly once across both runs"
+    );
+}
+
+/// The guard against a reused logical id has to survive a cancelled run too.
+///
+/// It lives on the record, so a run that loses its record loses the guard with it and the host
+/// silently dispatches different content under an id it has already used.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_run_still_refuses_a_reused_turn_id_with_changed_content() {
+    let hub = Arc::new(FakeHubApi::new());
+    let session = FakeVendorSession::new().answering([TurnAnswer::CompleteWhenReleased]);
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+
+    let abandoned = tokio::time::timeout(
+        MID_TURN,
+        supervisor.run(TurnRequest::new("turn-1", "ship it")),
+    )
+    .await;
+
+    assert!(
+        abandoned.is_err(),
+        "expected the run future to be dropped while the turn was still open, received {abandoned:?}"
+    );
+    let error = supervisor
+        .run(TurnRequest::new("turn-1", "ship something else"))
+        .await
+        .expect_err("expected a refusal for a logical turn id reused after a cancelled run");
+
+    assert!(
+        matches!(error, Error::HostConfiguration { .. }),
+        "expected a host-configuration refusal, received {error:?}"
+    );
+    assert_eq!(
+        hub.count(HubCallKind::Reserve),
+        1,
+        "expected the refusal to dispatch nothing, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        session.start_count(),
+        1,
+        "expected the refusal not to reach the vendor"
     );
 }
