@@ -79,8 +79,10 @@ let host = HostContext::builder()
 
 7. **A cancellation token, a clock and the caps**, all with defaults: `CancelToken` for shutdown,
    `Clock` for the instant an event is stamped with, and `Limits` for the turn channel's capacity
-   (1,024 payload events and 8 MiB), pending requests, line and buffer caps, stderr tail, request,
-   approval and idle timeouts, graceful interruption and shutdown deadlines. Request timeouts bound
+   (1,024 payload events, and 8 MiB of serialized queued payload per turn — of which roughly 1 MiB
+   is held for approval and question events, so a busy transcript cannot stop the host being asked;
+   see [lifecycle.md](lifecycle.md) for the derivation), pending requests, line and buffer caps,
+   stderr tail, request, approval and idle timeouts, graceful interruption and shutdown deadlines. Request timeouts bound
    individual protocol calls; approval timeouts leave room for a person or host policy to decide.
    Harnesses read them back through
    `host.limits()`, and a host constructing `TokioLauncher` hands it the same ones with
