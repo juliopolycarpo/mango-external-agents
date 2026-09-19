@@ -4744,6 +4744,91 @@ async fn an_elicitation_is_declined_natively_and_never_put_to_the_host() {
     assert_eq!(answer["result"], serde_json::json!({"action": "decline"}));
 }
 
+/// A url-mode elicitation carries no `turnId` of its own at this pin, and is still declined.
+///
+/// The correlation gate every other server request passes through would answer this one with the
+/// JSON-RPC error the native decline exists to stop sending, and leave the app-server told that
+/// this client is broken rather than that the form was refused.
+#[tokio::test]
+async fn a_url_mode_elicitation_with_no_turn_id_is_still_declined_natively() {
+    let (_session, launcher, mut turn) =
+        open_with_mid_turn_push("mcpServer/elicitation/request", |thread_id, _turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "mode": "url",
+                "elicitationId": "elicit-1",
+                "message": "open this",
+                "url": "https://example.test/form",
+            })
+        })
+        .await;
+
+    let events = drain(&mut turn).await;
+    let resolutions = events
+        .iter()
+        .filter(|kind| {
+            matches!(
+                kind,
+                EventKind::QuestionResolved {
+                    outcome: QuestionOutcome::Refused {
+                        reason: UnsupportedQuestion::ArbitraryForm
+                    },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "expected the form refused exactly once on the active turn, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(
+        answer.get("error"),
+        None,
+        "expected a native decline rather than a JSON-RPC error, received {answer}"
+    );
+    assert_eq!(answer["result"], serde_json::json!({"action": "decline"}));
+}
+
+/// A `turnId` the server writes as `null` is a missing correlation, not a malformed frame.
+#[tokio::test]
+async fn an_elicitation_whose_turn_id_is_null_is_declined_rather_than_refused() {
+    let (_session, launcher, mut turn) =
+        open_with_mid_turn_push("mcpServer/elicitation/request", |thread_id, _turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": serde_json::Value::Null,
+                "message": "enter your api token",
+                "requestedSchema": {"type": "object"},
+            })
+        })
+        .await;
+
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Refused {
+                    reason: UnsupportedQuestion::ArbitraryForm
+                },
+                ..
+            }
+        )),
+        "expected a native refusal to be recorded, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(
+        answer.get("error"),
+        None,
+        "expected a native decline rather than a JSON-RPC error, received {answer}"
+    );
+    assert_eq!(answer["result"], serde_json::json!({"action": "decline"}));
+}
+
 /// Each of the three permission decisions round-trips with its own scope: a turn grant, a session
 /// grant, and a denial that grants nothing.
 #[tokio::test]

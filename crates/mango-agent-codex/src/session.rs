@@ -43,9 +43,9 @@ use tokio::sync::{Mutex, Notify, oneshot, watch};
 
 use crate::approvals::{self, PendingApproval};
 use crate::protocol::approvals::{
-    McpServerElicitationRequestResponse, ServerAnswer, ServerRequest, ToolRequestUserInputAnswer,
-    ToolRequestUserInputOption, ToolRequestUserInputParams, ToolRequestUserInputQuestion,
-    ToolRequestUserInputResponse,
+    McpServerElicitationRequestParams, McpServerElicitationRequestResponse, ServerAnswer,
+    ServerRequest, ToolRequestUserInputAnswer, ToolRequestUserInputOption,
+    ToolRequestUserInputParams, ToolRequestUserInputQuestion, ToolRequestUserInputResponse,
 };
 use crate::protocol::method;
 use crate::protocol::notifications::Notification;
@@ -1372,6 +1372,19 @@ impl PeerHandler for CodexHandler {
             });
         }
 
+        // An MCP elicitation is an arbitrary JSON-schema form this library does not render — see
+        // `UnsupportedQuestion::ArbitraryForm` and the scope note in `docs/contracts.md`. Answered
+        // immediately and natively: no pending registration, no broker, no `QuestionAsked` — a
+        // form is never put to a host.
+        //
+        // Answered ahead of the turn-correlation gates below rather than after them. At this pin
+        // the `url` branch carries no `turnId` at all, so those gates would answer the one family
+        // whose whole point is not receiving a JSON-RPC error with exactly that error, and the
+        // server would be told this client is broken rather than that its form was declined.
+        if let ServerRequest::McpElicitation(params) = &request {
+            return self.decline_elicitation(params, &id).await;
+        }
+
         let Some(route) = self.shared.active_turn_route().await else {
             return ServerRequestOutcome::Failure(JsonRpcError {
                 code: -32602,
@@ -1414,40 +1427,6 @@ impl PeerHandler for CodexHandler {
                 ),
                 data: None,
             });
-        }
-
-        // An MCP elicitation is an arbitrary JSON-schema form this library does not render — see
-        // `UnsupportedQuestion::ArbitraryForm` and the scope note in `docs/contracts.md`. Answered
-        // immediately and natively: no pending registration, no broker, no `QuestionAsked` — a
-        // form is never put to a host.
-        if let ServerRequest::McpElicitation(params) = &request {
-            let _ = self
-                .shared
-                .emit_for(
-                    &route,
-                    EventKind::QuestionResolved {
-                        interaction_id: InteractionId::new(
-                            params
-                                .elicitation_id
-                                .clone()
-                                .unwrap_or_else(|| id.key().to_string()),
-                        ),
-                        outcome: QuestionOutcome::Refused {
-                            reason: UnsupportedQuestion::ArbitraryForm,
-                        },
-                    },
-                )
-                .await;
-            // No pending entry was ever registered for this answer, so a later
-            // `serverRequest/resolved` for it would otherwise find nothing in either map and
-            // spend an early-resolution marker on a question already settled.
-            self.shared
-                .remember_answered_resolution(&id.key(), &route.owner)
-                .await;
-            return ServerRequestOutcome::Answer(
-                serde_json::to_value(McpServerElicitationRequestResponse::decline())
-                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
-            );
         }
 
         // One read, reused below: a second `host.now()` call to build the deadline would let a
@@ -1838,6 +1817,77 @@ impl CodexHandler {
         )
         .await;
         decision
+    }
+
+    /// Declines an MCP elicitation natively, whether or not it correlates to a turn.
+    ///
+    /// The wire answer is unconditional: a form this library will not render must never leave the
+    /// app-server waiting on a JSON-RPC error, and a missing correlation is not a reason to send
+    /// one. The audit event is conditional, because it needs a turn to be reported on — an
+    /// elicitation that names another turn, or arrives outside one, is declined and not recorded.
+    async fn decline_elicitation(
+        &self,
+        params: &McpServerElicitationRequestParams,
+        id: &RequestId,
+    ) -> ServerRequestOutcome {
+        if let Some(route) = self.elicitation_route(params).await {
+            let _ = self
+                .shared
+                .emit_for(
+                    &route,
+                    EventKind::QuestionResolved {
+                        interaction_id: InteractionId::new(
+                            params
+                                .elicitation_id
+                                .clone()
+                                .unwrap_or_else(|| id.key().to_string()),
+                        ),
+                        outcome: QuestionOutcome::Refused {
+                            reason: UnsupportedQuestion::ArbitraryForm,
+                        },
+                    },
+                )
+                .await;
+            // No pending entry was ever registered for this answer, so a later
+            // `serverRequest/resolved` for it would otherwise find nothing in either map and
+            // spend an early-resolution marker on a question already settled.
+            self.shared
+                .remember_answered_resolution(&id.key(), &route.owner)
+                .await;
+        }
+        ServerRequestOutcome::Answer(
+            serde_json::to_value(McpServerElicitationRequestResponse::decline())
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+        )
+    }
+
+    /// The turn an elicitation's refusal is recorded on, when there is one it belongs to.
+    ///
+    /// An absent or empty `turnId` is a correlation the server did not offer, not a failed one:
+    /// the active turn is the only one the form can belong to, so it is reported there. A
+    /// `turnId` that names a different turn is somebody else's, and reports nowhere.
+    async fn elicitation_route(
+        &self,
+        params: &McpServerElicitationRequestParams,
+    ) -> Option<ActiveTurnRoute> {
+        let route = self.shared.active_turn_route().await?;
+        if !self.shared.approval_route_is_admissible(&route).await {
+            return None;
+        }
+        let Some(turn_id) = params
+            .turn_id
+            .as_deref()
+            .filter(|turn_id| !turn_id.is_empty())
+        else {
+            return Some(route);
+        };
+        if !route.native_turn_id.is_empty() {
+            return (turn_id == route.native_turn_id).then_some(route);
+        }
+        // The turn has not been told its native id yet, so the only thing that disqualifies this
+        // one is naming a turn that already ended.
+        let completed = self.shared.recently_completed(turn_id).await;
+        (!completed).then_some(route)
     }
 
     async fn resolved(

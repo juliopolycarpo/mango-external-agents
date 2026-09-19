@@ -165,7 +165,7 @@ impl ServerRequest {
             Self::FileChange(params) => Some(params.turn_id.as_str()),
             Self::Permissions(params) => Some(params.turn_id.as_str()),
             Self::RequestUserInput(params) => Some(params.turn_id.as_str()),
-            Self::McpElicitation(params) => Some(params.turn_id.as_str()),
+            Self::McpElicitation(params) => params.turn_id.as_deref(),
             Self::Refused { .. } => None,
         }
     }
@@ -453,9 +453,14 @@ impl ToolRequestUserInputResponse {
 pub struct McpServerElicitationRequestParams {
     /// Which conversation.
     pub thread_id: String,
-    /// Which turn.
+    /// Which turn, when the server named one.
+    ///
+    /// Optional here where the other approval families declare a plain `String`: the pinned
+    /// schema's `url` branch carries no `turnId` at all, and a server is free to write the member
+    /// as `null`. A `String` rejects an explicit null outright, which would fail the whole frame
+    /// to deserialise and fall back to the JSON-RPC error this path exists to stop sending.
     #[serde(default)]
-    pub turn_id: String,
+    pub turn_id: Option<String>,
     /// The vendor's own id for this ask, when the ask has one.
     ///
     /// Present only in the `url` mode: the pinned schema declares this type as a `oneOf` over
@@ -788,7 +793,7 @@ mod tests {
             panic!("expected an elicitation");
         };
         assert_eq!(params.thread_id, "thread-1");
-        assert_eq!(params.turn_id, "turn-1");
+        assert_eq!(params.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(params.elicitation_id.as_deref(), Some("elicit-1"));
         // The struct declares no field for `message`, `requestedSchema` or `serverName`, so
         // nothing of them can appear here even in debug output.
@@ -836,7 +841,28 @@ mod tests {
             panic!("expected an elicitation, received {url_mode:?}");
         };
         assert_eq!(params.elicitation_id.as_deref(), Some("elicit-1"));
-        assert_eq!(params.turn_id, "", "the pin says this one is nullable");
+        assert_eq!(
+            params.turn_id, None,
+            "the pin's url branch carries no turn of its own"
+        );
+
+        // A server that writes the member as `null` says the same thing: no correlation, not a
+        // malformed frame. A plain `String` would reject it and fail the whole frame to parse.
+        let nulled = ServerRequest::parse(
+            method::MCP_ELICITATION,
+            json!({
+                "threadId": "thread-1",
+                "turnId": null,
+                "mode": "form",
+                "message": "enter your token",
+                "requestedSchema": {"type": "object"},
+            }),
+        );
+        let ServerRequest::McpElicitation(params) = nulled else {
+            panic!("expected an elicitation, received {nulled:?}");
+        };
+        assert_eq!(params.turn_id, None);
+        assert_eq!(params.thread_id, "thread-1");
     }
 
     /// The wire shape for each of the three permission decisions.

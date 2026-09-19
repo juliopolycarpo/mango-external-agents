@@ -297,7 +297,12 @@ from `Session::answer` — whichever is first.
 ### MCP elicitations
 
 `mcpServer/elicitation/request` asks the client to fill in an arbitrary JSON-schema form on an MCP
-server's behalf. This library renders no form — see `UnsupportedQuestion::ArbitraryForm` and the
+server's behalf. It is answered ahead of the turn-correlation gates every other server request
+passes through: at this pin the `url` branch carries no `turnId` at all, and a server may write the
+member as `null`, so correlating first would answer the one family whose whole point is not
+receiving a JSON-RPC error with exactly that error. An elicitation that names no turn, names
+another turn, or arrives outside one is still declined on the wire; only one that belongs to the
+active turn is recorded as a `QuestionResolved` on it. This library renders no form — see `UnsupportedQuestion::ArbitraryForm` and the
 scope note in `docs/contracts.md` — so it answers `{"action": "decline"}` immediately and natively,
 never `cancel`: the vendor's own documentation is that `decline` lets the turn continue while
 `cancel` ends it, and refusing to render a form this library does not own is not a reason to end
