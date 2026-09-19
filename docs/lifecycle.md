@@ -64,6 +64,10 @@ and 8 MiB of serialized queued payload. Permission and question facts have a sep
 reserve of twice `max_pending_requests`, 128 events by default, within that same byte budget.
 The queue preserves ordering between payload and interaction events.
 
+Codex question settlement stays pending until `QuestionResolved` is published. Accepting an answer
+does not release that ownership: terminal cleanup publishes an accepted outcome before completing
+the turn, and server withdrawal closes any announced prompt.
+
 The terminal has separate storage for one bounded error or the pair `Cancelled`, `Completed`.
 Committing it never waits for transcript consumption and cannot create a detached delivery task.
 The first terminal wins; later events are refused. Vendor failure fields are normalized before
