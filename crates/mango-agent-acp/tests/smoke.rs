@@ -2,8 +2,11 @@
 //!
 //! `#[ignore]`d, so CI never runs it: it spawns a third party's binary, needs whatever that binary is
 //! signed in to, and costs tokens. It is how a profile earns
-//! [`AcpProfile::verified`](mango_agent_acp::AcpProfile), and how the next person re-checks one when an
-//! agent ships a new build.
+//! [`AcpProfile::is_verified`](mango_agent_acp::AcpProfile), and how the next person re-checks one when
+//! an agent ships a new build. A passing run is recorded as a
+//! [`VerificationEvidence`](mango_agent_acp::VerificationEvidence) on the profile — the build, the day,
+//! [`LiveSession`](mango_agent_acp::VerificationMethod) and this file — because a claim nobody can read
+//! back is not evidence.
 //!
 //! ```text
 //! MEA_ACP_PROFILE=cursor cargo test -p mango-agent-acp --all-features \

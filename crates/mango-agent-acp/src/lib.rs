@@ -15,7 +15,10 @@ pub mod transport;
 pub mod version;
 
 pub use harness::AcpHarness;
-pub use profile::{AcpProfile, SessionModeIds, builtin_profile, builtin_profiles};
+pub use profile::{
+    AcpProfile, SessionModeIds, VerificationEvidence, VerificationMethod, builtin_profile,
+    builtin_profiles,
+};
 pub use session::AcpSession;
 
 /// The protocol family every harness in this crate speaks.
