@@ -188,6 +188,64 @@ review returns `Error::NotSupported`; the host needs no vendor protocol code.
 See [`contracts.md`](contracts.md) for the rationale behind each of these shapes, the identifier
 mapping a host persists, and which public types are protected against future growth.
 
+## Hub-owned retry
+
+The library gives you the retry *contract* — `RequestFingerprint`, `RecoveryRecord`, `Dispatch`
+and the transitions between them. It does not give you a loop, and
+[`lifecycle.md`](lifecycle.md) says why: there is no database here, no client for your control
+plane, and no automatic submission. Read that section first; this one is only about what you owe
+on your side of the line.
+
+### How far did it get?
+
+Before any of it, learn to read the one question a bare `Result` cannot answer. A refusal that
+never reached the vendor is safe to replay; a socket that closed after the request went out is
+not. `TurnStream::dispatch()` answers it for an attempt you are holding, and
+`Error::Operation`'s `dispatch` answers it for one that failed.
+
+Branch on the answer, not on the error kind. `Dispatch::is_safe_to_replay` is true only for
+`NotSubmitted`; `AcceptanceUnknown` is deliberately false, because "probably did not arrive" is
+the reading that runs a turn twice. `Dispatch::needs_reconciliation` is the other branch, and it
+is the one your supervisor spends its time in.
+
+None of this makes a turn idempotent. The vendor decides what a second dispatch does, and no
+identifier the library mints changes that — see [`contracts.md`](contracts.md) for the three
+identities and why they stay separate.
+
+### What you store, and when
+
+You owe three durable things, and they have to be durable before the call that needs them, not
+after:
+
+- **A receipt.** Write the logical turn id, the attempt, the fingerprint and `AcceptanceUnknown`
+  to your own storage *before* the side-effecting submission. A receipt written afterwards is a
+  receipt you do not have when the process dies mid-call, and the operation you cannot account for
+  is exactly the one you were trying to protect.
+- **An event cursor.** Your supervisor owns the `TurnStream`; a browser owns a subscription to
+  your own fan-out. Persist how far you have relayed, so a reconnecting client resumes rather than
+  replaying, and so a disconnect is a detach rather than an abandonment.
+- **A checkpoint.** The committed terminal, keyed by the logical operation — session and turn,
+  never attempt. Commit idempotently and distinguish "recorded now" from "already recorded": the
+  second answer is what stops a lost acknowledgement from becoming a second execution.
+
+Backoff, jitter and per-attempt deadlines are yours. Cap the delay, honour a vendor retry hint but
+clamp it, make the wait cancellation-aware, and do not add a retry-count ceiling — a recoverable
+failure that has happened nine times is still a recoverable failure, and giving up on the tenth
+invents a terminal outcome nobody recorded.
+
+Two limits are worth knowing before you design around them. A vendor with **no idempotent
+submission** means the fingerprint buys you input validation and nothing else: re-sending under
+the same turn id starts a second turn, so `AcceptanceUnknown` never authorises a re-send on its
+own. A vendor with **no reconciliation query** is worse, because nothing can ever prove absence —
+`reconcile_not_submitted` is unreachable, and the only honest answer is to hand the uncertain
+operation to whoever can decide, as its own outcome. Silently replaying it and silently reporting
+success are the two failures that look identical in a log.
+
+`examples/hub-host/` is the executable version of all of this: a supervisor whose control plane is
+injected as a port, with named fakes that drop acknowledgements, answer "no reconciliation
+surface", and refuse terminally. Its tests assert exact submission counts, which is the only form
+of "it submitted once" that holds up.
+
 ## Mapping events to your own product
 
 Keep the mapping in one module. It is small, and it is where product vocabulary lives —
