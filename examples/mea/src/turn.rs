@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use mango_external_agents::event::{AgentEvent, EventKind};
 use mango_external_agents::{
-    ActivityContent, BrokerDecision, CancelReason, CloseReason, Error, InteractionId,
+    ActivityContent, BrokerDecision, CancelReason, CloseReason, Dispatch, Error, InteractionId,
     PermissionBroker, PermissionRequest, PermissionResponse, QuestionRequest, QuestionResponse,
     Result, Session, TurnRequest, TurnStream,
 };
@@ -63,7 +63,14 @@ async fn run_with_host(
     asker: &dyn crate::ask::QuestionInput,
 ) -> Result<()> {
     let outcome = async {
-        let mut stream = session.start_turn(request).await?;
+        let mut stream = match session.start_turn(request).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                report_start_failure(&error, json);
+                return Err(error);
+            }
+        };
+        report_dispatch(&stream, json);
         match tokio::time::timeout(
             TURN_DEADLINE,
             print_turn(session, &mut stream, json, broker, asker),
@@ -83,6 +90,79 @@ async fn run_with_host(
     .await;
     let closed = session.close(CloseReason::Requested).await;
     outcome.and(closed)
+}
+
+/// Says how certain the vendor's acceptance of this attempt is, before any event arrives.
+///
+/// A host's retry loop reads this and nothing else before deciding what a failure entitles it to
+/// do, so the example host that `docs/adopt.md` points at should show it rather than swallow it.
+/// [`Dispatch::Accepted`] is the ordinary answer; a harness whose vendor has no prompt
+/// acknowledgement reports [`Dispatch::AcceptanceUnknown`], and a host that replayed that attempt
+/// would run the turn twice.
+fn report_dispatch(turn: &TurnStream, json: bool) {
+    let dispatch = turn.dispatch();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "attempt": turn.attempt().get(),
+                "dispatch": dispatch,
+                "safeToReplay": dispatch.is_safe_to_replay(),
+                "needsReconciliation": dispatch.needs_reconciliation(),
+            })
+        );
+        return;
+    }
+    if dispatch != Dispatch::Accepted {
+        println!("dispatch: {dispatch} — this attempt must not be replayed blindly");
+    }
+}
+
+/// Says how far a refused start got, which is the half a bare error does not carry.
+///
+/// The distinction a retry loop exists for: a refusal that never reached the vendor is safe to
+/// send again, and one that may have arrived is not. An error nobody annotated reads as
+/// [`Dispatch::AcceptanceUnknown`], which is the conservative answer rather than a missing one.
+///
+/// `mea` itself never retries — it is a smoke tool, and a tool that quietly ran somebody's turn
+/// twice would be a bad example for the hosts `docs/adopt.md` sends here — so it prints the
+/// verdict and stops.
+fn report_start_failure(error: &Error, json: bool) {
+    let dispatch = error.dispatch();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "startFailed": error.to_string(),
+                "dispatch": dispatch,
+                "safeToReplay": dispatch.is_safe_to_replay(),
+                "needsReconciliation": dispatch.needs_reconciliation(),
+            })
+        );
+        return;
+    }
+    println!("start refused ({dispatch}): {}", retry_advice(dispatch));
+}
+
+/// What a host may do next, given how far the refused attempt got.
+///
+/// Separated from the printing so it can be asserted on: the mapping is the contract, and a test
+/// on captured stdout would be a test of `println!`.
+///
+/// # Example
+///
+/// ```text
+/// assert!(retry_advice(Dispatch::NotSubmitted).contains("safe"));
+/// ```
+fn retry_advice(dispatch: Dispatch) -> &'static str {
+    match dispatch {
+        Dispatch::NotSubmitted => "it never reached the vendor, so sending it again is safe",
+        Dispatch::AcceptanceUnknown => "it may have reached the vendor; reconcile before retrying",
+        Dispatch::Accepted => "the vendor took it and then failed it; do not send it again",
+        // `Dispatch` is non_exhaustive: a certainty this build does not know is not one it may
+        // describe as safe. Saying so is the conservative answer, not a missing one.
+        _ => "this build cannot say what that certainty means; do not send it again",
+    }
 }
 
 /// Prints events and keeps terminal input concurrent with the stream that may withdraw it.
@@ -1417,6 +1497,33 @@ mod tests {
         assert!(
             session.closed.load(Ordering::Acquire),
             "expected a failed start to close the session"
+        );
+    }
+
+    /// The mapping a retry loop reads. Asserted rather than described, because the difference
+    /// between "safe to send again" and "reconcile first" is the difference between one turn and
+    /// two — and every arm but the first has to refuse the replay.
+    #[test]
+    fn only_an_attempt_that_never_left_is_advised_as_safe_to_send_again() {
+        assert!(
+            super::retry_advice(mango_external_agents::Dispatch::NotSubmitted).contains("safe"),
+            "expected an unsubmitted attempt to be advised as safe, received {:?}",
+            super::retry_advice(mango_external_agents::Dispatch::NotSubmitted)
+        );
+        for refused in [
+            mango_external_agents::Dispatch::AcceptanceUnknown,
+            mango_external_agents::Dispatch::Accepted,
+        ] {
+            let advice = super::retry_advice(refused);
+            assert!(
+                !advice.contains("safe"),
+                "expected {refused} to refuse a blind replay, received {advice:?}"
+            );
+        }
+        assert!(
+            super::retry_advice(mango_external_agents::Dispatch::AcceptanceUnknown)
+                .contains("reconcile"),
+            "expected unknown acceptance to send a host to reconciliation"
         );
     }
 }
