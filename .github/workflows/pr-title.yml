@@ -1,0 +1,39 @@
+name: PR title
+
+# The squash subject is the pull request title, and git-cliff builds CHANGELOG.md and the release
+# notes from that subject. A title without a Conventional Commit type therefore costs the release
+# an entry, which is how v0.1.0's notes came to omit the pull request that produced the tagged tree.
+#
+# Separate from ci.yml so that editing a title or description re-runs this check alone rather than
+# the three-OS test matrix.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  title:
+    name: Title reads as a commit subject
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Through the environment, never interpolated into the script: a title is attacker-controlled
+      # text on a fork pull request.
+      - env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: scripts/check-pr-title.sh "$PR_TITLE"
