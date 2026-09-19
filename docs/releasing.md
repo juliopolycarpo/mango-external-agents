@@ -59,11 +59,33 @@ Run `mea doctor` and a harmless `mea turn` against Claude, Codex and Cursor on t
 Linux and Windows installations. Pinned CI covers Linux, macOS and Windows public contracts;
 authenticated turns require the maintainer's existing vendor login and are not a PR CI job.
 
-After the first manual publish, check all four 0.1.0 crate pages and docs.rs builds. Configure
-trusted publishing before relying on an automatic later release. Publishing and tagging happen
-only after the release PR is reviewed and merged; a passing PR does not prove a registry upload.
+After the first manual publish, check all four crate pages and docs.rs builds. Configure trusted
+publishing before relying on an automatic later release. Publishing and tagging happen only after
+the release PR is reviewed and merged; a passing PR does not prove a registry upload.
+
+**The tag must point at the commit the tarballs name.** Every published `.crate` carries a
+`.cargo_vcs_info.json` recording the commit it was packaged from. That value is immutable once the
+version lands, so tagging a later head — even one whose `crates/` tree is byte-identical — leaves
+the artifact pointing at a commit that is not the release. Read it back before tagging:
+
+```sh
+tar xzfO ~/.cargo/registry/cache/*/mango-external-agents-<version>.crate \
+  mango-external-agents-<version>/.cargo_vcs_info.json
+```
 
 `mea` remains source-only and unpublished. No binaries are attached to v0.1 releases.
+
+### 0.1.0, as executed
+
+Recorded because the order differed from the numbered procedure above and a later reader should not
+have to infer it. On 2026-09-19 the four crates were published by hand from `3ddd25e` — the merged
+release-gate head — and `v0.1.0` was tagged on that same commit afterwards, once the artifacts were
+verified: identical sources, README and licence in every tarball, all four resolving into a fresh
+downstream build, docs.rs green, `ring`-only TLS in the resolved graph. Trusted publishing was
+configured after the crates existed, which is the only order crates.io allows.
+
+Two checklist items above were not satisfied before that publish: no authenticated Claude or Codex
+turn, and no Windows lane. Both were run afterwards rather than before.
 
 ## Pre-releases
 
@@ -95,7 +117,9 @@ cargo publish -p mango-agent-acp --locked
 
 After that, configure trusted publishing on all four crates and let the workflow handle every
 later tag. The tag for that first version can still be pushed: the publish job checks crates.io
-before asking for a token and skips every crate that is already there.
+before asking for a token and skips every crate that is already there — which also means such a tag
+exercises nothing of the trusted-publishing path. The first tag that has something left to publish
+is the first one that proves it.
 
 ## When a release fails
 
