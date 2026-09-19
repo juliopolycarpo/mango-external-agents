@@ -3,8 +3,8 @@
 //! `docs/lifecycle.md` puts network retries and backoff on the host, so the library carries no
 //! `Backoff` type and no `retry_after` field. What it does carry is the contract this policy has
 //! to respect: bounded attempt deadlines, cancellation-aware waits, capped delays, vendor hints
-//! honoured, and **no retry-count exhaustion** — a recoverable failure is not a terminal outcome,
-//! so a counter that gave up would invent one.
+//! honoured between that cap and the host's own backoff, and **no retry-count exhaustion** — a
+//! recoverable failure is not a terminal outcome, so a counter that gave up would invent one.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -191,11 +191,19 @@ impl RetryPolicy {
 
     /// How long to wait before recoverable failure number `failures` is tried again.
     ///
-    /// Pure and synchronous, so the cap, the monotonicity and the hint clamp are assertable
+    /// Pure and synchronous, so the cap, the monotonicity and the hint bounds are assertable
     /// without a runtime. `failures` counts the failures already seen: the first retry passes `1`.
-    /// A Hub's `hint` replaces the computed delay — the Hub knows when it will answer and the
-    /// host does not — but it is still clamped by the cap, because a Hub that asks for an hour
-    /// must not be able to park a host's operation for an hour.
+    ///
+    /// A Hub's `hint` replaces the computed delay — the Hub knows when it will answer and the host
+    /// does not — but only *between* the two bounds the host owns. Above, the cap: a Hub that asks
+    /// for an hour must not be able to park a host's operation for an hour. Below, the host's own
+    /// capped exponential: a hint is a request to wait **longer**, never a licence to retry sooner
+    /// than the host had already decided. The floor is not theoretical. Every hint reaching here
+    /// has been resolved against the host's clock by
+    /// [`RetryHint::remaining`](crate::RetryHint::remaining), and an instant already in the past —
+    /// an echoed `Retry-After` that has elapsed, or a Hub whose clock runs behind this host's —
+    /// resolves to [`Duration::ZERO`]. Honouring that literally turns a rate-limited Hub into a
+    /// Hub being hammered at full rate, which is the opposite of what it asked for.
     ///
     /// # Example
     ///
@@ -214,11 +222,10 @@ impl RetryPolicy {
     /// assert_eq!(policy.delay_for(2, None), Duration::from_secs(2));
     /// assert_eq!(policy.delay_for(9, None), Duration::from_secs(8));
     /// assert_eq!(policy.delay_for(1, Some(Duration::from_secs(600))), Duration::from_secs(8));
+    /// // An expired hint leaves the host's own backoff standing rather than erasing it.
+    /// assert_eq!(policy.delay_for(3, Some(Duration::ZERO)), Duration::from_secs(4));
     /// ```
     pub fn delay_for(&self, failures: u32, hint: Option<Duration>) -> Duration {
-        if let Some(hint) = hint {
-            return hint.min(self.cap);
-        }
         let doublings = failures.saturating_sub(1).min(u32::BITS - 1);
         let exponential = self
             .base
@@ -226,7 +233,11 @@ impl RetryPolicy {
             .unwrap_or(self.cap)
             .min(self.cap);
         let factor = self.jitter.factor().clamp(0.0, 1.0);
-        exponential.mul_f64(1.0 - JITTER_SPREAD + JITTER_SPREAD * factor)
+        let computed = exponential.mul_f64(1.0 - JITTER_SPREAD + JITTER_SPREAD * factor);
+        match hint {
+            Some(hint) => hint.min(self.cap).max(computed),
+            None => computed,
+        }
     }
 
     /// Waits out `delay`, ending early and promptly when the host stops the operation.

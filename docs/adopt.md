@@ -230,10 +230,15 @@ after:
   never attempt. Commit idempotently and distinguish "recorded now" from "already recorded": the
   second answer is what stops a lost acknowledgement from becoming a second execution.
 
-Backoff, jitter and per-attempt deadlines are yours. Cap the delay, honour a vendor retry hint but
-clamp it, make the wait cancellation-aware, and do not add a retry-count ceiling — a recoverable
-failure that has happened nine times is still a recoverable failure, and giving up on the tenth
-invents a terminal outcome nobody recorded.
+Backoff, jitter and per-attempt deadlines are yours. Cap the delay, make the wait
+cancellation-aware, and do not add a retry-count ceiling — a recoverable failure that has happened
+nine times is still a recoverable failure, and giving up on the tenth invents a terminal outcome
+nobody recorded. Honour a vendor retry hint, but bound it on *both* sides: clamped above by your
+cap, so a vendor cannot park your operation for an hour, and floored below by the backoff you had
+already computed. A hint is a request to wait longer, never permission to retry sooner. Resolve an
+absolute hint against your own clock at the moment you are about to wait, and remember that an
+instant already past resolves to zero — take that literally and a vendor echoing an elapsed
+`Retry-After` gets hammered at full rate instead of left alone.
 
 Two limits are worth knowing before you design around them. A vendor with **no idempotent
 submission** means the fingerprint buys you input validation and nothing else: re-sending under

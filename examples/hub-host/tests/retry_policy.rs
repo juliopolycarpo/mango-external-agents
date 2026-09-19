@@ -2,13 +2,21 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use hub_host::testing::{FakeHubApi, FakeVendorSession, HubCallKind, ScriptedJitter};
-use hub_host::{Commit, RetryHint, RetryPolicy, Settled, Stop, WaitOutcome};
+use hub_host::testing::{
+    FakeHubApi, FakeVendorSession, HubCallKind, ReserveAnswer, ScriptedJitter,
+};
+use hub_host::{
+    Commit, HubApi, HubError, HubReceipt, Reconciliation, RetryHint, RetryPolicy, Settled, Stop,
+    Supervisor, WaitOutcome,
+};
 use mango_external_agents::testing::FrozenClock;
-use mango_external_agents::{CancelReason, Clock, TurnRequest};
+use mango_external_agents::{
+    CancelReason, Clock, OperationRef, RequestFingerprint, SystemClock, TerminalStatus, TurnRequest,
+};
+use tokio::time::Instant;
 
 const BASE: Duration = Duration::from_secs(1);
 const CAP: Duration = Duration::from_secs(8);
@@ -72,9 +80,15 @@ fn policy_with_maximum_jitter_first_delay() -> Duration {
     policy(ScriptedJitter::maximum()).delay_for(1, None)
 }
 
-/// A Hub knows when it will answer and the host does not, so the hint wins — up to the cap.
+/// A Hub knows when it will answer and the host does not, so the hint wins — between the two bounds.
+///
+/// The hint is clamped above by the cap and below by the host's own backoff. A hint of zero is not
+/// a request to retry immediately: it is what an *expired* hint resolves to, and every hint the
+/// supervisor passes here has already been resolved against the host's clock. Honouring it
+/// literally is how a host that is being rate limited hammers the Hub at full rate, so the
+/// exponential is the floor and the Hub only gets to ask for a *longer* wait than the host chose.
 #[test]
-fn a_hub_hint_replaces_the_computed_delay_and_is_still_clamped() {
+fn a_hub_hint_replaces_the_computed_delay_between_the_cap_and_the_backoff() {
     let policy = policy(ScriptedJitter::maximum());
 
     assert_eq!(
@@ -89,8 +103,44 @@ fn a_hub_hint_replaces_the_computed_delay_and_is_still_clamped() {
     );
     assert_eq!(
         policy.delay_for(1, Some(Duration::ZERO)),
-        Duration::ZERO,
-        "expected a hint of zero to be honoured rather than replaced by the backoff"
+        BASE,
+        "expected an expired hint to leave the host's own backoff standing, not to erase it"
+    );
+}
+
+/// An expired hint, repeated, must still grow the wait — or the host spins at full rate.
+///
+/// A Hub that keeps answering with a `not_before` already in the past resolves to
+/// [`Duration::ZERO`] every time. Without the floor the whole capped-exponential computation is
+/// discarded on every failure and the sequence is a flat zero, which is a hot loop against a Hub
+/// that has just said it is overloaded.
+#[test]
+fn a_hint_that_has_already_expired_never_shortens_the_backoff() {
+    let policy = policy(ScriptedJitter::maximum());
+    let expired: Vec<Duration> = (1..=10)
+        .map(|failure| policy.delay_for(failure, Some(Duration::ZERO)))
+        .collect();
+    let unhinted: Vec<Duration> = (1..=10)
+        .map(|failure| policy.delay_for(failure, None))
+        .collect();
+
+    assert_eq!(
+        expired, unhinted,
+        "expected an expired hint to leave the computed sequence untouched, received {expired:?}"
+    );
+    assert!(
+        expired.windows(2).all(|pair| pair[0] <= pair[1]),
+        "expected a non-decreasing sequence, received {expired:?}"
+    );
+    assert_eq!(
+        expired[0], BASE,
+        "expected the first expired-hint delay to be the base of {BASE:?}, received {:?}",
+        expired[0]
+    );
+    assert_eq!(
+        expired[9], CAP,
+        "expected the tenth expired-hint delay to sit at the cap of {CAP:?}, received {:?}",
+        expired[9]
     );
 }
 
@@ -189,5 +239,134 @@ async fn many_recoverable_failures_never_become_a_terminal_outcome() {
         session.start_count(),
         1,
         "expected the vendor work to run exactly once, after the hub finally accepted it"
+    );
+}
+
+/// A [`HubApi`] that stamps when each submission arrived and otherwise defers to a [`FakeHubApi`].
+///
+/// The gap between one submission and the next *is* the backoff the supervisor waited out. It is
+/// the only way to see the delays a loop nobody can step through actually took, and it is what
+/// separates "the policy computes a growing sequence" from "the supervisor waits it out".
+struct TimingHubApi {
+    inner: Arc<FakeHubApi>,
+    submissions: Mutex<Vec<Instant>>,
+}
+
+impl TimingHubApi {
+    fn new(inner: Arc<FakeHubApi>) -> Self {
+        Self {
+            inner,
+            submissions: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// How long the supervisor waited between each pair of consecutive submissions.
+    fn gaps(&self) -> Vec<Duration> {
+        let submissions = self
+            .submissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        submissions
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl HubApi for TimingHubApi {
+    async fn reserve(
+        &self,
+        operation: &OperationRef,
+        fingerprint: &RequestFingerprint,
+    ) -> Result<HubReceipt, HubError> {
+        self.submissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Instant::now());
+        self.inner.reserve(operation, fingerprint).await
+    }
+
+    async fn reconcile(&self, operation: &OperationRef) -> Result<Reconciliation, HubError> {
+        self.inner.reconcile(operation).await
+    }
+
+    async fn commit(
+        &self,
+        operation: &OperationRef,
+        terminal: &TerminalStatus,
+    ) -> Result<Commit, HubError> {
+        self.inner.commit(operation, terminal).await
+    }
+}
+
+/// The delays this policy produces for the first eight failures, with jitter at the top of its band.
+const EXPECTED_GAPS: [Duration; 8] = [
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+    Duration::from_millis(80),
+    Duration::from_millis(80),
+    Duration::from_millis(80),
+    Duration::from_millis(80),
+    Duration::from_millis(80),
+];
+
+/// A Hub echoing a `Retry-After` that has already elapsed must not be hammered at full rate.
+///
+/// Eight recoverable failures in a row, each carrying a `not_before` in the past. Every one of them
+/// resolves to [`Duration::ZERO`] against the host's clock, so a policy that honours a hint
+/// literally waits nothing at all, eight times over, against a Hub that has just said it is
+/// overloaded. The evidence is the gap between consecutive submissions under a paused clock: the
+/// capped-exponential sequence, not a flat zero.
+#[tokio::test(start_paused = true)]
+async fn an_expired_hub_hint_does_not_collapse_the_backoff_to_a_spin() {
+    let elapsed_hint = RetryHint::not_before(SystemTime::UNIX_EPOCH);
+    let failures = (0..8).map(|attempt| {
+        ReserveAnswer::Fail(
+            HubError::recoverable(format!("rate limited {attempt}")).with_hint(elapsed_hint),
+        )
+    });
+    let hub = Arc::new(TimingHubApi::new(Arc::new(
+        FakeHubApi::new().reserving(failures),
+    )));
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = Supervisor::new(
+        Box::new(session.clone()),
+        Arc::clone(&hub) as Arc<dyn HubApi>,
+        common::policy(),
+        stop,
+        Arc::new(SystemClock),
+    );
+
+    let started = Instant::now();
+    let settled = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the operation to settle");
+    let total = started.elapsed();
+
+    assert_eq!(
+        settled,
+        Settled::Committed {
+            terminal: common::COMPLETED,
+            commit: Commit::Recorded,
+        }
+    );
+    let gaps = hub.gaps();
+    assert_eq!(
+        gaps,
+        EXPECTED_GAPS.to_vec(),
+        "expected the capped-exponential sequence between submissions, received {gaps:?}"
+    );
+    assert!(
+        gaps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "expected a non-decreasing sequence of waits, received {gaps:?}"
+    );
+    assert_eq!(
+        total,
+        EXPECTED_GAPS.iter().sum::<Duration>(),
+        "expected the run to have waited out every backoff, received {total:?}"
     );
 }

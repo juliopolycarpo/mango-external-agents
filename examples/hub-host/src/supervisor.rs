@@ -535,7 +535,9 @@ impl Supervisor {
     ) -> Option<CancelReason> {
         progress.failures = progress.failures.saturating_add(1);
         // Resolved against the host's clock now rather than when it arrived: a hint that named an
-        // instant two minutes ago is a hint that has already been honoured.
+        // instant two minutes ago has nothing left to ask for and resolves to zero. Zero is not a
+        // licence to retry immediately — `delay_for` floors it with this policy's own backoff, or
+        // a Hub echoing an elapsed `Retry-After` would be hammered at full rate.
         let remaining = hint.map(|hint| hint.remaining(self.clock.now()));
         let delay = self.policy.delay_for(progress.failures, remaining);
         match self.policy.wait(delay, &self.stop).await {
