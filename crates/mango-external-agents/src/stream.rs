@@ -398,6 +398,63 @@ mod tests {
     use crate::operation::{AttemptId, Dispatch};
     use crate::session::CancelReason;
     use std::sync::Arc;
+
+    /// Nothing reaches a host after a turn's terminal, and the reason is structural.
+    ///
+    /// The conformance suite has a check for this, and until this test existed there was nothing
+    /// saying *why* that check has never fired. It is not that a late event is rare: an
+    /// [`EventReceiver`] can only be built by an [`EventSink`], `Buffer::push` refuses once
+    /// `finish` has set the status under the same lock, and `try_recv` empties the payload queue
+    /// before it hands out the reserved terminal. A publisher that is late is refused, not
+    /// queued — so the suite's drain has nothing to find however long it waits.
+    ///
+    /// Pinned here because the invariant is what lets a host stop its relay task on the terminal.
+    /// A `Buffer` that ever queued past `finish` would leave that host dropping events it was
+    /// entitled to see, and this is the test that would say so.
+    #[tokio::test]
+    async fn an_event_published_after_the_terminal_is_refused_and_the_stream_ends() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let (sink, mut events) = EventSink::new(
+            SessionId::new("session-1"),
+            TurnId::new("turn-1"),
+            AttemptId::FIRST,
+            Arc::clone(&clock),
+            16,
+        );
+
+        sink.complete()
+            .await
+            .expect("expected the terminal to commit");
+
+        let late = sink
+            .emit(EventKind::TextDelta {
+                text: String::from("after the terminal"),
+            })
+            .await;
+        assert!(
+            matches!(
+                late,
+                Err(Error::Closed {
+                    subject: "turn stream"
+                })
+            ),
+            "expected a post-terminal publication to be refused as a closed stream, received {late:?}"
+        );
+
+        let terminal = events.recv().await;
+        assert!(
+            matches!(
+                terminal.as_ref().map(|event| &event.kind),
+                Some(EventKind::Completed)
+            ),
+            "expected the reserved terminal, received {terminal:?}"
+        );
+        let after = events.recv().await;
+        assert!(
+            after.is_none(),
+            "expected the stream to end at its terminal, received {after:?}"
+        );
+    }
     use std::time::{Duration, SystemTime};
 
     #[tokio::test]

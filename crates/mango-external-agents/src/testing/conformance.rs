@@ -882,9 +882,17 @@ fn refuses_as_unsupported<T>(outcome: &crate::error::Result<T>, capability: Capa
 
 /// Whatever is already sitting behind the terminal, without waiting for more.
 ///
-/// Breaking at the terminal and stopping there is what made "nothing follows the terminal" a check
-/// that cannot fail: the loop never looks. An event already queued behind it is a turn that ended
-/// twice, or that kept talking afterwards, and it is exactly what a host would see.
+/// Not waiting is deliberate, and the reason is not the one an earlier comment here gave. The
+/// ordering is a **structural** invariant rather than a timing one: an [`EventReceiver`] can only
+/// be built by [`EventSink`], `Buffer::push` refuses once `finish` has set the status under the
+/// same lock, and `try_recv` empties the payload queue before it hands out the reserved terminal.
+/// So there is nothing a longer wait could surface — a late publisher is refused at the sink, not
+/// merely late. See `stream::tests::an_event_published_after_the_terminal_is_refused_and_the_stream_ends`,
+/// which pins that.
+///
+/// The drain stays because this is a public suite judging a `dyn Harness`, and because the sibling
+/// half of [`terminal_outcome`] — "exactly one terminal" — is not structural at all: a harness that
+/// drops its sink without committing one produces zero, and that is caught here.
 fn drain_queued(turn: &mut crate::stream::TurnStream, events: &mut Vec<AgentEvent>) {
     while let Ok(event) = turn.try_recv() {
         events.push(event);
