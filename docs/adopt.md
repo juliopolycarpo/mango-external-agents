@@ -222,7 +222,11 @@ after:
 - **A receipt.** Write the logical turn id, the attempt, the fingerprint and `AcceptanceUnknown`
   to your own storage *before* the side-effecting submission. A receipt written afterwards is a
   receipt you do not have when the process dies mid-call, and the operation you cannot account for
-  is exactly the one you were trying to protect.
+  is exactly the one you were trying to protect. The cost of writing first is an announced attempt
+  that then never dispatches: when `Dispatch::NotSubmitted` proves it never left, release it — and
+  if your control plane cannot be told, make sure it expires such an attempt on its own. Nothing
+  will ever commit a terminal for it, and a control plane that keeps reporting it as in flight
+  parks the next process to read that record on work nobody is doing.
 - **An event cursor.** Your supervisor owns the `TurnStream`; a browser owns a subscription to
   your own fan-out. Persist how far you have relayed, so a reconnecting client resumes rather than
   replaying, and so a disconnect is a detach rather than an abandonment.

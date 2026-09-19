@@ -446,16 +446,16 @@ impl Supervisor {
     /// });
     /// ```
     pub async fn run(&mut self, request: TurnRequest) -> Result<Settled> {
+        let stop = RunStop {
+            shutdown: Arc::clone(&self.inner.stop),
+            turn: self.abort_signal(&request.turn_id),
+        };
         // The record is reached through the map for the whole run and never moved out of it. A
         // `run` future can be dropped at any await inside `drive` — a caller's deadline, a losing
         // `select!` arm, a cancelled request handler — and a record living on this stack frame
         // would be destroyed with it. The next run would then build a fresh one, dispatch a second
         // time under the same logical id, and reserve it with an attempt the Hub cannot tell from
         // the first.
-        let stop = RunStop {
-            shutdown: Arc::clone(&self.inner.stop),
-            turn: self.abort_signal(&request.turn_id),
-        };
         let turn = match self.records.entry(request.turn_id.clone()) {
             // Validated through the entry rather than after a removal: a refused reuse must not
             // also lose the record that refused it, or the next identical retry would start a
@@ -596,9 +596,24 @@ impl SupervisorInner {
             // The library's own certainty is native proof: a failure carrying
             // `Dispatch::NotSubmitted` says the request never left, which is exactly what
             // `reconcile_not_submitted` asks for.
+            //
+            // It proves absence at the *vendor*, though, and the reservation is at the Hub. The
+            // record is about to advance to a strictly newer attempt, so without the withdrawal
+            // this one becomes an orphan: a reservation nothing will ever commit a terminal for,
+            // that the Hub answers `Accepted` about to whoever asks. The withdrawal is safe here
+            // and nowhere else, because this is the one failure that proves nothing is running
+            // under the attempt being released.
             Ok(Err(error)) if error.dispatch().is_safe_to_replay() => {
+                // A withdrawal this host cannot deliver is not a reason to stall an operation it
+                // has already proved did not run, and there is no record state for "still owes
+                // the Hub a withdrawal" to retry it from. So the hint is carried into the backoff
+                // and the orphan falls back to the Hub's expiry, which `HubApi::reserve` says is
+                // the Hub's half of this bargain.
+                let withdrawn = self.bounded(self.hub.withdraw(&operation)).await;
                 record.reconcile_not_submitted(&operation)?;
-                Ok(Step::Backoff(None))
+                Ok(Step::Backoff(
+                    withdrawn.err().and_then(|error| error.retry_hint()),
+                ))
             }
             // Everything else — an uncertain failure or a deadline — leaves `AcceptanceUnknown`,
             // so the next turn of the loop reconciles instead of replaying.

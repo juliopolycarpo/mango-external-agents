@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use hub_host::testing::{
     CommitAnswer, FakeHubApi, FakeVendorSession, HubCallKind, ReconcileAnswer, ReserveAnswer,
-    TurnAnswer,
+    TurnAnswer, WithdrawAnswer,
 };
 use hub_host::{Commit, HubError, HubStatus, Reconciliation, Settled, Stop};
 use mango_external_agents::{
@@ -184,10 +184,12 @@ async fn an_operation_a_hub_cannot_reconcile_surfaces_as_uncertain() {
     );
 }
 
-/// The library's own dispatch certainty is native proof, so no Hub query is needed.
+/// The library's own dispatch certainty is native proof, so no Hub *query* is needed.
 ///
 /// A refusal carrying `Dispatch::NotSubmitted` says the request never left this host. That is the
-/// one case where a newer attempt is safe without asking anybody.
+/// one case where a newer attempt is safe without asking anybody — but the reservation this
+/// attempt already took is still at the Hub, so it is withdrawn rather than left behind. Nothing
+/// in the sequence is a reconciliation: the host is telling the Hub something, not asking it.
 #[tokio::test(start_paused = true)]
 async fn a_failure_that_never_left_the_host_needs_no_hub_query_to_retry() {
     let hub = Arc::new(FakeHubApi::new());
@@ -211,6 +213,7 @@ async fn a_failure_that_never_left_the_host_needs_no_hub_query_to_retry() {
         hub.sequence(),
         vec![
             HubCallKind::Reserve,
+            HubCallKind::Withdraw,
             HubCallKind::Reserve,
             HubCallKind::Commit,
         ],
@@ -220,6 +223,90 @@ async fn a_failure_that_never_left_the_host_needs_no_hub_query_to_retry() {
         session.start_count(),
         1,
         "expected the refused dispatch not to count as vendor work"
+    );
+}
+
+/// A reservation whose dispatch never happened is withdrawn, not left for the Hub to hold.
+///
+/// Reserving is the side-effecting submission here, so it happens before the vendor is asked —
+/// which means a successful reservation can be followed by a dispatch that provably never left.
+/// The record advances to a newer attempt, and the Hub is left holding a reservation for an
+/// attempt that can never produce a terminal. It answers `Accepted` about that reservation to
+/// anyone who asks, so a supervisor resuming the operation from durable storage waits on work
+/// nobody is doing, forever.
+#[tokio::test(start_paused = true)]
+async fn a_reservation_whose_dispatch_never_happened_is_withdrawn() {
+    let hub = Arc::new(FakeHubApi::new());
+    let session = FakeVendorSession::new().answering([TurnAnswer::NotSubmitted]);
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+
+    let settled = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the operation to settle");
+
+    assert_eq!(
+        settled,
+        Settled::Committed {
+            terminal: common::COMPLETED,
+            commit: Commit::Recorded,
+        }
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Withdraw),
+        vec![AttemptId::FIRST],
+        "expected the attempt that never dispatched to be withdrawn, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        hub.held_reservations(),
+        vec![AttemptId::new(2)],
+        "expected only the attempt that actually ran to still be reserved"
+    );
+}
+
+/// A withdrawal the Hub will not take falls back to the Hub's own expiry, and stalls nothing.
+///
+/// The host has already proved the attempt did not run, so it is not going to sit still over a
+/// bookkeeping call it cannot deliver. It backs off, takes a strictly newer attempt, and leaves
+/// the orphan where `HubApi::reserve` says it belongs: with the Hub.
+#[tokio::test(start_paused = true)]
+async fn a_withdrawal_the_hub_will_not_take_still_lets_the_next_attempt_through() {
+    let hub = Arc::new(FakeHubApi::new().withdrawing([WithdrawAnswer::Fail(
+        HubError::recoverable("gateway timeout"),
+    )]));
+    let session = FakeVendorSession::new().answering([TurnAnswer::NotSubmitted]);
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+
+    let settled = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the operation to settle");
+
+    assert_eq!(
+        settled,
+        Settled::Committed {
+            terminal: common::COMPLETED,
+            commit: Commit::Recorded,
+        }
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Withdraw),
+        vec![AttemptId::FIRST],
+        "expected the withdrawal to be attempted once, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Reserve),
+        vec![AttemptId::FIRST, AttemptId::new(2)],
+        "expected a failed withdrawal not to stop the newer attempt"
+    );
+    assert_eq!(
+        hub.held_reservations(),
+        vec![AttemptId::FIRST, AttemptId::new(2)],
+        "expected the reservation the hub would not release to be left for the hub to expire"
     );
 }
 

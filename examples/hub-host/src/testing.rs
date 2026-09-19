@@ -84,6 +84,8 @@ impl Jitter for ScriptedJitter {
 pub enum HubCallKind {
     /// [`HubApi::reserve`].
     Reserve,
+    /// [`HubApi::withdraw`].
+    Withdraw,
     /// [`HubApi::reconcile`].
     Reconcile,
     /// [`HubApi::commit`].
@@ -112,6 +114,18 @@ pub enum ReserveAnswer {
     /// submission — the case a host that reads "error" as "it did not happen" duplicates.
     AcceptThenDropAcknowledgement,
     /// Fail without recording anything.
+    Fail(HubError),
+}
+
+/// One scripted answer to [`HubApi::withdraw`].
+#[derive(Clone, Debug)]
+pub enum WithdrawAnswer {
+    /// Release the reservation this attempt took.
+    Release,
+    /// Fail the call, leaving the reservation exactly where it was.
+    ///
+    /// The case that decides what the host owes a Hub it cannot reach: the attempt is proven not
+    /// to have run, and the reservation for it is still there.
     Fail(HubError),
 }
 
@@ -147,10 +161,23 @@ pub enum CommitAnswer {
 /// The logical identity a Hub is idempotent over: a session and a turn, never an attempt.
 type LogicalId = (SessionId, TurnId);
 
+/// Reservations per attempt, terminals per logical operation — the split the port documents.
+///
+/// A reservation belongs to the attempt that took it, so withdrawing one leaves any other alone.
+/// A terminal belongs to the logical operation, so committing one twice is the same commit.
 #[derive(Default)]
 struct HubLedger {
-    reserved: HashSet<LogicalId>,
+    reserved: HashSet<OperationRef>,
     committed: HashMap<LogicalId, TerminalStatus>,
+}
+
+impl HubLedger {
+    /// Whether any attempt of this logical operation is still reserved.
+    fn holds_any(&self, id: &LogicalId) -> bool {
+        self.reserved
+            .iter()
+            .any(|operation| &logical(operation) == id)
+    }
 }
 
 /// A [`HubApi`] that answers from a script and remembers every call.
@@ -166,6 +193,7 @@ struct HubLedger {
 #[derive(Default)]
 pub struct FakeHubApi {
     reserve: Mutex<VecDeque<ReserveAnswer>>,
+    withdraw: Mutex<VecDeque<WithdrawAnswer>>,
     reconcile: Mutex<VecDeque<ReconcileAnswer>>,
     commit: Mutex<VecDeque<CommitAnswer>>,
     calls: Mutex<Vec<HubCall>>,
@@ -234,6 +262,50 @@ impl FakeHubApi {
         let failures = (0..count)
             .map(|attempt| ReserveAnswer::Fail(HubError::recoverable(format!("reset {attempt}"))));
         self.reserving(failures)
+    }
+
+    /// Scripts the next withdrawals, in order. Later calls release the reservation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::HubError;
+    /// use hub_host::testing::{FakeHubApi, WithdrawAnswer};
+    ///
+    /// let hub = FakeHubApi::new()
+    ///     .withdrawing([WithdrawAnswer::Fail(HubError::recoverable("gateway timeout"))]);
+    /// assert!(hub.calls().is_empty());
+    /// ```
+    #[must_use]
+    pub fn withdrawing(self, answers: impl IntoIterator<Item = WithdrawAnswer>) -> Self {
+        self.withdraw
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(answers);
+        self
+    }
+
+    /// The attempts this Hub is still holding a reservation for, in generation order.
+    ///
+    /// What says whether a reservation was orphaned: an attempt that never dispatched and was
+    /// never withdrawn sits here forever, and the Hub answers `Accepted` about it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::FakeHubApi;
+    ///
+    /// assert!(FakeHubApi::new().held_reservations().is_empty());
+    /// ```
+    pub fn held_reservations(&self) -> Vec<AttemptId> {
+        let ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut attempts: Vec<AttemptId> = ledger
+            .reserved
+            .iter()
+            .map(|operation| operation.attempt)
+            .collect();
+        attempts.sort_unstable();
+        attempts
     }
 
     /// Scripts the next reconciliations, in order. Later calls answer from the Hub's record.
@@ -401,7 +473,7 @@ impl HubApi for FakeHubApi {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .reserved
-                    .insert(logical(operation));
+                    .insert(operation.clone());
                 Ok(self.next_receipt())
             }
             // Recorded first, reported as a failure second. That order is the bug this fake
@@ -411,12 +483,31 @@ impl HubApi for FakeHubApi {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .reserved
-                    .insert(logical(operation));
+                    .insert(operation.clone());
                 Err(HubError::recoverable(
                     "expected an acknowledgement, received a closed connection",
                 ))
             }
         }
+    }
+
+    async fn withdraw(&self, operation: &OperationRef) -> std::result::Result<(), HubError> {
+        self.record(HubCallKind::Withdraw, operation, None);
+        let answer = self
+            .withdraw
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(WithdrawAnswer::Release);
+        if let WithdrawAnswer::Fail(error) = answer {
+            return Err(error);
+        }
+        self.ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reserved
+            .remove(operation);
+        Ok(())
     }
 
     async fn reconcile(
@@ -441,7 +532,7 @@ impl HubApi for FakeHubApi {
                         terminal: terminal.clone(),
                     }));
                 }
-                Ok(Reconciliation::Answered(if ledger.reserved.contains(&id) {
+                Ok(Reconciliation::Answered(if ledger.holds_any(&id) {
                     HubStatus::Accepted
                 } else {
                     HubStatus::NeverArrived

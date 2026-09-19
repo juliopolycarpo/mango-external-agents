@@ -56,6 +56,10 @@ pub enum HubStatus {
     /// [`RecoveryRecord::reconcile_not_submitted`](mango_external_agents::RecoveryRecord::reconcile_not_submitted).
     NeverArrived,
     /// The Hub accepted a submission and the work has not ended yet.
+    ///
+    /// Read as "some attempt of this operation is outstanding". A Hub that keeps answering it for
+    /// a reservation whose dispatch never happened — see [`HubApi::withdraw`] — parks a host on
+    /// work nobody is doing, because nothing will ever commit a terminal for it.
     Accepted,
     /// The Hub already holds this operation's terminal outcome.
     Committed {
@@ -296,6 +300,16 @@ pub trait HubApi: Send + Sync {
     /// the same way [`RecoveryRecord::validate`](mango_external_agents::RecoveryRecord::validate)
     /// does in memory.
     ///
+    /// **A reservation is per attempt, and it is not proof that the vendor ran.** Reserving is the
+    /// side-effecting submission in a Hub-owned model, so it happens first — which means a host
+    /// can reserve successfully and then fail to dispatch. When the library proves that failure
+    /// never left the host, this one calls [`HubApi::withdraw`] and takes a strictly newer
+    /// attempt. If the withdrawal cannot be delivered, the reservation is **the Hub's to expire**:
+    /// nothing else will ever produce a terminal for it, and a Hub that answers
+    /// [`HubStatus::Accepted`] for it forever will park a supervisor resuming that logical
+    /// operation from durable storage on work nobody is doing. Implementing this port is agreeing
+    /// to one of the two — take the withdrawal, or expire what it would have withdrawn.
+    ///
     /// # Errors
     ///
     /// [`HubError::Recoverable`] when the call may be repeated, [`HubError::Refused`] when the Hub
@@ -305,6 +319,25 @@ pub trait HubApi: Send + Sync {
         operation: &OperationRef,
         fingerprint: &RequestFingerprint,
     ) -> Result<HubReceipt, HubError>;
+
+    /// Releases a reservation whose vendor dispatch never happened.
+    ///
+    /// Per attempt, like [`HubApi::reserve`], and only ever called with the library's own proof of
+    /// absence — a dispatch failure carrying
+    /// [`Dispatch::NotSubmitted`](mango_external_agents::Dispatch::NotSubmitted). Nothing can be
+    /// running at the vendor under a withdrawn attempt, which is what makes this safe where a
+    /// timeout or a lost acknowledgement would not be.
+    ///
+    /// Withdrawing keeps the Hub's view of the operation and the host's the same. Without it the
+    /// Hub keeps a reservation that can never produce a terminal, and answers "accepted" about it
+    /// to anyone who asks.
+    ///
+    /// # Errors
+    ///
+    /// [`HubError::Recoverable`] or [`HubError::Refused`]. The supervisor takes neither as a
+    /// reason to stop: it has already proved the attempt did not run, so it backs off and
+    /// dispatches a newer one, and the reservation falls back to the Hub's own expiry.
+    async fn withdraw(&self, operation: &OperationRef) -> Result<(), HubError>;
 
     /// Asks what the Hub knows about the logical operation `operation` belongs to.
     ///

@@ -287,6 +287,10 @@ impl HubApi for TimingHubApi {
         self.inner.reserve(operation, fingerprint).await
     }
 
+    async fn withdraw(&self, operation: &OperationRef) -> Result<(), HubError> {
+        self.inner.withdraw(operation).await
+    }
+
     async fn reconcile(&self, operation: &OperationRef) -> Result<Reconciliation, HubError> {
         self.inner.reconcile(operation).await
     }
