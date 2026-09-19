@@ -3733,8 +3733,21 @@ mod tests {
         shared: &Shared,
         native_turn_id: &str,
     ) -> (TurnId, mango_external_agents::stream::TurnStream) {
+        running_as(
+            shared,
+            native_turn_id,
+            mango_external_agents::operation::AttemptId::default(),
+        )
+        .await
+    }
+
+    /// The same, for a named dispatch of that turn: what a host's retry installs in the slot.
+    async fn running_as(
+        shared: &Shared,
+        native_turn_id: &str,
+        attempt: mango_external_agents::operation::AttemptId,
+    ) -> (TurnId, mango_external_agents::stream::TurnStream) {
         let turn_id = TurnId::new("turn-1");
-        let attempt = mango_external_agents::operation::AttemptId::default();
         let (sink, events) = EventSink::new(
             mango_external_agents::SessionId::new("chat-1"),
             turn_id.clone(),
@@ -4456,6 +4469,85 @@ mod tests {
             ),
             "expected the accepted answer to remain the host-visible outcome, received {resolved:?}"
         );
+    }
+
+    /// An answer naming a dispatch the host has already replaced cannot mutate its replacement.
+    ///
+    /// The round is announced while attempt 1 owns the turn; attempt 2 then takes the slot, which
+    /// is what a host retrying the same logical turn installs. The answer still names attempt 1's
+    /// round, and applying it there would settle a round on behalf of the attempt that replaced
+    /// it — the round the host is actually being shown.
+    #[tokio::test]
+    async fn an_answer_naming_a_superseded_attempt_is_refused() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+
+        let request_shared = Arc::clone(&shared);
+        let request = tokio::spawn(async move {
+            CodexHandler {
+                shared: request_shared,
+            }
+            .on_request(
+                String::from("item/tool/requestUserInput"),
+                serde_json::json!({
+                    "threadId": "thread-1", "turnId": "vendor-turn-1", "itemId": "ask-1",
+                    "isBlocking": false,
+                    "questions": [{"id": "note", "header": "Note", "question": "Anything else?"}],
+                }),
+                mango_external_agents::jsonrpc::RequestId::new(serde_json::json!(1)),
+            )
+            .await
+        });
+        let asked = stream.recv().await.expect("expected an announced question");
+        assert!(matches!(asked.kind, EventKind::QuestionAsked { .. }));
+
+        let (_turn_id, _replacement) = running_as(
+            &shared,
+            "vendor-turn-2",
+            mango_external_agents::operation::AttemptId::new(2),
+        )
+        .await;
+
+        let session = question_session(Arc::clone(&shared)).await;
+        let error = session
+            .answer(mango_external_agents::QuestionResponse::new(
+                mango_external_agents::InteractionId::new("ask-1"),
+                vec![mango_external_agents::Answer::new(
+                    mango_external_agents::QuestionId::new("note"),
+                    mango_external_agents::AnswerValue::text("answering the attempt that is gone"),
+                )],
+            ))
+            .await
+            .expect_err("expected the superseded round's answer to be refused");
+        assert!(
+            matches!(
+                error.cause(),
+                mango_external_agents::Error::Protocol { received, .. }
+                    if received == "an answer naming a superseded attempt"
+            ),
+            "expected a refusal naming the superseded attempt, received {error:?}"
+        );
+
+        let pending = shared.pending_questions.lock().await;
+        let entry = pending
+            .get(&mango_external_agents::InteractionId::new("ask-1"))
+            .expect("expected the refused round to survive untouched");
+        assert!(
+            entry.answer.is_some(),
+            "expected the refused answer not to consume the round's waiter"
+        );
+        assert!(
+            entry.settlement.is_none(),
+            "expected the refused answer not to settle the round, received {:?}",
+            entry.settlement
+        );
+        drop(pending);
+
+        shared
+            .release_pending_for(None, mango_external_agents::DecisionSource::Cancelled)
+            .await;
+        let _ = request.await.expect("expected the question task to finish");
     }
 
     /// A terminal cannot overtake the resolution of an answer [`Session::answer`] accepted.
