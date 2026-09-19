@@ -437,6 +437,13 @@ impl FileChange {
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ActivityContent {
+    /// Removes structured content from an activity that already has it.
+    ///
+    /// A started activity with no content uses `None`. In an [`ActivityUpdate`](crate::ActivityUpdate),
+    /// this marker tells a host to clear content retained from an earlier event. In an
+    /// [`ActivityResult`](crate::ActivityResult), it preserves that the vendor explicitly replaced
+    /// its terminal content collection with an empty one.
+    Empty,
     /// A plan, with steps that carry their own state.
     Plan {
         /// The steps, in the vendor's own order.
@@ -458,6 +465,7 @@ impl fmt::Debug for ActivityContent {
     /// Reports activity content shape without replaying vendor payloads.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Empty => formatter.write_str("Empty"),
             Self::Plan { steps } => formatter
                 .debug_struct("Plan")
                 .field("step_count", &steps.len())
@@ -488,6 +496,7 @@ impl ActivityContent {
     #[must_use]
     pub fn normalized_with_truncation(self) -> (Self, bool) {
         match self {
+            Self::Empty => (Self::Empty, false),
             Self::Plan { steps } => {
                 let dropped = steps.len() > PLAN_MAX_STEPS;
                 let mut truncated = dropped;
@@ -775,6 +784,7 @@ mod tests {
     #[test]
     fn content_round_trips_through_serialization_under_its_own_tag() {
         for content in [
+            ActivityContent::Empty,
             ActivityContent::Plan {
                 steps: vec![PlanStep::new("one")],
             },
@@ -792,6 +802,15 @@ mod tests {
                 content
             );
         }
+    }
+
+    /// `Empty` is an instruction rather than vendor text, so normalisation preserves it whole.
+    #[test]
+    fn empty_content_normalizes_without_claiming_a_truncation() {
+        assert_eq!(
+            ActivityContent::Empty.normalized_with_truncation(),
+            (ActivityContent::Empty, false)
+        );
     }
 
     #[test]

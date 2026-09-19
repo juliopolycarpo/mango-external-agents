@@ -712,7 +712,8 @@ pub struct ActivityUpdate {
     ///
     /// The field that makes a revised plan a plan again. Without it the second announcement of a
     /// checklist could only arrive as a new title, and a host that rendered steps the first time
-    /// would have to re-parse a sentence to keep them.
+    /// would have to re-parse a sentence to keep them. `None` leaves the existing content in
+    /// place; `Some(ActivityContent::Empty)` clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<ActivityContent>,
     /// True when any field above was cut to fit its bound.
@@ -779,6 +780,9 @@ impl ActivityUpdate {
     }
 
     /// Replaces the structured thing it produced, when there is one.
+    ///
+    /// `None` leaves existing content in place. Use [`ActivityContent::Empty`] through
+    /// [`Self::with_content`] when an update explicitly clears it.
     #[must_use]
     pub fn with_optional_content(mut self, content: Option<ActivityContent>) -> Self {
         self.content = content;
@@ -1672,6 +1676,18 @@ mod tests {
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].status, PlanStepStatus::Completed);
         assert_eq!(steps[1].status, PlanStepStatus::Pending);
+    }
+
+    /// An empty marker is a content replacement, unlike an omitted `content` field, so a reducer
+    /// can remove a diff or output an earlier event announced.
+    #[test]
+    fn an_update_with_empty_content_clears_what_a_host_retained() {
+        let update = ActivityUpdate::new()
+            .with_content(ActivityContent::Empty)
+            .normalized();
+
+        assert!(!update.is_empty(), "an explicit clear must reach the host");
+        assert_eq!(update.content, Some(ActivityContent::Empty));
     }
 
     /// A tool result is where most vendors say what they actually did. Carrying it only as

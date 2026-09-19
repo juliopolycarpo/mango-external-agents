@@ -314,8 +314,18 @@ fn tool_call(call: ToolCall) -> Vec<EventKind> {
 fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
     let call_id = update.tool_call_id.to_string();
     let fields = update.fields;
-    let detail = fields.content.as_deref().and_then(content_detail);
-    let content = fields.content.as_deref().and_then(tool_call_content);
+    // ACP replaces this complete collection. Its absence must therefore leave the activity alone,
+    // while an explicit empty (or one carrying no shape this crate renders) clears the content a
+    // host retained from the earlier call. `detail` is derived from that same collection, so it is
+    // explicitly empty too instead of leaving an old diff path or output line visible.
+    let detail = fields
+        .content
+        .as_deref()
+        .map(|content| content_detail(content).unwrap_or_default());
+    let content = fields
+        .content
+        .as_deref()
+        .map(|content| tool_call_content(content).unwrap_or(ActivityContent::Empty));
     // `locations` on an update is left uncarried: unlike `Activity`, `ActivityUpdate` has no
     // extensions slot to put a count in, and `raw_input`/`raw_output` never go anywhere — both are
     // unbounded vendor payloads this library forbids carrying.
@@ -994,6 +1004,90 @@ mod tests {
             );
         };
         assert_eq!(files[0].path, "/repo/src/lib.rs");
+    }
+
+    /// ACP replaces a tool call's complete content collection. An empty replacement must therefore
+    /// reach the host instead of being mistaken for an omitted `content` field, which retains what
+    /// the host already rendered.
+    #[test]
+    fn an_empty_tool_call_content_replacement_clears_the_activity() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_clear",
+                "title": "Edit",
+                "kind": "edit",
+                "status": "in_progress",
+                "content": [{
+                    "type": "diff",
+                    "path": "/repo/src/lib.rs",
+                    "newText": "fn main() {}"
+                }]
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_clear",
+                "content": []
+            }),
+        ]);
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.last() else {
+            panic!("expected an activity update that clears content, received {events:?}");
+        };
+        assert!(
+            update.content == Some(ActivityContent::Empty),
+            "expected an explicit content clear, received {update:?}"
+        );
+        assert_eq!(update.detail.as_deref(), Some(""));
+    }
+
+    /// `content` being absent is ACP leaving that collection unchanged. A later title update must
+    /// therefore carry neither an empty marker nor an empty detail that a host would read as a
+    /// replacement of the earlier diff.
+    #[test]
+    fn an_omitted_tool_call_content_update_retains_the_earlier_content() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_retain",
+                "title": "Edit",
+                "kind": "edit",
+                "status": "in_progress",
+                "content": [{
+                    "type": "diff",
+                    "path": "/repo/src/lib.rs",
+                    "newText": "fn main() {}"
+                }]
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_retain",
+                "title": "Editing src/lib.rs"
+            }),
+        ]);
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.last() else {
+            panic!("expected a title update that retains content, received {events:?}");
+        };
+        assert_eq!(update.title.as_deref(), Some("Editing src/lib.rs"));
+        assert_eq!(update.content, None);
+        assert_eq!(update.detail, None);
+    }
+
+    /// A terminal ACP update replaces its content collection just like a running one. The result
+    /// keeps the explicit empty marker so a host can distinguish it from a terminal update that
+    /// supplied no content field at all.
+    #[test]
+    fn an_empty_terminal_tool_call_content_replacement_carries_empty_result_content() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_complete_empty",
+            "status": "completed",
+            "content": []
+        })]);
+        let [EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
+            panic!("expected one completion, received {events:?}");
+        };
+        assert_eq!(result.content, Some(ActivityContent::Empty));
+        assert_eq!(result.detail.as_deref(), Some(""));
     }
 
     /// The `ActivityCompleted` a terminal status produces carries the same content the update did,

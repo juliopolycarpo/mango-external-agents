@@ -176,6 +176,11 @@ once and revised several times, and a tool result is where most vendors say what
 Without it the second announcement of a checklist could only arrive as a new title, and the files a
 patch touched would reach a host as a paragraph.
 
+On an `ActivityUpdate`, an absent `content` leaves the earlier structured content in place. A
+`Some(ActivityContent::Empty)` is the explicit opposite: it tells the host to remove the earlier
+plan, diff or output. That keeps a vendor's omitted field distinct from an update that replaced its
+own content collection with an empty one.
+
 Two fields inside `FileChange` are deliberately optional for the same reason:
 
 - `kind` is **absent** where the vendor does not state one. Two of the three vendors send a path and

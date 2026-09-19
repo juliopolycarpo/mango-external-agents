@@ -154,6 +154,7 @@ reaches a host as `content` rather than being flattened:
 | [`plan`](https://agentclientprotocol.com/protocol/agent-plan)'s entries                    | `Plan { steps }` — no `id`, because ACP names no id for an entry                    |
 | a [`tool_call` diff block](https://agentclientprotocol.com/protocol/v1/tool-calls#content) | `Diff { files }`, one `FileChange` per block, `old_text`/`new_text` carried as sent |
 | a tool call's own text, when it sends no diff                                              | `Output { text }`                                                                   |
+| an empty `tool_call_update.content` collection                                             | `Empty`, which clears the earlier structured content                                |
 
 A diff block's `kind` is the one this crate reads rather than one a vendor states: ACP defines
 `oldText` as "the original content (None for new files)", so its absence is `Created` and its
@@ -170,6 +171,8 @@ key called `locations` holding a number tells a host the paths are in there and 
 extension channel means they never can be. `raw_input`/`raw_output` never reach a host: both are unbounded vendor
 payloads. The tool-call activity's `item_id` is the same string as its call id, ACP naming no separate
 id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, not the agent's.
+
+ACP says a [`tool_call_update` collection replaces the previous collection](https://agentclientprotocol.com/protocol/v1/tool-calls#updating), rather than extending it. An omitted `content` field therefore leaves the host's structured content and detail untouched. An explicit empty collection emits `Some(ActivityContent::Empty)` and an empty detail, so the host removes the prior diff or output instead of retaining it.
 
 ## Permissions
 
