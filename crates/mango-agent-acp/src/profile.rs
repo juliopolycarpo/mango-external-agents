@@ -78,7 +78,13 @@ impl SessionModeIds {
 /// The two are not degrees of the same check. A live session is the agent doing the thing this
 /// library asks of it; a committed capture is its handshake, recorded, and says nothing about what
 /// happens after `initialize`. Only the first earns [`AcpProfile::is_verified`].
+///
+/// Closed against a third kind, of which there are already candidates: a captured *turn* rather
+/// than a handshake, a vendor's own documented statement, a third-party attestation. A host does
+/// not have to match on this at all — [`AcpProfile::is_verified`] is the boolean — so closing it
+/// costs nothing now and cannot be done at all once the crate is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VerificationMethod {
     /// `tests/smoke.rs` drove the installed agent: a session opened, answered and closed.
     LiveSession,
@@ -110,6 +116,7 @@ pub enum VerificationMethod {
 /// assert!(!opencode.is_verified(), "a handshake is not a session");
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VerificationEvidence {
     /// The build that was checked, as the agent's own version surface prints it.
     pub agent_version: &'static str,
@@ -119,6 +126,43 @@ pub struct VerificationEvidence {
     pub method: VerificationMethod,
     /// Where the result is, as a path from the root of this repository.
     pub source: &'static str,
+}
+
+impl VerificationEvidence {
+    /// One recorded check, for a host registering a profile of its own.
+    ///
+    /// The constructor exists because the struct is closed: a later field — who ran it, which
+    /// protocol version was negotiated — must not stop a host's own profile compiling. Every
+    /// argument is `&'static str` because a record is written in source beside the profile it
+    /// backs, never assembled at runtime from something a vendor said.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::{VerificationEvidence, VerificationMethod};
+    ///
+    /// let checked = VerificationEvidence::new(
+    ///     "1.4.2",
+    ///     "2026-09-19",
+    ///     VerificationMethod::LiveSession,
+    ///     "tests/my_agent_smoke.rs",
+    /// );
+    /// assert_eq!(checked.method, VerificationMethod::LiveSession);
+    /// ```
+    #[must_use]
+    pub const fn new(
+        agent_version: &'static str,
+        checked_on: &'static str,
+        method: VerificationMethod,
+        source: &'static str,
+    ) -> Self {
+        Self {
+            agent_version,
+            checked_on,
+            method,
+            source,
+        }
+    }
 }
 
 /// Everything about one ACP agent that is not the protocol.
