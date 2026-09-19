@@ -9,7 +9,6 @@ header = """
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
-
 """
 body = """
 {% if version -%}
@@ -20,12 +19,18 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
-- {% if commit.scope %}**({{ commit.scope }})** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first }}\
+- {% if commit.breaking %}[**breaking**] {% endif %}\
+{% if commit.scope %}**({{ commit.scope }})** {% endif %}\
+{{ commit.message | split(pat="\n") | first | upper_first }}\
 {% endfor %}
 {% endfor %}
 """
 footer = ""
-trim = true
+# false, not true: trimming each rendered section strips the newline that separates one version's
+# last entry from the next version's heading, which glues `## [0.1.0]` onto a bullet the moment the
+# file holds two releases. The header therefore ends without its own blank line, so that the one
+# the body carries is the only one between it and the first heading.
+trim = false
 # Group headers carry a sortable HTML comment for ordering; strip it from output.
 postprocessors = [{ pattern = '<!-- [0-9]+ -->', replace = "" }]
 

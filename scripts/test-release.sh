@@ -43,3 +43,45 @@ if scripts/check-pr-title.sh >/dev/null 2>&1; then
   exit 1
 fi
 echo 'pull request title checks passed'
+
+# What the title gate protects: git-cliff has to keep a squash subject that carries no Conventional
+# Commit type, show only its first line, and mark a breaking change. `filter_unconventional = true`
+# — the setting that kept #18 out of v0.1.0's notes — fails the first assertion, dropping the
+# `split` filter fails the second, and dropping the `commit.breaking` branch fails the third.
+if ! command -v git-cliff >/dev/null 2>&1; then
+  echo 'skipping the changelog regression: git-cliff is not on PATH' >&2
+else
+  config=$PWD/cliff.toml
+  fixture=$(mktemp -d)
+  trap 'rm -rf "$fixture"' EXIT
+  commit() {
+    git -C "$fixture" -c user.name=fixture -c user.email=fixture@example.invalid \
+      -c commit.gpgsign=false commit -q --allow-empty "$@"
+  }
+  git init -q -b main "$fixture"
+  commit -m 'feat(core)!: a breaking change' -m 'A body.'
+  commit -m 'Release gate: a subject with no type (#18)' \
+    -m 'A body line the changelog must not repeat.'
+  notes=$(git-cliff --config "$config" --repository "$fixture" 2>/dev/null)
+  for expected in '- Release gate: a subject with no type (#18)' \
+    '- [**breaking**] **(core)** A breaking change'; do
+    case "$notes" in
+      *"$expected"*) ;;
+      *)
+        echo "expected the changelog to contain '$expected', received:" >&2
+        echo "$notes" >&2
+        exit 1
+        ;;
+    esac
+  done
+  case "$notes" in
+    *'A body line the changelog must not repeat.'*)
+      echo 'expected the changelog to carry subjects only, received a commit body:' >&2
+      echo "$notes" >&2
+      exit 1
+      ;;
+  esac
+  rm -rf "$fixture"
+  trap - EXIT
+  echo 'changelog rendering checks passed'
+fi

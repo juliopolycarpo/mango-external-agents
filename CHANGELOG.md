@@ -8,19 +8,19 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### 🚀 Features
 
-- Structured activity content and Codex interaction answers (#17)
-- **(core)** Add verified discovery and session services (#16)
-- **(core)** Settle session, configuration, identity and interaction contracts (#13)
+- [**breaking**] Structured activity content and Codex interaction answers (#17)
+- [**breaking**] **(core)** Add verified discovery and session services (#16)
+- [**breaking**] **(core)** Settle session, configuration, identity and interaction contracts (#13)
 - **(release)** Prepare 0.1.0 with smoke tooling and vendor drift checks (#6)
 - **(acp)** The Agent Client Protocol harness, with per-agent profiles (#5)
-- **(codex)** Codex app-server harness (#4)
+- [**breaking**] **(codex)** Codex app-server harness (#4)
 - **(claude)** The Claude Code harness (#3)
 - **(core)** Traits, events, host ports, transports and testing fakes (#2)
 
 ### 🐛 Bug Fixes
 
-- **(core)** Make turn ownership and shutdown cancellation-safe (#15)
-- Harden diagnostics, Claude MCP scratch, and turn lifecycle (#12)
+- [**breaking**] **(core)** Make turn ownership and shutdown cancellation-safe (#15)
+- [**breaking**] Harden diagnostics, Claude MCP scratch, and turn lifecycle (#12)
 
 ### 📚 Documentation
 
@@ -42,4 +42,5 @@ project adheres to [Semantic Versioning](https://semver.org).
 ### Other
 
 - Release gate: host adoption, Hub-owned retry, and publication readiness (#18)
+
 
