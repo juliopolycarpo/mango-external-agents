@@ -1,0 +1,22 @@
+[package]
+name = "hub-host"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "Reference host proving the library's host-owned retry contract is executable; not published"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+mango-external-agents.workspace = true
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+mango-external-agents = { workspace = true, features = ["testing"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "test-util"] }
