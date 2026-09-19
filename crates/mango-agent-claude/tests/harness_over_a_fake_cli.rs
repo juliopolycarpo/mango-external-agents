@@ -1621,6 +1621,117 @@ mod a_turn {
         );
     }
 
+    /// A second turn resumes a named conversation, so an `init` naming a different one means the
+    /// CLI answered from history this session has never seen.
+    ///
+    /// Adopting it silently is the failure worth a test: the handle a host persisted would be
+    /// replaced by one nobody read, with no event, and the host's next `open_session` would resume
+    /// a conversation it believes it has a transcript for. The first turn stays lenient — it
+    /// proposes a handle with `--session-id` and a CLI that started a different conversation anyway
+    /// has made that one real — which is why this only bites from the second turn on.
+    #[tokio::test]
+    async fn refuses_a_later_turn_that_answers_from_a_different_conversation() {
+        const FIRST: &str = "b01414e7-4b4b-43a2-9109-a33e21664340";
+        const OTHER: &str = "3f8a1d52-91c4-4e7b-8a06-5d2b9c7e1f04";
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::replaying(&format!(
+                    "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{FIRST}\"}}\n{{\"type\":\"result\",\"is_error\":false}}"
+                )))
+                .with_turn(Run::replaying(&format!(
+                    "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{OTHER}\"}}\n{{\"type\":\"result\",\"is_error\":false}}"
+                ))),
+        );
+        let session = open(&launcher).await;
+
+        let mut first = session
+            .start_turn(TurnRequest::new("turn-1", "start"))
+            .await
+            .expect("expected a turn");
+        drain(&mut first).await;
+        assert_eq!(session.ids().native_session_id, FIRST);
+
+        let mut second = session
+            .start_turn(TurnRequest::new("turn-2", "and again"))
+            .await
+            .expect("expected a second turn");
+        let events = drain(&mut second).await;
+
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                mango_external_agents::EventKind::Error { error }
+                    if error.message.contains("continuing the session this turn resumed")
+            )),
+            "expected the turn to report the conversation mismatch, received {events:?}"
+        );
+        assert_eq!(
+            session.ids().native_session_id,
+            FIRST,
+            "the handle a host persisted must survive a run that answered from another conversation"
+        );
+    }
+
+    /// A later turn resumes a named conversation even when the vendor's echo is malformed.
+    ///
+    /// Treating that echo as if it were absent lets the process publish a result while the host
+    /// keeps the previous handle, leaving the host unable to tell whether the result belongs to
+    /// the conversation it asked Claude to resume.
+    #[tokio::test]
+    async fn refuses_a_later_turn_that_names_an_invalid_session_handle() {
+        const FIRST: &str = "b01414e7-4b4b-43a2-9109-a33e21664340";
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::replaying(&format!(
+                    "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{FIRST}\"}}\n{{\"type\":\"result\",\"is_error\":false}}"
+                )))
+                .with_turn(Run::replaying(
+                    r#"{"type":"system","subtype":"init","session_id":"not-a-uuid"}
+{"type":"result","is_error":false}"#,
+                )),
+        );
+        let session = open(&launcher).await;
+
+        let mut first = session
+            .start_turn(TurnRequest::new("turn-1", "start"))
+            .await
+            .expect("expected the first turn to start");
+        drain(&mut first).await;
+        assert_eq!(session.ids().native_session_id, FIRST);
+
+        let mut second = session
+            .start_turn(TurnRequest::new("turn-2", "and again"))
+            .await
+            .expect("expected the resumed turn to start");
+        let events = drain(&mut second).await;
+
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::Error { error }
+                    if error.message.contains("UUID-shaped Claude resume handle")
+            )),
+            "expected an invalid echoed handle to fail the resumed turn, received {events:?}"
+        );
+        assert!(
+            events.iter().all(|kind| matches!(
+                kind,
+                EventKind::TurnStarted { .. } | EventKind::Error { .. }
+            )),
+            "expected no result from an unverified conversation, received {events:?}"
+        );
+        assert_eq!(
+            session.ids().native_session_id,
+            FIRST,
+            "the persisted handle must survive an invalid echoed handle"
+        );
+        assert_eq!(
+            value_after(&launcher.turn_argvs()[1], "--resume"),
+            Some(FIRST),
+            "expected the rejected turn to have resumed the established handle"
+        );
+    }
+
     /// The echoed handle is a vendor-chosen value that a later argv carries.
     ///
     /// `system/init` is followed because it names the conversation that now exists — but following

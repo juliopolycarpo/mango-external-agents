@@ -139,9 +139,14 @@ id, and each turn spawns, streams and reaps its own child.
   The first turn passes it to `--resume`; only `system/init` echoing that exact UUID confirms the
   resumed snapshot. A missing, invalid or different id ends that turn with a protocol error instead
   of presenting another conversation as the requested history. Conversation content or a result
-  before that confirmation is refused without emitting it. Later valid `system/init` ids still
-  replace the active handle, because they are vendor-issued identities for a conversation this
-  session already established.
+  before that confirmation is refused without emitting it. A later turn is held to the same handle.
+  When its `system/init` supplies an id, the [documented `--resume <uuid>` form](https://code.claude.com/docs/en/headless.md)
+  requires it to be UUID-shaped and this harness requires it to match the persisted handle. A
+  missing id remains tolerated because it makes no competing identity assertion. A malformed or
+  different id fails that turn rather than replacing the handle a host persisted — see
+  [A later turn may not answer from another conversation](#the-event-stream). Only the *first*
+  turn's echo may replace the minted id, because that turn proposes one rather than naming an
+  existing conversation.
 
   A failed strict verification, including a stream that ends before `system/init` without a host
   cancellation, leaves the session nonresumable even when native cleanup finishes through the
@@ -185,6 +190,16 @@ id, and each turn spawns, streams and reaps its own child.
   the vendor would otherwise terminate about five seconds later itself.
 
   <https://code.claude.com/docs/en/headless.md>
+
+**A later turn may not answer from another conversation.** Every turn after the first is spawned
+with `--resume <handle>`. When `system/init` supplies a handle, it must be a UUID and equal that
+handle. A missing field leaves the persisted handle unchanged, but a malformed or different handle
+means the CLI may have answered from history this session has never seen. That turn fails with
+`Error::Protocol` and the handle the host persisted stays in force; adopting a supplied replacement
+would switch to a conversation nobody read, silently and with no event to notice. The first turn
+stays lenient on purpose: it *proposes* a handle with `--session-id`, and a CLI that started a
+different conversation anyway has made that one the real one, so following its id is the better
+guess. A strict resume is stricter still — see [Session model](#session-model).
 
 ## Cancellation, and what the vendor actually does
 
@@ -390,6 +405,34 @@ The reducer holds three properties, each with a fixture case behind it:
 - **Unknown records are ignored, not fatal.** `system/status`, `system/thinking_tokens`,
   `system/api_retry` and `rate_limit_event` all appear on one live run, and the vocabulary keeps
   growing. Only a `result` ends the turn.
+
+**Structured content** is carried, not flattened, where a fixture evidences the shape. Every
+activity the reducer starts sets `item_id` from the `tool_use` block's own `id` — Claude's dialect
+draws no difference between a call and the transcript item it produced, so the two coincide. A
+`Write` call's `file_path`/`content` become a single-file `ActivityContent::Diff`, with `kind` left
+absent because `Write` also overwrites a file that already exists and nothing in the stream says
+which of the two happened; that mapping and the item id are both pinned by
+`fixtures/claude/transcripts/denied-write-turn.jsonl`. An `Edit` call becomes a single-file `Diff` too, and
+there `kind` **is** stated — `Modified` — because a stated before is what distinguishes a
+modification from a creation without guessing. Its two strings are deliberately **not** carried:
+`old_text`/`new_text` are documented as the file's contents on either side of the change, which is
+what an ACP diff block sends, and `old_string`/`new_string` are a *region* of a file. Misfiling one
+as the other would make the same host code report that a two-thousand line file had been replaced
+by one line for Claude while being right about ACP. The neutral contract has no field for a region,
+so the region is omitted rather than misfiled. The key names come from a live headless run rather
+than from a fixture, which is weaker evidence and is why a reducer test pins them: a rename upstream
+fails there rather than as a row that quietly stops appearing. A closing `tool_result`'s own body becomes
+`ActivityContent::Output` on the `ActivityResult`, independent of a held `system/permission_denied`
+reason, which still wins the one-line `detail`.
+
+`MultiEdit`, `NotebookEdit`, `TodoWrite` and `ExitPlanMode` are **not** mapped: no captured
+transcript in this repo exercises them, and the pinned build's own `system/init.tools` list does not
+even enumerate the last three. `TodoWrite` is the expensive one — it is where a plan's steps live,
+so until it is captured a Claude plan reaches a host as an activity title rather than as
+`ActivityContent::Plan`, which is the one place this harness is behind the other two. A `mea
+capture` of a turn that drives these tools is what unblocks it; guessing their input keys from a
+published tool description would produce a mapping no test in this repository could hold to
+account.
 
 **Slash commands** are published by provenance. A build that states `terminal_slash_commands` is
 authoritative; one that does not publishes only the names whose origin the same record states — a

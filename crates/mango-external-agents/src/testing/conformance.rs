@@ -316,6 +316,10 @@ async fn check_turn(session: &dyn Session, options: &Options, report: &mut Repor
         "every event names its session and turn",
         stamping_outcome(&events, "conformance-turn-1", session),
     );
+    report.record(
+        "every structure the turn opened, it closed",
+        structure_outcome(&events),
+    );
 }
 
 /// The least this suite can say to one round of questions.
@@ -457,6 +461,10 @@ async fn check_cancelled_turn(session: &dyn Session, options: &Options, report: 
         Outcome::Passed
     };
     report.record("a cancelled turn still completes", outcome);
+    report.record(
+        "a cancelled turn closes what it opened",
+        structure_outcome(&events),
+    );
 }
 
 async fn check_optional_methods(session: &dyn Session, report: &mut Report) {
@@ -858,6 +866,88 @@ fn terminal_outcome(events: &[AgentEvent]) -> Outcome {
     Outcome::Passed
 }
 
+/// Whether every structure the turn opened reached an end before its terminal.
+///
+/// The failure this catches is a host rendering something nobody will ever stop: an activity is a
+/// control with a running state, a reasoning phase is a block a host keeps open until told
+/// otherwise, and an approval or a question is a **dialog somebody is looking at**. A turn that
+/// ends owing any of them leaves a reloaded transcript permanently mid-work, or a prompt with no
+/// buttons that do anything. Every terminal path owes them equally — a completion, a cancel and an
+/// error are all the end of the turn, which is why the cancelled turn is held to this too.
+///
+/// An activity update or completion for a call nobody started is the same defect from the other
+/// side: the host has nothing to apply it to, so it either invents a row or drops the frame.
+///
+/// Interactions are checked in **one** direction only. A resolution for an ask a host never saw is
+/// deliberate in more than one harness — a question this library refuses on the host's behalf is
+/// resolved without ever being asked, so that a host has an auditable record of a refusal it was
+/// right not to be shown. There is no dialog to leave open in that case, which is what this check
+/// is about.
+fn structure_outcome(events: &[AgentEvent]) -> Outcome {
+    let mut open: Vec<&str> = Vec::new();
+    let mut waiting: Vec<&str> = Vec::new();
+    let mut reasoning_open = false;
+    let mut failures = Vec::new();
+    for event in events {
+        match &event.kind {
+            EventKind::ActivityStarted { call_id, .. } => {
+                if open.contains(&call_id.as_str()) {
+                    failures.push(format!("activity {call_id} was started twice"));
+                }
+                open.push(call_id);
+            }
+            EventKind::ActivityUpdated { call_id, .. } => {
+                if !open.contains(&call_id.as_str()) {
+                    failures.push(format!("activity {call_id} was updated but never started"));
+                }
+            }
+            EventKind::ActivityCompleted { call_id, .. } => {
+                match open.iter().position(|id| id == call_id) {
+                    Some(index) => {
+                        open.remove(index);
+                    }
+                    None => {
+                        failures.push(format!(
+                            "activity {call_id} was completed but never started"
+                        ));
+                    }
+                }
+            }
+            EventKind::ApprovalRequested { request } => waiting.push(request.id().as_str()),
+            EventKind::QuestionAsked { request } => {
+                waiting.push(request.interaction.id.as_str());
+            }
+            EventKind::ApprovalResolved { interaction_id, .. }
+            | EventKind::QuestionResolved { interaction_id, .. } => {
+                if let Some(index) = waiting.iter().position(|id| *id == interaction_id.as_str()) {
+                    waiting.remove(index);
+                }
+            }
+            EventKind::ReasoningStarted => {
+                if std::mem::replace(&mut reasoning_open, true) {
+                    failures.push(String::from("a reasoning phase was started inside another"));
+                }
+            }
+            EventKind::ReasoningEnded if !std::mem::replace(&mut reasoning_open, false) => {
+                failures.push(String::from("a reasoning phase ended without starting"));
+            }
+            _ => {}
+        }
+    }
+    if !open.is_empty() {
+        failures.push(format!("the turn ended with {open:?} still running"));
+    }
+    if !waiting.is_empty() {
+        failures.push(format!(
+            "the turn ended with {waiting:?} still waiting for an answer"
+        ));
+    }
+    if reasoning_open {
+        failures.push(String::from("the turn ended mid-reasoning"));
+    }
+    outcome_for(failures)
+}
+
 fn stamping_outcome(events: &[AgentEvent], turn_id: &str, session: &dyn Session) -> Outcome {
     let session_id = session.ids().session_id.clone();
     let attempt = crate::operation::AttemptId::default();
@@ -888,7 +978,9 @@ fn outcome_for(failures: Vec<String>) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::{Options, Outcome, run};
+    use crate::event::EventKind;
     use crate::host::HostContext;
+    use crate::interaction::QuestionForm;
     use crate::testing::{FakeHarness, FakeLauncher};
     use std::sync::Arc;
 
@@ -1041,6 +1133,121 @@ mod tests {
             message.contains("vendor failure"),
             "expected a safe vendor failure diagnostic, received {message:?}"
         );
+    }
+
+    /// Four ways a turn can leave a host rendering something that never resolves, and the one
+    /// shape that is fine. Written against the helper rather than a harness because a harness that
+    /// produced any of these would be the bug this check exists to name.
+    #[test]
+    fn a_turn_that_ends_owing_a_structure_fails_the_check() {
+        let started = |call_id: &str| EventKind::ActivityStarted {
+            call_id: String::from(call_id),
+            activity: crate::event::Activity::new(
+                "Bash",
+                crate::event::ActivityKind::Command,
+                "ls",
+            ),
+        };
+        let completed = |call_id: &str| EventKind::ActivityCompleted {
+            call_id: String::from(call_id),
+            result: crate::event::ActivityResult::new(crate::event::ActivityStatus::Completed),
+        };
+
+        assert_eq!(
+            super::structure_outcome(&events(vec![
+                started("call-1"),
+                completed("call-1"),
+                EventKind::ReasoningStarted,
+                EventKind::ReasoningEnded,
+                EventKind::Completed,
+            ])),
+            Outcome::Passed
+        );
+
+        // A refusal resolves an ask the host was never shown, on purpose: it is the auditable
+        // record of a question this library declined to put to anybody. There is no dialog to
+        // leave open, so it is not a failure.
+        assert_eq!(
+            super::structure_outcome(&events(vec![
+                EventKind::QuestionResolved {
+                    interaction_id: crate::interaction::InteractionId::new("never-asked"),
+                    outcome: crate::interaction::QuestionOutcome::Refused {
+                        reason: crate::interaction::UnsupportedQuestion::ArbitraryForm,
+                    },
+                },
+                EventKind::Completed,
+            ])),
+            Outcome::Passed
+        );
+
+        for (case, kinds) in [
+            (
+                "an activity left running",
+                vec![started("call-1"), EventKind::Completed],
+            ),
+            (
+                "a completion for a call nobody started",
+                vec![completed("call-9"), EventKind::Completed],
+            ),
+            (
+                "an update for a call nobody started",
+                vec![
+                    EventKind::ActivityUpdated {
+                        call_id: String::from("call-9"),
+                        update: crate::event::ActivityUpdate::new().with_detail("still going"),
+                    },
+                    EventKind::Completed,
+                ],
+            ),
+            (
+                "a turn that ended mid-reasoning",
+                vec![EventKind::ReasoningStarted, EventKind::Completed],
+            ),
+            (
+                "a question left waiting for an answer",
+                vec![
+                    EventKind::QuestionAsked {
+                        request: crate::interaction::QuestionRequest::new(
+                            crate::interaction::Interaction::new(
+                                crate::interaction::InteractionId::new("ask-1"),
+                                crate::interaction::InteractionKind::Question,
+                                crate::event::SessionId::new("session-1"),
+                                std::time::SystemTime::UNIX_EPOCH,
+                            ),
+                            vec![crate::interaction::Question::new(
+                                crate::interaction::QuestionId::new("branch"),
+                                "which branch?",
+                                QuestionForm::FreeText { placeholder: None },
+                            )],
+                        ),
+                    },
+                    EventKind::Completed,
+                ],
+            ),
+            (
+                "a reasoning phase that ended without starting",
+                vec![EventKind::ReasoningEnded, EventKind::Completed],
+            ),
+        ] {
+            assert!(
+                matches!(super::structure_outcome(&events(kinds)), Outcome::Failed(_)),
+                "expected {case} to fail the structure check"
+            );
+        }
+    }
+
+    /// Stamped events, for a check that only reads their kinds.
+    fn events(kinds: Vec<EventKind>) -> Vec<crate::event::AgentEvent> {
+        kinds
+            .into_iter()
+            .map(|kind| crate::event::AgentEvent {
+                session_id: crate::event::SessionId::new("session-1"),
+                turn_id: crate::event::TurnId::new("turn-1"),
+                attempt: crate::operation::AttemptId::default(),
+                at: std::time::SystemTime::UNIX_EPOCH,
+                kind,
+            })
+            .collect()
     }
 
     #[tokio::test]

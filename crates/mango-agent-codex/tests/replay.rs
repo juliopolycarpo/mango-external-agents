@@ -20,10 +20,12 @@ use mango_external_agents::permission::{
 };
 use mango_external_agents::testing::{Announcer, FakeLauncher, FakeProcess};
 use mango_external_agents::{
-    ApprovalRouting, CancelReason, Clock, CloseReason, ConfigurationChange, ConfigurationPatch,
-    EnvSource, ExitStatus, Harness, HostContext, InterruptOutcome, LaunchSpec, ManagedProcess,
-    McpServer, McpTransport, OpenSession, PermissionLevel, ProcessControl, ProcessLauncher,
-    Session, SessionQuery, SessionStatus, SessionSubscription, Steer, TurnRequest,
+    Answer as QuestionAnswerValue, AnswerValue, ApprovalRouting, CancelReason, Clock, CloseReason,
+    ConfigurationChange, ConfigurationPatch, EnvSource, ExitStatus, Harness, HostContext,
+    InterruptOutcome, LaunchSpec, ManagedProcess, McpServer, McpTransport, OpenSession,
+    PermissionLevel, ProcessControl, ProcessLauncher, QuestionId, QuestionOptionId,
+    QuestionOutcome, QuestionResponse, Session, SessionQuery, SessionStatus, SessionSubscription,
+    Steer, TurnRequest, UnsupportedQuestion,
 };
 use support::{Transcript, workspace_path};
 
@@ -3039,6 +3041,73 @@ async fn host_shutdown_marks_a_pending_approval_as_cancelled() {
     );
 }
 
+/// A host shutdown resolves an open question round exactly once, like a turn cancellation does.
+///
+/// `release_pending_for` sends `QuestionAnswer::Cancelled { reported: true }` on the pending
+/// entry's oneshot ahead of a shutdown, and the waiter's `select!` is biased toward `waiting`, so
+/// it takes that oneshot arm rather than the nobody-answered `None` arm; the `reported` bit is
+/// what stops it from publishing a second time. Unlike the unit test for this path, the schedule
+/// here is not forced — it exercises the same exactly-once guarantee under whichever ordering the
+/// real runtime picks.
+#[tokio::test]
+async fn host_shutdown_resolves_an_open_question_round_exactly_once() {
+    let transcript = Transcript::load("turn");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the turn recording to name its thread");
+    let push = MidTurnPush::new(
+        thread_id.clone(),
+        "item/tool/requestUserInput",
+        serde_json::json!({
+            "threadId": thread_id,
+            "turnId": MID_TURN_PUSH_NATIVE_TURN_ID,
+            "itemId": "ask-1",
+            "isBlocking": false,
+            "questions": [{"id": "note", "header": "Note", "question": "Anything else?"}],
+        }),
+    );
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| push.respond(frame)));
+    let cancel = mango_external_agents::CancelToken::new();
+    let (host, _launcher) = with_launcher_limits_and_cancel(
+        launcher,
+        None,
+        mango_external_agents::Limits::default(),
+        cancel.clone(),
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "do something"))
+        .await
+        .expect("expected a turn");
+    await_question(&mut turn).await;
+
+    cancel.cancel();
+    let events = drain(&mut turn).await;
+
+    let resolutions = events
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::QuestionResolved { .. }))
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "expected exactly one resolution on shutdown, received {events:#?}"
+    );
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Cancelled,
+                ..
+            }
+        )),
+        "expected shutdown to record the round as cancelled, received {events:#?}"
+    );
+}
+
 /// EOF after a live activity has no `turn/completed` to reduce, so it must still fail the stream.
 #[tokio::test]
 async fn app_server_eof_after_an_activity_fails_the_turn_without_waiting_for_a_timeout() {
@@ -4291,35 +4360,94 @@ async fn the_harness_passes_the_cores_conformance_suite() {
     let thread_id = transcript
         .thread_id()
         .expect("expected the approval transcript to name its thread");
+    // Once Codex declares `Capability::Questions` the suite starts a third turn of its own —
+    // `check_questions`, between `check_turn` and `check_cancelled_turn` — so `turn/start` calls
+    // are counted by exact position rather than "first or not": the second now belongs to the
+    // question round, and only the third gets the old synthetic cancel id.
+    const CONFORMANCE_QUESTION_REQUEST_ID: i64 = 77_001;
     let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let responder_starts = Arc::clone(&starts);
+    let question_thread_id = thread_id.clone();
     launcher.push(transcript.as_process_intercepting(move |frame| {
         let method = frame.get("method").and_then(serde_json::Value::as_str);
         let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
         match method {
-            Some("turn/start")
-                if responder_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
-            {
-                None
+            Some("turn/start") => {
+                match responder_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    // `check_turn`: let the real recorded fixture answer.
+                    0 => None,
+                    // `check_questions`: a round-trip for the suite's own `check_questions` to
+                    // exercise, since a required capability covered only by a skip does not count.
+                    1 => Some(vec![
+                        serde_json::json!({
+                            "id": id,
+                            "result": {"turn": {"id": "conformance-question"}},
+                        })
+                        .to_string(),
+                        serde_json::json!({
+                            "id": CONFORMANCE_QUESTION_REQUEST_ID,
+                            "method": "item/tool/requestUserInput",
+                            "params": {
+                                "threadId": question_thread_id,
+                                "turnId": "conformance-question",
+                                "itemId": "conformance-question-item",
+                                "isBlocking": false,
+                                "questions": [{
+                                    "id": "conformance-question-1",
+                                    "header": "Conformance",
+                                    "question": "Anything to add?",
+                                }],
+                            },
+                        })
+                        .to_string(),
+                    ]),
+                    // `check_cancelled_turn`: the existing synthetic cancel id.
+                    _ => Some(vec![
+                        serde_json::json!({
+                            "id": id,
+                            "result": {"turn": {"id": "conformance-cancel"}},
+                        })
+                        .to_string(),
+                    ]),
+                }
             }
-            Some("turn/start") => Some(vec![
-                serde_json::json!({
-                    "id": id,
-                    "result": {"turn": {"id": "conformance-cancel"}},
-                })
-                .to_string(),
-            ]),
-            Some("turn/interrupt") => Some(vec![
-                serde_json::json!({"id": id, "result": {}}).to_string(),
-                serde_json::json!({
-                    "method": "turn/completed",
-                    "params": {
-                        "threadId": thread_id,
-                        "turn": {"id": "conformance-cancel", "status": "interrupted"},
-                    },
-                })
-                .to_string(),
-            ]),
+            // The client's answer to the pushed question: complete that turn so `check_questions`
+            // sees a terminal rather than waiting out its own timeout.
+            None if frame.get("id")
+                == Some(&serde_json::json!(CONFORMANCE_QUESTION_REQUEST_ID)) =>
+            {
+                Some(vec![
+                    serde_json::json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": question_thread_id,
+                            "turn": {"id": "conformance-question", "status": "completed"},
+                        },
+                    })
+                    .to_string(),
+                ])
+            }
+            // Named by whichever turn is actually being interrupted: `check_questions` answers
+            // and cancels back to back, so its own turn can still be active when this arrives,
+            // racing the completion its answer already triggered.
+            Some("turn/interrupt") => {
+                let interrupted_turn_id = frame
+                    .pointer("/params/turnId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("conformance-cancel")
+                    .to_owned();
+                Some(vec![
+                    serde_json::json!({"id": id, "result": {}}).to_string(),
+                    serde_json::json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": {"id": interrupted_turn_id, "status": "interrupted"},
+                        },
+                    })
+                    .to_string(),
+                ])
+            }
             _ => None,
         }
     }));
@@ -4340,6 +4468,16 @@ async fn the_harness_passes_the_cores_conformance_suite() {
         report.checks.len() >= 8,
         "expected the whole suite to run, received {:?}",
         report.checks
+    );
+    // A declared capability covered only by a skip is a capability nothing exercised. The
+    // recorded conversation pushes one `item/tool/requestUserInput` for exactly this reason.
+    assert!(
+        report
+            .skipped()
+            .iter()
+            .all(|check| !check.name.contains("question")),
+        "expected the question round trip to run rather than skip, received {:?}",
+        report.skipped()
     );
 }
 
@@ -4461,5 +4599,709 @@ async fn a_reset_requested_on_a_turn_is_refused_rather_than_silently_dropped() {
         launcher.written().len(),
         before,
         "expected no turn/start to reach the vendor for a patch this harness cannot encode"
+    );
+}
+
+/// The synthetic `id` every [`MidTurnPush`] raises its request under.
+///
+/// Fixed rather than random: every test using [`open_with_mid_turn_push`] owns its own session and
+/// launcher, so nothing else on the wire can collide with it.
+const MID_TURN_PUSH_REQUEST_ID: i64 = 90_210;
+
+/// The native turn id [`MidTurnPush`] answers `turn/start` with.
+const MID_TURN_PUSH_NATIVE_TURN_ID: &str = "vendor-turn-1";
+
+/// A server that answers `turn/start` immediately, pushes one out-of-band request right after,
+/// and completes the turn once that request's answer arrives.
+///
+/// The three server-request families this drives landed after the fixtures under
+/// `fixtures/codex/` were captured, so there is no real transcript to replay one from. Writing one
+/// by hand would put words in the app-server's mouth — `support::Transcript::as_process_intercepting`
+/// says the same — so this only shapes the wire the way a real mid-turn approval already does (see
+/// the `approval` fixture): the push rides the `turn/start` response, and the reply completes the
+/// turn.
+struct MidTurnPush {
+    thread_id: String,
+    method: &'static str,
+    params: serde_json::Value,
+    pushed: AtomicBool,
+    answered: AtomicBool,
+}
+
+impl MidTurnPush {
+    fn new(thread_id: String, method: &'static str, params: serde_json::Value) -> Self {
+        Self {
+            thread_id,
+            method,
+            params,
+            pushed: AtomicBool::new(false),
+            answered: AtomicBool::new(false),
+        }
+    }
+
+    fn respond(&self, frame: &serde_json::Value) -> Option<Vec<String>> {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        if method == Some("turn/start") && !self.pushed.swap(true, Ordering::SeqCst) {
+            let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            return Some(vec![
+                serde_json::json!({
+                    "id": id,
+                    "result": {"turn": {"id": MID_TURN_PUSH_NATIVE_TURN_ID}},
+                })
+                .to_string(),
+                serde_json::json!({
+                    "id": MID_TURN_PUSH_REQUEST_ID,
+                    "method": self.method,
+                    "params": self.params,
+                })
+                .to_string(),
+            ]);
+        }
+        if method == Some("turn/interrupt") && !self.answered.swap(true, Ordering::SeqCst) {
+            let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            return Some(vec![
+                serde_json::json!({"id": id, "result": {}}).to_string(),
+                serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": self.thread_id,
+                        "turn": {"id": MID_TURN_PUSH_NATIVE_TURN_ID, "status": "interrupted"},
+                    },
+                })
+                .to_string(),
+            ]);
+        }
+        if method.is_none()
+            && frame.get("id") == Some(&serde_json::json!(MID_TURN_PUSH_REQUEST_ID))
+            && !self.answered.swap(true, Ordering::SeqCst)
+        {
+            return Some(vec![
+                serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": self.thread_id,
+                        "turn": {"id": MID_TURN_PUSH_NATIVE_TURN_ID, "status": "completed"},
+                    },
+                })
+                .to_string(),
+            ]);
+        }
+        None
+    }
+}
+
+/// Opens a session and starts a turn against a server that pushes one out-of-band request.
+///
+/// `build_params` receives the thread and native turn id the push will use, so a test can write a
+/// request whose own `threadId`/`turnId` match what the session will actually see.
+async fn open_with_mid_turn_push_and_clock(
+    method: &'static str,
+    build_params: impl FnOnce(&str, &str) -> serde_json::Value,
+    clock: Option<Arc<dyn Clock>>,
+) -> (
+    Box<dyn Session>,
+    Arc<FakeLauncher>,
+    mango_external_agents::TurnStream,
+) {
+    let transcript = Transcript::load("turn");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the turn recording to name its thread");
+    let params = build_params(&thread_id, MID_TURN_PUSH_NATIVE_TURN_ID);
+    let push = MidTurnPush::new(thread_id, method, params);
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| push.respond(frame)));
+    let (host, launcher) = match clock {
+        Some(clock) => with_launcher_and_clock(launcher, None, clock),
+        None => with_launcher(launcher, None),
+    };
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let turn = session
+        .start_turn(TurnRequest::new("turn-1", "do something"))
+        .await
+        .expect("expected a turn");
+    (session, launcher, turn)
+}
+
+/// The common case of [`open_with_mid_turn_push_and_clock`]: the real clock.
+async fn open_with_mid_turn_push(
+    method: &'static str,
+    build_params: impl FnOnce(&str, &str) -> serde_json::Value,
+) -> (
+    Box<dyn Session>,
+    Arc<FakeLauncher>,
+    mango_external_agents::TurnStream,
+) {
+    open_with_mid_turn_push_and_clock(method, build_params, None).await
+}
+
+/// Reads a turn until the vendor asks a round of questions.
+async fn await_question(
+    turn: &mut mango_external_agents::TurnStream,
+) -> mango_external_agents::QuestionRequest {
+    let asked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = turn.recv().await {
+            if let EventKind::QuestionAsked { request } = event.kind {
+                return Some(request);
+            }
+        }
+        None
+    })
+    .await
+    .expect("expected the question round within the deadline");
+    asked.expect("expected the question round to reach the host")
+}
+
+/// The wire frame this harness sent in answer to a [`MidTurnPush`]'s request.
+fn mid_turn_push_answer(launcher: &FakeLauncher) -> serde_json::Value {
+    let line = launcher
+        .written()
+        .into_iter()
+        .find(|line| {
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) else {
+                return false;
+            };
+            frame.get("method").is_none()
+                && frame.get("id") == Some(&serde_json::json!(MID_TURN_PUSH_REQUEST_ID))
+        })
+        .unwrap_or_else(|| panic!("expected an answer to the pushed request, received none"));
+    serde_json::from_str(&line).expect("expected a JSON frame")
+}
+
+/// An MCP elicitation is an arbitrary form; this library renders none, so it is declined natively
+/// and no part of it ever reaches the host.
+#[tokio::test]
+async fn an_elicitation_is_declined_natively_and_never_put_to_the_host() {
+    let (_session, launcher, mut turn) =
+        open_with_mid_turn_push("mcpServer/elicitation/request", |thread_id, turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "elicitationId": "elicit-1",
+                "message": "enter your api token",
+                "requestedSchema": {"type": "object"},
+            })
+        })
+        .await;
+
+    let events = drain(&mut turn).await;
+    assert!(
+        !events
+            .iter()
+            .any(|kind| matches!(kind, EventKind::QuestionAsked { .. })),
+        "expected a form never to be put to the host, received {events:#?}"
+    );
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Refused {
+                    reason: UnsupportedQuestion::ArbitraryForm
+                },
+                ..
+            }
+        )),
+        "expected a native refusal to be recorded, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(answer["result"], serde_json::json!({"action": "decline"}));
+}
+
+/// A url-mode elicitation carries no `turnId` of its own at this pin, and is still declined.
+///
+/// The correlation gate every other server request passes through would answer this one with the
+/// JSON-RPC error the native decline exists to stop sending, and leave the app-server told that
+/// this client is broken rather than that the form was refused.
+#[tokio::test]
+async fn a_url_mode_elicitation_with_no_turn_id_is_still_declined_natively() {
+    let (_session, launcher, mut turn) =
+        open_with_mid_turn_push("mcpServer/elicitation/request", |thread_id, _turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "mode": "url",
+                "elicitationId": "elicit-1",
+                "message": "open this",
+                "url": "https://example.test/form",
+            })
+        })
+        .await;
+
+    let events = drain(&mut turn).await;
+    let resolutions = events
+        .iter()
+        .filter(|kind| {
+            matches!(
+                kind,
+                EventKind::QuestionResolved {
+                    outcome: QuestionOutcome::Refused {
+                        reason: UnsupportedQuestion::ArbitraryForm
+                    },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "expected the form refused exactly once on the active turn, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(
+        answer.get("error"),
+        None,
+        "expected a native decline rather than a JSON-RPC error, received {answer}"
+    );
+    assert_eq!(answer["result"], serde_json::json!({"action": "decline"}));
+}
+
+/// A `turnId` the server writes as `null` is a missing correlation, not a malformed frame.
+#[tokio::test]
+async fn an_elicitation_whose_turn_id_is_null_is_declined_rather_than_refused() {
+    let (_session, launcher, mut turn) =
+        open_with_mid_turn_push("mcpServer/elicitation/request", |thread_id, _turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": serde_json::Value::Null,
+                "message": "enter your api token",
+                "requestedSchema": {"type": "object"},
+            })
+        })
+        .await;
+
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Refused {
+                    reason: UnsupportedQuestion::ArbitraryForm
+                },
+                ..
+            }
+        )),
+        "expected a native refusal to be recorded, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(
+        answer.get("error"),
+        None,
+        "expected a native decline rather than a JSON-RPC error, received {answer}"
+    );
+    assert_eq!(answer["result"], serde_json::json!({"action": "decline"}));
+}
+
+/// Each of the three permission decisions round-trips with its own scope: a turn grant, a session
+/// grant, and a denial that grants nothing.
+#[tokio::test]
+async fn a_permissions_decision_round_trips_its_scope() {
+    for (option_id, expected_wire) in [
+        (
+            "grant:turn",
+            serde_json::json!({"permissions": {"fs": {"read": true}}, "scope": "turn"}),
+        ),
+        (
+            "grant:session",
+            serde_json::json!({"permissions": {"fs": {"read": true}}, "scope": "session"}),
+        ),
+        ("deny", serde_json::json!({"permissions": {}})),
+    ] {
+        let (session, launcher, mut turn) =
+            open_with_mid_turn_push("item/permissions/requestApproval", |thread_id, turn_id| {
+                serde_json::json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": "perm-1",
+                    "cwd": "/workspace",
+                    "reason": "needs filesystem access",
+                    "permissions": {"fs": {"read": true}},
+                })
+            })
+            .await;
+
+        let request = await_approval(&mut turn).await;
+        // The authority a grant hands over is rendered before anybody can grant it: a host or a
+        // broker choosing `grant:turn` off the title and the agent's own reason alone would be
+        // granting a profile it was never shown.
+        let detail = request
+            .detail
+            .as_deref()
+            .expect("expected the requested profile in the detail");
+        assert!(
+            detail.contains(r#"{"fs":{"read":true}}"#),
+            "expected the requested profile in the detail, received {detail:?}"
+        );
+        let response = request
+            .respond(option_id, DecisionSource::User)
+            .unwrap_or_else(|_| panic!("expected {option_id} among the offered options"));
+        session
+            .respond(response)
+            .await
+            .expect("expected the decision to land");
+        let events = drain(&mut turn).await;
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::ApprovalResolved { decision, .. } if decision.option_id == option_id
+            )),
+            "expected {option_id} to be recorded, received {events:#?}"
+        );
+
+        let answer = mid_turn_push_answer(&launcher);
+        assert_eq!(
+            answer["result"], expected_wire,
+            "expected {option_id} to echo {expected_wire}, received {answer}"
+        );
+    }
+}
+
+/// A round of three questions: a choice round-tripping its native label, a free-text answer and a
+/// decline — all in one round trip, the way a vendor asking three things at once is answered.
+#[tokio::test]
+async fn a_question_round_answers_a_choice_free_text_and_a_decline() {
+    let (session, launcher, mut turn) =
+        open_with_mid_turn_push("item/tool/requestUserInput", |thread_id, turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": "ask-1",
+                // Not blocking: the round offers a decline, and a required question refuses one.
+                "isBlocking": false,
+                "questions": [
+                    {
+                        "id": "branch",
+                        "header": "Branch",
+                        "question": "Which branch?",
+                        "options": [
+                            {"label": "main"},
+                            {"label": "next", "description": "the other one"},
+                        ],
+                    },
+                    {"id": "note", "header": "Note", "question": "Anything else?"},
+                    {"id": "extra", "header": "Extra", "question": "Want more?"},
+                ],
+            })
+        })
+        .await;
+
+    let request = await_question(&mut turn).await;
+    assert_eq!(request.questions.len(), 3);
+    assert!(request.questions.iter().all(|question| !question.required));
+    let branch = request
+        .question(&QuestionId::new("branch"))
+        .expect("expected the branch question");
+    assert!(
+        matches!(
+            &branch.form,
+            mango_external_agents::QuestionForm::Choice { options, .. }
+                if options.iter().any(|option| option.id == QuestionOptionId::new("next"))
+        ),
+        "expected the vendor's own label as the option's native id, received {:?}",
+        branch.form
+    );
+
+    let response = QuestionResponse::new(
+        request.interaction.id.clone(),
+        vec![
+            QuestionAnswerValue::new(
+                QuestionId::new("branch"),
+                AnswerValue::chosen(QuestionOptionId::new("next")),
+            ),
+            QuestionAnswerValue::new(QuestionId::new("note"), AnswerValue::text("ship it")),
+            QuestionAnswerValue::new(QuestionId::new("extra"), AnswerValue::Declined),
+        ],
+    );
+    session
+        .answer(response)
+        .await
+        .expect("expected the answer to land");
+
+    let events = drain(&mut turn).await;
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Answered { .. },
+                ..
+            }
+        )),
+        "expected the round resolved as answered, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(
+        answer["result"],
+        serde_json::json!({"answers": {
+            "branch": {"answers": ["next"]},
+            "note": {"answers": ["ship it"]},
+            "extra": {"answers": []},
+        }})
+    );
+}
+
+/// `required` is a round-level fact on the wire (`isBlocking`), not a per-question one, so every
+/// question in a blocking round carries it.
+#[tokio::test]
+async fn a_blocking_round_marks_every_question_required() {
+    let (session, _launcher, mut turn) =
+        open_with_mid_turn_push("item/tool/requestUserInput", |thread_id, turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": "ask-1",
+                "isBlocking": true,
+                "questions": [
+                    {"id": "note", "header": "Note", "question": "Anything else?"},
+                ],
+            })
+        })
+        .await;
+
+    let request = await_question(&mut turn).await;
+    assert!(request.questions.iter().all(|question| question.required));
+
+    session
+        .answer(QuestionResponse::new(
+            request.interaction.id.clone(),
+            vec![QuestionAnswerValue::new(
+                QuestionId::new("note"),
+                AnswerValue::text("done"),
+            )],
+        ))
+        .await
+        .expect("expected the answer to land");
+    drain(&mut turn).await;
+}
+
+/// A host cannot invent a choice: an answer naming an option the round never offered is refused
+/// before anything reaches the vendor, and the round stays open for a corrected answer.
+#[tokio::test]
+async fn an_invalid_answer_is_refused_before_reaching_the_wire() {
+    let (session, launcher, mut turn) =
+        open_with_mid_turn_push("item/tool/requestUserInput", |thread_id, turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": "ask-1",
+                "isBlocking": false,
+                "questions": [
+                    {
+                        "id": "branch",
+                        "header": "Branch",
+                        "question": "Which branch?",
+                        "options": [{"label": "main"}],
+                    },
+                ],
+            })
+        })
+        .await;
+
+    let request = await_question(&mut turn).await;
+    let before = launcher.written().len();
+
+    let error = session
+        .answer(QuestionResponse::new(
+            request.interaction.id.clone(),
+            vec![QuestionAnswerValue::new(
+                QuestionId::new("branch"),
+                AnswerValue::chosen(QuestionOptionId::new("trunk")),
+            )],
+        ))
+        .await
+        .expect_err("expected an option the round never offered to be refused");
+    assert!(
+        matches!(error.cause(), mango_external_agents::Error::Protocol { .. }),
+        "expected a protocol refusal, received {error:?}"
+    );
+    assert_eq!(
+        launcher.written().len(),
+        before,
+        "expected nothing to reach the vendor for an answer refused before the wire"
+    );
+
+    // The round is still open: a corrected answer still lands.
+    session
+        .answer(QuestionResponse::new(
+            request.interaction.id.clone(),
+            vec![QuestionAnswerValue::new(
+                QuestionId::new("branch"),
+                AnswerValue::chosen(QuestionOptionId::new("main")),
+            )],
+        ))
+        .await
+        .expect("expected the corrected answer to land");
+    drain(&mut turn).await;
+}
+
+/// A round with any question marked `isSecret` is refused whole and natively: no part of it, not
+/// even the questions that were not secret, ever reaches the host.
+#[tokio::test]
+async fn a_secret_question_refuses_the_whole_round_natively() {
+    let (_session, launcher, mut turn) =
+        open_with_mid_turn_push("item/tool/requestUserInput", |thread_id, turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": "ask-1",
+                "isBlocking": true,
+                "questions": [
+                    {"id": "note", "header": "Note", "question": "Say more?"},
+                    {
+                        "id": "token",
+                        "header": "Token",
+                        "question": "What is your API token?",
+                        "isSecret": true,
+                    },
+                ],
+            })
+        })
+        .await;
+
+    let events = drain(&mut turn).await;
+    assert!(
+        !events
+            .iter()
+            .any(|kind| matches!(kind, EventKind::QuestionAsked { .. })),
+        "expected no part of a secret round to reach the host, received {events:#?}"
+    );
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Refused {
+                    reason: UnsupportedQuestion::SecretCollection
+                },
+                ..
+            }
+        )),
+        "expected a native refusal to be recorded, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(answer["result"], serde_json::json!({"answers": {}}));
+}
+
+/// Cancelling the turn a question round belongs to resolves the round before the turn's own
+/// terminal, never after: a host reading events in order must see the round settled first.
+#[tokio::test]
+async fn cancelling_the_turn_resolves_its_open_question_round_first() {
+    let (session, launcher, mut turn) =
+        open_with_mid_turn_push("item/tool/requestUserInput", |thread_id, turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": "ask-1",
+                "isBlocking": false,
+                "questions": [{"id": "note", "header": "Note", "question": "Anything else?"}],
+            })
+        })
+        .await;
+
+    await_question(&mut turn).await;
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancellation to land");
+    let events = drain(&mut turn).await;
+
+    let resolved_at = events.iter().position(|kind| {
+        matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Cancelled,
+                ..
+            }
+        )
+    });
+    let terminal_at = events
+        .iter()
+        .position(|kind| matches!(kind, EventKind::Completed));
+    assert!(
+        resolved_at.is_some() && terminal_at.is_some() && resolved_at < terminal_at,
+        "expected the round cancelled before the turn's terminal, received {events:#?}"
+    );
+
+    // Exactly one, on the same terms as the expiry: the canceller reports the round and the
+    // waiter it wakes reports nothing, so a host closing its dialog on the first resolution is
+    // never handed a second identical one before the terminal.
+    let resolutions = events
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::QuestionResolved { .. }))
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "expected exactly one resolution, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(answer["result"], serde_json::json!({"answers": {}}));
+}
+
+/// An unanswered round is resolved exactly once, at its own deadline — never by the general
+/// `request_timeout`, and never twice: a late answer after the fact is refused, not applied.
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_question_round_expires_exactly_once() {
+    let (session, launcher, mut turn) = open_with_mid_turn_push_and_clock(
+        "item/tool/requestUserInput",
+        |thread_id, turn_id| {
+            serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": "ask-1",
+                "isBlocking": false,
+                "questions": [{"id": "note", "header": "Note", "question": "Anything else?"}],
+            })
+        },
+        Some(Arc::new(FixedClock(SystemTime::UNIX_EPOCH))),
+    )
+    .await;
+
+    let request = await_question(&mut turn).await;
+    tokio::time::advance(approval_timeout()).await;
+    let events = drain(&mut turn).await;
+
+    // Exactly one resolution: a deadline that fired twice, or that raced a second path into
+    // reporting the same round, would show up here as a second `QuestionResolved`.
+    let resolutions = events
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::QuestionResolved { .. }))
+        .count();
+    assert_eq!(
+        resolutions, 1,
+        "expected exactly one resolution, received {events:#?}"
+    );
+    assert!(
+        events.iter().any(|kind| matches!(
+            kind,
+            EventKind::QuestionResolved {
+                outcome: QuestionOutcome::Expired,
+                ..
+            }
+        )),
+        "expected the deadline to resolve the round as expired, received {events:#?}"
+    );
+
+    let answer = mid_turn_push_answer(&launcher);
+    assert_eq!(answer["result"], serde_json::json!({"answers": {}}));
+
+    // Exactly once: a late answer after expiry is refused, not silently applied.
+    let error = session
+        .answer(QuestionResponse::new(
+            request.interaction.id.clone(),
+            vec![QuestionAnswerValue::new(
+                QuestionId::new("note"),
+                AnswerValue::text("too late"),
+            )],
+        ))
+        .await
+        .expect_err("expected a late answer to be refused");
+    assert!(
+        matches!(error.cause(), mango_external_agents::Error::Protocol { .. }),
+        "expected a protocol refusal, received {error:?}"
     );
 }

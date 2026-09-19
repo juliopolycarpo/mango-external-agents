@@ -12,6 +12,7 @@ use crate::configuration::{
     ConfigurationState, ConfigurationValue, ConfigurationValueType, RejectedSetting, Rollback,
     SettingRejection,
 };
+use crate::content::ActivityContent;
 use crate::discovery::{AuthMode, AuthState, Discovery, GateVerdict, Model};
 use crate::error::{Error, ErrorCode, Result, VendorError};
 use crate::event::{
@@ -281,6 +282,54 @@ struct PendingTurn {
     sink: EventSink,
     approval: Option<PermissionRequest>,
     question: Option<QuestionRequest>,
+    /// The activity this turn announced and has not closed.
+    ///
+    /// Held so a cancel and a close can end it. A fake that leaves one running teaches every
+    /// harness written against it that a turn may end owing a spinner nobody will stop, which is
+    /// what the conformance suite's structure check exists to refuse.
+    open_activity: Option<String>,
+}
+
+/// Ends everything a stopped turn left open, before its terminal goes out.
+///
+/// The activity, and the interaction somebody is looking at. `Cancelled` in every case: nothing
+/// went wrong with the call or the ask, the turn they belonged to stopped. A fake that skips this
+/// teaches every harness written against it that a turn may end owing a spinner nobody will stop
+/// or a dialog with no button that does anything.
+///
+/// Best-effort emits — the sink may already be closed by a racing terminal, and the terminal is the
+/// event that matters.
+async fn close_open_interactions(turn: &PendingTurn) {
+    if let Some(call_id) = turn.open_activity.clone() {
+        let _ = turn
+            .sink
+            .emit(EventKind::ActivityCompleted {
+                call_id,
+                result: ActivityResult::new(ActivityStatus::Cancelled),
+            })
+            .await;
+    }
+    if let Some(question) = &turn.question {
+        let _ = turn
+            .sink
+            .emit(EventKind::QuestionResolved {
+                interaction_id: question.interaction.id.clone(),
+                outcome: QuestionOutcome::Cancelled,
+            })
+            .await;
+    }
+    if let Some(approval) = &turn.approval {
+        let _ = turn
+            .sink
+            .emit(EventKind::ApprovalResolved {
+                interaction_id: approval.id().clone(),
+                decision: ApprovalDecision::unresolved(
+                    "withdrawn",
+                    crate::permission::DecisionSource::Cancelled,
+                ),
+            })
+            .await;
+    }
 }
 
 fn approval_request(
@@ -394,17 +443,13 @@ impl FakeSession {
             })
             .await?;
         let result = if option_id == "deny" {
-            ActivityResult {
-                status: ActivityStatus::Cancelled,
-                detail: Some(String::from("refused")),
-                truncated: false,
-            }
+            ActivityResult::new(ActivityStatus::Cancelled).with_detail("refused")
         } else {
-            ActivityResult {
-                status: ActivityStatus::Completed,
-                detail: Some(String::from("3 passed")),
-                truncated: false,
-            }
+            ActivityResult::new(ActivityStatus::Completed)
+                .with_detail("3 passed")
+                .with_content(ActivityContent::Output {
+                    text: String::from("test result: ok. 3 passed; 0 failed"),
+                })
         };
         turn.sink
             .emit(EventKind::ActivityCompleted {
@@ -590,6 +635,7 @@ impl Session for FakeSession {
                 sink: sink.clone(),
                 approval: None,
                 question: Some(question.clone()),
+                open_activity: None,
             });
             // No broker is consulted: a question authorises nothing, so a permission policy has no
             // standing to answer one.
@@ -618,6 +664,7 @@ impl Session for FakeSession {
             sink: sink.clone(),
             approval: Some(request_for_approval.clone()),
             question: None,
+            open_activity: Some(String::from("call-1")),
         });
         drop(pending);
 
@@ -687,6 +734,7 @@ impl Session for FakeSession {
         let Some(turn) = pending.take() else {
             return Ok(());
         };
+        close_open_interactions(&turn).await;
         turn.sink.cancel(reason).await
     }
 
@@ -697,6 +745,7 @@ impl Session for FakeSession {
         // Terminal commitment is immediate and remains inside the admission critical section.
         if let Some(turn) = pending.take() {
             // A close ends whatever was running, for the same reason.
+            close_open_interactions(&turn).await;
             let _ = turn.sink.cancel(CancelReason::Shutdown).await;
         }
         Ok(())

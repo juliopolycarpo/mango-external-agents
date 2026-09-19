@@ -10,8 +10,8 @@ mod support;
 use mango_agent_claude::protocol::StreamRecord;
 use mango_agent_claude::reducer::{RunInit, TurnReducer};
 use mango_external_agents::{
-    Activity, ActivityKind, ActivityResult, ActivityStatus, Command, ErrorCode, EventKind,
-    VendorError,
+    Activity, ActivityContent, ActivityKind, ActivityResult, ActivityStatus, Command, ErrorCode,
+    EventKind, VendorError,
 };
 use support::READ_TURN;
 
@@ -349,6 +349,29 @@ mod on_a_recorded_denied_write {
             Some(
                 "Claude requested permissions to write to /work/repo/denied.txt, but you haven't granted it yet."
             )
+        );
+    }
+
+    /// The captured `tool_use` block's own `id` is what a later update or completion addresses,
+    /// and its `file_path`/`content` keys are the only ones this repo has fixture evidence for —
+    /// see `file_change_content`'s own doc for why `Edit`, `MultiEdit` and `NotebookEdit` stay
+    /// unmapped.
+    #[test]
+    fn carries_the_captured_writes_own_item_id_and_diff_content() {
+        let events = replay(DENIED_WRITE).events;
+        let (call_id, activity) = first_activity_started(&events);
+        assert_eq!(activity.item_id.as_deref(), Some(call_id));
+
+        let Some(ActivityContent::Diff { files }) = &activity.content else {
+            panic!("expected diff content, received {:?}", activity.content);
+        };
+        assert_eq!(files.len(), 1, "received {files:?}");
+        assert_eq!(files[0].path, "/work/repo/denied.txt");
+        assert_eq!(files[0].new_text.as_deref(), Some("hello"));
+        assert_eq!(
+            files[0].kind, None,
+            "expected no kind asserted for a Write, received {:?}",
+            files[0].kind
         );
     }
 

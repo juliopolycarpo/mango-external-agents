@@ -141,6 +141,17 @@ nothing of it survives into a value the harness holds. `~/.codex/auth.json` is n
 server's `account/chatgptAuthTokens/refresh` request — which asks a client to hand over a refreshed
 credential — is refused with a JSON-RPC error, unread.
 
+**What this harness answers rather than errors.** Three of the server's other requests now get a
+real answer, because a method-not-found tells a server the client is broken rather than that it
+declined. An MCP elicitation is answered `decline` — the library renders no arbitrary form, and its
+`message`, `requestedSchema` and `content` are never deserialised at all, because a form's fields
+can name a credential. An `item/permissions/requestApproval` is brokered and answered with the
+requested profile echoed back verbatim under the scope the vendor declares, or with a profile that
+grants nothing; nothing is synthesised or widened. An `item/tool/requestUserInput` becomes a typed
+question that grants no authority, and a round carrying a question the vendor marks `isSecret` is
+refused whole and never shown to a host. `item/tool/call` remains refused: vendor tools never enter
+the host's tool registry.
+
 **Protocol types:** hand-written against OpenAI's own published schema rather than vendored from
 its source tree. `crates/mango-agent-codex/vendor/` holds the schema inventory
 `codex app-server generate-json-schema` produced at the pinned tag, under the Apache-2.0 notice in

@@ -144,7 +144,45 @@ ACP supplies none of its own, and flattening it would report a shutdown as "you 
 Every other reason, `refusal` included, completes the turn: a refusal is the agent ending its own turn,
 and reporting it as an error would tell a host to retry a decision.
 
+### Structured activity content
+
+`plan`, `tool_call` and `tool_call_update` carry more than a title and a one-line `detail`, and it
+reaches a host as `content` rather than being flattened:
+
+| ACP                                                                                        | `ActivityContent`                                                                   |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| [`plan`](https://agentclientprotocol.com/protocol/agent-plan)'s entries                    | `Plan { steps }` — no `id`, because ACP names no id for an entry                    |
+| a [`tool_call` diff block](https://agentclientprotocol.com/protocol/v1/tool-calls#content) | `Diff { files }`, one `FileChange` per block, `old_text`/`new_text` carried as sent |
+| a tool call's own text, when it sends no diff                                              | `Output { text }`                                                                   |
+| an empty `tool_call_update.content` collection                                             | `Empty`, which clears the earlier structured content                                |
+
+A diff block's `kind` is the one this crate reads rather than one a vendor states: ACP defines
+`oldText` as "the original content (None for new files)", so its absence is `Created` and its
+presence is `Modified`. The schema crate marks that field `DefaultOnError`, so an agent sending a
+*malformed* `oldText` produces the same absence an omitted one does and its file is reported as
+created. Following the protocol's own definition is the documented behaviour; the alternative drops
+a real signal for every honest agent to guard against a broken one.
+
+A diff block wins the one content slot on a call that sends both; the text alongside it is treated as
+commentary and stays in `detail` — this crate does not synthesise a unified diff from `old_text` and
+`new_text`, or a `FileChange` from `locations`, which reaches a host only as a bounded count under
+`extensions["locationCount"]` — named for what it is rather than for the vendor's field, because a
+key called `locations` holding a number tells a host the paths are in there and the scalar-only
+extension channel means they never can be. `raw_input`/`raw_output` never reach a host: both are unbounded vendor
+payloads. The tool-call activity's `item_id` is the same string as its call id, ACP naming no separate
+id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, not the agent's.
+
+ACP says a [`tool_call_update` collection replaces the previous collection](https://agentclientprotocol.com/protocol/v1/tool-calls#updating), rather than extending it. An omitted `content` field therefore leaves the host's structured content and detail untouched. An explicit empty collection emits `Some(ActivityContent::Empty)` and an empty detail, so the host removes the prior diff or output instead of retaining it.
+
 ## Permissions
+
+A withdrawn question resolves on both sides. The agent hears ACP's own `Cancelled` outcome; a host
+that was shown the prompt hears `ApprovalResolved` with `DecisionSource::Cancelled` and an option id
+of `withdrawn`, which is not one of the request's own options — naming one would tell an audit trail
+somebody picked it. The resolution is queued on the same path every other one uses, so it goes out
+ahead of the turn's terminal; one that loses that race is dropped with the queue, because a
+resolution after the terminal is worse than none. A question the host was never told about produces
+no resolution at all: there is nothing for it to close.
 
 Two axes, six cells, answered per profile by `profile::matrix`. Routing never varies — who answers an
 approval is the host's own arrangement (a `PermissionBroker`, or the `ApprovalRequested` event) and the

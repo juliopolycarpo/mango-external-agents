@@ -194,6 +194,17 @@ impl AcpHarness {
     /// party's instruction — and a vendor tool call must never reach a host's executor. Declining is
     /// not a gap: every agent here has its own file and shell tools and uses them, which is what the
     /// activity events describe.
+    ///
+    /// **Elicitation is declined too, and it is the one worth spelling out.** ACP's
+    /// `elicitation/create` is the protocol's question surface, and advertising
+    /// `ClientCapabilities::elicitation` is a promise to render an arbitrary JSON-schema form and
+    /// return whatever fields it names — including a field named `password`. This library renders
+    /// no forms and collects no secrets, so the capability stays unadvertised and an agent that
+    /// sends the request anyway is answered `method not found`. That is the honest answer rather
+    /// than a gap: a client that never advertised a surface does not support it, and returning a
+    /// polite refusal instead would tell the agent the surface exists here and can be retried.
+    /// Contrast Codex, whose `mcpServer/elicitation/request` arrives unsolicited and therefore
+    /// *does* get a native `decline` — see `docs/harness-codex.md`.
     fn client_capabilities() -> ClientCapabilities {
         ClientCapabilities::default()
             .fs(FileSystemCapabilities::default())
@@ -1041,6 +1052,8 @@ fn gate(version: Option<&str>, minimum: Option<&str>) -> GateVerdict {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::{AcpHarness, ceiling, gate};
     use mango_external_agents::{Capabilities, CapabilityCeiling, GateVerdict, Harness};
 
@@ -1122,5 +1135,27 @@ mod tests {
         assert!(!capabilities.fs.read_text_file);
         assert!(!capabilities.fs.write_text_file);
         assert!(!capabilities.terminal);
+    }
+
+    /// Advertising elicitation is a promise to render an arbitrary JSON-schema form and to return
+    /// whatever fields it names, including one named `password`. This library renders no forms and
+    /// collects no secrets, so the capability stays unadvertised — and an agent reads that as the
+    /// refusal it is. Pinned here because the decision is invisible in the wire frame: the field is
+    /// simply absent, and a future `ClientCapabilities::default()` that started advertising it would
+    /// turn a refusal into a promise with no other test noticing.
+    #[test]
+    fn the_client_advertises_no_elicitation_surface_of_any_mode() {
+        let capabilities = AcpHarness::client_capabilities();
+        assert!(
+            capabilities.elicitation.is_none(),
+            "expected no elicitation capability, received {:?}",
+            capabilities.elicitation
+        );
+        let advertised =
+            serde_json::to_value(&capabilities).expect("expected serialisable capabilities");
+        assert!(
+            advertised.get("elicitation").is_none_or(Value::is_null),
+            "expected the wire frame to carry no elicitation member, received {advertised}"
+        );
     }
 }

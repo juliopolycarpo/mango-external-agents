@@ -59,7 +59,21 @@ WANTED = [
     "FileChangeRequestApprovalParams",
     "FileChangeRequestApprovalResponse",
     "FileChangeApprovalDecision",
+    "PermissionsRequestApprovalParams",
+    "PermissionsRequestApprovalResponse",
+    "PermissionGrantScope",
+    "GrantedPermissionProfile",
     "ServerRequestResolvedNotification",
+    # Questions and forms. The server blocks on each of these, so their shapes belong to the
+    # contract even where the answer this harness sends is the native refusal.
+    "ToolRequestUserInputParams",
+    "ToolRequestUserInputQuestion",
+    "ToolRequestUserInputOption",
+    "ToolRequestUserInputResponse",
+    "ToolRequestUserInputAnswer",
+    "McpServerElicitationRequestParams",
+    "McpServerElicitationRequestResponse",
+    "McpServerElicitationAction",
     # Permissions as configuration.
     "AskForApproval",
     "SandboxMode",

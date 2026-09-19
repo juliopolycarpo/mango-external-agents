@@ -1758,6 +1758,15 @@ fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) -> Result<()> 
 /// A fresh run creates its conversation once it has a valid id. A strict resume is stronger: the
 /// id must be the exact candidate the host supplied, otherwise Claude may have started a different
 /// conversation and the turn must fail rather than present its output as resumed history.
+///
+/// An **established** session is held to the same standard for a different reason. Every turn after
+/// the first is spawned with `--resume <handle>`, so a supplied `system/init` handle must be both
+/// UUID-shaped and equal to that handle. A malformed or different one means the CLI could be
+/// answering from a conversation this session has never seen. Adopting it would replace the handle
+/// the host persisted with one whose history nobody read, silently, with no event to notice. The
+/// first turn stays lenient on purpose: it passes `--session-id`, and a CLI that started a
+/// different conversation anyway has made that conversation the real one, so following its id is
+/// the better guess.
 fn confirm_session_id(
     shared: &Shared,
     state: &mut Mutable,
@@ -1765,7 +1774,10 @@ fn confirm_session_id(
 ) -> Result<bool> {
     if !state.resume_pending {
         if session_id.is_some() {
-            state.established = true;
+            let established = std::mem::replace(&mut state.established, true);
+            if established {
+                confirm_established_session_id(shared, session_id)?;
+            }
         }
         return Ok(false);
     }
@@ -1794,6 +1806,31 @@ fn confirm_session_id(
     state.resume_pending = false;
     state.established = true;
     Ok(true)
+}
+
+/// Holds an established session's later turns to the handle they were spawned with.
+///
+/// An omitted echo remains accepted because the vendor did not make an assertion to compare. Any
+/// supplied echo must be UUID-shaped and equal to the established handle before this turn can
+/// publish output.
+fn confirm_established_session_id(shared: &Shared, session_id: Option<&str>) -> Result<()> {
+    let Some(session_id) = session_id else {
+        return Ok(());
+    };
+    if !crate::argv::is_vendor_session_id(session_id) {
+        return Err(Error::Protocol {
+            expected: String::from("a system/init record with a UUID-shaped Claude resume handle"),
+            received: String::from("a system/init record with an invalid session handle"),
+        });
+    }
+    let expected = shared.core_state.snapshot().ids.native_session_id.clone();
+    if expected.is_empty() || session_id == expected {
+        return Ok(());
+    }
+    Err(Error::Protocol {
+        expected: String::from("a system/init record continuing the session this turn resumed"),
+        received: String::from("a system/init record naming a different Claude session"),
+    })
 }
 
 /// Whether the next terminal vendor record still lacks strict-resume confirmation.

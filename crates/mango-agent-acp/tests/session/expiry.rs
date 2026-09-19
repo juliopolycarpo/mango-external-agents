@@ -209,6 +209,52 @@ async fn a_host_allow_at_the_deadline_is_expired_before_the_timer_task_runs() {
     session.close(CloseReason::Shutdown).await.expect("close");
 }
 
+/// A host that rendered the prompt has to be told the ask is over.
+///
+/// The turn ends, the agent is answered `Cancelled`, and before this nothing else was said — so a
+/// host holding the dialog it opened on `ApprovalRequested` kept it open forever. The resolution
+/// has to arrive *before* the terminal, which is the whole difficulty: the withdrawal happens on
+/// the way to ending the turn.
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_turn_closes_the_approval_it_had_already_shown_the_host() {
+    let (session, _launcher) = open(
+        FakeAcpAgent::new().asking_for_approval(Approval::Once),
+        permissive(),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("withdrawal", "run it"))
+        .await
+        .expect("expected turn");
+    loop {
+        let event = turn.recv().await.expect("expected approval request");
+        if matches!(event.kind, EventKind::ApprovalRequested { .. }) {
+            break;
+        }
+    }
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to land");
+    let events = drain(&mut turn).await;
+
+    let resolved = events
+        .iter()
+        .position(|event| matches!(event, EventKind::ApprovalResolved { decision, .. } if decision.source == DecisionSource::Cancelled));
+    let terminal = events
+        .iter()
+        .position(|event| matches!(event, EventKind::Completed | EventKind::Error { .. }));
+    let Some(resolved) = resolved else {
+        panic!("expected the withdrawn approval to be resolved, received {events:?}");
+    };
+    assert!(
+        terminal.is_none_or(|terminal| resolved < terminal),
+        "a resolution after the terminal is worse than none, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
+
 struct SlowAllowBroker;
 
 #[async_trait::async_trait]

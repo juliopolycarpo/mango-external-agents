@@ -20,12 +20,17 @@
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Plan, PlanEntryStatus, SessionConfigOption, SessionUpdate,
-    StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    SessionConfigOption, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use mango_external_agents::event::{
     Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, EventKind,
     ThreadUsage, Usage,
+};
+use mango_external_agents::{
+    ActivityContent, ExtensionValue, Extensions, FileChange, PlanStep, PlanStepPriority,
+    PlanStepStatus,
 };
 
 /// The call id every plan update shares.
@@ -120,11 +125,7 @@ impl Reducer {
         if std::mem::take(&mut self.plan_started) {
             events.push(EventKind::ActivityCompleted {
                 call_id: String::from(PLAN_CALL_ID),
-                result: ActivityResult {
-                    status: ActivityStatus::Completed,
-                    detail: None,
-                    truncated: false,
-                },
+                result: ActivityResult::new(ActivityStatus::Completed),
             });
         }
         events
@@ -205,19 +206,24 @@ impl Reducer {
     fn plan(&mut self, plan: Plan) -> Vec<EventKind> {
         let title = plan_title(&plan);
         let detail = plan_detail(&plan);
+        let content = plan_content(&plan);
         if std::mem::replace(&mut self.plan_started, true) {
             return vec![EventKind::ActivityUpdated {
                 call_id: String::from(PLAN_CALL_ID),
-                update: ActivityUpdate {
-                    title: Some(title),
-                    detail: Some(detail),
-                    truncated: false,
-                },
+                update: ActivityUpdate::new()
+                    .with_title(title)
+                    .with_detail(detail)
+                    .with_content(content),
             }];
         }
         vec![EventKind::ActivityStarted {
             call_id: String::from(PLAN_CALL_ID),
-            activity: Activity::new("plan", ActivityKind::Plan, title).with_detail(detail),
+            // No `with_item_id`: `PLAN_CALL_ID` is already the event's own call id, minted by this
+            // crate rather than sent by the agent, and repeating it as the item id would dress a
+            // library-invented id up as something the vendor said.
+            activity: Activity::new("plan", ActivityKind::Plan, title)
+                .with_detail(detail)
+                .with_content(content),
         }]
     }
 }
@@ -271,13 +277,26 @@ fn plain_text(content: ContentBlock) -> Option<String> {
 
 fn tool_call(call: ToolCall) -> Vec<EventKind> {
     let call_id = call.tool_call_id.to_string();
+    // The item id and the call id are the same string here — the tension with
+    // `Activity::item_id`'s own doc, "distinct from the call", is real: ACP names no id for a tool
+    // call's transcript item apart from `tool_call_id`. Carried anyway, so a host can route an
+    // update by item id the same way across harnesses, even on the one where the two ids coincide.
     let activity = Activity::new(
         tool_name(&call),
         activity_kind(call.kind),
         call.title.clone(),
-    );
+    )
+    .with_item_id(call_id.clone());
     let activity = match content_detail(&call.content) {
         Some(detail) => activity.with_detail(detail),
+        None => activity,
+    };
+    let activity = match tool_call_content(&call.content) {
+        Some(content) => activity.with_content(content),
+        None => activity,
+    };
+    let activity = match locations_extension(&call.locations) {
+        Some(extensions) => activity.with_extensions(extensions),
         None => activity,
     };
     let mut events = vec![EventKind::ActivityStarted {
@@ -295,26 +314,39 @@ fn tool_call(call: ToolCall) -> Vec<EventKind> {
 fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
     let call_id = update.tool_call_id.to_string();
     let fields = update.fields;
-    let detail = fields.content.as_deref().and_then(content_detail);
+    // ACP replaces this complete collection. Its absence must therefore leave the activity alone,
+    // while an explicit empty (or one carrying no shape this crate renders) clears the content a
+    // host retained from the earlier call. `detail` is derived from that same collection, so it is
+    // explicitly empty too instead of leaving an old diff path or output line visible.
+    let detail = fields
+        .content
+        .as_deref()
+        .map(|content| content_detail(content).unwrap_or_default());
+    let content = fields
+        .content
+        .as_deref()
+        .map(|content| tool_call_content(content).unwrap_or(ActivityContent::Empty));
+    // `locations` on an update is left uncarried: unlike `Activity`, `ActivityUpdate` has no
+    // extensions slot to put a count in, and `raw_input`/`raw_output` never go anywhere — both are
+    // unbounded vendor payloads this library forbids carrying.
     if let Some(result) = fields.status.and_then(finished) {
-        return vec![EventKind::ActivityCompleted {
-            call_id,
-            result: ActivityResult { detail, ..result },
-        }];
+        let result = result.with_optional_detail(detail);
+        let result = match content {
+            Some(content) => result.with_content(content),
+            None => result,
+        };
+        return vec![EventKind::ActivityCompleted { call_id, result }];
     }
-    if fields.title.is_none() && detail.is_none() {
+    let update = ActivityUpdate::new()
+        .with_optional_title(fields.title)
+        .with_optional_detail(detail)
+        .with_optional_content(content);
+    if update.is_empty() {
         // A status-only move to `in_progress`, or a `locations`/`raw_input` refinement: nothing a
         // host would render differently, and an empty update is noise in a transcript.
         return Vec::new();
     }
-    vec![EventKind::ActivityUpdated {
-        call_id,
-        update: ActivityUpdate {
-            title: fields.title,
-            detail,
-            truncated: false,
-        },
-    }]
+    vec![EventKind::ActivityUpdated { call_id, update }]
 }
 
 /// The outcome of a terminal tool-call status, or nothing while it is still running.
@@ -327,11 +359,7 @@ fn finished(status: ToolCallStatus) -> Option<ActivityResult> {
         // guessing "completed" would close an activity that is still running.
         _ => return None,
     };
-    Some(ActivityResult {
-        status,
-        detail: None,
-        truncated: false,
-    })
+    Some(ActivityResult::new(status))
 }
 
 /// The agent's own tool name when it sent one, its title otherwise.
@@ -363,19 +391,99 @@ pub fn activity_kind(kind: ToolKind) -> ActivityKind {
 
 /// One line of specifics from a tool call's content, when it carries any.
 ///
-/// The first block only: the content list is the whole output of a tool and the neutral
-/// [`Activity::detail`](mango_external_agents::Activity) is one line, bounded by the core on the way
-/// through. A diff reports its path rather than its body for the same reason.
+/// A text block wins first, whichever position it is in: the bug this fixed was a diff block ahead
+/// of a text block in the list eating the text, because the old `find_map` took the first block of
+/// any kind. Failing that, a diff reports its path — not its body, which is one line, bounded by the
+/// core on the way through, and a diff is not one line; the body itself survives as a
+/// [`FileChange`] row in this crate's own `tool_call_content` instead. Failing that, a terminal
+/// contributes its id, same as before.
 #[must_use]
 pub fn content_detail(content: &[ToolCallContent]) -> Option<String> {
+    content_text(content)
+        .or_else(|| {
+            content_diffs(content)
+                .into_iter()
+                .next()
+                .map(|file| file.path)
+        })
+        .or_else(|| {
+            // A terminal is the host's to own, and this harness declines the capability — so an
+            // agent that embeds one has nothing here a host could open. Its id is what it said.
+            content.iter().find_map(|block| match block {
+                ToolCallContent::Terminal(terminal) => Some(terminal.terminal_id.to_string()),
+                _ => None,
+            })
+        })
+}
+
+/// The first text block's own words, when the call carries one.
+fn content_text(content: &[ToolCallContent]) -> Option<String> {
     content.iter().find_map(|block| match block {
         ToolCallContent::Content(inner) => plain_text(inner.content.clone()),
-        ToolCallContent::Diff(diff) => Some(diff.path.display().to_string()),
-        // A terminal is the host's to own, and this harness declines the capability — so an agent
-        // that embeds one has nothing here a host could open. Its id is what it said.
-        ToolCallContent::Terminal(terminal) => Some(terminal.terminal_id.to_string()),
         _ => None,
     })
+}
+
+/// Every diff block as its own row, in the vendor's own order.
+///
+/// Never a unified diff synthesised from the two texts: the core forbids computing one
+/// representation of a change from another, so `old_text`/`new_text` are carried as ACP sent them
+/// and nothing here builds a patch out of them.
+///
+/// The `kind` falls out of [`FileChange::with_texts`], which reads an absent `oldText` as a new
+/// file — ACP's own words for that field are "the original content (None for new files)". It is the
+/// one kind in this crate that is read rather than stated, and the caveat is that the schema crate
+/// marks `oldText` `DefaultOnError`: an agent sending a malformed one produces the same `None` an
+/// omitted one does, and that file is reported as created. Following the protocol's own definition
+/// is the documented behaviour; the alternative is dropping the signal for every honest agent to
+/// guard against a broken one.
+fn content_diffs(content: &[ToolCallContent]) -> Vec<FileChange> {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ToolCallContent::Diff(diff) => Some(
+                FileChange::new(diff.path.display().to_string())
+                    .with_texts(diff.old_text.clone(), diff.new_text.clone()),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The structured thing a tool call's content blocks describe, when they describe one this crate
+/// carries.
+///
+/// Diff blocks win the slot when the call has any: they are the call's real output, and a text block
+/// alongside them is treated as commentary that `detail` already carries. A call with text and no
+/// diff gets that text as [`ActivityContent::Output`] too, its own thing rather than only the one
+/// bounded line `detail` carries. A call with only a terminal id produces no content — a terminal is
+/// the host's to own, and this harness has nothing else to say about it.
+#[must_use]
+fn tool_call_content(content: &[ToolCallContent]) -> Option<ActivityContent> {
+    let files = content_diffs(content);
+    if !files.is_empty() {
+        return Some(ActivityContent::Diff { files });
+    }
+    content_text(content).map(|text| ActivityContent::Output { text })
+}
+
+/// A bounded, observational count of the files a call names, when it names any.
+///
+/// `locations` is a list of paths the call touched or will touch, not itself a diff — carrying it
+/// whole would duplicate what `tool_call_content` already carries for a call that sends diffs, and
+/// invent structure for one that does not. A count is the one honest, bounded fact left.
+///
+/// Keyed `locationCount` rather than by the vendor's own field name, which is the one place this
+/// crate departs from "key it as the vendor spelled it". A key named `locations` holding a number
+/// tells a host the paths are in there; the extension channel is scalar-only, so they never can be,
+/// and a name that promises a list nothing will ever deliver is worse than a name the vendor did
+/// not write.
+fn locations_extension(locations: &[ToolCallLocation]) -> Option<Extensions> {
+    if locations.is_empty() {
+        return None;
+    }
+    let count = i64::try_from(locations.len()).unwrap_or(i64::MAX);
+    Some(Extensions::new().with("locationCount", ExtensionValue::Integer(count)))
 }
 
 fn plan_title(plan: &Plan) -> String {
@@ -398,6 +506,55 @@ fn plan_detail(plan: &Plan) -> String {
         .unwrap_or_default()
 }
 
+/// Every entry as a step, in the vendor's own order.
+///
+/// ACP's plan carries no id of its own for an entry — the whole plan is replaced wholesale each time
+/// it changes, which is why [`PLAN_CALL_ID`] exists — so
+/// [`PlanStep::id`](mango_external_agents::PlanStep) is left absent rather than invented from an
+/// entry's position, which would silently reassign a step's identity the moment the agent reordered
+/// its own list.
+fn plan_content(plan: &Plan) -> ActivityContent {
+    ActivityContent::Plan {
+        steps: plan.entries.iter().map(plan_step).collect(),
+    }
+}
+
+fn plan_step(entry: &PlanEntry) -> PlanStep {
+    let step = PlanStep::new(entry.content.clone()).with_status(plan_step_status(&entry.status));
+    match plan_step_priority(&entry.priority) {
+        Some(priority) => step.with_priority(priority),
+        None => step,
+    }
+}
+
+fn plan_step_status(status: &PlanEntryStatus) -> PlanStepStatus {
+    match status {
+        PlanEntryStatus::Pending => PlanStepStatus::Pending,
+        PlanEntryStatus::InProgress => PlanStepStatus::InProgress,
+        PlanEntryStatus::Completed => PlanStepStatus::Completed,
+        // `#[non_exhaustive]`: unreachable from the wire today — `Plan::entries` skips an entry
+        // whose status this build cannot parse rather than handing one through — but a future ACP
+        // status is not evidence the step was dropped, so it falls back to `PlanStepStatus`'s own
+        // `#[default]` rather than to a guess this crate has no basis for.
+        _ => PlanStepStatus::Pending,
+    }
+}
+
+/// How the vendor ranked one entry, or nothing when this build does not know the rank it sent.
+///
+/// `#[non_exhaustive]`: also unreachable from the wire today, for the same reason as
+/// [`plan_step_status`]. A future ACP priority becomes "no ranking" rather than a guessed one —
+/// [`PlanStep::priority`](mango_external_agents::PlanStep) is already an [`Option`] for exactly
+/// this, an unranked step read as one nobody ranked rather than one ranked low.
+fn plan_step_priority(priority: &PlanEntryPriority) -> Option<PlanStepPriority> {
+    match priority {
+        PlanEntryPriority::High => Some(PlanStepPriority::High),
+        PlanEntryPriority::Medium => Some(PlanStepPriority::Medium),
+        PlanEntryPriority::Low => Some(PlanStepPriority::Low),
+        _ => None,
+    }
+}
+
 /// Whether a stop reason means somebody stopped the turn rather than the agent finishing it.
 ///
 /// The other four — `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` — are the agent ending
@@ -414,6 +571,9 @@ mod tests {
     use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolKind};
     use mango_external_agents::event::{
         ActivityKind, ActivityStatus, Command, EventKind, ThreadUsage, Usage,
+    };
+    use mango_external_agents::{
+        ActivityContent, ExtensionValue, FileChangeKind, PlanStepPriority, PlanStepStatus,
     };
     use serde_json::json;
 
@@ -576,6 +736,11 @@ mod tests {
         assert_eq!(call_id, "call_1");
         assert_eq!(activity.kind, ActivityKind::Command);
         assert_eq!(activity.title, "Run `cargo test`");
+        assert_eq!(
+            activity.item_id.as_deref(),
+            Some("call_1"),
+            "expected the call id carried as the item id too"
+        );
     }
 
     /// A call that arrives already finished has to be completed in the same breath, or a host shows
@@ -626,33 +791,326 @@ mod tests {
 
     /// A move to `in_progress` with nothing else in it changes nothing a host renders, and an empty
     /// update is noise in a transcript.
+    ///
+    /// `rawInput` rides along on the wire, as an agent that already reported its raw frame on the
+    /// original `tool_call` will keep doing: it must not turn a no-op status move into a visible
+    /// update, because nothing here ever carries a raw vendor frame.
     #[test]
     fn a_status_only_move_to_in_progress_produces_nothing() {
         assert_eq!(
             reduce(vec![json!({
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "call_4",
-                "status": "in_progress"
+                "status": "in_progress",
+                "rawInput": { "command": "cargo test" }
             })]),
             Vec::<EventKind>::new()
         );
     }
 
+    /// A diff's path still lands in `detail` — a lone diff block is the "as today" case — but its
+    /// body no longer does: it survives as a [`FileChange`] row instead, and nothing here synthesises
+    /// a unified diff out of the two texts ACP sent.
     #[test]
-    fn a_diff_reports_its_path_rather_than_its_body() {
+    fn a_diff_reports_its_path_in_detail_and_its_body_as_a_file_change() {
         let events = reduce(vec![json!({
             "sessionUpdate": "tool_call",
             "toolCallId": "call_5",
             "title": "Edit",
             "kind": "edit",
             "status": "pending",
-            "content": [{ "type": "diff", "path": "/repo/src/lib.rs", "newText": "fn main() {}" }]
+            "content": [{
+                "type": "diff",
+                "path": "/repo/src/lib.rs",
+                "oldText": "fn main() {}",
+                "newText": "fn main() { println!(\"hi\"); }"
+            }]
         })]);
         let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(activity.detail.as_deref(), Some("/repo/src/lib.rs"));
         assert_eq!(activity.kind, ActivityKind::FileChange);
+        let Some(ActivityContent::Diff { files }) = &activity.content else {
+            panic!("expected diff content, received {:?}", activity.content);
+        };
+        assert_eq!(files.len(), 1, "received {files:?}");
+        assert_eq!(files[0].path, "/repo/src/lib.rs");
+        assert_eq!(files[0].kind, Some(FileChangeKind::Modified));
+        assert_eq!(files[0].old_text.as_deref(), Some("fn main() {}"));
+        assert_eq!(
+            files[0].new_text.as_deref(),
+            Some("fn main() { println!(\"hi\"); }")
+        );
+        assert_eq!(
+            files[0].unified_diff, None,
+            "expected no synthesised unified diff"
+        );
+    }
+
+    /// A diff with no `oldText` is ACP's own way of saying the file is new.
+    #[test]
+    fn a_diff_with_no_old_text_is_a_created_file() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_new",
+            "title": "Create",
+            "kind": "edit",
+            "status": "pending",
+            "content": [{ "type": "diff", "path": "/repo/src/new.rs", "newText": "fn new() {}" }]
+        })]);
+        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+            panic!("expected one activity, received {events:?}");
+        };
+        let Some(ActivityContent::Diff { files }) = &activity.content else {
+            panic!("expected diff content, received {:?}", activity.content);
+        };
+        assert_eq!(files[0].kind, Some(FileChangeKind::Created));
+        assert_eq!(files[0].old_text, None);
+    }
+
+    /// The bug this whole mapping exists to fix: a text block and a diff block used to cost a host
+    /// one of the two, because the old lookup took only the first content block. Now the text stays
+    /// in `detail` and the diff's files survive as their own content, whichever order ACP sent them.
+    #[test]
+    fn a_tool_call_with_text_and_a_diff_keeps_both() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_6",
+            "title": "Edit",
+            "kind": "edit",
+            "status": "pending",
+            "content": [
+                { "type": "diff", "path": "/repo/src/lib.rs", "newText": "fn main() {}" },
+                { "type": "content", "content": { "type": "text", "text": "rewrote the entry point" } }
+            ]
+        })]);
+        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+            panic!("expected one activity, received {events:?}");
+        };
+        assert_eq!(
+            activity.detail.as_deref(),
+            Some("rewrote the entry point"),
+            "expected the text, not the diff's path, once a text block is present"
+        );
+        let Some(ActivityContent::Diff { files }) = &activity.content else {
+            panic!(
+                "expected the diff to survive as content, received {:?}",
+                activity.content
+            );
+        };
+        assert_eq!(files.len(), 1, "received {files:?}");
+        assert_eq!(files[0].path, "/repo/src/lib.rs");
+    }
+
+    /// A call with text and no diff gets that text as `Output` content too, not only as the one
+    /// bounded line `detail` carries.
+    #[test]
+    fn a_text_only_tool_call_carries_its_body_as_output_content() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_7",
+            "title": "Run",
+            "kind": "execute",
+            "status": "pending",
+            "content": [{ "type": "content", "content": { "type": "text", "text": "2 tests passed" } }]
+        })]);
+        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+            panic!("expected one activity, received {events:?}");
+        };
+        assert_eq!(activity.detail.as_deref(), Some("2 tests passed"));
+        assert_eq!(
+            activity.content,
+            Some(ActivityContent::Output {
+                text: String::from("2 tests passed")
+            })
+        );
+    }
+
+    /// A call that names files it touches, without a diff, gets that as a bounded count rather than
+    /// the raw path list — `locations` is not itself a diff, and the paths belong in a `FileChange`
+    /// row, not a scalar map.
+    #[test]
+    fn a_tool_calls_locations_become_a_bounded_count() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_8",
+            "title": "Search",
+            "kind": "search",
+            "status": "pending",
+            "locations": [{ "path": "/repo/src/a.rs" }, { "path": "/repo/src/b.rs" }]
+        })]);
+        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+            panic!("expected one activity, received {events:?}");
+        };
+        assert_eq!(
+            activity.extensions.get("locationCount"),
+            Some(&ExtensionValue::Integer(2)),
+            "received {:?}",
+            activity.extensions
+        );
+    }
+
+    /// A tool call that names no locations must not invent a `locations` extension entry for zero.
+    #[test]
+    fn a_tool_call_with_no_locations_carries_no_locations_extension() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_8b",
+            "title": "Search",
+            "kind": "search",
+            "status": "pending"
+        })]);
+        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+            panic!("expected one activity, received {events:?}");
+        };
+        assert!(
+            activity.extensions.is_empty(),
+            "received {:?}",
+            activity.extensions
+        );
+    }
+
+    /// A `tool_call_update` that only changes content — no title, no terminal status — still has to
+    /// reach a host: before this, only `title`/`detail` were checked for "is this update empty",
+    /// which would have dropped a content-only revision on the floor.
+    #[test]
+    fn a_tool_call_update_that_only_changes_content_still_produces_an_update() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_9",
+                "title": "Edit",
+                "kind": "edit",
+                "status": "in_progress"
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_9",
+                "content": [{ "type": "diff", "path": "/repo/src/lib.rs", "newText": "fn main() {}" }]
+            }),
+        ]);
+        let update_event = events.iter().find(
+            |event| matches!(event, EventKind::ActivityUpdated { call_id, .. } if call_id == "call_9"),
+        );
+        let Some(EventKind::ActivityUpdated { update, .. }) = update_event else {
+            panic!("expected a content-only update, received {events:?}");
+        };
+        assert!(update.title.is_none());
+        let Some(ActivityContent::Diff { files }) = &update.content else {
+            panic!(
+                "expected diff content on the update, received {:?}",
+                update.content
+            );
+        };
+        assert_eq!(files[0].path, "/repo/src/lib.rs");
+    }
+
+    /// ACP replaces a tool call's complete content collection. An empty replacement must therefore
+    /// reach the host instead of being mistaken for an omitted `content` field, which retains what
+    /// the host already rendered.
+    #[test]
+    fn an_empty_tool_call_content_replacement_clears_the_activity() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_clear",
+                "title": "Edit",
+                "kind": "edit",
+                "status": "in_progress",
+                "content": [{
+                    "type": "diff",
+                    "path": "/repo/src/lib.rs",
+                    "newText": "fn main() {}"
+                }]
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_clear",
+                "content": []
+            }),
+        ]);
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.last() else {
+            panic!("expected an activity update that clears content, received {events:?}");
+        };
+        assert!(
+            update.content == Some(ActivityContent::Empty),
+            "expected an explicit content clear, received {update:?}"
+        );
+        assert_eq!(update.detail.as_deref(), Some(""));
+    }
+
+    /// `content` being absent is ACP leaving that collection unchanged. A later title update must
+    /// therefore carry neither an empty marker nor an empty detail that a host would read as a
+    /// replacement of the earlier diff.
+    #[test]
+    fn an_omitted_tool_call_content_update_retains_the_earlier_content() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_retain",
+                "title": "Edit",
+                "kind": "edit",
+                "status": "in_progress",
+                "content": [{
+                    "type": "diff",
+                    "path": "/repo/src/lib.rs",
+                    "newText": "fn main() {}"
+                }]
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_retain",
+                "title": "Editing src/lib.rs"
+            }),
+        ]);
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.last() else {
+            panic!("expected a title update that retains content, received {events:?}");
+        };
+        assert_eq!(update.title.as_deref(), Some("Editing src/lib.rs"));
+        assert_eq!(update.content, None);
+        assert_eq!(update.detail, None);
+    }
+
+    /// A terminal ACP update replaces its content collection just like a running one. The result
+    /// keeps the explicit empty marker so a host can distinguish it from a terminal update that
+    /// supplied no content field at all.
+    #[test]
+    fn an_empty_terminal_tool_call_content_replacement_carries_empty_result_content() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_complete_empty",
+            "status": "completed",
+            "content": []
+        })]);
+        let [EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
+            panic!("expected one completion, received {events:?}");
+        };
+        assert_eq!(result.content, Some(ActivityContent::Empty));
+        assert_eq!(result.detail.as_deref(), Some(""));
+    }
+
+    /// The `ActivityCompleted` a terminal status produces carries the same content the update did,
+    /// not just its detail.
+    #[test]
+    fn a_tool_call_update_that_completes_with_content_carries_it_on_the_result() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_10",
+            "status": "completed",
+            "content": [{ "type": "diff", "path": "/repo/src/lib.rs", "newText": "fn main() {}" }]
+        })]);
+        let [EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
+            panic!("expected one completion, received {events:?}");
+        };
+        assert_eq!(result.status, ActivityStatus::Completed);
+        let Some(ActivityContent::Diff { files }) = &result.content else {
+            panic!(
+                "expected diff content on the result, received {:?}",
+                result.content
+            );
+        };
+        assert_eq!(files[0].path, "/repo/src/lib.rs");
     }
 
     /// ACP v1's plan is replaced wholesale and carries no id, so the first one opens an activity and
@@ -696,10 +1154,42 @@ mod tests {
         assert_eq!(activity.kind, ActivityKind::Plan);
         assert_eq!(activity.title, "Plan: 0/2 done");
         assert_eq!(activity.detail.as_deref(), Some("read the code"));
+        assert_eq!(
+            activity.item_id, None,
+            "expected no invented item id for a plan the agent gave no id of its own"
+        );
         assert_eq!(update.title.as_deref(), Some("Plan: 1/2 done"));
         assert_eq!(update.detail.as_deref(), Some("write the test"));
         assert_eq!(completed, PLAN_CALL_ID);
         assert_eq!(result.status, ActivityStatus::Completed);
+
+        // The steps, not just the title and detail a host already rendered: this is what makes a
+        // revision a plan again instead of only a new sentence.
+        let Some(ActivityContent::Plan { steps }) = &activity.content else {
+            panic!(
+                "expected plan content on the start, received {:?}",
+                activity.content
+            );
+        };
+        assert_eq!(steps.len(), 2, "received {steps:?}");
+        assert_eq!(steps[0].id, None, "expected no id ACP never sent");
+        assert_eq!(steps[0].title, "read the code");
+        assert_eq!(steps[0].status, PlanStepStatus::InProgress);
+        assert_eq!(steps[0].priority, Some(PlanStepPriority::High));
+        assert_eq!(steps[1].status, PlanStepStatus::Pending);
+        assert_eq!(steps[1].priority, Some(PlanStepPriority::Medium));
+
+        let Some(ActivityContent::Plan {
+            steps: revised_steps,
+        }) = &update.content
+        else {
+            panic!(
+                "expected plan content on the revision, received {:?}",
+                update.content
+            );
+        };
+        assert_eq!(revised_steps[0].status, PlanStepStatus::Completed);
+        assert_eq!(revised_steps[1].status, PlanStepStatus::InProgress);
     }
 
     /// The command catalog is session state now, not a turn event: it is reported as a

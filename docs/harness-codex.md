@@ -247,13 +247,86 @@ confirms that answer and consumes its bounded acknowledgement; it cannot become 
 that spends capacity for a later approval. This is client-side timing only: it adds no app-server
 method or wire field beyond the existing [documented surface][readme].
 
+### Permissions
+
+`item/permissions/requestApproval` is a third approval family: a permission profile the agent asks
+to be granted, not a command or a file change. It drives through the same
+`PermissionRequest`/`PermissionBroker` path as the two families above, with three options mirroring
+the scopes the vendor's own `PermissionGrantScope` declares:
+
+| Option id       | Effect | Scope     | Answers with                                    |
+| --------------- | ------ | --------- | ----------------------------------------------- |
+| `grant:turn`    | Allow  | `Turn`    | `{"permissions": <echoed>, "scope": "turn"}`    |
+| `grant:session` | Allow  | `Session` | `{"permissions": <echoed>, "scope": "session"}` |
+| `deny`          | Reject | `Once`    | `{"permissions": {}}`                           |
+
+`permissions` always travels back exactly as the request carried it: this harness never
+synthesises, widens or narrows a permission profile, and the only alternative to granting exactly
+what was asked is granting nothing. It is also what the request's detail leads with, compactly
+serialised and unchanged, ahead of the agent's own `reason` and `cwd`: a host or a broker offered
+`grant:turn` is offered exactly this profile. Following the [app-server permissions contract][readme],
+the harness offers only `deny` if the profile and its `Grants` prefix cannot survive detail
+normalization unchanged. This covers the 4,096-code-point limit and stripped display-control
+characters. A long reason or working directory may still be truncated after the complete profile.
+`strictAutoReview` is never set — it asks the vendor to change
+how it reviews later requests on its own, a standing instruction this library has no basis to give.
+
+### Questions
+
+`item/tool/requestUserInput` is not an approval: answering it tells the agent something and
+authorises nothing, so it drives through `QuestionRequest`/`Session::answer` and a
+`PermissionBroker` is never consulted about one. The pinned build's own schema marks this surface
+**EXPERIMENTAL**.
+
+| Wire field                      | Core shape                                                  |
+| ------------------------------- | ----------------------------------------------------------- |
+| `id`                            | `QuestionId`                                                |
+| `question`                      | prompt                                                      |
+| `header`                        | detail                                                      |
+| `isBlocking` (round-level)      | `required`, on every question in the round                  |
+| `options` non-empty             | `QuestionForm::Choice`, each option's own `label` as its id |
+| `options` absent, null or empty | `QuestionForm::FreeText`                                    |
+
+`isOther` is not offered: the neutral question contract has no arm for "one of these, or write your
+own", so a round that sets it is presented as its declared choices only. A round where any question
+sets `isSecret` is refused whole and natively — the wire answer is `{"answers": {}}`, the event is
+`QuestionResolved` with `UnsupportedQuestion::SecretCollection` — and no part of it, blocking or
+not, ever reaches the host: a password typed into a box labelled "answer" is a password in a
+host's transcript. `autoResolutionMs` is declared but documented as deprecated and not read; the
+deadline is the same `Limits::approval_timeout` every approval shares. An unanswered round
+resolves exactly once, at that deadline, at a cancelled turn or session, or at a validated answer
+from `Session::answer` — whichever is first.
+
+A `serverRequest/resolved` withdrawal closes an announced question with `QuestionOutcome::Cancelled`
+without sending another answer to the server. An answer already accepted by `Session::answer`
+retains its outcome during shutdown and terminal cleanup. The pending round remains owned until
+its resolution is published, so `Completed` cannot leave an accepted answer's prompt open.
+
+### MCP elicitations
+
+`mcpServer/elicitation/request` asks the client to fill in an arbitrary JSON-schema form on an MCP
+server's behalf. It is answered ahead of the turn-correlation gates every other server request
+passes through: at this pin the `url` branch carries no `turnId` at all, and a server may write the
+member as `null`, so correlating first would answer the one family whose whole point is not
+receiving a JSON-RPC error with exactly that error. An elicitation that names no turn, names
+another turn, or arrives outside one is still declined on the wire; only one that belongs to the
+active turn is recorded as a `QuestionResolved` on it. This library renders no form — see `UnsupportedQuestion::ArbitraryForm` and the
+scope note in `docs/contracts.md` — so it answers `{"action": "decline"}` immediately and natively,
+never `cancel`: the vendor's own documentation is that `decline` lets the turn continue while
+`cancel` ends it, and refusing to render a form this library does not own is not a reason to end
+somebody's turn. None of the request's own fields (`message`, `requestedSchema`, `content`,
+`serverName`, `url`) are ever deserialised, so none of them can reach a host-visible event or a
+log. A `QuestionResolved` event carrying `UnsupportedQuestion::ArbitraryForm` records that the
+vendor asked and this library said no; no `QuestionAsked` is ever emitted for one, because a form
+is never put to a host.
+
 Every other server-initiated request is refused with a JSON-RPC error rather than left hanging:
 
-| Request                                                                                                                                                                        | Refusal                                                 |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
-| `item/tool/call`                                                                                                                                                               | Vendor tools never enter the host's tool registry       |
-| `account/chatgptAuthTokens/refresh`                                                                                                                                            | This library reads, stores and forwards no vendor token |
-| `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `attestation/generate`, the v1 `execCommandApproval` / `applyPatchApproval` | No answer in the neutral approval contract              |
+| Request                                                                     | Refusal                                                 |
+| --------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `item/tool/call`                                                            | Vendor tools never enter the host's tool registry       |
+| `account/chatgptAuthTokens/refresh`                                         | This library reads, stores and forwards no vendor token |
+| `attestation/generate`, the v1 `execCommandApproval` / `applyPatchApproval` | No answer in the neutral approval contract              |
 
 ## Auth, without reading a credential
 
@@ -365,9 +438,27 @@ protocol evidence, not a record of a model answer, command, tool result, review 
 The approval fixture records a **refusal**. A fixture that captured a grant would be a recording of
 this tool letting an agent out of its sandbox, checked into the repository.
 
+## Structured content
+
+What an item reports reaches a host as structure rather than as one more line of `detail`:
+
+| Item                                | `ActivityContent`                                                                  |
+| ----------------------------------- | ---------------------------------------------------------------------------------- |
+| `fileChange.changes[]`              | `Diff { files }`, one `FileChange` per change, `diff` as the unified diff          |
+| `commandExecution.aggregatedOutput` | `Output { text }`, beside the detail that also carries the exit code               |
+| `plan.text`                         | nothing — freeform at this pin, and splitting it into steps would invent structure |
+
+`FileChange::kind` stays **absent**: the pinned schema states no per-file kind, and reading one off
+the diff text would be the re-parsing the type exists to prevent. Every activity carries the item's
+own id in `item_id`. A subagent's thread id is not carried either — the vendored inventory is a
+flattened property union across all nineteen item families, so it cannot say which family owns
+`agentThreadId`, and no captured frame carries it.
+
 ## Known gaps
 
 - No websocket or unix-socket transport (see above).
+- A subagent item's thread id is unmappable: see above.
+- Claude-style plan structure has no counterpart; `plan` is freeform text at this pin.
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.

@@ -22,6 +22,16 @@ pub const PLAN_MAX_STEPS: usize = 128;
 /// How many files one diff summary may carry.
 pub const DIFF_MAX_FILES: usize = 256;
 
+/// How many code points of file *contents* one diff summary may carry in total.
+///
+/// Each of [`FileChange`]'s three bodies is bounded on its own, which is enough to stop any one of
+/// them being a payload channel and not enough to stop [`DIFF_MAX_FILES`] of them together: the
+/// per-file ceilings multiply out to megabytes, against a turn buffer a host sizes in megabytes.
+/// So the bodies share a budget. Files past it keep their row — the path and the counts, which is
+/// what a host lists — and lose their contents, because knowing *which* files changed is worth more
+/// than the first few bodies and costs almost nothing.
+pub const DIFF_MAX_CONTENT_LENGTH: usize = 256 * 1024;
+
 /// Where one plan step stands.
 #[derive(
     Clone,
@@ -50,6 +60,36 @@ pub enum PlanStepStatus {
     Dropped,
 }
 
+impl fmt::Display for PlanStepStatus {
+    /// The status as one lowercase word, for a host rendering a checklist.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in progress",
+            Self::Completed => "completed",
+            Self::Dropped => "dropped",
+        })
+    }
+}
+
+/// How important one plan step is, as the vendor ranked it.
+///
+/// Absent where the vendor states no ranking. An unranked step is one nobody ranked, not a
+/// low-priority one, which is why this is an [`Option`] on [`PlanStep`] rather than a default.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum PlanStepPriority {
+    /// Critical to the goal.
+    High,
+    /// Important, not critical.
+    Medium,
+    /// Nice to have.
+    Low,
+}
+
 /// One step of a plan the vendor wrote.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +104,9 @@ pub struct PlanStep {
     pub title: String,
     /// Where it stands.
     pub status: PlanStepStatus,
+    /// How the vendor ranked it, when it ranked it at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<PlanStepPriority>,
 }
 
 impl fmt::Debug for PlanStep {
@@ -73,6 +116,7 @@ impl fmt::Debug for PlanStep {
             .debug_struct("PlanStep")
             .field("has_id", &self.id.is_some())
             .field("status", &self.status)
+            .field("priority", &self.priority)
             .finish_non_exhaustive()
     }
 }
@@ -84,6 +128,7 @@ impl PlanStep {
             id: None,
             title: title.into(),
             status: PlanStepStatus::Pending,
+            priority: None,
         }
     }
 
@@ -101,23 +146,51 @@ impl PlanStep {
         self
     }
 
+    /// Records how the vendor ranked it.
+    #[must_use]
+    pub fn with_priority(mut self, priority: PlanStepPriority) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
     /// This step with its title bounded and an unusable id dropped.
     ///
     /// The id is dropped rather than refusing the step: a step nobody can address is still a step
     /// somebody can read, and losing the whole plan over one unusable id would be worse.
     #[must_use]
     pub fn normalized(self) -> Self {
-        Self {
-            id: self
-                .id
-                .and_then(|id| normalize::opaque_id(&id, "plan step id").ok()),
-            title: normalize::bound_text(&self.title, TextLimit::Title).text,
-            status: self.status,
-        }
+        self.normalized_with_truncation().0
+    }
+
+    /// The same, saying whether anything was cut or dropped.
+    ///
+    /// The caller is an [`ActivityContent`], which is carried by an event that publishes a
+    /// `truncated` flag. A cut that never reaches that flag is a host told its payload is whole.
+    #[must_use]
+    fn normalized_with_truncation(self) -> (Self, bool) {
+        let title = normalize::bound_text(&self.title, TextLimit::Title);
+        let had_id = self.id.is_some();
+        let id = self
+            .id
+            .and_then(|id| normalize::opaque_id(&id, "plan step id").ok());
+        let truncated = title.truncated || (had_id && id.is_none());
+        (
+            Self {
+                id,
+                title: title.text,
+                status: self.status,
+                priority: self.priority,
+            },
+            truncated,
+        )
     }
 }
 
 /// What happened to one file.
+///
+/// Carried as an [`Option`] on [`FileChange`]: two of the three vendors this library drives send a
+/// path and a body without ever saying which of these it is, and deriving one by re-reading the
+/// diff text would be the host depending on a vendor's prose that this module exists to prevent.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -134,6 +207,18 @@ pub enum FileChangeKind {
     Renamed,
 }
 
+impl fmt::Display for FileChangeKind {
+    /// What happened, as one lowercase word.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Created => "created",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+        })
+    }
+}
+
 /// One file an activity touched.
 ///
 /// A description, never an instruction. Nothing in this library applies one, and a host that reads
@@ -145,8 +230,9 @@ pub enum FileChangeKind {
 pub struct FileChange {
     /// The path, as the vendor spelled it.
     pub path: String,
-    /// What happened to it.
-    pub kind: FileChangeKind,
+    /// What happened to it, when the vendor said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<FileChangeKind>,
     /// Where it was before, for a rename.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_path: Option<String>,
@@ -159,6 +245,16 @@ pub struct FileChange {
     /// The diff itself, when the vendor sent one and it fits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_diff: Option<String>,
+    /// The contents before the change, when the vendor sent contents rather than a diff.
+    ///
+    /// Absent for a file the vendor says is new, and absent for a vendor that sends a diff: one of
+    /// the two shapes is never derived from the other. Rendering a diff from these two is the
+    /// host's own choice; computing one here would put bytes no vendor wrote into a transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    /// The contents after it, on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
 }
 
 impl fmt::Debug for FileChange {
@@ -171,27 +267,74 @@ impl fmt::Debug for FileChange {
             .field("added_lines", &self.added_lines)
             .field("removed_lines", &self.removed_lines)
             .field("has_unified_diff", &self.unified_diff.is_some())
+            .field("has_old_text", &self.old_text.is_some())
+            .field("has_new_text", &self.new_text.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl FileChange {
-    /// One file, with nothing counted.
-    pub fn new(path: impl Into<String>, kind: FileChangeKind) -> Self {
+    /// One file, with nothing said about it beyond its path.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{FileChange, FileChangeKind};
+    ///
+    /// let change = FileChange::new("src/lib.rs").with_kind(FileChangeKind::Modified);
+    /// assert_eq!(change.kind, Some(FileChangeKind::Modified));
+    /// ```
+    pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            kind,
+            kind: None,
             previous_path: None,
             added_lines: None,
             removed_lines: None,
             unified_diff: None,
+            old_text: None,
+            new_text: None,
         }
     }
 
-    /// Records where the file was before a rename.
+    /// Records what the vendor said happened to it.
+    #[must_use]
+    pub fn with_kind(mut self, kind: FileChangeKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    /// Records where the file was before a rename, and that it was one.
     #[must_use]
     pub fn moved_from(mut self, previous_path: impl Into<String>) -> Self {
         self.previous_path = Some(previous_path.into());
+        self.kind = Some(FileChangeKind::Renamed);
+        self
+    }
+
+    /// Carries the contents after the change, with nothing claimed about what happened to the file.
+    ///
+    /// For a vendor whose write tool both creates and overwrites: the body is a fact, and which of
+    /// the two it was is not one this library has. Use [`with_texts`](Self::with_texts) where the
+    /// vendor says whether there was a before.
+    #[must_use]
+    pub fn with_new_text(mut self, new: impl Into<String>) -> Self {
+        self.new_text = Some(new.into());
+        self
+    }
+
+    /// Carries the contents the vendor sent on either side of the change.
+    ///
+    /// `None` for `old` is the vendor saying the file is new, which is the one kind this can be
+    /// read off a body rather than guessed.
+    #[must_use]
+    pub fn with_texts(mut self, old: Option<String>, new: impl Into<String>) -> Self {
+        self.kind = Some(match old {
+            Some(_) => FileChangeKind::Modified,
+            None => FileChangeKind::Created,
+        });
+        self.old_text = old;
+        self.new_text = Some(new.into());
         self
     }
 
@@ -212,21 +355,76 @@ impl FileChange {
 
     /// This change with its paths and diff bounded, or nothing when the path cannot be carried.
     ///
-    /// A path is sanitised but never shortened, on the same terms as everywhere else: a shortened
-    /// path names a different file, and a row naming the wrong file is worse than a missing row.
+    /// A path must survive sanitisation and its length bound whole: repairing or shortening it
+    /// could name a different file, and a row naming the wrong file is worse than a missing row.
     #[must_use]
     pub fn normalized(self) -> Option<Self> {
-        Some(Self {
-            path: normalize::vendor_path(&self.path)?,
-            kind: self.kind,
-            previous_path: self
-                .previous_path
-                .and_then(|path| normalize::vendor_path(&path)),
-            unified_diff: self
-                .unified_diff
-                .map(|diff| normalize::bound_text(&diff, TextLimit::Detail).text),
+        self.normalized_with_truncation().0
+    }
+
+    /// This change with every body dropped, keeping the row that says which file it was.
+    #[must_use]
+    fn without_contents(self) -> Self {
+        Self {
+            unified_diff: None,
+            old_text: None,
+            new_text: None,
             ..self
-        })
+        }
+    }
+
+    /// How many code points its three bodies hold together.
+    fn content_length(&self) -> usize {
+        [
+            self.unified_diff.as_deref(),
+            self.old_text.as_deref(),
+            self.new_text.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|body| body.chars().count())
+        .sum()
+    }
+
+    /// The same, saying whether any body was cut or an optional path was dropped.
+    ///
+    /// A dropped row is reported by the caller, which is the only one that knows a row went
+    /// missing; this reports only what it shortened itself.
+    #[must_use]
+    fn normalized_with_truncation(self) -> (Option<Self>, bool) {
+        let unified_diff = self
+            .unified_diff
+            .map(|diff| normalize::bound_text(&diff, TextLimit::Detail));
+        let old_text = self
+            .old_text
+            .map(|text| normalize::bound_text(&text, TextLimit::Detail));
+        let new_text = self
+            .new_text
+            .map(|text| normalize::bound_text(&text, TextLimit::Detail));
+        let truncated = [unified_diff.as_ref(), old_text.as_ref(), new_text.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|bounded| bounded.truncated);
+        let Some(path) = normalize::vendor_path(&self.path) else {
+            return (None, truncated);
+        };
+        let had_previous_path = self.previous_path.is_some();
+        let previous_path = self
+            .previous_path
+            .and_then(|path| normalize::vendor_path(&path));
+        let truncated = truncated || (had_previous_path && previous_path.is_none());
+        (
+            Some(Self {
+                path,
+                kind: self.kind,
+                previous_path,
+                unified_diff: unified_diff.map(|bounded| bounded.text),
+                old_text: old_text.map(|bounded| bounded.text),
+                new_text: new_text.map(|bounded| bounded.text),
+                ..self
+            }),
+            truncated,
+        )
     }
 }
 
@@ -239,6 +437,13 @@ impl FileChange {
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ActivityContent {
+    /// Removes structured content from an activity that already has it.
+    ///
+    /// A started activity with no content uses `None`. In an [`ActivityUpdate`](crate::ActivityUpdate),
+    /// this marker tells a host to clear content retained from an earlier event. In an
+    /// [`ActivityResult`](crate::ActivityResult), it preserves that the vendor explicitly replaced
+    /// its terminal content collection with an empty one.
+    Empty,
     /// A plan, with steps that carry their own state.
     Plan {
         /// The steps, in the vendor's own order.
@@ -260,6 +465,7 @@ impl fmt::Debug for ActivityContent {
     /// Reports activity content shape without replaying vendor payloads.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Empty => formatter.write_str("Empty"),
             Self::Plan { steps } => formatter
                 .debug_struct("Plan")
                 .field("step_count", &steps.len())
@@ -277,24 +483,68 @@ impl ActivityContent {
     /// This content with every vendor-written value bounded and unusable rows dropped.
     #[must_use]
     pub fn normalized(self) -> Self {
+        self.normalized_with_truncation().0
+    }
+
+    /// The same, saying whether anything was cut, shortened or dropped on the way through.
+    ///
+    /// Every event that carries content also publishes a `truncated` flag, and that flag is a
+    /// promise: a host reading `false` is entitled to treat what it received as whole. A plan cut
+    /// to its ceiling, a file whose path could not be carried, a body shortened to fit — all three
+    /// are the flag's business, and none of them shows up in the title or the detail the flag used
+    /// to be derived from.
+    #[must_use]
+    pub fn normalized_with_truncation(self) -> (Self, bool) {
         match self {
-            Self::Plan { steps } => Self::Plan {
-                steps: steps
+            Self::Empty => (Self::Empty, false),
+            Self::Plan { steps } => {
+                let dropped = steps.len() > PLAN_MAX_STEPS;
+                let mut truncated = dropped;
+                let steps = steps
                     .into_iter()
                     .take(PLAN_MAX_STEPS)
-                    .map(PlanStep::normalized)
-                    .collect(),
-            },
-            Self::Diff { files } => Self::Diff {
-                files: files
-                    .into_iter()
-                    .filter_map(FileChange::normalized)
-                    .take(DIFF_MAX_FILES)
-                    .collect(),
-            },
-            Self::Output { text } => Self::Output {
-                text: normalize::bound_text(&text, TextLimit::Detail).text,
-            },
+                    .map(|step| {
+                        let (step, cut) = step.normalized_with_truncation();
+                        truncated |= cut;
+                        step
+                    })
+                    .collect();
+                (Self::Plan { steps }, truncated)
+            }
+            Self::Diff { files } => {
+                let offered = files.len();
+                let mut truncated = false;
+                let mut spent = 0usize;
+                let mut carried: Vec<FileChange> = Vec::with_capacity(offered.min(DIFF_MAX_FILES));
+                for file in files {
+                    if carried.len() == DIFF_MAX_FILES {
+                        break;
+                    }
+                    let (file, cut) = file.normalized_with_truncation();
+                    truncated |= cut;
+                    let Some(file) = file else {
+                        continue;
+                    };
+                    // Charged only for what is carried: a row whose bodies are dropped costs the
+                    // shared budget nothing, so a later row that still fits inside the remainder
+                    // keeps its own.
+                    let next = spent.saturating_add(file.content_length());
+                    if next <= DIFF_MAX_CONTENT_LENGTH {
+                        spent = next;
+                        carried.push(file);
+                        continue;
+                    }
+                    truncated = true;
+                    carried.push(file.without_contents());
+                }
+                let files = carried;
+                truncated |= files.len() < offered;
+                (Self::Diff { files }, truncated)
+            }
+            Self::Output { text } => {
+                let bounded = normalize::bound_text(&text, TextLimit::Detail);
+                (Self::Output { text: bounded.text }, bounded.truncated)
+            }
         }
     }
 }
@@ -302,8 +552,8 @@ impl ActivityContent {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityContent, DIFF_MAX_FILES, FileChange, FileChangeKind, PLAN_MAX_STEPS, PlanStep,
-        PlanStepStatus,
+        ActivityContent, DIFF_MAX_CONTENT_LENGTH, DIFF_MAX_FILES, FileChange, FileChangeKind,
+        PLAN_MAX_STEPS, PlanStep, PlanStepStatus,
     };
 
     /// A host cannot render a checklist from a paragraph, which is what folding a plan into detail
@@ -340,13 +590,31 @@ mod tests {
         assert_eq!(step.title, "do the thing");
     }
 
+    /// The event-level `truncated` flag must cover an id dropped while retaining the readable
+    /// step. Otherwise a host sees `false` while no longer holding every field the agent sent.
+    #[test]
+    fn a_dropped_plan_step_id_reports_truncation() {
+        let (content, truncated) = ActivityContent::Plan {
+            steps: vec![PlanStep::new("do the thing").with_id("s".repeat(129))],
+        }
+        .normalized_with_truncation();
+
+        assert!(truncated, "a dropped plan step id must be reported");
+        let ActivityContent::Plan { steps } = content else {
+            panic!("expected a plan");
+        };
+        assert_eq!(steps[0].id, None);
+    }
+
     #[test]
     fn a_diff_keeps_per_file_counts_and_the_vendors_own_order() {
         let content = ActivityContent::Diff {
             files: vec![
-                FileChange::new("src/lib.rs", FileChangeKind::Modified).with_line_counts(10, 2),
-                FileChange::new("src/new.rs", FileChangeKind::Created),
-                FileChange::new("src/moved.rs", FileChangeKind::Renamed).moved_from("src/old.rs"),
+                FileChange::new("src/lib.rs")
+                    .with_kind(FileChangeKind::Modified)
+                    .with_line_counts(10, 2),
+                FileChange::new("src/new.rs").with_kind(FileChangeKind::Created),
+                FileChange::new("src/moved.rs").moved_from("src/old.rs"),
             ],
         }
         .normalized();
@@ -367,8 +635,8 @@ mod tests {
     fn a_file_whose_path_cannot_be_carried_whole_is_dropped() {
         let content = ActivityContent::Diff {
             files: vec![
-                FileChange::new("p".repeat(4_097), FileChangeKind::Modified),
-                FileChange::new("src/lib.rs", FileChangeKind::Modified),
+                FileChange::new("p".repeat(4_097)).with_kind(FileChangeKind::Modified),
+                FileChange::new("src/lib.rs").with_kind(FileChangeKind::Modified),
             ],
         }
         .normalized();
@@ -378,6 +646,22 @@ mod tests {
         };
         assert_eq!(files.len(), 1, "received {files:?}");
         assert_eq!(files[0].path, "src/lib.rs");
+    }
+
+    /// A rename still names its current path when the previous one cannot be carried, but the
+    /// event must disclose that it omitted that former path.
+    #[test]
+    fn a_dropped_previous_path_reports_truncation() {
+        let (content, truncated) = ActivityContent::Diff {
+            files: vec![FileChange::new("src/lib.rs").moved_from("p".repeat(4_097))],
+        }
+        .normalized_with_truncation();
+
+        assert!(truncated, "a dropped previous path must be reported");
+        let ActivityContent::Diff { files } = content else {
+            panic!("expected a diff");
+        };
+        assert_eq!(files[0].previous_path, None);
     }
 
     #[test]
@@ -394,7 +678,9 @@ mod tests {
 
         let ActivityContent::Diff { files } = (ActivityContent::Diff {
             files: (0..DIFF_MAX_FILES + 10)
-                .map(|index| FileChange::new(format!("file{index}.rs"), FileChangeKind::Modified))
+                .map(|index| {
+                    FileChange::new(format!("file{index}.rs")).with_kind(FileChangeKind::Modified)
+                })
                 .collect(),
         })
         .normalized() else {
@@ -403,14 +689,107 @@ mod tests {
         assert_eq!(files.len(), DIFF_MAX_FILES);
     }
 
+    /// Per-file bounds stop any one body being a payload channel; they do not stop 256 of them
+    /// together, which multiply out to megabytes against a turn buffer a host sizes in megabytes.
+    /// The rows survive — which files changed is what a host lists — and the bodies stop.
+    #[test]
+    fn a_diffs_bodies_share_a_budget_and_the_rows_past_it_keep_their_paths() {
+        let body = "x".repeat(4_000);
+        let ActivityContent::Diff { files } = (ActivityContent::Diff {
+            files: (0..200)
+                .map(|index| {
+                    FileChange::new(format!("src/file{index}.rs"))
+                        .with_new_text(body.clone())
+                        .with_line_counts(10, 2)
+                })
+                .collect(),
+        })
+        .normalized() else {
+            panic!("expected a diff");
+        };
+
+        assert_eq!(files.len(), 200, "every row survives");
+        assert!(
+            files[0].new_text.is_some(),
+            "the first bodies are carried, received {:?}",
+            files[0]
+        );
+        assert_eq!(
+            files[199].new_text, None,
+            "a body past the budget is dropped, received {:?}",
+            files[199]
+        );
+        assert_eq!(
+            files[199].added_lines,
+            Some(10),
+            "the row keeps what a host lists it by"
+        );
+        let carried: usize = files
+            .iter()
+            .filter_map(|file| file.new_text.as_deref())
+            .map(|text| text.chars().count())
+            .sum();
+        assert!(
+            carried <= DIFF_MAX_CONTENT_LENGTH,
+            "expected at most {DIFF_MAX_CONTENT_LENGTH} code points of contents, received {carried}"
+        );
+    }
+
+    /// The budget is spent on bodies that are carried, not on bodies that are dropped.
+    ///
+    /// A row past the ceiling loses its contents, so it costs the shared budget nothing. Charging
+    /// it anyway would push the running total past the ceiling for good and strip every later row,
+    /// including small ones that were still well inside it. The existing 200-row test cannot see
+    /// this: there, nothing after the first overflow would have fit either way.
+    #[test]
+    fn a_body_dropped_for_overflow_does_not_spend_the_budget_it_never_used() {
+        // Under the per-file ceiling, so no row is shortened before the shared budget is applied.
+        let big = "x".repeat(4_000);
+        let small = "y".repeat(2_000);
+        // The last row that fits, then one that does not, then one that still would.
+        let fitting = DIFF_MAX_CONTENT_LENGTH / big.chars().count();
+        let mut files: Vec<FileChange> = (0..fitting)
+            .map(|index| FileChange::new(format!("src/file{index}.rs")).with_new_text(big.clone()))
+            .collect();
+        files.push(FileChange::new("src/overflows.rs").with_new_text(big.clone()));
+        files.push(FileChange::new("src/still_fits.rs").with_new_text(small.clone()));
+
+        let ActivityContent::Diff { files } = (ActivityContent::Diff { files }).normalized() else {
+            panic!("expected a diff");
+        };
+
+        assert_eq!(files.len(), fitting + 2, "every row survives");
+        assert_eq!(
+            files[fitting].new_text, None,
+            "the row past the ceiling loses its body, received {:?}",
+            files[fitting]
+        );
+        assert_eq!(
+            files[fitting + 1].new_text.as_deref(),
+            Some(small.as_str()),
+            "a later body inside the remaining budget is carried, received {:?}",
+            files[fitting + 1]
+        );
+        let carried: usize = files
+            .iter()
+            .filter_map(|file| file.new_text.as_deref())
+            .map(|text| text.chars().count())
+            .sum();
+        assert!(
+            carried <= DIFF_MAX_CONTENT_LENGTH,
+            "expected at most {DIFF_MAX_CONTENT_LENGTH} code points of contents, received {carried}"
+        );
+    }
+
     #[test]
     fn content_round_trips_through_serialization_under_its_own_tag() {
         for content in [
+            ActivityContent::Empty,
             ActivityContent::Plan {
                 steps: vec![PlanStep::new("one")],
             },
             ActivityContent::Diff {
-                files: vec![FileChange::new("a.rs", FileChangeKind::Deleted)],
+                files: vec![FileChange::new("a.rs").with_kind(FileChangeKind::Deleted)],
             },
             ActivityContent::Output {
                 text: String::from("done"),
@@ -425,11 +804,21 @@ mod tests {
         }
     }
 
+    /// `Empty` is an instruction rather than vendor text, so normalisation preserves it whole.
+    #[test]
+    fn empty_content_normalizes_without_claiming_a_truncation() {
+        assert_eq!(
+            ActivityContent::Empty.normalized_with_truncation(),
+            (ActivityContent::Empty, false)
+        );
+    }
+
     #[test]
     fn an_over_long_diff_body_is_cut_rather_than_dropping_the_file_it_describes() {
         let content = ActivityContent::Diff {
             files: vec![
-                FileChange::new("src/lib.rs", FileChangeKind::Modified)
+                FileChange::new("src/lib.rs")
+                    .with_kind(FileChangeKind::Modified)
                     .with_unified_diff("+".repeat(9_000)),
             ],
         }

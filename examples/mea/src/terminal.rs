@@ -1,32 +1,42 @@
 //! The smoke host asks the person at its terminal before granting a permission.
 
-use std::io::{IsTerminal, Write};
-
 use mango_external_agents::{
     BrokerDecision, PermissionBroker, PermissionEffect, PermissionRequest,
 };
 
-pub(crate) struct TerminalBroker;
+pub(crate) struct TerminalBroker {
+    input: crate::ask::TerminalInput,
+}
+
+impl TerminalBroker {
+    pub(crate) fn new(input: crate::ask::TerminalInput) -> Self {
+        Self { input }
+    }
+}
+
+impl Default for TerminalBroker {
+    fn default() -> Self {
+        Self::new(crate::ask::TerminalInput::new())
+    }
+}
 
 #[async_trait::async_trait]
 impl PermissionBroker for TerminalBroker {
     async fn decide(&self, request: &PermissionRequest) -> BrokerDecision {
-        if !std::io::stdin().is_terminal() {
-            return decision("");
-        }
-        let summary = request.title.clone();
-        let prompt = allow_prompt(request);
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        // A detached input thread cannot keep the async runtime alive after turn expiry.
-        std::thread::spawn(move || {
-            eprint!("{summary}\n{prompt}");
-            let _ = std::io::stderr().flush();
-            let mut answer = String::new();
-            let _ = std::io::stdin().read_line(&mut answer);
-            let _ = sender.send(decision(&answer));
-        });
-        receiver.await.unwrap_or_else(|_| decision(""))
+        let Some(answer) = self.input.prompt_line(&render_prompt(request)).await else {
+            return decision_for(request, "");
+        };
+        decision_for(request, &answer)
     }
+}
+
+/// The title and prompt a person must see before they choose a permission option.
+fn render_prompt(request: &PermissionRequest) -> String {
+    let detail = request
+        .detail
+        .as_deref()
+        .map_or(String::new(), |detail| format!("\n{detail}"));
+    format!("{}{detail}\n{}", request.title, allow_prompt(request))
 }
 
 /// What a "y" would actually grant, for the question printed above the prompt.
@@ -53,8 +63,20 @@ fn allow_prompt(request: &PermissionRequest) -> String {
     match (offers_allow, offers_a_narrow_allow) {
         (true, true) => String::from("Allow once? [y/N] "),
         (true, false) => String::from("Allow — this applies beyond this one request. [y/N] "),
-        (false, _) => String::from("Allow? [y/N] "),
+        (false, _) => String::from("Only refusal is available. Press Enter to continue. "),
     }
+}
+
+/// Turns a typed line into an approval only when the request offers an allowing option.
+fn decision_for(request: &PermissionRequest, answer: &str) -> BrokerDecision {
+    if request
+        .options
+        .iter()
+        .any(|option| option.effect == PermissionEffect::Allow)
+    {
+        return decision(answer);
+    }
+    decision("")
 }
 
 fn decision(answer: &str) -> BrokerDecision {
@@ -68,6 +90,7 @@ fn decision(answer: &str) -> BrokerDecision {
 
 #[cfg(test)]
 mod tests {
+    use std::io::IsTerminal;
     use std::time::{Duration, SystemTime};
 
     use super::*;
@@ -96,7 +119,7 @@ mod tests {
                 .with_scope(PermissionScope::Once),
         ]);
         assert!(matches!(
-            TerminalBroker.decide(&request).await,
+            TerminalBroker::default().decide(&request).await,
             BrokerDecision::Deny { .. }
         ));
     }
@@ -144,11 +167,33 @@ mod tests {
     }
 
     #[test]
-    fn no_allow_option_renders_a_generic_question() {
+    fn a_permission_prompt_includes_the_detail_that_defines_its_authority() {
+        let request = permission_request(vec![
+            PermissionOption::new("allow", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once),
+        ])
+        .with_detail("read files: [/workspace/src]\nnetwork: enabled");
+
+        let prompt = render_prompt(&request);
+        assert!(
+            prompt.contains("read files: [/workspace/src]\nnetwork: enabled"),
+            "expected the full permission detail in the prompt, received {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn no_allow_option_explains_that_only_refusal_is_available() {
         let request = permission_request(vec![PermissionOption::new(
             "reject",
             PermissionEffect::Reject,
         )]);
-        assert_eq!(allow_prompt(&request), "Allow? [y/N] ");
+        assert_eq!(
+            allow_prompt(&request),
+            "Only refusal is available. Press Enter to continue. "
+        );
+        assert!(
+            matches!(decision_for(&request, "yes"), BrokerDecision::Deny { .. }),
+            "a typed yes must not become an approval when no allow option exists"
+        );
     }
 }

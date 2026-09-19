@@ -300,6 +300,7 @@ fn finish(status: Option<TurnStatus>, turn: &crate::protocol::requests::TurnHand
 mod tests {
     use super::{Outcome, reduce, routes_to_active_turn};
     use crate::protocol::notifications::{Notification, method};
+    use mango_external_agents::content::ActivityContent;
     use mango_external_agents::event::{ActivityKind, ActivityStatus, EventKind};
     use mango_external_agents::session::CancelReason;
     use serde_json::json;
@@ -548,6 +549,58 @@ mod tests {
         };
         assert_eq!(call_id, "exec-1");
         assert_eq!(result.status, ActivityStatus::Completed);
+    }
+
+    /// `call_id` on the envelope and `item_id` on the `Activity` are the same value, but only the
+    /// one on the `Activity` survives if a host keeps activities without their envelope.
+    #[test]
+    fn a_started_activitys_item_id_matches_its_call_id() {
+        let started = reduce(
+            &notification(
+                method::ITEM_STARTED,
+                json!({"threadId": THREAD, "turnId": "u", "item": {
+                    "type": "commandExecution", "id": "exec-9", "command": "echo mango",
+                    "status": "inProgress"
+                }}),
+            ),
+            THREAD,
+            now(),
+        );
+        let Outcome::Emit(events) = started else {
+            panic!("expected an activity, received {started:?}");
+        };
+        let EventKind::ActivityStarted { call_id, activity } = &events[0] else {
+            panic!("expected an activity start, received {events:?}");
+        };
+        assert_eq!(activity.item_id.as_deref(), Some(call_id.as_str()));
+    }
+
+    /// A patch's diff reaches the reducer as structure, not only as the joined path list the
+    /// command-completion test above already covers.
+    #[test]
+    fn a_file_changes_diff_reaches_the_reducer_as_structured_content() {
+        let diff = "@@ -1 +1 @@\n-old\n+new\n";
+        let started = reduce(
+            &notification(
+                method::ITEM_STARTED,
+                json!({"threadId": THREAD, "turnId": "u", "item": {
+                    "type": "fileChange", "id": "patch-1", "status": "inProgress",
+                    "changes": [{"path": "src/lib.rs", "diff": diff}]
+                }}),
+            ),
+            THREAD,
+            now(),
+        );
+        let Outcome::Emit(events) = started else {
+            panic!("expected an activity, received {started:?}");
+        };
+        let EventKind::ActivityStarted { activity, .. } = &events[0] else {
+            panic!("expected an activity start, received {events:?}");
+        };
+        let Some(ActivityContent::Diff { files }) = &activity.content else {
+            panic!("expected diff content, received {:?}", activity.content);
+        };
+        assert_eq!(files[0].unified_diff.as_deref(), Some(diff));
     }
 
     /// The turn's own text arrives twice — as deltas, then as a finished item. Rendering the item

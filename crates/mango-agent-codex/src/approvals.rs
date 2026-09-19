@@ -9,13 +9,16 @@ use std::time::SystemTime;
 
 use mango_external_agents::event::ActivityKind;
 use mango_external_agents::interaction::{Interaction, InteractionId, InteractionKind};
+use mango_external_agents::normalize::{self, TextLimit};
 use mango_external_agents::operation::OperationRef;
 use mango_external_agents::permission::{
     PermissionEffect, PermissionOption, PermissionRequest, PermissionRisk, PermissionScope,
 };
 
 use crate::protocol::approvals::{
-    ApprovalDecisionValue, CommandExecutionApprovalParams, FileChangeApprovalParams, ServerRequest,
+    ApprovalDecisionValue, CommandExecutionApprovalParams, FileChangeApprovalParams,
+    PermissionGrantScope, PermissionsRequestApprovalParams, PermissionsRequestApprovalResponse,
+    ServerAnswer, ServerRequest,
 };
 
 /// One question, and the answers this harness will take for it.
@@ -28,7 +31,9 @@ pub struct PendingApproval {
     /// What a host renders and a broker decides on.
     pub request: PermissionRequest,
     /// The wire value each option id answers with.
-    decisions: Vec<(String, ApprovalDecisionValue)>,
+    decisions: Vec<(String, ServerAnswer)>,
+    /// The answer that refuses without stopping the turn.
+    refusal: ServerAnswer,
 }
 
 impl PendingApproval {
@@ -38,7 +43,7 @@ impl PendingApproval {
     /// [`PermissionRequest::respond`] already refuses — checked again here because the answer to
     /// an unoffered id would otherwise be a decision nobody chose.
     #[must_use]
-    pub fn decision_for(&self, option_id: &str) -> Option<ApprovalDecisionValue> {
+    pub fn decision_for(&self, option_id: &str) -> Option<ServerAnswer> {
         self.decisions
             .iter()
             .find(|(id, _)| id == option_id)
@@ -59,11 +64,12 @@ impl PendingApproval {
     /// The answer that refuses without stopping the turn.
     ///
     /// What a timed-out or cancelled question is resolved with: the turn goes on, and the agent is
-    /// told no. `cancel` would stop the turn, which is a different decision and not one a deadline
-    /// gets to make.
+    /// told no. For the two ordinary approval families this is `decline`, never `cancel` — `cancel`
+    /// stops the turn, which is a different decision and not one a deadline gets to make. For a
+    /// permissions grant it is a granted profile that grants nothing: `{"permissions": {}}`.
     #[must_use]
-    pub fn refusal(&self) -> ApprovalDecisionValue {
-        ApprovalDecisionValue::Decline
+    pub fn refusal(&self) -> ServerAnswer {
+        self.refusal.clone()
     }
 }
 
@@ -81,6 +87,8 @@ pub(crate) fn to_request(
             Some(from_command(params, operation, expires_at))
         }
         ServerRequest::FileChange(params) => Some(from_file_change(params, operation, expires_at)),
+        ServerRequest::Permissions(params) => Some(from_permissions(params, operation, expires_at)),
+        ServerRequest::RequestUserInput(_) | ServerRequest::McpElicitation(_) => None,
         ServerRequest::Refused { .. } => None,
     }
 }
@@ -169,9 +177,14 @@ fn build(
     expires_at: SystemTime,
 ) -> PendingApproval {
     let options: Vec<PermissionOption> = decisions.iter().map(option_for).collect();
-    let decisions = decisions
+    let decisions: Vec<(String, ServerAnswer)> = decisions
         .into_iter()
-        .map(|decision| (decision.option_id().to_owned(), decision))
+        .map(|decision| {
+            (
+                decision.option_id().to_owned(),
+                ServerAnswer::Approval(decision),
+            )
+        })
         .collect();
     // The question, as the vendor names it: its own callback id where it has one, and the item it
     // gates otherwise. Not the JSON-RPC request id, which names the frame rather than the thing
@@ -194,7 +207,109 @@ fn build(
         Some(detail) => request.with_detail(detail),
         None => request,
     };
-    PendingApproval { request, decisions }
+    PendingApproval {
+        request,
+        decisions,
+        refusal: ServerAnswer::Approval(ApprovalDecisionValue::Decline),
+    }
+}
+
+/// The vendor asks whether the client will grant this permission profile.
+///
+/// A completely displayable profile offers a turn grant, a session grant, or a denial. Other
+/// profiles offer only denial. A grant echoes the requested profile unchanged.
+fn from_permissions(
+    params: &PermissionsRequestApprovalParams,
+    operation: OperationRef,
+    expires_at: SystemTime,
+) -> PendingApproval {
+    // A grant is available only if the complete profile survives the host's display bounds.
+    // Check the same normalization used by PermissionRequest, including character stripping.
+    // Reasons and cwd follow the profile so their truncation cannot conceal granted authority.
+    let profile = format!("Grants {}", params.permissions);
+    let profile_visible = !normalize::bound_text(&profile, TextLimit::Detail).truncated;
+    let title = if profile_visible {
+        "Grant the requested permissions"
+    } else {
+        "Deny permissions that cannot be displayed completely"
+    };
+    let mut lines: Vec<String> = Vec::with_capacity(3);
+    lines.push(profile);
+    if let Some(reason) = params.reason.as_deref() {
+        lines.push(reason.to_owned());
+    }
+    if let Some(cwd) = params.cwd.as_deref() {
+        lines.push(format!("in {cwd}"));
+    }
+    let detail = (!lines.is_empty()).then(|| lines.join("\n\n"));
+
+    let mut options = vec![
+        PermissionOption::new("grant:turn", PermissionEffect::Allow)
+            .with_label("Grant for this turn")
+            .with_scope(PermissionScope::Turn),
+        PermissionOption::new("grant:session", PermissionEffect::Allow)
+            .with_label("Grant for this session")
+            .with_scope(PermissionScope::Session),
+        PermissionOption::new("deny", PermissionEffect::Reject)
+            .with_label("Deny")
+            .with_scope(PermissionScope::Once),
+    ];
+    let mut decisions: Vec<(String, ServerAnswer)> = vec![
+        (
+            String::from("grant:turn"),
+            ServerAnswer::Permissions {
+                option_id: "grant:turn",
+                response: PermissionsRequestApprovalResponse::grant(
+                    params.permissions.clone(),
+                    PermissionGrantScope::Turn,
+                ),
+            },
+        ),
+        (
+            String::from("grant:session"),
+            ServerAnswer::Permissions {
+                option_id: "grant:session",
+                response: PermissionsRequestApprovalResponse::grant(
+                    params.permissions.clone(),
+                    PermissionGrantScope::Session,
+                ),
+            },
+        ),
+        (
+            String::from("deny"),
+            ServerAnswer::Permissions {
+                option_id: "deny",
+                response: PermissionsRequestApprovalResponse::deny(),
+            },
+        ),
+    ];
+    let refusal = decisions[2].1.clone();
+    if !profile_visible {
+        options.retain(|option| option.effect == PermissionEffect::Reject);
+        decisions.retain(|(id, _)| id == "deny");
+    }
+
+    // Named by the item it gates, the same convention `build` uses for the two ordinary approval
+    // families — not the JSON-RPC request id, which names the frame rather than the thing asked.
+    let interaction = Interaction::new(
+        InteractionId::new(&params.item_id),
+        InteractionKind::Permission,
+        operation.session_id.clone(),
+        expires_at,
+    )
+    .during(operation);
+    // `ActivityKind::Other`: a permissions grant is not tied to one command or file change, so
+    // none of the other kinds describe it any better.
+    let request = PermissionRequest::new(interaction, ActivityKind::Other, title, options);
+    let request = match detail {
+        Some(detail) => request.with_detail(detail),
+        None => request,
+    };
+    PendingApproval {
+        request,
+        decisions,
+        refusal,
+    }
 }
 
 /// What one vendor decision means, in the neutral vocabulary a policy can answer in.
@@ -453,9 +568,13 @@ mod tests {
 
         assert_eq!(
             with.decision_for("acceptWithExecpolicyAmendment"),
-            Some(ApprovalDecisionValue::AcceptWithExecpolicyAmendment(json!(
-                ["/bin/bash", "-lc", "printf 'mango' > mango.txt"]
-            ))),
+            Some(super::ServerAnswer::Approval(
+                ApprovalDecisionValue::AcceptWithExecpolicyAmendment(json!([
+                    "/bin/bash",
+                    "-lc",
+                    "printf 'mango' > mango.txt"
+                ]))
+            )),
             "expected the request's own payload to travel back with the answer"
         );
     }
@@ -472,8 +591,10 @@ mod tests {
 
         assert_eq!(
             with.decision_for("applyNetworkPolicyAmendment"),
-            Some(ApprovalDecisionValue::ApplyNetworkPolicyAmendment(
-                json!({"host": "example.com", "allow": true})
+            Some(super::ServerAnswer::Approval(
+                ApprovalDecisionValue::ApplyNetworkPolicyAmendment(
+                    json!({"host": "example.com", "allow": true})
+                )
             ))
         );
     }
@@ -512,7 +633,9 @@ mod tests {
         assert_eq!(pending.decision_for("acceptEverythingForever"), None);
         assert_eq!(
             pending.decision_for("decline"),
-            Some(ApprovalDecisionValue::Decline)
+            Some(super::ServerAnswer::Approval(
+                ApprovalDecisionValue::Decline
+            ))
         );
     }
 
@@ -554,5 +677,208 @@ mod tests {
             .expect("expected the question to survive bounding");
         assert_eq!(bounded.options.len(), 6);
         assert_eq!(bounded.id().as_str(), "exec-ee0f9baa");
+    }
+
+    /// A permissions grant offers exactly three options, and each echoes the request's own
+    /// profile back rather than inventing, widening or narrowing one.
+    #[test]
+    fn a_permissions_grant_offers_three_options_that_echo_the_requested_profile() {
+        let request = ServerRequest::parse(
+            method::PERMISSIONS_APPROVAL,
+            json!({
+                "threadId": "t", "turnId": "u", "itemId": "perm-1",
+                "cwd": "/workspace", "reason": "needs filesystem access",
+                "permissions": {"fs": {"read": true}},
+            }),
+        );
+        let pending = to_request(&request, now()).expect("expected a question");
+
+        assert_eq!(pending.request.id().as_str(), "perm-1");
+        assert_eq!(pending.request.options.len(), 3);
+        assert!(
+            pending
+                .request
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("/workspace")),
+            "expected the working directory in the detail, received {:?}",
+            pending.request.detail
+        );
+
+        let turn = pending
+            .decision_for("grant:turn")
+            .expect("expected a turn-scoped grant");
+        assert_eq!(
+            turn,
+            super::ServerAnswer::Permissions {
+                option_id: "grant:turn",
+                response: crate::protocol::approvals::PermissionsRequestApprovalResponse::grant(
+                    json!({"fs": {"read": true}}),
+                    crate::protocol::approvals::PermissionGrantScope::Turn,
+                ),
+            }
+        );
+
+        let session = pending
+            .decision_for("grant:session")
+            .expect("expected a session-scoped grant");
+        assert_eq!(
+            session,
+            super::ServerAnswer::Permissions {
+                option_id: "grant:session",
+                response: crate::protocol::approvals::PermissionsRequestApprovalResponse::grant(
+                    json!({"fs": {"read": true}}),
+                    crate::protocol::approvals::PermissionGrantScope::Session,
+                ),
+            }
+        );
+
+        assert_eq!(
+            pending.refusal(),
+            pending
+                .decision_for("deny")
+                .expect("expected a deny option")
+        );
+        assert_eq!(pending.refusal().to_wire(), json!({"permissions": {}}));
+    }
+
+    /// The profile a grant hands over leads the detail, so bounding cannot hide it.
+    ///
+    /// A detail is cut from its end. With the profile behind the agent's own words, an agent that
+    /// writes a long enough `reason` decides what a host sees of the authority it is about to be
+    /// offered — which is the concealment this ordering exists to stop.
+    #[test]
+    fn a_permissions_detail_leads_with_the_profile_however_long_the_reason_is() {
+        let request = ServerRequest::parse(
+            method::PERMISSIONS_APPROVAL,
+            json!({
+                "threadId": "t", "turnId": "u", "itemId": "perm-1",
+                "cwd": "/workspace", "reason": "y".repeat(8_192),
+                "permissions": {"fs": {"read": true}},
+            }),
+        );
+        let pending = to_request(&request, now()).expect("expected a question");
+        let detail = pending
+            .request
+            .detail
+            .as_deref()
+            .expect("expected a detail carrying the requested profile");
+        assert!(
+            detail.starts_with(r#"Grants {"fs":{"read":true}}"#),
+            "expected the profile at the head of the detail, received {:?}",
+            &detail[..detail.len().min(64)]
+        );
+
+        let bounded = pending
+            .request
+            .normalized()
+            .expect("expected the request to bound");
+        let bounded_detail = bounded
+            .detail
+            .as_deref()
+            .expect("expected the bounded detail to survive");
+        assert!(
+            bounded_detail.contains(r#"{"fs":{"read":true}}"#),
+            "expected the profile to survive bounding, received {:?}",
+            &bounded_detail[..bounded_detail.len().min(64)]
+        );
+        assert!(
+            bounded.truncated,
+            "expected the over-long reason to be reported as cut"
+        );
+    }
+
+    #[test]
+    fn a_permissions_profile_that_cannot_be_displayed_completely_offers_only_denial() {
+        for path in [
+            "a".repeat(4_096),
+            String::from("/workspace/\u{202e}private"),
+        ] {
+            let request = ServerRequest::parse(
+                method::PERMISSIONS_APPROVAL,
+                json!({
+                    "threadId": "t", "turnId": "u", "itemId": "perm-1",
+                    "permissions": {
+                        "fileSystem": {"read": [path]},
+                        "network": {"enabled": true},
+                    },
+                }),
+            );
+            let pending = to_request(&request, now()).expect("expected a denial prompt");
+            let bounded = pending
+                .request
+                .clone()
+                .normalized()
+                .expect("bounded prompt");
+            assert!(
+                bounded.truncated,
+                "expected the profile display to be changed"
+            );
+            assert_eq!(
+                bounded
+                    .options
+                    .iter()
+                    .map(|option| option.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["deny"],
+                "expected denial only when normalization hides part of the granted authority"
+            );
+            assert!(pending.decision_for("grant:turn").is_none());
+            assert!(pending.decision_for("grant:session").is_none());
+            assert!(
+                bounded.allow().is_err(),
+                "expected a broker grant to be refused"
+            );
+            assert!(
+                bounded.deny().is_ok(),
+                "expected the denial to remain usable"
+            );
+            assert_eq!(pending.refusal().to_wire(), json!({"permissions": {}}));
+        }
+    }
+
+    #[test]
+    fn a_permissions_profile_at_the_display_limit_still_offers_grants() {
+        let empty = json!({"fileSystem": {"read": [""]}, "network": {"enabled": true}});
+        let overhead = format!("Grants {empty}").chars().count();
+        let request = ServerRequest::parse(
+            method::PERMISSIONS_APPROVAL,
+            json!({
+                "threadId": "t", "turnId": "u", "itemId": "perm-1",
+                "reason": "r".repeat(8_192),
+                "permissions": {
+                    "fileSystem": {"read": ["é".repeat(
+                        mango_external_agents::normalize::TextLimit::Detail.max_code_points() - overhead
+                    )]},
+                    "network": {"enabled": true},
+                },
+            }),
+        );
+        let pending = to_request(&request, now()).expect("expected a permission prompt");
+        assert!(pending.decision_for("grant:turn").is_some());
+        assert!(pending.decision_for("grant:session").is_some());
+        let bounded = pending.request.normalized().expect("bounded prompt");
+        assert!(bounded.truncated, "expected the reason to be removed");
+        assert!(
+            bounded
+                .detail
+                .expect("profile detail")
+                .ends_with(r#""network":{"enabled":true}}"#)
+        );
+    }
+
+    /// `deny` is offered as an ordinary refusal, not the standing-rule vocabulary the two ordinary
+    /// approval families reserve for `cancel`.
+    #[test]
+    fn a_permissions_denial_is_an_ordinary_refusal() {
+        let request = ServerRequest::parse(
+            method::PERMISSIONS_APPROVAL,
+            json!({"threadId": "t", "turnId": "u", "itemId": "perm-1", "permissions": {}}),
+        );
+        let pending = to_request(&request, now()).expect("expected a question");
+        let deny = pending
+            .option("deny")
+            .expect("expected a deny option among the three offered");
+        assert_eq!(deny.effect, PermissionEffect::Reject);
     }
 }

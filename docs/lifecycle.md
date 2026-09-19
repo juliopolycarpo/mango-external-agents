@@ -64,11 +64,20 @@ and 8 MiB of serialized queued payload. Permission and question facts have a sep
 reserve of twice `max_pending_requests`, 128 events by default, within that same byte budget.
 The queue preserves ordering between payload and interaction events.
 
+Codex question settlement stays pending until `QuestionResolved` is published. Accepting an answer
+does not release that ownership: terminal cleanup publishes an accepted outcome before completing
+the turn, and server withdrawal closes any announced prompt.
+
 The terminal has separate storage for one bounded error or the pair `Cancelled`, `Completed`.
 Committing it never waits for transcript consumption and cannot create a detached delivery task.
 The first terminal wins; later events are refused. Vendor failure fields are normalized before
 the terminal or its observable status retains them. Host session and turn IDs remain exact, so
 hosts must bound those identifiers too.
+
+Structured content is bounded before it is queued, and a diff's file contents share one budget of
+their own (`DIFF_MAX_CONTENT_LENGTH`) — otherwise 256 per-file ceilings multiply out to megabytes in
+a single event against that same 8 MiB. A file past the budget keeps its row and loses its bodies,
+and `truncated` says so. See [`contracts.md`](contracts.md).
 
 Exceeding a count or byte budget returns `LimitExceeded` and commits a `stream-overflow` failure.
 Already queued events remain readable, followed by that failure. The driver stops native work.
