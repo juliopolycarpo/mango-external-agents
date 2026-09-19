@@ -2038,6 +2038,13 @@ mod tests {
             "expected the owning attempt's forced stop to taint the continuation, received {:?}",
             state.nonresumable
         );
+        // The other half of the same pointer check, and the one that keeps the assertion above
+        // honest: a `should_clear` stuck at `false` would leave a stopped, settled turn holding
+        // admission forever while every check here still passed.
+        assert!(
+            state.active.is_none(),
+            "expected the owning attempt's settled stop to release the slot, received one still held"
+        );
     }
 
     /// A session dropped rather than closed must hand its artifact to the blocking pool, not run
