@@ -162,19 +162,21 @@ impl PlanStep {
         self.normalized_with_truncation().0
     }
 
-    /// The same, saying whether anything was cut.
+    /// The same, saying whether anything was cut or dropped.
     ///
     /// The caller is an [`ActivityContent`], which is carried by an event that publishes a
     /// `truncated` flag. A cut that never reaches that flag is a host told its payload is whole.
     #[must_use]
     fn normalized_with_truncation(self) -> (Self, bool) {
         let title = normalize::bound_text(&self.title, TextLimit::Title);
-        let truncated = title.truncated;
+        let had_id = self.id.is_some();
+        let id = self
+            .id
+            .and_then(|id| normalize::opaque_id(&id, "plan step id").ok());
+        let truncated = title.truncated || (had_id && id.is_none());
         (
             Self {
-                id: self
-                    .id
-                    .and_then(|id| normalize::opaque_id(&id, "plan step id").ok()),
+                id,
                 title: title.text,
                 status: self.status,
                 priority: self.priority,
@@ -353,8 +355,8 @@ impl FileChange {
 
     /// This change with its paths and diff bounded, or nothing when the path cannot be carried.
     ///
-    /// A path is sanitised but never shortened, on the same terms as everywhere else: a shortened
-    /// path names a different file, and a row naming the wrong file is worse than a missing row.
+    /// A path must survive sanitisation and its length bound whole: repairing or shortening it
+    /// could name a different file, and a row naming the wrong file is worse than a missing row.
     #[must_use]
     pub fn normalized(self) -> Option<Self> {
         self.normalized_with_truncation().0
@@ -384,7 +386,7 @@ impl FileChange {
         .sum()
     }
 
-    /// The same, saying whether any of its three bodies was cut.
+    /// The same, saying whether any body was cut or an optional path was dropped.
     ///
     /// A dropped row is reported by the caller, which is the only one that knows a row went
     /// missing; this reports only what it shortened itself.
@@ -406,13 +408,16 @@ impl FileChange {
         let Some(path) = normalize::vendor_path(&self.path) else {
             return (None, truncated);
         };
+        let had_previous_path = self.previous_path.is_some();
+        let previous_path = self
+            .previous_path
+            .and_then(|path| normalize::vendor_path(&path));
+        let truncated = truncated || (had_previous_path && previous_path.is_none());
         (
             Some(Self {
                 path,
                 kind: self.kind,
-                previous_path: self
-                    .previous_path
-                    .and_then(|path| normalize::vendor_path(&path)),
+                previous_path,
                 unified_diff: unified_diff.map(|bounded| bounded.text),
                 old_text: old_text.map(|bounded| bounded.text),
                 new_text: new_text.map(|bounded| bounded.text),
@@ -576,6 +581,22 @@ mod tests {
         assert_eq!(step.title, "do the thing");
     }
 
+    /// The event-level `truncated` flag must cover an id dropped while retaining the readable
+    /// step. Otherwise a host sees `false` while no longer holding every field the agent sent.
+    #[test]
+    fn a_dropped_plan_step_id_reports_truncation() {
+        let (content, truncated) = ActivityContent::Plan {
+            steps: vec![PlanStep::new("do the thing").with_id("s".repeat(129))],
+        }
+        .normalized_with_truncation();
+
+        assert!(truncated, "a dropped plan step id must be reported");
+        let ActivityContent::Plan { steps } = content else {
+            panic!("expected a plan");
+        };
+        assert_eq!(steps[0].id, None);
+    }
+
     #[test]
     fn a_diff_keeps_per_file_counts_and_the_vendors_own_order() {
         let content = ActivityContent::Diff {
@@ -616,6 +637,22 @@ mod tests {
         };
         assert_eq!(files.len(), 1, "received {files:?}");
         assert_eq!(files[0].path, "src/lib.rs");
+    }
+
+    /// A rename still names its current path when the previous one cannot be carried, but the
+    /// event must disclose that it omitted that former path.
+    #[test]
+    fn a_dropped_previous_path_reports_truncation() {
+        let (content, truncated) = ActivityContent::Diff {
+            files: vec![FileChange::new("src/lib.rs").moved_from("p".repeat(4_097))],
+        }
+        .normalized_with_truncation();
+
+        assert!(truncated, "a dropped previous path must be reported");
+        let ActivityContent::Diff { files } = content else {
+            panic!("expected a diff");
+        };
+        assert_eq!(files[0].previous_path, None);
     }
 
     #[test]
