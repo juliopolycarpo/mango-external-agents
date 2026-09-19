@@ -511,8 +511,12 @@ impl ActivityContent {
                     let Some(file) = file else {
                         continue;
                     };
-                    spent = spent.saturating_add(file.content_length());
-                    if spent <= DIFF_MAX_CONTENT_LENGTH {
+                    // Charged only for what is carried: a row whose bodies are dropped costs the
+                    // shared budget nothing, so a later row that still fits inside the remainder
+                    // keeps its own.
+                    let next = spent.saturating_add(file.content_length());
+                    if next <= DIFF_MAX_CONTENT_LENGTH {
+                        spent = next;
                         carried.push(file);
                         continue;
                     }
@@ -673,6 +677,52 @@ mod tests {
             files[199].added_lines,
             Some(10),
             "the row keeps what a host lists it by"
+        );
+        let carried: usize = files
+            .iter()
+            .filter_map(|file| file.new_text.as_deref())
+            .map(|text| text.chars().count())
+            .sum();
+        assert!(
+            carried <= DIFF_MAX_CONTENT_LENGTH,
+            "expected at most {DIFF_MAX_CONTENT_LENGTH} code points of contents, received {carried}"
+        );
+    }
+
+    /// The budget is spent on bodies that are carried, not on bodies that are dropped.
+    ///
+    /// A row past the ceiling loses its contents, so it costs the shared budget nothing. Charging
+    /// it anyway would push the running total past the ceiling for good and strip every later row,
+    /// including small ones that were still well inside it. The existing 200-row test cannot see
+    /// this: there, nothing after the first overflow would have fit either way.
+    #[test]
+    fn a_body_dropped_for_overflow_does_not_spend_the_budget_it_never_used() {
+        // Under the per-file ceiling, so no row is shortened before the shared budget is applied.
+        let big = "x".repeat(4_000);
+        let small = "y".repeat(2_000);
+        // The last row that fits, then one that does not, then one that still would.
+        let fitting = DIFF_MAX_CONTENT_LENGTH / big.chars().count();
+        let mut files: Vec<FileChange> = (0..fitting)
+            .map(|index| FileChange::new(format!("src/file{index}.rs")).with_new_text(big.clone()))
+            .collect();
+        files.push(FileChange::new("src/overflows.rs").with_new_text(big.clone()));
+        files.push(FileChange::new("src/still_fits.rs").with_new_text(small.clone()));
+
+        let ActivityContent::Diff { files } = (ActivityContent::Diff { files }).normalized() else {
+            panic!("expected a diff");
+        };
+
+        assert_eq!(files.len(), fitting + 2, "every row survives");
+        assert_eq!(
+            files[fitting].new_text, None,
+            "the row past the ceiling loses its body, received {:?}",
+            files[fitting]
+        );
+        assert_eq!(
+            files[fitting + 1].new_text.as_deref(),
+            Some(small.as_str()),
+            "a later body inside the remaining budget is carried, received {:?}",
+            files[fitting + 1]
         );
         let carried: usize = files
             .iter()
