@@ -1,0 +1,31 @@
+{
+  "protocolVersion": 1,
+  "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+      "image": false,
+      "audio": false,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "sessionCapabilities": {
+      "list": {},
+      "resume": {},
+      "close": {}
+    },
+    "auth": {}
+  },
+  "authMethods": [
+    {
+      "id": "cached_token",
+      "name": "cached_token"
+    },
+    {
+      "id": "grok.com",
+      "name": "Grok"
+    }
+  ]
+}

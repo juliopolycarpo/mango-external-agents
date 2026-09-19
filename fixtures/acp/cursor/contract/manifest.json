@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "profile": "cursor",
+  "probe": "initialize",
+  "reproducible": false,
+  "sessionOpened": false,
+  "capturedFrom": "2026.09.10-fd3934a",
+  "capturedAt": "2026-09-19",
+  "files": {
+    "initialize.json": "sha256:a9bde86e013f35ff3611a92b811c8ce09b837ef284167cb3f4a6710500b96e38",
+    "version.json": "sha256:71658b25c753ff604c67952d7eaba8e79d4fccf18093d79c10e3c73fc91086e5"
+  }
+}

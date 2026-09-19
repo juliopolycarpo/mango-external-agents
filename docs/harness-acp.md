@@ -367,10 +367,17 @@ Two methods, and they are not degrees of the same thing:
 - `VerificationMethod::CommittedCapture` — a capture under `fixtures/` proves the handshake this
   profile's argv produces, and nothing past it.
 
-`opencode` is the second kind and is deliberately **not** verified. Its committed capture is an
-`initialize` probe whose manifest records `sessionOpened: false`; calling that verified would claim a
-session nobody opened. A profile with no evidence at all is a documented entry nobody has run; a host
-can say so in its own interface, and nothing here pretends otherwise.
+`cursor` and `grok` carry one of each: the live run that earned verification, and the handshake
+captured beside it, so the capability set they are driven under is a file rather than a memory.
+`opencode` carries the second kind alone and is deliberately **not** verified. Its committed capture
+is an `initialize` probe whose manifest records `sessionOpened: false`; calling that verified would
+claim a session nobody opened. A profile with no evidence at all is a documented entry nobody has
+run; a host can say so in its own interface, and nothing here pretends otherwise.
+
+A capture is not automatically reproducible. `scripts/install-vendor-cli.sh` pins `claude`, `codex`
+and `opencode` and nothing else, so `fixtures/acp/cursor/` and `fixtures/acp/grok/` declare
+`reproducible: false` and record `capturedFrom` and `capturedAt` in place of a promise CI cannot
+keep. The digests hold them to the tree either way.
 
 ### Executable names and installation order
 
@@ -483,8 +490,9 @@ never going to work.
   it exposes the live negotiated catalog and refuses a model or effort mapping that is missing or
   ambiguous.
 
-- **Public OpenCode contract capture.** `mea capture --harness acp --profile opencode` records the
-  installed CLI's version and its v1 `initialize` answer under `fixtures/acp/opencode/contract/`.
+- **Public ACP contract captures.** `mea capture --harness acp --profile <id>` records the installed
+  CLI's version and its v1 `initialize` answer under `fixtures/acp/<id>/contract/` — committed today
+  for `opencode`, `cursor` and `grok`.
   It sends no `authenticate` or `session/new` request. The capture keeps each auth method's `type`,
   `id` and `name` and the shape of `agentCapabilities`, drops `_meta` extension objects, and
   replaces every string *value* inside `agentCapabilities` with `[REDACTED]` rather than guessing

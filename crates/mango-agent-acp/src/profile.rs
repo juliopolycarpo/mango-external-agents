@@ -484,6 +484,16 @@ fn cursor() -> AcpProfile {
         method: VerificationMethod::LiveSession,
         source: SMOKE_TEST,
     })
+    // The live run above was re-run on this day and the handshake it produced committed beside
+    // it, so the capability set this profile is driven under is a file rather than a memory.
+    // `reproducible: false` in its manifest: `cursor-agent` has no pinned installer here, so CI
+    // cannot reproduce this capture and it is read as a maintainer's record of one build.
+    .with_verification(VerificationEvidence {
+        agent_version: "2026.09.10-fd3934a",
+        checked_on: "2026-09-19",
+        method: VerificationMethod::CommittedCapture,
+        source: "fixtures/acp/cursor/contract",
+    })
 }
 
 /// Grok Build's documented ACP v1 command, with background updates disabled.
@@ -515,6 +525,15 @@ fn grok() -> AcpProfile {
         checked_on: "2026-09-13",
         method: VerificationMethod::LiveSession,
         source: SMOKE_TEST,
+    })
+    // Re-run on this day and its handshake committed, on the same terms as Cursor's above:
+    // no pinned installer, so the capture is a maintainer's record rather than a reproducible
+    // contract. `capturedFrom` keeps the whole `--version` line, banner included.
+    .with_verification(VerificationEvidence {
+        agent_version: "1.0.30",
+        checked_on: "2026-09-19",
+        method: VerificationMethod::CommittedCapture,
+        source: "fixtures/acp/grok/contract",
     })
 }
 
@@ -751,6 +770,12 @@ mod tests {
     /// A profile claims verification only after `tests/smoke.rs` has been run against the agent
     /// itself. Anything else would put a check in a host's interface that nobody performed, so this
     /// test is the list — and it is what has to be updated when the next profile is driven for real.
+    ///
+    /// The two lists are deliberately different lengths. `opencode` has a committed handshake and
+    /// no live run, so it is captured and **not** verified; `cursor` and `grok` now have both. A
+    /// capture proves the argv reaches an ACP handshake and nothing more, which is exactly why
+    /// promoting a profile on the strength of one would be the unevidenced claim this pair of
+    /// assertions exists to prevent.
     #[test]
     fn only_profiles_checked_against_a_real_agent_claim_to_be_verified() {
         let claimed: Vec<String> = builtin_profiles()
@@ -776,8 +801,12 @@ mod tests {
             .collect();
         assert_eq!(
             captured,
-            vec![String::from("opencode")],
-            "expected only the profile with a committed capture, received {captured:?}"
+            vec![
+                String::from("cursor"),
+                String::from("grok"),
+                String::from("opencode"),
+            ],
+            "expected only the profiles with a committed handshake, received {captured:?}"
         );
     }
 
