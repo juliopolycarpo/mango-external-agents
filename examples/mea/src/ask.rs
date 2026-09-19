@@ -7,6 +7,8 @@
 //! and a "yes" typed at one of these prompts can never become an approval.
 
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 use mango_external_agents::interaction::ANSWER_TEXT_MAX_LENGTH;
 use mango_external_agents::{
@@ -32,27 +34,101 @@ pub(crate) trait QuestionInput: Send + Sync {
 }
 
 /// The person at the terminal, when there is one.
-pub(crate) struct TerminalInput;
+///
+/// One worker owns standard input for this turn. A question that ends while `read_line` is blocked
+/// drops its receiver, so the worker discards that line before it renders the next question. A
+/// second reader would race the old one and could consume a line meant for the next prompt.
+#[derive(Clone)]
+pub(crate) struct TerminalInput {
+    requests: mpsc::Sender<InputRequest>,
+}
+
+struct InputRequest {
+    prompt: String,
+    answer: tokio::sync::oneshot::Sender<String>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct PendingInput {
+    cancelled: Arc<AtomicBool>,
+    completed: bool,
+}
+
+impl Drop for PendingInput {
+    fn drop(&mut self) {
+        if self.completed || self.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        eprintln!(
+            "\nInput cancelled. Press Enter to discard the current line; the next prompt will then appear."
+        );
+    }
+}
+
+impl TerminalInput {
+    pub(crate) fn new() -> Self {
+        let (requests, receiver) = mpsc::channel();
+        std::thread::spawn(move || read_terminal_lines(receiver));
+        Self { requests }
+    }
+
+    /// Renders `prompt` and waits for one line, if this process owns a terminal.
+    pub(crate) async fn prompt_line(&self, prompt: &str) -> Option<String> {
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+        let (answer, receiver) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.requests
+            .send(InputRequest {
+                prompt: prompt.to_owned(),
+                answer,
+                cancelled: Arc::clone(&cancelled),
+            })
+            .ok()?;
+        let mut pending = PendingInput {
+            cancelled,
+            completed: false,
+        };
+        let typed = receiver.await.ok();
+        pending.completed = typed.is_some();
+        typed
+    }
+}
+
+/// The sole owner of the blocking standard-input read for one terminal input object.
+fn read_terminal_lines(requests: mpsc::Receiver<InputRequest>) {
+    deliver_terminal_lines(requests, || {
+        let mut typed = String::new();
+        let _ = std::io::stdin().read_line(&mut typed);
+        typed
+    });
+}
+
+/// Renders requests in order and drops a line whose request ended while it was being read.
+fn deliver_terminal_lines(
+    requests: mpsc::Receiver<InputRequest>,
+    mut read_line: impl FnMut() -> String,
+) {
+    while let Ok(request) = requests.recv() {
+        if request.cancelled.load(Ordering::Acquire) {
+            continue;
+        }
+        eprint!("{}", request.prompt);
+        let _ = std::io::stderr().flush();
+        let typed = read_line();
+        // The receiver is gone when the event loop withdrew the prompt. Dropping its line keeps a
+        // cancelled question from becoming the answer to whichever prompt arrives next.
+        if !request.cancelled.load(Ordering::Acquire) {
+            let _ = request.answer.send(typed);
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl QuestionInput for TerminalInput {
     async fn read_line(&self, prompt: &str) -> Option<String> {
-        if !std::io::stdin().is_terminal() {
-            return None;
-        }
-        let prompt = prompt.to_owned();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        // A detached input thread cannot keep the async runtime alive past the round's deadline,
-        // which is the same reason the permission broker beside this one reads on a thread of its
-        // own.
-        std::thread::spawn(move || {
-            eprint!("{prompt}");
-            let _ = std::io::stderr().flush();
-            let mut typed = String::new();
-            let _ = std::io::stdin().read_line(&mut typed);
-            let _ = sender.send(typed);
-        });
-        receiver.await.ok()
+        self.prompt_line(prompt).await
     }
 }
 
@@ -70,7 +146,7 @@ impl QuestionInput for TerminalInput {
 /// ```
 pub(crate) async fn answer_round(
     input: &dyn QuestionInput,
-    request: &QuestionRequest,
+    request: QuestionRequest,
 ) -> QuestionResponse {
     let mut answers = Vec::with_capacity(request.questions.len());
     for question in &request.questions {
@@ -185,6 +261,9 @@ fn bounded(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, SystemTime};
 
     use mango_external_agents::interaction::ANSWER_TEXT_MAX_LENGTH;
@@ -193,7 +272,10 @@ mod tests {
         QuestionId, QuestionOption, QuestionOptionId, QuestionRequest, SessionId,
     };
 
-    use super::{QuestionInput, answer_round, offline_answer, prompt_for, read_answer};
+    use super::{
+        InputRequest, QuestionInput, answer_round, deliver_terminal_lines, offline_answer,
+        prompt_for, read_answer,
+    };
 
     /// A keyboard that types the same line at every prompt, or nobody at all.
     struct ScriptedInput(Option<String>);
@@ -203,6 +285,65 @@ mod tests {
         async fn read_line(&self, _prompt: &str) -> Option<String> {
             self.0.clone()
         }
+    }
+
+    /// A named stand-in for the one blocking line source the terminal worker owns.
+    struct FakeTerminalLines {
+        lines: VecDeque<String>,
+        cancel_during_first_read: Arc<AtomicBool>,
+        reads: usize,
+    }
+
+    impl FakeTerminalLines {
+        fn read_line(&mut self) -> String {
+            self.reads += 1;
+            if self.reads == 1 {
+                self.cancel_during_first_read.store(true, Ordering::Release);
+            }
+            self.lines
+                .pop_front()
+                .expect("expected a line for each pending terminal read")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_read_discards_its_line_before_the_next_prompt_reads() {
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (first_answer, first_response) = tokio::sync::oneshot::channel();
+        let (second_answer, second_response) = tokio::sync::oneshot::channel();
+        sender
+            .send(InputRequest {
+                prompt: String::from("first: "),
+                answer: first_answer,
+                cancelled: Arc::clone(&cancelled),
+            })
+            .expect("expected the first prompt to reach the worker");
+        sender
+            .send(InputRequest {
+                prompt: String::from("second: "),
+                answer: second_answer,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })
+            .expect("expected the second prompt to reach the worker");
+        drop(sender);
+
+        let mut lines = FakeTerminalLines {
+            lines: VecDeque::from([String::from("old line\n"), String::from("new line\n")]),
+            cancel_during_first_read: cancelled,
+            reads: 0,
+        };
+        deliver_terminal_lines(receiver, || lines.read_line());
+
+        assert!(
+            first_response.await.is_err(),
+            "the line read after cancellation must not answer the old prompt"
+        );
+        assert_eq!(
+            second_response.await.expect("expected the second answer"),
+            "new line\n",
+            "the next prompt must read its own line after the cancelled one was discarded"
+        );
     }
 
     fn choice(required: bool) -> Question {
@@ -315,7 +456,7 @@ mod tests {
     async fn a_pasted_answer_longer_than_the_ceiling_is_cut_rather_than_refused() {
         let request = round(vec![free_text(true)]);
         let typed = "x".repeat(ANSWER_TEXT_MAX_LENGTH + 500);
-        let response = answer_round(&ScriptedInput(Some(typed)), &request).await;
+        let response = answer_round(&ScriptedInput(Some(typed)), request.clone()).await;
 
         request
             .validate(&response)
@@ -336,7 +477,8 @@ mod tests {
             named_choice("run-tests", false),
         ]);
         for typed in [None, Some("1"), Some(""), Some("nonsense")] {
-            let response = answer_round(&ScriptedInput(typed.map(str::to_owned)), &request).await;
+            let response =
+                answer_round(&ScriptedInput(typed.map(str::to_owned)), request.clone()).await;
             request
                 .validate(&response)
                 .unwrap_or_else(|error| panic!("typing {typed:?} produced {error}"));

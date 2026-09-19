@@ -165,11 +165,20 @@ field of its own is in `extensions`: a flat, scalar-only, capped, redacted map, 
 every case. Nothing read from it is executed. `docs/vendor-fields.md` lists, per vendor, which
 fields reach these types and which do not, with the reason and the test for each.
 
+An update with `content: None` keeps the earlier content. `Some(ActivityContent::Empty)` clears
+it. Apply that clearing value on updates and completion results so removed diffs or output do not
+remain visible.
+
 A vendor that stops to ask a **question** rather than for an approval sends
 `EventKind::QuestionAsked`, answered through `Session::answer`. It grants nothing: no
 `PermissionBroker` is consulted about one, and `InteractionKind::grants_authority` is the field a
 host's audit trail reads to keep the two apart. Secret collection and arbitrary forms are outside
 scope and are refused by name rather than reshaped into free text.
+
+Keep consuming turn events while a question prompt is open. Stop its input task when the matching
+`QuestionResolved` arrives or the turn ends, and discard any unfinished answer. `mea` demonstrates
+this with input running alongside its event loop. Its terminal reader discards a cancelled line
+after Enter before displaying a later prompt, so old input cannot answer a new question or approval.
 
 For native review, pass a `ReviewRequest` to `Session::start_review`. `ReviewTarget` covers
 uncommitted changes, a base branch, a commit, and custom instructions. The returned `ReviewStream`
