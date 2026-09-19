@@ -264,8 +264,11 @@ the scopes the vendor's own `PermissionGrantScope` declares:
 synthesises, widens or narrows a permission profile, and the only alternative to granting exactly
 what was asked is granting nothing. It is also what the request's detail leads with, compactly
 serialised and unchanged, ahead of the agent's own `reason` and `cwd`: a host or a broker offered
-`grant:turn` is offered exactly this profile, and a detail is cut from the end, so a verbose reason
-must not be able to push the authority being granted out of what is rendered. `strictAutoReview` is never set — it asks the vendor to change
+`grant:turn` is offered exactly this profile. Following the [app-server permissions contract][readme],
+the harness offers only `deny` if the profile and its `Grants` prefix cannot survive detail
+normalization unchanged. This covers the 4,096-code-point limit and stripped display-control
+characters. A long reason or working directory may still be truncated after the complete profile.
+`strictAutoReview` is never set — it asks the vendor to change
 how it reviews later requests on its own, a standing instruction this library has no basis to give.
 
 ### Questions
@@ -293,6 +296,11 @@ host's transcript. `autoResolutionMs` is declared but documented as deprecated a
 deadline is the same `Limits::approval_timeout` every approval shares. An unanswered round
 resolves exactly once, at that deadline, at a cancelled turn or session, or at a validated answer
 from `Session::answer` — whichever is first.
+
+A `serverRequest/resolved` withdrawal closes an announced question with `QuestionOutcome::Cancelled`
+without sending another answer to the server. An answer already accepted by `Session::answer`
+retains its outcome during shutdown and terminal cleanup. The pending round remains owned until
+its resolution is published, so `Completed` cannot leave an accepted answer's prompt open.
 
 ### MCP elicitations
 
