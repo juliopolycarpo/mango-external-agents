@@ -20,7 +20,8 @@ echo 'release tag checks passed'
 # case below is verbatim the title that shipped v0.1.0's release notes without the pull request
 # that produced the tagged tree.
 for title in 'feat(core): add a thing' 'fix: no scope' 'docs(release): record the bootstrap' \
-  'feat(acp)!: breaking change'; do
+  'feat(acp)!: breaking change' 'chore(deps): bump a dependency' \
+  'migration(fixtures): a type only cliff.toml names'; do
   if ! scripts/check-pr-title.sh "$title" >/dev/null; then
     echo "expected acceptance of '$title', received the rejection above" >&2
     exit 1
@@ -37,7 +38,25 @@ feat(nope): a scope AGENTS.md does not name
 nope(core): a type the changelog cannot group
 feat(core):no space after the colon
 feat(core):
+feat(): an empty scope is not a scope
 TITLES
+# Separate from the list above because a tab cannot survive being read back as literal text. The
+# space before the tab is load-bearing: `[[:space:]]` in the subject pattern consumes one character,
+# so `feat(core):<tab>` is rejected by the pattern itself and would pass this test against the
+# whitespace guard it is meant to exercise. With the space, the summary is the tab alone.
+tab_title=$(printf 'feat(core): \t')
+if rejection=$(scripts/check-pr-title.sh "$tab_title" 2>&1); then
+  echo 'expected rejection of a summary that is only a tab, received success' >&2
+  exit 1
+fi
+case "$rejection" in
+  *'received only whitespace'*) ;;
+  *)
+    echo 'expected the whitespace diagnostic for a tab-only summary, received:' >&2
+    echo "$rejection" >&2
+    exit 1
+    ;;
+esac
 if scripts/check-pr-title.sh >/dev/null 2>&1; then
   echo 'expected rejection of an empty title, received success' >&2
   exit 1

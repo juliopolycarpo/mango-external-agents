@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # A pull request title is a commit subject. Check it reads as one.
 #
-# This repository squash-merges, and GitHub takes the squash subject from the PR title verbatim.
+# This repository squash-merges, and GitHub takes the squash subject from the PR title verbatim —
+# but only while the repository's squash-title setting is `PR_TITLE`; under the default
+# `COMMIT_OR_PR_TITLE` a single-commit pull request is squashed under that commit's own subject and
+# this check guards nothing. `docs/releasing.md` records the setting this gate depends on.
 # git-cliff parses that subject to build CHANGELOG.md and the GitHub release notes, so a title
 # without a Conventional Commit type does not merely look untidy: the whole pull request is filed
 # under `Other` with no scope, and before the fix that came with this script it vanished from both
@@ -18,19 +21,34 @@ if [ -z "$title" ]; then
   exit 2
 fi
 
-# The Conventional Commits types this repository releases from; they are the ones cliff.toml groups.
-types="build chore ci docs feat fix migration perf refactor revert security style test"
+# Both lists are read from the file that owns them rather than repeated here, so what a contributor
+# is told to use and what this check enforces cannot drift apart. `|| true` on each grep because a
+# pattern that matches nothing exits 1, and under `pipefail` that would kill the assignment before
+# the diagnostic below could name the file that stopped answering.
 
-# Read from AGENTS.md rather than repeated here, so the list a contributor is told to use and the
-# list this check enforces cannot drift apart. The commit-rule bullet names every scope in
-# backticks; `type(scope): summary` and `examples/` carry characters outside the class and so are
-# not mistaken for scopes.
+# Collapse the matches into one space-separated line the `case` membership tests can scan.
+as_list() { sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//'; }
+
+# The types are exactly the ones cliff.toml groups: a type it does not parse lands the pull request
+# in `Other`. `^Initial commit` is not matched — the class is lower-case only.
+types=$(
+  { grep -oE 'message = "\^[a-z]+' cliff.toml || true; } | sed 's/.*\^//' | as_list
+)
+if [ -z "$types" ]; then
+  echo "expected '^<type>' message parsers in cliff.toml's commit_parsers, received none" >&2
+  exit 1
+fi
+
+# The scopes are the backticked words of the `Scopes:` sentence in AGENTS.md's commit rule, and
+# nothing else in that bullet: matching the whole bullet would turn any backticked lower-case word
+# a later edit adds to its prose into an accepted scope.
 scopes=$(
-  sed -n '/^- Conventional Commits with a body/,/per commit\./p' AGENTS.md |
-    grep -o '`[a-z]*`' | tr -d '`' | sort -u | tr '\n' ' '
+  sed -n '/^- Conventional Commits with a body/,/per commit\./p' AGENTS.md | tr '\n' ' ' |
+    { grep -oE 'Scopes:[^.]*\.' || true; } |
+    { grep -oE '`[a-z]+`' || true; } | tr -d '`' | as_list
 )
 if [ -z "$scopes" ]; then
-  echo "expected a 'Scopes:' list in AGENTS.md's commit rules, received none" >&2
+  echo "expected a 'Scopes:' sentence in AGENTS.md's commit rules, received none" >&2
   exit 1
 fi
 
@@ -43,9 +61,12 @@ fail() {
   exit 1
 }
 
-# type, optional (scope), optional !, colon, space, non-empty summary. Held in a variable because
-# the character class ends in `]]`, which closes the conditional if the pattern is written inline.
-subject='^([a-z]+)(\(([^)]*)\))?(!)?:[[:space:]](.+)$'
+# type, optional (scope), optional !, colon, space, non-empty summary. The scope is `[^)]+`, not
+# `[^)]*`: `feat(): x` would otherwise pass — an empty scope skips the membership check below, and
+# git-cliff does not read it as conventional, so the entry renders as `- Feat(): x`. Held in a
+# variable because the character class ends in `]]`, which closes the conditional if the pattern is
+# written inline.
+subject='^([a-z]+)(\(([^)]+)\))?(!)?:[[:space:]](.+)$'
 if [[ ! "$title" =~ $subject ]]; then
   fail "expected a Conventional Commit subject"
 fi
@@ -66,7 +87,8 @@ if [ -n "$scope" ]; then
 fi
 
 # A summary that is only whitespace passes the pattern above but produces an empty changelog entry.
-if [ -z "${summary// /}" ]; then
+# Matched against the whole class, not against spaces alone: a tab is whitespace too.
+if [[ "$summary" =~ ^[[:space:]]*$ ]]; then
   fail "expected a summary after the colon, received only whitespace"
 fi
 
