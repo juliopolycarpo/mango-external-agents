@@ -1672,6 +1672,66 @@ mod a_turn {
         );
     }
 
+    /// A later turn resumes a named conversation even when the vendor's echo is malformed.
+    ///
+    /// Treating that echo as if it were absent lets the process publish a result while the host
+    /// keeps the previous handle, leaving the host unable to tell whether the result belongs to
+    /// the conversation it asked Claude to resume.
+    #[tokio::test]
+    async fn refuses_a_later_turn_that_names_an_invalid_session_handle() {
+        const FIRST: &str = "b01414e7-4b4b-43a2-9109-a33e21664340";
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::replaying(&format!(
+                    "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{FIRST}\"}}\n{{\"type\":\"result\",\"is_error\":false}}"
+                )))
+                .with_turn(Run::replaying(
+                    r#"{"type":"system","subtype":"init","session_id":"not-a-uuid"}
+{"type":"result","is_error":false}"#,
+                )),
+        );
+        let session = open(&launcher).await;
+
+        let mut first = session
+            .start_turn(TurnRequest::new("turn-1", "start"))
+            .await
+            .expect("expected the first turn to start");
+        drain(&mut first).await;
+        assert_eq!(session.ids().native_session_id, FIRST);
+
+        let mut second = session
+            .start_turn(TurnRequest::new("turn-2", "and again"))
+            .await
+            .expect("expected the resumed turn to start");
+        let events = drain(&mut second).await;
+
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::Error { error }
+                    if error.message.contains("UUID-shaped Claude resume handle")
+            )),
+            "expected an invalid echoed handle to fail the resumed turn, received {events:?}"
+        );
+        assert!(
+            events.iter().all(|kind| matches!(
+                kind,
+                EventKind::TurnStarted { .. } | EventKind::Error { .. }
+            )),
+            "expected no result from an unverified conversation, received {events:?}"
+        );
+        assert_eq!(
+            session.ids().native_session_id,
+            FIRST,
+            "the persisted handle must survive an invalid echoed handle"
+        );
+        assert_eq!(
+            value_after(&launcher.turn_argvs()[1], "--resume"),
+            Some(FIRST),
+            "expected the rejected turn to have resumed the established handle"
+        );
+    }
+
     /// The echoed handle is a vendor-chosen value that a later argv carries.
     ///
     /// `system/init` is followed because it names the conversation that now exists — but following

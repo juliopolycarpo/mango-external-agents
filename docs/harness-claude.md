@@ -139,9 +139,11 @@ id, and each turn spawns, streams and reaps its own child.
   The first turn passes it to `--resume`; only `system/init` echoing that exact UUID confirms the
   resumed snapshot. A missing, invalid or different id ends that turn with a protocol error instead
   of presenting another conversation as the requested history. Conversation content or a result
-  before that confirmation is refused without emitting it. A later turn is held to the same handle:
-  once the session is established, a `system/init` naming a different id fails that turn rather than
-  replacing the handle a host persisted — see
+  before that confirmation is refused without emitting it. A later turn is held to the same handle.
+  When its `system/init` supplies an id, the [documented `--resume <uuid>` form](https://code.claude.com/docs/en/headless.md)
+  requires it to be UUID-shaped and this harness requires it to match the persisted handle. A
+  missing id remains tolerated because it makes no competing identity assertion. A malformed or
+  different id fails that turn rather than replacing the handle a host persisted — see
   [A later turn may not answer from another conversation](#the-event-stream). Only the *first*
   turn's echo may replace the minted id, because that turn proposes one rather than naming an
   existing conversation.
@@ -190,13 +192,14 @@ id, and each turn spawns, streams and reaps its own child.
   <https://code.claude.com/docs/en/headless.md>
 
 **A later turn may not answer from another conversation.** Every turn after the first is spawned
-with `--resume <handle>`, so its `system/init` echoing a different handle means the CLI answered
-from history this session has never seen. That turn fails with `Error::Protocol` and the handle the
-host persisted stays in force; adopting the new one would replace it with a conversation nobody
-read, silently and with no event to notice. The first turn stays lenient on purpose: it *proposes*
-a handle with `--session-id`, and a CLI that started a different conversation anyway has made that
-one the real one, so following its id is the better guess. A strict resume is stricter still — see
-[Session model](#session-model).
+with `--resume <handle>`. When `system/init` supplies a handle, it must be a UUID and equal that
+handle. A missing field leaves the persisted handle unchanged, but a malformed or different handle
+means the CLI may have answered from history this session has never seen. That turn fails with
+`Error::Protocol` and the handle the host persisted stays in force; adopting a supplied replacement
+would switch to a conversation nobody read, silently and with no event to notice. The first turn
+stays lenient on purpose: it *proposes* a handle with `--session-id`, and a CLI that started a
+different conversation anyway has made that one the real one, so following its id is the better
+guess. A strict resume is stricter still — see [Session model](#session-model).
 
 ## Cancellation, and what the vendor actually does
 

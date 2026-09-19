@@ -1760,12 +1760,13 @@ fn apply_init(shared: &Shared, end: &Arc<TurnEnd>, init: RunInit) -> Result<()> 
 /// conversation and the turn must fail rather than present its output as resumed history.
 ///
 /// An **established** session is held to the same standard for a different reason. Every turn after
-/// the first is spawned with `--resume <handle>`, so its `system/init` echoing a *different* handle
-/// means the CLI is answering from a conversation this session has never seen. Adopting it would
-/// replace the handle the host persisted with one whose history nobody read, silently, with no
-/// event to notice — a second conversation wearing the first one's name. The first turn stays
-/// lenient on purpose: it passes `--session-id`, and a CLI that started a different conversation
-/// anyway has made that conversation the real one, so following its id is the better guess.
+/// the first is spawned with `--resume <handle>`, so a supplied `system/init` handle must be both
+/// UUID-shaped and equal to that handle. A malformed or different one means the CLI could be
+/// answering from a conversation this session has never seen. Adopting it would replace the handle
+/// the host persisted with one whose history nobody read, silently, with no event to notice. The
+/// first turn stays lenient on purpose: it passes `--session-id`, and a CLI that started a
+/// different conversation anyway has made that conversation the real one, so following its id is
+/// the better guess.
 fn confirm_session_id(
     shared: &Shared,
     state: &mut Mutable,
@@ -1809,14 +1810,19 @@ fn confirm_session_id(
 
 /// Holds an established session's later turns to the handle they were spawned with.
 ///
-/// Only a handle this file would have followed is compared: an echo that is not UUID-shaped is
-/// left to `apply_init`'s own vetting, which keeps the minted id in force rather than adopting
-/// something a later `--resume` could not carry, and refusing here would end a turn over an echo
-/// nothing was going to believe.
+/// An omitted echo remains accepted because the vendor did not make an assertion to compare. Any
+/// supplied echo must be UUID-shaped and equal to the established handle before this turn can
+/// publish output.
 fn confirm_established_session_id(shared: &Shared, session_id: Option<&str>) -> Result<()> {
-    let Some(session_id) = session_id.filter(|id| crate::argv::is_vendor_session_id(id)) else {
+    let Some(session_id) = session_id else {
         return Ok(());
     };
+    if !crate::argv::is_vendor_session_id(session_id) {
+        return Err(Error::Protocol {
+            expected: String::from("a system/init record with a UUID-shaped Claude resume handle"),
+            received: String::from("a system/init record with an invalid session handle"),
+        });
+    }
     let expected = shared.core_state.snapshot().ids.native_session_id.clone();
     if expected.is_empty() || session_id == expected {
         return Ok(());
