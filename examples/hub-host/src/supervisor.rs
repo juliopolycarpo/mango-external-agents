@@ -266,6 +266,13 @@ impl Supervisor {
     /// Pulling it ends that turn and nothing else; the session's own [`Stop`] is still what ends
     /// everything.
     ///
+    /// One signal per logical turn id, kept for the supervisor's life, so an abort is **final for
+    /// that turn id**: a later `run` of it settles as [`Settled::Stopped`] without reconciling or
+    /// dispatching, the same way a refusal does. That is deliberate — an operation the owner
+    /// stopped is not one a retry loop gets to resume — and it is why the signal is per logical
+    /// turn rather than per run. A caller that wants the work after all gives it a new turn id,
+    /// which is a new logical operation and is the honest way to say so.
+    ///
     /// # Example
     ///
     /// ```
@@ -538,7 +545,7 @@ impl SupervisorInner {
                 }
                 Step::Continue => {}
                 Step::Backoff(hint) => {
-                    // The second half of the pair described at the top of this loop.
+                    // The second of the three described at the top of this loop.
                     if let Some(reason) = self.back_off(&mut progress, hint).await {
                         self.abandon(&mut progress, reason).await;
                         return Ok(Settled::Stopped { reason });

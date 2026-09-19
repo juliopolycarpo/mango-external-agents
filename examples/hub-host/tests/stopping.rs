@@ -206,6 +206,57 @@ async fn aborting_one_turn_leaves_the_session_able_to_run_the_next() {
     );
 }
 
+/// An abort is final for the turn id it named, the way a Hub refusal is.
+///
+/// One signal per logical turn id, kept for the supervisor's life, so running that id again does
+/// not resume it. An operation the owner stopped is not one a retry loop gets to pick back up;
+/// asking for the work after all means a new logical turn id, which says so honestly.
+#[tokio::test(start_paused = true)]
+async fn an_aborted_turn_id_is_not_resumed_by_running_it_again() {
+    let hub = Arc::new(FakeHubApi::new());
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    supervisor
+        .abort_signal(&TurnId::new("turn-1"))
+        .stop(CancelReason::Requested);
+
+    let aborted = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the aborted operation to settle");
+    let renamed = supervisor
+        .run(TurnRequest::new("turn-2", "ship it"))
+        .await
+        .expect("expected the renamed operation to settle");
+
+    assert_eq!(
+        aborted,
+        Settled::Stopped {
+            reason: CancelReason::Requested
+        }
+    );
+    assert_eq!(
+        renamed,
+        Settled::Committed {
+            terminal: common::COMPLETED,
+            commit: Commit::Recorded,
+        },
+        "expected a new logical turn id to be the way to ask for the work after all"
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Reserve).len(),
+        1,
+        "expected only the renamed turn to be submitted, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        session.start_count(),
+        1,
+        "expected the aborted turn never to reach the vendor"
+    );
+}
+
 /// Shutdown is the one that *is* session-wide, and stays that way.
 ///
 /// The owner going away ends every operation this supervisor has left, which is the whole reason
