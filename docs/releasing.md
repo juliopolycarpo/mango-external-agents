@@ -106,6 +106,17 @@ The repository owner sets these up once.
   crates.io with this repository and the workflow file `release.yml`. The publish step uses
   `rust-lang/crates-io-auth-action` to exchange the OIDC token for a short-lived one; one exchange
   covers every crate that trusts this repository.
+- The squash-merge title set to the pull request title, not GitHub's default. Under
+  `COMMIT_OR_PR_TITLE` a pull request holding a single commit is squashed under that commit's
+  subject, so `scripts/check-pr-title.sh` would be checking text the changelog never sees.
+
+  ```sh
+  gh api -X PATCH repos/juliopolycarpo/mango-external-agents -f squash_merge_commit_title=PR_TITLE
+  ```
+
+- The branch ruleset requiring the `Title reads as a commit subject` context. It lives in its own
+  workflow, so it is not covered by ci.yml's `Gate` context and does not block a merge until the
+  ruleset names it.
 
 Trusted publishing can only be configured for a crate that already exists. The first version of
 each crate is therefore published from a maintainer's machine, in dependency order:
