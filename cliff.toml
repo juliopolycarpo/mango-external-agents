@@ -20,7 +20,7 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
-- {% if commit.scope %}**({{ commit.scope }})** {% endif %}{{ commit.message | upper_first }}\
+- {% if commit.scope %}**({{ commit.scope }})** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first }}\
 {% endfor %}
 {% endfor %}
 """
@@ -31,22 +31,23 @@ postprocessors = [{ pattern = '<!-- [0-9]+ -->', replace = "" }]
 
 [git]
 conventional_commits = true
-filter_unconventional = true
+filter_unconventional = false
 split_commits = false
 commit_preprocessors = []
 commit_parsers = [
   { message = "^chore\\(release\\)", skip = true },
-  { message = "^chore\\(deps\\)", group = "<!-- 8 -->⬆️ Dependencies" },
-  { message = "^build\\(deps\\)", group = "<!-- 8 -->⬆️ Dependencies" },
-  { message = "^feat", group = "<!-- 0 -->🚀 Features" },
-  { message = "^fix", group = "<!-- 1 -->🐛 Bug Fixes" },
-  { message = "^perf", group = "<!-- 2 -->⚡ Performance" },
-  { message = "^refactor", group = "<!-- 3 -->♻️ Refactor" },
-  { message = "^security", group = "<!-- 4 -->🔒 Security" },
-  { message = "^migration", group = "<!-- 5 -->🛢️ Migrations" },
-  { message = "^docs", group = "<!-- 6 -->📚 Documentation" },
-  { message = "^test", group = "<!-- 7 -->🧪 Testing" },
-  { message = "^ci", group = "<!-- 9 -->👷 CI" },
+  { message = "^Initial commit", skip = true },
+  { message = "^chore\\(deps\\)", group = "<!-- 08 -->⬆️ Dependencies" },
+  { message = "^build\\(deps\\)", group = "<!-- 08 -->⬆️ Dependencies" },
+  { message = "^feat", group = "<!-- 00 -->🚀 Features" },
+  { message = "^fix", group = "<!-- 01 -->🐛 Bug Fixes" },
+  { message = "^perf", group = "<!-- 02 -->⚡ Performance" },
+  { message = "^refactor", group = "<!-- 03 -->♻️ Refactor" },
+  { message = "^security", group = "<!-- 04 -->🔒 Security" },
+  { message = "^migration", group = "<!-- 05 -->🛢️ Migrations" },
+  { message = "^docs", group = "<!-- 06 -->📚 Documentation" },
+  { message = "^test", group = "<!-- 07 -->🧪 Testing" },
+  { message = "^ci", group = "<!-- 09 -->👷 CI" },
   { message = "^build", group = "<!-- 10 -->🏗️ Build" },
   { message = "^style", group = "<!-- 11 -->🎨 Styling" },
   { message = "^chore", group = "<!-- 12 -->🧹 Miscellaneous" },
