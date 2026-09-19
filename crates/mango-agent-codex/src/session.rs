@@ -2235,15 +2235,16 @@ impl CodexHandler {
                 None
             }
             None => {
-                // Nobody answered: the shared deadline elapsed, or the host is going away.
+                // Nobody answered: the oneshot was not ready when the shared deadline elapsed or
+                // the host started going away. `select!` above is biased toward `waiting`, so a
+                // value that had already landed on the oneshot — an answer, or the `Cancelled`
+                // that `release_pending_for` sends ahead of a shutdown — would have won that arm
+                // instead; its `reported` bit is what keeps that path from publishing twice.
                 //
-                // Reported only by the waiter that still owned the round. The select above is
-                // biased toward the host's cancel token, so on a shutdown this arm is taken
-                // whatever the canceller sent and the `reported` bit below is never read; an
-                // empty slot means somebody else already took this round and published for it.
-                // A round the host answered in the same window is likewise not this task's to
-                // report — saying nothing is better than publishing `Cancelled` over an answer
-                // that landed.
+                // Reported only by the waiter that still owned the round: an empty slot means
+                // somebody else already took this round and published for it. A round the host
+                // answered in the same window is likewise not this task's to report — saying
+                // nothing is better than publishing `Cancelled` over an answer that landed.
                 if removed.is_some() {
                     let outcome = if self.shared.host.cancel().is_cancelled() {
                         QuestionOutcome::Cancelled
@@ -4187,11 +4188,12 @@ mod tests {
 
     /// A shutdown that empties the round before the waiter is polled resolves it once.
     ///
-    /// The waiting task's select is biased toward the host's cancel token, so once that token is
-    /// set the task takes the nobody-answered arm no matter what the canceller sent it — the
-    /// `reported` bit on `QuestionAnswer::Cancelled` is never read on this path. What separates
-    /// the two publishes is whether this waiter still owned the round: if the canceller already
-    /// took the slot, it already reported it.
+    /// `release_pending_for` sends `QuestionAnswer::Cancelled { reported: true }` on the pending
+    /// entry's oneshot before this waiter can be polled again, so once the schedule below forces
+    /// that ordering the waiting task's `select!` — biased toward `waiting`, not the cancel token
+    /// — takes the oneshot's `Cancelled` arm rather than the nobody-answered `None` arm. The
+    /// `reported` bit is what keeps that arm from publishing a second time: the canceller already
+    /// reported for this round, so the waiter reports nothing.
     ///
     /// The schedule is forced rather than hoped for. `release_pending_for` empties the map before
     /// its first real yield, so on a current-thread runtime the waiting task cannot be polled in
