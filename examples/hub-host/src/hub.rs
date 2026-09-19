@@ -285,9 +285,9 @@ impl std::error::Error for HubError {}
 
 /// The external service that owns this host's operations.
 ///
-/// Injected into the host's own loop rather than constructed by it, so the loop can be proven
-/// against a Hub that drops acknowledgements, has no reconciliation query, or refuses outright —
-/// none of which a real deployment can be asked to do on demand.
+/// Injected into [`Supervisor`](crate::Supervisor) rather than constructed by it, so the loop can
+/// be proven against a Hub that drops acknowledgements, has no reconciliation query, or refuses
+/// outright — none of which a real deployment can be asked to do on demand.
 #[async_trait::async_trait]
 pub trait HubApi: Send + Sync {
     /// Announces one attempt before anything side-effecting happens, returning a receipt.

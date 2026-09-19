@@ -1,12 +1,14 @@
 //! The host's backoff, and the rule that a recoverable failure is never a terminal outcome.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use hub_host::testing::ScriptedJitter;
-use hub_host::{RetryHint, RetryPolicy, Stop, WaitOutcome};
+use hub_host::testing::{FakeHubApi, FakeVendorSession, HubCallKind, ScriptedJitter};
+use hub_host::{Commit, RetryHint, RetryPolicy, Settled, Stop, WaitOutcome};
 use mango_external_agents::testing::FrozenClock;
-use mango_external_agents::{CancelReason, Clock};
+use mango_external_agents::{CancelReason, Clock, TurnRequest};
 
 const BASE: Duration = Duration::from_secs(1);
 const CAP: Duration = Duration::from_secs(8);
@@ -142,4 +144,50 @@ async fn a_wait_ends_at_the_stop_rather_than_at_the_end_of_the_delay() {
         "expected the wait to end at the stop rather than after the full ten minutes"
     );
     assert_eq!(outcome, WaitOutcome::Stopped);
+}
+
+/// A recoverable failure that has happened eight times is still a recoverable failure.
+///
+/// A retry-count ceiling would turn "the network is down" into a terminal outcome the Hub never
+/// recorded. Nothing here counts attempts for the purpose of giving up.
+#[tokio::test(start_paused = true)]
+async fn many_recoverable_failures_never_become_a_terminal_outcome() {
+    let hub = Arc::new(FakeHubApi::new().reserving_after_recoverable_failures(8));
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+
+    let settled = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the operation to settle");
+
+    assert_eq!(
+        settled,
+        Settled::Committed {
+            terminal: common::COMPLETED,
+            commit: Commit::Recorded,
+        }
+    );
+    let attempts = hub.attempts(HubCallKind::Reserve);
+    assert_eq!(
+        attempts.len(),
+        9,
+        "expected eight failures and one success, received {attempts:?}"
+    );
+    assert!(
+        attempts.windows(2).all(|pair| pair[1] > pair[0]),
+        "expected strictly increasing attempt generations, received {attempts:?}"
+    );
+    let fingerprints = hub.fingerprints(HubCallKind::Reserve);
+    assert!(
+        fingerprints.windows(2).all(|pair| pair[0] == pair[1]),
+        "expected one fingerprint across every attempt, received {} distinct submissions",
+        fingerprints.len()
+    );
+    assert_eq!(
+        session.start_count(),
+        1,
+        "expected the vendor work to run exactly once, after the hub finally accepted it"
+    );
 }

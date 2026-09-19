@@ -1,18 +1,24 @@
-//! Named fakes for what a host cannot ask a real deployment to do on demand.
+//! Named fakes for the two things a host cannot ask a real deployment to do on demand.
 //!
-//! [`FakeHubApi`] is not a kind fake. It drops acknowledgements, declares that it has no
+//! Neither is a kind fake. [`FakeHubApi`] drops acknowledgements, declares that it has no
 //! reconciliation query and refuses outright, and it records every call it received so a test can
 //! assert an **exact** count rather than "it looked like it only submitted once".
+//! [`FakeVendorSession`] is here rather than in the library's own `testing` feature because what
+//! it has to express — a `start_turn` whose acknowledgement is lost after the vendor started the
+//! work — is a host-side failure, not a vendor dialect.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
-use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use mango_external_agents::{
-    AttemptId, OperationRef, RequestFingerprint, SessionId, TerminalStatus, TurnId,
+    AttemptId, CancelReason, CloseReason, Dispatch, Error, EventKind, EventSink, HarnessIdentity,
+    OperationRef, PermissionResponse, RequestFingerprint, Result, Session, SessionId, SessionIds,
+    SessionSnapshot, SessionState, SystemClock, TerminalStatus, TransportKind, TransportSelection,
+    TurnId, TurnRequest, TurnStream,
 };
+use tokio::sync::Notify;
 
 use crate::hub::{Commit, HubApi, HubError, HubReceipt, HubStatus, Reconciliation};
 use crate::retry::Jitter;
@@ -459,5 +465,317 @@ impl HubApi for FakeHubApi {
         }
         ledger.committed.insert(id, terminal.clone());
         Ok(Commit::Recorded)
+    }
+}
+
+/// One scripted answer to [`Session::start_turn`].
+#[derive(Clone, Copy, Debug)]
+pub enum TurnAnswer {
+    /// Run a short transcript and complete it before answering.
+    Complete,
+    /// Emit the opening events, then hold the turn open until [`FakeVendorSession::release`].
+    ///
+    /// The only way to have a watcher disconnect *mid-turn* rather than after it.
+    CompleteWhenReleased,
+    /// Refuse before the request left this host.
+    ///
+    /// Carries [`Dispatch::NotSubmitted`], which is the library's own proof of absence.
+    NotSubmitted,
+    /// Fail after the vendor may already have started the work.
+    ///
+    /// Carries [`Dispatch::AcceptanceUnknown`]: the acknowledgement is gone and nothing local can
+    /// say whether the turn ran.
+    AcknowledgementLost,
+}
+
+struct SessionScript {
+    turns: VecDeque<TurnAnswer>,
+    default: TurnAnswer,
+}
+
+/// A [`Session`] with no vendor behind it, scripted per turn and counting what it was asked.
+///
+/// Cloning shares one session: the test keeps a handle while the supervisor owns a `Box<dyn
+/// Session>` built from another.
+///
+/// # Example
+///
+/// ```
+/// use hub_host::testing::FakeVendorSession;
+///
+/// let session = FakeVendorSession::new();
+/// assert_eq!(session.start_count(), 0);
+/// ```
+#[derive(Clone)]
+pub struct FakeVendorSession {
+    inner: Arc<VendorInner>,
+}
+
+struct VendorInner {
+    state: SessionState,
+    script: Mutex<SessionScript>,
+    starts: AtomicU64,
+    cancels: Mutex<Vec<CancelReason>>,
+    gate: Notify,
+    released: AtomicBool,
+}
+
+impl VendorInner {
+    /// Waits for the gate, and returns at once when it is already open.
+    ///
+    /// The flag is read *after* the wait is registered, for the same reason
+    /// [`CancelToken`](mango_external_agents::CancelToken) does it in that order: a `release`
+    /// landing between the two would otherwise be missed and the held turn would never finish.
+    async fn released(&self) {
+        loop {
+            let opened = self.gate.notified();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            opened.await;
+        }
+    }
+
+    fn open_gate(&self) {
+        self.released.store(true, Ordering::Release);
+        self.gate.notify_waiters();
+    }
+}
+
+impl std::fmt::Debug for FakeVendorSession {
+    /// Reports what it has been asked, not the ids it answers to.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FakeVendorSession")
+            .field("start_count", &self.start_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for FakeVendorSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeVendorSession {
+    /// A session whose every turn runs a short transcript and completes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::FakeVendorSession;
+    ///
+    /// assert_eq!(FakeVendorSession::new().start_count(), 0);
+    /// ```
+    pub fn new() -> Self {
+        let snapshot = SessionSnapshot::opening(
+            SessionIds {
+                session_id: SessionId::new("hub-chat-1"),
+                native_session_id: String::from("vendor-session-1"),
+            },
+            HarnessIdentity::claude(),
+            TransportSelection::new(None, TransportKind::Stdio),
+            SystemTime::UNIX_EPOCH,
+        );
+        Self {
+            inner: Arc::new(VendorInner {
+                state: SessionState::new(Arc::new(SystemClock), snapshot),
+                script: Mutex::new(SessionScript {
+                    turns: VecDeque::new(),
+                    default: TurnAnswer::Complete,
+                }),
+                starts: AtomicU64::new(0),
+                cancels: Mutex::new(Vec::new()),
+                gate: Notify::new(),
+                released: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Scripts the next turns, in order. Later turns fall back to the default answer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::{FakeVendorSession, TurnAnswer};
+    ///
+    /// let session = FakeVendorSession::new().answering([TurnAnswer::AcknowledgementLost]);
+    /// assert_eq!(session.start_count(), 0);
+    /// ```
+    #[must_use]
+    pub fn answering(self, answers: impl IntoIterator<Item = TurnAnswer>) -> Self {
+        self.inner
+            .script
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .turns
+            .extend(answers);
+        self
+    }
+
+    /// Changes what an unscripted turn does.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::{FakeVendorSession, TurnAnswer};
+    ///
+    /// let session = FakeVendorSession::new().by_default(TurnAnswer::CompleteWhenReleased);
+    /// assert_eq!(session.start_count(), 0);
+    /// ```
+    #[must_use]
+    pub fn by_default(self, answer: TurnAnswer) -> Self {
+        self.inner
+            .script
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .default = answer;
+        self
+    }
+
+    /// Exactly how many turns this session was asked to start.
+    ///
+    /// The count test 3 turns on: a terminal consumed from the Hub means the vendor was not asked
+    /// a second time, and only an exact number says so.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::FakeVendorSession;
+    ///
+    /// assert_eq!(FakeVendorSession::new().start_count(), 0);
+    /// ```
+    pub fn start_count(&self) -> usize {
+        self.inner.starts.load(Ordering::Acquire) as usize
+    }
+
+    /// Every reason this session was cancelled with, in order.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::FakeVendorSession;
+    ///
+    /// assert!(FakeVendorSession::new().cancels().is_empty());
+    /// ```
+    pub fn cancels(&self) -> Vec<CancelReason> {
+        self.inner
+            .cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Lets every turn held open by [`TurnAnswer::CompleteWhenReleased`] finish.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::FakeVendorSession;
+    ///
+    /// // Releasing a session with no held turn is harmless.
+    /// FakeVendorSession::new().release();
+    /// ```
+    pub fn release(&self) {
+        self.inner.open_gate();
+    }
+
+    fn next_answer(&self) -> TurnAnswer {
+        let mut script = self
+            .inner
+            .script
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        script.turns.pop_front().unwrap_or(script.default)
+    }
+}
+
+fn lost_acknowledgement() -> Error {
+    Error::Link {
+        peer: String::from("hub vendor session"),
+        message: String::from("expected a turn acknowledgement, received a closed link"),
+    }
+    .with_dispatch(Dispatch::AcceptanceUnknown)
+}
+
+fn never_left() -> Error {
+    Error::Link {
+        peer: String::from("hub vendor session"),
+        message: String::from("expected an open link, received one closed before the write"),
+    }
+    .with_dispatch(Dispatch::NotSubmitted)
+}
+
+#[async_trait::async_trait]
+impl Session for FakeVendorSession {
+    fn state(&self) -> &SessionState {
+        &self.inner.state
+    }
+
+    async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        let answer = self.next_answer();
+        match answer {
+            TurnAnswer::NotSubmitted => return Err(never_left()),
+            TurnAnswer::AcknowledgementLost => {
+                // Counted before the failure: the vendor started the work, and only the answer
+                // was lost. A fake that did not count it would let a duplicate run go unnoticed.
+                self.inner.starts.fetch_add(1, Ordering::AcqRel);
+                return Err(lost_acknowledgement());
+            }
+            TurnAnswer::Complete | TurnAnswer::CompleteWhenReleased => {}
+        }
+        self.inner.starts.fetch_add(1, Ordering::AcqRel);
+
+        let (sink, events) = EventSink::new(
+            self.inner.state.snapshot().ids.session_id.clone(),
+            request.turn_id.clone(),
+            request.attempt,
+            Arc::new(SystemClock),
+            64,
+        );
+        sink.emit(EventKind::TurnStarted {
+            native_turn_id: format!("vendor-turn-{}", request.attempt),
+        })
+        .await?;
+        sink.emit(EventKind::TextDelta {
+            text: format!("working on {}", request.input),
+        })
+        .await?;
+        let stream = TurnStream::accepted(
+            request.turn_id.clone(),
+            request.attempt,
+            format!("vendor-turn-{}", request.attempt),
+            events,
+        );
+        if matches!(answer, TurnAnswer::Complete) {
+            sink.complete().await?;
+            return Ok(stream);
+        }
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            inner.released().await;
+            let _ = sink.complete().await;
+        });
+        Ok(stream)
+    }
+
+    async fn respond(&self, _response: PermissionResponse) -> Result<()> {
+        Ok(())
+    }
+
+    async fn cancel(&self, reason: CancelReason) -> Result<()> {
+        self.inner
+            .cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(reason);
+        self.inner.open_gate();
+        Ok(())
+    }
+
+    async fn close(&self, _reason: CloseReason) -> Result<()> {
+        self.inner.open_gate();
+        Ok(())
     }
 }
