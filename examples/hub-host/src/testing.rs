@@ -15,6 +15,63 @@ use mango_external_agents::{
 };
 
 use crate::hub::{Commit, HubApi, HubError, HubReceipt, HubStatus, Reconciliation};
+use crate::retry::Jitter;
+
+/// A [`Jitter`] that always answers the same factor.
+///
+/// Exists so a backoff test asserts an exact [`Duration`](std::time::Duration). A policy proven
+/// against a range is a policy whose cap can be off by a factor of four without a test noticing.
+#[derive(Clone, Copy, Debug)]
+pub struct ScriptedJitter {
+    factor: f64,
+}
+
+impl ScriptedJitter {
+    /// The top of the jitter band: nothing is removed from the computed delay.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::{Jitter, testing::ScriptedJitter};
+    ///
+    /// assert_eq!(ScriptedJitter::maximum().factor(), 1.0);
+    /// ```
+    pub fn maximum() -> Self {
+        Self { factor: 1.0 }
+    }
+
+    /// The bottom of the jitter band: the most the policy will ever shorten a delay.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::{Jitter, testing::ScriptedJitter};
+    ///
+    /// assert_eq!(ScriptedJitter::minimum().factor(), 0.0);
+    /// ```
+    pub fn minimum() -> Self {
+        Self { factor: 0.0 }
+    }
+
+    /// A factor anywhere in between.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::{Jitter, testing::ScriptedJitter};
+    ///
+    /// assert_eq!(ScriptedJitter::at(0.5).factor(), 0.5);
+    /// ```
+    pub fn at(factor: f64) -> Self {
+        Self { factor }
+    }
+}
+
+impl Jitter for ScriptedJitter {
+    fn factor(&self) -> f64 {
+        self.factor
+    }
+}
 
 /// Which [`HubApi`] method a recorded call was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

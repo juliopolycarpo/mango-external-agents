@@ -26,6 +26,10 @@
 //! [`TurnStream`]: mango_external_agents::TurnStream
 
 pub mod hub;
+pub mod retry;
+pub mod stop;
 pub mod testing;
 
 pub use hub::{Commit, HubApi, HubError, HubReceipt, HubStatus, Reconciliation, RetryHint};
+pub use retry::{HashJitter, Jitter, RetryPolicy, WaitOutcome};
+pub use stop::Stop;
