@@ -490,6 +490,12 @@ pub enum TurnAnswer {
     ///
     /// The only way to have a watcher disconnect *mid-turn* rather than after it.
     CompleteWhenReleased,
+    /// Hold the *acknowledgement* itself until [`FakeVendorSession::release`], then complete.
+    ///
+    /// A vendor that has taken the request and not yet answered. The supervisor has no stream to
+    /// select on here and no transcript to read, which is what makes it the one window where a
+    /// host can be left waiting out its whole attempt deadline after the owner said stop.
+    AcknowledgeWhenReleased,
     /// Refuse before the request left this host.
     ///
     /// Carries [`Dispatch::NotSubmitted`], which is the library's own proof of absence.
@@ -736,6 +742,9 @@ impl Session for FakeVendorSession {
                 self.inner.starts.fetch_add(1, Ordering::AcqRel);
                 return Err(lost_acknowledgement());
             }
+            // Awaited before the start is counted: a turn whose acknowledgement never came back
+            // is a turn this session never started.
+            TurnAnswer::AcknowledgeWhenReleased => self.inner.released().await,
             TurnAnswer::Complete | TurnAnswer::CompleteWhenReleased => {}
         }
         self.inner.starts.fetch_add(1, Ordering::AcqRel);
@@ -761,7 +770,10 @@ impl Session for FakeVendorSession {
             format!("vendor-turn-{}", request.attempt),
             events,
         );
-        if matches!(answer, TurnAnswer::Complete) {
+        if matches!(
+            answer,
+            TurnAnswer::Complete | TurnAnswer::AcknowledgeWhenReleased
+        ) {
             sink.complete().await?;
             return Ok(stream);
         }

@@ -104,6 +104,55 @@ async fn a_stop_during_a_live_turn_cancels_the_vendor_with_the_host_s_reason() {
     );
 }
 
+/// A stop that lands while the vendor is still acknowledging must not wait out the deadline.
+///
+/// The submission is the one window with neither a transcript to select on nor a backoff to
+/// interrupt: the attempt deadline is the only other future in the race. A host that observes the
+/// stop only when that deadline expires makes an abort, a revoked consent and an owner shutdown
+/// all take the full deadline — which is exactly how long a host has to wait before it gives up
+/// and kills the process instead.
+#[tokio::test(start_paused = true)]
+async fn a_stop_while_the_vendor_is_acknowledging_does_not_wait_out_the_deadline() {
+    let hub = Arc::new(FakeHubApi::new());
+    let session = FakeVendorSession::new().answering([TurnAnswer::AcknowledgeWhenReleased]);
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let running = tokio::spawn({
+        let request = TurnRequest::new("turn-1", "ship it");
+        async move { supervisor.run(request).await }
+    });
+
+    common::until("the submission to reach the vendor", || {
+        hub.count(HubCallKind::Reserve) == 1
+    })
+    .await;
+    let pulled_at = tokio::time::Instant::now();
+    stop.stop(CancelReason::Requested);
+    let settled = running
+        .await
+        .expect("expected the run task to finish")
+        .expect("expected the operation to settle");
+    let after_the_stop = pulled_at.elapsed();
+
+    assert_eq!(
+        settled,
+        Settled::Stopped {
+            reason: CancelReason::Requested
+        }
+    );
+    assert_eq!(
+        after_the_stop,
+        Duration::ZERO,
+        "expected the stop to end the submission at once rather than after the {:?} attempt deadline",
+        common::ATTEMPT_DEADLINE
+    );
+    assert_eq!(
+        session.start_count(),
+        0,
+        "expected a turn the vendor never acknowledged not to count as started"
+    );
+}
+
 /// The first reason wins, so a shutdown racing an abort cannot rewrite the audit trail.
 #[test]
 fn a_stop_keeps_the_reason_it_was_first_given() {

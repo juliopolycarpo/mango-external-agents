@@ -388,13 +388,17 @@ impl SupervisorInner {
             terminal_came_from_hub: false,
         };
         loop {
-            // One of a **pair**. This catches a stop that landed while the last step was running;
-            // the one inside `back_off` catches a stop that lands while this loop is sleeping
-            // between attempts. Neither is redundant and neither covers the other in the case it
-            // was written for — but each *does* cover the other well enough that deleting one
-            // leaves the stop tests green, because the loop reaches the survivor on its next pass.
-            // So: do not delete one on the evidence of a passing suite. Delete both and the
-            // suite fails; that is what the coverage is actually proving.
+            // One of a **set of three**, and the only one that decides what a stop settles as.
+            // This catches a stop that landed while the last step was running; the one inside
+            // `back_off` catches a stop that lands while this loop is sleeping between attempts;
+            // the one in `submit` catches a stop that lands while the vendor is acknowledging a
+            // dispatch, which is the one window with neither a transcript nor a backoff to
+            // interrupt. None is redundant and none covers another in the case it was written for
+            // — but each *does* cover the others well enough that deleting one leaves the stop
+            // tests green, because the loop reaches a survivor on its next pass. So: do not delete
+            // one on the evidence of a passing suite. The exception is `submit`'s, whose absence
+            // is visible as the full attempt deadline elapsing. Delete this one and `back_off`'s
+            // and the suite fails; that is what the coverage is actually proving.
             if let Some(reason) = self.stop.reason() {
                 self.abandon(&mut progress, reason).await;
                 return Ok(Settled::Stopped { reason });
@@ -461,11 +465,19 @@ impl SupervisorInner {
         }
 
         let dispatched = request.clone().as_attempt(operation.attempt);
-        let started = tokio::time::timeout(
-            self.policy.attempt_deadline(),
-            self.session.start_turn(dispatched),
-        )
-        .await;
+        // The third of the set described at the top of `drive`. Without it the attempt deadline is
+        // the only other future in this race, so a stop landing while the vendor is acknowledging
+        // is not seen until the deadline expires — the whole of it, for an abort, a revoked
+        // consent or a shutdown. Answering `Continue` hands the stop back to the loop's own guard
+        // rather than duplicating the abandon-and-settle it already does.
+        let started = tokio::select! {
+            biased;
+            () = self.stop.stopped() => return Ok(Step::Continue),
+            started = tokio::time::timeout(
+                self.policy.attempt_deadline(),
+                self.session.start_turn(dispatched),
+            ) => started,
+        };
         match started {
             Ok(Ok(stream)) => {
                 record.record_dispatch(&operation, Dispatch::Accepted)?;
