@@ -54,6 +54,9 @@ pub enum Settled {
         operation: OperationRef,
     },
     /// The Hub refused the operation for good.
+    ///
+    /// Remembered by the supervisor: running the same logical turn id again answers with this
+    /// same refusal rather than reconciling or dispatching anything.
     Refused {
         /// What the Hub gave as its reason.
         reason: String,
@@ -107,7 +110,28 @@ struct Progress {
 pub struct Supervisor {
     inner: SupervisorInner,
     session_id: SessionId,
-    records: HashMap<TurnId, RecoveryRecord>,
+    records: HashMap<TurnId, LogicalTurn>,
+}
+
+/// Everything the supervisor remembers about one logical turn between runs.
+///
+/// The record carries what the library owns. The refusal is the host's half of the same question:
+/// [`HubError::Refused`] is documented as terminal for the logical operation, and the record has
+/// no state for "the control plane will never take this", because the control plane is not the
+/// library's business. Without it the refusal lives only as long as the `Settled` value a caller
+/// may drop, and the next run reconciles and dispatches work the Hub refused for good.
+struct LogicalTurn {
+    record: RecoveryRecord,
+    refusal: Option<String>,
+}
+
+impl LogicalTurn {
+    fn new(record: RecoveryRecord) -> Self {
+        Self {
+            record,
+            refusal: None,
+        }
+    }
 }
 
 /// Everything one run borrows immutably, split out so the records never leave the map.
@@ -263,14 +287,15 @@ impl Supervisor {
     /// assert!(supervisor.record(&TurnId::new("never-run")).is_none());
     /// ```
     pub fn record(&self, turn_id: &TurnId) -> Option<&RecoveryRecord> {
-        self.records.get(turn_id)
+        self.records.get(turn_id).map(|turn| &turn.record)
     }
 
     /// Drives one logical operation until it is committed, refused, stopped or uncertain.
     ///
     /// Reusing a `turn_id` with different content is refused before anything is dispatched;
     /// reusing it with identical content resumes the same logical operation rather than starting a
-    /// second one.
+    /// second one. A logical turn the Hub has already refused answers [`Settled::Refused`] again,
+    /// without a reconciliation and without a dispatch.
     ///
     /// # Errors
     ///
@@ -322,24 +347,34 @@ impl Supervisor {
         // would be destroyed with it. The next run would then build a fresh one, dispatch a second
         // time under the same logical id, and reserve it with an attempt the Hub cannot tell from
         // the first.
-        let record = match self.records.entry(request.turn_id.clone()) {
+        let turn = match self.records.entry(request.turn_id.clone()) {
             // Validated through the entry rather than after a removal: a refused reuse must not
             // also lose the record that refused it, or the next identical retry would start a
             // second operation.
             Entry::Occupied(occupied) => {
-                occupied.get().validate(&request)?;
+                occupied.get().record.validate(&request)?;
                 occupied.into_mut()
             }
-            Entry::Vacant(vacant) => {
-                vacant.insert(RecoveryRecord::new(self.session_id.clone(), &request)?)
-            }
+            Entry::Vacant(vacant) => vacant.insert(LogicalTurn::new(RecoveryRecord::new(
+                self.session_id.clone(),
+                &request,
+            )?)),
         };
-        self.inner.drive(record, &request).await
+        // Answered before anything is reconciled or dispatched. A refusal is the Hub's final word
+        // on the logical operation, so a caller that runs the same request again — a crash
+        // recovery, or one that read `Settled::Refused` as "try that id again" — gets the same
+        // answer rather than a second execution of work the Hub will not take.
+        if let Some(reason) = &turn.refusal {
+            return Ok(Settled::Refused {
+                reason: reason.clone(),
+            });
+        }
+        self.inner.drive(turn, &request).await
     }
 }
 
 impl SupervisorInner {
-    async fn drive(&self, record: &mut RecoveryRecord, request: &TurnRequest) -> Result<Settled> {
+    async fn drive(&self, turn: &mut LogicalTurn, request: &TurnRequest) -> Result<Settled> {
         let mut progress = Progress {
             stream: None,
             failures: 0,
@@ -358,6 +393,7 @@ impl SupervisorInner {
                 self.abandon(&mut progress, reason).await;
                 return Ok(Settled::Stopped { reason });
             }
+            let record = &mut turn.record;
             let step = match record.action() {
                 RecoveryAction::Submit => self.submit(record, request, &mut progress).await?,
                 RecoveryAction::Observe => self.observe(record, &mut progress).await?,
@@ -373,7 +409,14 @@ impl SupervisorInner {
                 }
             };
             match step {
-                Step::Settled(settled) => return Ok(settled),
+                Step::Settled(settled) => {
+                    // Recorded on the logical turn, not just returned: the refusal has to outlive
+                    // the `Settled` value the caller is free to drop.
+                    if let Settled::Refused { reason } = &settled {
+                        turn.refusal = Some(reason.clone());
+                    }
+                    return Ok(settled);
+                }
                 Step::Continue => {}
                 Step::Backoff(hint) => {
                     // The second half of the pair described at the top of this loop.

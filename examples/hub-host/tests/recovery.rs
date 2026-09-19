@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hub_host::testing::{
-    FakeHubApi, FakeVendorSession, HubCallKind, ReconcileAnswer, ReserveAnswer, TurnAnswer,
+    CommitAnswer, FakeHubApi, FakeVendorSession, HubCallKind, ReconcileAnswer, ReserveAnswer,
+    TurnAnswer,
 };
 use hub_host::{Commit, HubError, HubStatus, Reconciliation, Settled, Stop};
 use mango_external_agents::{AttemptId, Dispatch, Error, TerminalStatus, TurnId, TurnRequest};
@@ -257,6 +258,139 @@ async fn reusing_a_logical_turn_id_with_different_content_is_refused() {
         Some(&TerminalStatus::Completed),
         "expected the first operation's committed terminal to survive the refusal"
     );
+}
+
+/// A Hub that refuses a reservation has ended the logical operation, not just this run.
+///
+/// The uncertainty recorded before the reservation is what makes a *lost* acknowledgement
+/// recoverable, and it is exactly wrong for a refusal: it leaves the record on `Reconcile`, where
+/// a Hub that never stored the reservation answers "never arrived", which unlocks a newer attempt.
+/// So a second run — a crash recovery, or a caller reading `Settled::Refused` as "try that id
+/// again" — executes work the Hub refused for good.
+#[tokio::test(start_paused = true)]
+async fn a_refused_reservation_stays_refused_on_the_next_run() {
+    let hub = Arc::new(
+        FakeHubApi::new().reserving([ReserveAnswer::Fail(HubError::refused("quota withdrawn"))]),
+    );
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    let first = supervisor
+        .run(request.clone())
+        .await
+        .expect("expected the first operation to settle");
+    let second = supervisor
+        .run(request)
+        .await
+        .expect("expected the second operation to settle");
+
+    assert_eq!(first, refused("quota withdrawn"));
+    assert_eq!(
+        second,
+        refused("quota withdrawn"),
+        "expected the refusal to stand for the logical turn rather than be retried"
+    );
+    assert_eq!(
+        hub.sequence(),
+        vec![HubCallKind::Reserve],
+        "expected the second run to ask the hub nothing at all"
+    );
+    assert_eq!(
+        session.start_count(),
+        0,
+        "expected refused work never to reach the vendor"
+    );
+}
+
+/// The same rule on the reconciliation path, where the reservation did land.
+#[tokio::test(start_paused = true)]
+async fn a_refused_reconciliation_stays_refused_on_the_next_run() {
+    let hub = Arc::new(
+        FakeHubApi::new()
+            .reserving([ReserveAnswer::AcceptThenDropAcknowledgement])
+            .reconciling([
+                ReconcileAnswer::Fail(HubError::refused("operation withdrawn")),
+                // Only a naive second run reaches this one. Scripted so that run ends rather than
+                // spinning on a hub that keeps answering "accepted" for work nobody is doing.
+                ReconcileAnswer::Answer(Reconciliation::Answered(HubStatus::Committed {
+                    terminal: TerminalStatus::Completed,
+                })),
+            ]),
+    );
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    let first = supervisor
+        .run(request.clone())
+        .await
+        .expect("expected the first operation to settle");
+    let second = supervisor
+        .run(request)
+        .await
+        .expect("expected the second operation to settle");
+
+    assert_eq!(first, refused("operation withdrawn"));
+    assert_eq!(
+        second,
+        refused("operation withdrawn"),
+        "expected the refusal to stand for the logical turn rather than be retried"
+    );
+    assert_eq!(
+        hub.sequence(),
+        vec![HubCallKind::Reserve, HubCallKind::Reconcile],
+        "expected the second run to ask the hub nothing at all"
+    );
+}
+
+/// And on the commit path, where the vendor work is already done.
+///
+/// The terminal exists and the Hub will not take it. That is a refusal of the logical operation,
+/// and re-running it must not offer the outcome again as if the first answer had not happened.
+#[tokio::test(start_paused = true)]
+async fn a_refused_commit_stays_refused_on_the_next_run() {
+    let hub = Arc::new(
+        FakeHubApi::new().committing([CommitAnswer::Fail(HubError::refused("outcome rejected"))]),
+    );
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    let first = supervisor
+        .run(request.clone())
+        .await
+        .expect("expected the first operation to settle");
+    let second = supervisor
+        .run(request)
+        .await
+        .expect("expected the second operation to settle");
+
+    assert_eq!(first, refused("outcome rejected"));
+    assert_eq!(
+        second,
+        refused("outcome rejected"),
+        "expected the refusal to stand for the logical turn rather than be retried"
+    );
+    assert_eq!(
+        hub.sequence(),
+        vec![HubCallKind::Reserve, HubCallKind::Commit],
+        "expected the second run to ask the hub nothing at all"
+    );
+    assert_eq!(
+        session.start_count(),
+        1,
+        "expected the second run not to re-run work whose outcome the hub refused"
+    );
+}
+
+fn refused(reason: &str) -> Settled {
+    Settled::Refused {
+        reason: String::from(reason),
+    }
 }
 
 /// Dropping the `run` future must not destroy the record that says the work already went out.
