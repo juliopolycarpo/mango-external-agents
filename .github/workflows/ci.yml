@@ -60,7 +60,7 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
-          tool: cargo-deny,dprint
+          tool: cargo-deny,dprint,git-cliff
       - run: cargo deny check
       - run: scripts/check-versions.sh
       - run: scripts/test-release.sh
