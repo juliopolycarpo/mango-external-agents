@@ -8,5 +8,10 @@
   "schemaFiles": [
     "initialize-params.schema.json",
     "initialize-response.schema.json"
-  ]
+  ],
+  "files": {
+    "initialize-params.schema.json": "sha256:6f0094be9a65242ec779a40794cbd4fdfa32fca1e45084a16adfb50501d33ea2",
+    "initialize-response.schema.json": "sha256:62ad689c2cb6379913c1d72749cfd8de5089d35760214123518eb92eef11acc9",
+    "version.json": "sha256:d590ba21af54f4f1a1a2d0400caf1fedee173fb7591c17267158fcc61b3deb2a"
+  }
 }

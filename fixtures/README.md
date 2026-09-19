@@ -26,3 +26,27 @@ reproduce their bytes, and routine drift checks must leave them alone:
 A historical fixture remains captured and never hand-edited. Keep it when it continues to prove a
 compatibility case. Replace it only with a new capture that proves the same case on a consciously
 chosen version.
+
+## Digests
+
+Every `manifest.json` carries a `files` member holding one SHA-256 digest per file beside it, and
+`mea`'s own test suite recomputes all of them — so "never hand-edited" is a failing test rather
+than a sentence. The test names the file, the digest its manifest declares and the digest the file
+has. It runs under `scripts/check.sh` with the rest of the suite; nothing has to be enabled for it.
+
+`mea capture` writes the digests with the capture. A capture whose files changed for a reason
+other than a vendor change — none is expected — is regenerated from the files as they stand:
+
+```sh
+cargo run -p mea -- digests            # rewrite every manifest's digests under fixtures/
+cargo run -p mea -- digests --check    # the same verification, by hand
+```
+
+That command reads the committed bytes and writes what they hash to. It never runs a vendor CLI
+and never touches a captured file, which is why it is also how a historical capture — one no
+present-day command can reproduce — came to carry digests at all.
+
+The historical Claude manifest additionally carries an aggregate `checksum` from the session that
+recorded it in 2026-09. Nothing in this repository can recompute it: it is not the digest of the
+committed files in any order, of their digests, or of the manifest itself. It is left as written
+and held only to its shape; the per-file digests are what the integrity check reads.

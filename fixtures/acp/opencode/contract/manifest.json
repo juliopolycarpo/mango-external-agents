@@ -3,5 +3,9 @@
   "profile": "opencode",
   "probe": "initialize",
   "reproducible": true,
-  "sessionOpened": false
+  "sessionOpened": false,
+  "files": {
+    "initialize.json": "sha256:a7df7958b12c1570d2f5b75a8fb5a37a438c5b850aa60fc36cfd3a63f4dc1647",
+    "version.json": "sha256:57e2c162be1997762668f324bad86045fa91525fc7f859f0b446894a27b0536a"
+  }
 }

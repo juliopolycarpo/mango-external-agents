@@ -26,6 +26,10 @@ mango-agent-codex.workspace = true
 # sandbox policy of its own to express.
 mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio"] }
 
+# The fixture digests are SHA-256, from the crypto this workspace already ships: TLS is `ring`
+# everywhere, so hashing a captured file adds a call rather than a dependency.
+ring = "0.17.14"
+
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }

@@ -1027,6 +1027,7 @@ dependencies = [
  "mango-agent-claude",
  "mango-agent-codex",
  "mango-external-agents",
+ "ring",
  "serde_json",
  "tempfile",
  "tokio",
