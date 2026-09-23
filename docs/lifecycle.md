@@ -106,8 +106,9 @@ correlation continues on its own path until closure. Request deadlines include w
 dropping a request removes its pending correlation entry. Approval deadlines remain separate from
 request and idle deadlines.
 
-ACP also bounds its SDK frame boundary by `max_pending_requests` queued frames and
-`turn_buffer_bytes` serialized bytes in each direction. Output byte accounting includes the active
+ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
+`turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
+individually), and `turn_buffer_bytes` serialized bytes in each direction. Output byte accounting includes the active
 physical write, and an oversized batch or queue fails the connection. Generic outgoing ACP
 requests reserve admission before entering the SDK queue.
 

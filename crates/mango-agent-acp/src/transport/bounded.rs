@@ -43,7 +43,7 @@ impl BoundedTransport {
             limits,
         } = self;
         let future = async move {
-            let (pending, writing) = mpsc::channel(limits.max_pending_requests.max(1));
+            let (pending, writing) = mpsc::channel(outgoing_capacity(&limits));
             let budget = Arc::new(Semaphore::new(
                 limits.turn_buffer_bytes.min(u32::MAX as usize),
             ));
@@ -94,41 +94,41 @@ impl<R: Role> ConnectTo<R> for BoundedTransport {
 }
 
 /// Account for a single producer's queued frames using the SDK channel's current queue length.
-/// Sizes are removed only after the consumer has taken the corresponding frame; a concurrent
-/// dequeue can make this conservative but can never let extra bytes past the cap.
+/// Each queued frame is charged its bytes and its JSON-RPC message count (one, or every member of a
+/// batch). Charges are removed only after the consumer has taken the corresponding frame; a
+/// concurrent dequeue can make this conservative but can never let extra messages or bytes past
+/// the cap.
 async fn read_frames(
     mut source: IncomingLines,
     target: futures::channel::mpsc::UnboundedSender<TransportFrame>,
     limits: Limits,
 ) -> agent_client_protocol::Result<()> {
-    let mut sizes = VecDeque::new();
+    let mut charges: VecDeque<(usize, usize)> = VecDeque::new();
     let mut bytes = 0_usize;
+    let mut messages = 0_usize;
     while let Some(line) = source.next().await {
         let line = line.map_err(|_| failure("ACP framed input failed"))?;
         let queued = target.len();
-        while sizes.len() > queued {
-            bytes -= sizes.pop_front().expect("queued frame size");
+        while charges.len() > queued {
+            let (size, count) = charges.pop_front().expect("queued frame charge");
+            bytes -= size;
+            messages -= count;
         }
+        let frame = TransportFrame::parse_json(&line);
+        let count = match &frame {
+            TransportFrame::Batch(batch) => batch.len().max(1),
+            _ => 1,
+        };
         bytes = bytes.saturating_add(line.len());
-        if queued >= limits.max_pending_requests.max(1) || bytes > limits.turn_buffer_bytes {
+        messages = messages.saturating_add(count);
+        if messages > frame_limit(&limits) || bytes > limits.turn_buffer_bytes {
             return Err(failure(format!(
-                "ACP incoming frame queue exceeded its count or byte budget: received {} frames and {bytes} bytes; expected at most {} frames and {} bytes",
-                queued.saturating_add(1),
-                limits.max_pending_requests.max(1),
+                "ACP incoming queue exceeded its message or byte budget (Limits::turn_channel_capacity or Limits::max_pending_requests, Limits::turn_buffer_bytes): received {messages} messages and {bytes} bytes; expected at most {} messages and {} bytes",
+                frame_limit(&limits),
                 limits.turn_buffer_bytes,
             )));
         }
-        let frame = TransportFrame::parse_json(&line);
-        if let TransportFrame::Batch(batch) = &frame
-            && batch.len() > limits.max_pending_requests.max(1)
-        {
-            return Err(failure(format!(
-                "ACP batch exceeded the pending-message budget: received {} messages; expected at most {}",
-                batch.len(),
-                limits.max_pending_requests.max(1),
-            )));
-        }
-        sizes.push_back(line.len());
+        charges.push_back((line.len(), count));
         target
             .unbounded_send(frame)
             .map_err(|_| failure("ACP incoming frame receiver closed"))?;
@@ -172,7 +172,8 @@ async fn queue_output(
                 _bytes: bytes,
             })
             .map_err(|_| failure(format!(
-                "ACP outgoing frame queue exceeded the pending-message budget: received another frame; expected fewer than {} queued frames",
+                "ACP outgoing frame queue exceeded the frame budget (Limits::turn_channel_capacity or Limits::max_pending_requests): received {} queued frames; expected at most {}",
+                pending.max_capacity().saturating_sub(pending.capacity()).saturating_add(1),
                 pending.max_capacity(),
             )))?;
     }
@@ -195,6 +196,28 @@ async fn write_frames(
         .close()
         .await
         .map_err(|_| failure("ACP framed output close failed"))
+}
+
+/// The most JSON-RPC messages queued at the SDK boundary in either direction.
+///
+/// The queue carries `session/update` notifications and responses to the requests admitted under
+/// `max_pending_requests`, so it holds at least as many messages as either. Notifications and turn
+/// events are related but not one to one; the byte budget is what bounds memory. For example, the
+/// default limits allow 1,024 queued messages.
+fn frame_limit(limits: &Limits) -> usize {
+    limits
+        .turn_channel_capacity
+        .max(limits.max_pending_requests)
+        .max(1)
+}
+
+/// The outgoing writer queue's capacity: the message cap, clamped to what tokio can allocate.
+///
+/// A host may set a huge count and rely on bytes; `mpsc::channel` panics above
+/// `Semaphore::MAX_PERMITS`, so the count is clamped rather than passed through. For example,
+/// `usize::MAX` becomes `Semaphore::MAX_PERMITS`.
+fn outgoing_capacity(limits: &Limits) -> usize {
+    frame_limit(limits).min(Semaphore::MAX_PERMITS)
 }
 
 fn failure(message: impl Into<String>) -> agent_client_protocol::Error {

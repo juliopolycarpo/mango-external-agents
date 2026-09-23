@@ -4489,3 +4489,6 @@ mod expiry;
 
 #[path = "session/contracts.rs"]
 mod contracts;
+
+#[path = "session/burst.rs"]
+mod burst;

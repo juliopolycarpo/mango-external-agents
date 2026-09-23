@@ -41,10 +41,27 @@ here because the first spawns the agent itself and the second takes over this pr
 
 The core's `LineStream` and `ByteSink` frame the pipes under `Limits::line`. `BoundedTransport`
 passes frames through the SDK's [`Channel` interface](https://docs.rs/agent-client-protocol/2.1.0/agent_client_protocol/struct.Channel.html),
-leaving JSON-RPC parsing and routing to the official SDK. It caps queued frame counts at
-`max_pending_requests` and serialized bytes at `turn_buffer_bytes` in each direction. Output bytes
-remain charged through the physical write. Batch sizes have the same pending-message cap. Queue
-pressure fails the connection explicitly and triggers native cleanup.
+leaving JSON-RPC parsing and routing to the official SDK. Each direction has two bounds:
+
+| Bound           | Limit                                                                | Unit              | Default           |
+| --------------- | -------------------------------------------------------------------- | ----------------- | ----------------- |
+| Queued messages | larger of `Limits::turn_channel_capacity` and `max_pending_requests` | JSON-RPC messages | 1,024             |
+| Queued bytes    | `Limits::turn_buffer_bytes`                                          | serialized bytes  | 8 MiB (8,388,608) |
+
+Incoming messages are counted individually: a batch is charged one message per member, so
+batches cannot multiply the queue past the cap. Outgoing frames are single messages from the SDK
+and are counted one each. The queue carries both `session/update` notifications and responses to
+the requests admitted under `max_pending_requests`, so the message cap is never below either
+quantity. It is deliberately not `max_pending_requests` alone: a burst of ordinary notifications
+ahead of the SDK actor is not request concurrency. Notifications and turn events are related but
+not one to one (a first thought chunk opens reasoning and adds a delta; a completed tool call
+starts and completes an activity), so the message count is a coarse guard and the byte budget is
+what bounds memory. A host may set a very large count to rely on bytes alone; the outgoing writer
+queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking.
+
+Output bytes remain charged through the physical write. A single frame larger than the byte
+budget, or a queue that would exceed either bound, fails the connection with an error naming the
+received count or size and the limit; the session then closes and its child is released.
 
 The SDK's `Lines` carrier uses unbounded internal queues; its `ByteStreams` carrier also frames input
 without the host's line cap. Neither provides the budgets this harness requires.
