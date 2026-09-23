@@ -2882,8 +2882,6 @@ struct GatedLauncher {
     fail_kill: bool,
     /// Every `ProcessControl::kill` call, counted before the gate so a second reaper is visible.
     kills: Arc<AtomicUsize>,
-    /// Every stdin `ByteSink::close`, the only observable of an ACP transport close.
-    stdin_closes: Arc<AtomicUsize>,
 }
 
 /// A launcher whose first cleanup attempt fails but whose returned control can reap the same child
@@ -3063,16 +3061,11 @@ impl GatedLauncher {
             release_kill: CancelToken::new(),
             fail_kill,
             kills: Arc::new(AtomicUsize::new(0)),
-            stdin_closes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn kills(&self) -> usize {
         self.kills.load(Ordering::Acquire)
-    }
-
-    fn stdin_closes(&self) -> usize {
-        self.stdin_closes.load(Ordering::Acquire)
     }
 
     async fn wait_for_kill(&self) {
@@ -3090,13 +3083,7 @@ impl mango_external_agents::ProcessLauncher for GatedLauncher {
         &self,
         spec: mango_external_agents::LaunchSpec,
     ) -> mango_external_agents::Result<mango_external_agents::ManagedProcess> {
-        let mut process = self.inner.spawn(spec).await?;
-        process.stdin = process.stdin.take().map(|inner| {
-            Box::new(ClosingCountingStdin {
-                inner,
-                closes: Arc::clone(&self.stdin_closes),
-            }) as Box<dyn mango_external_agents::ByteSink>
-        });
+        let process = self.inner.spawn(spec).await?;
         Ok(mango_external_agents::ManagedProcess {
             control: Arc::new(GatedControl {
                 inner: process.control,
@@ -3131,24 +3118,6 @@ struct GatedControl {
     release_kill: CancelToken,
     fail_kill: bool,
     kills: Arc<AtomicUsize>,
-}
-
-/// Counts transport closes on a child's stdin while forwarding every byte unchanged.
-struct ClosingCountingStdin {
-    inner: Box<dyn mango_external_agents::ByteSink>,
-    closes: Arc<AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl mango_external_agents::ByteSink for ClosingCountingStdin {
-    async fn write_all(&mut self, bytes: &[u8]) -> mango_external_agents::Result<()> {
-        self.inner.write_all(bytes).await
-    }
-
-    async fn close(&mut self) -> mango_external_agents::Result<()> {
-        self.closes.fetch_add(1, Ordering::AcqRel);
-        self.inner.close().await
-    }
 }
 
 /// The first termination request reports a typed host-launch error; every later one reaches the

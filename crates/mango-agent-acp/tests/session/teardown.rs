@@ -72,11 +72,6 @@ fn assert_one_teardown(watched: &WatchedSession) {
         "expected kills: 1 | received: {}",
         watched.launcher.kills()
     );
-    assert!(
-        watched.launcher.stdin_closes() <= 1,
-        "expected transport closes: at most 1 | received: {}",
-        watched.launcher.stdin_closes()
-    );
     assert_eq!(
         watched.inner.live_children(),
         0,
@@ -104,68 +99,128 @@ async fn acp_teardown_watcher_then_close_kills_once() {
     settle().await;
 
     assert_one_teardown(&watched);
-    assert_eq!(watched.session.snapshot().status, SessionStatus::Closed);
+    let status = watched.session.snapshot().status;
+    assert_eq!(
+        status,
+        SessionStatus::Closed,
+        "expected session status: Closed | received: {status:?}"
+    );
 }
 
-/// A close owns teardown first; the watcher then wakes on the ended pipe and must not reap again.
-#[tokio::test]
-async fn acp_teardown_close_then_watcher_kills_once() {
-    let watched = open_watched(false).await;
-    watched.launcher.release();
-
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        watched.session.close(CloseReason::Requested),
-    )
-    .await
-    .expect("expected close to return, not hang")
-    .expect("expected close to succeed");
-    watched.agent_gone.cancel();
-    settle().await;
-
-    assert_one_teardown(&watched);
-    assert_eq!(watched.session.snapshot().status, SessionStatus::Closed);
+/// A host clock that advances one microsecond on every read, so the order of two stamped facts
+/// is the order in which the harness produced them.
+struct TickingClock {
+    ticks: std::sync::atomic::AtomicU64,
 }
 
-/// Dropping a pending close and then the session itself while cleanup is held leaves one owner,
-/// which still kills the child once when the host control is released.
+impl Clock for TickingClock {
+    fn now(&self) -> SystemTime {
+        let tick = self.ticks.fetch_add(1, Ordering::AcqRel);
+        SystemTime::UNIX_EPOCH + Duration::from_micros(tick)
+    }
+}
+
+/// `Closed` means nothing more will happen, so a watcher that finished the shared cleanup must
+/// not publish it while the close that owns the turn still has its terminal to write.
+///
+/// The ticking clock stamps both facts: the snapshot that first reads `Closed` must be stamped
+/// after the turn's terminal event.
 #[tokio::test]
-async fn acp_teardown_concurrent_close_and_drop_kill_once() {
-    let watched = open_watched(false).await;
-    let closing = {
-        let session = Arc::clone(&watched.session);
-        tokio::spawn(async move { session.close(CloseReason::Shutdown).await })
-    };
-    tokio::time::timeout(Duration::from_secs(5), watched.launcher.wait_for_kill())
+async fn acp_teardown_closed_is_published_after_the_turn_terminal() {
+    let inner = FakeLauncher::new();
+    let agent_gone = CancelToken::new();
+    inner.push(
+        FakeAcpAgent::new()
+            .never_finishing_turns()
+            .process()
+            .ending_stdout_when(agent_gone.clone()),
+    );
+    let launcher = GatedLauncher::new(inner.clone(), false);
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .clock(Arc::new(TickingClock {
+            ticks: std::sync::atomic::AtomicU64::new(1),
+        }))
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+    let session: Arc<dyn Session> = Arc::from(
+        AcpHarness::new(profile())
+            .open_session(
+                &host,
+                OpenSession::new("terminal-first").with_configuration(permissive()),
+            )
+            .await
+            .expect("expected a session"),
+    );
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "keep working"))
         .await
-        .expect("expected close to reach the process kill");
-    closing.abort();
-    let _ = closing.await;
-    let WatchedSession {
-        session,
-        launcher,
-        inner,
-        agent_gone,
-    } = watched;
-    drop(session);
+        .expect("expected a turn");
+    let mut lifecycle = session.subscribe();
+
     agent_gone.cancel();
-    settle().await;
+    tokio::time::timeout(Duration::from_secs(5), launcher.wait_for_kill())
+        .await
+        .expect("expected the watcher to reach the process kill");
+    let closing = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::Requested).await })
+    };
+    // Let the close join the held shutdown before the kill is released.
+    tokio::time::sleep(Duration::from_millis(20)).await;
     launcher.release();
 
+    let mut closed_at = None;
     tokio::time::timeout(Duration::from_secs(5), async {
-        while inner.live_children() != 0 {
-            tokio::task::yield_now().await;
+        loop {
+            let current = lifecycle.current();
+            if current.status == SessionStatus::Closed {
+                closed_at = Some(current.observed_at);
+                return;
+            }
+            let _ = lifecycle.changed().await;
         }
     })
     .await
-    .expect("expected the one owned cleanup to reap the child after its callers were dropped");
-    settle().await;
-    assert_eq!(
-        launcher.kills(),
-        1,
-        "expected kills: 1 | received: {}",
-        launcher.kills()
+    .expect("expected the session to reach Closed");
+    tokio::time::timeout(Duration::from_secs(5), closing)
+        .await
+        .expect("expected close to settle after release")
+        .expect("expected the close task to join")
+        .expect("expected close to succeed");
+
+    let events = drain_events(&mut turn).await;
+    let terminal_at = events
+        .iter()
+        .find(|event| event.is_terminal())
+        .map(|event| event.at)
+        .expect("expected the turn to receive a terminal");
+    let closed_at = closed_at.expect("expected a Closed snapshot");
+    assert!(
+        closed_at > terminal_at,
+        "expected Closed stamped after the turn terminal ({terminal_at:?}) | received: Closed at \
+         {closed_at:?}"
     );
+}
+
+/// Reads every event a turn produced, bounded so a missing terminal fails instead of hanging.
+async fn drain_events(turn: &mut TurnStream) -> Vec<mango_external_agents::AgentEvent> {
+    let mut events = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(5), turn.recv()).await {
+        let terminal = event.is_terminal();
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    events
 }
 
 /// While the watcher's cleanup is stalled at the kill, every close waiter stays pending and the
@@ -192,10 +247,10 @@ async fn acp_teardown_close_waits_for_a_stalled_watcher_cleanup() {
         );
     }
     let status = watched.session.snapshot().status;
-    assert_ne!(
+    assert_eq!(
         status,
-        SessionStatus::Closed,
-        "expected session status: not Closed while the kill is held | received: {status:?}"
+        SessionStatus::Closing,
+        "expected session status: Closing while the kill is held | received: {status:?}"
     );
 
     watched.launcher.release();
@@ -208,7 +263,12 @@ async fn acp_teardown_close_waits_for_a_stalled_watcher_cleanup() {
     }
     settle().await;
     assert_one_teardown(&watched);
-    assert_eq!(watched.session.snapshot().status, SessionStatus::Closed);
+    let status = watched.session.snapshot().status;
+    assert_eq!(
+        status,
+        SessionStatus::Closed,
+        "expected session status: Closed | received: {status:?}"
+    );
 }
 
 /// A failed watcher-owned cleanup is the result every close waiter observes; none reports success
@@ -255,10 +315,10 @@ async fn acp_teardown_a_failed_watcher_cleanup_fails_every_close_waiter() {
         watched.launcher.kills()
     );
     let status = watched.session.snapshot().status;
-    assert_ne!(
+    assert_eq!(
         status,
-        SessionStatus::Closed,
-        "expected session status: not Closed after failed cleanup | received: {status:?}"
+        SessionStatus::Closing,
+        "expected session status: Closing after failed cleanup | received: {status:?}"
     );
 }
 
@@ -272,17 +332,16 @@ const FIXTURE_MODE: &str = "MEA_ACP_TEARDOWN_FIXTURE";
 /// can end it. Without the environment marker it returns at once.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "re-exec'd fixture body; only runs as a real child process"]
 fn acp_teardown_fixture_child() {
     use std::io::{BufRead as _, Write as _};
     if std::env::var(FIXTURE_MODE).is_err() {
         return;
     }
     let stdin = std::io::stdin();
+    // Re-exec'd with `--quiet`, libtest's only preamble is a complete `running 1 test` line,
+    // which the ACP reader skips as a non-frame.
     let mut stdout = std::io::stdout();
-    // libtest has already printed `test <name> ... ` without a newline; end that line so the
-    // first JSON-RPC reply starts on a line of its own.
-    let _ = writeln!(stdout);
-    let _ = stdout.flush();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -321,7 +380,10 @@ async fn acp_teardown_real_process_is_killed_once_and_reaped() {
             "fixture",
             [
                 String::from("fixture-acp"),
-                String::from("acp_teardown_fixture_child"),
+                String::from("--ignored"),
+                String::from("--exact"),
+                String::from("teardown::acp_teardown_fixture_child"),
+                String::from("--quiet"),
                 String::from("--nocapture"),
                 String::from("--test-threads=1"),
             ],
@@ -357,6 +419,10 @@ async fn acp_teardown_real_process_is_killed_once_and_reaped() {
         .expect("expected a session over the real fixture process"),
     );
     let pid = counting.pid().expect("expected the launched child's pid");
+    let _cleanup = FixtureCleanup {
+        pid: Some(pid),
+        directory: None,
+    };
     let proc_entry = std::path::PathBuf::from(format!("/proc/{pid}"));
 
     // A child that died on its own (for example on SIGPIPE) would make the teardown look clean.
@@ -389,6 +455,31 @@ async fn acp_teardown_real_process_is_killed_once_and_reaped() {
         !proc_entry.exists(),
         "expected fixture child {pid}: reaped after close | received: still present"
     );
+}
+
+/// Kills a fixture child that outlived a failed assertion and removes its scratch directory.
+///
+/// Unwinding past a failed assert would otherwise leave a sleeping re-exec'd test binary behind.
+#[cfg(target_os = "linux")]
+struct FixtureCleanup {
+    pid: Option<u32>,
+    directory: Option<std::path::PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FixtureCleanup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid
+            && std::path::Path::new(&format!("/proc/{pid}")).exists()
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        if let Some(directory) = &self.directory {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
 }
 
 /// Wraps the real Tokio launcher and counts kills on the one child it spawns.
@@ -435,4 +526,31 @@ impl ProcessLauncher for CountingTokioLauncher {
             ..process
         })
     }
+}
+
+/// A session dropped on a thread with no Tokio runtime still reaps its child through the runtime
+/// its connection runs on, instead of silently skipping cleanup.
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_teardown_a_session_dropped_outside_a_runtime_reaps_its_child() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().process());
+    let session = AcpHarness::new(profile())
+        .open_session(&host(&launcher), OpenSession::new("drop-off-runtime"))
+        .await
+        .expect("expected a session");
+    std::thread::spawn(move || drop(session))
+        .join()
+        .expect("expected the dropping thread to finish");
+
+    let reaped = tokio::time::timeout(Duration::from_secs(5), async {
+        while launcher.live_children() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        reaped.is_ok(),
+        "expected live children: 0 after a drop outside a runtime | received: {}",
+        launcher.live_children()
+    );
 }

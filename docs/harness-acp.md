@@ -465,10 +465,12 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 
 Teardown has one owner per session: the connection's shutdown task, which ends the dispatch loop
 and reaps the child through a single shared reaper. `close`, the watcher that notices an agent
-exit or a failed transport, an abandoned request, and a dropped session all join that task rather
-than killing the child again. Every `close` waits for its result, so a second or concurrent close
-never reports success before the child is reaped, and a cleanup failure is the error each waiter
-receives. `Closed` is published only after the reap succeeds.
+exit or a failed transport, and an abandoned request all join that task rather than killing the
+child again. A dropped session has no connection handle left to join, so its watcher reaps through
+the same shared reaper instead. Every `close` waits for the shared result, so a second or
+concurrent close never reports success before the child is reaped, and a cleanup failure is the
+error each waiter receives. `Closed` is published only after the reap succeeds and the running
+turn has written its terminal; when a close is in progress, the close publishes it.
 
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
