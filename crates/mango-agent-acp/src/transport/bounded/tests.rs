@@ -70,7 +70,7 @@ async fn an_unread_sdk_channel_hits_the_incoming_count_budget() {
             Ok(notification()),
         ])),
         Limits {
-            max_pending_requests: 1,
+            turn_channel_capacity: 1,
             ..Limits::default()
         },
     );
@@ -102,7 +102,7 @@ async fn queued_input_bytes_and_batch_members_have_independent_limits() {
         (
             vec![format!("[{},{}]", notification(), notification())],
             Limits {
-                max_pending_requests: 1,
+                turn_channel_capacity: 1,
                 ..Limits::default()
             },
             "batch exceeded",
@@ -122,6 +122,105 @@ async fn queued_input_bytes_and_batch_members_have_independent_limits() {
                 .contains(expected)
         );
     }
+}
+
+#[tokio::test]
+async fn a_notification_burst_beyond_the_request_cap_fits_the_frame_budget() {
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    let limits = Limits {
+        max_pending_requests: 2,
+        turn_channel_capacity: 16,
+        ..Limits::default()
+    };
+    let lines = std::iter::repeat_with(notification).take(12).map(Ok);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        read_frames(Box::pin(futures::stream::iter(lines)), tx, limits),
+    )
+    .await
+    .expect("expected the burst to be queued, received a stalled reader")
+    .unwrap_or_else(|error| {
+        panic!("expected 12 unread notifications to fit a 16-frame budget, received {error:?}")
+    });
+    let mut queued = 0;
+    while rx.next().await.is_some() {
+        queued += 1;
+    }
+    assert_eq!(queued, 12, "expected every notification to reach the SDK");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_undrained_transport_accepts_a_burst_larger_than_the_request_cap() {
+    let transport = BoundedTransport::new(
+        output(GatedSink::default()),
+        Box::pin(futures::stream::iter(
+            std::iter::repeat_with(notification).take(12).map(Ok),
+        )),
+        Limits {
+            max_pending_requests: 2,
+            turn_channel_capacity: 16,
+            ..Limits::default()
+        },
+    );
+    let (mut channel, drive) = transport.parts();
+    channel.tx.close_channel();
+    tokio::time::timeout(Duration::from_secs(1), drive)
+        .await
+        .expect("expected the transport to finish, received a stalled drive")
+        .unwrap_or_else(|error| {
+            panic!(
+                "expected 12 undrained notifications to fit a 16-frame budget, received {error:?}"
+            )
+        });
+    let mut queued = 0;
+    while channel.rx.next().await.is_some() {
+        queued += 1;
+    }
+    assert_eq!(queued, 12, "expected every notification to reach the SDK");
+}
+
+#[tokio::test]
+async fn an_unread_burst_past_the_frame_budget_names_received_and_expected_counts() {
+    let (tx, _rx) = futures::channel::mpsc::unbounded();
+    let limits = Limits {
+        max_pending_requests: 64,
+        turn_channel_capacity: 3,
+        ..Limits::default()
+    };
+    let lines = std::iter::repeat_with(notification).take(5).map(Ok);
+    let error = read_frames(Box::pin(futures::stream::iter(lines)), tx, limits)
+        .await
+        .expect_err("expected the fourth unread frame to exceed a 3-frame budget");
+    let error = serde_json::to_string(&error).expect("error");
+    assert!(
+        error.contains("received 4 frames") && error.contains("expected at most 3 frames"),
+        "expected received 4 frames against a 3-frame budget, received {error}"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_frame_names_its_size_and_the_byte_budget() {
+    let (tx, _rx) = futures::channel::mpsc::unbounded();
+    let line = notification();
+    let limits = Limits {
+        turn_buffer_bytes: line.len() - 1,
+        ..Limits::default()
+    };
+    let error = read_frames(
+        Box::pin(futures::stream::iter([Ok(line.clone())])),
+        tx,
+        limits,
+    )
+    .await
+    .expect_err("expected a frame larger than the byte budget to be refused");
+    let error = serde_json::to_string(&error).expect("error");
+    assert!(
+        error.contains(&format!("{} bytes;", line.len()))
+            && error.contains(&format!("and {} bytes", line.len() - 1)),
+        "expected received {} bytes against a {}-byte budget, received {error}",
+        line.len(),
+        line.len() - 1
+    );
 }
 
 #[tokio::test]
@@ -203,7 +302,7 @@ async fn a_stalled_writer_refuses_outgoing_count_and_byte_pressure() {
             .expect_err("expected bounded output refusal");
         let error = serde_json::to_string(&error).expect("error");
         assert!(error.contains(if bytes == usize::MAX {
-            "pending-message budget"
+            "frame budget"
         } else {
             "byte budget"
         }));

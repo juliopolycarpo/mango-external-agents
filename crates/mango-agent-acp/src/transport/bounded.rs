@@ -43,7 +43,7 @@ impl BoundedTransport {
             limits,
         } = self;
         let future = async move {
-            let (pending, writing) = mpsc::channel(limits.max_pending_requests.max(1));
+            let (pending, writing) = mpsc::channel(frame_limit(&limits));
             let budget = Arc::new(Semaphore::new(
                 limits.turn_buffer_bytes.min(u32::MAX as usize),
             ));
@@ -110,22 +110,22 @@ async fn read_frames(
             bytes -= sizes.pop_front().expect("queued frame size");
         }
         bytes = bytes.saturating_add(line.len());
-        if queued >= limits.max_pending_requests.max(1) || bytes > limits.turn_buffer_bytes {
+        if queued >= frame_limit(&limits) || bytes > limits.turn_buffer_bytes {
             return Err(failure(format!(
-                "ACP incoming frame queue exceeded its count or byte budget: received {} frames and {bytes} bytes; expected at most {} frames and {} bytes",
+                "ACP incoming frame queue exceeded its frame or byte budget (Limits::turn_channel_capacity, Limits::turn_buffer_bytes): received {} frames and {bytes} bytes; expected at most {} frames and {} bytes",
                 queued.saturating_add(1),
-                limits.max_pending_requests.max(1),
+                frame_limit(&limits),
                 limits.turn_buffer_bytes,
             )));
         }
         let frame = TransportFrame::parse_json(&line);
         if let TransportFrame::Batch(batch) = &frame
-            && batch.len() > limits.max_pending_requests.max(1)
+            && batch.len() > frame_limit(&limits)
         {
             return Err(failure(format!(
-                "ACP batch exceeded the pending-message budget: received {} messages; expected at most {}",
+                "ACP batch exceeded the frame budget (Limits::turn_channel_capacity): received {} messages; expected at most {}",
                 batch.len(),
-                limits.max_pending_requests.max(1),
+                frame_limit(&limits),
             )));
         }
         sizes.push_back(line.len());
@@ -172,7 +172,7 @@ async fn queue_output(
                 _bytes: bytes,
             })
             .map_err(|_| failure(format!(
-                "ACP outgoing frame queue exceeded the pending-message budget: received another frame; expected fewer than {} queued frames",
+                "ACP outgoing frame queue exceeded the frame budget (Limits::turn_channel_capacity): received another frame; expected at most {} queued frames",
                 pending.max_capacity(),
             )))?;
     }
@@ -195,6 +195,16 @@ async fn write_frames(
         .close()
         .await
         .map_err(|_| failure("ACP framed output close failed"))
+}
+
+/// The most frames queued at the SDK boundary in either direction.
+///
+/// Frames are mostly `session/update` notifications, each of which becomes at most one turn event,
+/// so the queue shares the turn's event capacity. Request concurrency (`max_pending_requests`) is a
+/// different quantity and is enforced by the SDK-facing request paths. For example, the default
+/// limits allow 1,024 queued frames.
+fn frame_limit(limits: &Limits) -> usize {
+    limits.turn_channel_capacity.max(1)
 }
 
 fn failure(message: impl Into<String>) -> agent_client_protocol::Error {
