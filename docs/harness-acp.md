@@ -475,7 +475,11 @@ written its terminal; when a close is in progress, the close publishes it. After
 cleanup, a close waits for a turn another task is still settling, bounded by
 `Limits::shutdown_timeout`. Past that bound the close returns `Error::Timeout` naming the turn slot
 release and the session stays `Closing`: it admits no new work, but it does not claim the turn
-settled. After a failed cleanup the close returns that failure at once.
+settled. After a failed cleanup the close returns that failure at once. The watcher waits under
+the same bound, but it has no caller to report to: if the turn slot is still held when the bound
+expires, it leaves the session `Closing` without an error. A host that watches status only should
+call `close` on a session that stays `Closing`: the close either settles the turn and publishes
+`Closed`, or returns the `Error::Timeout` described above.
 
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
