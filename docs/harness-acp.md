@@ -43,18 +43,19 @@ The core's `LineStream` and `ByteSink` frame the pipes under `Limits::line`. `Bo
 passes frames through the SDK's [`Channel` interface](https://docs.rs/agent-client-protocol/2.1.0/agent_client_protocol/struct.Channel.html),
 leaving JSON-RPC parsing and routing to the official SDK. Each direction has two bounds:
 
-| Bound            | Limit                           | Unit              | Default           |
-| ---------------- | ------------------------------- | ----------------- | ----------------- |
-| Queued frames    | `Limits::turn_channel_capacity` | JSON-RPC frames   | 1,024             |
-| Queued bytes     | `Limits::turn_buffer_bytes`     | serialized bytes  | 8 MiB (8,388,608) |
-| Members of batch | `Limits::turn_channel_capacity` | JSON-RPC messages | 1,024             |
+| Bound           | Limit                           | Unit              | Default           |
+| --------------- | ------------------------------- | ----------------- | ----------------- |
+| Queued messages | `Limits::turn_channel_capacity` | JSON-RPC messages | 1,024             |
+| Queued bytes    | `Limits::turn_buffer_bytes`     | serialized bytes  | 8 MiB (8,388,608) |
 
-The frame cap is the turn's event capacity because frames are mostly `session/update`
+Incoming messages are counted individually: a batch is charged one message per member, so
+batches cannot multiply the queue past the cap. Outgoing frames are single messages from the SDK
+and are counted one each. The message cap is the turn's event capacity because messages are mostly `session/update`
 notifications, each of which becomes at most one turn event. It is deliberately not
 `max_pending_requests`: that caps concurrent requests and approval callbacks, and a burst of
 ordinary notifications ahead of the SDK actor is not request concurrency. Output bytes remain
-charged through the physical write. A single frame larger than the byte budget, a queue that would
-exceed either bound, or an oversized batch fails the connection with an error naming the received
+charged through the physical write. A single frame larger than the byte budget, or a queue that would
+exceed either bound fails the connection with an error naming the received
 count or size and the limit; the session then closes and its child is released.
 
 The SDK's `Lines` carrier uses unbounded internal queues; its `ByteStreams` carrier also frames input

@@ -158,8 +158,9 @@ pub struct Limits {
     /// How many payload events one turn holds before reporting overflow and stopping native work.
     /// Interaction events have a count reserve of their own, twice [`Self::max_pending_requests`].
     ///
-    /// ACP also uses it as the frame cap at its SDK boundary: at most this many frames queue per
-    /// direction of the connection, since each queued `session/update` becomes at most one event.
+    /// ACP also uses it as the message cap at its SDK boundary: at most this many JSON-RPC messages
+    /// (batch members counted individually) queue per direction of the connection, since each
+    /// queued `session/update` becomes at most one event.
     pub turn_channel_capacity: usize,
     /// Maximum serialized bytes queued per turn, excluding its reserved terminal.
     ///

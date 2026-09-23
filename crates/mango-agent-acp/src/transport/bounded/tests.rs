@@ -82,7 +82,7 @@ async fn an_unread_sdk_channel_hits_the_incoming_count_budget() {
     assert!(
         serde_json::to_string(&error)
             .expect("error")
-            .contains("incoming frame queue")
+            .contains("incoming queue")
     );
     assert!(channel.rx.next().await.is_some());
     assert!(channel.rx.next().await.is_none());
@@ -105,7 +105,7 @@ async fn queued_input_bytes_and_batch_members_have_independent_limits() {
                 turn_channel_capacity: 1,
                 ..Limits::default()
             },
-            "batch exceeded",
+            "received 2 messages",
         ),
     ] {
         let (tx, _rx) = futures::channel::mpsc::unbounded();
@@ -193,8 +193,38 @@ async fn an_unread_burst_past_the_frame_budget_names_received_and_expected_count
         .expect_err("expected the fourth unread frame to exceed a 3-frame budget");
     let error = serde_json::to_string(&error).expect("error");
     assert!(
-        error.contains("received 4 frames") && error.contains("expected at most 3 frames"),
-        "expected received 4 frames against a 3-frame budget, received {error}"
+        error.contains("received 4 messages") && error.contains("expected at most 3 messages"),
+        "expected received 4 messages against a 3-message budget, received {error}"
+    );
+}
+
+#[tokio::test]
+async fn unread_batches_are_charged_per_member_against_the_message_budget() {
+    let (tx, _rx) = futures::channel::mpsc::unbounded();
+    let limits = Limits {
+        turn_channel_capacity: 5,
+        ..Limits::default()
+    };
+    let batch = |members: usize| {
+        format!(
+            "[{}]",
+            std::iter::repeat_with(notification)
+                .take(members)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let error = read_frames(
+        Box::pin(futures::stream::iter([Ok(batch(3)), Ok(batch(3))])),
+        tx,
+        limits,
+    )
+    .await
+    .expect_err("expected two unread 3-member batches to exceed a 5-message budget");
+    let error = serde_json::to_string(&error).expect("error");
+    assert!(
+        error.contains("received 6 messages") && error.contains("expected at most 5 messages"),
+        "expected received 6 messages against a 5-message budget, received {error}"
     );
 }
 
