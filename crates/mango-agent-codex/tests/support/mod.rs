@@ -153,6 +153,39 @@ impl Transcript {
             .map(str::to_owned)
     }
 
+    /// Replays this transcript over the real process's own stdin and stdout, then outlives EOF.
+    ///
+    /// For a re-exec'd copy of a test binary acting as a real `codex app-server` child: it answers
+    /// the same way [`Self::as_process`] does, and after stdin ends it sleeps so only a kill can end
+    /// it. libtest has already printed an unterminated `test <name> ... `, so the first write ends
+    /// that line before any frame.
+    ///
+    /// ```ignore
+    /// Transcript::load("turn").serve_stdio_until_killed();
+    /// ```
+    pub fn serve_stdio_until_killed(&self) -> ! {
+        use std::io::{BufRead as _, Write as _};
+        let mut replay = Replay {
+            remaining: self.steps.iter().cloned().collect(),
+        };
+        let mut stdout = std::io::stdout();
+        let _ = writeln!(stdout);
+        for frame in &self.greeting {
+            let _ = writeln!(stdout, "{frame}");
+        }
+        let _ = stdout.flush();
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            for answer in replay.answer(&line) {
+                let _ = writeln!(stdout, "{answer}");
+            }
+            let _ = stdout.flush();
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
     /// A fake child that replays this transcript.
     ///
     /// Matched by method rather than by position, so a harness that asks the same questions in a

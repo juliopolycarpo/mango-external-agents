@@ -137,6 +137,12 @@ caller receives the same `Error::CleanupRequired` control for host reconciliatio
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.
+
+Teardown has one owner per session. The host-shutdown and connection-loss watcher, `close`, an
+abandoned turn that will not settle, and a dropped session all request the same detached worker,
+which closes the JSON-RPC client once and stops the child once. Every `close` waits for that
+worker's result, so none reports success before the child is reaped, and a failed cleanup is the
+error each waiter receives. `Closed` is published only after the reap succeeds.
 Native activity restarts the host's `Limits::idle_timeout`, but only this turn's own: the connection
 also carries a subagent's thread, a detached review's, later frames for a turn already over, and
 account-level `rateLimits` updates that name no conversation at all, and none of those extend the

@@ -7,6 +7,8 @@
 #[path = "replay/contracts.rs"]
 mod contracts;
 mod support;
+#[path = "replay/teardown.rs"]
+mod teardown;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -77,6 +79,12 @@ struct GatedLauncher {
     kill_gate: Option<Arc<FakeGate>>,
     interrupt_write_gate: Option<Arc<FakeGate>>,
     keep_child_alive_after_stdin_close: bool,
+    /// Makes every held kill report a typed failure after the gate opens.
+    fail_kill: bool,
+    /// Every `ProcessControl::kill` call, counted before the gate so a second reaper is visible.
+    kills: Arc<AtomicUsize>,
+    /// Every stdin `ByteSink::close`, the observable of one JSON-RPC client close.
+    stdin_closes: Arc<AtomicUsize>,
 }
 
 impl GatedLauncher {
@@ -90,7 +98,23 @@ impl GatedLauncher {
             kill_gate,
             interrupt_write_gate,
             keep_child_alive_after_stdin_close: false,
+            fail_kill: false,
+            kills: Arc::new(AtomicUsize::new(0)),
+            stdin_closes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn failing_kills(mut self) -> Self {
+        self.fail_kill = true;
+        self
+    }
+
+    fn kills(&self) -> usize {
+        self.kills.load(Ordering::Acquire)
+    }
+
+    fn stdin_closes(&self) -> usize {
+        self.stdin_closes.load(Ordering::Acquire)
     }
 
     fn keeping_child_alive_after_stdin_close(mut self) -> Self {
@@ -116,13 +140,39 @@ impl ProcessLauncher for GatedLauncher {
                 Box::new(NonTerminatingStdin { inner }) as Box<dyn mango_external_agents::ByteSink>
             });
         }
+        child.stdin = child.stdin.take().map(|inner| {
+            Box::new(CloseCountingStdin {
+                inner,
+                closes: Arc::clone(&self.stdin_closes),
+            }) as Box<dyn mango_external_agents::ByteSink>
+        });
         if let Some(gate) = &self.kill_gate {
             child.control = Arc::new(GatedProcessControl {
                 inner: child.control,
                 kill_gate: Arc::clone(gate),
+                fail_kill: self.fail_kill,
+                kills: Arc::clone(&self.kills),
             });
         }
         Ok(child)
+    }
+}
+
+/// Counts JSON-RPC transport closes on a child's stdin while forwarding every byte unchanged.
+struct CloseCountingStdin {
+    inner: Box<dyn mango_external_agents::ByteSink>,
+    closes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSink for CloseCountingStdin {
+    async fn write_all(&mut self, bytes: &[u8]) -> mango_external_agents::Result<()> {
+        self.inner.write_all(bytes).await
+    }
+
+    async fn close(&mut self) -> mango_external_agents::Result<()> {
+        self.closes.fetch_add(1, Ordering::AcqRel);
+        self.inner.close().await
     }
 }
 
@@ -215,6 +265,8 @@ impl mango_external_agents::ByteSink for GatedStdin {
 struct GatedProcessControl {
     inner: Arc<dyn ProcessControl>,
     kill_gate: Arc<FakeGate>,
+    fail_kill: bool,
+    kills: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -239,7 +291,14 @@ impl ProcessControl for GatedProcessControl {
     }
 
     async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.kills.fetch_add(1, Ordering::AcqRel);
         self.kill_gate.wait_for_release().await;
+        if self.fail_kill {
+            return Err(mango_external_agents::Error::Launch {
+                program: String::from("fake codex app-server"),
+                message: String::from("the test process refused termination"),
+            });
+        }
         self.inner.kill(reason).await
     }
 }
