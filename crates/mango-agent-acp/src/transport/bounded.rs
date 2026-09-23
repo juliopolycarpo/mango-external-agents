@@ -43,7 +43,7 @@ impl BoundedTransport {
             limits,
         } = self;
         let future = async move {
-            let (pending, writing) = mpsc::channel(frame_limit(&limits));
+            let (pending, writing) = mpsc::channel(outgoing_capacity(&limits));
             let budget = Arc::new(Semaphore::new(
                 limits.turn_buffer_bytes.min(u32::MAX as usize),
             ));
@@ -123,7 +123,7 @@ async fn read_frames(
         messages = messages.saturating_add(count);
         if messages > frame_limit(&limits) || bytes > limits.turn_buffer_bytes {
             return Err(failure(format!(
-                "ACP incoming queue exceeded its message or byte budget (Limits::turn_channel_capacity, Limits::turn_buffer_bytes): received {messages} messages and {bytes} bytes; expected at most {} messages and {} bytes",
+                "ACP incoming queue exceeded its message or byte budget (Limits::turn_channel_capacity or Limits::max_pending_requests, Limits::turn_buffer_bytes): received {messages} messages and {bytes} bytes; expected at most {} messages and {} bytes",
                 frame_limit(&limits),
                 limits.turn_buffer_bytes,
             )));
@@ -172,7 +172,8 @@ async fn queue_output(
                 _bytes: bytes,
             })
             .map_err(|_| failure(format!(
-                "ACP outgoing frame queue exceeded the frame budget (Limits::turn_channel_capacity): received another frame; expected at most {} queued frames",
+                "ACP outgoing frame queue exceeded the frame budget (Limits::turn_channel_capacity or Limits::max_pending_requests): received {} queued frames; expected at most {}",
+                pending.max_capacity().saturating_sub(pending.capacity()).saturating_add(1),
                 pending.max_capacity(),
             )))?;
     }
@@ -197,14 +198,26 @@ async fn write_frames(
         .map_err(|_| failure("ACP framed output close failed"))
 }
 
-/// The most frames queued at the SDK boundary in either direction.
+/// The most JSON-RPC messages queued at the SDK boundary in either direction.
 ///
-/// Frames are mostly `session/update` notifications, each of which becomes at most one turn event,
-/// so the queue shares the turn's event capacity. Request concurrency (`max_pending_requests`) is a
-/// different quantity and is enforced by the SDK-facing request paths. For example, the default
-/// limits allow 1,024 queued frames.
+/// The queue carries `session/update` notifications and responses to the requests admitted under
+/// `max_pending_requests`, so it holds at least as many messages as either. Notifications and turn
+/// events are related but not one to one; the byte budget is what bounds memory. For example, the
+/// default limits allow 1,024 queued messages.
 fn frame_limit(limits: &Limits) -> usize {
-    limits.turn_channel_capacity.max(1)
+    limits
+        .turn_channel_capacity
+        .max(limits.max_pending_requests)
+        .max(1)
+}
+
+/// The outgoing writer queue's capacity: the message cap, clamped to what tokio can allocate.
+///
+/// A host may set a huge count and rely on bytes; `mpsc::channel` panics above
+/// `Semaphore::MAX_PERMITS`, so the count is clamped rather than passed through. For example,
+/// `usize::MAX` becomes `Semaphore::MAX_PERMITS`.
+fn outgoing_capacity(limits: &Limits) -> usize {
+    frame_limit(limits).min(Semaphore::MAX_PERMITS)
 }
 
 fn failure(message: impl Into<String>) -> agent_client_protocol::Error {

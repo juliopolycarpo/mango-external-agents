@@ -71,6 +71,7 @@ async fn an_unread_sdk_channel_hits_the_incoming_count_budget() {
         ])),
         Limits {
             turn_channel_capacity: 1,
+            max_pending_requests: 1,
             ..Limits::default()
         },
     );
@@ -103,6 +104,7 @@ async fn queued_input_bytes_and_batch_members_have_independent_limits() {
             vec![format!("[{},{}]", notification(), notification())],
             Limits {
                 turn_channel_capacity: 1,
+                max_pending_requests: 1,
                 ..Limits::default()
             },
             "received 2 messages",
@@ -183,7 +185,7 @@ async fn an_undrained_transport_accepts_a_burst_larger_than_the_request_cap() {
 async fn an_unread_burst_past_the_frame_budget_names_received_and_expected_counts() {
     let (tx, _rx) = futures::channel::mpsc::unbounded();
     let limits = Limits {
-        max_pending_requests: 64,
+        max_pending_requests: 1,
         turn_channel_capacity: 3,
         ..Limits::default()
     };
@@ -203,6 +205,7 @@ async fn unread_batches_are_charged_per_member_against_the_message_budget() {
     let (tx, _rx) = futures::channel::mpsc::unbounded();
     let limits = Limits {
         turn_channel_capacity: 5,
+        max_pending_requests: 1,
         ..Limits::default()
     };
     let batch = |members: usize| {
@@ -226,6 +229,63 @@ async fn unread_batches_are_charged_per_member_against_the_message_budget() {
         error.contains("received 6 messages") && error.contains("expected at most 5 messages"),
         "expected received 6 messages against a 5-message budget, received {error}"
     );
+}
+
+fn response(id: usize) -> String {
+    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{}}}}"#)
+}
+
+#[tokio::test]
+async fn a_batch_of_admitted_responses_fits_despite_a_small_turn_capacity() {
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    let limits = Limits {
+        turn_channel_capacity: 1,
+        max_pending_requests: 4,
+        ..Limits::default()
+    };
+    let batch = format!("[{},{},{}]", response(1), response(2), response(3));
+    read_frames(Box::pin(futures::stream::iter([Ok(batch)])), tx, limits)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("expected 3 responses to fit 4 admitted requests with turn capacity 1, received {error:?}")
+        });
+    assert!(
+        rx.next().await.is_some(),
+        "expected the batch to reach the SDK"
+    );
+}
+
+#[test]
+fn an_unbounded_count_is_clamped_to_what_tokio_can_allocate() {
+    let limits = Limits {
+        turn_channel_capacity: usize::MAX,
+        ..Limits::default()
+    };
+    assert_eq!(frame_limit(&limits), usize::MAX);
+    assert_eq!(outgoing_capacity(&limits), Semaphore::MAX_PERMITS);
+}
+
+#[tokio::test]
+async fn a_transport_with_an_unbounded_count_runs_without_panicking() {
+    let transport = BoundedTransport::new(
+        output(GatedSink::default()),
+        Box::pin(futures::stream::iter([Ok(notification())])),
+        Limits {
+            turn_channel_capacity: usize::MAX,
+            ..Limits::default()
+        },
+    );
+    let (mut channel, drive) = transport.parts();
+    channel.tx.close_channel();
+    let result = tokio::spawn(tokio::time::timeout(Duration::from_secs(1), drive))
+        .await
+        .unwrap_or_else(|panic| {
+            panic!("expected no panic for usize::MAX turn capacity, received {panic}")
+        });
+    result
+        .expect("expected the transport to finish, received a stalled drive")
+        .expect("expected the transport to accept the frame");
+    assert!(channel.rx.next().await.is_some());
 }
 
 #[tokio::test]
@@ -331,10 +391,14 @@ async fn a_stalled_writer_refuses_outgoing_count_and_byte_pressure() {
             .await
             .expect_err("expected bounded output refusal");
         let error = serde_json::to_string(&error).expect("error");
-        assert!(error.contains(if bytes == usize::MAX {
-            "frame budget"
+        let expected = if bytes == usize::MAX {
+            "received 2 queued frames; expected at most 1"
         } else {
             "byte budget"
-        }));
+        };
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in the refusal, received {error}"
+        );
     }
 }
