@@ -149,12 +149,18 @@ answers `turn/interrupt` with an empty result and later ends the turn with `turn
 
 | Stage                 | Bound                                                            | On expiry                                                    |
 | --------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------ |
-| Pending start         | The `turn/start` request's own `request_timeout`                 | `Dispatch::AcceptanceUnknown`; the settle stage begins       |
+| Pending start         | `request_timeout`, from the start request or from the stop       | Start treated as unanswered; the settle stage begins         |
 | Interrupt ack         | The `turn/interrupt` request's own `request_timeout`             | Process shutdown, as for a refused interrupt                 |
 | Turn settle after ack | `cancel_settle_timeout` (60 s default), from the acknowledgement | Process shutdown                                             |
 | Shutdown escalation   | `kill_grace`, then `shutdown_timeout` per teardown stage         | `Error::CleanupRequired` carrying the host's process control |
 
-The stages add up. At worst a stop takes the rest of the start's `request_timeout`, then
+The pending-start bound has two clocks. The start request's own deadline returns
+`Dispatch::AcceptanceUnknown` to its caller. The stop worker also bounds its own wait by
+`request_timeout`, counted from when the stop began. That second clock matters when a host keeps
+the `start_turn` future alive but no longer polls it: the request's own deadline can then never
+fire.
+
+The stages add up. At worst a stop takes up to `request_timeout` waiting for the start, then
 `request_timeout` for the interrupt, then `cancel_settle_timeout`, then `kill_grace` plus the
 `shutdown_timeout` teardown stages. At the defaults that is about five minutes (120 + 120 + 60 +
 2 + a few 5 s stages). A start whose answer was lost but that a notification later names pays one

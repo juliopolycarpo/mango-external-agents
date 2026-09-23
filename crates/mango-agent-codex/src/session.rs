@@ -2525,7 +2525,8 @@ impl CodexSession {
     /// The first pass records the cancel and refuses the owner's approvals; for a pending start
     /// it can send nothing, because Codex's interrupt must name the turn. The second pass sends
     /// the interrupt once the id is known, or nothing when the start can never be named. Each wait
-    /// is bounded by a protocol request's own `request_timeout`, never by a shutdown deadline.
+    /// is bounded by `request_timeout`, never by a shutdown deadline; the start wait is bounded
+    /// here as well, because an unpolled start future never reaches its own deadline.
     async fn dispatch_stop(
         shared: &Shared,
         client: &Client,
@@ -2533,7 +2534,17 @@ impl CodexSession {
         reason: CancelReason,
     ) -> Result<()> {
         shared.cancel_owner(client, Some(owner), reason).await?;
-        shared.wait_for_start_resolution(owner).await;
+        // The start future belongs to the host, which may keep it alive without polling it; then
+        // neither its request deadline nor its drop guard ever resolves the start. Bound the wait
+        // here too, from when the stop began, and treat expiry as a lost answer. A notification
+        // that names the turn later still gets its interrupt in the settle stage.
+        let request_timeout = shared.host.limits().request_timeout;
+        if tokio::time::timeout(request_timeout, shared.wait_for_start_resolution(owner))
+            .await
+            .is_err()
+        {
+            shared.mark_start_unanswerable(owner).await;
+        }
         shared.cancel_owner(client, Some(owner), reason).await?;
         Ok(())
     }

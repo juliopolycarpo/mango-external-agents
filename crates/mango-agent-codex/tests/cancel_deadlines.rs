@@ -827,3 +827,46 @@ async fn poison_during_a_pending_start_sends_no_interrupt() {
         "expected the poisoned session to reap its app-server"
     );
 }
+
+/// A host may keep a `start_turn` future alive but stop polling it, for example a pinned future
+/// that lost a `select!`. The stop worker cannot rely on that future to resolve the start: after
+/// `request_timeout` it treats the start as unanswerable and moves on to settle and escalation.
+#[tokio::test(start_paused = true)]
+async fn a_stop_does_not_wait_on_an_unpolled_start_future() {
+    let fixture = Fixture::open(true, InterruptAnswer::AckAndComplete, KillBehaviour::Reaps).await;
+    let session = Arc::clone(&fixture.session);
+    let mut start =
+        Box::pin(async move { session.start_turn(TurnRequest::new("turn-1", "run")).await });
+    tokio::select! {
+        _ = &mut start => panic!("expected the held turn/start to stay unanswered"),
+        () = fixture.wait_for_written("turn/start") => {}
+    }
+    // `start` stays alive and is never polled again.
+
+    let bound = fixture.limits.request_timeout
+        + fixture.limits.cancel_settle_timeout
+        + fixture.limits.kill_grace
+        + fixture.limits.shutdown_timeout * 4;
+    let cancelled = tokio::time::timeout(bound, fixture.session.cancel(CancelReason::Requested));
+    let _ = cancelled.await;
+    let stopped = tokio::time::timeout(bound, async {
+        while fixture.status() != SessionStatus::Closed {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        stopped.is_ok(),
+        "expected the stop to escalate within {bound:?} | received: status {:?}, kills {}",
+        fixture.status(),
+        fixture.kills()
+    );
+    assert_eq!(
+        fixture.kills(),
+        1,
+        "expected kills: 1 | received: {}",
+        fixture.kills()
+    );
+    fixture.assert_interrupts(0, "for a start that was never named");
+    drop(start);
+}
