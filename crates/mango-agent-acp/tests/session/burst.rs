@@ -29,15 +29,15 @@ async fn open_with(agent: FakeAcpAgent, limits: Limits) -> (Box<dyn Session>, Fa
 }
 
 /// Notifications are not requests: a burst larger than the request cap must not kill the session
-/// when it fits the frame budget.
+/// when it fits the message budget. The burst arrives as one batch, so it is queued whole before
+/// the SDK actor can drain any of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_notification_burst_larger_than_the_request_cap_completes_the_turn() {
     let (session, launcher) = open_with(
-        FakeAcpAgent::new().with_updates(chunks(400)),
-        Limits {
-            max_pending_requests: 2,
-            ..Limits::default()
-        },
+        FakeAcpAgent::new()
+            .with_updates(chunks(400))
+            .batching_updates(),
+        Limits::default(),
     )
     .await;
     let mut turn = session
@@ -50,11 +50,25 @@ async fn a_notification_burst_larger_than_the_request_cap_completes_the_turn() {
     }
 
     let events = drain(&mut turn).await;
+    let summary: Vec<String> = events
+        .iter()
+        .map(|kind| format!("{kind:?}").chars().take(80).collect())
+        .collect();
     assert!(
-        matches!(events.last(), Some(EventKind::Completed)),
-        "expected a completed turn after 400 notifications with max_pending_requests 2, received {events:?}"
+        matches!(events.last(), Some(EventKind::Completed))
+            && events
+                .iter()
+                .any(|kind| matches!(kind, EventKind::TextDelta { .. }))
+            && !events
+                .iter()
+                .any(|kind| matches!(kind, EventKind::Cancelled { .. })),
+        "expected streamed text then completion for a 400-notification batch under the default 64-request cap, received {summary:?}"
     );
-    assert_eq!(session.snapshot().status, SessionStatus::Ready);
+    assert_eq!(
+        session.snapshot().status,
+        SessionStatus::Ready,
+        "expected the session to survive a 400-notification batch"
+    );
     tokio::time::timeout(
         Duration::from_secs(5),
         session.close(CloseReason::Requested),

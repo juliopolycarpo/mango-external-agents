@@ -85,6 +85,8 @@ pub struct FakeAcpAgent {
     /// A mode request that fails after earlier configuration options may have succeeded.
     set_mode_error: Option<(i32, String)>,
     updates: Vec<serde_json::Value>,
+    /// Sends a turn's updates as one JSON-RPC batch rather than one line each.
+    batch_updates: bool,
     stop_reason: String,
     version_output: String,
 }
@@ -117,6 +119,7 @@ impl FakeAcpAgent {
             config_options: None,
             config_option_error: None,
             set_mode_error: None,
+            batch_updates: false,
             updates: vec![
                 serde_json::json!({
                     "sessionUpdate": "available_commands_update",
@@ -299,6 +302,16 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn with_updates(mut self, updates: Vec<serde_json::Value>) -> Self {
         self.updates = updates;
+        self
+    }
+
+    /// Sends a turn's `session/update` notifications as one JSON-RPC batch line.
+    ///
+    /// Models an agent whose whole burst arrives in one frame, ahead of any protocol actor. For
+    /// example, `FakeAcpAgent::new().with_updates(updates).batching_updates()`.
+    #[must_use]
+    pub fn batching_updates(mut self) -> Self {
+        self.batch_updates = true;
         self
     }
 
@@ -544,6 +557,9 @@ impl FakeAcpAgent {
                 )
             })
             .collect();
+        if self.batch_updates && !lines.is_empty() {
+            lines = vec![format!("[{}]", lines.join(","))];
+        }
 
         if self.never_finishes {
             return lines;
