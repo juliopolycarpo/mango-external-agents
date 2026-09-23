@@ -2376,4 +2376,23 @@ mod tests {
             refused.map(|_| "an installed turn")
         );
     }
+
+    /// A slot the prompt task never releases turns into a typed timeout naming what was held,
+    /// rather than an `Ok` that would let the session look settled.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreleased_turn_slot_is_a_typed_timeout() {
+        let (state, host) = state();
+        let _held = state
+            .begin_turn(sink(&host, "turn-held"), None)
+            .expect("expected the turn to take the slot");
+        let bound = Duration::from_secs(3);
+        let error = crate::session::wait_for_turn_release(&state, bound)
+            .await
+            .expect_err("expected a held slot: Err(Timeout) | received: Ok");
+        assert!(
+            matches!(&error, Error::Timeout { operation, after }
+                if operation.contains("turn slot release") && *after == bound),
+            "expected Timeout naming the turn slot release after {bound:?} | received: {error:?}"
+        );
+    }
 }

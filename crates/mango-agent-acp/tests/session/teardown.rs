@@ -600,3 +600,47 @@ async fn acp_teardown_no_turn_is_admitted_after_the_watcher_fires() {
     );
     wait_for_closed(&watched.session).await;
 }
+
+/// When the shared cleanup failed, the prompt task writes the failure terminal and keeps its slot
+/// installed on purpose. A later close must report that failure at once, not wait out
+/// `shutdown_timeout` for a slot that will never be released.
+#[tokio::test]
+async fn acp_teardown_close_after_a_failed_cleanup_returns_promptly() {
+    let watched = open_watched(true).await;
+    let mut turn = watched
+        .session
+        .start_turn(TurnRequest::new("turn-1", "keep working"))
+        .await
+        .expect("expected a turn");
+    watched.agent_gone.cancel();
+    tokio::time::timeout(Duration::from_secs(5), watched.launcher.wait_for_kill())
+        .await
+        .expect("expected the cleanup to reach the process kill");
+    watched.launcher.release();
+    let events = drain_events(&mut turn).await;
+    assert!(
+        events.last().is_some_and(|event| event.is_terminal()),
+        "expected the prompt task to write the failure terminal | received: {events:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let closed = tokio::time::timeout(
+        Duration::from_secs(4),
+        watched.session.close(CloseReason::Requested),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let result = closed.unwrap_or_else(|_| {
+        panic!(
+            "expected close: settled before shutdown_timeout | received: pending after {elapsed:?}"
+        )
+    });
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "expected close: returned promptly | received: after {elapsed:?}"
+    );
+    assert!(
+        result.is_err(),
+        "expected close result: Err(cleanup failed) | received: {result:?}"
+    );
+}

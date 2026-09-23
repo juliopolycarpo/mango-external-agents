@@ -471,9 +471,11 @@ the same shared reaper instead. Every `close` waits for the shared result, so a 
 concurrent close never reports success before the child is reaped, and a cleanup failure is the
 error each waiter receives. Once the watcher sees the agent go, it refuses new turns before it
 waits on anything. `Closed` is published only after the reap succeeds and the running turn has
-written its terminal; when a close is in progress, the close publishes it. The wait for a turn
-another task is still settling is bounded by `Limits::shutdown_timeout`, and past that bound the
-status stays `Closing`.
+written its terminal; when a close is in progress, the close publishes it. After a successful
+cleanup, a close waits for a turn another task is still settling, bounded by
+`Limits::shutdown_timeout`. Past that bound the close returns `Error::Timeout` naming the turn slot
+release and the session stays `Closing`: it admits no new work, but it does not claim the turn
+settled. After a failed cleanup the close returns that failure at once.
 
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports

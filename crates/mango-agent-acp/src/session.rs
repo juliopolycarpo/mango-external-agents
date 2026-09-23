@@ -1468,7 +1468,7 @@ async fn finish_close(
 
     connection.begin_shutdown(reason.into());
     let result = connection.wait_shutdown().await;
-    let mut turn_settled = true;
+    let mut result = result;
     if let Some(handle) = ending
         && let Some((turn, _, closing)) = state.prepare_terminal_matching(&handle)
     {
@@ -1494,19 +1494,41 @@ async fn finish_close(
         }
         if owned {
             state.release_turn_matching(&handle);
-        } else {
+        } else if result.is_ok() {
             // The prompt task claimed this terminal and releases the slot once it is written.
-            // `Closed` waits for that, bounded so a stuck writer cannot hold the close forever.
-            turn_settled = tokio::time::timeout(limits.shutdown_timeout, state.wait_for_no_turn())
-                .await
-                .is_ok();
+            // After a failed cleanup it deliberately keeps the slot, so there is nothing to wait
+            // for: the cleanup error already says what was left behind.
+            result = wait_for_turn_release(&state, limits.shutdown_timeout).await;
         }
     }
 
-    if result.is_ok() && turn_settled {
+    if result.is_ok() {
         session_state.set_status(SessionStatus::Closed);
     }
     close.finish(result);
+}
+
+/// Waits, bounded, for a prompt task that claimed its turn's terminal to release the slot.
+///
+/// On expiry the session is still closed to new work; the error names what was left behind so
+/// the caller is not told the turn had settled.
+///
+/// ```ignore
+/// let settled = wait_for_turn_release(&state, limits.shutdown_timeout).await;
+/// ```
+pub(crate) async fn wait_for_turn_release(
+    state: &client::SessionState,
+    bound: std::time::Duration,
+) -> Result<()> {
+    tokio::time::timeout(bound, state.wait_for_no_turn())
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from(
+                "ACP turn slot release (expected: released by the prompt task that wrote the \
+                 terminal | received: still held)",
+            ),
+            after: bound,
+        })
 }
 
 impl AcpSession {
