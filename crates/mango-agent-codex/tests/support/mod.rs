@@ -157,8 +157,8 @@ impl Transcript {
     ///
     /// For a re-exec'd copy of a test binary acting as a real `codex app-server` child: it answers
     /// the same way [`Self::as_process`] does, and after stdin ends it sleeps so only a kill can end
-    /// it. libtest has already printed an unterminated `test <name> ... `, so the first write ends
-    /// that line before any frame.
+    /// it. The re-exec runs libtest with `--quiet`, whose only preamble is a complete
+    /// `running 1 test` line that the JSON-RPC reader skips as a non-frame.
     ///
     /// ```ignore
     /// Transcript::load("turn").serve_stdio_until_killed();
@@ -169,7 +169,6 @@ impl Transcript {
             remaining: self.steps.iter().cloned().collect(),
         };
         let mut stdout = std::io::stdout();
-        let _ = writeln!(stdout);
         for frame in &self.greeting {
             let _ = writeln!(stdout, "{frame}");
         }

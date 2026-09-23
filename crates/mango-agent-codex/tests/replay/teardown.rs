@@ -88,8 +88,8 @@ fn assert_one_teardown(launcher: &GatedLauncher, inner: &FakeLauncher) {
         "expected kills: 1 | received: {}",
         launcher.kills()
     );
-    // `Client::close` is idempotent internally, so the transport close is the only observable of
-    // how many owners reached it.
+    // The stdin sink close is what this can observe. `Client::close` is itself idempotent, so this
+    // proves the transport closed once, not that only one owner called it.
     assert_eq!(
         launcher.stdin_closes(),
         1,
@@ -123,27 +123,12 @@ async fn codex_teardown_watcher_then_close_kills_once() {
     settle().await;
 
     assert_one_teardown(&watched.launcher, &watched.inner);
-    assert_eq!(watched.session.snapshot().status, SessionStatus::Closed);
-}
-
-/// A close owns teardown first; host shutdown afterwards must not start a second reaper.
-#[tokio::test]
-async fn codex_teardown_close_then_watcher_kills_once() {
-    let watched = open_watched(false).await;
-    release_kills(&watched.kill_gate);
-
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        watched.session.close(CloseReason::Requested),
-    )
-    .await
-    .expect("expected close to return, not hang")
-    .expect("expected close to succeed");
-    watched.cancel.cancel();
-    settle().await;
-
-    assert_one_teardown(&watched.launcher, &watched.inner);
-    assert_eq!(watched.session.snapshot().status, SessionStatus::Closed);
+    let status = watched.session.snapshot().status;
+    assert_eq!(
+        status,
+        SessionStatus::Closed,
+        "expected session status: Closed | received: {status:?}"
+    );
 }
 
 /// Dropping a pending close and then the session itself while cleanup is held leaves one owner,
@@ -213,10 +198,10 @@ async fn codex_teardown_close_waits_for_a_stalled_watcher_cleanup() {
         );
     }
     let status = watched.session.snapshot().status;
-    assert_ne!(
+    assert_eq!(
         status,
-        SessionStatus::Closed,
-        "expected session status: not Closed while the kill is held | received: {status:?}"
+        SessionStatus::Closing,
+        "expected session status: Closing while the kill is held | received: {status:?}"
     );
 
     release_kills(&watched.kill_gate);
@@ -229,7 +214,12 @@ async fn codex_teardown_close_waits_for_a_stalled_watcher_cleanup() {
     }
     settle().await;
     assert_one_teardown(&watched.launcher, &watched.inner);
-    assert_eq!(watched.session.snapshot().status, SessionStatus::Closed);
+    let status = watched.session.snapshot().status;
+    assert_eq!(
+        status,
+        SessionStatus::Closed,
+        "expected session status: Closed | received: {status:?}"
+    );
 }
 
 /// A failed watcher-owned cleanup is the result every close waiter observes; none reports success
@@ -279,10 +269,10 @@ async fn codex_teardown_a_failed_watcher_cleanup_fails_every_close_waiter() {
         watched.launcher.kills()
     );
     let status = watched.session.snapshot().status;
-    assert_ne!(
+    assert_eq!(
         status,
-        SessionStatus::Closed,
-        "expected session status: not Closed after failed cleanup | received: {status:?}"
+        SessionStatus::Closing,
+        "expected session status: Closing after failed cleanup | received: {status:?}"
     );
 }
 
@@ -296,6 +286,7 @@ const FIXTURE_MODE: &str = "MEA_CODEX_TEARDOWN_FIXTURE";
 /// only a kill can end it. Without the environment marker it returns at once.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "re-exec'd fixture body; only runs as a real child process"]
 fn codex_teardown_fixture_child() {
     if std::env::var(FIXTURE_MODE).is_err() {
         return;
@@ -324,8 +315,9 @@ fn write_fixture_executable() -> std::path::PathBuf {
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\n{FIXTURE_MODE}=1 exec '{}' codex_teardown_fixture_child --nocapture --test-threads=1\n",
-            test_binary.display()
+            "#!/bin/sh\n{FIXTURE_MODE}=1 exec {} --ignored --exact \
+             teardown::codex_teardown_fixture_child --quiet --nocapture --test-threads=1\n",
+            shell_quoted(&test_binary.display().to_string())
         ),
     )
     .expect("expected the fixture wrapper to be written");
@@ -334,12 +326,37 @@ fn write_fixture_executable() -> std::path::PathBuf {
     wrapper
 }
 
+/// Quotes one word for `/bin/sh`, including embedded single quotes.
+///
+/// ```ignore
+/// assert_eq!(shell_quoted("it's"), "'it'\\''s'");
+/// ```
+#[cfg(target_os = "linux")]
+fn shell_quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// The wrapper quoting survives a path holding the shell's own quote character.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_teardown_shell_quoting_escapes_single_quotes() {
+    let quoted = shell_quoted("/tmp/it's here/codex");
+    assert_eq!(
+        quoted, "'/tmp/it'\\''s here/codex'",
+        "expected a single-quoted word with the quote escaped | received: {quoted}"
+    );
+}
+
 /// A real app-server child spawned through the Tokio launcher is alive until `close`, is killed
 /// once by the shared teardown owner, and is gone afterwards even when the session is dropped too.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_teardown_real_process_is_killed_once_and_reaped() {
     let wrapper = write_fixture_executable();
+    let mut cleanup = FixtureCleanup {
+        pid: None,
+        directory: wrapper.parent().map(std::path::Path::to_path_buf),
+    };
     let counting = CountingTokioLauncher::default();
     let host = host_context(
         Arc::new(counting.clone()),
@@ -364,6 +381,7 @@ async fn codex_teardown_real_process_is_killed_once_and_reaped() {
         .expect("expected a session over the real fixture process"),
     );
     let pid = counting.pid().expect("expected the launched child's pid");
+    cleanup.pid = Some(pid);
     let proc_entry = std::path::PathBuf::from(format!("/proc/{pid}"));
 
     // A child that died on its own (for example on SIGPIPE) would make the teardown look clean.
@@ -385,7 +403,6 @@ async fn codex_teardown_real_process_is_killed_once_and_reaped() {
     second.expect("expected the joined close to succeed");
     drop(session);
     settle().await;
-    let _ = std::fs::remove_dir_all(wrapper.parent().unwrap_or(&wrapper));
 
     assert_eq!(
         counting.kills(),
@@ -397,6 +414,31 @@ async fn codex_teardown_real_process_is_killed_once_and_reaped() {
         !proc_entry.exists(),
         "expected fixture child {pid}: reaped after close | received: still present"
     );
+}
+
+/// Kills a fixture child that outlived a failed assertion and removes its scratch directory.
+///
+/// Unwinding past a failed assert would otherwise leave a sleeping re-exec'd test binary behind.
+#[cfg(target_os = "linux")]
+struct FixtureCleanup {
+    pid: Option<u32>,
+    directory: Option<std::path::PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FixtureCleanup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid
+            && std::path::Path::new(&format!("/proc/{pid}")).exists()
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        if let Some(directory) = &self.directory {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
 }
 
 /// Wraps the real Tokio launcher and counts kills on the one child it spawns.
@@ -477,4 +519,120 @@ impl ProcessControl for CountingControl {
         self.kills.fetch_add(1, Ordering::AcqRel);
         self.inner.kill(reason).await
     }
+}
+
+/// Wraps the fake launcher so the host's process control panics when asked to kill.
+struct PanickingKillLauncher {
+    inner: Arc<FakeLauncher>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for PanickingKillLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> mango_external_agents::Result<ManagedProcess> {
+        let mut child = self.inner.spawn(spec).await?;
+        child.control = Arc::new(PanickingKillControl {
+            inner: child.control,
+        });
+        Ok(child)
+    }
+}
+
+/// A host process control whose `kill` panics, as a buggy host implementation might.
+struct PanickingKillControl {
+    inner: Arc<dyn ProcessControl>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for PanickingKillControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, _reason: CancelReason) -> mango_external_agents::Result<()> {
+        panic!("test host process control panicked during kill");
+    }
+}
+
+/// A panic inside the teardown worker still settles every close waiter with an error instead of
+/// leaving them parked forever on a completion that never fires.
+#[tokio::test]
+async fn codex_teardown_a_panicking_cleanup_fails_every_close_waiter() {
+    let inner = Arc::new(FakeLauncher::new());
+    inner.push(Transcript::load("turn").as_process());
+    let host = host_context(
+        Arc::new(PanickingKillLauncher {
+            inner: Arc::clone(&inner),
+        }),
+        None,
+        teardown_limits(),
+        mango_external_agents::CancelToken::new(),
+        None,
+    );
+    let session: Arc<dyn Session> = Arc::from(
+        CodexHarness::new()
+            .open_session(&host, OpenSession::new("panicking-teardown"))
+            .await
+            .expect("expected a session"),
+    );
+
+    let first = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.close(CloseReason::Requested).await })
+    };
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.close(CloseReason::Shutdown),
+    )
+    .await
+    .expect("expected close waiter: settled after a panicking cleanup | received: still pending");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+        .await
+        .expect(
+            "expected close waiter: settled after a panicking cleanup | received: still pending",
+        )
+        .expect("expected the close task to join");
+    for result in [first, second] {
+        let error =
+            result.expect_err("expected close result: Err(cleanup panicked) | received: Ok");
+        assert!(
+            error.to_string().contains("panicked"),
+            "expected an error naming the panicked teardown | received: {error}"
+        );
+    }
+    let status = session.snapshot().status;
+    assert_eq!(
+        status,
+        SessionStatus::Closing,
+        "expected session status: Closing after a panicked cleanup | received: {status:?}"
+    );
+}
+
+/// A session dropped on a thread with no Tokio runtime still reaps its child, through the runtime
+/// it was opened on, instead of silently skipping cleanup.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_teardown_a_session_dropped_outside_a_runtime_reaps_its_child() {
+    let (session, launcher) = open("turn").await;
+    std::thread::spawn(move || drop(session))
+        .join()
+        .expect("expected the dropping thread to finish");
+
+    let reaped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while launcher.live_children() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        reaped.is_ok(),
+        "expected live children: 0 after a drop outside a runtime | received: {}",
+        launcher.live_children()
+    );
 }

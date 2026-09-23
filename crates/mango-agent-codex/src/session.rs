@@ -77,6 +77,8 @@ pub struct CodexSession {
     closed: AtomicBool,
     /// Stops the vendor if the host cancels its shared lifetime token.
     shutdown_watcher: tokio::task::JoinHandle<()>,
+    /// The runtime the session was opened on, so a drop on a thread without one still reaps.
+    runtime: tokio::runtime::Handle,
 }
 
 /// Accepted defaults and the ordering of successful start attempts.
@@ -936,6 +938,10 @@ impl Shared {
         let mut message =
             format!("Codex app-server connection ended while the turn was active: {termination}");
         if let Some(control) = self.control.get() {
+            // A bounded, read-only probe for the diagnostic, not a reap: the teardown owner still
+            // waits and reaps afterwards. It relies on `ProcessControl::wait` being repeatable and
+            // cancel-safe, which the core's own `stop_process` already assumes by waiting after an
+            // interrupt and again after the kill.
             if let Ok(Ok(status)) =
                 tokio::time::timeout(std::time::Duration::from_millis(10), control.wait()).await
             {
@@ -2555,10 +2561,23 @@ impl CodexSession {
             return;
         }
         let worker_shared = Arc::clone(&shared);
+        let worker_control = Arc::clone(&control);
         tokio::spawn(async move {
-            if let Err(error) =
-                Self::shutdown_session(worker_shared, client, control, state, reason).await
-            {
+            // The cleanup runs in a task of its own so a panicking host `ProcessControl` surfaces
+            // here as a join error. Without that, the completion below never ran and every close
+            // waiter stayed parked forever.
+            let worker = tokio::spawn(Self::shutdown_session(
+                worker_shared,
+                client,
+                worker_control,
+                state,
+                reason,
+            ));
+            let outcome = match worker.await {
+                Ok(outcome) => outcome,
+                Err(joined) => Err(teardown_panicked(control, &joined)),
+            };
+            if let Err(error) = outcome {
                 *shared.teardown_error.lock().await = Some(error);
             }
             shared.teardown_complete.store(true, Ordering::Release);
@@ -2727,6 +2746,8 @@ impl CodexSession {
             control,
             closed: AtomicBool::new(false),
             shutdown_watcher,
+            // `new` already spawned the watcher above, which only succeeds inside a runtime.
+            runtime: tokio::runtime::Handle::current(),
         }
     }
 
@@ -3453,11 +3474,38 @@ impl Drop for CodexSession {
         let client = Arc::clone(&self.client);
         let control = Arc::clone(&self.control);
         let state = self.state.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                Self::request_shutdown(shared, client, control, state, CancelReason::Shutdown);
-            });
-        }
+        // The current runtime when there is one, else the one the session was opened on: a host
+        // dropping its last handle from a plain thread must not orphan the app-server.
+        let runtime =
+            tokio::runtime::Handle::try_current().unwrap_or_else(|_| self.runtime.clone());
+        runtime.spawn(async move {
+            Self::request_shutdown(shared, client, control, state, CancelReason::Shutdown);
+        });
+    }
+}
+
+/// The typed failure every close waiter receives when the teardown worker did not return.
+///
+/// The child may still be live, so the host's control rides along for reconciliation.
+///
+/// ```ignore
+/// let error = teardown_panicked(control, &join_error);
+/// assert!(error.cleanup_control().is_some());
+/// ```
+fn teardown_panicked(control: Arc<dyn ProcessControl>, joined: &tokio::task::JoinError) -> Error {
+    let shape = if joined.is_panic() {
+        "panicked"
+    } else {
+        "was cancelled"
+    };
+    Error::CleanupRequired {
+        control,
+        source: Box::new(Error::Link {
+            peer: String::from("codex app-server"),
+            message: format!(
+                "expected the session teardown worker to return | received: it {shape}"
+            ),
+        }),
     }
 }
 
@@ -5249,5 +5297,40 @@ mod tests {
         assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
         assert_eq!(base64(&[0x00, 0x00, 0x00]), "AAAA");
         assert_eq!(base64(&[0xff]), "/w==");
+    }
+
+    /// A teardown worker that panicked becomes a cleanup-required error naming the panic, so a
+    /// close waiter is told the child may still be live.
+    #[tokio::test]
+    async fn a_panicked_teardown_worker_is_reported_as_cleanup_required() {
+        let joined = tokio::spawn(async { panic!("test teardown worker panicked") })
+            .await
+            .expect_err("expected the spawned worker to panic");
+        let launcher = mango_external_agents::testing::FakeLauncher::new();
+        launcher.push(mango_external_agents::testing::FakeProcess::transcript(
+            Vec::<String>::new(),
+        ));
+        let control = mango_external_agents::ProcessLauncher::spawn(
+            &launcher,
+            mango_external_agents::LaunchSpec {
+                argv: vec![String::from("codex")],
+                cwd: std::env::temp_dir(),
+                env: Default::default(),
+                stdin: true,
+                hide_window: true,
+            },
+        )
+        .await
+        .expect("expected the fake child to launch")
+        .control;
+        let error = super::teardown_panicked(control, &joined);
+        assert!(
+            error.cleanup_control().is_some(),
+            "expected a cleanup-required error carrying the control | received: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("panicked"),
+            "expected an error naming the panic | received: {error}"
+        );
     }
 }
