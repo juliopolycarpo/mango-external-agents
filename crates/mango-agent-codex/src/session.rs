@@ -523,6 +523,8 @@ struct StartGuard {
     state: SessionState,
     owner: Arc<()>,
     armed: bool,
+    /// The runtime the start began on, so a drop on a thread without one still abandons the owner.
+    runtime: tokio::runtime::Handle,
 }
 
 impl StartGuard {
@@ -540,6 +542,8 @@ impl StartGuard {
             state,
             owner,
             armed: true,
+            // Built inside the async `start_turn`, so a runtime is current.
+            runtime: tokio::runtime::Handle::current(),
         }
     }
 
@@ -558,11 +562,13 @@ impl Drop for StartGuard {
         let control = Arc::clone(&self.control);
         let state = self.state.clone();
         let owner = Arc::clone(&self.owner);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                CodexSession::abandon_owner(shared, client, control, state, owner).await;
-            });
-        }
+        // The current runtime when there is one, else the one the start began on: a caller
+        // dropping the future from a plain thread must not strand the turn slot.
+        let runtime =
+            tokio::runtime::Handle::try_current().unwrap_or_else(|_| self.runtime.clone());
+        runtime.spawn(async move {
+            CodexSession::abandon_owner(shared, client, control, state, owner).await;
+        });
     }
 }
 

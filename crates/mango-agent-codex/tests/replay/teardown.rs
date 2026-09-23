@@ -636,3 +636,44 @@ async fn codex_teardown_a_session_dropped_outside_a_runtime_reaps_its_child() {
         launcher.live_children()
     );
 }
+
+/// A pending `start_turn` dropped on a thread with no runtime still abandons its owner through
+/// the runtime the start began on, instead of leaving the turn slot and the app-server held.
+#[tokio::test(start_paused = true)]
+async fn codex_teardown_a_start_dropped_outside_a_runtime_releases_its_owner() {
+    let (session, launcher) =
+        open_with_delayed_first_start(DelayedStartAnswer::Success, false).await;
+    let starting_session = Arc::clone(&session);
+    let mut start = Box::pin(async move {
+        starting_session
+            .start_turn(TurnRequest::new("turn-abandoned-off-runtime", "one"))
+            .await
+    });
+    tokio::select! {
+        biased;
+        _ = &mut start => panic!("expected the delayed start to stay pending"),
+        () = wait_for_turn_start(&launcher) => {}
+    }
+    std::thread::spawn(move || drop(start))
+        .join()
+        .expect("expected the dropping thread not to panic");
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(replay_limits().shutdown_timeout).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected live children: 0 after an off-runtime start drop | received: {}",
+        launcher.live_children()
+    );
+    let error = session
+        .start_turn(TurnRequest::new("turn-after-abandonment", "two"))
+        .await
+        .expect_err("expected start after abandonment: Err(Closed) | received: Ok");
+    assert!(
+        matches!(error.cause(), mango_external_agents::Error::Closed { .. }),
+        "expected start after abandonment: Err(Closed) | received: {error:?}"
+    );
+}
