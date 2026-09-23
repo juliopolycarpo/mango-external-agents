@@ -41,7 +41,11 @@ These are different observations:
 exited or stopping child, and an unsupported operation. The Tokio launcher uses SIGINT on Unix and
 reports unsupported on Windows. Hosts can
 implement their platform's interruption mechanism. `stop_process_with_limits` waits for
-`kill_grace`, then uses `shutdown_timeout` for each cleanup stage. Tree cleanup still runs after a
+`kill_grace`, then uses `shutdown_timeout` for each cleanup stage. In the Codex harness those two
+limits bound process teardown only. There, a turn being cancelled on a live session is bounded by
+`cancel_settle_timeout` once its protocol stop is acknowledged, and expiry escalates to that
+teardown. See `docs/harness-codex.md` for the stages. The Claude and ACP harnesses still bound
+their cancellation with `kill_grace` and `shutdown_timeout`. Tree cleanup still runs after a
 leader exits because descendants may hold the workspace. SIGTERM or forced termination does not
 establish the same vendor continuation state as a clean interrupt.
 
