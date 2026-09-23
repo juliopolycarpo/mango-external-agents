@@ -636,6 +636,11 @@ impl Harness for AcpHarness {
             if close.is_started() {
                 return;
             }
+            // Admission closes before any await: a turn started now would run on a dead
+            // connection and could still be writing its terminal after `Closed`.
+            if let Some(state) = turn_state.upgrade() {
+                state.close_turn_admission();
+            }
             // `Closing` first, and `Closed` only after the owned connection cleanup succeeds:
             // neither EOF nor a dead dispatch loop proves the agent process is gone.
             closing_state.set_status(mango_external_agents::SessionStatus::Closing);

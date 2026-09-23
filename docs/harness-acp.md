@@ -469,8 +469,11 @@ exit or a failed transport, and an abandoned request all join that task rather t
 child again. A dropped session has no connection handle left to join, so its watcher reaps through
 the same shared reaper instead. Every `close` waits for the shared result, so a second or
 concurrent close never reports success before the child is reaped, and a cleanup failure is the
-error each waiter receives. `Closed` is published only after the reap succeeds and the running
-turn has written its terminal; when a close is in progress, the close publishes it.
+error each waiter receives. Once the watcher sees the agent go, it refuses new turns before it
+waits on anything. `Closed` is published only after the reap succeeds and the running turn has
+written its terminal; when a close is in progress, the close publishes it. The wait for a turn
+another task is still settling is bounded by `Limits::shutdown_timeout`, and past that bound the
+status stays `Closing`.
 
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports

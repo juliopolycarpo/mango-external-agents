@@ -127,6 +127,19 @@ impl Clock for TickingClock {
 /// after the turn's terminal event.
 #[tokio::test]
 async fn acp_teardown_closed_is_published_after_the_turn_terminal() {
+    assert_closed_after_terminal(true).await;
+}
+
+/// Without any close, the prompt task writes the turn's terminal after the watcher's cleanup;
+/// the watcher waits for the turn to leave its slot before it publishes `Closed`.
+#[tokio::test]
+async fn acp_teardown_closed_without_close_is_published_after_the_turn_terminal() {
+    assert_closed_after_terminal(false).await;
+}
+
+/// Drives a dead agent with a live turn to `Closed`, optionally with a close claimed while the
+/// shared cleanup is held, and asserts the turn's terminal was stamped first.
+async fn assert_closed_after_terminal(with_close: bool) {
     let inner = FakeLauncher::new();
     let agent_gone = CancelToken::new();
     inner.push(
@@ -169,12 +182,19 @@ async fn acp_teardown_closed_is_published_after_the_turn_terminal() {
     tokio::time::timeout(Duration::from_secs(5), launcher.wait_for_kill())
         .await
         .expect("expected the watcher to reach the process kill");
-    let closing = {
+    // `close` claims the session synchronously on its first poll, so polling it once is the
+    // observable that it owns the turn before the held kill is released.
+    let mut closing = with_close.then(|| {
         let session = Arc::clone(&session);
-        tokio::spawn(async move { session.close(CloseReason::Requested).await })
-    };
-    // Let the close join the held shutdown before the kill is released.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+        Box::pin(async move { session.close(CloseReason::Requested).await })
+    });
+    if let Some(closing) = closing.as_mut() {
+        tokio::select! {
+            biased;
+            _ = closing.as_mut() => panic!("expected close to wait on the held cleanup"),
+            () = std::future::ready(()) => {}
+        }
+    }
     launcher.release();
 
     let mut closed_at = None;
@@ -190,11 +210,12 @@ async fn acp_teardown_closed_is_published_after_the_turn_terminal() {
     })
     .await
     .expect("expected the session to reach Closed");
-    tokio::time::timeout(Duration::from_secs(5), closing)
-        .await
-        .expect("expected close to settle after release")
-        .expect("expected the close task to join")
-        .expect("expected close to succeed");
+    if let Some(closing) = closing {
+        tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .expect("expected close to settle after release")
+            .expect("expected close to succeed");
+    }
 
     let events = drain_events(&mut turn).await;
     let terminal_at = events
@@ -553,4 +574,29 @@ async fn acp_teardown_a_session_dropped_outside_a_runtime_reaps_its_child() {
         "expected live children: 0 after a drop outside a runtime | received: {}",
         launcher.live_children()
     );
+}
+
+/// Once the watcher has seen the agent go, the session admits no new turn: a start that slipped
+/// in would run on a dead connection and could still be writing its terminal after `Closed`.
+#[tokio::test]
+async fn acp_teardown_no_turn_is_admitted_after_the_watcher_fires() {
+    let watched = open_watched(false).await;
+    watched.agent_gone.cancel();
+    tokio::time::timeout(Duration::from_secs(5), watched.launcher.wait_for_kill())
+        .await
+        .expect("expected the watcher to reach the process kill");
+
+    let started = watched
+        .session
+        .start_turn(TurnRequest::new("turn-after-exit", "too late"))
+        .await;
+    watched.launcher.release();
+    let Err(error) = started else {
+        panic!("expected start after agent exit: Err(Closed) | received: Ok(stream)");
+    };
+    assert!(
+        matches!(error.cause(), Error::Closed { .. }),
+        "expected start after agent exit: Err(Closed) | received: {error:?}"
+    );
+    wait_for_closed(&watched.session).await;
 }

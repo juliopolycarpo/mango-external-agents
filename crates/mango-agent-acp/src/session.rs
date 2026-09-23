@@ -1468,12 +1468,14 @@ async fn finish_close(
 
     connection.begin_shutdown(reason.into());
     let result = connection.wait_shutdown().await;
+    let mut turn_settled = true;
     if let Some(handle) = ending
         && let Some((turn, _, closing)) = state.prepare_terminal_matching(&handle)
     {
         // Terminal commitment is reserved in the core stream, so neither a full transcript nor a
         // dropped initiating close future can prevent this task from settling its owned turn.
-        if turn.finish() {
+        let owned = turn.finish();
+        if owned {
             let _ = turn.approvals.flush(&turn.sink).await;
             for kind in closing {
                 let _ = turn.sink.emit(kind).await;
@@ -1490,10 +1492,18 @@ async fn finish_close(
                 }
             }
         }
-        state.release_turn_matching(&handle);
+        if owned {
+            state.release_turn_matching(&handle);
+        } else {
+            // The prompt task claimed this terminal and releases the slot once it is written.
+            // `Closed` waits for that, bounded so a stuck writer cannot hold the close forever.
+            turn_settled = tokio::time::timeout(limits.shutdown_timeout, state.wait_for_no_turn())
+                .await
+                .is_ok();
+        }
     }
 
-    if result.is_ok() {
+    if result.is_ok() && turn_settled {
         session_state.set_status(SessionStatus::Closed);
     }
     close.finish(result);

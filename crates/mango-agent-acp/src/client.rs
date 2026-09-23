@@ -292,6 +292,8 @@ pub(crate) struct SessionState {
     turn: Mutex<Option<TurnHandle>>,
     /// Wakes a lifecycle watcher once the running turn has written its terminal and left the slot.
     turn_released: tokio::sync::Notify,
+    /// Set by the connection-loss watcher: no further turn may take the slot on a dead connection.
+    admission_closed: AtomicBool,
     /// The explicit settings the next turn inherits.
     ///
     /// `None` on either permission axis leaves the vendor's own setting in force. Turning that
@@ -360,6 +362,7 @@ impl SessionState {
             limits: *host.limits(),
             turn: Mutex::new(None),
             turn_released: tokio::sync::Notify::new(),
+            admission_closed: AtomicBool::new(false),
             configuration: Mutex::new(configuration),
             catalog_revision: Mutex::new(0),
             turn_start: Mutex::new(()),
@@ -394,6 +397,9 @@ impl SessionState {
         level: Option<PermissionLevel>,
     ) -> Result<TurnHandle> {
         let mut turn = self.lock_turn();
+        if self.admission_closed.load(Ordering::Acquire) {
+            return Err(Error::Closed { subject: "session" });
+        }
         if turn.is_some() {
             return Err(Error::Busy);
         }
@@ -579,6 +585,20 @@ impl SessionState {
             drop(active);
             self.turn_released.notify_waiters();
         }
+    }
+
+    /// Refuses every later turn, for a watcher that saw the connection die.
+    ///
+    /// Taken under the slot's own guard, so a start either installed its turn first — and the
+    /// watcher then waits for that turn's terminal — or observes the refusal.
+    ///
+    /// ```ignore
+    /// state.close_turn_admission();
+    /// assert!(state.begin_turn(sink, None).is_err());
+    /// ```
+    pub(crate) fn close_turn_admission(&self) {
+        let _turn = self.lock_turn();
+        self.admission_closed.store(true, Ordering::Release);
     }
 
     /// Waits until no turn holds the prompt slot.
@@ -1089,6 +1109,9 @@ pub(crate) struct ConnectionHandle {
     /// its diagnostic-safe summary here because the core error is not cloneable and a second close
     /// must still report the first cleanup failure rather than inventing success.
     shutdown_result: Mutex<Option<std::result::Result<(), String>>>,
+    /// The runtime the connection was driven on. Shutdown is spawned through it, so a request
+    /// or scope guard dropped on a thread without a runtime still ends the child.
+    runtime: tokio::runtime::Handle,
     /// How many shutdown tasks `begin_shutdown` started; the single-flight guard keeps it at one.
     #[cfg(test)]
     shutdown_runs: std::sync::atomic::AtomicUsize,
@@ -1284,8 +1307,6 @@ impl DriveShutdownGuard {
 /// that picker request take the same shutdown path as an explicit close.
 pub(crate) struct ConnectionShutdownGuard {
     connection: Option<Arc<ConnectionHandle>>,
-    /// The runtime the scope began on, so a drop on a thread without one still ends the child.
-    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl ConnectionShutdownGuard {
@@ -1293,7 +1314,6 @@ impl ConnectionShutdownGuard {
     pub(crate) fn new(connection: Arc<ConnectionHandle>) -> Self {
         Self {
             connection: Some(connection),
-            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -1334,16 +1354,8 @@ impl Drop for ConnectionShutdownGuard {
         let Some(connection) = self.connection.take() else {
             return;
         };
-        // The current runtime when there is one, else the one this scope began on: a caller
-        // dropping it from a plain thread must not orphan the child.
-        let Some(runtime) = tokio::runtime::Handle::try_current()
-            .ok()
-            .or_else(|| self.runtime.clone())
-        else {
-            return;
-        };
-        let _entered = runtime.enter();
-        // Drop has no caller to receive a cleanup failure. Explicit owners use `shutdown`, which
+        // `begin_shutdown` spawns on the connection's own runtime, so this is safe from a plain
+        // thread too. Drop has no caller to receive a cleanup failure. Explicit owners use `shutdown`, which
         // preserves its result for them instead.
         connection.begin_shutdown(mango_external_agents::CancelReason::Shutdown);
     }
@@ -1464,6 +1476,8 @@ pub(crate) async fn drive(
         shutdown_started: AtomicBool::new(false),
         shutdown_complete: mango_external_agents::CancelToken::new(),
         shutdown_result: Mutex::new(None),
+        // `drive` is async and has already spawned the dispatch loop, so a runtime is current.
+        runtime: tokio::runtime::Handle::current(),
         #[cfg(test)]
         shutdown_runs: std::sync::atomic::AtomicUsize::new(0),
         requests: RequestAdmission::new(state.limits.max_pending_requests),
@@ -1483,7 +1497,7 @@ impl ConnectionHandle {
         let connection = Arc::clone(self);
         #[cfg(test)]
         self.shutdown_runs.fetch_add(1, Ordering::AcqRel);
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             let result = connection
                 .shutdown(reason)
                 .await
@@ -2317,5 +2331,49 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), state.wait_for_no_turn())
             .await
             .expect("expected wait_for_no_turn: immediate with no turn | received: still pending");
+    }
+
+    /// An in-flight request dropped on a thread with no runtime must not panic its owner and must
+    /// still start the connection's shutdown, through the runtime the connection was driven on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_abandoned_outside_a_runtime_still_shuts_the_connection_down() {
+        let (connection, kills, launcher) = counted_connection().await;
+        let dropped = std::thread::scope(|scope| {
+            let submitted = super::submit(
+                &connection,
+                agent_client_protocol::schema::v1::CloseSessionRequest::new(
+                    agent_client_protocol::schema::v1::SessionId::new("sess_abandoned"),
+                ),
+            )
+            .expect("expected the request to be admitted");
+            scope
+                .spawn(move || drop(submitted))
+                .join()
+                .map_err(|_| "the dropping thread panicked")
+        });
+        assert!(
+            dropped.is_ok(),
+            "expected an off-runtime drop: no panic | received: {dropped:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), connection.wait_shutdown())
+            .await
+            .expect("expected the abandoned request to have started shutdown")
+            .expect("expected the shutdown to succeed");
+        let kills = kills.load(Ordering::Acquire);
+        assert_eq!(kills, 1, "expected kills: 1 | received: {kills}");
+        assert_eq!(launcher.live_children(), 0, "expected live children: 0");
+    }
+
+    /// After the watcher closes admission, no turn can take the slot on the dead connection.
+    #[tokio::test]
+    async fn a_closed_turn_admission_refuses_the_next_turn() {
+        let (state, host) = state();
+        state.close_turn_admission();
+        let refused = state.begin_turn(sink(&host, "turn-late"), None);
+        assert!(
+            matches!(refused, Err(Error::Closed { .. })),
+            "expected begin_turn after admission closed: Err(Closed) | received: {:?}",
+            refused.map(|_| "an installed turn")
+        );
     }
 }
