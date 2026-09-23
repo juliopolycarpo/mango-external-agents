@@ -163,6 +163,7 @@ impl Transcript {
     /// ```ignore
     /// Transcript::load("turn").serve_stdio_until_killed();
     /// ```
+    #[cfg(target_os = "linux")]
     pub fn serve_stdio_until_killed(&self) -> ! {
         use std::io::{BufRead as _, Write as _};
         let mut replay = Replay {
