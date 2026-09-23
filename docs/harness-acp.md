@@ -463,6 +463,13 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 | `start_review`          | `Error::NotSupported`                                                                                                            |
 | `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                     |
 
+Teardown has one owner per session: the connection's shutdown task, which ends the dispatch loop
+and reaps the child through a single shared reaper. `close`, the watcher that notices an agent
+exit or a failed transport, an abandoned request, and a dropped session all join that task rather
+than killing the child again. Every `close` waits for its result, so a second or concurrent close
+never reports success before the child is reaped, and a cleanup failure is the error each waiter
+receives. `Closed` is published only after the reap succeeds.
+
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
 that absence or the pinned profiles return a stale-session reply (`session/load` code `-32002`),
