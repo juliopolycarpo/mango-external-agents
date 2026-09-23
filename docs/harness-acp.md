@@ -463,6 +463,24 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 | `start_review`          | `Error::NotSupported`                                                                                                            |
 | `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                     |
 
+Teardown has one owner per session: the connection's shutdown task, which ends the dispatch loop
+and reaps the child through a single shared reaper. `close`, the watcher that notices an agent
+exit or a failed transport, and an abandoned request all join that task rather than killing the
+child again. A dropped session has no connection handle left to join, so its watcher reaps through
+the same shared reaper instead. Every `close` waits for the shared result, so a second or
+concurrent close never reports success before the child is reaped, and a cleanup failure is the
+error each waiter receives. Once the watcher sees the agent go, it refuses new turns before it
+waits on anything. `Closed` is published only after the reap succeeds and the running turn has
+written its terminal; when a close is in progress, the close publishes it. After a successful
+cleanup, a close waits for a turn another task is still settling, bounded by
+`Limits::shutdown_timeout`. Past that bound the close returns `Error::Timeout` naming the turn slot
+release and the session stays `Closing`: it admits no new work, but it does not claim the turn
+settled. After a failed cleanup the close returns that failure at once. The watcher waits under
+the same bound, but it has no caller to report to: if the turn slot is still held when the bound
+expires, it leaves the session `Closing` without an error. A host that watches status only should
+call `close` on a session that stays `Closing`: the close either settles the turn and publishes
+`Closed`, or returns the `Error::Timeout` described above.
+
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
 that absence or the pinned profiles return a stale-session reply (`session/load` code `-32002`),

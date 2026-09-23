@@ -544,6 +544,10 @@ impl Harness for AcpHarness {
         let watched_connection = Arc::downgrade(&connection);
         let child_reaper = connection.child_reaper();
         let closing_state = session_state.clone();
+        // Weak for the same reason the connection is: a parked question's connection clone inside
+        // this state would otherwise keep the loop this watcher waits on alive.
+        let turn_state = Arc::downgrade(&connection_state);
+        let settle_limit = host.limits().shutdown_timeout;
 
         let catalog = opened
             .config_options
@@ -632,6 +636,11 @@ impl Harness for AcpHarness {
             if close.is_started() {
                 return;
             }
+            // Admission closes before any await: a turn started now would run on a dead
+            // connection and could still be writing its terminal after `Closed`.
+            if let Some(state) = turn_state.upgrade() {
+                state.close_turn_admission();
+            }
             // `Closing` first, and `Closed` only after the owned connection cleanup succeeds:
             // neither EOF nor a dead dispatch loop proves the agent process is gone.
             closing_state.set_status(mango_external_agents::SessionStatus::Closing);
@@ -646,9 +655,25 @@ impl Harness for AcpHarness {
                     .reap(mango_external_agents::CancelReason::Shutdown)
                     .await
             };
-            if cleanup.is_ok() {
-                closing_state.set_status(mango_external_agents::SessionStatus::Closed);
+            if cleanup.is_err() {
+                return;
             }
+            // `Closed` promises nothing more will happen, so the turn's terminal comes first. The
+            // prompt task, or a close that took the turn over, writes it after the same cleanup
+            // this watcher just joined, and only then releases the slot.
+            if let Some(state) = turn_state.upgrade() {
+                let settled = tokio::time::timeout(settle_limit, state.wait_for_no_turn()).await;
+                drop(state);
+                if settled.is_err() {
+                    return;
+                }
+            }
+            // A close that began while cleanup ran owns the status: it publishes `Closed` after
+            // settling its turn, so publishing here as well would race it.
+            if close.is_started() {
+                return;
+            }
+            closing_state.set_status(mango_external_agents::SessionStatus::Closed);
         });
         Ok(Box::new(session))
     }

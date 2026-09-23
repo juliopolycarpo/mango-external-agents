@@ -290,6 +290,10 @@ pub(crate) struct SessionState {
     /// The host limits used to form every approval deadline.
     limits: mango_external_agents::Limits,
     turn: Mutex<Option<TurnHandle>>,
+    /// Wakes a lifecycle watcher once the running turn has written its terminal and left the slot.
+    turn_released: tokio::sync::Notify,
+    /// Set by the connection-loss watcher: no further turn may take the slot on a dead connection.
+    admission_closed: AtomicBool,
     /// The explicit settings the next turn inherits.
     ///
     /// `None` on either permission axis leaves the vendor's own setting in force. Turning that
@@ -357,6 +361,8 @@ impl SessionState {
             broker: host.broker().cloned(),
             limits: *host.limits(),
             turn: Mutex::new(None),
+            turn_released: tokio::sync::Notify::new(),
+            admission_closed: AtomicBool::new(false),
             configuration: Mutex::new(configuration),
             catalog_revision: Mutex::new(0),
             turn_start: Mutex::new(()),
@@ -391,6 +397,9 @@ impl SessionState {
         level: Option<PermissionLevel>,
     ) -> Result<TurnHandle> {
         let mut turn = self.lock_turn();
+        if self.admission_closed.load(Ordering::Acquire) {
+            return Err(Error::Closed { subject: "session" });
+        }
         if turn.is_some() {
             return Err(Error::Busy);
         }
@@ -573,6 +582,41 @@ impl SessionState {
             .is_some_and(|current| current.generation == handle.generation)
         {
             active.take();
+            drop(active);
+            self.turn_released.notify_waiters();
+        }
+    }
+
+    /// Refuses every later turn, for a watcher that saw the connection die.
+    ///
+    /// Taken under the slot's own guard, so a start either installed its turn first — and the
+    /// watcher then waits for that turn's terminal — or observes the refusal.
+    ///
+    /// ```ignore
+    /// state.close_turn_admission();
+    /// assert!(state.begin_turn(sink, None).is_err());
+    /// ```
+    pub(crate) fn close_turn_admission(&self) {
+        let _turn = self.lock_turn();
+        self.admission_closed.store(true, Ordering::Release);
+    }
+
+    /// Waits until no turn holds the prompt slot.
+    ///
+    /// A turn leaves the slot only after its terminal is committed, so a watcher that awaits this
+    /// can publish `Closed` knowing nothing more will reach the turn's stream.
+    ///
+    /// ```ignore
+    /// state.wait_for_no_turn().await;
+    /// session_state.set_status(SessionStatus::Closed);
+    /// ```
+    pub(crate) async fn wait_for_no_turn(&self) {
+        loop {
+            let released = self.turn_released.notified();
+            if self.lock_turn().is_none() {
+                return;
+            }
+            released.await;
         }
     }
 
@@ -1065,6 +1109,12 @@ pub(crate) struct ConnectionHandle {
     /// its diagnostic-safe summary here because the core error is not cloneable and a second close
     /// must still report the first cleanup failure rather than inventing success.
     shutdown_result: Mutex<Option<std::result::Result<(), String>>>,
+    /// The runtime the connection was driven on. Shutdown is spawned through it, so a request
+    /// or scope guard dropped on a thread without a runtime still ends the child.
+    runtime: tokio::runtime::Handle,
+    /// How many shutdown tasks `begin_shutdown` started; the single-flight guard keeps it at one.
+    #[cfg(test)]
+    shutdown_runs: std::sync::atomic::AtomicUsize,
     /// Bounds non-turn ACP requests before they enter the SDK's unbounded pending-request queue.
     /// A prompt has its own single-turn admission in `SessionState` and does not use this permit.
     requests: RequestAdmission,
@@ -1304,11 +1354,10 @@ impl Drop for ConnectionShutdownGuard {
         let Some(connection) = self.connection.take() else {
             return;
         };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // Drop has no caller to receive a cleanup failure. Explicit owners use `shutdown`,
-            // which preserves its result for them instead.
-            connection.begin_shutdown(mango_external_agents::CancelReason::Shutdown);
-        }
+        // `begin_shutdown` spawns on the connection's own runtime, so this is safe from a plain
+        // thread too. Drop has no caller to receive a cleanup failure. Explicit owners use `shutdown`, which
+        // preserves its result for them instead.
+        connection.begin_shutdown(mango_external_agents::CancelReason::Shutdown);
     }
 }
 
@@ -1427,6 +1476,10 @@ pub(crate) async fn drive(
         shutdown_started: AtomicBool::new(false),
         shutdown_complete: mango_external_agents::CancelToken::new(),
         shutdown_result: Mutex::new(None),
+        // `drive` is async and has already spawned the dispatch loop, so a runtime is current.
+        runtime: tokio::runtime::Handle::current(),
+        #[cfg(test)]
+        shutdown_runs: std::sync::atomic::AtomicUsize::new(0),
         requests: RequestAdmission::new(state.limits.max_pending_requests),
     })
 }
@@ -1442,7 +1495,9 @@ impl ConnectionHandle {
             return;
         }
         let connection = Arc::clone(self);
-        tokio::spawn(async move {
+        #[cfg(test)]
+        self.shutdown_runs.fetch_add(1, Ordering::AcqRel);
+        self.runtime.spawn(async move {
             let result = connection
                 .shutdown(reason)
                 .await
@@ -2156,5 +2211,188 @@ mod tests {
         })
         .await
         .expect("expected the detached kill to complete after its waiter was cancelled");
+    }
+
+    /// A live connection over a silent fake child whose kills are counted.
+    async fn counted_connection() -> (Arc<super::ConnectionHandle>, Arc<AtomicUsize>, FakeLauncher)
+    {
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let (state, host) = state();
+        let mut process = launcher
+            .spawn(LaunchSpec {
+                argv: vec![String::from("fake-acp")],
+                cwd: host.cwd().to_path_buf(),
+                env: Default::default(),
+                stdin: true,
+                hide_window: true,
+            })
+            .await
+            .expect("expected the fake child to launch");
+        let kills = Arc::new(AtomicUsize::new(0));
+        process.control = Arc::new(CountingProcessControl {
+            inner: Arc::clone(&process.control),
+            kills: Arc::clone(&kills),
+        });
+        let launched = crate::transport::frame(process, &host).expect("expected framed child");
+        let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
+        let connection = drive(
+            launched,
+            Arc::new(state),
+            String::from("acp-client-tests"),
+            cleanup,
+        )
+        .await
+        .expect("expected a connection handle");
+        (Arc::new(connection), kills, launcher)
+    }
+
+    /// The child reaper is its own single-flight owner: two reaps, even concurrent, kill once and
+    /// both observe the one outcome.
+    #[tokio::test]
+    async fn two_reaps_of_one_child_kill_it_once() {
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let (_, host) = state();
+        let process = launcher
+            .spawn(LaunchSpec {
+                argv: vec![String::from("fake-acp")],
+                cwd: host.cwd().to_path_buf(),
+                env: Default::default(),
+                stdin: true,
+                hide_window: true,
+            })
+            .await
+            .expect("expected the fake child to launch");
+        let kills = Arc::new(AtomicUsize::new(0));
+        let reaper = super::ChildReaper::new(
+            Arc::new(CountingProcessControl {
+                inner: process.control,
+                kills: Arc::clone(&kills),
+            }),
+            *host.limits(),
+        );
+        let (first, second) = tokio::join!(
+            reaper.reap(CancelReason::Shutdown),
+            reaper.reap(CancelReason::Requested)
+        );
+        first.expect("expected the first reap to succeed");
+        second.expect("expected the joined reap to succeed");
+        let kills = kills.load(Ordering::Acquire);
+        assert_eq!(kills, 1, "expected kills: 1 | received: {kills}");
+    }
+
+    /// `begin_shutdown` is its own single-flight owner, independently of the child reaper: a
+    /// second call joins the first shutdown task rather than running another.
+    #[tokio::test]
+    async fn two_shutdown_requests_run_one_shutdown_task() {
+        let (connection, kills, launcher) = counted_connection().await;
+        connection.begin_shutdown(CancelReason::Shutdown);
+        connection.begin_shutdown(CancelReason::Requested);
+        connection
+            .wait_shutdown()
+            .await
+            .expect("expected the shared shutdown to succeed");
+        let runs = connection.shutdown_runs.load(Ordering::Acquire);
+        assert_eq!(runs, 1, "expected shutdown task runs: 1 | received: {runs}");
+        let kills = kills.load(Ordering::Acquire);
+        assert_eq!(kills, 1, "expected kills: 1 | received: {kills}");
+        assert_eq!(launcher.live_children(), 0, "expected live children: 0");
+    }
+
+    /// A shutdown guard dropped on a thread with no runtime still ends its child through the
+    /// runtime it was created on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shutdown_guard_dropped_outside_a_runtime_reaps_its_child() {
+        let (connection, kills, launcher) = counted_connection().await;
+        let guard = super::ConnectionShutdownGuard::new(connection);
+        std::thread::spawn(move || drop(guard))
+            .join()
+            .expect("expected the dropping thread to finish");
+        let reaped = tokio::time::timeout(Duration::from_secs(5), async {
+            while launcher.live_children() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            reaped.is_ok(),
+            "expected live children: 0 after a drop outside a runtime | received: {}",
+            launcher.live_children()
+        );
+        let kills = kills.load(Ordering::Acquire);
+        assert_eq!(kills, 1, "expected kills: 1 | received: {kills}");
+    }
+
+    /// With no turn in the slot there is nothing left to settle, so the watcher is not held.
+    #[tokio::test]
+    async fn waiting_for_no_turn_returns_at_once_when_the_slot_is_empty() {
+        let (state, _) = state();
+        tokio::time::timeout(Duration::from_secs(1), state.wait_for_no_turn())
+            .await
+            .expect("expected wait_for_no_turn: immediate with no turn | received: still pending");
+    }
+
+    /// An in-flight request dropped on a thread with no runtime must not panic its owner and must
+    /// still start the connection's shutdown, through the runtime the connection was driven on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_abandoned_outside_a_runtime_still_shuts_the_connection_down() {
+        let (connection, kills, launcher) = counted_connection().await;
+        let dropped = std::thread::scope(|scope| {
+            let submitted = super::submit(
+                &connection,
+                agent_client_protocol::schema::v1::CloseSessionRequest::new(
+                    agent_client_protocol::schema::v1::SessionId::new("sess_abandoned"),
+                ),
+            )
+            .expect("expected the request to be admitted");
+            scope
+                .spawn(move || drop(submitted))
+                .join()
+                .map_err(|_| "the dropping thread panicked")
+        });
+        assert!(
+            dropped.is_ok(),
+            "expected an off-runtime drop: no panic | received: {dropped:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), connection.wait_shutdown())
+            .await
+            .expect("expected the abandoned request to have started shutdown")
+            .expect("expected the shutdown to succeed");
+        let kills = kills.load(Ordering::Acquire);
+        assert_eq!(kills, 1, "expected kills: 1 | received: {kills}");
+        assert_eq!(launcher.live_children(), 0, "expected live children: 0");
+    }
+
+    /// After the watcher closes admission, no turn can take the slot on the dead connection.
+    #[tokio::test]
+    async fn a_closed_turn_admission_refuses_the_next_turn() {
+        let (state, host) = state();
+        state.close_turn_admission();
+        let refused = state.begin_turn(sink(&host, "turn-late"), None);
+        assert!(
+            matches!(refused, Err(Error::Closed { .. })),
+            "expected begin_turn after admission closed: Err(Closed) | received: {:?}",
+            refused.map(|_| "an installed turn")
+        );
+    }
+
+    /// A slot the prompt task never releases turns into a typed timeout naming what was held,
+    /// rather than an `Ok` that would let the session look settled.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreleased_turn_slot_is_a_typed_timeout() {
+        let (state, host) = state();
+        let _held = state
+            .begin_turn(sink(&host, "turn-held"), None)
+            .expect("expected the turn to take the slot");
+        let bound = Duration::from_secs(3);
+        let error = crate::session::wait_for_turn_release(&state, bound)
+            .await
+            .expect_err("expected a held slot: Err(Timeout) | received: Ok");
+        assert!(
+            matches!(&error, Error::Timeout { operation, after }
+                if operation.contains("turn slot release") && *after == bound),
+            "expected Timeout naming the turn slot release after {bound:?} | received: {error:?}"
+        );
     }
 }

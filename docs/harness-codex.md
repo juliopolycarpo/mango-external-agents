@@ -131,9 +131,16 @@ The slot is released when Codex commits its native terminal, before the host dra
 events. A dropped library `TurnStream` is owner abandonment: the harness refuses pending approvals,
 sends `turn/interrupt`, waits through the host's graceful-turn bound, and closes and reaps the
 app-server if the turn will not settle. A browser disconnect that should leave work running must
-therefore retain the stream in a host supervisor. Dropping the owning session follows the same
-bounded cleanup path. Closing twice waits for the first reaper; if it cannot reap the child, each
-caller receives the same `Error::CleanupRequired` control for host reconciliation.
+therefore retain the stream in a host supervisor.
+
+Teardown has one owner per session. The host-shutdown and connection-loss watcher, `close`, an
+abandoned turn that will not settle, and a dropped session all request the same detached worker,
+which closes the JSON-RPC client once and stops the child once. A session dropped on a thread
+without a Tokio runtime hands that worker to the runtime it was opened on. Every `close` waits for
+the worker's result, so none reports success before the child is reaped. If the worker cannot reap
+the child, or panics inside the host's process control, each caller receives the same
+`Error::CleanupRequired` control for host reconciliation. `Closed` is published only after the
+reap succeeds.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.
