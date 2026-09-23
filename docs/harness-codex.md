@@ -154,6 +154,14 @@ answers `turn/interrupt` with an empty result and later ends the turn with `turn
 | Turn settle after ack | `cancel_settle_timeout` (60 s default), from the acknowledgement | Process shutdown                                             |
 | Shutdown escalation   | `kill_grace`, then `shutdown_timeout` per teardown stage         | `Error::CleanupRequired` carrying the host's process control |
 
+The stages add up. At worst a stop takes the rest of the start's `request_timeout`, then
+`request_timeout` for the interrupt, then `cancel_settle_timeout`, then `kill_grace` plus the
+`shutdown_timeout` teardown stages. At the defaults that is about five minutes (120 + 120 + 60 +
+2 + a few 5 s stages). A start whose answer was lost but that a notification later names pays one
+more interrupt and settle round. For that whole time `cancel` waits and the session stays busy.
+`close` does not wait for this: it goes straight to process shutdown, bounded by `kill_grace` and
+`shutdown_timeout` alone.
+
 Each owner has one stop worker, and it sends at most one `turn/interrupt`: repeated cancels, a
 dropped stream, an idle expiry and a racing `close` all share it. Until the turn ends the slot stays
 occupied and `start_turn` answers `Busy`, because Codex reads a `turn/start` on a live turn as a

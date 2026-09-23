@@ -144,6 +144,28 @@ impl HeldTurnServer {
         self.announcer.announce(self.completed(turn, status));
     }
 
+    /// Reports activity on `turn`, which names it before any `turn/start` answer does.
+    fn item_started(&self, turn: &str) {
+        self.announcer.announce(
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": self.thread_id,
+                    "turnId": turn,
+                    "item": {"clientId": null, "content": [], "id": "item-1", "type": "userMessage"},
+                },
+            })
+            .to_string(),
+        );
+    }
+
+    /// A terminal that names no thread or turn, which poisons the connection.
+    fn unroutable_terminal(&self) {
+        self.announcer.announce(
+            json!({"method": "turn/completed", "params": {"unexpected": true}}).to_string(),
+        );
+    }
+
     fn completed(&self, turn: &str, status: &str) -> String {
         json!({
             "method": "turn/completed",
@@ -350,7 +372,9 @@ impl Fixture {
                 .iter()
                 .any(|line| line.contains(&needle))
             {
-                tokio::task::yield_now().await;
+                // A timer, not a yield: on a paused clock only a pending timer lets time advance,
+                // so a yield loop would never reach this bound and hang instead of failing.
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -585,9 +609,14 @@ async fn repeated_cancel_and_close_share_one_stop() {
         .unwrap_or_else(|_| panic!("expected close within the shutdown policy of {bound:?}"))
         .expect("expected close to succeed");
     for cancel in [first, second] {
-        let _ = tokio::time::timeout(Duration::from_secs(5), cancel)
+        let result = tokio::time::timeout(Duration::from_secs(5), cancel)
             .await
-            .expect("expected each cancel waiter to finish after close");
+            .expect("expected each cancel waiter to finish after close")
+            .expect("expected the cancel task to finish");
+        assert!(
+            result.is_ok(),
+            "expected a cancel that close reaped cleanly to succeed | received: {result:?}"
+        );
     }
     fixture.assert_interrupts(1, "after close raced the stop");
     assert_eq!(
@@ -705,5 +734,96 @@ async fn settle_expiry_whose_teardown_fails_returns_the_cleanup_control() {
         1,
         "expected kills: 1 | received: {}",
         fixture.kills()
+    );
+}
+
+/// A close that ends a stopping turn and then cannot reap the child hands its cleanup control to
+/// the cancel waiter as well, rather than letting that waiter report success.
+#[tokio::test(start_paused = true)]
+async fn close_racing_a_stop_that_cannot_reap_fails_the_cancel_waiter() {
+    let fixture = Fixture::open(false, InterruptAnswer::Held, KillBehaviour::Refused).await;
+    let _turn = fixture
+        .session
+        .start_turn(TurnRequest::new("turn-1", "run"))
+        .await
+        .expect("expected a live native turn");
+    let cancel = fixture.spawn_cancel();
+    fixture.wait_for_written("turn/interrupt").await;
+
+    let closed = tokio::time::timeout(
+        Duration::from_secs(120),
+        fixture.session.close(CloseReason::Shutdown),
+    )
+    .await
+    .expect("expected close within the shutdown policy");
+    let close_error = closed.expect_err("expected close to report the failed reap");
+    expect_cleanup_required(&close_error, "close");
+
+    let cancelled = tokio::time::timeout(Duration::from_secs(120), cancel)
+        .await
+        .expect("expected the cancel waiter to finish after close")
+        .expect("expected the cancel task to finish");
+    match cancelled {
+        Ok(()) => panic!(
+            "expected the cancel waiter to receive Error::CleanupRequired | received: Ok(())"
+        ),
+        Err(error) => expect_cleanup_required(&error, "cancel waiter after a racing close"),
+    }
+}
+
+/// A start whose answer was lost can still be named by a later notification. The stop then sends
+/// its one interrupt and the turn settles, instead of being killed at the settle deadline.
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_start_named_later_is_interrupted_not_killed() {
+    let fixture = Fixture::open(true, InterruptAnswer::AckAndComplete, KillBehaviour::Reaps).await;
+    let session = Arc::clone(&fixture.session);
+    let start =
+        tokio::spawn(async move { session.start_turn(TurnRequest::new("turn-1", "run")).await });
+    fixture.wait_for_written("turn/start").await;
+    let cancel = fixture.spawn_cancel();
+
+    let turn = tokio::time::timeout(fixture.limits.request_timeout * 2, start)
+        .await
+        .expect("expected the start to give up at its request deadline")
+        .expect("expected the start task to finish")
+        .expect("expected an acceptance-unknown stream rather than an error");
+    assert_eq!(
+        turn.dispatch(),
+        mango_external_agents::Dispatch::AcceptanceUnknown,
+        "expected a lost start answer to leave acceptance unknown"
+    );
+
+    fixture.server.item_started("vendor-turn-1");
+    tokio::time::sleep(SLOW).await;
+    fixture.assert_interrupts(1, "after a notification named the unanswered start");
+    fixture.assert_no_kill("after the named turn was interrupted");
+    let _ = tokio::time::timeout(Duration::from_secs(5), cancel)
+        .await
+        .expect("expected cancel to return");
+    assert_eq!(fixture.status(), SessionStatus::Ready);
+}
+
+/// Poison while a start is pending releases its slot and reaps the process, so the start's late
+/// answer sends no interrupt: process teardown, not a protocol stop, ends that turn.
+#[tokio::test(start_paused = true)]
+async fn poison_during_a_pending_start_sends_no_interrupt() {
+    let fixture = Fixture::open(true, InterruptAnswer::AckAndComplete, KillBehaviour::Reaps).await;
+    let session = Arc::clone(&fixture.session);
+    let start =
+        tokio::spawn(async move { session.start_turn(TurnRequest::new("turn-1", "run")).await });
+    fixture.wait_for_written("turn/start").await;
+
+    fixture.server.unroutable_terminal();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    fixture.server.answer_start();
+    let _ = tokio::time::timeout(Duration::from_secs(30), start)
+        .await
+        .expect("expected the start to return after poison");
+    tokio::time::sleep(SLOW).await;
+    fixture.assert_interrupts(0, "after poison and a late start answer");
+    assert_eq!(
+        fixture.launcher.live_children(),
+        0,
+        "expected the poisoned session to reap its app-server"
     );
 }
