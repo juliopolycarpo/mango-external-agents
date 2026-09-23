@@ -201,6 +201,11 @@ pub struct Limits {
     /// running it, and expiry is not proof it stopped — it is the point where the harness stops
     /// waiting and reaps the process under [`Self::shutdown_timeout`] and [`Self::kill_grace`].
     ///
+    /// A Codex `cancel` can therefore wait, with the session busy, for the rest of a pending
+    /// start's request, one interrupt request, this deadline, and then the shutdown stages. At
+    /// the defaults that is about five minutes. `close` skips the protocol stop and stays within
+    /// [`Self::kill_grace`] and [`Self::shutdown_timeout`].
+    ///
     /// For example, a host whose tools can take minutes to abort raises this without lengthening
     /// every protocol request: `Limits { cancel_settle_timeout: Duration::from_secs(300),
     /// ..Limits::default() }`.
