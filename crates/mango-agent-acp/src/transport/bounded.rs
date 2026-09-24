@@ -47,14 +47,6 @@ enum Budget {
 }
 
 impl Budget {
-    const ALL: [Self; 5] = [
-        Self::IncomingMessages,
-        Self::IncomingBytes,
-        Self::OutgoingFrameBytes,
-        Self::OutgoingBytes,
-        Self::OutgoingFrames,
-    ];
-
     fn subject(self) -> &'static str {
         match self {
             Self::IncomingMessages => "JSON-RPC messages queued from the ACP agent",
@@ -65,9 +57,6 @@ impl Budget {
         }
     }
 }
-
-/// The key under which [`Overflow`] rides an SDK error's `data` out of the transport future.
-const OVERFLOW_KEY: &str = "meaTransportOverflow";
 
 impl Overflow {
     /// An incoming message-count overflow, for tests outside this module.
@@ -92,30 +81,14 @@ impl Overflow {
         }
     }
 
-    /// Builds the SDK error that fails the connection, keeping `message` and carrying `self`.
-    fn fail(self, message: String) -> agent_client_protocol::Error {
-        let mut error = failure(message);
-        error.data = Some(serde_json::json!({
-            OVERFLOW_KEY: [self.budget.subject(), self.limit, self.received]
-        }));
-        error
-    }
-
-    /// Recovers the overflow [`Self::fail`] attached, or `None` for any other transport error.
-    fn from_error(error: &agent_client_protocol::Error) -> Option<Self> {
-        let fields = error.data.as_ref()?.get(OVERFLOW_KEY)?.as_array()?;
-        let [subject, limit, received] = fields.as_slice() else {
-            return None;
-        };
-        let subject = subject.as_str()?;
-        let budget = Budget::ALL
-            .into_iter()
-            .find(|budget| budget.subject() == subject)?;
-        Some(Self {
-            budget,
-            limit: usize::try_from(limit.as_u64()?).ok()?,
-            received: usize::try_from(received.as_u64()?).ok()?,
-        })
+    /// Records `self` in `slot`, then builds the SDK error that fails the connection.
+    ///
+    /// Recorded here, before the error returns and the incoming sender drops, so a request the
+    /// SDK fails on another worker already finds the budget. For example,
+    /// `return Err(overflow.fail(&slot, message))`.
+    fn fail(self, slot: &OverflowSlot, message: String) -> agent_client_protocol::Error {
+        let _ = slot.set(self);
+        failure(message)
     }
 }
 
@@ -153,15 +126,10 @@ impl BoundedTransport {
                 limits.turn_buffer_bytes.min(u32::MAX as usize),
             ));
             futures::try_join!(
-                read_frames(incoming, transport.tx, limits),
-                queue_output(transport.rx, pending, budget, limits),
+                read_frames(incoming, transport.tx, limits, &overflow),
+                queue_output(transport.rx, pending, budget, limits, &overflow),
                 write_frames(outgoing, writing),
-            )
-            .inspect_err(|error| {
-                if let Some(found) = Overflow::from_error(error) {
-                    let _ = overflow.set(found);
-                }
-            })?;
+            )?;
             Ok(())
         }
         .boxed();
@@ -212,6 +180,7 @@ async fn read_frames(
     mut source: IncomingLines,
     target: futures::channel::mpsc::UnboundedSender<TransportFrame>,
     limits: Limits,
+    slot: &OverflowSlot,
 ) -> agent_client_protocol::Result<()> {
     let mut charges: VecDeque<(usize, usize)> = VecDeque::new();
     let mut bytes = 0_usize;
@@ -245,7 +214,7 @@ async fn read_frames(
                     received: bytes,
                 }
             };
-            return Err(overflow.fail(format!(
+            return Err(overflow.fail(slot, format!(
                 "ACP incoming queue exceeded its message or byte budget (Limits::turn_channel_capacity or Limits::max_pending_requests, Limits::turn_buffer_bytes): received {messages} messages and {bytes} bytes; expected at most {} messages and {} bytes",
                 frame_limit(&limits),
                 limits.turn_buffer_bytes,
@@ -272,6 +241,7 @@ async fn queue_output(
     pending: mpsc::Sender<PendingFrame>,
     budget: Arc<Semaphore>,
     limits: Limits,
+    slot: &OverflowSlot,
 ) -> agent_client_protocol::Result<()> {
     while let Some(frame) = frames.next().await {
         let line = frame.to_json()?;
@@ -282,7 +252,7 @@ async fn queue_output(
                 limit: byte_limit,
                 received: line.len(),
             };
-            return Err(overflow.fail(format!(
+            return Err(overflow.fail(slot, format!(
                 "ACP output frame exceeded the byte budget: received {} bytes; expected at most {byte_limit}",
                 line.len(),
             )));
@@ -297,7 +267,7 @@ async fn queue_output(
                     limit: byte_limit,
                     received: byte_limit.saturating_sub(available).saturating_add(line.len()),
                 }
-                .fail(format!(
+                .fail(slot, format!(
                     "ACP outgoing frame queue exceeded the byte budget: received {} more bytes; expected at most {available} available bytes",
                     line.len(),
                 ))
@@ -317,7 +287,7 @@ async fn queue_output(
                     limit: pending.max_capacity(),
                     received,
                 }
-                .fail(format!(
+                .fail(slot, format!(
                     "ACP outgoing frame queue exceeded the frame budget (Limits::turn_channel_capacity or Limits::max_pending_requests): received {received} queued frames; expected at most {}",
                     pending.max_capacity(),
                 ))
