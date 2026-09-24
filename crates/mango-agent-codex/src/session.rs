@@ -2980,6 +2980,14 @@ impl CodexSession {
         let (handle, extra) = match answer {
             Ok(answer) => turn_of(answer),
             Err(error) => {
+                if !request_written.load(Ordering::Acquire) {
+                    // Refused before any byte reached the link — a closed client, a full
+                    // request budget, an unencodable frame. Codex never saw it, so this is a
+                    // clean refusal: release the owner and report the start as not submitted.
+                    self.shared.release_refused_start(&owner).await;
+                    start_guard.disarm();
+                    return Err(error.with_dispatch(Dispatch::NotSubmitted));
+                }
                 if !start_was_explicitly_refused(&error) {
                     // A local transport, decoding, or timeout failure says nothing about whether
                     // the app-server accepted the request. Keeping the slot occupied prevents

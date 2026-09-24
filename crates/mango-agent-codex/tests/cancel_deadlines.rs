@@ -349,14 +349,22 @@ impl Fixture {
         interrupt_answer: InterruptAnswer,
         kill: KillBehaviour,
     ) -> Self {
-        Self::open_with_write_gate(hold_first_start, interrupt_answer, kill, None).await
+        Self::open_with(
+            hold_first_start,
+            interrupt_answer,
+            kill,
+            None,
+            Limits::default(),
+        )
+        .await
     }
 
-    async fn open_with_write_gate(
+    async fn open_with(
         hold_first_start: bool,
         interrupt_answer: InterruptAnswer,
         kill: KillBehaviour,
         write_gate: Option<WriteGate>,
+        limits: Limits,
     ) -> Self {
         let transcript = Transcript::load("turn");
         let server = Arc::new(HeldTurnServer::new(
@@ -374,7 +382,6 @@ impl Fixture {
                 .announcing(server.announcer.clone()),
         );
         let kills = Arc::new(AtomicUsize::new(0));
-        let limits = Limits::default();
         let host = HostContext::builder()
             .launcher(Arc::new(CountingLauncher {
                 inner: Arc::clone(&launcher),
@@ -930,7 +937,7 @@ async fn a_stop_does_not_wait_on_an_unpolled_start_future() {
 #[tokio::test(start_paused = true)]
 async fn a_start_dropped_before_its_request_was_written_releases_at_once() {
     let gate = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
-    let fixture = Fixture::open_with_write_gate(
+    let fixture = Fixture::open_with(
         false,
         InterruptAnswer::AckAndComplete,
         KillBehaviour::Reaps,
@@ -938,6 +945,7 @@ async fn a_start_dropped_before_its_request_was_written_releases_at_once() {
             method: "account/rateLimits/read",
             gate: Arc::clone(&gate),
         }),
+        Limits::default(),
     )
     .await;
     gate.forget_permits(Semaphore::MAX_PERMITS);
@@ -978,4 +986,60 @@ async fn a_start_dropped_before_its_request_was_written_releases_at_once() {
     );
     fixture.assert_no_kill("after a start dropped before its write");
     usage.abort();
+}
+
+/// A start refused locally before any byte was written, here by a full pending-request budget,
+/// is a clean refusal: an error marked not submitted, the owner released, and no kill.
+#[tokio::test(start_paused = true)]
+async fn a_start_refused_before_writing_is_not_submitted_and_releases() {
+    let fixture = Fixture::open_with(
+        false,
+        InterruptAnswer::AckAndComplete,
+        KillBehaviour::Reaps,
+        None,
+        Limits {
+            max_pending_requests: 1,
+            ..Limits::default()
+        },
+    )
+    .await;
+    // The one pending-request slot, held by a call the fake app-server never answers.
+    let usage_session = Arc::clone(&fixture.session);
+    let usage = tokio::spawn(async move { usage_session.refresh_account_usage().await });
+    fixture.wait_for_written("account/rateLimits/read").await;
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture
+            .session
+            .start_turn(TurnRequest::new("turn-1", "run")),
+    )
+    .await
+    .expect("expected the refused start to return promptly");
+    match &refused {
+        Ok(stream) => panic!(
+            "expected Err with Dispatch::NotSubmitted | received: Ok with {:?}",
+            stream.dispatch()
+        ),
+        Err(error) => assert_eq!(
+            error.dispatch(),
+            mango_external_agents::Dispatch::NotSubmitted,
+            "expected Dispatch::NotSubmitted | received: {error:?}"
+        ),
+    }
+    assert_eq!(fixture.starts(), 0, "expected no turn/start on the wire");
+
+    usage.abort();
+    let _ = usage.await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let next = fixture
+        .session
+        .start_turn(TurnRequest::new("turn-2", "again"))
+        .await;
+    assert!(
+        next.is_ok(),
+        "expected the next start admitted | received: {:?}",
+        next.as_ref().err()
+    );
+    fixture.assert_no_kill("after a start refused before writing");
 }
