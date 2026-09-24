@@ -360,8 +360,9 @@ impl Shared {
     /// Waits until this owner's start can be acted on by a stop: its native turn is named, its start
     /// answer can never arrive, or it no longer occupies admission.
     ///
-    /// Not bounded here. A pending `turn/start` is bounded by its own request deadline, and every
-    /// way that request ends either names the turn, releases the slot or marks it unanswerable.
+    /// Not bounded here: the caller bounds it. `dispatch_stop` wraps this wait in
+    /// `Limits::request_timeout` and marks the start unanswerable on expiry, because the start's
+    /// own request deadline only runs while the host keeps polling its `start_turn` future.
     async fn wait_for_start_resolution(&self, owner: &Arc<()>) {
         loop {
             let changed = self.turn_finished.notified();
