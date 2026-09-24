@@ -377,14 +377,14 @@ impl Shared {
         }
     }
 
-    /// Whether this owner is live, unnamed and not yet interrupted, so a later notification that
-    /// names it should trigger the stop's one interrupt.
+    /// Whether this owner is live and not yet interrupted, so naming it — now or later — should
+    /// trigger the stop's one interrupt.
+    ///
+    /// Not gated on the id still being empty: the pump can name the turn between the stop's
+    /// empty-id pass and this check, and [`Self::wait_for_named`] returns at once for a named turn.
     async fn awaiting_name(&self, owner: &Arc<()>) -> bool {
         self.turn.lock().await.as_ref().is_some_and(|active| {
-            Arc::ptr_eq(&active.owner, owner)
-                && !active.finishing
-                && !active.interrupt_dispatched
-                && active.native_turn_id.is_empty()
+            Arc::ptr_eq(&active.owner, owner) && !active.finishing && !active.interrupt_dispatched
         })
     }
 
@@ -560,6 +560,16 @@ struct TerminalClaim {
     owner: Arc<()>,
     sink: EventSink,
     cancel_reason: Option<CancelReason>,
+}
+
+/// How a stopped turn's settle stage ended.
+enum Settled {
+    /// Codex reported the turn over, or another path released it.
+    Ended,
+    /// The settle deadline passed with the turn still admitted.
+    Expired,
+    /// The late interrupt for a newly named turn failed while the turn was live.
+    InterruptFailed(Error),
 }
 
 /// Completion state for one detached native-stop worker.
@@ -2561,10 +2571,14 @@ impl CodexSession {
         if !shared.owner_is_active(&owner).await {
             return Ok(());
         }
-        let limits = *shared.host.limits();
-        let mut interrupted = Self::dispatch_stop(&shared, &client, &owner, reason).await;
-        loop {
-            if let Err(error) = interrupted {
+        let settle = shared.host.limits().cancel_settle_timeout;
+        let settled = match Self::dispatch_stop(&shared, &client, &owner, reason).await {
+            Ok(()) => Self::settle_stop(&shared, &client, &owner, reason, settle).await,
+            Err(error) => Settled::InterruptFailed(error),
+        };
+        match settled {
+            Settled::Ended => Self::after_turn_gone(&shared).await,
+            Settled::InterruptFailed(error) => {
                 // Codex refused, or never acknowledged, the interrupt while the turn is live.
                 if shared.seal_owner_for_shutdown(&owner).await {
                     Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
@@ -2572,31 +2586,43 @@ impl CodexSession {
                     // its `CleanupRequired` carries the control the host needs to reconcile.
                     return Self::wait_for_shutdown(&shared).await.and(Err(error));
                 }
-                return Self::after_turn_gone(&shared).await;
+                Self::after_turn_gone(&shared).await
             }
-            // The stop did all it can on the protocol. The turn stays admitted until Codex
-            // reports it over; only this separate deadline escalates to process shutdown. A
-            // start whose answer was lost can still be named by a notification, and then gets
-            // its one interrupt with a fresh settle clock.
-            let awaiting_name = shared.awaiting_name(&owner).await;
+            Settled::Expired => {
+                if shared.seal_owner_for_shutdown(&owner).await {
+                    Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
+                    return Self::wait_for_shutdown(&shared).await;
+                }
+                Self::after_turn_gone(&shared).await
+            }
+        }
+    }
+
+    /// Waits for a stopped turn to end, bounded by `settle`.
+    ///
+    /// The stop did all it can on the protocol. The turn stays admitted until Codex reports it
+    /// over. A turn that is named but not yet interrupted — a lost start answer named later by a
+    /// notification, or named while the stop was between its passes — gets its one interrupt
+    /// here, with a fresh settle clock.
+    async fn settle_stop(
+        shared: &Shared,
+        client: &Client,
+        owner: &Arc<()>,
+        reason: CancelReason,
+        settle: std::time::Duration,
+    ) -> Settled {
+        loop {
+            let awaiting_name = shared.awaiting_name(owner).await;
             tokio::select! {
-                () = shared.wait_for_turn_end(&owner) => {
-                    return Self::after_turn_gone(&shared).await;
-                }
-                () = tokio::time::sleep(limits.cancel_settle_timeout) => break,
-                () = shared.wait_for_named(&owner), if awaiting_name => {
-                    interrupted = shared
-                        .cancel_owner(&client, Some(&owner), reason)
-                        .await
-                        .map(|_| ());
+                () = shared.wait_for_turn_end(owner) => return Settled::Ended,
+                () = tokio::time::sleep(settle) => return Settled::Expired,
+                () = shared.wait_for_named(owner), if awaiting_name => {
+                    if let Err(error) = shared.cancel_owner(client, Some(owner), reason).await {
+                        return Settled::InterruptFailed(error);
+                    }
                 }
             }
         }
-        if shared.seal_owner_for_shutdown(&owner).await {
-            Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
-            return Self::wait_for_shutdown(&shared).await;
-        }
-        Self::after_turn_gone(&shared).await
     }
 
     /// What a stop reports once its turn left admission without this worker escalating.
@@ -5425,6 +5451,49 @@ mod tests {
         assert!(
             error.to_string().contains("panicked"),
             "expected an error naming the panic | received: {error}"
+        );
+    }
+
+    /// On a multi-thread runtime the pump can name a lost start while the stop worker is between
+    /// its second, empty-id pass and the settle stage. The settle stage must still send that
+    /// turn's one interrupt rather than wait out its deadline and kill the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_named_before_the_settle_stage_gets_its_one_interrupt() {
+        let shared = shared();
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+        let owner = {
+            let mut turn = shared.turn.lock().await;
+            let active = turn.as_mut().expect("expected the installed turn");
+            active.start_unanswerable = true;
+            Arc::clone(&active.owner)
+        };
+        let link = ScriptedLink::new();
+        let client = Client::connect(
+            link.clone().into_link(),
+            super::CodexSession::handler(Arc::clone(&shared)),
+            ClientOptions::new("Codex app-server"),
+        );
+        let settling = tokio::spawn(async move {
+            let _ = super::CodexSession::settle_stop(
+                &shared,
+                &client,
+                &owner,
+                mango_external_agents::CancelReason::Requested,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let interrupts = link
+            .sent()
+            .iter()
+            .filter(|line| line.contains("\"turn/interrupt\""))
+            .count();
+        settling.abort();
+        assert_eq!(
+            interrupts, 1,
+            "expected turn/interrupt dispatches: 1 | received: {interrupts}"
         );
     }
 }
