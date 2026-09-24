@@ -142,3 +142,76 @@ async fn aborting_and_joining_a_stalled_driver_still_reports_successful_reaping(
         "expected successful cleanup result after both driver join and child reap were proven",
     );
 }
+
+/// Answers every request with a batch larger than the default 1,024-message transport budget
+/// instead of a response, so the request is in flight when the overflow kills the connection.
+#[derive(Clone, Default)]
+struct FloodingAgent {
+    received: mango_external_agents::CancelToken,
+}
+
+impl FloodingAgent {
+    const BATCH: usize = 1_100;
+
+    fn process(&self) -> FakeProcess {
+        let agent = self.clone();
+        FakeProcess::responding(move |_line| {
+            agent.received.cancel();
+            let batch: Vec<serde_json::Value> = (0..Self::BATCH)
+                .map(|_| {
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "method": "session/unsupported",
+                        "params": {"sessionId": "native-1"}
+                    })
+                })
+                .collect();
+            vec![serde_json::Value::Array(batch).to_string()]
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_request_in_flight_when_an_incoming_budget_overflows_returns_limit_exceeded() {
+    let agent = FloodingAgent::default();
+    let (connection, launcher) = drive_fake_agent(agent.process()).await;
+    let profile = crate::profile::builtin_profile("opencode").expect("opencode profile");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        send(
+            &connection,
+            &profile,
+            Duration::from_secs(5),
+            "initialize",
+            agent_client_protocol::schema::v1::InitializeRequest::new(
+                agent_client_protocol::schema::ProtocolVersion::V1,
+            ),
+        ),
+    )
+    .await
+    .expect("expected the overflow to end the request before the test deadline");
+    assert!(
+        agent.received.is_cancelled(),
+        "expected the request to reach the agent before the overflow"
+    );
+    let error = result.expect_err("expected the overflow to fail the in-flight request");
+    let text = error.to_string();
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                limit: 1024,
+                received: FloodingAgent::BATCH,
+                ..
+            }
+        ),
+        "expected LimitExceeded {{ limit: 1024, received: {} }}, received {text:?}",
+        FloodingAgent::BATCH
+    );
+    connection.begin_shutdown(CancelReason::Shutdown);
+    connection.wait_shutdown().await.expect("cleanup");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected no live child after cleanup"
+    );
+}
