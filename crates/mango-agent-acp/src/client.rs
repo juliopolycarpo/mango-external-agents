@@ -1461,7 +1461,10 @@ pub(crate) async fn drive(
             Ok(Ok(())) => "a connection that closed before it opened",
             Err(_) => "a connection task that did not finish",
         };
-        let error = Error::Vendor(link_failure(with_stderr(shape, child.control.as_ref())));
+        let error = match overflow.get() {
+            Some(overflow) => overflow.error(),
+            None => Error::Vendor(link_failure(with_stderr(shape, child.control.as_ref()))),
+        };
         child.finish().await?;
         return Err(error);
     };
@@ -1689,7 +1692,9 @@ where
     };
     abandonment.disarm();
     answered.map_err(|error| {
-        if let Some(overflow) = connection.overflow() {
+        if is_link_closure(&error)
+            && let Some(overflow) = connection.overflow()
+        {
             return overflow.error();
         }
         if agent_client_protocol::is_incoming_transport_closed(&error) {
@@ -1700,6 +1705,24 @@ where
         }
         crate::error::request_error(method, &error, &profile.login_text())
     })
+}
+
+/// Whether the SDK failed a request because the link went away, rather than the agent answering.
+///
+/// Two local shapes: the SDK's `incoming transport closed` reason, and its `never received` error
+/// when the connection's reply channel was dropped with the request pending. Only these may be
+/// explained by a connection-wide transport budget; an agent's own refusal is kept as it came.
+/// For example, a `set_config_option` refusal stays a vendor error even after a later overflow.
+pub(crate) fn is_link_closure(error: &agent_client_protocol::Error) -> bool {
+    if agent_client_protocol::is_incoming_transport_closed(error) {
+        return true;
+    }
+    let Some(detail) = error.data.as_ref().and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    error.code == agent_client_protocol::ErrorCode::InternalError
+        && detail.starts_with("response to `")
+        && detail.contains("` never received: ")
 }
 
 /// A message with the child's stderr appended, when it wrote any.

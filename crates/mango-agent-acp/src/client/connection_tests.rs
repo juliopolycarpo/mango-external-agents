@@ -42,6 +42,12 @@ impl UnknownMessageAgent {
 }
 
 async fn drive_fake_agent(process: FakeProcess) -> (Arc<ConnectionHandle>, FakeLauncher) {
+    let (driven, launcher) = try_drive_fake_agent(process).await;
+    (Arc::new(driven.expect("driver")), launcher)
+}
+
+/// Launches `process` and runs `drive`, returning its result as is.
+async fn try_drive_fake_agent(process: FakeProcess) -> (Result<ConnectionHandle>, FakeLauncher) {
     let launcher = FakeLauncher::new();
     launcher.push(process);
     let host = HostContext::builder()
@@ -76,12 +82,8 @@ async fn drive_fake_agent(process: FakeProcess) -> (Arc<ConnectionHandle>, FakeL
     .await
     .expect("transport");
     let cleanup = DriveShutdownGuard::from_launched(&launched, *host.limits());
-    let connection = Arc::new(
-        drive(launched, state, String::from("bounded-acp-tests"), cleanup)
-            .await
-            .expect("driver"),
-    );
-    (connection, launcher)
+    let driven = drive(launched, state, String::from("bounded-acp-tests"), cleanup).await;
+    (driven, launcher)
 }
 
 #[tokio::test(start_paused = true)]
@@ -213,5 +215,117 @@ async fn a_request_in_flight_when_an_incoming_budget_overflows_returns_limit_exc
         launcher.live_children(),
         0,
         "expected no live child after cleanup"
+    );
+}
+
+/// Refuses every request with the agent's own JSON-RPC error.
+struct RefusingAgent;
+
+impl RefusingAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            let frame: serde_json::Value = serde_json::from_str(line).expect("SDK JSON frame");
+            vec![
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": frame["id"],
+                    "error": {"code": -32000, "message": "refused by the agent"}
+                })
+                .to_string(),
+            ]
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_agent_refusal_is_kept_even_when_the_connection_has_overflowed() {
+    let (connection, _) = drive_fake_agent(RefusingAgent::process()).await;
+    let _ = connection
+        .overflow
+        .set(crate::transport::Overflow::incoming_messages(8, 50));
+    let profile = crate::profile::builtin_profile("opencode").expect("opencode profile");
+    let error = send(
+        &connection,
+        &profile,
+        Duration::from_secs(5),
+        "initialize",
+        agent_client_protocol::schema::v1::InitializeRequest::new(
+            agent_client_protocol::schema::ProtocolVersion::V1,
+        ),
+    )
+    .await
+    .expect_err("expected the agent's refusal");
+    assert!(
+        !matches!(error, Error::LimitExceeded { .. }),
+        "expected the agent's own refusal, not the connection's overflow, received {error}"
+    );
+    connection.begin_shutdown(CancelReason::Shutdown);
+    connection.wait_shutdown().await.expect("cleanup");
+}
+
+#[test]
+fn only_the_sdk_link_closure_shapes_count_as_link_closure() {
+    let mut closed = agent_client_protocol::Error::internal_error();
+    closed.data = Some(
+        serde_json::json!({"reason": agent_client_protocol::INCOMING_TRANSPORT_CLOSED_REASON}),
+    );
+    let dropped = agent_client_protocol::util::internal_error(
+        "response to `initialize` never received: oneshot canceled",
+    );
+    let refused = agent_client_protocol::Error::new(-32000, "refused by the agent");
+    let plain = agent_client_protocol::util::internal_error("agent crashed");
+    let seen = [
+        is_link_closure(&closed),
+        is_link_closure(&dropped),
+        is_link_closure(&refused),
+        is_link_closure(&plain),
+    ];
+    assert_eq!(
+        seen,
+        [true, true, false, false],
+        "expected [closed transport, dropped reply, agent refusal, other internal error] closure = [true, true, false, false], received {seen:?}"
+    );
+}
+
+/// Floods before the client's first read, so the transport fails before the connection opens.
+struct GreetingFloodAgent;
+
+impl GreetingFloodAgent {
+    fn process() -> FakeProcess {
+        let batch: Vec<serde_json::Value> = (0..FloodingAgent::BATCH)
+            .map(|_| {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "method": "session/unsupported",
+                    "params": {"sessionId": "native-1"}
+                })
+            })
+            .collect();
+        FakeProcess::responding(|_| Vec::new())
+            .with_greeting([serde_json::Value::Array(batch).to_string()])
+    }
+}
+
+#[tokio::test]
+async fn a_transport_overflow_before_the_connection_opens_returns_limit_exceeded() {
+    let (driven, launcher) = try_drive_fake_agent(GreetingFloodAgent::process()).await;
+    let Err(error) = driven else {
+        panic!("expected the greeting flood to fail the connection before it opened, received Ok");
+    };
+    let text = error.to_string();
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                limit: 1024,
+                received: FloodingAgent::BATCH,
+                ..
+            }
+        ),
+        "expected LimitExceeded {{ limit: 1024, received: {} }}, received {text:?}",
+        FloodingAgent::BATCH
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected no live child after the failed open"
     );
 }
