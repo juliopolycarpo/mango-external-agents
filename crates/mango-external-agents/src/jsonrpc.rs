@@ -508,12 +508,65 @@ impl Client {
         P: Serialize + Send,
         R: DeserializeOwned,
     {
-        let answer = tokio::time::timeout(timeout, self.call(method, params, timeout))
+        self.answer_within(method, params, timeout, None).await
+    }
+
+    /// Calls a method like [`Client::request`] and records when its frame starts reaching the
+    /// link.
+    ///
+    /// `write_started` becomes `true` once this call holds the link's writer and begins sending,
+    /// so any byte of the request may be out. A caller that drops this future while the flag is
+    /// still `false` knows the peer never saw any of the request. The flag marks possible
+    /// delivery, not success: it stays raised when the write then fails or the call times out. That is the fact a harness needs
+    /// before it can release a start without reconciling a turn the vendor might be running.
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
+    /// use std::sync::atomic::{AtomicBool, Ordering};
+    ///
+    /// let written = AtomicBool::new(false);
+    /// let _: mango_external_agents::Result<serde_json::Value> =
+    ///     client.request_tracking_write("ping", serde_json::json!({}), &written).await;
+    /// assert!(written.load(Ordering::Acquire));
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::request`].
+    pub async fn request_tracking_write<P, R>(
+        &self,
+        method: &str,
+        params: P,
+        write_started: &AtomicBool,
+    ) -> Result<R>
+    where
+        P: Serialize + Send,
+        R: DeserializeOwned,
+    {
+        let timeout = self.state.options.request_timeout;
+        self.answer_within(method, params, timeout, Some(write_started))
             .await
-            .map_err(|_| Error::Timeout {
-                operation: String::from("a JSON-RPC request"),
-                after: timeout,
-            })??;
+    }
+
+    async fn answer_within<P, R>(
+        &self,
+        method: &str,
+        params: P,
+        timeout: Duration,
+        write_started: Option<&AtomicBool>,
+    ) -> Result<R>
+    where
+        P: Serialize + Send,
+        R: DeserializeOwned,
+    {
+        let answer =
+            tokio::time::timeout(timeout, self.call(method, params, timeout, write_started))
+                .await
+                .map_err(|_| Error::Timeout {
+                    operation: String::from("a JSON-RPC request"),
+                    after: timeout,
+                })??;
         serde_json::from_value(answer).map_err(|error| Error::Protocol {
             expected: String::from("a JSON-RPC result"),
             received: error.to_string(),
@@ -589,7 +642,13 @@ impl Client {
         &self.state.options.peer_name
     }
 
-    async fn call<P>(&self, method: &str, params: P, timeout: Duration) -> Result<Value>
+    async fn call<P>(
+        &self,
+        method: &str,
+        params: P,
+        timeout: Duration,
+        write_started: Option<&AtomicBool>,
+    ) -> Result<Value>
     where
         P: Serialize + Send,
     {
@@ -635,7 +694,7 @@ impl Client {
             id: id.clone(),
         };
 
-        if let Err(error) = self.state.write(frame).await {
+        if let Err(error) = self.state.write_marking(frame, write_started).await {
             // The entry goes before the error leaves: nothing is waiting on this call — the
             // failure is returning here — so an orphan left behind would be failed later by a
             // close or a dying pump, against a caller that had already given up.
@@ -830,8 +889,17 @@ impl ClientState {
     }
 
     async fn write(&self, frame: String) -> Result<()> {
+        self.write_marking(frame, None).await
+    }
+
+    /// Writes one frame, setting `started` once this write holds the sender and begins.
+    async fn write_marking(&self, frame: String, started: Option<&AtomicBool>) -> Result<()> {
         tokio::time::timeout(self.options.request_timeout, async {
-            self.sender.lock().await.send(frame).await
+            let mut sender = self.sender.lock().await;
+            if let Some(started) = started {
+                started.store(true, Ordering::Release);
+            }
+            sender.send(frame).await
         })
         .await
         .map_err(|_| Error::Timeout {
@@ -1564,6 +1632,118 @@ mod tests {
             matches!(error, Error::Timeout { .. }),
             "expected a timeout, received {error:?}"
         );
+    }
+
+    /// A tracked request reports its write once the frame is on its way, and not before: a future
+    /// dropped unpolled leaves the flag down, one that reached the link raises it.
+    #[tokio::test(start_paused = true)]
+    async fn a_tracked_request_reports_only_a_write_that_began() {
+        let link = ScriptedLink::new();
+        let client = Client::connect(
+            link.clone().into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::new("peer"),
+        );
+
+        let unsent = AtomicBool::new(false);
+        drop(client.request_tracking_write::<_, Value>("ping", json!({}), &unsent));
+        assert!(
+            !unsent.load(Ordering::Acquire),
+            "expected write_started: false for an unpolled request | received: true"
+        );
+        assert!(link.sent().is_empty(), "expected nothing on the wire");
+
+        let sent = AtomicBool::new(false);
+        let answering = link.clone();
+        let (answer, ()) = tokio::join!(
+            client.request_tracking_write::<_, Value>("ping", json!({}), &sent),
+            async move {
+                answering.wait_for_sent(1).await;
+                answering.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"pong"}"#);
+            }
+        );
+        assert!(
+            sent.load(Ordering::Acquire),
+            "expected write_started: true after the frame was sent | received: false"
+        );
+        assert_eq!(answer.expect("expected the scripted answer"), json!("pong"));
+    }
+
+    /// Holds the one send whose frame names `method`, so the writer stays busy for the test.
+    struct GatedSender {
+        inner: Box<dyn crate::link::LinkSender>,
+        method: &'static str,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::link::LinkSender for GatedSender {
+        async fn send(&mut self, message: String) -> crate::error::Result<()> {
+            if message.contains(self.method) {
+                self.gate
+                    .acquire()
+                    .await
+                    .expect("the fake send gate must stay open")
+                    .forget();
+            }
+            self.inner.send(message).await
+        }
+
+        async fn close(&mut self) -> crate::error::Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    /// A tracked request waiting for the writer another call holds has written nothing, so its
+    /// flag stays down; it rises only once that request takes the writer and sends.
+    #[tokio::test(start_paused = true)]
+    async fn a_tracked_request_behind_a_busy_writer_reports_no_write() {
+        let link = ScriptedLink::new();
+        let (sender, receiver) = link.clone().into_link().split();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let client = Arc::new(Client::connect(
+            crate::link::Link::new(
+                Box::new(GatedSender {
+                    inner: sender,
+                    method: "hold",
+                    gate: Arc::clone(&gate),
+                }),
+                receiver,
+            ),
+            RecordingHandler::arc(None),
+            ClientOptions::new("peer"),
+        ));
+        let holding = Arc::clone(&client);
+        let held =
+            tokio::spawn(async move { holding.request::<_, Value>("hold", json!({})).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let flag = AtomicBool::new(false);
+        let mut tracked =
+            std::pin::pin!(client.request_tracking_write::<_, Value>("ping", json!({}), &flag));
+        tokio::select! {
+            biased;
+            _ = &mut tracked => panic!("expected the tracked request to wait for the writer"),
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "expected write_started: false while another call holds the writer | received: true"
+        );
+
+        gate.add_permits(1);
+        let answering = link.clone();
+        let (answer, ()) = tokio::join!(tracked, async move {
+            answering.wait_for_sent(2).await;
+            answering.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"held"}"#);
+            answering.push_line(r#"{"jsonrpc":"2.0","id":"2","result":"pong"}"#);
+        });
+        assert!(
+            flag.load(Ordering::Acquire),
+            "expected write_started: true once the request sent | received: false"
+        );
+        assert_eq!(answer.expect("expected the scripted answer"), json!("pong"));
+        let _ = held.await;
     }
 
     /// Client labels identify a peer to the caller but can be host-authored text, so they must not

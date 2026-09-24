@@ -129,9 +129,9 @@ active turn in `turn/interrupt` and `turn/steer`.
 
 The slot is released when Codex commits its native terminal, before the host drains buffered
 events. A dropped library `TurnStream` is owner abandonment: the harness refuses pending approvals,
-sends `turn/interrupt`, waits through the host's graceful-turn bound, and closes and reaps the
-app-server if the turn will not settle. A browser disconnect that should leave work running must
-therefore retain the stream in a host supervisor.
+sends `turn/interrupt`, waits for the turn to settle, and closes and reaps the app-server if it
+will not. A browser disconnect that should leave work running must therefore retain the stream in
+a host supervisor.
 
 Teardown has one owner per session. The host-shutdown and connection-loss watcher, `close`, an
 abandoned turn that will not settle, and a dropped session all request the same detached worker,
@@ -141,6 +141,48 @@ the worker's result, so none reports success before the child is reaped. If the 
 the child, or panics inside the host's process control, each caller receives the same
 `Error::CleanupRequired` control for host reconciliation. `Closed` is published only after the
 reap succeeds.
+
+Stopping a turn has four deadlines, and none of them borrows another's meaning. The
+[app-server protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)
+answers `turn/interrupt` with an empty result and later ends the turn with `turn/completed` status
+`interrupted`; neither step has a vendor deadline, so each is bounded by the host's `Limits`:
+
+| Stage                 | Bound                                                            | On expiry                                                    |
+| --------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------ |
+| Pending start         | `request_timeout`, from the start request or from the stop       | Start treated as unanswered; the settle stage begins         |
+| Interrupt ack         | The `turn/interrupt` request's own `request_timeout`             | Process shutdown, as for a refused interrupt                 |
+| Turn settle after ack | `cancel_settle_timeout` (60 s default), from the acknowledgement | Process shutdown                                             |
+| Shutdown escalation   | `kill_grace`, then `shutdown_timeout` per teardown stage         | `Error::CleanupRequired` carrying the host's process control |
+
+The pending-start bound has two clocks. The start request's own deadline returns
+`Dispatch::AcceptanceUnknown` to its caller. The stop worker also bounds its own wait by
+`request_timeout`, counted from when the stop began. That second clock matters when a host keeps
+the `start_turn` future alive but no longer polls it: the request's own deadline can then never
+fire.
+
+A start future dropped before any byte of its `turn/start` reached the link releases the slot at
+once, with no settle wait and no kill: Codex never saw the request, so no native turn can exist.
+
+The stages add up. At worst a stop takes up to `request_timeout` waiting for the start, then
+`request_timeout` for the interrupt, then `cancel_settle_timeout`, then `kill_grace` plus the
+`shutdown_timeout` teardown stages. At the defaults that is about five minutes (120 + 120 + 60 +
+2 + a few 5 s stages). A start whose answer was lost but that a notification later names pays one
+more interrupt and settle round. For that whole time the session stays busy. A `cancel` call waits
+only when the turn is already named: then it covers the interrupt, the settle deadline and any
+shutdown. A cancel that arrives before the start answer returns once the stop is recorded. `close`
+does not wait for this: it goes straight to process shutdown, bounded by `kill_grace` and
+`shutdown_timeout` alone.
+
+Each owner has one stop worker, and it sends at most one `turn/interrupt`: repeated cancels, a
+dropped stream, an idle expiry and a racing `close` all share it. Until the turn ends the slot stays
+occupied and `start_turn` answers `Busy`, because Codex reads a `turn/start` on a live turn as a
+steer. An expired deadline is not treated as proof the turn stopped. The harness stops waiting and
+reaps the process, and the session is `Closed` only once that reap succeeds. A cancel that
+arrives before `turn/start` answers returns once the stop is recorded, and the worker sends the
+interrupt when the answer names the turn. The turn's terminal arrives on the start caller's
+stream. If escalation cannot reap the child, `close` returns the resulting `CleanupRequired` and
+its control, so nothing is lost by not waiting. A cancel on a named turn waits for the worker and
+returns its error whole, including a `CleanupRequired`.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.

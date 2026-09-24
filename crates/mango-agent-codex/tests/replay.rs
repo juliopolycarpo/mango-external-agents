@@ -1441,7 +1441,7 @@ async fn dropping_a_start_future_reaps_an_unacknowledged_attempt() {
     start.abort();
     let _ = start.await;
     tokio::task::yield_now().await;
-    tokio::time::advance(replay_limits().shutdown_timeout).await;
+    tokio::time::advance(replay_limits().cancel_settle_timeout).await;
     tokio::task::yield_now().await;
 
     assert_eq!(
@@ -2254,7 +2254,7 @@ async fn a_native_interrupt_in_progress_keeps_admission_owned() {
         }
     }));
     let mut limits = replay_limits();
-    limits.shutdown_timeout = std::time::Duration::from_millis(30);
+    limits.cancel_settle_timeout = std::time::Duration::from_millis(30);
     let (host, launcher) = with_launcher_limits(launcher, None, limits);
     let session: Arc<dyn Session> = Arc::from(
         CodexHarness::new()

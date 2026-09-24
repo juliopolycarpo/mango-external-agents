@@ -182,7 +182,36 @@ pub struct Limits {
     /// Maximum time a turn may remain silent without an outstanding host interaction.
     pub idle_timeout: Duration,
     /// Maximum time allowed for a session shutdown stage.
+    ///
+    /// Shutdown is the process-teardown policy: closing a connection, then reaping its child after
+    /// [`Self::kill_grace`]. In the Codex harness it does not bound a turn that is being cancelled
+    /// on a live session; that is [`Self::cancel_settle_timeout`].
     pub shutdown_timeout: Duration,
+    /// How long a turn this side asked to stop may stay unresolved before the harness escalates to
+    /// process shutdown.
+    ///
+    /// Honoured by the Codex harness. The Claude and ACP harnesses still bound their cancellation
+    /// with [`Self::kill_grace`] and [`Self::shutdown_timeout`].
+    ///
+    /// The clock starts once the stop request has done all it can on the protocol: the vendor
+    /// acknowledged the native interrupt, or the turn can never be interrupted because its start
+    /// answer was lost. The interrupt request itself and a still-pending start request are each
+    /// bounded by [`Self::request_timeout`] instead. Until the turn ends or this deadline expires,
+    /// the session stays admitted-busy: a vendor that has not reported the turn over may still be
+    /// running it, and expiry is not proof it stopped — it is the point where the harness stops
+    /// waiting and reaps the process under [`Self::shutdown_timeout`] and [`Self::kill_grace`].
+    ///
+    /// A Codex session can therefore stay busy for up to one request wait on a pending start, one
+    /// interrupt request, this deadline, and then the shutdown stages. At the defaults that is
+    /// about five minutes. A `cancel` call waits only when the turn is already named: then it
+    /// covers the interrupt, this deadline and any shutdown. Before that it returns as soon as the
+    /// stop is recorded. `close` skips the protocol stop and stays within [`Self::kill_grace`] and
+    /// [`Self::shutdown_timeout`].
+    ///
+    /// For example, a host whose tools can take minutes to abort raises this without lengthening
+    /// every protocol request: `Limits { cancel_settle_timeout: Duration::from_secs(300),
+    /// ..Limits::default() }`.
+    pub cancel_settle_timeout: Duration,
     /// How long a vendor approval stays answerable before the harness refuses it.
     ///
     /// Separate from [`Self::request_timeout`]: a request deadline bounds a protocol call, while an
@@ -204,6 +233,7 @@ impl Default for Limits {
             request_timeout: Duration::from_secs(120),
             idle_timeout: Duration::from_secs(120),
             shutdown_timeout: Duration::from_secs(5),
+            cancel_settle_timeout: Duration::from_secs(60),
             approval_timeout: Duration::from_secs(30 * 60),
             kill_grace: Duration::from_secs(2),
         }
@@ -547,6 +577,19 @@ mod tests {
                 message: String::from("a launcher that spawns nothing"),
             })
         }
+    }
+
+    /// A stopping turn outlives one full shutdown pass by default, so a slow but honest vendor
+    /// stop is never mistaken for a dead process.
+    #[test]
+    fn default_cancel_settle_outlasts_the_shutdown_policy() {
+        let limits = Limits::default();
+        let shutdown = limits.kill_grace + limits.shutdown_timeout;
+        assert!(
+            limits.cancel_settle_timeout > shutdown,
+            "expected cancel_settle_timeout > kill_grace + shutdown_timeout ({shutdown:?}) | received: {:?}",
+            limits.cancel_settle_timeout
+        );
     }
 
     fn context() -> HostContext {

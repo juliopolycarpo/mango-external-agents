@@ -659,7 +659,7 @@ async fn codex_teardown_a_start_dropped_outside_a_runtime_releases_its_owner() {
         .expect("expected the dropping thread not to panic");
 
     tokio::task::yield_now().await;
-    tokio::time::advance(replay_limits().shutdown_timeout).await;
+    tokio::time::advance(replay_limits().cancel_settle_timeout).await;
     tokio::task::yield_now().await;
 
     assert_eq!(

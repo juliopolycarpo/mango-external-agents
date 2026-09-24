@@ -196,7 +196,8 @@ pub(crate) struct Shared {
     shutting_down: AtomicBool,
     /// Wakes the session-owned process reaper after an unexpected link termination.
     terminated: mango_external_agents::CancelToken,
-    /// Wakes an abandonment watcher after its owned native turn reaches a terminal outcome.
+    /// Wakes an abandonment watcher after its owned native turn reaches a terminal outcome, and a
+    /// stop worker waiting on a pending start once that start is named or can never be.
     turn_finished: Notify,
     /// Restarts the one active turn's idle period after a native frame or approval transition.
     idle_changes: watch::Sender<u64>,
@@ -356,6 +357,69 @@ impl Shared {
         }
     }
 
+    /// Waits until this owner's start can be acted on by a stop: its native turn is named, its start
+    /// answer can never arrive, or it no longer occupies admission.
+    ///
+    /// Not bounded here: the caller bounds it. `dispatch_stop` wraps this wait in
+    /// `Limits::request_timeout` and marks the start unanswerable on expiry, because the start's
+    /// own request deadline only runs while the host keeps polling its `start_turn` future.
+    async fn wait_for_start_resolution(&self, owner: &Arc<()>) {
+        loop {
+            let changed = self.turn_finished.notified();
+            if !self.turn.lock().await.as_ref().is_some_and(|active| {
+                Arc::ptr_eq(&active.owner, owner)
+                    && !active.finishing
+                    && active.native_turn_id.is_empty()
+                    && !active.start_unanswerable
+            }) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Whether this owner is live and not yet interrupted, so naming it — now or later — should
+    /// trigger the stop's one interrupt.
+    ///
+    /// Not gated on the id still being empty: the pump can name the turn between the stop's
+    /// empty-id pass and this check, and [`Self::wait_for_named`] returns at once for a named turn.
+    async fn awaiting_name(&self, owner: &Arc<()>) -> bool {
+        self.turn.lock().await.as_ref().is_some_and(|active| {
+            Arc::ptr_eq(&active.owner, owner) && !active.finishing && !active.interrupt_dispatched
+        })
+    }
+
+    /// Waits until this owner's native turn is named, by a notification or a late answer.
+    ///
+    /// Never returns while the owner stays unnamed; the caller races it against the turn's end
+    /// and its settle deadline.
+    async fn wait_for_named(&self, owner: &Arc<()>) {
+        loop {
+            let changed = self.turn_finished.notified();
+            if self.turn.lock().await.as_ref().is_some_and(|active| {
+                Arc::ptr_eq(&active.owner, owner) && !active.native_turn_id.is_empty()
+            }) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Records that this owner's `turn/start` answer will never be read, so a stop waiting for the
+    /// turn's id moves on to its settle deadline instead.
+    async fn mark_start_unanswerable(&self, owner: &Arc<()>) {
+        if let Some(active) = self
+            .turn
+            .lock()
+            .await
+            .as_mut()
+            .filter(|active| Arc::ptr_eq(&active.owner, owner))
+        {
+            active.start_unanswerable = true;
+        }
+        self.turn_finished.notify_waiters();
+    }
+
     /// Seals the session only if this owner still holds admission at the point an abandoned-turn
     /// reaper must escalate. The turn lock also guards `begin`, so a replacement cannot enter the
     /// gap between this check and the shutdown request.
@@ -378,7 +442,7 @@ impl Shared {
         owner: Option<&Arc<()>>,
         reason: CancelReason,
     ) -> Result<bool> {
-        let Some((route, thread_id, native_turn_id, pending_start)) = ({
+        let Some((route, thread_id, native_turn_id, no_dispatch)) = ({
             let mut turn = self.turn.lock().await;
             turn.as_mut()
                 .filter(|active| {
@@ -387,8 +451,11 @@ impl Shared {
                 .map(|active| {
                     active.cancel_reason.get_or_insert(reason);
                     let pending_start = active.native_turn_id.is_empty();
-                    if pending_start {
-                        active.cancel_before_start = true;
+                    // One native stop per turn: a second interrupt while the first is still
+                    // unanswered adds nothing but another request to time out.
+                    let already_dispatched = active.interrupt_dispatched;
+                    if !pending_start {
+                        active.interrupt_dispatched = true;
                     }
                     (
                         ActiveTurnRoute {
@@ -399,7 +466,7 @@ impl Shared {
                         },
                         self.thread_id().to_owned(),
                         active.native_turn_id.clone(),
-                        pending_start,
+                        pending_start || already_dispatched,
                     )
                 })
         }) else {
@@ -408,7 +475,7 @@ impl Shared {
 
         self.release_pending_for(Some(&route.owner), DecisionSource::Cancelled)
             .await;
-        if !self.owns_active_turn(&route).await || pending_start {
+        if !self.owns_active_turn(&route).await || no_dispatch {
             return Ok(true);
         }
 
@@ -470,8 +537,10 @@ struct ActiveTurn {
     announced: bool,
     /// Native reviews have their own lifecycle and do not accept user steering.
     is_review: bool,
-    /// A cancel arrived before the server supplied the id its interrupt needs.
-    cancel_before_start: bool,
+    /// The `turn/start` answer will never be read, so this turn can never be named or interrupted.
+    start_unanswerable: bool,
+    /// `turn/interrupt` has been sent for this turn. It is sent at most once.
+    interrupt_dispatched: bool,
     /// Why this turn is being stopped, when somebody here asked for it.
     ///
     /// The server reports only that a turn was interrupted. Who asked, and why, is this side's
@@ -494,12 +563,22 @@ struct TerminalClaim {
     cancel_reason: Option<CancelReason>,
 }
 
+/// How a stopped turn's settle stage ended.
+enum Settled {
+    /// Codex reported the turn over, or another path released it.
+    Ended,
+    /// The settle deadline passed with the turn still admitted.
+    Expired,
+    /// The late interrupt for a newly named turn failed while the turn was live.
+    InterruptFailed(Error),
+}
+
 /// Completion state for one detached native-stop worker.
 struct StopState {
     started: AtomicBool,
     complete: AtomicBool,
-    failed: AtomicBool,
-    vendor_failure: Mutex<Option<VendorError>>,
+    /// The worker's own error, kept whole so a `CleanupRequired` still carries its control.
+    failure: Mutex<Option<Error>>,
     done: Notify,
 }
 
@@ -508,10 +587,17 @@ impl StopState {
         Self {
             started: AtomicBool::new(false),
             complete: AtomicBool::new(false),
-            failed: AtomicBool::new(false),
-            vendor_failure: Mutex::new(None),
+            failure: Mutex::new(None),
             done: Notify::new(),
         }
+    }
+
+    /// A stop that has nothing left to do, for an owner that no longer holds admission.
+    fn finished() -> Self {
+        let stop = Self::new();
+        stop.started.store(true, Ordering::Release);
+        stop.complete.store(true, Ordering::Release);
+        stop
     }
 }
 
@@ -525,6 +611,8 @@ struct StartGuard {
     armed: bool,
     /// The runtime the start began on, so a drop on a thread without one still abandons the owner.
     runtime: tokio::runtime::Handle,
+    /// Whether any byte of this attempt's start request may have reached Codex.
+    request_written: Arc<AtomicBool>,
 }
 
 impl StartGuard {
@@ -544,6 +632,7 @@ impl StartGuard {
             armed: true,
             // Built inside the async `start_turn`, so a runtime is current.
             runtime: tokio::runtime::Handle::current(),
+            request_written: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -566,7 +655,16 @@ impl Drop for StartGuard {
         // dropping the future from a plain thread must not strand the turn slot.
         let runtime =
             tokio::runtime::Handle::try_current().unwrap_or_else(|_| self.runtime.clone());
+        // A start request that never began writing cannot have started a native turn, so its
+        // owner is released at once, without a settle wait or a kill.
+        if !self.request_written.load(Ordering::Acquire) {
+            runtime.spawn(async move {
+                shared.release_refused_start(&owner).await;
+            });
+            return;
+        }
         runtime.spawn(async move {
+            shared.mark_start_unanswerable(&owner).await;
             CodexSession::abandon_owner(shared, client, control, state, owner).await;
         });
     }
@@ -789,7 +887,11 @@ impl Shared {
         }
         active.announced = true;
         active.native_turn_id = native_turn_id.clone();
-        Ok(Some((active.sink.clone(), native_turn_id)))
+        let sink = active.sink.clone();
+        drop(turn);
+        // A stop worker waiting for this start can now name the turn it has to interrupt.
+        self.turn_finished.notify_waiters();
+        Ok(Some((sink, native_turn_id)))
     }
 
     /// Puts one event on the stream that still belongs to this start attempt.
@@ -2405,13 +2507,7 @@ impl CodexSession {
                 .map(|active| Arc::clone(&active.stop))
         };
         let Some(stop) = stop else {
-            return Arc::new(StopState {
-                started: AtomicBool::new(true),
-                complete: AtomicBool::new(true),
-                failed: AtomicBool::new(false),
-                vendor_failure: Mutex::new(None),
-                done: Notify::new(),
-            });
+            return Arc::new(StopState::finished());
         };
         if stop
             .started
@@ -2420,15 +2516,10 @@ impl CodexSession {
         {
             let worker_stop = Arc::clone(&stop);
             tokio::spawn(async move {
-                match Self::stop_owner(shared, client, control, state, owner, reason).await {
-                    Ok(()) => {}
-                    Err(Error::Vendor(error)) => {
-                        *worker_stop.vendor_failure.lock().await = Some(error);
-                        worker_stop.failed.store(true, Ordering::Release);
-                    }
-                    Err(_) => {
-                        worker_stop.failed.store(true, Ordering::Release);
-                    }
+                if let Err(error) =
+                    Self::stop_owner(shared, client, control, state, owner, reason).await
+                {
+                    *worker_stop.failure.lock().await = Some(error);
                 }
                 worker_stop.complete.store(true, Ordering::Release);
                 worker_stop.done.notify_waiters();
@@ -2442,20 +2533,42 @@ impl CodexSession {
         loop {
             let done = stop.done.notified();
             if stop.complete.load(Ordering::Acquire) {
-                return if stop.failed.load(Ordering::Acquire) {
-                    if let Some(error) = stop.vendor_failure.lock().await.clone() {
-                        return Err(Error::Vendor(error));
-                    }
-                    Err(Error::Link {
-                        peer: String::from("Codex app-server"),
-                        message: String::from("bounded native turn cancellation did not complete"),
-                    })
-                } else {
-                    Ok(())
+                return match stop.failure.lock().await.as_ref() {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(()),
                 };
             }
             done.await;
         }
+    }
+
+    /// Sends this owner's one `turn/interrupt`, first waiting for a pending start to name its turn.
+    ///
+    /// The first pass records the cancel and refuses the owner's approvals; for a pending start
+    /// it can send nothing, because Codex's interrupt must name the turn. The second pass sends
+    /// the interrupt once the id is known, or nothing when the start can never be named. Each wait
+    /// is bounded by `request_timeout`, never by a shutdown deadline; the start wait is bounded
+    /// here as well, because an unpolled start future never reaches its own deadline.
+    async fn dispatch_stop(
+        shared: &Shared,
+        client: &Client,
+        owner: &Arc<()>,
+        reason: CancelReason,
+    ) -> Result<()> {
+        shared.cancel_owner(client, Some(owner), reason).await?;
+        // The start future belongs to the host, which may keep it alive without polling it; then
+        // neither its request deadline nor its drop guard ever resolves the start. Bound the wait
+        // here too, from when the stop began, and treat expiry as a lost answer. A notification
+        // that names the turn later still gets its interrupt in the settle stage.
+        let request_timeout = shared.host.limits().request_timeout;
+        if tokio::time::timeout(request_timeout, shared.wait_for_start_resolution(owner))
+            .await
+            .is_err()
+        {
+            shared.mark_start_unanswerable(owner).await;
+        }
+        shared.cancel_owner(client, Some(owner), reason).await?;
+        Ok(())
     }
 
     /// Cancels one owned native turn and escalates only when its terminal does not arrive.
@@ -2470,39 +2583,67 @@ impl CodexSession {
         if !shared.owner_is_active(&owner).await {
             return Ok(());
         }
-        let limits = *shared.host.limits();
-        let interrupted = tokio::time::timeout(
-            limits.kill_grace,
-            shared.cancel_owner(&client, Some(&owner), reason),
-        )
-        .await;
-        match interrupted {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
+        let settle = shared.host.limits().cancel_settle_timeout;
+        let settled = match Self::dispatch_stop(&shared, &client, &owner, reason).await {
+            Ok(()) => Self::settle_stop(&shared, &client, &owner, reason, settle).await,
+            Err(error) => Settled::InterruptFailed(error),
+        };
+        match settled {
+            Settled::Ended => Self::after_turn_gone(&shared).await,
+            Settled::InterruptFailed(error) => {
+                // Codex refused, or never acknowledged, the interrupt while the turn is live.
                 if shared.seal_owner_for_shutdown(&owner).await {
                     Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
-                    let _ = Self::wait_for_shutdown(&shared).await;
-                    return Err(error);
+                    // A teardown that could not reap the child outranks the interrupt failure:
+                    // its `CleanupRequired` carries the control the host needs to reconcile.
+                    return Self::wait_for_shutdown(&shared).await.and(Err(error));
                 }
-                return Ok(());
+                Self::after_turn_gone(&shared).await
             }
-            Err(_) => {
+            Settled::Expired => {
                 if shared.seal_owner_for_shutdown(&owner).await {
                     Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
                     return Self::wait_for_shutdown(&shared).await;
                 }
-                return Ok(());
+                Self::after_turn_gone(&shared).await
             }
         }
-        if tokio::time::timeout(limits.shutdown_timeout, shared.wait_for_turn_end(&owner))
-            .await
-            .is_ok()
-        {
-            return Ok(());
+    }
+
+    /// Waits for a stopped turn to end, bounded by `settle`.
+    ///
+    /// The stop did all it can on the protocol. The turn stays admitted until Codex reports it
+    /// over. A turn that is named but not yet interrupted — a lost start answer named later by a
+    /// notification, or named while the stop was between its passes — gets its one interrupt
+    /// here, with a fresh settle clock.
+    async fn settle_stop(
+        shared: &Shared,
+        client: &Client,
+        owner: &Arc<()>,
+        reason: CancelReason,
+        settle: std::time::Duration,
+    ) -> Settled {
+        loop {
+            let awaiting_name = shared.awaiting_name(owner).await;
+            tokio::select! {
+                () = shared.wait_for_turn_end(owner) => return Settled::Ended,
+                () = tokio::time::sleep(settle) => return Settled::Expired,
+                () = shared.wait_for_named(owner), if awaiting_name => {
+                    if let Err(error) = shared.cancel_owner(client, Some(owner), reason).await {
+                        return Settled::InterruptFailed(error);
+                    }
+                }
+            }
         }
-        if shared.seal_owner_for_shutdown(&owner).await {
-            Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
-            return Self::wait_for_shutdown(&shared).await;
+    }
+
+    /// What a stop reports once its turn left admission without this worker escalating.
+    ///
+    /// A racing `close` may have ended the turn and then failed to reap the child. The stop waiter
+    /// shares that teardown's outcome, so its `CleanupRequired` is not reported as success.
+    async fn after_turn_gone(shared: &Shared) -> Result<()> {
+        if shared.teardown_started.load(Ordering::Acquire) {
+            return Self::wait_for_shutdown(shared).await;
         }
         Ok(())
     }
@@ -2814,7 +2955,8 @@ impl CodexSession {
                 native_turn_id: String::new(),
                 announced: false,
                 is_review: rpc_method == method::REVIEW_START,
-                cancel_before_start: false,
+                start_unanswerable: false,
+                interrupt_dispatched: false,
                 cancel_reason: None,
                 abandonment_watcher: None,
                 idle_watcher: None,
@@ -2830,15 +2972,28 @@ impl CodexSession {
             Arc::clone(&owner),
         );
 
-        let answer: Result<R> = self.client.request(rpc_method, params).await;
+        let request_written = Arc::clone(&start_guard.request_written);
+        let answer: Result<R> = self
+            .client
+            .request_tracking_write(rpc_method, params, &request_written)
+            .await;
         let (handle, extra) = match answer {
             Ok(answer) => turn_of(answer),
             Err(error) => {
+                if !request_written.load(Ordering::Acquire) {
+                    // Refused before any byte reached the link — a closed client, a full
+                    // request budget, an unencodable frame. Codex never saw it, so this is a
+                    // clean refusal: release the owner and report the start as not submitted.
+                    self.shared.release_refused_start(&owner).await;
+                    start_guard.disarm();
+                    return Err(error.with_dispatch(Dispatch::NotSubmitted));
+                }
                 if !start_was_explicitly_refused(&error) {
                     // A local transport, decoding, or timeout failure says nothing about whether
                     // the app-server accepted the request. Keeping the slot occupied prevents
                     // the next start from becoming a steer of a vendor turn whose handle never
                     // reached this client.
+                    self.shared.mark_start_unanswerable(&owner).await;
                     self.watch_stream_abandonment(Arc::clone(&owner), sink.clone())
                         .await;
                     start_guard.disarm();
@@ -2927,22 +3082,21 @@ impl CodexSession {
             }
         }
 
-        let cancel_before_start = {
-            let mut turn = self.shared.turn.lock().await;
-            match turn.as_mut() {
-                Some(active) if Arc::ptr_eq(&active.owner, &owner) => {
-                    active.native_turn_id.clone_from(&native_turn_id);
-                    active.cancel_before_start
-                }
-                _ => false,
-            }
-        };
-
-        // A cancel that beat this answer could not name the turn. It kept the slot occupied so no
-        // later `turn/start` could become a steer; now this call has the id needed to stop it.
-        if cancel_before_start {
-            self.interrupt(handle.id.clone()).await;
+        if let Some(active) = self
+            .shared
+            .turn
+            .lock()
+            .await
+            .as_mut()
+            .filter(|active| Arc::ptr_eq(&active.owner, &owner))
+        {
+            active.native_turn_id.clone_from(&native_turn_id);
         }
+        // A cancel that beat this answer could not name the turn. It kept the slot occupied so no
+        // later `turn/start` could become a steer; its stop worker now has the id and sends the
+        // one interrupt. Session shutdown and poison release the slot instead: their process
+        // teardown, not an interrupt, ends that turn.
+        self.shared.turn_finished.notify_waiters();
 
         self.watch_stream_abandonment(owner, sink).await;
         start_guard.disarm();
@@ -2950,23 +3104,6 @@ impl CodexSession {
             TurnStream::accepted(turn_id, attempt, native_turn_id, events),
             extra,
         ))
-    }
-
-    /// Stops one vendor turn, best effort.
-    ///
-    /// Used where nothing can be done about a failure: the turn is already out of this session's
-    /// hands, and the alternative to a call that might not land is no call at all.
-    async fn interrupt(&self, turn_id: String) {
-        let _: Result<Value> = self
-            .client
-            .request(
-                method::TURN_INTERRUPT,
-                TurnInterruptParams {
-                    thread_id: self.shared.thread_id().to_owned(),
-                    turn_id,
-                },
-            )
-            .await;
     }
 
     fn input_for(request: &TurnRequest) -> Result<Vec<UserInput>> {
@@ -3818,7 +3955,8 @@ mod tests {
             // This helper installs a turn already past the point `begin` would have announced it.
             announced: true,
             is_review: false,
-            cancel_before_start: false,
+            start_unanswerable: false,
+            interrupt_dispatched: false,
             cancel_reason: None,
             abandonment_watcher: None,
             idle_watcher: None,
@@ -5337,6 +5475,49 @@ mod tests {
         assert!(
             error.to_string().contains("panicked"),
             "expected an error naming the panic | received: {error}"
+        );
+    }
+
+    /// On a multi-thread runtime the pump can name a lost start while the stop worker is between
+    /// its second, empty-id pass and the settle stage. The settle stage must still send that
+    /// turn's one interrupt rather than wait out its deadline and kill the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_named_before_the_settle_stage_gets_its_one_interrupt() {
+        let shared = shared();
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+        let owner = {
+            let mut turn = shared.turn.lock().await;
+            let active = turn.as_mut().expect("expected the installed turn");
+            active.start_unanswerable = true;
+            Arc::clone(&active.owner)
+        };
+        let link = ScriptedLink::new();
+        let client = Client::connect(
+            link.clone().into_link(),
+            super::CodexSession::handler(Arc::clone(&shared)),
+            ClientOptions::new("Codex app-server"),
+        );
+        let settling = tokio::spawn(async move {
+            let _ = super::CodexSession::settle_stop(
+                &shared,
+                &client,
+                &owner,
+                mango_external_agents::CancelReason::Requested,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let interrupts = link
+            .sent()
+            .iter()
+            .filter(|line| line.contains("\"turn/interrupt\""))
+            .count();
+        settling.abort();
+        assert_eq!(
+            interrupts, 1,
+            "expected turn/interrupt dispatches: 1 | received: {interrupts}"
         );
     }
 }
