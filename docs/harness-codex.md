@@ -160,12 +160,17 @@ The pending-start bound has two clocks. The start request's own deadline returns
 the `start_turn` future alive but no longer polls it: the request's own deadline can then never
 fire.
 
+A start future dropped before any byte of its `turn/start` reached the link releases the slot at
+once, with no settle wait and no kill: Codex never saw the request, so no native turn can exist.
+
 The stages add up. At worst a stop takes up to `request_timeout` waiting for the start, then
 `request_timeout` for the interrupt, then `cancel_settle_timeout`, then `kill_grace` plus the
 `shutdown_timeout` teardown stages. At the defaults that is about five minutes (120 + 120 + 60 +
 2 + a few 5 s stages). A start whose answer was lost but that a notification later names pays one
-more interrupt and settle round. For that whole time `cancel` waits and the session stays busy.
-`close` does not wait for this: it goes straight to process shutdown, bounded by `kill_grace` and
+more interrupt and settle round. For that whole time the session stays busy. A `cancel` call waits
+only when the turn is already named: then it covers the interrupt, the settle deadline and any
+shutdown. A cancel that arrives before the start answer returns once the stop is recorded. `close`
+does not wait for this: it goes straight to process shutdown, bounded by `kill_grace` and
 `shutdown_timeout` alone.
 
 Each owner has one stop worker, and it sends at most one `turn/interrupt`: repeated cancels, a

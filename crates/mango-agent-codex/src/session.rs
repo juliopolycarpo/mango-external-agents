@@ -610,6 +610,8 @@ struct StartGuard {
     armed: bool,
     /// The runtime the start began on, so a drop on a thread without one still abandons the owner.
     runtime: tokio::runtime::Handle,
+    /// Whether any byte of this attempt's start request may have reached Codex.
+    request_written: Arc<AtomicBool>,
 }
 
 impl StartGuard {
@@ -629,6 +631,7 @@ impl StartGuard {
             armed: true,
             // Built inside the async `start_turn`, so a runtime is current.
             runtime: tokio::runtime::Handle::current(),
+            request_written: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -651,6 +654,14 @@ impl Drop for StartGuard {
         // dropping the future from a plain thread must not strand the turn slot.
         let runtime =
             tokio::runtime::Handle::try_current().unwrap_or_else(|_| self.runtime.clone());
+        // A start request that never began writing cannot have started a native turn, so its
+        // owner is released at once, without a settle wait or a kill.
+        if !self.request_written.load(Ordering::Acquire) {
+            runtime.spawn(async move {
+                shared.release_refused_start(&owner).await;
+            });
+            return;
+        }
         runtime.spawn(async move {
             shared.mark_start_unanswerable(&owner).await;
             CodexSession::abandon_owner(shared, client, control, state, owner).await;
@@ -2960,7 +2971,11 @@ impl CodexSession {
             Arc::clone(&owner),
         );
 
-        let answer: Result<R> = self.client.request(rpc_method, params).await;
+        let request_written = Arc::clone(&start_guard.request_written);
+        let answer: Result<R> = self
+            .client
+            .request_tracking_write(rpc_method, params, &request_written)
+            .await;
         let (handle, extra) = match answer {
             Ok(answer) => turn_of(answer),
             Err(error) => {

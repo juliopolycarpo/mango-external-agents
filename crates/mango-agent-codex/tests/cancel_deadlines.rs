@@ -207,12 +207,56 @@ struct CountingLauncher {
     inner: Arc<FakeLauncher>,
     kills: Arc<AtomicUsize>,
     kill: KillBehaviour,
+    write_gate: Option<WriteGate>,
+}
+
+/// Holds the one stdin write that names `method` until the test adds a permit.
+///
+/// While held, the client's single writer is busy, so every later frame waits its turn and has
+/// not been written at all.
+#[derive(Clone)]
+struct WriteGate {
+    method: &'static str,
+    gate: Arc<Semaphore>,
+}
+
+/// A fake child's stdin that stops at the gated write.
+struct GatedStdin {
+    inner: Box<dyn mango_external_agents::ByteSink>,
+    write_gate: WriteGate,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::ByteSink for GatedStdin {
+    async fn write_all(&mut self, bytes: &[u8]) -> mango_external_agents::Result<()> {
+        let needle = format!("\"{}\"", self.write_gate.method);
+        if String::from_utf8_lossy(bytes).contains(&needle) {
+            self.write_gate
+                .gate
+                .acquire()
+                .await
+                .expect("the fake write gate must stay open")
+                .forget();
+        }
+        self.inner.write_all(bytes).await
+    }
+
+    async fn close(&mut self) -> mango_external_agents::Result<()> {
+        self.inner.close().await
+    }
 }
 
 #[async_trait::async_trait]
 impl ProcessLauncher for CountingLauncher {
     async fn spawn(&self, spec: LaunchSpec) -> mango_external_agents::Result<ManagedProcess> {
         let mut child = self.inner.spawn(spec).await?;
+        if let Some(write_gate) = &self.write_gate {
+            let write_gate = write_gate.clone();
+            child.stdin = child.stdin.take().map(|inner| {
+                Box::new(GatedStdin { inner, write_gate })
+                    as Box<dyn mango_external_agents::ByteSink>
+            });
+        }
         if matches!(self.kill, KillBehaviour::Refused) {
             child.stdin = child.stdin.take().map(|inner| {
                 Box::new(SurvivingStdin { inner }) as Box<dyn mango_external_agents::ByteSink>
@@ -305,6 +349,15 @@ impl Fixture {
         interrupt_answer: InterruptAnswer,
         kill: KillBehaviour,
     ) -> Self {
+        Self::open_with_write_gate(hold_first_start, interrupt_answer, kill, None).await
+    }
+
+    async fn open_with_write_gate(
+        hold_first_start: bool,
+        interrupt_answer: InterruptAnswer,
+        kill: KillBehaviour,
+        write_gate: Option<WriteGate>,
+    ) -> Self {
         let transcript = Transcript::load("turn");
         let server = Arc::new(HeldTurnServer::new(
             transcript
@@ -327,6 +380,7 @@ impl Fixture {
                 inner: Arc::clone(&launcher),
                 kills: Arc::clone(&kills),
                 kill,
+                write_gate,
             }))
             .cwd(workspace_path())
             .client_info("mango-test", "0.0.1")
@@ -869,4 +923,59 @@ async fn a_stop_does_not_wait_on_an_unpolled_start_future() {
     );
     fixture.assert_interrupts(0, "for a start that was never named");
     drop(start);
+}
+
+/// A start dropped before its `turn/start` frame reached the wire cannot have a native turn, so
+/// its owner is released at once: no settle wait, no kill, and the next start is admitted.
+#[tokio::test(start_paused = true)]
+async fn a_start_dropped_before_its_request_was_written_releases_at_once() {
+    let gate = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
+    let fixture = Fixture::open_with_write_gate(
+        false,
+        InterruptAnswer::AckAndComplete,
+        KillBehaviour::Reaps,
+        Some(WriteGate {
+            method: "account/rateLimits/read",
+            gate: Arc::clone(&gate),
+        }),
+    )
+    .await;
+    gate.forget_permits(Semaphore::MAX_PERMITS);
+
+    // Occupies the client's one writer, so the start below cannot write its frame.
+    let usage_session = Arc::clone(&fixture.session);
+    let usage = tokio::spawn(async move { usage_session.refresh_account_usage().await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let session = Arc::clone(&fixture.session);
+    let mut start =
+        Box::pin(async move { session.start_turn(TurnRequest::new("turn-1", "run")).await });
+    tokio::select! {
+        _ = &mut start => panic!("expected the start to wait behind the held write"),
+        () = tokio::time::sleep(Duration::from_millis(10)) => {}
+    }
+    assert_eq!(
+        fixture.starts(),
+        0,
+        "expected turn/start unwritten | received a written start"
+    );
+    drop(start);
+    gate.add_permits(1_000);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let next = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture
+            .session
+            .start_turn(TurnRequest::new("turn-2", "again")),
+    )
+    .await
+    .expect("expected the next start to answer promptly");
+    assert!(
+        next.is_ok(),
+        "expected the next start admitted | received: {:?}",
+        next.as_ref().err()
+    );
+    fixture.assert_no_kill("after a start dropped before its write");
+    usage.abort();
 }
