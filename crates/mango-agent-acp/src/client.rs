@@ -1103,6 +1103,8 @@ pub(crate) struct ConnectionHandle {
     /// bound its own wind-down, and the session's lifecycle watcher has to observe the same event
     /// without competing for it.
     driver_done: mango_external_agents::CancelToken,
+    /// Filled by the bounded transport when a queue budget failed the connection.
+    overflow: crate::transport::OverflowSlot,
     shutdown_started: AtomicBool,
     shutdown_complete: mango_external_agents::CancelToken,
     /// The one teardown outcome every close waiter observes. `Error` is intentionally reduced to
@@ -1384,6 +1386,10 @@ impl std::fmt::Debug for ConnectionHandle {
 /// reach. `VendorError::message` is the field that exists for vendor text a host reads and
 /// `Display` never writes, which is exactly the shape this needs; `Error::Link`'s summary is
 /// written verbatim and could not carry it.
+///
+/// The one exception is a transport budget: when the agent overflows a message or byte budget
+/// before the connection opens, this returns the recorded [`Error::LimitExceeded`], naming the
+/// limit and the received value, instead of `acp-link-closed`.
 pub(crate) async fn drive(
     launched: LaunchedAgent,
     state: Arc<SessionState>,
@@ -1394,6 +1400,7 @@ pub(crate) async fn drive(
     wait_for_drive_startup_hold(&child).await;
 
     let LaunchedAgent { transport, .. } = launched;
+    let overflow = transport.overflow();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1458,7 +1465,10 @@ pub(crate) async fn drive(
             Ok(Ok(())) => "a connection that closed before it opened",
             Err(_) => "a connection task that did not finish",
         };
-        let error = Error::Vendor(link_failure(with_stderr(shape, child.control.as_ref())));
+        let error = match overflow.get() {
+            Some(overflow) => overflow.error(),
+            None => Error::Vendor(link_failure(with_stderr(shape, child.control.as_ref()))),
+        };
         child.finish().await?;
         return Err(error);
     };
@@ -1473,6 +1483,7 @@ pub(crate) async fn drive(
         driver: Mutex::new(Some(driver)),
         limits: state.limits,
         driver_done,
+        overflow,
         shutdown_started: AtomicBool::new(false),
         shutdown_complete: mango_external_agents::CancelToken::new(),
         shutdown_result: Mutex::new(None),
@@ -1557,6 +1568,15 @@ impl ConnectionHandle {
     /// loop itself, and only this reports that. Anything watching for a dead agent wants both.
     pub(crate) fn driver_done(&self) -> &mango_external_agents::CancelToken {
         &self.driver_done
+    }
+
+    /// The transport budget that failed this connection, if one did.
+    ///
+    /// Set before the SDK reports the closed connection, so a request or turn that observed the
+    /// failure can read it. For example, a prompt ended by an oversized frame reports this instead
+    /// of a cancellation.
+    pub(crate) fn overflow(&self) -> Option<crate::transport::Overflow> {
+        self.overflow.get().copied()
     }
 
     /// Ends the dispatch loop and the child. Idempotent.
@@ -1676,6 +1696,11 @@ where
     };
     abandonment.disarm();
     answered.map_err(|error| {
+        if is_link_closure(&error)
+            && let Some(overflow) = connection.overflow()
+        {
+            return overflow.error();
+        }
         if agent_client_protocol::is_incoming_transport_closed(&error) {
             return Error::Vendor(link_failure(with_stderr(
                 &format!("a transport that closed under {method}"),
@@ -1684,6 +1709,24 @@ where
         }
         crate::error::request_error(method, &error, &profile.login_text())
     })
+}
+
+/// Whether the SDK failed a request because the link went away, rather than the agent answering.
+///
+/// Two local shapes: the SDK's `incoming transport closed` reason, and its `never received` error
+/// when the connection's reply channel was dropped with the request pending. Only these may be
+/// explained by a connection-wide transport budget; an agent's own refusal is kept as it came.
+/// For example, a `set_config_option` refusal stays a vendor error even after a later overflow.
+pub(crate) fn is_link_closure(error: &agent_client_protocol::Error) -> bool {
+    if agent_client_protocol::is_incoming_transport_closed(error) {
+        return true;
+    }
+    let Some(detail) = error.data.as_ref().and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    error.code == agent_client_protocol::ErrorCode::InternalError
+        && detail.starts_with("response to `")
+        && detail.contains("` never received: ")
 }
 
 /// A message with the child's stderr appended, when it wrote any.
@@ -1704,6 +1747,19 @@ pub(crate) fn link_failure(message: String) -> VendorError {
     VendorError::new(
         mango_external_agents::ErrorCode::from_static("acp-link-closed"),
         message,
+    )
+}
+
+/// The failure a turn ends with when a transport budget failed the agent's link under it.
+///
+/// Mirrors the core's `stream-overflow`: the code names the cause and the message is the typed
+/// [`Error::LimitExceeded`] text. For example, a 50-message batch under an 8-message cap ends the
+/// turn with `acp-transport-overflow` and
+/// `expected at most 8 JSON-RPC messages queued from the ACP agent, received 50`.
+pub(crate) fn overflow_failure(overflow: crate::transport::Overflow) -> VendorError {
+    VendorError::new(
+        mango_external_agents::ErrorCode::from_static("acp-transport-overflow"),
+        overflow.error().to_string(),
     )
 }
 
@@ -2035,6 +2091,19 @@ mod tests {
     }
 
     /// Cancelling `drive` before its connection task exists still reaps the child it was handed.
+    #[test]
+    fn an_overflow_failure_names_the_code_the_limit_and_the_received_count() {
+        let overflow = crate::transport::Overflow::incoming_messages(8, 50);
+        let failure = super::overflow_failure(overflow);
+        assert_eq!(failure.code.as_str(), "acp-transport-overflow");
+        assert_eq!(
+            failure.message,
+            "expected at most 8 JSON-RPC messages queued from the ACP agent, received 50",
+            "expected the typed limit text, received {:?}",
+            failure.message
+        );
+    }
+
     #[tokio::test]
     async fn a_cancelled_driver_startup_kills_its_injected_child_once() {
         let launcher = FakeLauncher::new();

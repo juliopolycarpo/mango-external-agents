@@ -63,6 +63,17 @@ Output bytes remain charged through the physical write. A single frame larger th
 budget, or a queue that would exceed either bound, fails the connection with an error naming the
 received count or size and the limit; the session then closes and its child is released.
 
+What the host observes: the turn in flight ends with one `EventKind::Error` whose code is
+`acp-transport-overflow` and whose message is the core `Error::LimitExceeded` text, for example
+`expected at most 8 JSON-RPC messages queued from the ACP agent, received 50`, instead of a
+`Cancelled { reason: Requested }` or the generic `acp-link-closed`. That holds when a host `close`
+races the overflow's cleanup. One outcome takes precedence: if the process cleanup itself fails,
+the turn ends with `acp-link-closed` naming the cleanup failure, because a possibly live child
+is the more urgent fact. A session request
+awaiting an answer on that connection returns `Error::LimitExceeded` with the same subject, limit
+and received value. The session then reaches `Closing` and, once the child is reaped and the turn's
+terminal is written, `Closed`.
+
 The SDK's `Lines` carrier uses unbounded internal queues; its `ByteStreams` carrier also frames input
 without the host's line cap. Neither provides the budgets this harness requires.
 

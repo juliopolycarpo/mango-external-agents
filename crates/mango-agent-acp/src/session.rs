@@ -34,7 +34,7 @@ use mango_external_agents::{
     SessionLifecycle, TurnStream,
 };
 
-use crate::client::{self, ConnectionHandle, link_failure, with_stderr};
+use crate::client::{self, ConnectionHandle, link_failure, overflow_failure, with_stderr};
 use crate::profile::AcpProfile;
 use crate::{content, reducer};
 
@@ -1253,6 +1253,15 @@ impl Session for AcpSession {
                 // remains closed until a later session close can retry teardown.
                 return;
             }
+            let overflow = match outcome {
+                None | Some(Err(_)) => connection.overflow(),
+                Some(Ok(_)) => None,
+            };
+            if let Some(overflow) = overflow {
+                let _ = turn.sink.fail(overflow_failure(overflow)).await;
+                state.release_turn_matching(&handle);
+                return;
+            }
             match outcome {
                 None => {
                     if let Some(message) = cancel_failure {
@@ -1481,9 +1490,16 @@ async fn finish_close(
                 let _ = turn.sink.emit(kind).await;
             }
             match &result {
-                Ok(()) => {
-                    let _ = turn.sink.cancel(reason.into()).await;
-                }
+                // A budget that already failed the link is why the turn ended, even when a
+                // host close raced its cleanup and took the terminal over.
+                Ok(()) => match connection.overflow() {
+                    Some(overflow) => {
+                        let _ = turn.sink.fail(overflow_failure(overflow)).await;
+                    }
+                    None => {
+                        let _ = turn.sink.cancel(reason.into()).await;
+                    }
+                },
                 Err(error) => {
                     let _ = turn
                         .sink

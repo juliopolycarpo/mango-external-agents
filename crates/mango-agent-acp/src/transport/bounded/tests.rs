@@ -115,6 +115,7 @@ async fn queued_input_bytes_and_batch_members_have_independent_limits() {
             Box::pin(futures::stream::iter(lines.into_iter().map(Ok))),
             tx,
             limits,
+            &OverflowSlot::default(),
         )
         .await
         .expect_err("expected an explicit bounded-frame refusal");
@@ -137,7 +138,12 @@ async fn a_notification_burst_beyond_the_request_cap_fits_the_frame_budget() {
     let lines = std::iter::repeat_with(notification).take(12).map(Ok);
     tokio::time::timeout(
         Duration::from_secs(1),
-        read_frames(Box::pin(futures::stream::iter(lines)), tx, limits),
+        read_frames(
+            Box::pin(futures::stream::iter(lines)),
+            tx,
+            limits,
+            &OverflowSlot::default(),
+        ),
     )
     .await
     .expect("expected the burst to be queued, received a stalled reader")
@@ -190,9 +196,14 @@ async fn an_unread_burst_past_the_frame_budget_names_received_and_expected_count
         ..Limits::default()
     };
     let lines = std::iter::repeat_with(notification).take(5).map(Ok);
-    let error = read_frames(Box::pin(futures::stream::iter(lines)), tx, limits)
-        .await
-        .expect_err("expected the fourth unread frame to exceed a 3-frame budget");
+    let error = read_frames(
+        Box::pin(futures::stream::iter(lines)),
+        tx,
+        limits,
+        &OverflowSlot::default(),
+    )
+    .await
+    .expect_err("expected the fourth unread frame to exceed a 3-frame budget");
     let error = serde_json::to_string(&error).expect("error");
     assert!(
         error.contains("received 4 messages") && error.contains("expected at most 3 messages"),
@@ -221,6 +232,7 @@ async fn unread_batches_are_charged_per_member_against_the_message_budget() {
         Box::pin(futures::stream::iter([Ok(batch(3)), Ok(batch(3))])),
         tx,
         limits,
+        &OverflowSlot::default(),
     )
     .await
     .expect_err("expected two unread 3-member batches to exceed a 5-message budget");
@@ -244,7 +256,7 @@ async fn a_batch_of_admitted_responses_fits_despite_a_small_turn_capacity() {
         ..Limits::default()
     };
     let batch = format!("[{},{},{}]", response(1), response(2), response(3));
-    read_frames(Box::pin(futures::stream::iter([Ok(batch)])), tx, limits)
+    read_frames(Box::pin(futures::stream::iter([Ok(batch)])), tx, limits, &OverflowSlot::default())
         .await
         .unwrap_or_else(|error| {
             panic!("expected 3 responses to fit 4 admitted requests with turn capacity 1, received {error:?}")
@@ -300,6 +312,7 @@ async fn an_oversized_frame_names_its_size_and_the_byte_budget() {
         Box::pin(futures::stream::iter([Ok(line.clone())])),
         tx,
         limits,
+        &OverflowSlot::default(),
     )
     .await
     .expect_err("expected a frame larger than the byte budget to be refused");
@@ -330,7 +343,8 @@ async fn consumed_input_releases_its_byte_budget() {
             (index < 3).then(|| (Ok(notification()), (index + 1, acknowledgements)))
         },
     );
-    let reader = read_frames(Box::pin(source), tx, limits);
+    let slot = OverflowSlot::default();
+    let reader = read_frames(Box::pin(source), tx, limits, &slot);
     let consumer = async move {
         let mut count = 0;
         while rx.next().await.is_some() {
@@ -354,9 +368,15 @@ async fn outgoing_bytes_remain_owned_until_the_physical_write_finishes() {
         .expect("frame");
     drop(frames);
     let (pending, writing) = mpsc::channel(2);
-    queue_output(input, pending, Arc::clone(&budget), Limits::default())
-        .await
-        .expect("queued");
+    queue_output(
+        input,
+        pending,
+        Arc::clone(&budget),
+        Limits::default(),
+        &OverflowSlot::default(),
+    )
+    .await
+    .expect("queued");
     assert_eq!(budget.available_permits(), 0);
     let sink = GatedSink::default();
     let writer = tokio::spawn(write_frames(output(sink.clone()), writing));
@@ -387,9 +407,15 @@ async fn a_stalled_writer_refuses_outgoing_count_and_byte_pressure() {
         drop(frames);
         let (pending, _writing) = mpsc::channel(1);
         let budget = Arc::new(Semaphore::new(bytes.min(u32::MAX as usize)));
-        let error = queue_output(input, pending, budget, Limits::default())
-            .await
-            .expect_err("expected bounded output refusal");
+        let error = queue_output(
+            input,
+            pending,
+            budget,
+            Limits::default(),
+            &OverflowSlot::default(),
+        )
+        .await
+        .expect_err("expected bounded output refusal");
         let error = serde_json::to_string(&error).expect("error");
         let expected = if bytes == usize::MAX {
             "received 2 queued frames; expected at most 1"
@@ -401,4 +427,103 @@ async fn a_stalled_writer_refuses_outgoing_count_and_byte_pressure() {
             "expected {expected:?} in the refusal, received {error}"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_budget_failure_fills_the_shared_overflow_slot() {
+    let transport = BoundedTransport::new(
+        output(GatedSink::default()),
+        Box::pin(futures::stream::iter([
+            Ok(notification()),
+            Ok(notification()),
+        ])),
+        Limits {
+            turn_channel_capacity: 1,
+            max_pending_requests: 1,
+            ..Limits::default()
+        },
+    );
+    let slot = transport.overflow();
+    let (_channel, drive) = transport.parts();
+    let _ = tokio::time::timeout(Duration::from_secs(1), drive).await;
+    let text = slot.get().map(|overflow| overflow.error().to_string());
+    assert_eq!(
+        text.as_deref(),
+        Some("expected at most 1 JSON-RPC messages queued from the ACP agent, received 2"),
+        "expected the slot to name the message budget, received {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_budget_refusal_records_its_overflow_before_returning() {
+    let slot = OverflowSlot::default();
+    let (tx, _rx) = futures::channel::mpsc::unbounded();
+    let limits = Limits {
+        turn_channel_capacity: 1,
+        max_pending_requests: 1,
+        ..Limits::default()
+    };
+    let batch = format!("[{},{}]", notification(), notification());
+    let _ = read_frames(
+        Box::pin(futures::stream::iter([Ok(batch)])),
+        tx,
+        limits,
+        &slot,
+    )
+    .await;
+    let recorded = slot.get().copied();
+    assert_eq!(
+        recorded,
+        Some(Overflow::incoming_messages(1, 2)),
+        "expected the 2-message batch under a 1-message cap to be recorded, received {recorded:?}"
+    );
+}
+
+/// Records whether the overflow slot was filled at each wake of the SDK's incoming receiver.
+struct SlotAtWake {
+    slot: OverflowSlot,
+    seen: Mutex<Vec<bool>>,
+}
+
+impl futures::task::ArcWake for SlotAtWake {
+    fn wake_by_ref(this: &Arc<Self>) {
+        this.seen
+            .lock()
+            .expect("seen")
+            .push(this.slot.get().is_some());
+    }
+}
+
+/// The SDK fails pending requests when its incoming channel closes, possibly on another worker,
+/// so the budget must already be recorded at the instant that close wakes the receiver.
+#[tokio::test]
+async fn the_overflow_is_recorded_before_the_incoming_channel_closes() {
+    let batch = format!("[{},{}]", notification(), notification());
+    let transport = BoundedTransport::new(
+        output(GatedSink::default()),
+        Box::pin(futures::stream::iter([Ok(batch)])),
+        Limits {
+            turn_channel_capacity: 1,
+            max_pending_requests: 1,
+            ..Limits::default()
+        },
+    );
+    let watcher = Arc::new(SlotAtWake {
+        slot: transport.overflow(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let (mut channel, drive) = transport.parts();
+    let waker = futures::task::waker(Arc::clone(&watcher));
+    let mut context = std::task::Context::from_waker(&waker);
+    assert!(
+        channel.rx.poll_next_unpin(&mut context).is_pending(),
+        "expected an empty incoming channel before the transport runs"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(1), drive).await;
+    let seen = watcher.seen.lock().expect("seen").clone();
+    assert_eq!(
+        seen,
+        vec![true],
+        "expected one close wake with the overflow already recorded, received {seen:?}"
+    );
 }
