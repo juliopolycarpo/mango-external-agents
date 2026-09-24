@@ -34,7 +34,7 @@ use mango_external_agents::{
     SessionLifecycle, TurnStream,
 };
 
-use crate::client::{self, ConnectionHandle, link_failure, with_stderr};
+use crate::client::{self, ConnectionHandle, link_failure, overflow_failure, with_stderr};
 use crate::profile::AcpProfile;
 use crate::{content, reducer};
 
@@ -1251,6 +1251,15 @@ impl Session for AcpSession {
                     .await;
                 // The process may still be live. Keep this generation installed so admission
                 // remains closed until a later session close can retry teardown.
+                return;
+            }
+            let overflow = match outcome {
+                None | Some(Err(_)) => connection.overflow(),
+                Some(Ok(_)) => None,
+            };
+            if let Some(overflow) = overflow {
+                let _ = turn.sink.fail(overflow_failure(overflow)).await;
+                state.release_turn_matching(&handle);
                 return;
             }
             match outcome {

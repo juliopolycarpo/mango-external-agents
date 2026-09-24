@@ -402,3 +402,50 @@ async fn a_stalled_writer_refuses_outgoing_count_and_byte_pressure() {
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_budget_failure_fills_the_shared_overflow_slot() {
+    let transport = BoundedTransport::new(
+        output(GatedSink::default()),
+        Box::pin(futures::stream::iter([
+            Ok(notification()),
+            Ok(notification()),
+        ])),
+        Limits {
+            turn_channel_capacity: 1,
+            max_pending_requests: 1,
+            ..Limits::default()
+        },
+    );
+    let slot = transport.overflow();
+    let (_channel, drive) = transport.parts();
+    let _ = tokio::time::timeout(Duration::from_secs(1), drive).await;
+    let text = slot.get().map(|overflow| overflow.error().to_string());
+    assert_eq!(
+        text.as_deref(),
+        Some("expected at most 1 JSON-RPC messages queued from the ACP agent, received 2"),
+        "expected the slot to name the message budget, received {text:?}"
+    );
+}
+
+#[test]
+fn an_overflow_round_trips_through_the_sdk_error_and_other_errors_carry_none() {
+    for budget in Budget::ALL {
+        let overflow = Overflow {
+            budget,
+            limit: 8,
+            received: 50,
+        };
+        let recovered = Overflow::from_error(&overflow.fail(String::from("message")));
+        assert_eq!(
+            recovered,
+            Some(overflow),
+            "expected {overflow:?} to round-trip, received {recovered:?}"
+        );
+    }
+    let plain = Overflow::from_error(&failure("ACP framed input failed"));
+    assert_eq!(
+        plain, None,
+        "expected no overflow on a plain failure, received {plain:?}"
+    );
+}

@@ -1103,6 +1103,8 @@ pub(crate) struct ConnectionHandle {
     /// bound its own wind-down, and the session's lifecycle watcher has to observe the same event
     /// without competing for it.
     driver_done: mango_external_agents::CancelToken,
+    /// Filled by the bounded transport when a queue budget failed the connection.
+    overflow: crate::transport::OverflowSlot,
     shutdown_started: AtomicBool,
     shutdown_complete: mango_external_agents::CancelToken,
     /// The one teardown outcome every close waiter observes. `Error` is intentionally reduced to
@@ -1394,6 +1396,7 @@ pub(crate) async fn drive(
     wait_for_drive_startup_hold(&child).await;
 
     let LaunchedAgent { transport, .. } = launched;
+    let overflow = transport.overflow();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1473,6 +1476,7 @@ pub(crate) async fn drive(
         driver: Mutex::new(Some(driver)),
         limits: state.limits,
         driver_done,
+        overflow,
         shutdown_started: AtomicBool::new(false),
         shutdown_complete: mango_external_agents::CancelToken::new(),
         shutdown_result: Mutex::new(None),
@@ -1557,6 +1561,15 @@ impl ConnectionHandle {
     /// loop itself, and only this reports that. Anything watching for a dead agent wants both.
     pub(crate) fn driver_done(&self) -> &mango_external_agents::CancelToken {
         &self.driver_done
+    }
+
+    /// The transport budget that failed this connection, if one did.
+    ///
+    /// Set before the SDK reports the closed connection, so a request or turn that observed the
+    /// failure can read it. For example, a prompt ended by an oversized frame reports this instead
+    /// of a cancellation.
+    pub(crate) fn overflow(&self) -> Option<crate::transport::Overflow> {
+        self.overflow.get().copied()
     }
 
     /// Ends the dispatch loop and the child. Idempotent.
@@ -1676,6 +1689,9 @@ where
     };
     abandonment.disarm();
     answered.map_err(|error| {
+        if let Some(overflow) = connection.overflow() {
+            return overflow.error();
+        }
         if agent_client_protocol::is_incoming_transport_closed(&error) {
             return Error::Vendor(link_failure(with_stderr(
                 &format!("a transport that closed under {method}"),
@@ -1704,6 +1720,19 @@ pub(crate) fn link_failure(message: String) -> VendorError {
     VendorError::new(
         mango_external_agents::ErrorCode::from_static("acp-link-closed"),
         message,
+    )
+}
+
+/// The failure a turn ends with when a transport budget failed the agent's link under it.
+///
+/// Mirrors the core's `stream-overflow`: the code names the cause and the message is the typed
+/// [`Error::LimitExceeded`] text. For example, a 50-message batch under an 8-message cap ends the
+/// turn with `acp-transport-overflow` and
+/// `expected at most 8 JSON-RPC messages queued from the ACP agent, received 50`.
+pub(crate) fn overflow_failure(overflow: crate::transport::Overflow) -> VendorError {
+    VendorError::new(
+        mango_external_agents::ErrorCode::from_static("acp-transport-overflow"),
+        overflow.error().to_string(),
     )
 }
 
@@ -2035,6 +2064,19 @@ mod tests {
     }
 
     /// Cancelling `drive` before its connection task exists still reaps the child it was handed.
+    #[test]
+    fn an_overflow_failure_names_the_code_the_limit_and_the_received_count() {
+        let overflow = crate::transport::Overflow::incoming_messages(8, 50);
+        let failure = super::overflow_failure(overflow);
+        assert_eq!(failure.code.as_str(), "acp-transport-overflow");
+        assert_eq!(
+            failure.message,
+            "expected at most 8 JSON-RPC messages queued from the ACP agent, received 50",
+            "expected the typed limit text, received {:?}",
+            failure.message
+        );
+    }
+
     #[tokio::test]
     async fn a_cancelled_driver_startup_kills_its_injected_child_once() {
         let launcher = FakeLauncher::new();
