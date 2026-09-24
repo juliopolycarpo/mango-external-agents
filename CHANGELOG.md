@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.2.0] - 2026-09-24
+
+### 🐛 Bug Fixes
+
+- **(acp)** Report transport budget overflow as a turn error (#27)
+- [**breaking**] **(codex)** Separate turn-cancel settling from shutdown deadlines (#26)
+- Finish Codex and ACP teardown before settling close (#25)
+- **(acp)** Budget notification bursts by frames, not pending requests (#24)
+- **(release)** Make the changelog describe what 0.1.0 shipped (#19)
+
 ## [0.1.0] - 2026-09-19
 
 ### 🚀 Features
