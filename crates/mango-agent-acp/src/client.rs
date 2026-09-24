@@ -1386,6 +1386,10 @@ impl std::fmt::Debug for ConnectionHandle {
 /// reach. `VendorError::message` is the field that exists for vendor text a host reads and
 /// `Display` never writes, which is exactly the shape this needs; `Error::Link`'s summary is
 /// written verbatim and could not carry it.
+///
+/// The one exception is a transport budget: when the agent overflows a message or byte budget
+/// before the connection opens, this returns the recorded [`Error::LimitExceeded`], naming the
+/// limit and the received value, instead of `acp-link-closed`.
 pub(crate) async fn drive(
     launched: LaunchedAgent,
     state: Arc<SessionState>,
