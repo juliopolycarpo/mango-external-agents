@@ -65,8 +65,11 @@ received count or size and the limit; the session then closes and its child is r
 
 What the host observes: the turn in flight ends with one `EventKind::Error` whose code is
 `acp-transport-overflow` and whose message is the core `Error::LimitExceeded` text, for example
-`expected at most 8 JSON-RPC messages queued from the ACP agent, received 50` — never a
-`Cancelled { reason: Requested }` and never the generic `acp-link-closed`. A session request
+`expected at most 8 JSON-RPC messages queued from the ACP agent, received 50`, instead of a
+`Cancelled { reason: Requested }` or the generic `acp-link-closed`. That holds when a host `close`
+races the overflow's cleanup. One outcome takes precedence: if the process cleanup itself fails,
+the turn ends with `acp-link-closed` naming the cleanup failure, because a possibly live child
+is the more urgent fact. A session request
 awaiting an answer on that connection returns `Error::LimitExceeded` with the same subject, limit
 and received value. The session then reaches `Closing` and, once the child is reaped and the turn's
 terminal is written, `Closed`.

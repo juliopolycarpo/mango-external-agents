@@ -1490,9 +1490,16 @@ async fn finish_close(
                 let _ = turn.sink.emit(kind).await;
             }
             match &result {
-                Ok(()) => {
-                    let _ = turn.sink.cancel(reason.into()).await;
-                }
+                // A budget that already failed the link is why the turn ended, even when a
+                // host close raced its cleanup and took the terminal over.
+                Ok(()) => match connection.overflow() {
+                    Some(overflow) => {
+                        let _ = turn.sink.fail(overflow_failure(overflow)).await;
+                    }
+                    None => {
+                        let _ = turn.sink.cancel(reason.into()).await;
+                    }
+                },
                 Err(error) => {
                     let _ = turn
                         .sink

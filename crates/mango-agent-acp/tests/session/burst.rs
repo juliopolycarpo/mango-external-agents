@@ -178,3 +178,85 @@ async fn a_batch_over_the_message_budget_fails_the_turn_and_releases_the_child()
     )
     .await;
 }
+
+/// A host close that races the overflow's cleanup owns the turn's terminal; it must still report
+/// the budget rather than cancelling with the close's own reason.
+#[tokio::test]
+async fn a_close_racing_a_budget_overflow_still_reports_the_budget() {
+    let inner = FakeLauncher::new();
+    inner.push(
+        FakeAcpAgent::new()
+            .with_updates(chunks(50))
+            .batching_updates()
+            .process(),
+    );
+    let launcher = GatedLauncher::new(inner.clone(), false);
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            turn_channel_capacity: 8,
+            max_pending_requests: 4,
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+    let session: Arc<dyn Session> = Arc::from(
+        AcpHarness::new(profile())
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session"),
+    );
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "stream too much"))
+        .await
+        .expect("expected a turn");
+    tokio::time::timeout(Duration::from_secs(5), launcher.wait_for_kill())
+        .await
+        .expect("expected the overflow cleanup to reach the held process kill");
+
+    let closing = Arc::clone(&session);
+    let mut close = tokio::spawn(async move { closing.close(CloseReason::Requested).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut close)
+            .await
+            .is_err(),
+        "expected close waiter: pending while the kill is held | received: completed early"
+    );
+    launcher.release();
+    tokio::time::timeout(Duration::from_secs(5), close)
+        .await
+        .expect("expected close to settle after release")
+        .expect("expected the close task to join")
+        .expect("expected a clean close");
+
+    let events = drain(&mut turn).await;
+    let summary: Vec<String> = events
+        .iter()
+        .map(|kind| format!("{kind:?}").chars().take(200).collect())
+        .collect();
+    let codes: Vec<&str> = events
+        .iter()
+        .filter_map(|kind| match kind {
+            EventKind::Error { error } => Some(error.code.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        codes == ["acp-transport-overflow"]
+            && !events
+                .iter()
+                .any(|kind| matches!(kind, EventKind::Cancelled { .. })),
+        "expected one acp-transport-overflow error and no cancellation, received {summary:?}"
+    );
+    assert_eq!(session.snapshot().status, SessionStatus::Closed);
+    assert_eq!(
+        inner.live_children(),
+        0,
+        "expected live children: 0 | received: {}",
+        inner.live_children()
+    );
+}
