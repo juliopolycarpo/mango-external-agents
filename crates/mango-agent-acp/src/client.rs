@@ -156,6 +156,13 @@ pub(crate) struct TurnHandle {
     pub(crate) approvals: Arc<ApprovalEvents>,
 }
 
+/// The ACP session a connection is bound to, and the one a failed load abandoned.
+#[derive(Debug, Default)]
+struct NativeBinding {
+    bound: Option<agent_client_protocol::schema::v1::SessionId>,
+    abandoned: Option<agent_client_protocol::schema::v1::SessionId>,
+}
+
 /// Settles the questions a cancellation owes, however its own answer turns out.
 ///
 /// The expiry path answers one question and notifies the agent, and either call can fail on a
@@ -337,11 +344,11 @@ pub(crate) struct SessionState {
     /// Bumped on every frame the agent sends and every change to the pending questions, so the
     /// idle deadline restarts on progress and re-reads whether a question is still open.
     activity: tokio::sync::watch::Sender<u64>,
-    /// The ACP session this connection serves, once `session/new` or `session/load` named it.
+    /// Which ACP session this connection serves, and which one it gave up on.
     ///
     /// Each session owns its own child, so a frame naming any other id is not this session's to
-    /// act on. Unset while the session opens: nothing is running a turn yet.
-    native_session_id: Mutex<Option<agent_client_protocol::schema::v1::SessionId>>,
+    /// act on. See [`Self::serves`].
+    native_session: Mutex<NativeBinding>,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -380,21 +387,50 @@ impl SessionState {
             pending: Mutex::new(HashMap::new()),
             next_approval: AtomicU64::new(0),
             activity: tokio::sync::watch::channel(0).0,
-            native_session_id: Mutex::new(None),
+            native_session: Mutex::new(NativeBinding::default()),
         }
     }
 
-    /// Binds this connection to the ACP session the agent opened.
+    /// Binds this connection to one ACP session: the one being loaded, or the one opened.
     pub(crate) fn bind_native_session(&self, id: agent_client_protocol::schema::v1::SessionId) {
-        *self
-            .native_session_id
+        self.lock_native_session().bound = Some(id);
+    }
+
+    /// Gives up on the session a failed `session/load` named, before a fallback opens a new one.
+    ///
+    /// Frames naming it are refused from here on. And whatever its replay already announced — a
+    /// command catalog, configuration options — was that session's state, not the one the host is
+    /// about to get, so it is cleared rather than inherited.
+    ///
+    /// ```ignore
+    /// state.bind_native_session(loading.clone());
+    /// // session/load refused, falling back:
+    /// state.abandon_native_session();
+    /// ```
+    pub(crate) fn abandon_native_session(&self) {
+        {
+            let mut binding = self.lock_native_session();
+            binding.abandoned = binding.bound.take();
+        }
+        let mut revision = self.lock_catalog_revision();
+        *revision = revision.wrapping_add(1);
+        self.core_state.update(|snapshot| {
+            snapshot.commands = Vec::new();
+            snapshot.catalog = ConfigurationCatalog::empty();
+            snapshot.configuration.observed = Configuration::unknown();
+        });
+    }
+
+    fn lock_native_session(&self) -> std::sync::MutexGuard<'_, NativeBinding> {
+        self.native_session
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(id);
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether a frame naming `id` belongs to this session.
     ///
-    /// True until the session is bound, and afterwards only for the id the agent opened.
+    /// Once bound, only for the bound id. Before that, for any id except one a failed load
+    /// abandoned: a fallback's `session/new` has not named its session yet.
     ///
     /// Accepting frames before the bind is deliberate. ACP sends session-scoped traffic ahead of
     /// the open's own response: `session/load` replays the conversation as `session/update`
@@ -403,11 +439,11 @@ impl SessionState {
     /// before the bind can reach a turn or a host: no turn exists yet, so an update produces only
     /// session facts and a permission request is answered `Cancelled`.
     fn serves(&self, id: &agent_client_protocol::schema::v1::SessionId) -> bool {
-        self.native_session_id
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_none_or(|bound| bound == id)
+        let binding = self.lock_native_session();
+        match &binding.bound {
+            Some(bound) => bound == id,
+            None => binding.abandoned.as_ref() != Some(id),
+        }
     }
 
     /// Restarts idle accounting: the agent said something, or a question opened or closed.
@@ -2558,6 +2594,45 @@ mod tests {
 
     /// A slot the prompt task never releases turns into a typed timeout naming what was held,
     /// rather than an `Ok` that would let the session look settled.
+    /// The binding follows a fallback resume: frames for the session being loaded are this
+    /// session's, frames for it once the load is abandoned are not — even before the fresh
+    /// session names itself — and once that one binds, only it is.
+    #[test]
+    fn a_fallback_refuses_the_abandoned_session_until_and_after_the_new_one_binds() {
+        use agent_client_protocol::schema::v1::SessionId as AcpSessionId;
+        let (state, _host) = state();
+        let loading = AcpSessionId::new("sess_loading");
+        let fresh = AcpSessionId::new("sess_fresh");
+        assert!(
+            state.serves(&loading),
+            "expected an unbound session to accept any id"
+        );
+
+        state.bind_native_session(loading.clone());
+        assert!(state.serves(&loading));
+        assert!(
+            !state.serves(&fresh),
+            "expected only the loading id while bound"
+        );
+
+        state.abandon_native_session();
+        assert!(
+            !state.serves(&loading),
+            "expected the abandoned id refused while the fallback opens"
+        );
+        assert!(
+            state.serves(&fresh),
+            "expected the fallback's own early frames accepted before it binds"
+        );
+
+        state.bind_native_session(fresh.clone());
+        assert!(state.serves(&fresh));
+        assert!(
+            !state.serves(&loading),
+            "expected the abandoned id still refused"
+        );
+    }
+
     /// A frame that arrives on the same timer tick as the idle deadline is progress, not silence.
     ///
     /// The frame's task sleeps a shade less than the deadline, so both timers fall due on one

@@ -94,6 +94,9 @@ pub struct FakeAcpAgent {
     version_output: String,
     /// Replaces the `agentCapabilities` value `initialize` answers with; `Some(None)` omits it.
     capabilities_override: Option<Option<serde_json::Value>>,
+    /// `session/update` payloads `session/load` sends, naming the requested session, before it
+    /// answers — whether it then loads or refuses.
+    load_replay: Vec<serde_json::Value>,
 }
 
 impl Default for FakeAcpAgent {
@@ -155,6 +158,7 @@ impl FakeAcpAgent {
             stop_reason: String::from("end_turn"),
             version_output: String::from("fake-acp 1.2.3"),
             capabilities_override: None,
+            load_replay: Vec::new(),
         }
     }
 
@@ -383,6 +387,30 @@ impl FakeAcpAgent {
         self
     }
 
+    /// Sends these `session/update` payloads from `session/load`, naming the session it was asked
+    /// to load, before answering it.
+    ///
+    /// ACP's `session/load` replays the conversation this way before it responds. Combined with
+    /// [`refusing_load_session`](Self::refusing_load_session) it is an agent that talked about a
+    /// session it then failed to load.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let _process = FakeAcpAgent::new()
+    ///     .replaying_on_load(vec![serde_json::json!({
+    ///         "sessionUpdate": "agent_message_chunk",
+    ///         "content": { "type": "text", "text": "earlier" }
+    ///     })])
+    ///     .process();
+    /// ```
+    #[must_use]
+    pub fn replaying_on_load(mut self, updates: Vec<serde_json::Value>) -> Self {
+        self.load_replay = updates;
+        self
+    }
+
     /// Prints this for a version probe.
     #[must_use]
     pub fn printing_version(mut self, output: impl Into<String>) -> Self {
@@ -420,12 +448,28 @@ impl FakeAcpAgent {
         match (method, id) {
             (Some("initialize"), Some(id)) => vec![result(id, self.initialize_result())],
             (Some("session/new"), Some(id)) => vec![self.session_result(id, config_options)],
-            (Some("session/load"), Some(id)) => match (self.load_session, &self.load_session_error)
-            {
-                (true, Some((code, message))) => vec![error(id, *code, message)],
-                (true, None) => vec![self.load_session_result(id, config_options)],
-                (false, _) => vec![error(id, -32601, "method not found")],
-            },
+            (Some("session/load"), Some(id)) => {
+                let loading = message["params"]["sessionId"].clone();
+                let mut lines: Vec<String> = match self.load_session {
+                    true => self
+                        .load_replay
+                        .iter()
+                        .map(|update| {
+                            notification(
+                                "session/update",
+                                serde_json::json!({ "sessionId": loading, "update": update }),
+                            )
+                        })
+                        .collect(),
+                    false => Vec::new(),
+                };
+                lines.push(match (self.load_session, &self.load_session_error) {
+                    (true, Some((code, message))) => error(id, *code, message),
+                    (true, None) => self.load_session_result(id, config_options),
+                    (false, _) => error(id, -32601, "method not found"),
+                });
+                lines
+            }
             (Some("session/list"), Some(_id)) if self.holds_listing => Vec::new(),
             (Some("session/list"), Some(id)) => vec![result(id, self.list_result(&message))],
             (Some("session/set_mode"), Some(id)) => match &self.set_mode_error {

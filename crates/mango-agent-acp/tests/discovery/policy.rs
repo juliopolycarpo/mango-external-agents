@@ -410,3 +410,88 @@ fn builtin_profiles_do_not_forward_credentials() {
         );
     }
 }
+
+/// The command catalog a `session/load` replay announces for the session it names.
+fn replayed_catalog() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "sessionUpdate": "available_commands_update",
+        "availableCommands": [{ "name": "from-the-old-session", "description": "Replayed" }]
+    })]
+}
+
+fn has_replayed_command(session: &dyn mango_external_agents::Session) -> bool {
+    session
+        .snapshot()
+        .commands
+        .iter()
+        .any(|command| command.name == "from-the-old-session")
+}
+
+/// A fallback resume replaces the session the agent failed to load with a fresh one. What the
+/// agent said about the failed one while trying is that session's state, not the new session's:
+/// its replayed facts must not land on the conversation the host actually got.
+#[tokio::test]
+async fn a_fallback_resume_does_not_inherit_facts_about_the_session_that_failed_to_load() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        FakeAcpAgent::new()
+            .replaying_on_load(replayed_catalog())
+            .refusing_load_session(-32002, "thread expired")
+            .process(),
+    );
+    let session = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(
+            &host(launcher),
+            mango_external_agents::OpenSession::new("resume")
+                .resuming("agent-session", mango_external_agents::ResumeMode::Fallback),
+        )
+        .await
+        .expect("expected the fallback to open a fresh session");
+
+    assert!(!session.snapshot().resumed, "expected a fresh conversation");
+    assert!(
+        !has_replayed_command(session.as_ref()),
+        "expected no command from the session that failed to load, received {:?}",
+        session.snapshot().commands
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+}
+
+/// The other half: a load that succeeds replays the session it names, and that replay is the
+/// resumed session's own state.
+#[tokio::test]
+async fn a_successful_load_keeps_what_its_replay_announced() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        FakeAcpAgent::new()
+            .replaying_on_load(replayed_catalog())
+            .process(),
+    );
+    let session = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(
+            &host(launcher),
+            mango_external_agents::OpenSession::new("resume")
+                .resuming("agent-session", mango_external_agents::ResumeMode::Strict),
+        )
+        .await
+        .expect("expected the load to succeed");
+
+    assert!(
+        session.snapshot().resumed,
+        "expected the resumed conversation"
+    );
+    assert!(
+        has_replayed_command(session.as_ref()),
+        "expected the replayed catalog on the resumed session, received {:?}",
+        session.snapshot().commands
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+}

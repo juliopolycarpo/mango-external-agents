@@ -250,7 +250,10 @@ bounded by the core's `TextLimit::Detail`.
 Each session owns its own agent process, so a `session/update` or `session/request_permission`
 naming a `sessionId` other than the one `session/new` or `session/load` returned is not this
 session's: the update is dropped, and the request is answered with ACP's `Cancelled` outcome
-rather than shown to a host that never opened that conversation.
+rather than shown to a host that never opened that conversation. A resume binds to the requested
+id before `session/load` is sent. If the load fails and `ResumeMode::Fallback` opens a fresh session,
+the failed id is refused from then on, and whatever its replay already announced (commands,
+configuration options) is cleared rather than inherited by the new session.
 
 A withdrawn question resolves on both sides. The agent hears ACP's own `Cancelled` outcome; a host
 that was shown the prompt hears `ApprovalResolved` with `DecisionSource::Cancelled` and an option id
