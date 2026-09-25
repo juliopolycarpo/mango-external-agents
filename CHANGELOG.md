@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.3.0] - 2026-09-25
+
+### 🚀 Features
+
+- [**breaking**] **(codex)** Report Codex credits, reset credits and spend control (#33)
+
+### 🐛 Bug Fixes
+
+- [**breaking**] **(acp)** Bring the ACP harness to parity with the TypeScript adapter (#29)
+- [**breaking**] **(codex)** Bring the Codex harness to parity with the TypeScript adapter (#31)
+
 ## [0.2.0] - 2026-09-24
 
 ### 🐛 Bug Fixes

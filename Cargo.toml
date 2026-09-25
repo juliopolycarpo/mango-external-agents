@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "examples/hub-host", "examples/mea"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Julio Polycarpo"]
 edition = "2024"
 homepage = "https://mangostudio.dev"
@@ -15,10 +15,10 @@ rust-version = "1.96"
 # in-workspace dependency is declared here once, so a release bump touches one
 # number. scripts/check-versions.sh enforces it.
 [workspace.dependencies]
-mango-agent-acp = { path = "crates/mango-agent-acp", version = "0.2.0", default-features = false }
-mango-agent-claude = { path = "crates/mango-agent-claude", version = "0.2.0", default-features = false }
-mango-agent-codex = { path = "crates/mango-agent-codex", version = "0.2.0", default-features = false }
-mango-external-agents = { path = "crates/mango-external-agents", version = "0.2.0", default-features = false }
+mango-agent-acp = { path = "crates/mango-agent-acp", version = "0.3.0", default-features = false }
+mango-agent-claude = { path = "crates/mango-agent-claude", version = "0.3.0", default-features = false }
+mango-agent-codex = { path = "crates/mango-agent-codex", version = "0.3.0", default-features = false }
+mango-external-agents = { path = "crates/mango-external-agents", version = "0.3.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
