@@ -94,6 +94,11 @@ WANTED = [
     "RateLimitSnapshot",
     "RateLimitWindow",
     "AccountRateLimitsUpdatedNotification",
+    "GetAccountRateLimitsResponse",
+    "CreditsSnapshot",
+    "SpendControlLimitSnapshot",
+    "RateLimitResetCreditsSummary",
+    "RateLimitResetCredit",
     # Account and models.
     "Account",
     "GetAccountParams",

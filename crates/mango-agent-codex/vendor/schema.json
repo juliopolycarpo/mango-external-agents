@@ -126,6 +126,13 @@
         "inProgress"
       ]
     },
+    "CreditsSnapshot": {
+      "properties": [
+        "balance",
+        "hasCredits",
+        "unlimited"
+      ]
+    },
     "ErrorNotification": {
       "properties": [
         "error",
@@ -175,6 +182,16 @@
     "GetAccountParams": {
       "properties": [
         "refreshToken"
+      ]
+    },
+    "GetAccountRateLimitsResponse": {
+      "properties": [
+        "accountId",
+        "ordinaryUsageAllowed",
+        "rateLimitResetCredits",
+        "rateLimitUpsell",
+        "rateLimits",
+        "rateLimitsByLimitId"
       ]
     },
     "GetAccountResponse": {
@@ -349,6 +366,23 @@
         "strictAutoReview"
       ]
     },
+    "RateLimitResetCredit": {
+      "properties": [
+        "description",
+        "expiresAt",
+        "grantedAt",
+        "id",
+        "resetType",
+        "status",
+        "title"
+      ]
+    },
+    "RateLimitResetCreditsSummary": {
+      "properties": [
+        "availableCount",
+        "credits"
+      ]
+    },
     "RateLimitSnapshot": {
       "properties": [
         "credits",
@@ -454,6 +488,14 @@
       "values": [
         "asc",
         "desc"
+      ]
+    },
+    "SpendControlLimitSnapshot": {
+      "properties": [
+        "limit",
+        "remainingPercent",
+        "resetsAt",
+        "used"
       ]
     },
     "Thread": {
