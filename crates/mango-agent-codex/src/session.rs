@@ -48,7 +48,7 @@ use crate::protocol::approvals::{
     ToolRequestUserInputParams, ToolRequestUserInputQuestion, ToolRequestUserInputResponse,
 };
 use crate::protocol::method;
-use crate::protocol::notifications::Notification;
+use crate::protocol::notifications::{Notification, RateLimitSnapshot};
 use crate::protocol::requests::{
     RateLimitsReadResponse, ReviewStartParams, ReviewStartResponse, ReviewTarget, ThreadListParams,
     ThreadListResponse, TurnHandle, TurnInterruptParams, TurnStartParams, TurnStartResponse,
@@ -216,6 +216,13 @@ pub(crate) struct Shared {
     resolution_markers: Mutex<ResolutionMarkers>,
     /// Serializes steers, so each one reads the native turn id the previous steer left behind.
     steering: Mutex<()>,
+    /// The account's quota as last read in full and merged forward by sparse updates.
+    ///
+    /// `None` until an `account/rateLimits/read` answers: a sparse update alone is not a reading
+    /// worth showing.
+    account_limits: Mutex<Option<RateLimitSnapshot>>,
+    /// Whether an update already asked for the missing baseline.
+    baseline_requested: AtomicBool,
     #[cfg(test)]
     resolution_marker_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
     #[cfg(test)]
@@ -247,6 +254,8 @@ impl Shared {
             teardown_done: Notify::new(),
             resolution_markers: Mutex::new(ResolutionMarkers::default()),
             steering: Mutex::new(()),
+            account_limits: Mutex::new(None),
+            baseline_requested: AtomicBool::new(false),
             #[cfg(test)]
             resolution_marker_gate: Mutex::new(None),
             #[cfg(test)]
@@ -907,6 +916,68 @@ impl Shared {
         Ok(Some((sink, native_turn_id)))
     }
 
+    /// Folds one quota update into the baseline and reports the result to the running turn.
+    ///
+    /// With no baseline yet, the update is not shown; instead one `account/rateLimits/read` is
+    /// asked for in the background, and its full answer becomes the baseline and the reading
+    /// reported. An update that arrives while that read is outstanding is older than its answer.
+    async fn rate_limits_updated(self: &Arc<Self>, update: &RateLimitSnapshot) {
+        let merged = {
+            let mut baseline = self.account_limits.lock().await;
+            let Some(current) = baseline.as_ref() else {
+                drop(baseline);
+                self.request_baseline();
+                return;
+            };
+            let merged = crate::rate_limits::merge(current, update);
+            *baseline = Some(merged.clone());
+            merged
+        };
+        self.report_limits(&merged).await;
+    }
+
+    /// Asks for the full reading a sparse update could not be merged onto, once per session.
+    fn request_baseline(self: &Arc<Self>) {
+        if self.baseline_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(client) = self.client.get().cloned() else {
+            return;
+        };
+        let shared = Arc::clone(self);
+        // Detached: the notification handler runs on the connection's reader, which has to keep
+        // reading for this request to be answered at all.
+        tokio::spawn(async move {
+            let read = client
+                .request::<_, RateLimitsReadResponse>(
+                    method::ACCOUNT_RATE_LIMITS_READ,
+                    empty_params(),
+                )
+                .await;
+            let Ok(RateLimitsReadResponse {
+                rate_limits: Some(snapshot),
+            }) = read
+            else {
+                // Nothing to merge onto yet; a later update may ask again.
+                shared.baseline_requested.store(false, Ordering::Release);
+                return;
+            };
+            shared.adopt_baseline(snapshot.clone()).await;
+            shared.report_limits(&snapshot).await;
+        });
+    }
+
+    /// Replaces the baseline with a full reading.
+    async fn adopt_baseline(&self, snapshot: RateLimitSnapshot) {
+        *self.account_limits.lock().await = Some(snapshot);
+    }
+
+    /// Puts one quota reading on the running turn's stream, when a turn is running.
+    async fn report_limits(&self, snapshot: &RateLimitSnapshot) {
+        let limits = crate::rate_limits::to_account_limits(snapshot, self.host.now());
+        let _ = self.emit(EventKind::AccountLimits { limits }).await;
+    }
+
     /// Moves the attempt `owner` still runs from `previous` to the continuation id a steer named.
     ///
     /// The app-server answers `turn/steer` with "the accepted turnId"; when that differs from the
@@ -1456,6 +1527,13 @@ impl PeerHandler for CodexHandler {
                     return;
                 }
             }
+        }
+
+        // Quota belongs to the account and arrives whether or not a turn is running. It is merged
+        // into the session's baseline rather than shown as the partial snapshot it may be.
+        if let Notification::RateLimits(update) = &notification {
+            self.shared.rate_limits_updated(&update.rate_limits).await;
+            return;
         }
 
         let active_route = self.shared.active_turn_route().await;
@@ -3627,6 +3705,9 @@ impl Session for CodexSession {
             .client
             .request(method::ACCOUNT_RATE_LIMITS_READ, empty_params())
             .await?;
+        if let Some(snapshot) = &response.rate_limits {
+            self.shared.adopt_baseline(snapshot.clone()).await;
+        }
         Ok(AccountUsage {
             // Absence is unknown, never an empty quota: a server that answered without a snapshot
             // has not told us the account is unmetered.

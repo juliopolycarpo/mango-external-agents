@@ -1268,11 +1268,13 @@ async fn a_recorded_turn_replays_as_a_turn_that_ends_exactly_once() {
             .any(|kind| matches!(kind, EventKind::Usage { .. })),
         "expected this turn's own usage, received {events:#?}"
     );
+    // The recording holds quota updates but no full `account/rateLimits/read`, so there is no
+    // baseline to merge them onto and no partial snapshot is shown; the merge has its own tests.
     assert!(
-        events
+        !events
             .iter()
             .any(|kind| matches!(kind, EventKind::AccountLimits { .. })),
-        "expected the account quota the server rolled forward, received {events:#?}"
+        "expected no quota reading without a baseline, received {events:#?}"
     );
 }
 
@@ -2996,6 +2998,111 @@ async fn a_steer_during_a_pending_approval_is_answered_promptly() {
     .expect("expected the steer to be answered while the approval is pending")
     .expect("expected a steer outcome");
     assert_eq!(outcome, mango_external_agents::SteerOutcome::Accepted);
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Answers `account/rateLimits/read` with a full snapshot the tests can tell apart from updates.
+fn rate_limits_answer(frame: &serde_json::Value) -> Option<Vec<String>> {
+    (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(|| {
+        vec![
+            serde_json::json!({"id": frame["id"], "result": {"rateLimits": {
+                "primary": {"usedPercent": 10.0, "windowDurationMins": 300, "resetsAt": 1789301053},
+                "secondary": {"usedPercent": 20.0, "windowDurationMins": 10080,
+                              "resetsAt": 1789817658},
+                "planType": "plus"}}})
+            .to_string(),
+        ]
+    })
+}
+
+/// Every quota snapshot a turn reported, as (label, used percent) pairs.
+fn quota_readings(events: &[EventKind]) -> Vec<Vec<(String, f64)>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::AccountLimits { limits } => Some(
+                limits
+                    .windows
+                    .iter()
+                    .map(|window| {
+                        (
+                            window.label.clone().unwrap_or_default(),
+                            window.used_percent,
+                        )
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `account/rateLimits/updated` may carry only what changed. A window it leaves out or sends as
+/// `null` keeps its last reading instead of disappearing from the host's display.
+#[tokio::test]
+async fn a_sparse_quota_update_merges_onto_the_last_full_reading() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), rate_limits_answer).await;
+    running
+        .session
+        .refresh_account_usage()
+        .await
+        .expect("expected a baseline reading");
+    running.announcer.announce(
+        serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "primary": {"usedPercent": 30.0, "windowDurationMins": 300, "resetsAt": 1789301053},
+            "secondary": null}}})
+        .to_string(),
+    );
+    running.complete();
+    let events = drain(&mut running.turn).await;
+    assert_eq!(
+        quota_readings(&events),
+        vec![vec![
+            (String::from("primary"), 30.0),
+            (String::from("secondary"), 20.0)
+        ]],
+        "expected the update's primary window over the baseline's secondary, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Without a full reading there is nothing to merge a sparse update onto, so the session reads
+/// one and reports that instead of a partial snapshot.
+#[tokio::test]
+async fn a_quota_update_before_any_full_reading_reports_a_fresh_full_reading() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), rate_limits_answer).await;
+    running.announcer.announce(
+        serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "primary": {"usedPercent": 30.0}}}})
+        .to_string(),
+    );
+    let reading = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = running.turn.recv().await {
+            if let EventKind::AccountLimits { .. } = &event.kind {
+                return Some(event.kind);
+            }
+        }
+        None
+    })
+    .await
+    .expect("expected a quota reading within the deadline")
+    .expect("expected a quota reading on the turn");
+    assert_eq!(
+        quota_readings(&[reading]),
+        vec![vec![
+            (String::from("primary"), 10.0),
+            (String::from("secondary"), 20.0)
+        ]],
+        "expected the full reading rather than the sparse update"
+    );
     running
         .session
         .close(CloseReason::Shutdown)

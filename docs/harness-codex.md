@@ -426,6 +426,16 @@ would stop a turn, and telling the user to run `codex login` would send them to 
 is not broken. Opening a session against a signed-out CLI fails with `Error::AuthRequired` carrying
 the vendor's own command as text. The library never runs it.
 
+## Account quota
+
+`account/rateLimits/read` returns the account's full quota, and `account/rateLimits/updated` is
+"emitted whenever a user's ChatGPT rate limits change" ([app-server][app-server]) and may carry only
+what changed. The session keeps the last full reading as a baseline: `Session::refresh_account_usage`
+sets it, and each update is merged onto it before the result reaches the running turn as
+`AccountLimits`. A window or plan the update omits or sends as `null` keeps the baseline's value; a
+present one overwrites it. An update that arrives before any baseline is not shown: the session asks
+for one `account/rateLimits/read` in the background and reports its full answer instead.
+
 ## Transports
 
 `stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket, and its README

@@ -100,7 +100,9 @@ pub fn reduce(notification: &Notification, thread_id: &str, now: std::time::Syst
         Notification::ItemCompleted(completed) => item_completed(&completed.item),
         Notification::ThreadTokenUsage(usage) => usage_events(&usage.token_usage),
         // Quota belongs to the account rather than to a conversation, which is why it names no
-        // thread and is not routed by one.
+        // thread and is not routed by one. This is the snapshot as sent; a session does not route
+        // it here, but merges it onto its last full reading (`rate_limits::merge`) because an
+        // update may be sparse.
         Notification::RateLimits(update) => Outcome::one(EventKind::AccountLimits {
             limits: crate::rate_limits::to_account_limits(&update.rate_limits, now),
         }),
