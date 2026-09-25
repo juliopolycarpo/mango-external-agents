@@ -40,6 +40,7 @@ on the wire)".
 | `account/read`                  | Whether somebody is signed in, and how |
 | `account/rateLimits/read`       | `Session::refresh_account_usage`       |
 | `model/list`                    | `Discovery::models`                    |
+| `permissionProfile/list`        | `Discovery::permission_matrix`         |
 | `thread/start`, `thread/resume` | `Harness::open_session`                |
 | `thread/read`                   | Metadata-only resume workspace check   |
 | `thread/list`                   | Session and harness-level listing      |
@@ -243,6 +244,17 @@ because setting one without the other produces a configuration nobody chose:
 | `ReadOnly`        | `read-only`          | `never`          |
 | `Default`         | `workspace-write`    | `on-request`     |
 | `FullAccess`      | `danger-full-access` | `never`          |
+
+Discovery narrows the matrix to what the machine allows. The app-server documents
+`permissionProfile/list` "with the project cwd to discover available profiles and whether managed
+requirements allow each one" ([app-server][app-server]); the probe asks it for the host's working
+directory and reads the built-in profile each level selects — `:read-only`, `:workspace` and
+`:danger-full-access`. A level whose profile is reported `allowed: false`, or is not listed at all,
+is unsupported under both routings with `UnsupportedReason::Other(PROFILE_DISALLOWED)`, the
+constant `mango_agent_codex::permissions::PROFILE_DISALLOWED`, so a host can say a policy refused
+it. A build that does not answer the call keeps the declared matrix: not being able to ask is not a
+refusal. A cell narrowed only at open time still fails at `thread/start`, as the core's discovery
+contract describes.
 
 `ReadOnly` pairs with `never` rather than `on-request` deliberately: nothing at that level may
 change the machine, so an escalation prompt's only honest answer is no.

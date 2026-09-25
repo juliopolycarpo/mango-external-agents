@@ -29,7 +29,8 @@ use crate::discovery::{self, LOGIN_HINT, PROGRAM};
 use crate::permissions::PermissionOverrides;
 use crate::protocol::requests::{
     AccountReadResponse, ApprovalsReviewer, ClientInfo, InitializeParams, InitializeResponse,
-    ModelListParams, ModelListResponse, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
+    ModelListParams, ModelListResponse, PermissionProfileListParams, PermissionProfileListResponse,
+    PermissionProfileSummary, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
     ThreadStartParams, ThreadStartResponse, ThreadSummary, empty_params,
 };
 use crate::protocol::schema::MINIMUM_CODEX_VERSION;
@@ -192,15 +193,18 @@ impl Harness for CodexHarness {
             });
         }
 
-        let (auth, models) = probe_app_server(host, &self.executable).await?;
+        let probed = probe_app_server(host, &self.executable).await?;
         Ok(Discovery {
             executable: self.executable.get().cloned(),
             version: Some(version),
             gate,
-            auth,
+            auth: probed.auth,
             capabilities: DiscoveredCapabilities::new(CAPABILITIES),
-            permission_matrix: self.permission_matrix(),
-            models,
+            permission_matrix: probed.profiles.map_or_else(
+                || self.permission_matrix(),
+                |profiles| crate::permissions::matrix_allowed_by(&profiles),
+            ),
+            models: probed.models,
             configuration_catalog: ConfigurationCatalog::empty(),
         })
     }
@@ -623,20 +627,64 @@ impl mango_external_agents::process::ByteSource for NoBytes {
     }
 }
 
-/// Auth state and the model catalog, from one short-lived app-server connection.
+/// What one short-lived app-server connection learned.
+struct Probed {
+    auth: AuthState,
+    models: Vec<Model>,
+    /// The permission profiles, when the server answered the question at all.
+    profiles: Option<Vec<PermissionProfileSummary>>,
+}
+
+impl Probed {
+    fn unknown() -> Self {
+        Self {
+            auth: AuthState::Unknown,
+            models: Vec::new(),
+            profiles: None,
+        }
+    }
+}
+
+/// How many pages of one paginated listing a probe walks, so a server that always returns a
+/// cursor cannot hold discovery open.
+const PROBE_PAGE_LIMIT: usize = 8;
+
+/// Every permission profile the server lists for the host's project, or nothing when it would not
+/// answer: a build that cannot say has not forbidden anything.
+async fn read_permission_profiles(
+    client: &Client,
+    cwd: &str,
+) -> Option<Vec<PermissionProfileSummary>> {
+    let mut profiles = Vec::new();
+    let mut cursor = None;
+    for _ in 0..PROBE_PAGE_LIMIT {
+        let page: PermissionProfileListResponse = client
+            .request(
+                method::PERMISSION_PROFILE_LIST,
+                PermissionProfileListParams::for_project(cwd, cursor),
+            )
+            .await
+            .ok()?;
+        profiles.extend(page.data);
+        cursor = page.next_cursor.filter(|cursor| !cursor.is_empty());
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Some(profiles)
+}
+
+/// Auth state, the model catalog and the allowed permission profiles, from one short-lived
+/// app-server connection.
 ///
 /// A probe that could not reach the server reports `Unknown` and no models rather than failing:
 /// the CLI is installed and the gate passed, and how a host treats an unreachable app-server is
 /// its own decision.
-async fn probe_app_server(
-    host: &HostContext,
-    executable: &ExecutablePath,
-) -> Result<(AuthState, Vec<Model>)> {
-    let unknown = (AuthState::Unknown, Vec::new());
+async fn probe_app_server(host: &HostContext, executable: &ExecutablePath) -> Result<Probed> {
     let connection = match ProbeConnection::open(host, executable).await {
         Ok(connection) => connection,
         Err(error) if error.cleanup_control().is_some() => return Err(error),
-        Err(_) => return Ok(unknown),
+        Err(_) => return Ok(Probed::unknown()),
     };
 
     let account: AccountReadResponse = connection
@@ -649,19 +697,21 @@ async fn probe_app_server(
         .request(method::MODEL_LIST, ModelListParams { limit: None })
         .await
         .unwrap_or_default();
-    let probed = (
-        discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
-        models
+    let profiles = read_permission_profiles(&connection.client, host.absolute_cwd()?).await;
+    let probed = Probed {
+        auth: discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
+        models: models
             .data
             .into_iter()
             .filter(|model| !model.hidden)
             .map(to_model)
             .collect(),
-    );
+        profiles,
+    };
     match connection.close().await {
         Ok(()) => Ok(probed),
         Err(error) if error.cleanup_control().is_some() => Err(error),
-        Err(_) => Ok(unknown),
+        Err(_) => Ok(Probed::unknown()),
     }
 }
 

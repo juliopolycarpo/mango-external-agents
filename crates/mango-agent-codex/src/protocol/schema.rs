@@ -154,6 +154,7 @@ mod tests {
                 method::MODEL_LIST,
                 method::ACCOUNT_READ,
                 method::ACCOUNT_RATE_LIMITS_READ,
+                method::PERMISSION_PROFILE_LIST,
             ],
         );
         assert_declares_methods("ClientNotification", &[method::INITIALIZED]);
@@ -435,6 +436,9 @@ mod tests {
             ],
         );
         assert_declares("ReasoningEffortOption", &["reasoningEffort", "description"]);
+        assert_declares("PermissionProfileListParams", &["cursor", "cwd"]);
+        assert_declares("PermissionProfileListResponse", &["data", "nextCursor"]);
+        assert_declares("PermissionProfileSummary", &["id", "allowed"]);
     }
 
     #[test]

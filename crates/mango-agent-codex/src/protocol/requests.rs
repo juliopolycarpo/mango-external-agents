@@ -795,6 +795,55 @@ pub struct ModelListResponse {
     pub data: Vec<Model>,
 }
 
+/// Asking which permission profiles this machine's configuration allows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PermissionProfileListParams {
+    /// Where to continue from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// The project directory, so its configuration layers apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl PermissionProfileListParams {
+    /// One page of profiles for the project at `cwd`, continuing from `cursor`.
+    #[must_use]
+    pub fn for_project(cwd: &str, cursor: Option<String>) -> Self {
+        Self {
+            cursor,
+            cwd: Some(cwd.to_owned()),
+        }
+    }
+}
+
+/// One permission profile, and whether the effective requirements allow selecting it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PermissionProfileSummary {
+    /// The profile's id, such as `:workspace`.
+    pub id: String,
+    /// Whether the effective requirements allow selecting it.
+    #[serde(default)]
+    pub allowed: bool,
+}
+
+/// One page of permission profiles.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PermissionProfileListResponse {
+    /// The profiles.
+    #[serde(default)]
+    pub data: Vec<PermissionProfileSummary>,
+    /// Where the next page starts, when there is one.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
 /// How an account is signed in, as the app-server reports it.
 ///
 /// No credential is anywhere in this shape, and none is asked for: `account/read` answers with the

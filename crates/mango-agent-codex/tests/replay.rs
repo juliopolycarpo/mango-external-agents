@@ -5156,7 +5156,103 @@ async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
     );
 }
 
-/// The contract every harness must pass, run against the recorded conversation.
+/// A probe host whose app-server replays the recorded handshake, with `answer` consulted first.
+fn probe_host(
+    answer: impl Fn(&serde_json::Value) -> Option<Vec<String>> + Send + Sync + 'static,
+) -> (HostContext, Arc<FakeLauncher>) {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(version_answer());
+    launcher.push(Transcript::load("handshake").as_process_intercepting(answer));
+    with_launcher(launcher, None)
+}
+
+/// Answers `permissionProfile/list` with these profiles.
+fn profiles_answer(frame: &serde_json::Value, profiles: &serde_json::Value) -> Option<Vec<String>> {
+    (frame.get("method") == Some(&serde_json::json!("permissionProfile/list"))).then(|| {
+        vec![
+            serde_json::json!({"id": frame["id"],
+                               "result": {"data": profiles, "nextCursor": null}})
+            .to_string(),
+        ]
+    })
+}
+
+/// The machine's own Codex requirements can forbid a permission profile. Offering it anyway
+/// produces a choice that fails at `thread/start`; a profile reported `allowed: false`, or not
+/// listed at all, is reported unsupported for a policy reason instead.
+#[tokio::test]
+async fn discovery_offers_only_the_permission_profiles_the_machine_allows() {
+    let (host, launcher) = probe_host(|frame| {
+        profiles_answer(
+            frame,
+            &serde_json::json!([
+                {"id": ":read-only", "description": null, "allowed": true},
+                {"id": ":danger-full-access", "description": null, "allowed": false}
+            ]),
+        )
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+
+    let matrix = &discovery.permission_matrix;
+    for routing in [ApprovalRouting::User, ApprovalRouting::AutoReview] {
+        assert!(
+            matrix.supports(PermissionLevel::ReadOnly, routing),
+            "expected the allowed read-only profile to stay selectable with {routing:?}"
+        );
+        for level in [PermissionLevel::Default, PermissionLevel::FullAccess] {
+            let cell = matrix
+                .cell(level, routing)
+                .expect("expected every cell to be described");
+            assert!(
+                !cell.supported
+                    && matches!(
+                        &cell.unsupported_reason,
+                        Some(mango_external_agents::permission::UnsupportedReason::Other(reason))
+                            if reason == mango_agent_codex::permissions::PROFILE_DISALLOWED
+                    ),
+                "expected {level:?}/{routing:?} to be refused by policy, received {cell:?}"
+            );
+        }
+    }
+    let asked: serde_json::Value = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("permissionProfile/list"))
+        .and_then(|line| serde_json::from_str(&line).ok())
+        .expect("expected the profiles to be asked for");
+    assert_eq!(
+        asked["params"]["cwd"],
+        serde_json::json!(workspace_path().to_string_lossy()),
+        "expected the project cwd, so project config layers apply"
+    );
+}
+
+/// A build that cannot answer the profile question has not forbidden anything.
+#[tokio::test]
+async fn discovery_keeps_the_declared_matrix_when_the_profiles_cannot_be_read() {
+    let (host, _) = probe_host(|frame| {
+        (frame.get("method") == Some(&serde_json::json!("permissionProfile/list"))).then(|| {
+            vec![
+                serde_json::json!({"id": frame["id"],
+                                   "error": {"code": -32601, "message": "method not found"}})
+                .to_string(),
+            ]
+        })
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+    assert_eq!(
+        discovery.permission_matrix,
+        mango_agent_codex::permissions::matrix()
+    );
+}
+
+/// The contract every harness must pass, run against the recorded conversation./// The contract every harness must pass, run against the recorded conversation.
 #[tokio::test]
 async fn the_harness_passes_the_cores_conformance_suite() {
     // The suite probes before it opens anything, and a probe spawns `codex --version` first.
@@ -5168,7 +5264,18 @@ async fn the_harness_passes_the_cores_conformance_suite() {
     // trip the suite cannot prove anywhere else.
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(version_answer());
-    launcher.push(Transcript::load("handshake").as_process());
+    launcher.push(
+        Transcript::load("handshake").as_process_intercepting(|frame| {
+            profiles_answer(
+                frame,
+                &serde_json::json!([
+                    {"id": ":read-only", "allowed": true},
+                    {"id": ":workspace", "allowed": true},
+                    {"id": ":danger-full-access", "allowed": true}
+                ]),
+            )
+        }),
+    );
     let transcript = Transcript::load("approval");
     let thread_id = transcript
         .thread_id()

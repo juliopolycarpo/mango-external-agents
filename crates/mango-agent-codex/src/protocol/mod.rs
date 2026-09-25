@@ -73,6 +73,8 @@ pub mod method {
     pub const ACCOUNT_READ: &str = "account/read";
     /// The account's plan quota.
     pub const ACCOUNT_RATE_LIMITS_READ: &str = "account/rateLimits/read";
+    /// The permission profiles this machine's configuration allows.
+    pub const PERMISSION_PROFILE_LIST: &str = "permissionProfile/list";
 }
 
 /// The peer as a person would name it, in errors and log lines.
