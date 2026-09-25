@@ -346,7 +346,7 @@ mod tests {
         assert_declares("ItemCompletedNotification", &["threadId", "turnId", "item"]);
         assert_declares(
             "AgentMessageDeltaNotification",
-            &["threadId", "turnId", "delta"],
+            &["threadId", "turnId", "itemId", "delta"],
         );
         assert_declares(
             "ReasoningSummaryTextDeltaNotification",

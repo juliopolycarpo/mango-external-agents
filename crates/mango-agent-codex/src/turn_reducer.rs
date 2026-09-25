@@ -11,6 +11,12 @@
 //!   most one per [`ACTIVITY_UPDATE_INTERVAL`], carrying a bounded tail of the output rather than a
 //!   build log. The idle deadline is reset by the session for every such frame, emitted or not.
 //!
+//! - **Answer text the deltas did not carry.** An `agentMessage` item arrives as
+//!   `item/agentMessage/delta` frames and again, whole, on `item/completed`. Rendering both would
+//!   double the answer, and rendering only the deltas drops a message that was never streamed —
+//!   which a resumed conversation can deliver. The completion therefore adds exactly the text its
+//!   deltas did not.
+//!
 //! One [`TurnReducer`] belongs to one turn, and is dropped with it.
 
 use std::collections::HashMap;
@@ -19,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use mango_external_agents::event::{ActivityUpdate, EventKind};
 
 use crate::activity;
-use crate::protocol::items::FileUpdateChange;
+use crate::protocol::items::{FileUpdateChange, ThreadItem};
 use crate::protocol::notifications::Notification;
 use crate::reducer::{self, Outcome};
 
@@ -60,6 +66,8 @@ pub const ACTIVITY_UPDATE_DETAIL_MAX_CHARS: usize = 2_000;
 #[derive(Debug, Default)]
 pub struct TurnReducer {
     activities: HashMap<String, OpenActivity>,
+    /// The answer text already emitted per message item, until that item completes.
+    streamed: HashMap<String, String>,
 }
 
 /// One activity the host was told about and has not seen complete.
@@ -124,6 +132,14 @@ impl TurnReducer {
             }
             return self.progress(item_id, progress, instant);
         }
+        if let Notification::ItemCompleted(completed) = notification
+            && let ThreadItem::AgentMessage { id, text } = &completed.item
+        {
+            if !reducer::routes_to_active_turn(notification, thread_id, active_native_turn_id) {
+                return Outcome::Ignore;
+            }
+            return self.completed_message(id, text);
+        }
 
         let outcome = reducer::reduce_for_active_turn(
             notification,
@@ -131,8 +147,31 @@ impl TurnReducer {
             active_native_turn_id,
             observed_at,
         );
+        if let (Notification::AgentMessageDelta(delta), Outcome::Emit(_)) = (notification, &outcome)
+        {
+            self.streamed
+                .entry(delta.item_id.clone())
+                .or_default()
+                .push_str(&delta.delta);
+        }
         self.observe(&outcome);
         outcome
+    }
+
+    /// What a completed message adds to the text its deltas already delivered.
+    ///
+    /// When the completed text does not begin with what was streamed, the vendor rewrote the
+    /// message and the whole of it is emitted, as the TypeScript adapter did: a correction is
+    /// worth more than avoiding a repeat.
+    fn completed_message(&mut self, item_id: &str, text: &str) -> Outcome {
+        let streamed = self.streamed.remove(item_id).unwrap_or_default();
+        let remainder = text.strip_prefix(streamed.as_str()).unwrap_or(text);
+        if remainder.is_empty() {
+            return Outcome::Ignore;
+        }
+        Outcome::Emit(vec![EventKind::TextDelta {
+            text: remainder.to_owned(),
+        }])
     }
 
     /// Tracks which activities are open, from what the pure reducer decided to emit.
@@ -429,6 +468,87 @@ mod tests {
             matches!(&update.content, Some(ActivityContent::Diff { files }) if files.len() == 2),
             "expected both files as a diff, received {:?}",
             update.content
+        );
+    }
+
+    fn message_delta(item_id: &str, delta: &str) -> Notification {
+        Notification::parse(
+            method::AGENT_MESSAGE_DELTA,
+            json!({"threadId": THREAD, "turnId": TURN, "itemId": item_id, "delta": delta}),
+        )
+    }
+
+    fn message_completed(item_id: &str, text: &str) -> Notification {
+        Notification::parse(
+            method::ITEM_COMPLETED,
+            json!({"threadId": THREAD, "turnId": TURN,
+                   "item": {"type": "agentMessage", "id": item_id, "text": text}}),
+        )
+    }
+
+    fn text_of(outcome: &Outcome) -> String {
+        match outcome {
+            Outcome::Emit(events) => events
+                .iter()
+                .filter_map(|event| match event {
+                    EventKind::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn a_message_that_was_never_streamed_is_emitted_whole_on_completion() {
+        let mut turn = TurnReducer::new();
+        let at = tokio::time::Instant::now();
+        let outcome = reduce_at(&mut turn, &message_completed("m", "whole answer"), at);
+        assert_eq!(text_of(&outcome), "whole answer");
+    }
+
+    #[test]
+    fn a_completion_adds_only_the_text_its_deltas_left_out() {
+        let mut turn = TurnReducer::new();
+        let at = tokio::time::Instant::now();
+        let streamed = [
+            reduce_at(&mut turn, &message_delta("m", "who"), at),
+            reduce_at(&mut turn, &message_delta("m", "le "), at),
+        ];
+        let completed = reduce_at(&mut turn, &message_completed("m", "whole answer"), at);
+        assert_eq!(
+            streamed.iter().map(text_of).collect::<String>() + &text_of(&completed),
+            "whole answer"
+        );
+        assert_eq!(
+            reduce_at(&mut turn, &message_completed("m2", ""), at),
+            Outcome::Ignore,
+            "expected an empty message to add nothing"
+        );
+    }
+
+    #[test]
+    fn a_fully_streamed_message_adds_nothing_on_completion() {
+        let mut turn = TurnReducer::new();
+        let at = tokio::time::Instant::now();
+        let _ = reduce_at(&mut turn, &message_delta("m", "done"), at);
+        assert_eq!(
+            reduce_at(&mut turn, &message_completed("m", "done"), at),
+            Outcome::Ignore
+        );
+    }
+
+    #[test]
+    fn another_turns_completed_message_is_not_this_turns_answer() {
+        let mut turn = TurnReducer::new();
+        let foreign = Notification::parse(
+            method::ITEM_COMPLETED,
+            json!({"threadId": THREAD, "turnId": "older",
+                   "item": {"type": "agentMessage", "id": "m", "text": "late"}}),
+        );
+        assert_eq!(
+            reduce_at(&mut turn, &foreign, tokio::time::Instant::now()),
+            Outcome::Ignore
         );
     }
 

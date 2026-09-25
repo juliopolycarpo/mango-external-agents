@@ -491,6 +491,16 @@ protocol evidence, not a record of a model answer, command, tool result, review 
 The approval fixture records a **refusal**. A fixture that captured a grant would be a recording of
 this tool letting an agent out of its sandbox, checked into the repository.
 
+## Answer text
+
+The answer streams as `item/agentMessage/delta` and arrives again, whole, on the `agentMessage`
+item's `item/completed`. Deltas are emitted as they come; the completion adds only the text its
+deltas did not deliver, so a message that was never streamed — as a resumed conversation can
+deliver one — still reaches the host exactly once. When the completed text does not start with what
+was streamed, the vendor rewrote the message and the whole text is emitted. The documented item
+shape is `agentMessage - {id, text, phase?} containing the accumulated agent reply`
+([app-server][app-server]).
+
 ## Structured content
 
 What an item reports reaches a host as structure rather than as one more line of `detail`:

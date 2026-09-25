@@ -276,11 +276,15 @@ pub struct ItemNotification {
 /// A piece of the answer.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AgentMessageDelta {
     /// Which conversation.
     pub thread_id: String,
     /// Which turn.
     pub turn_id: String,
+    /// Which message item the text belongs to, so its completion can add only what is missing.
+    #[serde(default)]
+    pub item_id: String,
     /// The text.
     #[serde(default)]
     pub delta: String,

@@ -2691,6 +2691,87 @@ async fn a_command_that_keeps_printing_keeps_its_turn_alive_past_the_idle_deadli
         .expect("expected cleanup");
 }
 
+/// The answer's text, as a host would join its deltas.
+fn answer_text(events: &[EventKind]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A message the server never streamed still reaches the host, exactly once, from its completion.
+///
+/// A resumed or replayed conversation can deliver an `agentMessage` whose whole text is on
+/// `item/completed` and on no `item/agentMessage/delta` at all.
+#[tokio::test]
+async fn an_answer_that_arrives_only_on_its_completed_item_is_delivered_once() {
+    let mut running = AnnouncedTurn::open(replay_limits()).await;
+    let turn_id = AnnouncedTurn::NATIVE_TURN_ID;
+    running.announce(
+        "item/started",
+        serde_json::json!({"turnId": turn_id, "item": {"type": "agentMessage", "id": "msg-1", "text": ""}}),
+    );
+    running.announce(
+        "item/completed",
+        serde_json::json!({"turnId": turn_id,
+                           "item": {"type": "agentMessage", "id": "msg-1", "text": "all done"}}),
+    );
+    running.complete();
+
+    let events = drain(&mut running.turn).await;
+    assert_eq!(
+        answer_text(&events),
+        "all done",
+        "expected the completed item's text as the answer, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Deltas and the completion describe the same text; only what the deltas left out is added.
+#[tokio::test]
+async fn a_completed_answer_adds_only_what_its_deltas_did_not_deliver() {
+    let mut running = AnnouncedTurn::open(replay_limits()).await;
+    let turn_id = AnnouncedTurn::NATIVE_TURN_ID;
+    running.announce(
+        "item/agentMessage/delta",
+        serde_json::json!({"turnId": turn_id, "itemId": "msg-1", "delta": "all "}),
+    );
+    running.announce(
+        "item/completed",
+        serde_json::json!({"turnId": turn_id,
+                           "item": {"type": "agentMessage", "id": "msg-1", "text": "all done"}}),
+    );
+    running.announce(
+        "item/agentMessage/delta",
+        serde_json::json!({"turnId": turn_id, "itemId": "msg-2", "delta": "streamed"}),
+    );
+    running.announce(
+        "item/completed",
+        serde_json::json!({"turnId": turn_id,
+                           "item": {"type": "agentMessage", "id": "msg-2", "text": "streamed"}}),
+    );
+    running.complete();
+
+    let events = drain(&mut running.turn).await;
+    assert_eq!(
+        answer_text(&events),
+        "all donestreamed",
+        "expected each message's text exactly once, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
 /// A pending approval has its own deadline and does not consume the turn's idle budget.
 #[tokio::test(start_paused = true)]
 async fn a_pending_approval_pauses_the_native_idle_deadline() {

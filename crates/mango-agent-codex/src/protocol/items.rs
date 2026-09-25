@@ -207,8 +207,9 @@ impl ThreadItem {
     /// Whether this item's own lifecycle is the turn's text rather than an activity.
     ///
     /// The answer and the reasoning arrive twice: as deltas while they are being written, and as a
-    /// whole item when they finish. Rendering both would double every sentence, so the reducer
-    /// takes the deltas and drops these.
+    /// whole item when they finish. Rendering both would double every sentence, so neither becomes
+    /// an activity; a completed answer contributes only the text its deltas did not deliver (see
+    /// [`crate::turn_reducer`]).
     #[must_use]
     pub fn is_streamed_text(&self) -> bool {
         matches!(self, Self::AgentMessage { .. } | Self::Reasoning { .. })
