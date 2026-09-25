@@ -391,6 +391,11 @@ install locations without editing the profile or changing a user's `PATH`.
   with every optional surface off rather than being refused: the ACP schema defines the field's
   default as the empty capability set, and the official schema crate reads a malformed value the
   same way. Narrowing fails closed; an unknown key beside the known ones is ignored.
+- Capabilities and catalogs narrow only when a session opens; there is no discovery-time handshake,
+  because one would start the agent's auth and network path on every probe. `Discovery`'s
+  configuration catalog is therefore empty, and the agent's model and mode options (Cursor's `model`
+  and `mode` config options) arrive on the session's catalog when `session/new` or `session/load`
+  answers.
 
 ## Client capabilities
 
