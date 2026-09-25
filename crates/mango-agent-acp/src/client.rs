@@ -441,7 +441,10 @@ impl SessionState {
             }
             tokio::select! {
                 () = tokio::time::sleep(idle) => {
-                    if self.pending_count() == 0 {
+                    // `select!` picks among ready branches at random, so the sleep can win on the
+                    // same tick a frame arrived. A change it has not consumed is progress: loop, and
+                    // the change branch restarts the deadline.
+                    if self.pending_count() == 0 && !changes.has_changed().unwrap_or(false) {
                         return;
                     }
                 }
@@ -2555,6 +2558,45 @@ mod tests {
 
     /// A slot the prompt task never releases turns into a typed timeout naming what was held,
     /// rather than an `Ok` that would let the session look settled.
+    /// A frame that arrives on the same timer tick as the idle deadline is progress, not silence.
+    ///
+    /// The frame's task sleeps a shade less than the deadline, so both timers fall due on one
+    /// tick and the frame's runs first; the idle wait is then polled with its sleep and its change
+    /// both ready. `select!` picks between ready branches at random, so the case repeats until an
+    /// unguarded sleep would have won at least once.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_on_the_idle_deadline_tick_restarts_the_deadline() {
+        let idle = Duration::from_secs(5);
+        for round in 0..32 {
+            let (state, _host) = state();
+            let state = Arc::new(state);
+            let frame = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move {
+                    tokio::time::sleep(idle - Duration::from_micros(500)).await;
+                    state.touch();
+                }
+            });
+            let waiter = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move { state.idle_expired(idle).await }
+            });
+            tokio::time::sleep(idle + Duration::from_millis(1)).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                frame.is_finished(),
+                "expected the frame to have arrived in round {round}"
+            );
+            assert!(
+                !waiter.is_finished(),
+                "expected idle state: waiting after a frame on the deadline tick | received: expired, in round {round}"
+            );
+            waiter.abort();
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_unreleased_turn_slot_is_a_typed_timeout() {
         let (state, host) = state();
