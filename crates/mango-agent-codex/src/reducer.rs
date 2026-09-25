@@ -105,6 +105,11 @@ pub fn reduce(notification: &Notification, thread_id: &str, now: std::time::Syst
             limits: crate::rate_limits::to_account_limits(&update.rate_limits, now),
         }),
         Notification::TurnCompleted(completed) => finish(completed.turn.status, &completed.turn),
+        // Streamed progress needs to know which activities this turn announced, which is
+        // `TurnReducer`'s memory rather than this function's.
+        Notification::CommandOutputDelta(_)
+        | Notification::McpToolCallProgress(_)
+        | Notification::FileChangePatchUpdated(_) => Outcome::Ignore,
         // A turn beginning is the same turn the host already started; announcing it again would
         // be a second session start. An error notification is a report, never an ending.
         Notification::TurnStarted(_)

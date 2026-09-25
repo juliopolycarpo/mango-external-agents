@@ -535,6 +535,8 @@ struct ActiveTurn {
     /// under the turn lock and announces; the other does nothing, which is what keeps the
     /// announcement to exactly once.
     announced: bool,
+    /// What this turn already announced, for the announcements that depend on it.
+    reducer: crate::turn_reducer::TurnReducer,
     /// Native reviews have their own lifecycle and do not accept user steering.
     is_review: bool,
     /// The `turn/start` answer will never be read, so this turn can never be named or interrupted.
@@ -892,6 +894,35 @@ impl Shared {
         // A stop worker waiting for this start can now name the turn it has to interrupt.
         self.turn_finished.notify_waiters();
         Ok(Some((sink, native_turn_id)))
+    }
+
+    /// Reduces one announcement with the memory of the turn `route` still owns.
+    ///
+    /// A route whose turn has already been replaced or is finishing keeps the stateless reduction:
+    /// its events can no longer reach a stream, but a malformed terminal must still poison.
+    async fn reduce_for(&self, route: &ActiveTurnRoute, notification: &Notification) -> Outcome {
+        let thread_id = self.thread_id();
+        let native_turn_id = Some(route.native_turn_id.as_str());
+        let observed_at = self.host.now();
+        let mut turn = self.turn.lock().await;
+        match turn
+            .as_mut()
+            .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
+        {
+            Some(active) => active.reducer.reduce(
+                notification,
+                thread_id,
+                native_turn_id,
+                observed_at,
+                tokio::time::Instant::now(),
+            ),
+            None => reducer::reduce_for_active_turn(
+                notification,
+                thread_id,
+                native_turn_id,
+                observed_at,
+            ),
+        }
     }
 
     /// Puts one event on the stream that still belongs to this start attempt.
@@ -1457,12 +1488,7 @@ impl PeerHandler for CodexHandler {
             self.shared.signal_idle_change();
         }
 
-        let outcome = reducer::reduce_for_active_turn(
-            &notification,
-            self.shared.thread_id(),
-            Some(active_route.native_turn_id.as_str()),
-            self.shared.host.now(),
-        );
+        let outcome = self.shared.reduce_for(&active_route, &notification).await;
         match outcome {
             Outcome::Emit(events) => {
                 for event in events {
@@ -2954,6 +2980,7 @@ impl CodexSession {
                 attempt,
                 native_turn_id: String::new(),
                 announced: false,
+                reducer: crate::turn_reducer::TurnReducer::new(),
                 is_review: rpc_method == method::REVIEW_START,
                 start_unanswerable: false,
                 interrupt_dispatched: false,
@@ -3954,6 +3981,7 @@ mod tests {
             native_turn_id: native_turn_id.to_owned(),
             // This helper installs a turn already past the point `begin` would have announced it.
             announced: true,
+            reducer: crate::turn_reducer::TurnReducer::new(),
             is_review: false,
             start_unanswerable: false,
             interrupt_dispatched: false,

@@ -2533,6 +2533,164 @@ async fn traffic_for_another_conversation_does_not_extend_this_turns_idle_deadli
         .expect("expected cleanup after idle cancellation");
 }
 
+/// A running turn the test speaks for, and everything needed to speak.
+struct AnnouncedTurn {
+    session: Box<dyn Session>,
+    launcher: Arc<FakeLauncher>,
+    announcer: Announcer,
+    turn: mango_external_agents::TurnStream,
+    thread_id: String,
+}
+
+impl AnnouncedTurn {
+    /// The native turn id every announced turn runs under.
+    const NATIVE_TURN_ID: &str = "announced-turn";
+
+    /// Opens the recorded interrupt conversation and starts one turn the server names
+    /// [`Self::NATIVE_TURN_ID`], leaving every later notification to [`Self::announce`].
+    async fn open(limits: mango_external_agents::Limits) -> Self {
+        let transcript = Transcript::load("interrupt");
+        let thread_id = transcript
+            .thread_id()
+            .expect("expected the recorded thread id");
+        let announcer = Announcer::new();
+        let launcher = Arc::new(FakeLauncher::new());
+        let completed_thread = thread_id.clone();
+        launcher.push(
+            transcript
+                .as_process_intercepting(move |frame| {
+                    let method = frame.get("method").and_then(serde_json::Value::as_str);
+                    let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                    match method {
+                        Some("turn/start") => Some(vec![
+                            serde_json::json!({
+                                "id": id,
+                                "result": {"turn": {"id": Self::NATIVE_TURN_ID}},
+                            })
+                            .to_string(),
+                        ]),
+                        Some("turn/interrupt") => Some(vec![
+                            serde_json::json!({"id": id, "result": {}}).to_string(),
+                            serde_json::json!({
+                                "method": "turn/completed",
+                                "params": {
+                                    "threadId": completed_thread,
+                                    "turn": {"id": Self::NATIVE_TURN_ID, "status": "interrupted"},
+                                },
+                            })
+                            .to_string(),
+                        ]),
+                        _ => None,
+                    }
+                })
+                .announcing(announcer.clone()),
+        );
+        let (host, launcher) = with_launcher_limits(launcher, None, limits);
+        let session = CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "one"))
+            .await
+            .expect("expected an active turn");
+        tokio::task::yield_now().await;
+        Self {
+            session,
+            launcher,
+            announcer,
+            turn,
+            thread_id,
+        }
+    }
+
+    /// Puts one notification for this turn's thread on the wire.
+    fn announce(&self, method: &str, mut params: serde_json::Value) {
+        params["threadId"] = serde_json::Value::String(self.thread_id.clone());
+        self.announcer
+            .announce(serde_json::json!({"method": method, "params": params}).to_string());
+    }
+
+    /// Ends the turn the way the server does when it finishes on its own.
+    fn complete(&self) {
+        self.announce(
+            "turn/completed",
+            serde_json::json!({"turn": {"id": Self::NATIVE_TURN_ID, "status": "completed"}}),
+        );
+    }
+
+    fn interrupted(&self) -> bool {
+        self.launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"turn/interrupt\""))
+    }
+}
+
+/// A command that is still printing is a turn that is still working.
+///
+/// Between a command's `item/started` and its `item/completed`, the only frames the app-server
+/// writes for it are `item/commandExecution/outputDelta`. A build or a test suite that runs past
+/// the idle deadline while printing must not be cancelled as idle.
+#[tokio::test(start_paused = true)]
+async fn a_command_that_keeps_printing_keeps_its_turn_alive_past_the_idle_deadline() {
+    let limits = replay_limits();
+    let mut running = AnnouncedTurn::open(limits).await;
+    running.announce(
+        "item/started",
+        serde_json::json!({"turnId": AnnouncedTurn::NATIVE_TURN_ID, "item": {
+            "type": "commandExecution", "id": "cmd-long", "command": "cargo build",
+            "status": "inProgress"}}),
+    );
+
+    // Output every 30 seconds for five minutes, against the default 120 second idle deadline.
+    let rounds = limits.idle_timeout.as_secs() * 5 / 2 / 30;
+    for round in 0..rounds {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert!(
+            !running.interrupted(),
+            "expected printing output to keep the turn alive, received turn/interrupt after round {round} ({}s)",
+            round * 30
+        );
+        running.announce(
+            "item/commandExecution/outputDelta",
+            serde_json::json!({"turnId": AnnouncedTurn::NATIVE_TURN_ID, "itemId": "cmd-long",
+                               "delta": format!("compiling crate {round}\n")}),
+        );
+    }
+    running.complete();
+
+    let events = drain(&mut running.turn).await;
+    assert!(
+        !running.interrupted(),
+        "expected no idle interrupt for a command that kept printing"
+    );
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the turn to complete on its own, received {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EventKind::Cancelled { .. })),
+        "expected no cancellation, received {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ActivityUpdated { call_id, update }
+                if call_id == "cmd-long"
+                    && update.detail.as_deref().is_some_and(|detail| detail.contains("compiling"))
+        )),
+        "expected the printed output to reach the host as updates to the command, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
 /// A pending approval has its own deadline and does not consume the turn's idle budget.
 #[tokio::test(start_paused = true)]
 async fn a_pending_approval_pauses_the_native_idle_deadline() {

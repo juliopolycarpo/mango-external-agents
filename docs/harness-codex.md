@@ -70,6 +70,7 @@ be a misattribution rather than a nicety.
 
 Notifications acted on: `turn/started`, `turn/completed`, `item/started`, `item/completed`,
 `item/agentMessage/delta`, `item/reasoning/textDelta`, `item/reasoning/summaryTextDelta`,
+`item/commandExecution/outputDelta`, `item/mcpToolCall/progress`, `item/fileChange/patchUpdated`,
 `thread/tokenUsage/updated`, `account/rateLimits/updated`, `serverRequest/resolved`, `error`.
 Everything else is dropped by name.
 
@@ -186,7 +187,10 @@ returns its error whole, including a `CleanupRequired`.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.
-Native activity restarts the host's `Limits::idle_timeout`, but only this turn's own: the connection
+Native activity restarts the host's `Limits::idle_timeout`, including the streamed progress of a
+running item: between a command's `item/started` and `item/completed` the app-server writes only
+`item/commandExecution/outputDelta` for it, so a build that prints for longer than the deadline is
+still a working turn. That activity must be this turn's own: the connection
 also carries a subagent's thread, a detached review's, later frames for a turn already over, and
 account-level `rateLimits` updates that name no conversation at all, and none of those extend the
 deadline. An outstanding approval pauses that clock because its `approval_timeout` is the deadline
@@ -496,6 +500,21 @@ What an item reports reaches a host as structure rather than as one more line of
 | `fileChange.changes[]`              | `Diff { files }`, one `FileChange` per change, `diff` as the unified diff          |
 | `commandExecution.aggregatedOutput` | `Output { text }`, beside the detail that also carries the exit code               |
 | `plan.text`                         | nothing — freeform at this pin, and splitting it into steps would invent structure |
+
+While an item runs, its streamed progress updates the same activity through `ActivityUpdated`,
+following the [item notifications][app-server] the app-server documents:
+
+| Notification                        | `ActivityUpdate`                                             |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `item/commandExecution/outputDelta` | `detail`: the most recent 2,000 characters of output         |
+| `item/mcpToolCall/progress`         | `detail`: the most recent 2,000 characters of progress lines |
+| `item/fileChange/patchUpdated`      | `detail`: the paths; `content`: `Diff` of the patch as it is |
+
+An activity reports at most one update every five seconds — the first after a quiet window is
+emitted at once, and what was held back rides the next one — and `truncated` says when the tail
+dropped older output. The completed item still carries the whole `aggregatedOutput`. Progress for
+an item this turn never announced as an activity, or already completed, is dropped rather than
+addressed to a call id the host was never told about.
 
 `FileChange::kind` stays **absent**: the pinned schema states no per-file kind, and reading one off
 the diff text would be the re-parsing the type exists to prevent. Every activity carries the item's

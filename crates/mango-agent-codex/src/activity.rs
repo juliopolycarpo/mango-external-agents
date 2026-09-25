@@ -163,7 +163,7 @@ fn command_detail(output: Option<&str>, exit_code: Option<i64>) -> Option<String
     }
 }
 
-fn file_change_detail(changes: &[FileUpdateChange]) -> Option<String> {
+pub(crate) fn file_change_detail(changes: &[FileUpdateChange]) -> Option<String> {
     if changes.is_empty() {
         return None;
     }
@@ -180,7 +180,7 @@ fn file_change_detail(changes: &[FileUpdateChange]) -> Option<String> {
 ///
 /// `FileChange::kind` stays absent: at this pin the vendor states no per-file kind, and reading
 /// one off the diff text would be re-parsing vendor prose this module exists to avoid.
-fn file_change_content(changes: &[FileUpdateChange]) -> Option<ActivityContent> {
+pub(crate) fn file_change_content(changes: &[FileUpdateChange]) -> Option<ActivityContent> {
     if changes.is_empty() {
         return None;
     }

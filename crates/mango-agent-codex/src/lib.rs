@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod rate_limits;
 pub mod reducer;
 pub mod session;
+pub mod turn_reducer;
 
 pub use harness::CodexHarness;
 pub use protocol::schema::{MINIMUM_CODEX_VERSION, PIN};

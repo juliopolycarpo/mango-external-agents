@@ -8,7 +8,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::items::ThreadItem;
+use super::items::{FileUpdateChange, ThreadItem};
 use super::requests::{ThreadSummary, TurnHandle};
 
 /// The notification methods this harness acts on, exactly as the app-server spells them.
@@ -29,6 +29,12 @@ pub mod method {
     pub const REASONING_TEXT_DELTA: &str = "item/reasoning/textDelta";
     /// A piece of the reasoning summary, which is what a default build streams.
     pub const REASONING_SUMMARY_TEXT_DELTA: &str = "item/reasoning/summaryTextDelta";
+    /// What a running command printed since the last delta.
+    pub const COMMAND_EXECUTION_OUTPUT_DELTA: &str = "item/commandExecution/outputDelta";
+    /// A progress message from a running MCP tool call.
+    pub const MCP_TOOL_CALL_PROGRESS: &str = "item/mcpToolCall/progress";
+    /// The files a patch in progress touches, as they stand now.
+    pub const FILE_CHANGE_PATCH_UPDATED: &str = "item/fileChange/patchUpdated";
     /// Tokens this turn and this thread have used.
     pub const THREAD_TOKEN_USAGE_UPDATED: &str = "thread/tokenUsage/updated";
     /// The account's plan quota, as the server rolls it forward.
@@ -40,7 +46,11 @@ pub mod method {
 }
 
 /// One announcement, in the families this harness acts on.
+///
+/// Non-exhaustive: a family that starts mattering becomes a variant here, and a host matching on
+/// this type must not stop compiling when it does.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Notification {
     /// A conversation opened.
     ThreadStarted(ThreadStarted),
@@ -56,6 +66,12 @@ pub enum Notification {
     AgentMessageDelta(AgentMessageDelta),
     /// A piece of the reasoning, whether streamed as text or as a summary.
     ReasoningDelta(ReasoningDelta),
+    /// Output a running command printed.
+    CommandOutputDelta(CommandOutputDelta),
+    /// A running MCP tool call reported progress.
+    McpToolCallProgress(McpToolCallProgress),
+    /// A patch in progress changed the files it touches.
+    FileChangePatchUpdated(FileChangePatchUpdated),
     /// Tokens used.
     ThreadTokenUsage(TurnTokenUsage),
     /// The account's plan quota.
@@ -120,6 +136,11 @@ impl Notification {
             method::REASONING_TEXT_DELTA | method::REASONING_SUMMARY_TEXT_DELTA => {
                 read(params, method, Self::ReasoningDelta)
             }
+            method::COMMAND_EXECUTION_OUTPUT_DELTA => {
+                read(params, method, Self::CommandOutputDelta)
+            }
+            method::MCP_TOOL_CALL_PROGRESS => read(params, method, Self::McpToolCallProgress),
+            method::FILE_CHANGE_PATCH_UPDATED => read(params, method, Self::FileChangePatchUpdated),
             method::THREAD_TOKEN_USAGE_UPDATED => read(params, method, Self::ThreadTokenUsage),
             method::ACCOUNT_RATE_LIMITS_UPDATED => read(params, method, Self::RateLimits),
             method::SERVER_REQUEST_RESOLVED => read(params, method, Self::ServerRequestResolved),
@@ -147,6 +168,9 @@ impl Notification {
             }
             Self::AgentMessageDelta(delta) => Some(delta.thread_id.as_str()),
             Self::ReasoningDelta(delta) => Some(delta.thread_id.as_str()),
+            Self::CommandOutputDelta(delta) => Some(delta.thread_id.as_str()),
+            Self::McpToolCallProgress(progress) => Some(progress.thread_id.as_str()),
+            Self::FileChangePatchUpdated(update) => Some(update.thread_id.as_str()),
             Self::ThreadTokenUsage(usage) => Some(usage.thread_id.as_str()),
             Self::ServerRequestResolved(resolved) => Some(resolved.thread_id.as_str()),
             Self::Error(error) => Some(error.thread_id.as_str()),
@@ -169,6 +193,9 @@ impl Notification {
             }
             Self::AgentMessageDelta(delta) => Some(delta.turn_id.as_str()),
             Self::ReasoningDelta(delta) => Some(delta.turn_id.as_str()),
+            Self::CommandOutputDelta(delta) => Some(delta.turn_id.as_str()),
+            Self::McpToolCallProgress(progress) => Some(progress.turn_id.as_str()),
+            Self::FileChangePatchUpdated(update) => Some(update.turn_id.as_str()),
             Self::ThreadTokenUsage(usage) => Some(usage.turn_id.as_str()),
             Self::Error(error) => Some(error.turn_id.as_str()),
             Self::Malformed { turn_id, .. } => turn_id.as_deref(),
@@ -193,6 +220,9 @@ impl Notification {
                 | Self::ItemCompleted(_)
                 | Self::AgentMessageDelta(_)
                 | Self::ReasoningDelta(_)
+                | Self::CommandOutputDelta(_)
+                | Self::McpToolCallProgress(_)
+                | Self::FileChangePatchUpdated(_)
                 | Self::ThreadTokenUsage(_)
                 | Self::Error(_)
         ) || self.is_malformed_terminal()
@@ -274,6 +304,57 @@ pub struct ReasoningDelta {
     /// The text.
     #[serde(default)]
     pub delta: String,
+}
+
+/// Output a running command printed since its last delta, stdout and stderr together.
+///
+/// Between a command's `item/started` and its `item/completed` this is the only frame the
+/// app-server writes for it, so it is what says a long build is still working.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CommandOutputDelta {
+    /// Which conversation.
+    pub thread_id: String,
+    /// Which turn.
+    pub turn_id: String,
+    /// Which command item.
+    pub item_id: String,
+    /// The text, in order after the previous delta.
+    #[serde(default)]
+    pub delta: String,
+}
+
+/// A progress message from a running MCP tool call.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct McpToolCallProgress {
+    /// Which conversation.
+    pub thread_id: String,
+    /// Which turn.
+    pub turn_id: String,
+    /// Which MCP tool-call item.
+    pub item_id: String,
+    /// What the server reported.
+    #[serde(default)]
+    pub message: String,
+}
+
+/// The files a patch in progress touches, as they stand now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct FileChangePatchUpdated {
+    /// Which conversation.
+    pub thread_id: String,
+    /// Which turn.
+    pub turn_id: String,
+    /// Which file-change item.
+    pub item_id: String,
+    /// Every file the patch touches so far, each with its diff.
+    #[serde(default)]
+    pub changes: Vec<FileUpdateChange>,
 }
 
 /// Tokens, as the server counts them.
@@ -477,6 +558,39 @@ mod tests {
                 notification.thread_id(),
                 Some("t"),
                 "expected {family} to name its thread, received {notification:?}"
+            );
+        }
+    }
+
+    /// Streamed progress for a running item names its conversation, its turn and its item, so a
+    /// long command's output can count as that turn's progress.
+    #[test]
+    fn streamed_item_progress_names_its_thread_turn_and_item() {
+        let cases = [
+            (
+                method::COMMAND_EXECUTION_OUTPUT_DELTA,
+                json!({"threadId": "t", "turnId": "u", "itemId": "i", "delta": "compiling\n"}),
+            ),
+            (
+                method::MCP_TOOL_CALL_PROGRESS,
+                json!({"threadId": "t", "turnId": "u", "itemId": "i", "message": "halfway"}),
+            ),
+            (
+                method::FILE_CHANGE_PATCH_UPDATED,
+                json!({"threadId": "t", "turnId": "u", "itemId": "i",
+                       "changes": [{"path": "a.rs", "kind": {"type": "add"}, "diff": "+a\n"}]}),
+            ),
+        ];
+        for (family, params) in cases {
+            let notification = Notification::parse(family, params);
+            assert_eq!(
+                (notification.thread_id(), notification.turn_id()),
+                (Some("t"), Some("u")),
+                "expected {family} to name its thread and turn, received {notification:?}"
+            );
+            assert!(
+                notification.requires_native_turn_match(),
+                "expected {family} to be matched against the active native turn"
             );
         }
     }

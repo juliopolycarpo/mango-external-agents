@@ -183,6 +183,9 @@ mod tests {
                 notifications::method::AGENT_MESSAGE_DELTA,
                 notifications::method::REASONING_TEXT_DELTA,
                 notifications::method::REASONING_SUMMARY_TEXT_DELTA,
+                notifications::method::COMMAND_EXECUTION_OUTPUT_DELTA,
+                notifications::method::MCP_TOOL_CALL_PROGRESS,
+                notifications::method::FILE_CHANGE_PATCH_UPDATED,
                 notifications::method::THREAD_TOKEN_USAGE_UPDATED,
                 notifications::method::ACCOUNT_RATE_LIMITS_UPDATED,
                 notifications::method::SERVER_REQUEST_RESOLVED,
@@ -353,6 +356,19 @@ mod tests {
             "CommandExecutionStatus",
             &["inProgress", "completed", "failed", "declined"],
         );
+        assert_declares(
+            "CommandExecutionOutputDeltaNotification",
+            &["threadId", "turnId", "itemId", "delta"],
+        );
+        assert_declares(
+            "McpToolCallProgressNotification",
+            &["threadId", "turnId", "itemId", "message"],
+        );
+        assert_declares(
+            "FileChangePatchUpdatedNotification",
+            &["threadId", "turnId", "itemId", "changes"],
+        );
+        assert_declares("FileUpdateChange", &["path", "diff"]);
     }
 
     #[test]
