@@ -3485,6 +3485,58 @@ async fn a_refresh_merges_the_updates_that_land_while_it_is_in_flight() {
         .expect("expected cleanup");
 }
 
+/// A background read and a host refresh can overlap. A read that was sent first but answers
+/// last is older than the baseline already adopted, and must not rewind it.
+#[tokio::test]
+async fn an_overlapping_older_quota_read_does_not_rewind_a_fresher_baseline() {
+    let running = Arc::new(
+        AnnouncedTurn::open_answering(replay_limits(), |frame| {
+            (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read")))
+                .then(Vec::new)
+        })
+        .await,
+    );
+    running.announcer.announce(primary_update(5.0));
+    let background = nth_rate_limits_read(&running, 0).await;
+    let refresh = tokio::spawn({
+        let running = Arc::clone(&running);
+        async move { running.session.refresh_account_usage().await }
+    });
+    let refreshed = nth_rate_limits_read(&running, 1).await;
+    running.announcer.announce(primary_update(60.0));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": refreshed, "result": {"rateLimits": {
+            "primary": {"usedPercent": 30.0}, "secondary": {"usedPercent": 20.0}}}})
+        .to_string(),
+    );
+    refresh
+        .await
+        .expect("expected the refresh task")
+        .expect("expected a reading");
+    running.announcer.announce(
+        serde_json::json!({"id": background, "result": {"rateLimits": {
+            "primary": {"usedPercent": 10.0}, "secondary": {"usedPercent": 5.0}}}})
+        .to_string(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(primary_update(70.0));
+    let mut running = Arc::into_inner(running).expect("expected the only handle");
+    assert_eq!(
+        next_quota(&mut running.turn).await,
+        vec![
+            (String::from("primary"), 70.0),
+            (String::from("secondary"), 20.0)
+        ],
+        "expected the older read's late answer to leave the fresher baseline in place"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
 /// A pending approval has its own deadline and does not consume the turn's idle budget.
 #[tokio::test(start_paused = true)]
 async fn a_pending_approval_pauses_the_native_idle_deadline() {

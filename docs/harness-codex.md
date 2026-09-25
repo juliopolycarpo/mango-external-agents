@@ -474,7 +474,9 @@ present one overwrites it. An update that arrives before any baseline is not sho
 for one `account/rateLimits/read` in the background and reports its full answer instead. Every full
 read — that one or a host's `refresh_account_usage` — has any update that arrived while it was in
 flight merged over its answer, and a refresh returns that merged reading. Updates held for a read
-that failed are dropped with it rather than laid over a later one.
+that failed are dropped with it rather than laid over a later one. Reads are numbered as they are
+sent, and a read that answers after a later one was adopted is older than the baseline and is
+dropped rather than rewinding it.
 
 ## Transports
 
