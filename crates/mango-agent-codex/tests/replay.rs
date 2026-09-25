@@ -5548,6 +5548,73 @@ async fn discovery_with_a_host_key_fingerprints_the_signed_in_account() {
     );
 }
 
+/// A profile listing cut off by the page limit is incomplete, not a statement that the missing
+/// built-in profiles are forbidden.
+#[tokio::test]
+async fn discovery_keeps_the_declared_matrix_when_the_profile_listing_never_ends() {
+    let (host, _) = probe_host(|frame| {
+        (frame.get("method") == Some(&serde_json::json!("permissionProfile/list"))).then(|| {
+            vec![
+                serde_json::json!({"id": frame["id"], "result": {
+                    "data": [{"id": "custom", "allowed": true}], "nextCursor": "again"}})
+                .to_string(),
+            ]
+        })
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+    assert_eq!(
+        discovery.permission_matrix,
+        mango_agent_codex::permissions::matrix(),
+        "expected an unfinished listing to leave the declared matrix alone"
+    );
+}
+
+/// Hidden models are left out of the picker, so they must not use up the catalog's budget before
+/// the visible ones on later pages are read.
+#[tokio::test]
+async fn hidden_models_do_not_use_up_the_catalog_before_visible_ones_are_read() {
+    let (host, _) = probe_host(|frame| {
+        if frame.get("method") == Some(&serde_json::json!("model/list")) {
+            let page = match frame
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str)
+            {
+                None => {
+                    let hidden: Vec<serde_json::Value> = (0..300)
+                        .map(|index| {
+                            serde_json::json!({"id": format!("hidden-{index}"),
+                                                        "hidden": true})
+                        })
+                        .collect();
+                    serde_json::json!({"data": hidden, "nextCursor": "page-2"})
+                }
+                Some(_) => serde_json::json!({"data": [{"id": "visible"}], "nextCursor": null}),
+            };
+            return Some(vec![
+                serde_json::json!({"id": frame["id"], "result": page}).to_string(),
+            ]);
+        }
+        profiles_answer(frame, &serde_json::json!([]))
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+    let ids: Vec<&str> = discovery
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["visible"],
+        "expected the visible model past the hidden page"
+    );
+}
+
 /// A build that cannot answer the profile question has not forbidden anything.
 #[tokio::test]
 async fn discovery_keeps_the_declared_matrix_when_the_profiles_cannot_be_read() {

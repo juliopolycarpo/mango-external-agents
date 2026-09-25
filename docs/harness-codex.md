@@ -236,8 +236,10 @@ the one terminal fact.
 
 `model/list` and `permissionProfile/list` are cursor-paginated with a server-chosen page size
 ([app-server][app-server]). The probe follows `nextCursor` for up to eight pages each, and the
-model catalog also stops at the core's 256-model cap. A page that fails mid-walk keeps the models
-already read.
+model catalog also stops at the core's 256-model cap, counting only models the picker shows
+(hidden ones are dropped as they are read). A page that fails mid-walk keeps the models already
+read. A profile listing that still has a cursor after eight pages is incomplete, and is treated
+like one that failed: the declared matrix stays.
 
 ## The permission matrix
 

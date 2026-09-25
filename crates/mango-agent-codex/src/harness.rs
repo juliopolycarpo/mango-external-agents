@@ -720,7 +720,8 @@ async fn read_model_catalog(client: &Client) -> Vec<crate::protocol::requests::M
         else {
             break;
         };
-        models.extend(page.data);
+        // Hidden models never reach the picker, so they do not count against its cap.
+        models.extend(page.data.into_iter().filter(|model| !model.hidden));
         cursor = page.next_cursor.filter(|cursor| !cursor.is_empty());
         if cursor.is_none()
             || models.len() >= mango_external_agents::normalize::MODEL_CATALOG_MAX_ITEMS
@@ -732,7 +733,8 @@ async fn read_model_catalog(client: &Client) -> Vec<crate::protocol::requests::M
 }
 
 /// Every permission profile the server lists for the host's project, or nothing when it would not
-/// answer: a build that cannot say has not forbidden anything.
+/// answer or did not finish within the page limit: a build that cannot say has not forbidden
+/// anything.
 async fn read_permission_profiles(
     client: &Client,
     cwd: &str,
@@ -750,10 +752,12 @@ async fn read_permission_profiles(
         profiles.extend(page.data);
         cursor = page.next_cursor.filter(|cursor| !cursor.is_empty());
         if cursor.is_none() {
-            break;
+            return Some(profiles);
         }
     }
-    Some(profiles)
+    // Cut off by the page limit: a profile missing from an unfinished listing is unknown, not
+    // forbidden.
+    None
 }
 
 /// Auth state, the model catalog and the allowed permission profiles, from one short-lived
