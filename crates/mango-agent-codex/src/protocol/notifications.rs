@@ -429,8 +429,11 @@ pub struct RateLimitWindow {
 }
 
 /// The account's plan quota, as one snapshot.
+///
+/// Non-exhaustive: the vendor's snapshot is wider than what this harness reads.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct RateLimitSnapshot {
     /// The shorter window, usually hours.
     #[serde(default)]
@@ -441,6 +444,136 @@ pub struct RateLimitSnapshot {
     /// The plan the vendor named.
     #[serde(default)]
     pub plan_type: Option<String>,
+    /// Remaining workspace credits, when the server returned them.
+    #[serde(default)]
+    pub credits: Option<CreditsSnapshot>,
+    /// The spend-control limit, when there is one.
+    #[serde(default)]
+    pub individual_limit: Option<SpendControlLimitSnapshot>,
+    /// Whether spend control is reached. `None` is unavailable, not a recovery.
+    #[serde(default)]
+    pub spend_control_reached: Option<bool>,
+}
+
+/// Pay-as-you-go credits, as the server reports them.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CreditsSnapshot {
+    /// Whether the account has any.
+    #[serde(default)]
+    pub has_credits: bool,
+    /// Whether usage is unlimited.
+    #[serde(default)]
+    pub unlimited: bool,
+    /// The balance, as the server wrote it.
+    #[serde(default)]
+    pub balance: Option<String>,
+}
+
+/// A spend-control limit, as the server reports it.
+#[derive(Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SpendControlLimitSnapshot {
+    /// The limit, as the server wrote it.
+    #[serde(default)]
+    pub limit: String,
+    /// How much is used, as the server wrote it.
+    #[serde(default)]
+    pub used: String,
+    /// How much remains, as a percentage the server computed.
+    #[serde(default)]
+    pub remaining_percent: Option<f64>,
+    /// Unix seconds when it resets.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
+impl std::fmt::Debug for CreditsSnapshot {
+    /// Reports credit shape without logging the balance.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreditsSnapshot")
+            .field("has_credits", &self.has_credits)
+            .field("unlimited", &self.unlimited)
+            .field("has_balance", &self.balance.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SpendControlLimitSnapshot {
+    /// Reports spend-control shape without logging vendor amounts.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpendControlLimitSnapshot")
+            .field("remaining_percent", &self.remaining_percent)
+            .field("resets_at", &self.resets_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RateLimitResetCreditsSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RateLimitResetCreditsSummary")
+            .field("available_count", &self.available_count)
+            .field("credit_count", &self.credits.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RateLimitResetCredit {
+    /// Reports the row's shape without logging vendor ids or text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RateLimitResetCredit")
+            .field("granted_at", &self.granted_at)
+            .field("expires_at", &self.expires_at)
+            .field("has_title", &self.title.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Earned rate-limit resets, as `account/rateLimits/read` reports them.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RateLimitResetCreditsSummary {
+    /// How many are available; authoritative even when `credits` is capped.
+    #[serde(default)]
+    pub available_count: i64,
+    /// Detail rows. `None` means only the count is known.
+    #[serde(default)]
+    pub credits: Option<Vec<RateLimitResetCredit>>,
+}
+
+/// One earned rate-limit reset.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RateLimitResetCredit {
+    /// The server's opaque id.
+    #[serde(default)]
+    pub id: String,
+    /// What it resets.
+    #[serde(default)]
+    pub reset_type: Option<String>,
+    /// Its state, such as `available`.
+    #[serde(default)]
+    pub status: String,
+    /// Unix seconds when it was granted.
+    #[serde(default)]
+    pub granted_at: Option<i64>,
+    /// Unix seconds when it expires, or `None` when it does not.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// A display title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// A display description.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// A quota announcement.
@@ -627,6 +760,42 @@ mod tests {
         assert_eq!(windows.primary.map(|window| window.used_percent), Some(4.0));
         assert_eq!(windows.secondary.and_then(|window| window.resets_at), None);
         assert_eq!(windows.plan_type.as_deref(), Some("plus"));
+    }
+
+    /// Credits, spend control and reset credits carry balances, amounts, vendor ids and text; a
+    /// stray `{:?}` on the wire types must print their shape only.
+    #[test]
+    fn quota_wire_types_debug_as_shape_without_vendor_values() {
+        let snapshot: super::RateLimitSnapshot = serde_json::from_value(json!({
+            "credits": {"balance": "balance-secret", "hasCredits": true, "unlimited": false},
+            "individualLimit": {"limit": "limit-secret", "used": "used-secret",
+                                "remainingPercent": 40.0, "resetsAt": 1},
+            "spendControlReached": false
+        }))
+        .expect("expected a snapshot");
+        let resets: super::RateLimitResetCreditsSummary = serde_json::from_value(json!({
+            "availableCount": 1,
+            "credits": [{"id": "id-secret", "resetType": "type-secret", "status": "status-secret",
+                         "grantedAt": 1, "expiresAt": null, "title": "title-secret",
+                         "description": "description-secret"}]
+        }))
+        .expect("expected a summary");
+        let rendered = format!("{snapshot:?} {resets:?}");
+        for secret in [
+            "balance-secret",
+            "limit-secret",
+            "used-secret",
+            "id-secret",
+            "type-secret",
+            "status-secret",
+            "title-secret",
+            "description-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "expected {secret} out of Debug, received {rendered}"
+            );
+        }
     }
 
     /// An error notification is a report, not a terminal: the server still sends `turn/completed`.

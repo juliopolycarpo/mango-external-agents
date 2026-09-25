@@ -7,9 +7,14 @@
 
 use std::time::{Duration, SystemTime};
 
-use mango_external_agents::event::{AccountLimits, RateLimitWindow};
+use mango_external_agents::event::{
+    AccountLimits, Credits, RateLimitWindow, ResetCredit, ResetCredits, SpendControl,
+};
 
-use crate::protocol::notifications::{RateLimitSnapshot, RateLimitWindow as VendorRateLimitWindow};
+use crate::protocol::notifications::{
+    CreditsSnapshot, RateLimitResetCreditsSummary, RateLimitSnapshot,
+    RateLimitWindow as VendorRateLimitWindow,
+};
 
 /// The vendor's own label for the shorter window.
 const PRIMARY_LABEL: &str = "primary";
@@ -38,17 +43,84 @@ pub fn to_account_limits(snapshot: &RateLimitSnapshot, observed_at: SystemTime) 
     .filter_map(|(label, window)| window.map(|window| to_window(label, window)))
     .collect();
 
-    AccountLimits {
-        windows,
-        plan_type: snapshot.plan_type.clone(),
-        observed_at,
+    let mut limits = AccountLimits::unknown(observed_at);
+    limits.windows = windows;
+    limits.plan_type = snapshot.plan_type.clone();
+    limits.credits = snapshot.credits.as_ref().map(to_credits);
+    limits.spend_control = to_spend_control(snapshot);
+    limits
+}
+
+/// The earned rate-limit resets a full `account/rateLimits/read` reported, as the core models
+/// them. A negative count is not a count and reads as zero; timestamps are Unix seconds.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_codex::protocol::RateLimitResetCreditsSummary;
+/// use mango_agent_codex::rate_limits::to_reset_credits;
+///
+/// let summary: RateLimitResetCreditsSummary =
+///     serde_json::from_value(serde_json::json!({"availableCount": 2, "credits": null})).unwrap();
+/// let resets = to_reset_credits(&summary);
+/// assert_eq!(resets.available_count, 2);
+/// assert!(resets.credits.is_none());
+/// ```
+#[must_use]
+pub fn to_reset_credits(summary: &RateLimitResetCreditsSummary) -> ResetCredits {
+    let mut resets = ResetCredits::new(u64::try_from(summary.available_count).unwrap_or(0));
+    resets.credits = summary.credits.as_ref().map(|credits| {
+        credits
+            .iter()
+            .map(|credit| {
+                let mut row = ResetCredit::new(credit.id.clone(), credit.status.clone());
+                row.reset_type = credit.reset_type.clone().filter(|kind| !kind.is_empty());
+                row.granted_at = credit.granted_at.and_then(unix_seconds);
+                row.expires_at = credit.expires_at.and_then(unix_seconds);
+                row.title = credit.title.clone().filter(|title| !title.is_empty());
+                row.description = credit
+                    .description
+                    .clone()
+                    .filter(|description| !description.is_empty());
+                row
+            })
+            .collect()
+    });
+    resets
+}
+
+fn to_credits(credits: &CreditsSnapshot) -> Credits {
+    let mut mapped = Credits::default();
+    mapped.has_credits = Some(credits.has_credits);
+    mapped.unlimited = Some(credits.unlimited);
+    mapped.balance = credits
+        .balance
+        .clone()
+        .filter(|balance| !balance.is_empty());
+    mapped
+}
+
+/// The spend-control state, or nothing when the server reported neither a limit nor whether it
+/// is reached: `null` there is unavailable, not a recovery.
+fn to_spend_control(snapshot: &RateLimitSnapshot) -> Option<SpendControl> {
+    if snapshot.individual_limit.is_none() && snapshot.spend_control_reached.is_none() {
+        return None;
     }
+    let mut spend = SpendControl::default();
+    if let Some(limit) = &snapshot.individual_limit {
+        spend.limit = Some(limit.limit.clone()).filter(|text| !text.is_empty());
+        spend.used = Some(limit.used.clone()).filter(|text| !text.is_empty());
+        spend.remaining_percent = limit.remaining_percent;
+        spend.resets_at = limit.resets_at.and_then(unix_seconds);
+    }
+    spend.reached = snapshot.spend_control_reached;
+    Some(spend)
 }
 
 /// A sparse `account/rateLimits/updated` snapshot, laid over the last full reading.
 ///
-/// The update may carry only what changed. A window or plan it leaves out, or sends as `null`,
-/// keeps the baseline's value — an explicit `null` is not a reading that the window went away —
+/// The update may carry only what changed. A window, plan, credit snapshot, spend-control limit
+/// or reached flag it leaves out, or sends as `null`, keeps the baseline's value — an explicit `null` is not a reading that the window went away —
 /// and a present value overwrites it. Inside a present window, `usedPercent` always overwrites
 /// (the vendor declares it required) while a `null` duration or reset time keeps the baseline's.
 ///
@@ -78,7 +150,30 @@ pub fn merge(baseline: &RateLimitSnapshot, update: &RateLimitSnapshot) -> RateLi
             .plan_type
             .clone()
             .or_else(|| baseline.plan_type.clone()),
+        credits: merge_credits(baseline.credits.as_ref(), update.credits.as_ref()),
+        individual_limit: update
+            .individual_limit
+            .clone()
+            .or_else(|| baseline.individual_limit.clone()),
+        spend_control_reached: update
+            .spend_control_reached
+            .or(baseline.spend_control_reached),
     }
+}
+
+/// Credits the update sent overwrite; a `null` balance keeps the baseline's.
+fn merge_credits(
+    baseline: Option<&CreditsSnapshot>,
+    update: Option<&CreditsSnapshot>,
+) -> Option<CreditsSnapshot> {
+    let Some(update) = update else {
+        return baseline.cloned();
+    };
+    let mut merged = update.clone();
+    if merged.balance.is_none() {
+        merged.balance = baseline.and_then(|baseline| baseline.balance.clone());
+    }
+    Some(merged)
 }
 
 fn merge_window(
@@ -218,6 +313,111 @@ mod tests {
         assert_eq!(primary.resets_at, Some(1500));
         assert_eq!(merged.secondary, baseline.secondary);
         assert_eq!(merged.plan_type.as_deref(), Some("plus"));
+    }
+
+    /// The recorded read's shape: credits and a reached flag, no individual limit.
+    #[test]
+    fn credits_and_spend_control_map_with_absence_kept_absent() {
+        let limits = to_account_limits(
+            &snapshot(serde_json::json!({
+                "credits": {"balance": "12.5", "hasCredits": true, "unlimited": false},
+                "individualLimit": null, "spendControlReached": false
+            })),
+            observed_at(),
+        );
+        let credits = limits.credits.expect("expected credits");
+        assert_eq!(credits.balance.as_deref(), Some("12.5"));
+        assert_eq!(credits.has_credits, Some(true));
+        let spend = limits.spend_control.expect("expected spend control");
+        assert_eq!((spend.reached, spend.limit), (Some(false), None));
+
+        let silent = to_account_limits(&snapshot(serde_json::json!({})), observed_at());
+        assert!(silent.credits.is_none() && silent.spend_control.is_none());
+    }
+
+    #[test]
+    fn an_individual_limit_carries_its_amounts_and_reset_time() {
+        let limits = to_account_limits(
+            &snapshot(serde_json::json!({
+                "individualLimit": {"limit": "100", "used": "40", "remainingPercent": 60.0,
+                                    "resetsAt": 1789301053},
+                "spendControlReached": null
+            })),
+            observed_at(),
+        );
+        let spend = limits.spend_control.expect("expected spend control");
+        assert_eq!(spend.limit.as_deref(), Some("100"));
+        assert_eq!(spend.used.as_deref(), Some("40"));
+        assert_eq!(spend.remaining_percent, Some(60.0));
+        assert_eq!(
+            spend.resets_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_301_053))
+        );
+        assert_eq!(spend.reached, None, "expected null to stay unavailable");
+    }
+
+    /// Sparse updates: credits, the limit and the reached flag follow the same rules as windows.
+    #[test]
+    fn credits_and_spend_control_merge_like_every_other_field() {
+        let baseline = snapshot(serde_json::json!({
+            "credits": {"balance": "12.5", "hasCredits": true, "unlimited": false},
+            "individualLimit": {"limit": "100", "used": "40", "remainingPercent": 60.0,
+                                "resetsAt": 1000},
+            "spendControlReached": false
+        }));
+        let kept = super::merge(
+            &baseline,
+            &snapshot(serde_json::json!({
+                "credits": null, "individualLimit": null, "spendControlReached": null
+            })),
+        );
+        assert_eq!(kept.credits, baseline.credits);
+        assert_eq!(kept.individual_limit, baseline.individual_limit);
+        assert_eq!(kept.spend_control_reached, Some(false));
+
+        let moved = super::merge(
+            &baseline,
+            &snapshot(serde_json::json!({
+                "credits": {"balance": null, "hasCredits": false, "unlimited": false},
+                "spendControlReached": true
+            })),
+        );
+        let credits = moved.credits.expect("expected credits");
+        assert!(
+            !credits.has_credits,
+            "expected the update's flag to overwrite"
+        );
+        assert_eq!(
+            credits.balance.as_deref(),
+            Some("12.5"),
+            "expected a null balance to keep the baseline's"
+        );
+        assert_eq!(moved.spend_control_reached, Some(true));
+        assert_eq!(moved.individual_limit, baseline.individual_limit);
+    }
+
+    #[test]
+    fn reset_credits_keep_the_count_authoritative_and_the_rows_as_reported() {
+        let summary: crate::protocol::notifications::RateLimitResetCreditsSummary =
+            serde_json::from_value(serde_json::json!({"availableCount": 5, "credits": [
+                {"id": "r-1", "resetType": "codexRateLimits", "status": "available",
+                 "grantedAt": 1787352411, "expiresAt": null, "title": null, "description": ""}
+            ]}))
+            .expect("expected a summary");
+        let resets = super::to_reset_credits(&summary);
+        assert_eq!(resets.available_count, 5);
+        let rows = resets.credits.expect("expected rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].expires_at, None);
+        assert_eq!(
+            rows[0].description, None,
+            "expected empty text to read as absent"
+        );
+
+        let negative: crate::protocol::notifications::RateLimitResetCreditsSummary =
+            serde_json::from_value(serde_json::json!({"availableCount": -3}))
+                .expect("expected a summary");
+        assert_eq!(super::to_reset_credits(&negative).available_count, 0);
     }
 
     #[test]

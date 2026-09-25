@@ -538,7 +538,7 @@ struct QuotaState {
     /// The last full `account/rateLimits/read`, merged forward by sparse updates.
     ///
     /// `None` until a read answers: a sparse update alone is not a reading worth showing.
-    baseline: Option<RateLimitSnapshot>,
+    baseline: Option<QuotaReading>,
     /// Updates that arrived while a read was in flight, merged in arrival order.
     ///
     /// The notification worker and the task awaiting the read run separately, so these may be
@@ -553,19 +553,41 @@ struct QuotaState {
     adopted_read: u64,
 }
 
+/// One quota reading, kept whole so windows and resets are always reported together.
+#[derive(Clone)]
+struct QuotaReading {
+    /// The snapshot, merged forward by sparse updates.
+    snapshot: RateLimitSnapshot,
+    /// The earned resets the adopted read reported. Only a full read carries them, so sparse
+    /// updates leave them as they are.
+    resets: Option<crate::protocol::notifications::RateLimitResetCreditsSummary>,
+}
+
+impl QuotaReading {
+    /// This reading as the core models it, bounded as a streamed reading would be.
+    fn to_account_limits(&self, observed_at: SystemTime) -> mango_external_agents::AccountLimits {
+        let mut limits = crate::rate_limits::to_account_limits(&self.snapshot, observed_at);
+        limits.reset_credits = self
+            .resets
+            .as_ref()
+            .map(crate::rate_limits::to_reset_credits);
+        limits.normalized()
+    }
+}
+
 /// How one full quota read settled.
 enum QuotaRead {
     /// Its answer, with pending updates laid over it, is the new baseline.
-    Adopted(RateLimitSnapshot),
+    Adopted(QuotaReading),
     /// A read sent after it was already adopted; the baseline it leaves is that fresher one.
-    Stale(Option<RateLimitSnapshot>),
+    Stale(Option<QuotaReading>),
     /// It returned no snapshot.
     Unanswered,
 }
 
 impl QuotaRead {
     /// The baseline a caller should report after this read.
-    fn baseline(self) -> Option<RateLimitSnapshot> {
+    fn baseline(self) -> Option<QuotaReading> {
         match self {
             Self::Adopted(baseline) => Some(baseline),
             Self::Stale(baseline) => baseline,
@@ -1111,7 +1133,10 @@ impl Shared {
                 }
                 return;
             };
-            let merged = crate::rate_limits::merge(current, update);
+            let merged = QuotaReading {
+                snapshot: crate::rate_limits::merge(&current.snapshot, update),
+                resets: current.resets.clone(),
+            };
             quota.baseline = Some(merged.clone());
             merged
         };
@@ -1132,15 +1157,28 @@ impl Shared {
     /// baseline — unless a read sent after it was already adopted, in which case this answer is
     /// older than the baseline and is dropped. Pending updates are kept while another read is
     /// still in flight, so the last one to answer sees them too, and dropped with the last read.
-    async fn finish_quota_read(&self, read: u64, answer: Option<&RateLimitSnapshot>) -> QuotaRead {
+    async fn finish_quota_read(
+        &self,
+        read: u64,
+        response: Option<&RateLimitsReadResponse>,
+    ) -> QuotaRead {
+        // The snapshot and the resets are independently optional: a read with resets and no
+        // snapshot is still a reading, with no windows.
+        let resets = response.and_then(|response| response.rate_limit_reset_credits.clone());
+        let answer = response
+            .and_then(|response| response.rate_limits.clone())
+            .or_else(|| resets.as_ref().map(|_| RateLimitSnapshot::default()));
         let mut quota = self.quota.lock().await;
         quota.reads_in_flight = quota.reads_in_flight.saturating_sub(1);
-        let adopted = match answer {
+        let adopted = match &answer {
             Some(answer) if read > quota.adopted_read => {
                 quota.adopted_read = read;
-                let merged = match quota.pending.as_ref() {
-                    Some(pending) => crate::rate_limits::merge(answer, pending),
-                    None => answer.clone(),
+                let merged = QuotaReading {
+                    snapshot: match quota.pending.as_ref() {
+                        Some(pending) => crate::rate_limits::merge(answer, pending),
+                        None => answer.clone(),
+                    },
+                    resets,
                 };
                 quota.baseline = Some(merged.clone());
                 Some(merged)
@@ -1177,8 +1215,7 @@ impl Shared {
                     empty_params(),
                 )
                 .await;
-            let answer = read.ok().and_then(|response| response.rate_limits);
-            let settled = shared.finish_quota_read(sequence, answer.as_ref()).await;
+            let settled = shared.finish_quota_read(sequence, read.ok().as_ref()).await;
             // A later update may ask again, whether this one answered or not.
             shared.baseline_requested.store(false, Ordering::Release);
             // Only a newly adopted reading is news to the turn; a stale answer changed nothing.
@@ -1189,8 +1226,8 @@ impl Shared {
     }
 
     /// Puts one quota reading on the running turn's stream, when a turn is running.
-    async fn report_limits(&self, snapshot: &RateLimitSnapshot) {
-        let limits = crate::rate_limits::to_account_limits(snapshot, self.host.now());
+    async fn report_limits(&self, reading: &QuotaReading) {
+        let limits = reading.to_account_limits(self.host.now());
         let _ = self.emit(EventKind::AccountLimits { limits }).await;
     }
 
@@ -3982,23 +4019,16 @@ impl Session for CodexSession {
             .client
             .request::<_, RateLimitsReadResponse>(method::ACCOUNT_RATE_LIMITS_READ, empty_params())
             .await;
-        let answer = response
-            .as_ref()
-            .ok()
-            .and_then(|response| response.rate_limits.clone());
         let merged = self
             .shared
-            .finish_quota_read(sequence, answer.as_ref())
+            .finish_quota_read(sequence, response.as_ref().ok())
             .await
             .baseline();
         response?;
-        Ok(AccountUsage {
-            // Absence is unknown, never an empty quota: a server that answered without a snapshot
-            // has not told us the account is unmetered.
-            limits: merged.as_ref().map(|snapshot| {
-                crate::rate_limits::to_account_limits(snapshot, self.shared.host.now())
-            }),
-        })
+        // Absence is unknown, never an empty quota: a server that answered without a snapshot
+        // has not told us the account is unmetered.
+        let limits = merged.map(|reading| reading.to_account_limits(self.shared.host.now()));
+        Ok(AccountUsage { limits })
     }
 }
 

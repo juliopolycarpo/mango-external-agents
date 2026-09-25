@@ -478,6 +478,20 @@ that failed are dropped with it rather than laid over a later one. Reads are num
 sent, and a read that answers after a later one was adopted is older than the baseline and is
 dropped rather than rewinding it.
 
+Beyond the windows and the plan, a reading carries what the documented `account/rateLimits/read`
+reports about the rest of the account's quota ([app-server][app-server]):
+
+| Vendor field                                        | `AccountLimits`                                                                      |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `rateLimits.credits`                                | `credits: Credits { has_credits, unlimited, balance }`                               |
+| `rateLimits.individualLimit`, `spendControlReached` | `spend_control: SpendControl { limit, used, remaining_percent, resets_at, reached }` |
+| `rateLimitResetCredits`                             | `reset_credits: ResetCredits { available_count, credits }`                           |
+
+Absence stays absent: a `null` spend-control state is unavailable rather than recovered, and
+`reset_credits.credits` is `None` when only the count is known. Credits and spend control merge
+like the windows — a `null` credit balance or reached flag keeps the baseline's. Reset credits are
+reported only by a full read, so a sparse update leaves the last read's in place.
+
 ## Transports
 
 `stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket, and its README

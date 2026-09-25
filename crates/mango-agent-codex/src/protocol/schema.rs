@@ -415,6 +415,35 @@ mod tests {
         );
         assert_declares("RateLimitSnapshot", &["primary", "secondary", "planType"]);
         assert_declares("AccountRateLimitsUpdatedNotification", &["rateLimits"]);
+        assert_declares(
+            "RateLimitSnapshot",
+            &["credits", "individualLimit", "spendControlReached"],
+        );
+        assert_declares("CreditsSnapshot", &["hasCredits", "unlimited", "balance"]);
+        assert_declares(
+            "SpendControlLimitSnapshot",
+            &["limit", "used", "remainingPercent", "resetsAt"],
+        );
+        assert_declares(
+            "GetAccountRateLimitsResponse",
+            &["rateLimits", "rateLimitResetCredits"],
+        );
+        assert_declares(
+            "RateLimitResetCreditsSummary",
+            &["availableCount", "credits"],
+        );
+        assert_declares(
+            "RateLimitResetCredit",
+            &[
+                "id",
+                "resetType",
+                "status",
+                "grantedAt",
+                "expiresAt",
+                "title",
+                "description",
+            ],
+        );
     }
 
     #[test]

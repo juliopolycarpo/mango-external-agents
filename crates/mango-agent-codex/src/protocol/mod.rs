@@ -29,10 +29,11 @@ pub use approvals::{
 };
 pub use items::{CommandExecutionStatus, ItemStatus, ThreadItem};
 pub use notifications::{
-    AgentMessageDelta, CommandOutputDelta, ErrorNotification, FileChangePatchUpdated,
-    ItemNotification, McpToolCallProgress, Notification, RateLimitSnapshot, RateLimitWindow,
-    ReasoningDelta, ServerRequestResolved, ThreadStarted, ThreadTokenUsage, TokenUsageBreakdown,
-    TurnNotification, TurnTokenUsage,
+    AgentMessageDelta, CommandOutputDelta, CreditsSnapshot, ErrorNotification,
+    FileChangePatchUpdated, ItemNotification, McpToolCallProgress, Notification,
+    RateLimitResetCredit, RateLimitResetCreditsSummary, RateLimitSnapshot, RateLimitWindow,
+    ReasoningDelta, ServerRequestResolved, SpendControlLimitSnapshot, ThreadStarted,
+    ThreadTokenUsage, TokenUsageBreakdown, TurnNotification, TurnTokenUsage,
 };
 pub use requests::{
     Account, AccountReadResponse, AskForApproval, ClientInfo, InitializeParams, InitializeResponse,
