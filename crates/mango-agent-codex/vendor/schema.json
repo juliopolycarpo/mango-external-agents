@@ -51,6 +51,30 @@
         "version"
       ]
     },
+    "CodexErrorInfo": {
+      "properties": [
+        "activeTurnNotSteerable",
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts"
+      ],
+      "values": [
+        "badRequest",
+        "contextWindowExceeded",
+        "cyberPolicy",
+        "internalServerError",
+        "misalignmentPolicyViolation",
+        "other",
+        "rateLimitExceeded",
+        "sandboxError",
+        "serverOverloaded",
+        "sessionBudgetExceeded",
+        "threadRollbackFailed",
+        "unauthorized",
+        "usageLimitExceeded"
+      ]
+    },
     "CommandExecutionApprovalDecision": {
       "properties": [
         "acceptWithExecpolicyAmendment",
@@ -61,6 +85,14 @@
         "acceptForSession",
         "cancel",
         "decline"
+      ]
+    },
+    "CommandExecutionOutputDeltaNotification": {
+      "properties": [
+        "delta",
+        "itemId",
+        "threadId",
+        "turnId"
       ]
     },
     "CommandExecutionRequestApprovalParams": {
@@ -110,6 +142,14 @@
         "decline"
       ]
     },
+    "FileChangePatchUpdatedNotification": {
+      "properties": [
+        "changes",
+        "itemId",
+        "threadId",
+        "turnId"
+      ]
+    },
     "FileChangeRequestApprovalParams": {
       "properties": [
         "grantRoot",
@@ -123,6 +163,13 @@
     "FileChangeRequestApprovalResponse": {
       "properties": [
         "decision"
+      ]
+    },
+    "FileUpdateChange": {
+      "properties": [
+        "diff",
+        "kind",
+        "path"
       ]
     },
     "GetAccountParams": {
@@ -199,6 +246,14 @@
         "content"
       ]
     },
+    "McpToolCallProgressNotification": {
+      "properties": [
+        "itemId",
+        "message",
+        "threadId",
+        "turnId"
+      ]
+    },
     "McpToolCallStatus": {
       "values": [
         "completed",
@@ -253,6 +308,26 @@
       "values": [
         "session",
         "turn"
+      ]
+    },
+    "PermissionProfileListParams": {
+      "properties": [
+        "cursor",
+        "cwd",
+        "limit"
+      ]
+    },
+    "PermissionProfileListResponse": {
+      "properties": [
+        "data",
+        "nextCursor"
+      ]
+    },
+    "PermissionProfileSummary": {
+      "properties": [
+        "allowed",
+        "description",
+        "id"
       ]
     },
     "PermissionsRequestApprovalParams": {
@@ -373,6 +448,12 @@
       "properties": [
         "requestId",
         "threadId"
+      ]
+    },
+    "SortDirection": {
+      "values": [
+        "asc",
+        "desc"
       ]
     },
     "Thread": {
@@ -551,6 +632,28 @@
         "serviceTier",
         "thread",
         "turnsBackwardsCursor"
+      ]
+    },
+    "ThreadSortKey": {
+      "values": [
+        "created_at",
+        "recency_at",
+        "section_position",
+        "updated_at"
+      ]
+    },
+    "ThreadSourceKind": {
+      "values": [
+        "appServer",
+        "cli",
+        "exec",
+        "subAgent",
+        "subAgentCompact",
+        "subAgentOther",
+        "subAgentReview",
+        "subAgentThreadSpawn",
+        "unknown",
+        "vscode"
       ]
     },
     "ThreadStartParams": {
@@ -765,6 +868,7 @@
       "account/read",
       "initialize",
       "model/list",
+      "permissionProfile/list",
       "review/start",
       "thread/list",
       "thread/read",
@@ -778,7 +882,10 @@
       "account/rateLimits/updated",
       "error",
       "item/agentMessage/delta",
+      "item/commandExecution/outputDelta",
       "item/completed",
+      "item/fileChange/patchUpdated",
+      "item/mcpToolCall/progress",
       "item/reasoning/summaryTextDelta",
       "item/reasoning/textDelta",
       "item/started",
