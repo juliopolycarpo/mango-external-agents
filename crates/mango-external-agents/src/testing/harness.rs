@@ -70,6 +70,7 @@ pub struct FakeHarness {
     publishes_session_updates: bool,
     over_advertises: bool,
     approval_before_question: bool,
+    over_advertises_review: bool,
 }
 
 impl Default for FakeHarness {
@@ -92,13 +93,14 @@ impl FakeHarness {
     /// ```
     pub fn new() -> Self {
         let mut harness = Self {
-            descriptor: Arc::new(Self::descriptor_for(true, false)),
+            descriptor: Arc::new(Self::descriptor_for(true, false, false)),
             asks_for_approval: true,
             asks_a_question: false,
             rejects_answers: false,
             publishes_session_updates: true,
             over_advertises: false,
             approval_before_question: false,
+            over_advertises_review: false,
         };
         harness.redeclare();
         harness
@@ -109,7 +111,7 @@ impl FakeHarness {
     /// Split out because the declaration has to follow the behaviour: the conformance suite fails
     /// a harness that advertises an interaction and then never raises one, so a fake hard-coding
     /// `questions: true` while its turns ask nothing would be the first thing that suite caught.
-    fn descriptor_for(approvals: bool, questions: bool) -> HarnessDescriptor {
+    fn descriptor_for(approvals: bool, questions: bool, native_review: bool) -> HarnessDescriptor {
         HarnessDescriptor {
             identity: HarnessIdentity::claude(),
             vendor: VENDOR,
@@ -124,6 +126,7 @@ impl FakeHarness {
                 configuration: true,
                 session_configuration: true,
                 configuration_catalog: true,
+                native_review,
                 ..Capabilities::none()
             }),
             transports: &[TransportKind::Stdio],
@@ -141,7 +144,11 @@ impl FakeHarness {
         } else {
             (self.asks_for_approval, self.asks_a_question)
         };
-        self.descriptor = Arc::new(Self::descriptor_for(approvals, questions));
+        self.descriptor = Arc::new(Self::descriptor_for(
+            approvals,
+            questions,
+            self.over_advertises_review,
+        ));
     }
 
     /// The same harness with turns that never ask for anything.
@@ -192,6 +199,18 @@ impl FakeHarness {
         self.asks_for_approval = false;
         self.asks_a_question = false;
         self.over_advertises = true;
+        self.redeclare();
+        self
+    }
+
+    /// The same harness declaring a native review its sessions do not serve.
+    ///
+    /// Its sessions keep the default [`Session::start_review`], which refuses as unsupported. A
+    /// host that read the descriptor would offer a review action that can never start, so this is
+    /// the shape the conformance suite has to fail rather than pass.
+    #[must_use]
+    pub fn advertising_a_review_it_does_not_serve(mut self) -> Self {
+        self.over_advertises_review = true;
         self.redeclare();
         self
     }
