@@ -229,7 +229,22 @@ mod tests {
         assert_declares("Thread", &["id", "preview", "name", "cwd", "updatedAt"]);
         assert_declares("ThreadReadParams", &["threadId", "includeTurns"]);
         assert_declares("ThreadReadResponse", &["thread"]);
-        assert_declares("ThreadListParams", &["cursor", "limit", "cwd"]);
+        assert_declares(
+            "ThreadListParams",
+            &[
+                "cursor",
+                "limit",
+                "cwd",
+                "sortKey",
+                "sortDirection",
+                "sourceKinds",
+                "archived",
+            ],
+        );
+        assert_declares("Thread", &["recencyAt"]);
+        assert_accepts("ThreadSortKey", &["recency_at"]);
+        assert_accepts("SortDirection", &["desc"]);
+        assert_accepts("ThreadSourceKind", &["cli", "exec", "appServer"]);
         assert_declares("ThreadListResponse", &["data", "nextCursor"]);
     }
 

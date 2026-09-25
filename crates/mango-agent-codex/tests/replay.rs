@@ -4284,6 +4284,69 @@ async fn listing_discards_rows_outside_the_authorized_workspace() {
     assert_eq!(page.sessions[0].preview.as_deref(), Some("allowed"));
 }
 
+/// A picker is sorted by when a conversation was last used, lists the threads a person started
+/// from the CLI, `codex exec` or an app-server client, and leaves archived ones out. The vendor's
+/// own defaults are creation order and interactive sources only, so each is asked for explicitly.
+#[tokio::test]
+async fn the_picker_asks_for_recent_user_threads_and_dates_them_by_recency() {
+    let workspace = workspace_path().to_string_lossy().into_owned();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        Transcript::load("handshake").as_process_intercepting(move |frame| {
+            (frame["method"] == "thread/list").then(|| {
+                vec![
+                    serde_json::json!({"id": frame["id"], "result": {"data": [
+                        {"id": "recent", "preview": "p", "cwd": workspace,
+                         "createdAt": 100, "updatedAt": 200, "recencyAt": 300},
+                        {"id": "older-build", "preview": "q", "cwd": workspace,
+                         "createdAt": 100, "updatedAt": 250, "recencyAt": null}
+                    ], "nextCursor": null}})
+                    .to_string(),
+                ]
+            })
+        }),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+    let page = CodexHarness::new()
+        .list_sessions(&host, SessionQuery::default())
+        .await
+        .expect("expected a picker page");
+
+    let asked: serde_json::Value = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("thread/list"))
+        .and_then(|line| serde_json::from_str(&line).ok())
+        .expect("expected a thread/list frame");
+    let params = &asked["params"];
+    assert_eq!(
+        (
+            &params["sortKey"],
+            &params["sortDirection"],
+            &params["sourceKinds"],
+            &params["archived"],
+        ),
+        (
+            &serde_json::json!("recency_at"),
+            &serde_json::json!("desc"),
+            &serde_json::json!(["cli", "exec", "appServer"]),
+            &serde_json::json!(false),
+        ),
+        "expected an explicit recency sort, user sources and no archived threads, received {params}"
+    );
+    let seconds = |row: usize| {
+        page.sessions[row]
+            .updated_at
+            .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+    };
+    assert_eq!(
+        (seconds(0), seconds(1)),
+        (Some(300), Some(250)),
+        "expected recencyAt, falling back to updatedAt"
+    );
+}
+
 /// A responsive app-server that leaves the picker request unanswered.
 struct UnansweredListServer;
 

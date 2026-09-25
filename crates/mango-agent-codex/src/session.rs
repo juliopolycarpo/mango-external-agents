@@ -3645,11 +3645,7 @@ pub(crate) async fn list_threads(
 ) -> Result<SessionPage> {
     validate_list_workspace(host, &query)?;
     let cwd = host.absolute_cwd()?;
-    let params = ThreadListParams {
-        cursor: query.cursor,
-        limit: query.limit,
-        cwd: Some(cwd.to_owned()),
-    };
+    let params = ThreadListParams::picker(query.cursor, query.limit, cwd);
     let page: ThreadListResponse = client.request(method::THREAD_LIST, params).await?;
     if let Some(limit) = query.limit
         && page.data.len() > limit
@@ -3666,17 +3662,17 @@ pub(crate) async fn list_threads(
             .into_iter()
             .filter(|thread| thread.cwd.as_deref() == Some(cwd))
             .map(|thread| NativeSession {
-                native_session_id: thread.id,
-                // A title may be absent; the preview is the first user message when supplied.
-                title: thread.name.filter(|name| !name.is_empty()),
-                preview: Some(thread.preview).filter(|preview| !preview.is_empty()),
-                workspace_path: thread.cwd,
-                updated_at: thread.updated_at.and_then(|seconds| {
+                updated_at: thread.last_used_at().and_then(|seconds| {
                     u64::try_from(seconds).ok().and_then(|seconds| {
                         std::time::SystemTime::UNIX_EPOCH
                             .checked_add(std::time::Duration::from_secs(seconds))
                     })
                 }),
+                native_session_id: thread.id,
+                // A title may be absent; the preview is the first user message when supplied.
+                title: thread.name.filter(|name| !name.is_empty()),
+                preview: Some(thread.preview).filter(|preview| !preview.is_empty()),
+                workspace_path: thread.cwd,
             })
             .collect(),
         next_cursor: page.next_cursor,

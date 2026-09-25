@@ -55,7 +55,13 @@ connection. Both paths require an absolute, lexically normalized UTF-8 host work
 the `cwd` filter and refuse a query for another directory. Codex refuses that host configuration
 before it launches `codex --version` or an app-server, without canonicalizing the path or reading
 the filesystem. The vendor's cursor, native id, title, preview and Unix
-second timestamps pass through when supplied. Rows with missing or foreign workspace paths are
+second timestamps pass through when supplied. Every listing states its filters rather than
+inheriting the server's defaults, which are creation order and interactive sources only
+([`thread/list`][app-server]): `sortKey: "recency_at"`, `sortDirection: "desc"`,
+`sourceKinds: ["cli", "exec", "appServer"]` and `archived: false`. `vscode` is left out because an
+editor-owned thread has a live owner the host cannot see, and the subagent kinds are Codex's own
+machinery. A row's timestamp is its `recencyAt`, falling back to `updatedAt` for a build that
+leaves it null. Rows with missing or foreign workspace paths are
 discarded even if the server returns them under the `cwd` filter. Before `thread/resume`, the
 harness calls `thread/read` with `includeTurns: false` and requires its native id and original
 working directory to match the request and the host's authorised directory. It checks the resume
