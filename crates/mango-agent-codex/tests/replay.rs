@@ -2967,6 +2967,93 @@ async fn a_steer_adopts_the_continuation_turn_id_the_server_answers_with() {
         .expect("expected cleanup");
 }
 
+/// The steer's answer and the continuation's first frames can arrive back to back, and the
+/// notification worker may reach those frames before the steer task has adopted the new id. They
+/// must still be this turn's, in order, and the continuation's completion must end the stream.
+#[tokio::test]
+async fn frames_right_behind_a_steer_answer_belong_to_the_continuation() {
+    for round in 0..20 {
+        let thread = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+        let answer_thread = std::sync::Arc::clone(&thread);
+        let mut running = AnnouncedTurn::open_answering(replay_limits(), move |frame| {
+            let mut lines = steer_answer(frame, Some("continued-turn"))?;
+            let thread_id = answer_thread.get().cloned().unwrap_or_default();
+            lines.push(
+                serde_json::json!({"method": "item/agentMessage/delta", "params": {
+                    "threadId": thread_id, "turnId": "continued-turn", "itemId": "m",
+                    "delta": "after"}})
+                .to_string(),
+            );
+            lines.push(
+                serde_json::json!({"method": "turn/completed", "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": "continued-turn", "status": "completed"}}})
+                .to_string(),
+            );
+            Some(lines)
+        })
+        .await;
+        let _ = thread.set(running.thread_id.clone());
+        let outcome = running
+            .session
+            .steer(AnnouncedTurn::steer("also this"))
+            .await
+            .expect("expected a steer outcome");
+        assert_eq!(outcome, mango_external_agents::SteerOutcome::Accepted);
+        let events = drain(&mut running.turn).await;
+        assert_eq!(
+            answer_text(&events),
+            "after",
+            "expected the continuation's delta in round {round}, received {events:#?}"
+        );
+        assert!(
+            matches!(events.last(), Some(EventKind::Completed)),
+            "expected the continuation's completion to end round {round}, received {events:#?}"
+        );
+        running
+            .session
+            .close(CloseReason::Shutdown)
+            .await
+            .expect("expected cleanup");
+    }
+}
+
+/// The host never learns a continuation id, so the id it was given at `TurnStarted` has to keep
+/// addressing the turn however many continuations follow.
+#[tokio::test]
+async fn the_announced_turn_id_still_steers_after_many_continuations() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let answer_counter = Arc::clone(&counter);
+    let running = AnnouncedTurn::open_answering(replay_limits(), move |frame| {
+        if frame.get("method") != Some(&serde_json::json!("turn/steer")) {
+            return None;
+        }
+        let next = answer_counter.fetch_add(1, Ordering::AcqRel);
+        steer_answer(frame, Some(&format!("continued-{next}")))
+    })
+    .await;
+    for round in 0..40 {
+        let outcome = running
+            .session
+            .steer(AnnouncedTurn::steer("more"))
+            .await
+            .expect("expected a steer outcome");
+        assert_eq!(
+            outcome,
+            mango_external_agents::SteerOutcome::Accepted,
+            "expected the announced id to steer in round {round}"
+        );
+    }
+    assert_eq!(
+        running
+            .steers()
+            .last()
+            .map(|frame| &frame["params"]["expectedTurnId"]),
+        Some(&serde_json::json!("continued-38")),
+        "expected the last steer to address the latest continuation"
+    );
+}
+
 /// Two steers issued together must not both read the turn id before either answer arrives: the
 /// first can move the turn to a continuation id the second would then miss.
 #[tokio::test]
