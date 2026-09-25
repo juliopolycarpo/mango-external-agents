@@ -361,19 +361,27 @@ impl Reducer {
     /// ACP describes `tool_call` as the frame that announces a call, but nothing stops an agent from
     /// sending it again for a call that is still running. A second [`EventKind::ActivityStarted`]
     /// under the same id would give a host two rows for one call, so the repeat arrives as an update
-    /// carrying everything the new frame said. A call that already ended stays ended.
+    /// carrying everything the new frame said, except an empty content or locations collection,
+    /// which leaves the host's copy alone. A call that already ended stays ended.
     fn tool_call(&mut self, call: ToolCall, now: Instant) -> Vec<EventKind> {
         let call_id = call.tool_call_id.to_string();
         if self.finished_calls.contains(&call_id) {
             return Vec::new();
         }
         if self.open_calls.contains_key(&call_id) {
-            let fields = ToolCallUpdateFields::new()
+            // `tool_call` has no way to say "unchanged": an absent collection deserialises as an
+            // empty one. So only a non-empty collection replaces what the host holds; an empty one
+            // on a repeat is the agent saying nothing about it, not clearing it.
+            let mut fields = ToolCallUpdateFields::new()
                 .kind(call.kind)
                 .status(call.status)
-                .title(call.title)
-                .content(call.content)
-                .locations(call.locations);
+                .title(call.title);
+            if !call.content.is_empty() {
+                fields = fields.content(call.content);
+            }
+            if !call.locations.is_empty() {
+                fields = fields.locations(call.locations);
+            }
             return self.tool_call_update(ToolCallUpdate::new(call.tool_call_id, fields), now);
         }
         let finished = finished(call.status).is_some();
@@ -1865,6 +1873,40 @@ mod tests {
             Some(ActivityContent::Output {
                 text: String::from("done")
             })
+        );
+    }
+
+    /// ACP's `tool_call` carries its content collection even when the agent has nothing new to
+    /// say, so a repeated announcement with no content is a status or title change, not an order to
+    /// clear the output. A terminal repeat after held output must leave the host with that output.
+    #[test]
+    fn a_repeat_terminal_tool_call_after_held_output_keeps_the_last_output() {
+        let start = Instant::now();
+        let mut reducer = Reducer::new().with_update_interval(Duration::from_secs(5));
+        let _ = reducer.update_at(update(announced("call_log")), start);
+        let _ = reducer.update_at(update(output("call_log", "first")), start);
+        let _ = reducer.update_at(update(output("call_log", "last")), start);
+        let (events, _) = reducer.update_at(
+            update(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_log",
+                "title": "Tool",
+                "kind": "other",
+                "status": "completed"
+            })),
+            start,
+        );
+        assert_eq!(
+            update_texts(&events),
+            vec![Some(String::from("last"))],
+            "expected the held output delivered before the completion, received {events:?}"
+        );
+        let Some(EventKind::ActivityCompleted { result, .. }) = events.last() else {
+            panic!("expected the repeat to complete the call, received {events:?}");
+        };
+        assert_eq!(
+            result.content, None,
+            "expected the empty repeat not to clear the output, received {result:?}"
         );
     }
 

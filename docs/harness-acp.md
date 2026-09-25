@@ -176,8 +176,9 @@ client never saw announced — a loaded session's in-flight call is one — and 
 only to a call it saw start, so the first frame for an unknown id emits `ActivityStarted` first,
 built from the update's own title and kind (title `tool` when it names none), and then its completion
 when the update is already terminal. A second `tool_call` for a call that is still open arrives as an
-update rather than a second start, and a frame for a call that already ended is dropped: the host
-closed that row.
+update rather than a second start; an empty `content` or `locations` on it leaves the host's copy
+alone, because `tool_call` cannot say "unchanged" any other way. A frame for a call that already
+ended is dropped: the host closed that row.
 
 ACP ends a turn with the `session/prompt` response, not with a frame per call, so a call the agent
 never reported as `completed` or `failed` is closed by the turn's own end, before its terminal and in
