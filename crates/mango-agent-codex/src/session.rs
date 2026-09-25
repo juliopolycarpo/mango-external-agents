@@ -223,6 +223,10 @@ pub(crate) struct Shared {
     /// `None` until an `account/rateLimits/read` answers: a sparse update alone is not a reading
     /// worth showing.
     account_limits: Mutex<Option<RateLimitSnapshot>>,
+    /// Updates that arrived while the baseline read was in flight, merged in arrival order.
+    ///
+    /// They may be newer than the read's answer, so they are laid over it once it lands.
+    pending_limits: Mutex<Option<RateLimitSnapshot>>,
     /// Whether an update already asked for the missing baseline.
     baseline_requested: AtomicBool,
     #[cfg(test)]
@@ -258,6 +262,7 @@ impl Shared {
             steering: Mutex::new(()),
             steer_hold: std::sync::Mutex::new(SteerHold::default()),
             account_limits: Mutex::new(None),
+            pending_limits: Mutex::new(None),
             baseline_requested: AtomicBool::new(false),
             #[cfg(test)]
             resolution_marker_gate: Mutex::new(None),
@@ -1012,6 +1017,16 @@ impl Shared {
         let merged = {
             let mut baseline = self.account_limits.lock().await;
             let Some(current) = baseline.as_ref() else {
+                // The update that asks for the baseline is older than its answer; later ones,
+                // which arrive while the read is in flight, may not be.
+                if self.baseline_requested.load(Ordering::Acquire) {
+                    let mut pending = self.pending_limits.lock().await;
+                    *pending = Some(match pending.as_ref() {
+                        Some(earlier) => crate::rate_limits::merge(earlier, update),
+                        None => update.clone(),
+                    });
+                    return;
+                }
                 drop(baseline);
                 self.request_baseline();
                 return;
@@ -1049,8 +1064,17 @@ impl Shared {
                 shared.baseline_requested.store(false, Ordering::Release);
                 return;
             };
-            shared.adopt_baseline(snapshot.clone()).await;
-            shared.report_limits(&snapshot).await;
+            let merged = {
+                let mut baseline = shared.account_limits.lock().await;
+                let pending = shared.pending_limits.lock().await.take();
+                let merged = pending.map_or_else(
+                    || snapshot.clone(),
+                    |pending| crate::rate_limits::merge(&snapshot, &pending),
+                );
+                *baseline = Some(merged.clone());
+                merged
+            };
+            shared.report_limits(&merged).await;
         });
     }
 

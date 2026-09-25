@@ -3280,6 +3280,68 @@ async fn a_quota_update_before_any_full_reading_reports_a_fresh_full_reading() {
         .expect("expected cleanup");
 }
 
+/// An update that arrives while the baseline is being read is not lost: it is merged onto the
+/// baseline once that answers.
+#[tokio::test]
+async fn a_quota_update_during_the_baseline_read_is_merged_onto_it() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        // The test answers the read itself, after the second update.
+        (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(Vec::new)
+    })
+    .await;
+    let update = |percent: f64| {
+        serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "primary": {"usedPercent": percent}}}})
+        .to_string()
+    };
+    running.announcer.announce(update(30.0));
+    let read_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(id) = running.launcher.written().iter().find_map(|line| {
+                let frame: serde_json::Value = serde_json::from_str(line).ok()?;
+                (frame["method"] == "account/rateLimits/read").then(|| frame["id"].clone())
+            }) {
+                return id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the baseline read on the wire");
+    running.announcer.announce(update(40.0));
+    // Let the second update reach the session before the read answers.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": read_id, "result": {"rateLimits": {
+            "primary": {"usedPercent": 10.0}, "secondary": {"usedPercent": 20.0}}}})
+        .to_string(),
+    );
+    let reading = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = running.turn.recv().await {
+            if let EventKind::AccountLimits { .. } = &event.kind {
+                return Some(event.kind);
+            }
+        }
+        None
+    })
+    .await
+    .expect("expected a quota reading within the deadline")
+    .expect("expected a quota reading on the turn");
+    assert_eq!(
+        quota_readings(&[reading]),
+        vec![vec![
+            (String::from("primary"), 40.0),
+            (String::from("secondary"), 20.0)
+        ]],
+        "expected the update that arrived during the read merged onto its answer"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
 /// A pending approval has its own deadline and does not consume the turn's idle budget.
 #[tokio::test(start_paused = true)]
 async fn a_pending_approval_pauses_the_native_idle_deadline() {
