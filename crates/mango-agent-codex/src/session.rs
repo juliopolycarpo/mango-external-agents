@@ -218,15 +218,8 @@ pub(crate) struct Shared {
     steering: Mutex<()>,
     /// Notifications held, in arrival order, while a steer's answer is being adopted.
     steer_hold: std::sync::Mutex<SteerHold>,
-    /// The account's quota as last read in full and merged forward by sparse updates.
-    ///
-    /// `None` until an `account/rateLimits/read` answers: a sparse update alone is not a reading
-    /// worth showing.
-    account_limits: Mutex<Option<RateLimitSnapshot>>,
-    /// Updates that arrived while the baseline read was in flight, merged in arrival order.
-    ///
-    /// They may be newer than the read's answer, so they are laid over it once it lands.
-    pending_limits: Mutex<Option<RateLimitSnapshot>>,
+    /// The account's quota: the last full reading, and what arrived while a read was in flight.
+    quota: Mutex<QuotaState>,
     /// Whether an update already asked for the missing baseline.
     baseline_requested: AtomicBool,
     #[cfg(test)]
@@ -261,8 +254,7 @@ impl Shared {
             resolution_markers: Mutex::new(ResolutionMarkers::default()),
             steering: Mutex::new(()),
             steer_hold: std::sync::Mutex::new(SteerHold::default()),
-            account_limits: Mutex::new(None),
-            pending_limits: Mutex::new(None),
+            quota: Mutex::new(QuotaState::default()),
             baseline_requested: AtomicBool::new(false),
             #[cfg(test)]
             resolution_marker_gate: Mutex::new(None),
@@ -537,6 +529,24 @@ impl Shared {
             completed.pop_front();
         }
     }
+}
+
+/// The session's quota bookkeeping, under one lock so a read's answer and an update cannot
+/// interleave between checking and merging.
+#[derive(Default)]
+struct QuotaState {
+    /// The last full `account/rateLimits/read`, merged forward by sparse updates.
+    ///
+    /// `None` until a read answers: a sparse update alone is not a reading worth showing.
+    baseline: Option<RateLimitSnapshot>,
+    /// Updates that arrived while a read was in flight, merged in arrival order.
+    ///
+    /// The notification worker and the task awaiting the read run separately, so these may be
+    /// newer than the read's answer and are laid over it when it lands. They belong to reads in
+    /// flight only: when the last one fails, they are dropped rather than laid over a later one.
+    pending: Option<RateLimitSnapshot>,
+    /// Full reads, from the host's refresh or the session's own, not yet answered.
+    reads_in_flight: usize,
 }
 
 /// How many notifications a steer may hold before the session gives up on the connection.
@@ -1057,75 +1067,88 @@ impl Shared {
     ///
     /// With no baseline yet, the update is not shown; instead one `account/rateLimits/read` is
     /// asked for in the background, and its full answer becomes the baseline and the reading
-    /// reported. An update that arrives while that read is outstanding is older than its answer.
+    /// reported. The update that asks is older than that answer; any that arrive while a read is
+    /// in flight may not be, and are laid over its answer.
     async fn rate_limits_updated(self: &Arc<Self>, update: &RateLimitSnapshot) {
         let merged = {
-            let mut baseline = self.account_limits.lock().await;
-            let Some(current) = baseline.as_ref() else {
-                // The update that asks for the baseline is older than its answer; later ones,
-                // which arrive while the read is in flight, may not be.
-                if self.baseline_requested.load(Ordering::Acquire) {
-                    let mut pending = self.pending_limits.lock().await;
-                    *pending = Some(match pending.as_ref() {
-                        Some(earlier) => crate::rate_limits::merge(earlier, update),
-                        None => update.clone(),
-                    });
-                    return;
+            let mut quota = self.quota.lock().await;
+            if quota.reads_in_flight > 0 {
+                quota.pending = Some(match quota.pending.as_ref() {
+                    Some(earlier) => crate::rate_limits::merge(earlier, update),
+                    None => update.clone(),
+                });
+            }
+            let Some(current) = quota.baseline.as_ref() else {
+                let idle = quota.reads_in_flight == 0;
+                drop(quota);
+                if idle {
+                    self.request_baseline();
                 }
-                drop(baseline);
-                self.request_baseline();
                 return;
             };
             let merged = crate::rate_limits::merge(current, update);
-            *baseline = Some(merged.clone());
+            quota.baseline = Some(merged.clone());
             merged
         };
         self.report_limits(&merged).await;
     }
 
-    /// Asks for the full reading a sparse update could not be merged onto, once per session.
+    /// Records that a full read is about to be sent.
+    async fn begin_quota_read(&self) {
+        self.quota.lock().await.reads_in_flight += 1;
+    }
+
+    /// Settles one full read: its answer, with any update that arrived meanwhile laid over it,
+    /// becomes the baseline. A read that returned nothing leaves the baseline alone, and when it
+    /// was the last one in flight its pending updates go with it.
+    async fn finish_quota_read(
+        &self,
+        answer: Option<&RateLimitSnapshot>,
+    ) -> Option<RateLimitSnapshot> {
+        let mut quota = self.quota.lock().await;
+        quota.reads_in_flight = quota.reads_in_flight.saturating_sub(1);
+        let Some(answer) = answer else {
+            if quota.reads_in_flight == 0 {
+                quota.pending = None;
+            }
+            return None;
+        };
+        let merged = match quota.pending.take() {
+            Some(pending) => crate::rate_limits::merge(answer, &pending),
+            None => answer.clone(),
+        };
+        quota.baseline = Some(merged.clone());
+        Some(merged)
+    }
+
+    /// Asks for the full reading a sparse update could not be merged onto, once at a time.
     fn request_baseline(self: &Arc<Self>) {
         if self.baseline_requested.swap(true, Ordering::AcqRel) {
             return;
         }
         let Some(client) = self.client.get().cloned() else {
+            self.baseline_requested.store(false, Ordering::Release);
             return;
         };
         let shared = Arc::clone(self);
         // Detached: the notification handler runs on the connection's reader, which has to keep
         // reading for this request to be answered at all.
         tokio::spawn(async move {
+            shared.begin_quota_read().await;
             let read = client
                 .request::<_, RateLimitsReadResponse>(
                     method::ACCOUNT_RATE_LIMITS_READ,
                     empty_params(),
                 )
                 .await;
-            let Ok(RateLimitsReadResponse {
-                rate_limits: Some(snapshot),
-            }) = read
-            else {
-                // Nothing to merge onto yet; a later update may ask again.
-                shared.baseline_requested.store(false, Ordering::Release);
-                return;
-            };
-            let merged = {
-                let mut baseline = shared.account_limits.lock().await;
-                let pending = shared.pending_limits.lock().await.take();
-                let merged = pending.map_or_else(
-                    || snapshot.clone(),
-                    |pending| crate::rate_limits::merge(&snapshot, &pending),
-                );
-                *baseline = Some(merged.clone());
-                merged
-            };
-            shared.report_limits(&merged).await;
+            let answer = read.ok().and_then(|response| response.rate_limits);
+            let merged = shared.finish_quota_read(answer.as_ref()).await;
+            // A later update may ask again, whether this one answered or not.
+            shared.baseline_requested.store(false, Ordering::Release);
+            if let Some(merged) = merged {
+                shared.report_limits(&merged).await;
+            }
         });
-    }
-
-    /// Replaces the baseline with a full reading.
-    async fn adopt_baseline(&self, snapshot: RateLimitSnapshot) {
-        *self.account_limits.lock().await = Some(snapshot);
     }
 
     /// Puts one quota reading on the running turn's stream, when a turn is running.
@@ -3915,17 +3938,23 @@ impl Session for CodexSession {
     }
 
     async fn refresh_account_usage(&self) -> Result<AccountUsage> {
-        let response: RateLimitsReadResponse = self
+        // The same bookkeeping as the session's own read: an update that lands while this is in
+        // flight is laid over the answer rather than lost to it.
+        self.shared.begin_quota_read().await;
+        let response = self
             .client
-            .request(method::ACCOUNT_RATE_LIMITS_READ, empty_params())
-            .await?;
-        if let Some(snapshot) = &response.rate_limits {
-            self.shared.adopt_baseline(snapshot.clone()).await;
-        }
+            .request::<_, RateLimitsReadResponse>(method::ACCOUNT_RATE_LIMITS_READ, empty_params())
+            .await;
+        let answer = response
+            .as_ref()
+            .ok()
+            .and_then(|response| response.rate_limits.clone());
+        let merged = self.shared.finish_quota_read(answer.as_ref()).await;
+        response?;
         Ok(AccountUsage {
             // Absence is unknown, never an empty quota: a server that answered without a snapshot
             // has not told us the account is unmetered.
-            limits: response.rate_limits.as_ref().map(|snapshot| {
+            limits: merged.as_ref().map(|snapshot| {
                 crate::rate_limits::to_account_limits(snapshot, self.shared.host.now())
             }),
         })

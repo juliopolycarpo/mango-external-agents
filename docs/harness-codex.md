@@ -471,8 +471,10 @@ what changed. The session keeps the last full reading as a baseline: `Session::r
 sets it, and each update is merged onto it before the result reaches the running turn as
 `AccountLimits`. A window or plan the update omits or sends as `null` keeps the baseline's value; a
 present one overwrites it. An update that arrives before any baseline is not shown: the session asks
-for one `account/rateLimits/read` in the background and reports its full answer instead, with any
-update that arrived while that read was in flight merged over it.
+for one `account/rateLimits/read` in the background and reports its full answer instead. Every full
+read — that one or a host's `refresh_account_usage` — has any update that arrived while it was in
+flight merged over its answer, and a refresh returns that merged reading. Updates held for a read
+that failed are dropped with it rather than laid over a later one.
 
 ## Transports
 

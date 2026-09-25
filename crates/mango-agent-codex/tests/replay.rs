@@ -3342,6 +3342,149 @@ async fn a_quota_update_during_the_baseline_read_is_merged_onto_it() {
         .expect("expected cleanup");
 }
 
+/// Waits for the `n`th (0-based) `account/rateLimits/read` the library writes, and its id.
+async fn nth_rate_limits_read(running: &AnnouncedTurn, n: usize) -> serde_json::Value {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let reads: Vec<serde_json::Value> = running
+                .launcher
+                .written()
+                .iter()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|frame| frame["method"] == "account/rateLimits/read")
+                .map(|frame| frame["id"].clone())
+                .collect();
+            if let Some(id) = reads.get(n) {
+                return id.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected rate-limit read {n} on the wire"))
+}
+
+/// The next quota reading a turn reports.
+async fn next_quota(turn: &mut mango_external_agents::TurnStream) -> Vec<(String, f64)> {
+    let reading = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = turn.recv().await {
+            if let EventKind::AccountLimits { .. } = &event.kind {
+                return Some(event.kind);
+            }
+        }
+        None
+    })
+    .await
+    .expect("expected a quota reading within the deadline")
+    .expect("expected a quota reading on the turn");
+    quota_readings(&[reading]).remove(0)
+}
+
+fn primary_update(percent: f64) -> String {
+    serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+        "primary": {"usedPercent": percent}}}})
+    .to_string()
+}
+
+/// An update held for a read that then failed belongs to no answer: laying it over a later,
+/// fresher read would report an older value as current.
+#[tokio::test]
+async fn an_update_held_for_a_failed_baseline_read_is_not_laid_over_a_later_one() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(Vec::new)
+    })
+    .await;
+    running.announcer.announce(primary_update(30.0));
+    let first = nth_rate_limits_read(&running, 0).await;
+    running.announcer.announce(primary_update(40.0));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": first, "error": {"code": -32603, "message": "busy"}}).to_string(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(primary_update(45.0));
+    let second = nth_rate_limits_read(&running, 1).await;
+    running.announcer.announce(
+        serde_json::json!({"id": second, "result": {"rateLimits": {
+            "primary": {"usedPercent": 50.0}}}})
+        .to_string(),
+    );
+    assert_eq!(
+        next_quota(&mut running.turn).await,
+        vec![(String::from("primary"), 50.0)],
+        "expected the later read's own answer, not the update held for the failed one"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A host refresh is a full read like the background one, so an update that lands while it is in
+/// flight is merged over its answer rather than lost to it — and one after it merges onto it.
+#[tokio::test]
+async fn a_refresh_merges_the_updates_that_land_while_it_is_in_flight() {
+    let running = Arc::new(
+        AnnouncedTurn::open_answering(replay_limits(), |frame| {
+            (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read")))
+                .then(Vec::new)
+        })
+        .await,
+    );
+    let refresh = tokio::spawn({
+        let running = Arc::clone(&running);
+        async move { running.session.refresh_account_usage().await }
+    });
+    let read = nth_rate_limits_read(&running, 0).await;
+    running.announcer.announce(primary_update(60.0));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": read, "result": {"rateLimits": {
+            "primary": {"usedPercent": 30.0}, "secondary": {"usedPercent": 20.0}}}})
+        .to_string(),
+    );
+    let usage = refresh
+        .await
+        .expect("expected the refresh task")
+        .expect("expected a reading");
+    let windows: Vec<(String, f64)> = usage
+        .limits
+        .expect("expected limits")
+        .windows
+        .iter()
+        .map(|window| {
+            (
+                window.label.clone().unwrap_or_default(),
+                window.used_percent,
+            )
+        })
+        .collect();
+    assert_eq!(
+        windows,
+        vec![
+            (String::from("primary"), 60.0),
+            (String::from("secondary"), 20.0)
+        ],
+        "expected the in-flight update merged over the refresh's answer"
+    );
+    running.announcer.announce(primary_update(70.0));
+    let mut running = Arc::into_inner(running).expect("expected the only handle");
+    assert_eq!(
+        next_quota(&mut running.turn).await,
+        vec![
+            (String::from("primary"), 70.0),
+            (String::from("secondary"), 20.0)
+        ],
+        "expected a later update merged onto the refreshed baseline"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
 /// A pending approval has its own deadline and does not consume the turn's idle budget.
 #[tokio::test(start_paused = true)]
 async fn a_pending_approval_pauses_the_native_idle_deadline() {
