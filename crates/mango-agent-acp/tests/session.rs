@@ -4506,6 +4506,9 @@ mod contracts;
 #[path = "session/burst.rs"]
 mod burst;
 
+#[path = "session/edges.rs"]
+mod edges;
+
 /// The `tool_call` frame for a call the agent reports as running and never ends.
 fn running_call(call_id: &str) -> serde_json::Value {
     serde_json::json!({

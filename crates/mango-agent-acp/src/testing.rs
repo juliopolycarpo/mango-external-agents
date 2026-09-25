@@ -92,6 +92,8 @@ pub struct FakeAcpAgent {
     batch_updates: bool,
     stop_reason: String,
     version_output: String,
+    /// Replaces the `agentCapabilities` value `initialize` answers with; `Some(None)` omits it.
+    capabilities_override: Option<Option<serde_json::Value>>,
 }
 
 impl Default for FakeAcpAgent {
@@ -152,6 +154,7 @@ impl FakeAcpAgent {
             ],
             stop_reason: String::from("end_turn"),
             version_output: String::from("fake-acp 1.2.3"),
+            capabilities_override: None,
         }
     }
 
@@ -363,6 +366,23 @@ impl FakeAcpAgent {
         self
     }
 
+    /// Answers `initialize` with this `agentCapabilities` value, or with none at all for `None`.
+    ///
+    /// For an agent whose handshake is malformed or from a later protocol revision: the value is
+    /// written as given, so it need not be an object.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let _process = FakeAcpAgent::new().with_agent_capabilities(None).process();
+    /// ```
+    #[must_use]
+    pub fn with_agent_capabilities(mut self, capabilities: Option<serde_json::Value>) -> Self {
+        self.capabilities_override = Some(capabilities);
+        self
+    }
+
     /// Prints this for a version probe.
     #[must_use]
     pub fn printing_version(mut self, output: impl Into<String>) -> Self {
@@ -460,7 +480,7 @@ impl FakeAcpAgent {
         if self.supports_close {
             session_capabilities.insert(String::from("close"), serde_json::json!({}));
         }
-        serde_json::json!({
+        let mut response = serde_json::json!({
             "protocolVersion": self.protocol_version,
             "agentInfo": { "name": "fake-acp", "version": "1.2.3" },
             "agentCapabilities": {
@@ -470,7 +490,17 @@ impl FakeAcpAgent {
                 "sessionCapabilities": session_capabilities,
             },
             "authMethods": [],
-        })
+        });
+        match &self.capabilities_override {
+            None => {}
+            Some(None) => {
+                if let Some(object) = response.as_object_mut() {
+                    object.remove("agentCapabilities");
+                }
+            }
+            Some(Some(value)) => response["agentCapabilities"] = value.clone(),
+        }
+        response
     }
 
     fn list_result(&self, request: &serde_json::Value) -> serde_json::Value {

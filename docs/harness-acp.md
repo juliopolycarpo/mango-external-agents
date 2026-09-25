@@ -387,6 +387,10 @@ install locations without editing the profile or changing a user's `PATH`.
   only knowable from `initialize`. What the agent actually advertised arrives as the session-effective
   tier on `Session::snapshot().capabilities` after `open_session` — which is the case the three
   capability tiers exist for.
+  An agent whose `initialize` omits `agentCapabilities`, or sends one that is not an object, opens
+  with every optional surface off rather than being refused: the ACP schema defines the field's
+  default as the empty capability set, and the official schema crate reads a malformed value the
+  same way. Narrowing fails closed; an unknown key beside the known ones is ignored.
 
 ## Client capabilities
 

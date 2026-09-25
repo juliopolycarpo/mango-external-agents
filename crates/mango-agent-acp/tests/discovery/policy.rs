@@ -232,6 +232,46 @@ async fn strict_resume_is_a_typed_refusal_when_the_agent_does_not_advertise_it()
     );
 }
 
+/// A strict resume asks for that conversation or nothing. When the agent advertised
+/// `session/load` and then refused it, the refusal is the answer: no fresh session is opened in
+/// its place, and the child is ended.
+#[tokio::test]
+async fn strict_resume_returns_the_agents_refusal_of_session_load() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        FakeAcpAgent::new()
+            .refusing_load_session(-32002, "thread expired")
+            .process(),
+    );
+    let result = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(
+            &host(launcher.clone()),
+            mango_external_agents::OpenSession::new("resume")
+                .resuming("agent-session", mango_external_agents::ResumeMode::Strict),
+        )
+        .await;
+
+    let Err(error) = result else {
+        panic!("expected a strict resume to fail on a refused session/load, received a session");
+    };
+    assert!(
+        matches!(error.cause(), Error::Vendor(vendor) if vendor.vendor_code.as_deref() == Some("-32002")),
+        "expected the agent's own refusal, received {error:?}"
+    );
+    let written = launcher.written();
+    assert!(written.iter().any(|line| line.contains("\"session/load\"")));
+    assert!(
+        !written.iter().any(|line| line.contains("\"session/new\"")),
+        "expected no fresh session in place of a strict resume"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the refused open to end the child"
+    );
+}
+
 /// A negotiated absence of session/load conclusively rules out resume before a load is attempted.
 #[tokio::test]
 async fn fallback_starts_new_when_the_agent_does_not_advertise_load_session() {
