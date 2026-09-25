@@ -429,8 +429,11 @@ pub struct RateLimitWindow {
 }
 
 /// The account's plan quota, as one snapshot.
+///
+/// Non-exhaustive: the vendor's snapshot is wider than what this harness reads.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct RateLimitSnapshot {
     /// The shorter window, usually hours.
     #[serde(default)]
@@ -441,6 +444,91 @@ pub struct RateLimitSnapshot {
     /// The plan the vendor named.
     #[serde(default)]
     pub plan_type: Option<String>,
+    /// Remaining workspace credits, when the server returned them.
+    #[serde(default)]
+    pub credits: Option<CreditsSnapshot>,
+    /// The spend-control limit, when there is one.
+    #[serde(default)]
+    pub individual_limit: Option<SpendControlLimitSnapshot>,
+    /// Whether spend control is reached. `None` is unavailable, not a recovery.
+    #[serde(default)]
+    pub spend_control_reached: Option<bool>,
+}
+
+/// Pay-as-you-go credits, as the server reports them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CreditsSnapshot {
+    /// Whether the account has any.
+    #[serde(default)]
+    pub has_credits: bool,
+    /// Whether usage is unlimited.
+    #[serde(default)]
+    pub unlimited: bool,
+    /// The balance, as the server wrote it.
+    #[serde(default)]
+    pub balance: Option<String>,
+}
+
+/// A spend-control limit, as the server reports it.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SpendControlLimitSnapshot {
+    /// The limit, as the server wrote it.
+    #[serde(default)]
+    pub limit: String,
+    /// How much is used, as the server wrote it.
+    #[serde(default)]
+    pub used: String,
+    /// How much remains, as a percentage the server computed.
+    #[serde(default)]
+    pub remaining_percent: Option<f64>,
+    /// Unix seconds when it resets.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
+/// Earned rate-limit resets, as `account/rateLimits/read` reports them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RateLimitResetCreditsSummary {
+    /// How many are available; authoritative even when `credits` is capped.
+    #[serde(default)]
+    pub available_count: i64,
+    /// Detail rows. `None` means only the count is known.
+    #[serde(default)]
+    pub credits: Option<Vec<RateLimitResetCredit>>,
+}
+
+/// One earned rate-limit reset.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RateLimitResetCredit {
+    /// The server's opaque id.
+    #[serde(default)]
+    pub id: String,
+    /// What it resets.
+    #[serde(default)]
+    pub reset_type: Option<String>,
+    /// Its state, such as `available`.
+    #[serde(default)]
+    pub status: String,
+    /// Unix seconds when it was granted.
+    #[serde(default)]
+    pub granted_at: Option<i64>,
+    /// Unix seconds when it expires, or `None` when it does not.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// A display title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// A display description.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// A quota announcement.

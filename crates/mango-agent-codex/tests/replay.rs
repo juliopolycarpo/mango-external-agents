@@ -5044,6 +5044,106 @@ async fn refreshing_account_usage_reports_the_windows_the_vendor_named() {
     }
 }
 
+/// The recorded read also reports pay-as-you-go credits, earned rate-limit resets and the
+/// spend-control state; all three reach the host with the windows.
+#[tokio::test]
+async fn refreshing_account_usage_reports_credits_resets_and_spend_control() {
+    let (session, _) = open("handshake").await;
+    let limits = session
+        .refresh_account_usage()
+        .await
+        .expect("expected a reading")
+        .limits
+        .expect("expected the recorded snapshot");
+
+    let credits = limits.credits.expect("expected the recorded credits");
+    assert_eq!(
+        (credits.has_credits, credits.unlimited),
+        (Some(false), Some(false))
+    );
+    assert_eq!(credits.balance.as_deref(), Some("[REDACTED]"));
+
+    let resets = limits
+        .reset_credits
+        .expect("expected the recorded reset credits");
+    assert_eq!(resets.available_count, 3);
+    let rows = resets.credits.expect("expected the recorded detail rows");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].status, "available");
+    assert_eq!(rows[0].reset_type.as_deref(), Some("codexRateLimits"));
+    assert_eq!(
+        rows[0].granted_at,
+        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_787_352_411))
+    );
+
+    // The capture reports no individual limit and `spendControlReached: false`.
+    let spend = limits
+        .spend_control
+        .expect("expected the recorded spend-control state");
+    assert_eq!(spend.reached, Some(false));
+    assert_eq!(spend.limit, None);
+}
+
+/// Resets arrive only on a full read, and a sparse update that omits the credit balance keeps it:
+/// the reading the turn sees after an update still carries both.
+#[tokio::test]
+async fn a_sparse_update_keeps_the_resets_and_balance_the_full_read_reported() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(|| {
+            vec![
+                serde_json::json!({"id": frame["id"], "result": {
+                    "rateLimits": {"primary": {"usedPercent": 10.0},
+                                   "credits": {"balance": "12.5", "hasCredits": true,
+                                               "unlimited": false},
+                                   "spendControlReached": false},
+                    "rateLimitResetCredits": {"availableCount": 2, "credits": null}}})
+                .to_string(),
+            ]
+        })
+    })
+    .await;
+    running
+        .session
+        .refresh_account_usage()
+        .await
+        .expect("expected a baseline");
+    running.announcer.announce(
+        serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "primary": {"usedPercent": 30.0},
+            "credits": {"balance": null, "hasCredits": false, "unlimited": false},
+            "spendControlReached": true}}})
+        .to_string(),
+    );
+    let limits = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = running.turn.recv().await {
+            if let EventKind::AccountLimits { limits } = event.kind {
+                return Some(limits);
+            }
+        }
+        None
+    })
+    .await
+    .expect("expected a quota reading within the deadline")
+    .expect("expected a quota reading on the turn");
+    let credits = limits.credits.expect("expected credits");
+    assert_eq!(credits.has_credits, Some(false));
+    assert_eq!(credits.balance.as_deref(), Some("12.5"));
+    assert_eq!(
+        limits.reset_credits.map(|resets| resets.available_count),
+        Some(2),
+        "expected the full read's resets to survive the update"
+    );
+    assert_eq!(
+        limits.spend_control.and_then(|spend| spend.reached),
+        Some(true)
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
 /// A permission level is two vendor settings that move together; a routing is a third.
 #[tokio::test]
 async fn the_configuration_a_host_chose_reaches_the_thread_as_three_settings() {

@@ -905,10 +905,14 @@ pub struct AccountReadResponse {
 /// What asking for the account's quota answered with.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct RateLimitsReadResponse {
     /// The snapshot, when the server had one.
     #[serde(default)]
     pub rate_limits: Option<super::notifications::RateLimitSnapshot>,
+    /// Earned rate-limit resets, when the service provides them. Only a full read carries these.
+    #[serde(default)]
+    pub rate_limit_reset_credits: Option<super::notifications::RateLimitResetCreditsSummary>,
 }
 
 /// Params for a call that takes none, as a strict server will accept it.

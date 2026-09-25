@@ -551,6 +551,9 @@ struct QuotaState {
     next_read: u64,
     /// The newest read whose answer became the baseline; an older one answering later is stale.
     adopted_read: u64,
+    /// The earned resets the adopted read reported. Only a full read carries them, so sparse
+    /// updates leave them as they are.
+    reset_credits: Option<crate::protocol::notifications::RateLimitResetCreditsSummary>,
 }
 
 /// How one full quota read settled.
@@ -1132,12 +1135,19 @@ impl Shared {
     /// baseline — unless a read sent after it was already adopted, in which case this answer is
     /// older than the baseline and is dropped. Pending updates are kept while another read is
     /// still in flight, so the last one to answer sees them too, and dropped with the last read.
-    async fn finish_quota_read(&self, read: u64, answer: Option<&RateLimitSnapshot>) -> QuotaRead {
+    async fn finish_quota_read(
+        &self,
+        read: u64,
+        response: Option<&RateLimitsReadResponse>,
+    ) -> QuotaRead {
+        let answer = response.and_then(|response| response.rate_limits.as_ref());
         let mut quota = self.quota.lock().await;
         quota.reads_in_flight = quota.reads_in_flight.saturating_sub(1);
         let adopted = match answer {
             Some(answer) if read > quota.adopted_read => {
                 quota.adopted_read = read;
+                quota.reset_credits =
+                    response.and_then(|response| response.rate_limit_reset_credits.clone());
                 let merged = match quota.pending.as_ref() {
                     Some(pending) => crate::rate_limits::merge(answer, pending),
                     None => answer.clone(),
@@ -1177,8 +1187,7 @@ impl Shared {
                     empty_params(),
                 )
                 .await;
-            let answer = read.ok().and_then(|response| response.rate_limits);
-            let settled = shared.finish_quota_read(sequence, answer.as_ref()).await;
+            let settled = shared.finish_quota_read(sequence, read.ok().as_ref()).await;
             // A later update may ask again, whether this one answered or not.
             shared.baseline_requested.store(false, Ordering::Release);
             // Only a newly adopted reading is news to the turn; a stale answer changed nothing.
@@ -1190,8 +1199,24 @@ impl Shared {
 
     /// Puts one quota reading on the running turn's stream, when a turn is running.
     async fn report_limits(&self, snapshot: &RateLimitSnapshot) {
-        let limits = crate::rate_limits::to_account_limits(snapshot, self.host.now());
+        let limits = self.account_limits(snapshot).await;
         let _ = self.emit(EventKind::AccountLimits { limits }).await;
+    }
+
+    /// One quota snapshot as the core models it, with the resets the adopted read reported.
+    async fn account_limits(
+        &self,
+        snapshot: &RateLimitSnapshot,
+    ) -> mango_external_agents::AccountLimits {
+        let mut limits = crate::rate_limits::to_account_limits(snapshot, self.host.now());
+        limits.reset_credits = self
+            .quota
+            .lock()
+            .await
+            .reset_credits
+            .as_ref()
+            .map(crate::rate_limits::to_reset_credits);
+        limits
     }
 
     /// Moves the attempt `owner` still runs from `previous` to the continuation id a steer named.
@@ -3982,23 +4007,19 @@ impl Session for CodexSession {
             .client
             .request::<_, RateLimitsReadResponse>(method::ACCOUNT_RATE_LIMITS_READ, empty_params())
             .await;
-        let answer = response
-            .as_ref()
-            .ok()
-            .and_then(|response| response.rate_limits.clone());
         let merged = self
             .shared
-            .finish_quota_read(sequence, answer.as_ref())
+            .finish_quota_read(sequence, response.as_ref().ok())
             .await
             .baseline();
         response?;
-        Ok(AccountUsage {
-            // Absence is unknown, never an empty quota: a server that answered without a snapshot
-            // has not told us the account is unmetered.
-            limits: merged.as_ref().map(|snapshot| {
-                crate::rate_limits::to_account_limits(snapshot, self.shared.host.now())
-            }),
-        })
+        // Absence is unknown, never an empty quota: a server that answered without a snapshot
+        // has not told us the account is unmetered.
+        let limits = match merged {
+            Some(snapshot) => Some(self.shared.account_limits(&snapshot).await),
+            None => None,
+        };
+        Ok(AccountUsage { limits })
     }
 }
 
