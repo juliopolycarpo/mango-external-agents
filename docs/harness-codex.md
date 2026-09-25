@@ -40,6 +40,7 @@ on the wire)".
 | `account/read`                  | Whether somebody is signed in, and how |
 | `account/rateLimits/read`       | `Session::refresh_account_usage`       |
 | `model/list`                    | `Discovery::models`                    |
+| `permissionProfile/list`        | `Discovery::permission_matrix`         |
 | `thread/start`, `thread/resume` | `Harness::open_session`                |
 | `thread/read`                   | Metadata-only resume workspace check   |
 | `thread/list`                   | Session and harness-level listing      |
@@ -55,7 +56,13 @@ connection. Both paths require an absolute, lexically normalized UTF-8 host work
 the `cwd` filter and refuse a query for another directory. Codex refuses that host configuration
 before it launches `codex --version` or an app-server, without canonicalizing the path or reading
 the filesystem. The vendor's cursor, native id, title, preview and Unix
-second timestamps pass through when supplied. Rows with missing or foreign workspace paths are
+second timestamps pass through when supplied. Every listing states its filters rather than
+inheriting the server's defaults, which are creation order and interactive sources only
+([`thread/list`][app-server]): `sortKey: "recency_at"`, `sortDirection: "desc"`,
+`sourceKinds: ["cli", "exec", "appServer"]` and `archived: false`. `vscode` is left out because an
+editor-owned thread has a live owner the host cannot see, and the subagent kinds are Codex's own
+machinery. A row's timestamp is its `recencyAt`, falling back to `updatedAt` for a build that
+leaves it null. Rows with missing or foreign workspace paths are
 discarded even if the server returns them under the `cwd` filter. Before `thread/resume`, the
 harness calls `thread/read` with `includeTurns: false` and requires its native id and original
 working directory to match the request and the host's authorised directory. It checks the resume
@@ -70,8 +77,17 @@ be a misattribution rather than a nicety.
 
 Notifications acted on: `turn/started`, `turn/completed`, `item/started`, `item/completed`,
 `item/agentMessage/delta`, `item/reasoning/textDelta`, `item/reasoning/summaryTextDelta`,
+`item/commandExecution/outputDelta`, `item/mcpToolCall/progress`, `item/fileChange/patchUpdated`,
 `thread/tokenUsage/updated`, `account/rateLimits/updated`, `serverRequest/resolved`, `error`.
 Everything else is dropped by name.
+
+**A failed turn keeps the vendor's classification.** The app-server documents failures as an
+`error` notification with `{ error: { message, codexErrorInfo?, additionalDetails? } }` followed by
+`turn/completed` with status `failed` ([app-server][app-server]). The `codexErrorInfo` label — a
+string such as `usageLimitExceeded`, or the one key of an object such as `httpConnectionFailed` —
+becomes `VendorError::vendor_code` on the turn's failure, taken from the completion's own error or,
+when that names none, from the last report the server did not mean to retry. The harness code stays
+`codex-turn-failed`.
 
 **`turn/completed` is the only terminal.** The `error` notification reads like an ending and is
 not one — it carries `willRetry`, and the turn's own completion still follows. Ending a turn there
@@ -104,7 +120,25 @@ anything reaches the vendor.
 
 `turn/steer` carries `expectedTurnId` as a precondition. A steer naming a turn that is not the one
 running is refused here rather than landing on whatever turn happens to be live; the app-server's
-own refusal (`-32600 "no active turn to steer"`) maps to `SteerRejection::TurnAlreadyCompleted`.
+own refusal (`-32600 "no active turn to steer"`) maps to `SteerRejection::TurnAlreadyCompleted`,
+and its structured `activeTurnNotSteerable` refusal (`-32600 "cannot steer a review turn"` or
+`"cannot steer a compact turn"`) maps to `SteerRejection::TurnNotSteerable`. The JSON-RPC client
+does not retain the error's `data`, so that refusal is recognised by code and message.
+
+The app-server answers a steer with "the accepted `turnId`" ([app-server][app-server]). When that
+differs from the id the steer expected, Codex continues the turn under it, and the session adopts
+it: later frames are matched against it, the interrupt names it, and the next steer's
+`expectedTurnId` carries it. A host keeps steering with the native id it was given at
+`TurnStarted`; the session accepts that id for the whole turn, and the last few superseded ones,
+for the same attempt. The steer's answer and the continuation's first frames can arrive back to
+back on separate workers, so notifications arriving while a steer is in flight are held in order
+and replayed once its answer is handled; none is routed against the id the steer replaced. The
+replay runs in its own task, so a host that drops its steer future mid-way does not strand the
+queue. Held frames are bounded by count and by `Limits::turn_buffer_bytes`, and exceeding either
+fails the session; a held frame for this conversation still restarts the idle deadline.
+Steers are serialized per session, so a second steer issued while the first is in flight reads the
+id the first one left behind. The JSON-RPC client keeps reading while an approval is pending, so a
+steer sent then is answered without waiting for the approval.
 
 `review/start` is sent without `delivery`, which the server reads as inline: a detached review runs
 on a thread this session is not subscribed to, and its events would arrive under an id the reducer
@@ -186,7 +220,10 @@ returns its error whole, including a `CleanupRequired`.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.
-Native activity restarts the host's `Limits::idle_timeout`, but only this turn's own: the connection
+Native activity restarts the host's `Limits::idle_timeout`, including the streamed progress of a
+running item: between a command's `item/started` and `item/completed` the app-server writes only
+`item/commandExecution/outputDelta` for it, so a build that prints for longer than the deadline is
+still a working turn. That activity must be this turn's own: the connection
 also carries a subagent's thread, a detached review's, later frames for a turn already over, and
 account-level `rateLimits` updates that name no conversation at all, and none of those extend the
 deadline. An outstanding approval pauses that clock because its `approval_timeout` is the deadline
@@ -199,6 +236,13 @@ an approval, or blocking cancellation on an unread consumer.
 Native reviews reject steering with `TurnNotSteerable`. Cancellation and close retain the host's
 reason when they win the terminal race; when Codex completed first, its completed outcome remains
 the one terminal fact.
+
+`model/list` and `permissionProfile/list` are cursor-paginated with a server-chosen page size
+([app-server][app-server]). The probe follows `nextCursor` for up to eight pages each, and the
+model catalog also stops at the core's 256-model cap, counting only models the picker shows
+(hidden ones are dropped as they are read). A page that fails mid-walk keeps the models already
+read. A profile listing that still has a cursor after eight pages is incomplete, and is treated
+like one that failed: the declared matrix stays.
 
 ## The permission matrix
 
@@ -213,6 +257,17 @@ because setting one without the other produces a configuration nobody chose:
 | `ReadOnly`        | `read-only`          | `never`          |
 | `Default`         | `workspace-write`    | `on-request`     |
 | `FullAccess`      | `danger-full-access` | `never`          |
+
+Discovery narrows the matrix to what the machine allows. The app-server documents
+`permissionProfile/list` "with the project cwd to discover available profiles and whether managed
+requirements allow each one" ([app-server][app-server]); the probe asks it for the host's working
+directory and reads the built-in profile each level selects — `:read-only`, `:workspace` and
+`:danger-full-access`. A level whose profile is reported `allowed: false`, or is not listed at all,
+is unsupported under both routings with `UnsupportedReason::Other(PROFILE_DISALLOWED)`, the
+constant `mango_agent_codex::permissions::PROFILE_DISALLOWED`, so a host can say a policy refused
+it. A build that does not answer the call keeps the declared matrix: not being able to ask is not a
+refusal. A cell narrowed only at open time still fails at `thread/start`, as the core's discovery
+contract describes.
 
 `ReadOnly` pairs with `never` rather than `on-request` deliberately: nothing at that level may
 change the machine, so an escalation prompt's only honest answer is no.
@@ -379,9 +434,21 @@ Every other server-initiated request is refused with a JSON-RPC error rather tha
 
 ## Auth, without reading a credential
 
-`account/read` answers with the kind of account and, for a ChatGPT sign-in, a plan name. That is
-all this harness reads — `~/.codex/auth.json` is never opened, the email the same call returns is
-not modelled, and there is no login method anywhere.
+`account/read` answers with the kind of account and, for a ChatGPT sign-in, a plan name and an
+email. `~/.codex/auth.json` is never opened, the email is never modelled, and there is no login
+method anywhere.
+
+**The account fingerprint.** A host that keeps a Codex continuation across restarts has to notice
+when the signed-in account changed, and the email is the only non-secret account identity the
+app-server reports ([app-server][app-server]: "`email` is null when the ChatGPT account doesn't have
+an email address"). `CodexHarness::discover_with_account(host, key)` runs the ordinary probe and also
+returns `CodexAccount { plan_type, fingerprint }`, where the fingerprint is
+`hex(HMAC-SHA256(key, "codex:" + email))[..32]` — the value the TypeScript adapter stored, so a
+migrating host keeps matching its continuations. The address is borrowed from the raw `account/read`
+answer for that one digest and returned nowhere. A plain hash is refused on purpose: anyone holding it
+could test a guessed address offline, so the key is required (`AccountFingerprintKey` refuses an
+empty one) and never leaves the host. `Harness::discover`, which has no key, computes nothing. A
+ChatGPT account without an email, an API-key account and a Bedrock account have no fingerprint.
 
 | `account/read`                      | `AuthState`                               |
 | ----------------------------------- | ----------------------------------------- |
@@ -395,6 +462,21 @@ The last row matters: a build pointed at a provider of its own is not signed out
 would stop a turn, and telling the user to run `codex login` would send them to fix something that
 is not broken. Opening a session against a signed-out CLI fails with `Error::AuthRequired` carrying
 the vendor's own command as text. The library never runs it.
+
+## Account quota
+
+`account/rateLimits/read` returns the account's full quota, and `account/rateLimits/updated` is
+"emitted whenever a user's ChatGPT rate limits change" ([app-server][app-server]) and may carry only
+what changed. The session keeps the last full reading as a baseline: `Session::refresh_account_usage`
+sets it, and each update is merged onto it before the result reaches the running turn as
+`AccountLimits`. A window or plan the update omits or sends as `null` keeps the baseline's value; a
+present one overwrites it. An update that arrives before any baseline is not shown: the session asks
+for one `account/rateLimits/read` in the background and reports its full answer instead. Every full
+read — that one or a host's `refresh_account_usage` — has any update that arrived while it was in
+flight merged over its answer, and a refresh returns that merged reading. Updates held for a read
+that failed are dropped with it rather than laid over a later one. Reads are numbered as they are
+sent, and a read that answers after a later one was adopted is older than the baseline and is
+dropped rather than rewinding it.
 
 ## Transports
 
@@ -487,6 +569,16 @@ protocol evidence, not a record of a model answer, command, tool result, review 
 The approval fixture records a **refusal**. A fixture that captured a grant would be a recording of
 this tool letting an agent out of its sandbox, checked into the repository.
 
+## Answer text
+
+The answer streams as `item/agentMessage/delta` and arrives again, whole, on the `agentMessage`
+item's `item/completed`. Deltas are emitted as they come; the completion adds only the text its
+deltas did not deliver, so a message that was never streamed — as a resumed conversation can
+deliver one — still reaches the host exactly once. When the completed text does not start with what
+was streamed, the vendor rewrote the message and the whole text is emitted. The documented item
+shape is `agentMessage - {id, text, phase?} containing the accumulated agent reply`
+([app-server][app-server]).
+
 ## Structured content
 
 What an item reports reaches a host as structure rather than as one more line of `detail`:
@@ -497,11 +589,33 @@ What an item reports reaches a host as structure rather than as one more line of
 | `commandExecution.aggregatedOutput` | `Output { text }`, beside the detail that also carries the exit code               |
 | `plan.text`                         | nothing — freeform at this pin, and splitting it into steps would invent structure |
 
+While an item runs, its streamed progress updates the same activity through `ActivityUpdated`,
+following the [item notifications][app-server] the app-server documents:
+
+| Notification                        | `ActivityUpdate`                                             |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `item/commandExecution/outputDelta` | `detail`: the most recent 2,000 characters of output         |
+| `item/mcpToolCall/progress`         | `detail`: the most recent 2,000 characters of progress lines |
+| `item/fileChange/patchUpdated`      | `detail`: the paths; `content`: `Diff` of the patch as it is |
+
+An activity reports at most one update every five seconds — the first after a quiet window is
+emitted at once, and what was held back rides the next one — and `truncated` says when the tail
+dropped older output. The completed item still carries the whole `aggregatedOutput`. Progress for
+an item this turn never announced as an activity, or already completed, is dropped rather than
+addressed to a call id the host was never told about.
+
 `FileChange::kind` stays **absent**: the pinned schema states no per-file kind, and reading one off
 the diff text would be the re-parsing the type exists to prevent. Every activity carries the item's
 own id in `item_id`. A subagent's thread id is not carried either — the vendored inventory is a
 flattened property union across all nineteen item families, so it cannot say which family owns
 `agentThreadId`, and no captured frame carries it.
+
+An item family this build does not model — `imageView`, `dynamicToolCall`, `sleep`, or one a
+newer Codex adds — is still work the agent did, so it renders as an `ActivityKind::Other` activity
+named by the vendor's own `type`, bracketed by its `id`. Echoes of the client's own input
+(`userMessage`, `hookPrompt`, `functionCallOutput`) render nothing, and an unknown item without an
+id renders nothing because no completion could address it. The item families are listed in the
+[app-server documentation][app-server].
 
 ## Known gaps
 
@@ -511,8 +625,8 @@ flattened property union across all nineteen item families, so it cannot say whi
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
-- Vendor steering refusals other than the observed "no active turn" response retain the vendor
-  error; native reviews are rejected locally as `TurnNotSteerable`.
+- Vendor steering refusals other than "no active turn" and "cannot steer a review/compact turn"
+  retain the vendor error; native reviews are rejected locally as `TurnNotSteerable`.
 
 Compliance posture: see [compliance.md](compliance.md).
 

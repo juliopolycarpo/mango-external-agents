@@ -45,6 +45,61 @@ pub fn to_account_limits(snapshot: &RateLimitSnapshot, observed_at: SystemTime) 
     }
 }
 
+/// A sparse `account/rateLimits/updated` snapshot, laid over the last full reading.
+///
+/// The update may carry only what changed. A window or plan it leaves out, or sends as `null`,
+/// keeps the baseline's value — an explicit `null` is not a reading that the window went away —
+/// and a present value overwrites it. Inside a present window, `usedPercent` always overwrites
+/// (the vendor declares it required) while a `null` duration or reset time keeps the baseline's.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_codex::protocol::RateLimitSnapshot;
+/// use mango_agent_codex::rate_limits::merge;
+///
+/// let baseline: RateLimitSnapshot = serde_json::from_value(serde_json::json!({
+///     "primary": {"usedPercent": 10.0}, "secondary": {"usedPercent": 20.0}, "planType": "plus"
+/// })).unwrap();
+/// let update: RateLimitSnapshot = serde_json::from_value(serde_json::json!({
+///     "primary": {"usedPercent": 30.0}, "secondary": null
+/// })).unwrap();
+/// let merged = merge(&baseline, &update);
+/// assert_eq!(merged.primary.map(|window| window.used_percent), Some(30.0));
+/// assert_eq!(merged.secondary.map(|window| window.used_percent), Some(20.0));
+/// assert_eq!(merged.plan_type.as_deref(), Some("plus"));
+/// ```
+#[must_use]
+pub fn merge(baseline: &RateLimitSnapshot, update: &RateLimitSnapshot) -> RateLimitSnapshot {
+    RateLimitSnapshot {
+        primary: merge_window(baseline.primary, update.primary),
+        secondary: merge_window(baseline.secondary, update.secondary),
+        plan_type: update
+            .plan_type
+            .clone()
+            .or_else(|| baseline.plan_type.clone()),
+    }
+}
+
+fn merge_window(
+    baseline: Option<VendorRateLimitWindow>,
+    update: Option<VendorRateLimitWindow>,
+) -> Option<VendorRateLimitWindow> {
+    let Some(update) = update else {
+        return baseline;
+    };
+    let Some(baseline) = baseline else {
+        return Some(update);
+    };
+    Some(VendorRateLimitWindow {
+        used_percent: update.used_percent,
+        window_duration_mins: update
+            .window_duration_mins
+            .or(baseline.window_duration_mins),
+        resets_at: update.resets_at.or(baseline.resets_at),
+    })
+}
+
 fn to_window(label: &str, window: &VendorRateLimitWindow) -> RateLimitWindow {
     RateLimitWindow {
         label: Some(String::from(label)),
@@ -141,6 +196,42 @@ mod tests {
             observed_at(),
         );
         assert_eq!(limits.windows[0].resets_at, None);
+    }
+
+    #[test]
+    fn a_present_window_overwrites_while_an_absent_or_null_one_keeps_the_baseline() {
+        let baseline = snapshot(serde_json::json!({
+            "primary": {"usedPercent": 10.0, "windowDurationMins": 300, "resetsAt": 1000},
+            "secondary": {"usedPercent": 20.0, "windowDurationMins": 10080, "resetsAt": 2000},
+            "planType": "plus"
+        }));
+        let merged = super::merge(
+            &baseline,
+            &snapshot(serde_json::json!({
+                "primary": {"usedPercent": 30.0, "windowDurationMins": null, "resetsAt": 1500},
+                "secondary": null
+            })),
+        );
+        let primary = merged.primary.expect("expected the primary window");
+        assert_eq!(primary.used_percent, 30.0);
+        assert_eq!(primary.window_duration_mins, Some(300));
+        assert_eq!(primary.resets_at, Some(1500));
+        assert_eq!(merged.secondary, baseline.secondary);
+        assert_eq!(merged.plan_type.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn a_window_the_baseline_lacked_is_taken_whole_from_the_update() {
+        let merged = super::merge(
+            &snapshot(serde_json::json!({"primary": {"usedPercent": 10.0}})),
+            &snapshot(serde_json::json!({"secondary": {"usedPercent": 5.0}, "planType": "pro"})),
+        );
+        assert_eq!(merged.primary.map(|window| window.used_percent), Some(10.0));
+        assert_eq!(
+            merged.secondary.map(|window| window.used_percent),
+            Some(5.0)
+        );
+        assert_eq!(merged.plan_type.as_deref(), Some("pro"));
     }
 
     /// Every percentage the core writes has to be JSON, and the core clamps on the way out. This

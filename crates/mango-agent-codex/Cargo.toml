@@ -19,6 +19,9 @@ workspace = true
 async-trait = "0.1.92"
 http = "1.4.0"
 mango-external-agents = { workspace = true, features = ["stdio"] }
+# HMAC-SHA256 for the host-keyed account fingerprint, from the crypto the core already ships: TLS
+# is `ring` everywhere in this workspace.
+ring = { version = "0.17.14", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }

@@ -48,7 +48,7 @@ use crate::protocol::approvals::{
     ToolRequestUserInputParams, ToolRequestUserInputQuestion, ToolRequestUserInputResponse,
 };
 use crate::protocol::method;
-use crate::protocol::notifications::Notification;
+use crate::protocol::notifications::{Notification, RateLimitSnapshot};
 use crate::protocol::requests::{
     RateLimitsReadResponse, ReviewStartParams, ReviewStartResponse, ReviewTarget, ThreadListParams,
     ThreadListResponse, TurnHandle, TurnInterruptParams, TurnStartParams, TurnStartResponse,
@@ -66,6 +66,9 @@ pub const CALL_FAILED: ErrorCode = ErrorCode::from_static("codex-call-failed");
 /// Native ids retained after terminal frames so a delayed old frame cannot attach while the next
 /// start still waits for its response.
 const RECENT_COMPLETED_TURNS: usize = 16;
+
+/// How many superseded native ids one turn remembers for steers that still name them.
+const EARLIER_NATIVE_TURN_IDS: usize = 16;
 
 /// One live conversation with a `codex app-server`.
 pub struct CodexSession {
@@ -211,6 +214,14 @@ pub(crate) struct Shared {
     /// same connection. Both classifications share one lock so a normal confirmation cannot be
     /// recorded as an early resolution while its answer is being remembered.
     resolution_markers: Mutex<ResolutionMarkers>,
+    /// Serializes steers, so each one reads the native turn id the previous steer left behind.
+    steering: Mutex<()>,
+    /// Notifications held, in arrival order, while a steer's answer is being adopted.
+    steer_hold: std::sync::Mutex<SteerHold>,
+    /// The account's quota: the last full reading, and what arrived while a read was in flight.
+    quota: Mutex<QuotaState>,
+    /// Whether an update already asked for the missing baseline.
+    baseline_requested: AtomicBool,
     #[cfg(test)]
     resolution_marker_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
     #[cfg(test)]
@@ -241,6 +252,10 @@ impl Shared {
             teardown_error: Mutex::new(None),
             teardown_done: Notify::new(),
             resolution_markers: Mutex::new(ResolutionMarkers::default()),
+            steering: Mutex::new(()),
+            steer_hold: std::sync::Mutex::new(SteerHold::default()),
+            quota: Mutex::new(QuotaState::default()),
+            baseline_requested: AtomicBool::new(false),
             #[cfg(test)]
             resolution_marker_gate: Mutex::new(None),
             #[cfg(test)]
@@ -516,6 +531,177 @@ impl Shared {
     }
 }
 
+/// The session's quota bookkeeping, under one lock so a read's answer and an update cannot
+/// interleave between checking and merging.
+#[derive(Default)]
+struct QuotaState {
+    /// The last full `account/rateLimits/read`, merged forward by sparse updates.
+    ///
+    /// `None` until a read answers: a sparse update alone is not a reading worth showing.
+    baseline: Option<RateLimitSnapshot>,
+    /// Updates that arrived while a read was in flight, merged in arrival order.
+    ///
+    /// The notification worker and the task awaiting the read run separately, so these may be
+    /// newer than the read's answer and are laid over it when it lands. They belong to reads in
+    /// flight only: when the last one fails, they are dropped rather than laid over a later one.
+    pending: Option<RateLimitSnapshot>,
+    /// Full reads, from the host's refresh or the session's own, not yet answered.
+    reads_in_flight: usize,
+    /// The sequence number the next full read is sent under.
+    next_read: u64,
+    /// The newest read whose answer became the baseline; an older one answering later is stale.
+    adopted_read: u64,
+}
+
+/// How one full quota read settled.
+enum QuotaRead {
+    /// Its answer, with pending updates laid over it, is the new baseline.
+    Adopted(RateLimitSnapshot),
+    /// A read sent after it was already adopted; the baseline it leaves is that fresher one.
+    Stale(Option<RateLimitSnapshot>),
+    /// It returned no snapshot.
+    Unanswered,
+}
+
+impl QuotaRead {
+    /// The baseline a caller should report after this read.
+    fn baseline(self) -> Option<RateLimitSnapshot> {
+        match self {
+            Self::Adopted(baseline) => Some(baseline),
+            Self::Stale(baseline) => baseline,
+            Self::Unanswered => None,
+        }
+    }
+}
+
+/// How many notifications a steer may hold before the session gives up on the connection.
+const STEER_HOLD_LIMIT: usize = 1024;
+
+/// Notifications that arrived while a steer was in flight.
+///
+/// The steer's answer can name a continuation turn id, and the notification worker is separate
+/// from the task awaiting that answer: frames for the continuation can be routed before the id is
+/// adopted and would be dropped as another turn's. Holding every notification until the answer
+/// is handled, then replaying them in order, makes the transition visible before any of them is
+/// routed.
+///
+/// Held frames are outside the connection's own byte budget, so the hold is bounded by count and
+/// by [`Limits::turn_buffer_bytes`](mango_external_agents::Limits::turn_buffer_bytes); exceeding
+/// either poisons the session.
+#[derive(Default)]
+struct SteerHold {
+    /// Steers whose answer has not been handled yet. Steers are serialized, but a dropped steer
+    /// future can leave its replay running while the next steer begins.
+    holders: usize,
+    /// Whether a replay task owns the queue. At most one exists, so frames leave in order.
+    draining: bool,
+    held: VecDeque<(String, Value, usize)>,
+    held_bytes: usize,
+}
+
+impl SteerHold {
+    /// Whether a new frame has to join the queue rather than be routed now.
+    fn is_holding(&self) -> bool {
+        self.holders > 0 || self.draining
+    }
+}
+
+/// One steer's claim on the hold; released exactly once, whether or not the steer finishes.
+struct SteerHoldGuard {
+    shared: Option<Arc<Shared>>,
+}
+
+impl SteerHoldGuard {
+    fn hold(shared: &Arc<Shared>) -> Self {
+        shared
+            .steer_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .holders += 1;
+        Self {
+            shared: Some(Arc::clone(shared)),
+        }
+    }
+
+    /// Releases this steer's claim and waits for the replay it may have started.
+    ///
+    /// The replay runs in its own task, so dropping this future — a host's timeout wrapper, a
+    /// disconnect — only stops the waiting; the replay still finishes and routing reopens.
+    async fn release(mut self) {
+        let Some(shared) = self.shared.take() else {
+            return;
+        };
+        if let Some(replay) = release_claim(shared) {
+            let _ = replay.await;
+        }
+    }
+}
+
+impl Drop for SteerHoldGuard {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            let _ = release_claim(shared);
+        }
+    }
+}
+
+/// Gives up one claim and, when it was the last and nobody is replaying, starts the replay.
+fn release_claim(shared: Arc<Shared>) -> Option<tokio::task::JoinHandle<()>> {
+    let mut hold = shared
+        .steer_hold
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hold.holders = hold.holders.saturating_sub(1);
+    if hold.holders > 0 || hold.draining {
+        return None;
+    }
+    if hold.held.is_empty() {
+        return None;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // No runtime left to route on: the connection is going away with it.
+        hold.held.clear();
+        hold.held_bytes = 0;
+        return None;
+    };
+    hold.draining = true;
+    drop(hold);
+    Some(runtime.spawn(replay_steer_hold(shared)))
+}
+
+/// Routes the held frames one at a time and reopens live routing only once the queue is empty,
+/// under the same lock the worker checks, so no live frame can overtake a held one. A steer that
+/// takes a new claim meanwhile leaves the rest queued for its own release.
+async fn replay_steer_hold(shared: Arc<Shared>) {
+    let handler = CodexHandler {
+        shared: Arc::clone(&shared),
+    };
+    loop {
+        let next = {
+            let mut hold = shared
+                .steer_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next = if hold.holders > 0 {
+                None
+            } else {
+                hold.held.pop_front()
+            };
+            match next {
+                Some((method, params, bytes)) => {
+                    hold.held_bytes = hold.held_bytes.saturating_sub(bytes);
+                    (method, params)
+                }
+                None => {
+                    hold.draining = false;
+                    return;
+                }
+            }
+        };
+        handler.handle_notification(next.0, next.1).await;
+    }
+}
+
 /// The turn currently running, and the sink its events go to.
 struct ActiveTurn {
     /// The particular `begin` call that installed this slot.
@@ -535,6 +721,14 @@ struct ActiveTurn {
     /// under the turn lock and announces; the other does nothing, which is what keeps the
     /// announcement to exactly once.
     announced: bool,
+    /// Native ids this attempt ran under before a steer continued it under `native_turn_id`.
+    ///
+    /// A host knows only the id the turn was announced with, so a steer naming any of these still
+    /// addresses this attempt. The first entry, that announced id, is kept for the whole turn;
+    /// the rest are bounded by [`EARLIER_NATIVE_TURN_IDS`].
+    earlier_native_turn_ids: VecDeque<String>,
+    /// What this turn already announced, for the announcements that depend on it.
+    reducer: crate::turn_reducer::TurnReducer,
     /// Native reviews have their own lifecycle and do not accept user steering.
     is_review: bool,
     /// The `turn/start` answer will never be read, so this turn can never be named or interrupted.
@@ -892,6 +1086,175 @@ impl Shared {
         // A stop worker waiting for this start can now name the turn it has to interrupt.
         self.turn_finished.notify_waiters();
         Ok(Some((sink, native_turn_id)))
+    }
+
+    /// Folds one quota update into the baseline and reports the result to the running turn.
+    ///
+    /// With no baseline yet, the update is not shown; instead one `account/rateLimits/read` is
+    /// asked for in the background, and its full answer becomes the baseline and the reading
+    /// reported. The update that asks is older than that answer; any that arrive while a read is
+    /// in flight may not be, and are laid over its answer.
+    async fn rate_limits_updated(self: &Arc<Self>, update: &RateLimitSnapshot) {
+        let merged = {
+            let mut quota = self.quota.lock().await;
+            if quota.reads_in_flight > 0 {
+                quota.pending = Some(match quota.pending.as_ref() {
+                    Some(earlier) => crate::rate_limits::merge(earlier, update),
+                    None => update.clone(),
+                });
+            }
+            let Some(current) = quota.baseline.as_ref() else {
+                let idle = quota.reads_in_flight == 0;
+                drop(quota);
+                if idle {
+                    self.request_baseline();
+                }
+                return;
+            };
+            let merged = crate::rate_limits::merge(current, update);
+            quota.baseline = Some(merged.clone());
+            merged
+        };
+        self.report_limits(&merged).await;
+    }
+
+    /// Records that a full read is about to be sent, and the sequence number it is sent under.
+    async fn begin_quota_read(&self) -> u64 {
+        let mut quota = self.quota.lock().await;
+        quota.reads_in_flight += 1;
+        quota.next_read += 1;
+        quota.next_read
+    }
+
+    /// Settles the full read sent as `read`, and returns the baseline it leaves behind.
+    ///
+    /// Its answer, with any update that arrived while it was in flight laid over it, becomes the
+    /// baseline — unless a read sent after it was already adopted, in which case this answer is
+    /// older than the baseline and is dropped. Pending updates are kept while another read is
+    /// still in flight, so the last one to answer sees them too, and dropped with the last read.
+    async fn finish_quota_read(&self, read: u64, answer: Option<&RateLimitSnapshot>) -> QuotaRead {
+        let mut quota = self.quota.lock().await;
+        quota.reads_in_flight = quota.reads_in_flight.saturating_sub(1);
+        let adopted = match answer {
+            Some(answer) if read > quota.adopted_read => {
+                quota.adopted_read = read;
+                let merged = match quota.pending.as_ref() {
+                    Some(pending) => crate::rate_limits::merge(answer, pending),
+                    None => answer.clone(),
+                };
+                quota.baseline = Some(merged.clone());
+                Some(merged)
+            }
+            _ => None,
+        };
+        if quota.reads_in_flight == 0 {
+            quota.pending = None;
+        }
+        match (adopted, answer) {
+            (Some(merged), _) => QuotaRead::Adopted(merged),
+            (None, Some(_)) => QuotaRead::Stale(quota.baseline.clone()),
+            (None, None) => QuotaRead::Unanswered,
+        }
+    }
+
+    /// Asks for the full reading a sparse update could not be merged onto, once at a time.
+    fn request_baseline(self: &Arc<Self>) {
+        if self.baseline_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(client) = self.client.get().cloned() else {
+            self.baseline_requested.store(false, Ordering::Release);
+            return;
+        };
+        let shared = Arc::clone(self);
+        // Detached: the notification handler runs on the connection's reader, which has to keep
+        // reading for this request to be answered at all.
+        tokio::spawn(async move {
+            let sequence = shared.begin_quota_read().await;
+            let read = client
+                .request::<_, RateLimitsReadResponse>(
+                    method::ACCOUNT_RATE_LIMITS_READ,
+                    empty_params(),
+                )
+                .await;
+            let answer = read.ok().and_then(|response| response.rate_limits);
+            let settled = shared.finish_quota_read(sequence, answer.as_ref()).await;
+            // A later update may ask again, whether this one answered or not.
+            shared.baseline_requested.store(false, Ordering::Release);
+            // Only a newly adopted reading is news to the turn; a stale answer changed nothing.
+            if let QuotaRead::Adopted(merged) = settled {
+                shared.report_limits(&merged).await;
+            }
+        });
+    }
+
+    /// Puts one quota reading on the running turn's stream, when a turn is running.
+    async fn report_limits(&self, snapshot: &RateLimitSnapshot) {
+        let limits = crate::rate_limits::to_account_limits(snapshot, self.host.now());
+        let _ = self.emit(EventKind::AccountLimits { limits }).await;
+    }
+
+    /// Moves the attempt `owner` still runs from `previous` to the continuation id a steer named.
+    ///
+    /// The app-server answers `turn/steer` with "the accepted turnId"; when that differs from the
+    /// one the steer expected, Codex continues the turn under it, and later frames, steers and the
+    /// interrupt must use it. A turn that ended or moved on meanwhile is left alone.
+    async fn adopt_continuation(
+        &self,
+        owner: &Arc<()>,
+        previous: &str,
+        continued: &str,
+    ) -> Result<()> {
+        if continued.is_empty() || continued == previous {
+            return Ok(());
+        }
+        let continued =
+            mango_external_agents::normalize::opaque_id(continued, "continued native turn id")?;
+        let mut turn = self.turn.lock().await;
+        let Some(active) = turn.as_mut().filter(|active| {
+            !active.finishing
+                && Arc::ptr_eq(&active.owner, owner)
+                && active.native_turn_id == previous
+        }) else {
+            return Ok(());
+        };
+        let previous = std::mem::replace(&mut active.native_turn_id, continued);
+        // The first entry is the id the host was given at `TurnStarted` and never learns a
+        // replacement for, so it is never evicted; only the ids in between are bounded.
+        if active.earlier_native_turn_ids.len() == EARLIER_NATIVE_TURN_IDS {
+            active.earlier_native_turn_ids.remove(1);
+        }
+        active.earlier_native_turn_ids.push_back(previous);
+        Ok(())
+    }
+
+    /// Reduces one announcement with the memory of the turn `route` still owns.
+    ///
+    /// A route whose turn has already been replaced or is finishing keeps the stateless reduction:
+    /// its events can no longer reach a stream, but a malformed terminal must still poison.
+    async fn reduce_for(&self, route: &ActiveTurnRoute, notification: &Notification) -> Outcome {
+        let thread_id = self.thread_id();
+        let native_turn_id = Some(route.native_turn_id.as_str());
+        let observed_at = self.host.now();
+        let mut turn = self.turn.lock().await;
+        match turn
+            .as_mut()
+            .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
+        {
+            Some(active) => active.reducer.reduce(
+                notification,
+                thread_id,
+                native_turn_id,
+                observed_at,
+                tokio::time::Instant::now(),
+            ),
+            None => reducer::reduce_for_active_turn(
+                notification,
+                thread_id,
+                native_turn_id,
+                observed_at,
+            ),
+        }
     }
 
     /// Puts one event on the stream that still belongs to this start attempt.
@@ -1359,154 +1722,52 @@ fn to_wire_answers(response: &QuestionResponse) -> ToolRequestUserInputResponse 
 #[async_trait::async_trait]
 impl PeerHandler for CodexHandler {
     async fn on_notification(&self, method: String, params: Value) {
-        let notification = Notification::parse(&method, params);
-
-        // The server resolved one of its own questions — an interrupt did it, or a policy of its
-        // own answered first. Releasing the waiter is what keeps the task composing a reply, and
-        // its share of this session, from outliving the question.
-        if let Notification::ServerRequestResolved(resolved) = &notification
-            && resolved.thread_id == self.shared.thread_id()
-        {
-            let route = self.shared.active_turn_route().await;
-            if let Some(route) = route {
-                let released = self
-                    .release_resolved(&RequestId::new(resolved.request_id.clone()).key(), &route)
-                    .await;
-                if !released {
-                    self.shared
-                            .poison(VendorError::new(
-                                reducer::PROTOCOL_ERROR,
-                                "expected room for a serverRequest/resolved tombstone, received a full bounded set",
-                            ))
-                            .await;
-                    return;
-                }
-            }
-        }
-
-        let active_route = self.shared.active_turn_route().await;
-        let Some(mut active_route) = active_route else {
-            return;
-        };
-        if active_route.native_turn_id.is_empty()
-            && notification.requires_native_turn_match()
-            && let Some(turn_id) = notification.turn_id()
-            && self.shared.recently_completed(turn_id).await
-        {
-            return;
-        }
-
-        // The vendor's own turn id can arrive on a notification before `turn/start` answers.
-        // Whichever side learns it first announces the turn as accepted, exactly once, before
-        // anything else reaches the host on this attempt's stream.
-        //
-        // Gated on `requires_native_turn_match()`, the same test the reducer itself uses to
-        // decide whether a family's id can be trusted — which excludes `turn/started` on
-        // purpose. Captured review transcripts show its id can differ from `review/start`'s own
-        // response and from every later item and completion for the same review; claiming from
-        // it here would announce a review under an id nothing else on its stream agrees with.
-        if active_route.native_turn_id.is_empty()
-            && notification.requires_native_turn_match()
-            && let Some(turn_id) = notification.turn_id()
-        {
-            match self
+        let routed_here = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .is_some_and(|thread| thread == self.shared.thread_id());
+        let live = {
+            let mut hold = self
                 .shared
-                .claim_announcement(&active_route.owner, turn_id)
-                .await
-            {
-                Ok(Some((sink, native_turn_id))) => {
-                    active_route.native_turn_id.clone_from(&native_turn_id);
-                    if sink
-                        .emit(EventKind::TurnStarted { native_turn_id })
-                        .await
-                        .is_err()
-                    {
-                        self.shared
-                            .poison(VendorError::new(
-                                reducer::PROTOCOL_ERROR,
-                                "expected a host stream that accepts an accepted turn announcement",
-                            ))
-                            .await;
-                        return;
-                    }
+                .steer_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hold.is_holding() {
+                // Held frames left the connection's byte budget when this call returns, so the
+                // hold counts them against the turn's own.
+                let bytes =
+                    method.len() + serde_json::to_string(&params).map_or(0, |raw| raw.len());
+                let budget = self.shared.host.limits().turn_buffer_bytes;
+                if hold.held.len() >= STEER_HOLD_LIMIT
+                    || hold.held_bytes.saturating_add(bytes) > budget
+                {
+                    None
+                } else {
+                    hold.held_bytes += bytes;
+                    hold.held.push_back((method, params, bytes));
+                    Some(None)
                 }
-                Ok(None) => {}
-                Err(_) => {
-                    self.shared
-                        .poison(VendorError::new(
-                            reducer::PROTOCOL_ERROR,
-                            "expected an app-server notification with a usable native turn id",
-                        ))
-                        .await;
-                    return;
-                }
+            } else {
+                Some(Some((method, params)))
             }
-        }
-
-        // Idle accounting measures *this* turn's silence. A subagent's thread, a detached review,
-        // another turn of this thread and an account-level quota update all ride the same
-        // connection, and resetting the deadline for them would let steady foreign traffic keep a
-        // genuinely hung turn alive for as long as the connection lasts. Routed, not reduced: a
-        // frame can belong to this turn and still render nothing, as `turn/started` and a retrying
-        // `error` do, and withholding the reset for those would time out a turn that is working.
-        if reducer::routes_to_active_turn(
-            &notification,
-            self.shared.thread_id(),
-            Some(active_route.native_turn_id.as_str()),
-        ) {
-            self.shared.signal_idle_change();
-        }
-
-        let outcome = reducer::reduce_for_active_turn(
-            &notification,
-            self.shared.thread_id(),
-            Some(active_route.native_turn_id.as_str()),
-            self.shared.host.now(),
-        );
-        match outcome {
-            Outcome::Emit(events) => {
-                for event in events {
-                    let emitted = if notification.requires_native_turn_match() {
-                        self.shared.emit_for(&active_route, event).await
-                    } else {
-                        self.shared.emit(event).await
-                    };
-                    if matches!(emitted, Err(Error::LimitExceeded { .. })) {
-                        self.shared
-                            .poison(VendorError::new(
-                                CALL_FAILED,
-                                "expected bounded Codex transcript publication, received overflow",
-                            ))
-                            .await;
-                        return;
-                    }
+        };
+        match live {
+            Some(Some((method, params))) => self.handle_notification(method, params).await,
+            Some(None) => {
+                // Queued progress for this conversation is still progress: a slow steer answer
+                // must not let the idle deadline stop a turn that is working.
+                if routed_here {
+                    self.shared.signal_idle_change();
                 }
             }
-            Outcome::Finish { .. } => {
-                // Whatever the server was still asking is moot: its turn is over, and a question
-                // belonging to a finished turn is one nobody will be shown.
-                //
-                // Hold question settlement ownership through both the drain and terminal claim.
-                // A request task that already routed to this turn then observes `finishing`
-                // before it can register a new host-visible round after this drain.
-                let _settlement = self.shared.question_settlements.lock().await;
+            None => {
                 self.shared
-                    .release_pending_approvals_for(
-                        Some(&active_route.owner),
-                        DecisionSource::Cancelled,
-                    )
-                    .await;
-                self.shared
-                    .release_pending_questions_for_locked(Some(&active_route.owner))
-                    .await;
-                self.shared
-                    .finish_for(&active_route, notification.turn_id(), outcome)
+                    .poison(VendorError::new(
+                        reducer::PROTOCOL_ERROR,
+                        "expected notifications held during a steer to fit the turn's count and byte budget, received more",
+                    ))
                     .await;
             }
-            Outcome::Poison { failure } => {
-                self.shared.poison(failure).await;
-            }
-            Outcome::Ignore => {}
         }
     }
 
@@ -1664,6 +1925,161 @@ impl PeerHandler for CodexHandler {
 }
 
 impl CodexHandler {
+    /// Routes one notification now, outside any steer hold.
+    async fn handle_notification(&self, method: String, params: Value) {
+        let notification = Notification::parse(&method, params);
+
+        // The server resolved one of its own questions — an interrupt did it, or a policy of its
+        // own answered first. Releasing the waiter is what keeps the task composing a reply, and
+        // its share of this session, from outliving the question.
+        if let Notification::ServerRequestResolved(resolved) = &notification
+            && resolved.thread_id == self.shared.thread_id()
+        {
+            let route = self.shared.active_turn_route().await;
+            if let Some(route) = route {
+                let released = self
+                    .release_resolved(&RequestId::new(resolved.request_id.clone()).key(), &route)
+                    .await;
+                if !released {
+                    self.shared
+                            .poison(VendorError::new(
+                                reducer::PROTOCOL_ERROR,
+                                "expected room for a serverRequest/resolved tombstone, received a full bounded set",
+                            ))
+                            .await;
+                    return;
+                }
+            }
+        }
+
+        // Quota belongs to the account and arrives whether or not a turn is running. It is merged
+        // into the session's baseline rather than shown as the partial snapshot it may be.
+        if let Notification::RateLimits(update) = &notification {
+            self.shared.rate_limits_updated(&update.rate_limits).await;
+            return;
+        }
+
+        let active_route = self.shared.active_turn_route().await;
+        let Some(mut active_route) = active_route else {
+            return;
+        };
+        if active_route.native_turn_id.is_empty()
+            && notification.requires_native_turn_match()
+            && let Some(turn_id) = notification.turn_id()
+            && self.shared.recently_completed(turn_id).await
+        {
+            return;
+        }
+
+        // The vendor's own turn id can arrive on a notification before `turn/start` answers.
+        // Whichever side learns it first announces the turn as accepted, exactly once, before
+        // anything else reaches the host on this attempt's stream.
+        //
+        // Gated on `requires_native_turn_match()`, the same test the reducer itself uses to
+        // decide whether a family's id can be trusted — which excludes `turn/started` on
+        // purpose. Captured review transcripts show its id can differ from `review/start`'s own
+        // response and from every later item and completion for the same review; claiming from
+        // it here would announce a review under an id nothing else on its stream agrees with.
+        if active_route.native_turn_id.is_empty()
+            && notification.requires_native_turn_match()
+            && let Some(turn_id) = notification.turn_id()
+        {
+            match self
+                .shared
+                .claim_announcement(&active_route.owner, turn_id)
+                .await
+            {
+                Ok(Some((sink, native_turn_id))) => {
+                    active_route.native_turn_id.clone_from(&native_turn_id);
+                    if sink
+                        .emit(EventKind::TurnStarted { native_turn_id })
+                        .await
+                        .is_err()
+                    {
+                        self.shared
+                            .poison(VendorError::new(
+                                reducer::PROTOCOL_ERROR,
+                                "expected a host stream that accepts an accepted turn announcement",
+                            ))
+                            .await;
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    self.shared
+                        .poison(VendorError::new(
+                            reducer::PROTOCOL_ERROR,
+                            "expected an app-server notification with a usable native turn id",
+                        ))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        // Idle accounting measures *this* turn's silence. A subagent's thread, a detached review,
+        // another turn of this thread and an account-level quota update all ride the same
+        // connection, and resetting the deadline for them would let steady foreign traffic keep a
+        // genuinely hung turn alive for as long as the connection lasts. Routed, not reduced: a
+        // frame can belong to this turn and still render nothing, as `turn/started` and a retrying
+        // `error` do, and withholding the reset for those would time out a turn that is working.
+        if reducer::routes_to_active_turn(
+            &notification,
+            self.shared.thread_id(),
+            Some(active_route.native_turn_id.as_str()),
+        ) {
+            self.shared.signal_idle_change();
+        }
+
+        let outcome = self.shared.reduce_for(&active_route, &notification).await;
+        match outcome {
+            Outcome::Emit(events) => {
+                for event in events {
+                    let emitted = if notification.requires_native_turn_match() {
+                        self.shared.emit_for(&active_route, event).await
+                    } else {
+                        self.shared.emit(event).await
+                    };
+                    if matches!(emitted, Err(Error::LimitExceeded { .. })) {
+                        self.shared
+                            .poison(VendorError::new(
+                                CALL_FAILED,
+                                "expected bounded Codex transcript publication, received overflow",
+                            ))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            Outcome::Finish { .. } => {
+                // Whatever the server was still asking is moot: its turn is over, and a question
+                // belonging to a finished turn is one nobody will be shown.
+                //
+                // Hold question settlement ownership through both the drain and terminal claim.
+                // A request task that already routed to this turn then observes `finishing`
+                // before it can register a new host-visible round after this drain.
+                let _settlement = self.shared.question_settlements.lock().await;
+                self.shared
+                    .release_pending_approvals_for(
+                        Some(&active_route.owner),
+                        DecisionSource::Cancelled,
+                    )
+                    .await;
+                self.shared
+                    .release_pending_questions_for_locked(Some(&active_route.owner))
+                    .await;
+                self.shared
+                    .finish_for(&active_route, notification.turn_id(), outcome)
+                    .await;
+            }
+            Outcome::Poison { failure } => {
+                self.shared.poison(failure).await;
+            }
+            Outcome::Ignore => {}
+        }
+    }
+
     /// Puts one question to whoever answers, and waits.
     ///
     /// Returns `None` when the server resolved the question itself while this was waiting.
@@ -2954,6 +3370,8 @@ impl CodexSession {
                 attempt,
                 native_turn_id: String::new(),
                 announced: false,
+                earlier_native_turn_ids: VecDeque::new(),
+                reducer: crate::turn_reducer::TurnReducer::new(),
                 is_review: rpc_method == method::REVIEW_START,
                 start_unanswerable: false,
                 interrupt_dispatched: false,
@@ -3428,17 +3846,27 @@ impl Session for CodexSession {
     }
 
     async fn steer(&self, steer: Steer) -> Result<SteerOutcome> {
+        // Held across the read, the request and the adoption: a second steer issued while the
+        // first is in flight must address the id the first one leaves behind.
+        let _steering = self.shared.steering.lock().await;
         let running = {
             let turn = self.shared.turn.lock().await;
-            turn.as_ref().map(|active| {
-                (
-                    active.turn_id.clone(),
-                    active.native_turn_id.clone(),
-                    active.is_review,
-                )
-            })
+            turn.as_ref()
+                .filter(|active| !active.finishing)
+                .map(|active| {
+                    (
+                        Arc::clone(&active.owner),
+                        active.turn_id.clone(),
+                        active.native_turn_id.clone(),
+                        active.native_turn_id == steer.native_turn_id
+                            || active
+                                .earlier_native_turn_ids
+                                .contains(&steer.native_turn_id),
+                        active.is_review,
+                    )
+                })
         };
-        let Some((turn_id, native_turn_id, is_review)) = running else {
+        let Some((owner, turn_id, native_turn_id, names_this_turn, is_review)) = running else {
             return Ok(SteerOutcome::Rejected {
                 reason: SteerRejection::TurnAlreadyCompleted,
             });
@@ -3448,7 +3876,7 @@ impl Session for CodexSession {
                 reason: SteerRejection::TurnNotSteerable,
             });
         }
-        if turn_id != steer.turn_id || native_turn_id != steer.native_turn_id {
+        if turn_id != steer.turn_id || native_turn_id.is_empty() || !names_this_turn {
             // The turn the host meant is not the one running. Steering the live one instead would
             // put the input on a turn nobody addressed.
             return Ok(SteerOutcome::Rejected {
@@ -3459,16 +3887,31 @@ impl Session for CodexSession {
         let params = TurnSteerParams {
             thread_id: self.shared.thread_id().to_owned(),
             input: vec![UserInput::text(steer.input)],
-            expected_turn_id: steer.native_turn_id,
+            // The id Codex is running now, which a continuation may have moved past the one the
+            // host named.
+            expected_turn_id: native_turn_id.clone(),
         };
-        match self
+        let hold = SteerHoldGuard::hold(&self.shared);
+        let answered = self
             .client
             .request::<_, TurnSteerResponse>(method::TURN_STEER, params)
-            .await
-        {
-            Ok(_) => Ok(SteerOutcome::Accepted),
+            .await;
+        let adopted = match &answered {
+            Ok(response) => {
+                self.shared
+                    .adopt_continuation(&owner, &native_turn_id, &response.turn_id)
+                    .await
+            }
+            Err(_) => Ok(()),
+        };
+        hold.release().await;
+        match answered {
+            Ok(_) => adopted.map(|()| SteerOutcome::Accepted),
             Err(Error::Vendor(error)) if is_no_active_turn(&error) => Ok(SteerOutcome::Rejected {
                 reason: SteerRejection::TurnAlreadyCompleted,
+            }),
+            Err(Error::Vendor(error)) if is_not_steerable(&error) => Ok(SteerOutcome::Rejected {
+                reason: SteerRejection::TurnNotSteerable,
             }),
             Err(error) => Err(error),
         }
@@ -3532,14 +3975,27 @@ impl Session for CodexSession {
     }
 
     async fn refresh_account_usage(&self) -> Result<AccountUsage> {
-        let response: RateLimitsReadResponse = self
+        // The same bookkeeping as the session's own read: an update that lands while this is in
+        // flight is laid over the answer rather than lost to it.
+        let sequence = self.shared.begin_quota_read().await;
+        let response = self
             .client
-            .request(method::ACCOUNT_RATE_LIMITS_READ, empty_params())
-            .await?;
+            .request::<_, RateLimitsReadResponse>(method::ACCOUNT_RATE_LIMITS_READ, empty_params())
+            .await;
+        let answer = response
+            .as_ref()
+            .ok()
+            .and_then(|response| response.rate_limits.clone());
+        let merged = self
+            .shared
+            .finish_quota_read(sequence, answer.as_ref())
+            .await
+            .baseline();
+        response?;
         Ok(AccountUsage {
             // Absence is unknown, never an empty quota: a server that answered without a snapshot
             // has not told us the account is unmetered.
-            limits: response.rate_limits.as_ref().map(|snapshot| {
+            limits: merged.as_ref().map(|snapshot| {
                 crate::rate_limits::to_account_limits(snapshot, self.shared.host.now())
             }),
         })
@@ -3554,11 +4010,7 @@ pub(crate) async fn list_threads(
 ) -> Result<SessionPage> {
     validate_list_workspace(host, &query)?;
     let cwd = host.absolute_cwd()?;
-    let params = ThreadListParams {
-        cursor: query.cursor,
-        limit: query.limit,
-        cwd: Some(cwd.to_owned()),
-    };
+    let params = ThreadListParams::picker(query.cursor, query.limit, cwd);
     let page: ThreadListResponse = client.request(method::THREAD_LIST, params).await?;
     if let Some(limit) = query.limit
         && page.data.len() > limit
@@ -3575,17 +4027,17 @@ pub(crate) async fn list_threads(
             .into_iter()
             .filter(|thread| thread.cwd.as_deref() == Some(cwd))
             .map(|thread| NativeSession {
-                native_session_id: thread.id,
-                // A title may be absent; the preview is the first user message when supplied.
-                title: thread.name.filter(|name| !name.is_empty()),
-                preview: Some(thread.preview).filter(|preview| !preview.is_empty()),
-                workspace_path: thread.cwd,
-                updated_at: thread.updated_at.and_then(|seconds| {
+                updated_at: thread.last_used_at().and_then(|seconds| {
                     u64::try_from(seconds).ok().and_then(|seconds| {
                         std::time::SystemTime::UNIX_EPOCH
                             .checked_add(std::time::Duration::from_secs(seconds))
                     })
                 }),
+                native_session_id: thread.id,
+                // A title may be absent; the preview is the first user message when supplied.
+                title: thread.name.filter(|name| !name.is_empty()),
+                preview: Some(thread.preview).filter(|preview| !preview.is_empty()),
+                workspace_path: thread.cwd,
             })
             .collect(),
         next_cursor: page.next_cursor,
@@ -3664,6 +4116,17 @@ fn teardown_panicked(control: Arc<dyn ProcessControl>, joined: &tokio::task::Joi
 fn is_no_active_turn(error: &VendorError) -> bool {
     error.vendor_code.as_deref() == Some(NO_ACTIVE_TURN_CODE)
         && error.message.to_lowercase().contains("no active turn")
+}
+
+/// Whether a steer failed because the running turn is a review or a compaction.
+///
+/// The pinned app-server answers `-32600` with `cannot steer a review turn` or `cannot steer a
+/// compact turn`, and attaches `codexErrorInfo: {activeTurnNotSteerable: {turnKind}}` as data. The
+/// JSON-RPC client keeps the code and message but not the data, so both of those are checked, on
+/// the same terms as [`is_no_active_turn`].
+fn is_not_steerable(error: &VendorError) -> bool {
+    error.vendor_code.as_deref() == Some(NO_ACTIVE_TURN_CODE)
+        && error.message.starts_with("cannot steer a ")
 }
 
 /// The JSON-RPC code the app-server refuses a steer with: the generic invalid-request code.
@@ -3954,6 +4417,8 @@ mod tests {
             native_turn_id: native_turn_id.to_owned(),
             // This helper installs a turn already past the point `begin` would have announced it.
             announced: true,
+            earlier_native_turn_ids: std::collections::VecDeque::new(),
+            reducer: crate::turn_reducer::TurnReducer::new(),
             is_review: false,
             start_unanswerable: false,
             interrupt_dispatched: false,
@@ -3972,6 +4437,119 @@ mod tests {
                 events,
             ),
         )
+    }
+
+    fn held_delta(delta: &str) -> serde_json::Value {
+        serde_json::json!({"threadId": "thread-1", "turnId": "vendor-turn-1", "itemId": "m",
+                           "delta": delta})
+    }
+
+    /// Reads the next answer text off a turn, or fails naming what was expected.
+    async fn next_text(stream: &mut mango_external_agents::stream::TurnStream, expected: &str) {
+        let text = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = stream.recv().await {
+                if let EventKind::TextDelta { text } = event.kind {
+                    return Some(text);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        assert_eq!(
+            text.as_deref(),
+            Some(expected),
+            "expected the next answer text on the turn"
+        );
+    }
+
+    /// A host may drop its steer future while the hold is being replayed, through a timeout
+    /// wrapper or a disconnect. The replay must still finish and routing must go live again, or
+    /// every later frame — the terminal included — is queued forever.
+    #[tokio::test]
+    async fn dropping_a_steer_mid_release_still_replays_and_reopens_routing_in_order() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+        let handler = super::CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let guard = super::SteerHoldGuard::hold(&shared);
+        handler
+            .on_notification(String::from("item/agentMessage/delta"), held_delta("a"))
+            .await;
+
+        // The replay needs the turn lock, so holding it here makes the release pend; the
+        // timeout then drops the release future mid-way, as a host's wrapper would.
+        let turn = shared.turn.lock().await;
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(20), guard.release()).await;
+        assert!(dropped.is_err(), "expected the release to be cut off");
+        drop(turn);
+
+        handler
+            .on_notification(String::from("item/agentMessage/delta"), held_delta("b"))
+            .await;
+        next_text(&mut stream, "a").await;
+        next_text(&mut stream, "b").await;
+    }
+
+    /// Held frames are outside the connection's own byte budget, so the hold has one of its own.
+    #[tokio::test]
+    async fn a_steer_hold_past_its_byte_budget_fails_the_session_cleanly() {
+        let host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd("/workspace")
+            .client_info("mango-test", "0.0.1")
+            .limits(Limits {
+                turn_buffer_bytes: 4096,
+                ..Limits::default()
+            })
+            .build()
+            .expect("expected a host");
+        let shared = Arc::new(Shared::new(
+            host,
+            mango_external_agents::SessionId::new("chat-1"),
+        ));
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+        let handler = super::CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let _guard = super::SteerHoldGuard::hold(&shared);
+        for _ in 0..8 {
+            handler
+                .on_notification(
+                    String::from("item/agentMessage/delta"),
+                    held_delta(&"x".repeat(1024)),
+                )
+                .await;
+        }
+        assert!(
+            shared.is_shutting_down(),
+            "expected a hold past its byte budget to fail the session"
+        );
+    }
+
+    /// A slow steer answer must not let the idle deadline kill a turn whose progress is queued.
+    #[tokio::test]
+    async fn a_held_frame_for_this_conversation_still_counts_as_progress() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+        let handler = super::CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let changes = shared.idle_changes.subscribe();
+        let _guard = super::SteerHoldGuard::hold(&shared);
+        handler
+            .on_notification(String::from("item/agentMessage/delta"), held_delta("a"))
+            .await;
+        assert!(
+            changes.has_changed().unwrap_or(false),
+            "expected a held frame for this conversation to restart the idle deadline"
+        );
     }
 
     /// The trap the running-turn guard exists to close. A host that drops its stream stops

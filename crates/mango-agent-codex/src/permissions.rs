@@ -7,10 +7,20 @@
 //! be given.
 
 use mango_external_agents::permission::{
-    ApprovalRouting, ConfigurationVerdict, PermissionLevel, PermissionMatrix,
+    ApprovalRouting, ConfigurationVerdict, PermissionLevel, PermissionMatrix, UnsupportedReason,
 };
 
-use crate::protocol::requests::{ApprovalsReviewer, AskForApproval, SandboxMode, SandboxPolicy};
+use crate::protocol::requests::{
+    ApprovalsReviewer, AskForApproval, PermissionProfileSummary, SandboxMode, SandboxPolicy,
+};
+
+/// Why a cell is unsupported when the machine's own Codex requirements forbid its profile.
+///
+/// The text of [`UnsupportedReason::Other`](mango_external_agents::permission::UnsupportedReason)
+/// for that case, public so a host can recognise it and say that a policy, not the harness, is
+/// what refused.
+pub const PROFILE_DISALLOWED: &str =
+    "the machine's Codex requirements do not allow this permission profile";
 
 /// Only the permission settings explicitly selected by the host.
 pub(crate) struct PermissionOverrides {
@@ -148,9 +158,92 @@ pub fn matrix() -> PermissionMatrix {
     })
 }
 
+/// The built-in permission profile each level selects, as `permissionProfile/list` names it.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_codex::permissions::profile_id;
+/// use mango_external_agents::PermissionLevel;
+///
+/// assert_eq!(profile_id(PermissionLevel::Default), ":workspace");
+/// ```
+#[must_use]
+pub fn profile_id(level: PermissionLevel) -> &'static str {
+    match level {
+        PermissionLevel::ReadOnly => ":read-only",
+        PermissionLevel::Default => ":workspace",
+        PermissionLevel::FullAccess => ":danger-full-access",
+    }
+}
+
+/// The declared matrix, narrowed to the levels whose profile the machine allows.
+///
+/// A profile reported `allowed: false`, or missing from the list, makes both of its level's cells
+/// unsupported with [`PROFILE_DISALLOWED`]: either way this machine will not run it, and offering
+/// it would produce a choice that fails at `thread/start`.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_codex::permissions::matrix_allowed_by;
+/// use mango_external_agents::{ApprovalRouting, PermissionLevel};
+///
+/// let matrix = matrix_allowed_by(&[]);
+/// assert!(!matrix.supports(PermissionLevel::ReadOnly, ApprovalRouting::User));
+/// ```
+#[must_use]
+pub fn matrix_allowed_by(profiles: &[PermissionProfileSummary]) -> PermissionMatrix {
+    PermissionMatrix::build(|level, routing| {
+        let vendor_id = Some(VendorConfiguration::for_pair(level, routing).vendor_id());
+        let allowed = profiles
+            .iter()
+            .any(|profile| profile.id == profile_id(level) && profile.allowed);
+        if allowed {
+            ConfigurationVerdict::Supported { vendor_id }
+        } else {
+            ConfigurationVerdict::Unsupported {
+                reason: UnsupportedReason::Other(String::from(PROFILE_DISALLOWED)),
+                vendor_id,
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{VendorConfiguration, matrix};
+
+    fn profile(id: &str, allowed: bool) -> crate::protocol::requests::PermissionProfileSummary {
+        serde_json::from_value(serde_json::json!({"id": id, "allowed": allowed}))
+            .expect("expected a profile")
+    }
+
+    #[test]
+    fn a_level_is_offered_only_when_its_profile_is_listed_and_allowed() {
+        let narrowed =
+            super::matrix_allowed_by(&[profile(":read-only", true), profile(":workspace", false)]);
+        for routing in ApprovalRouting::ALL {
+            assert!(narrowed.supports(PermissionLevel::ReadOnly, routing));
+            assert!(
+                !narrowed.supports(PermissionLevel::Default, routing),
+                "expected a profile reported disallowed to be refused"
+            );
+            assert!(
+                !narrowed.supports(PermissionLevel::FullAccess, routing),
+                "expected an unlisted profile to be refused"
+            );
+        }
+        assert_eq!(
+            super::matrix_allowed_by(&[
+                profile(":read-only", true),
+                profile(":workspace", true),
+                profile(":danger-full-access", true),
+            ]),
+            matrix(),
+            "expected every allowed profile to leave the declared matrix intact"
+        );
+    }
     use crate::protocol::requests::{ApprovalsReviewer, AskForApproval, SandboxMode};
     use mango_external_agents::permission::{ApprovalRouting, PermissionLevel};
     use mango_external_agents::{ConfigurationChange, ConfigurationPatch};

@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod account;
 pub mod activity;
 pub mod approvals;
 mod configuration;
@@ -11,6 +12,7 @@ pub mod protocol;
 pub mod rate_limits;
 pub mod reducer;
 pub mod session;
+pub mod turn_reducer;
 
 pub use harness::CodexHarness;
 pub use protocol::schema::{MINIMUM_CODEX_VERSION, PIN};

@@ -29,9 +29,10 @@ pub use approvals::{
 };
 pub use items::{CommandExecutionStatus, ItemStatus, ThreadItem};
 pub use notifications::{
-    AgentMessageDelta, ErrorNotification, ItemNotification, Notification, RateLimitSnapshot,
-    RateLimitWindow, ReasoningDelta, ServerRequestResolved, ThreadStarted, ThreadTokenUsage,
-    TokenUsageBreakdown, TurnNotification, TurnTokenUsage,
+    AgentMessageDelta, CommandOutputDelta, ErrorNotification, FileChangePatchUpdated,
+    ItemNotification, McpToolCallProgress, Notification, RateLimitSnapshot, RateLimitWindow,
+    ReasoningDelta, ServerRequestResolved, ThreadStarted, ThreadTokenUsage, TokenUsageBreakdown,
+    TurnNotification, TurnTokenUsage,
 };
 pub use requests::{
     Account, AccountReadResponse, AskForApproval, ClientInfo, InitializeParams, InitializeResponse,
@@ -72,6 +73,8 @@ pub mod method {
     pub const ACCOUNT_READ: &str = "account/read";
     /// The account's plan quota.
     pub const ACCOUNT_RATE_LIMITS_READ: &str = "account/rateLimits/read";
+    /// The permission profiles this machine's configuration allows.
+    pub const PERMISSION_PROFILE_LIST: &str = "permissionProfile/list";
 }
 
 /// The peer as a person would name it, in errors and log lines.

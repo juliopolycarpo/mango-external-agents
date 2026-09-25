@@ -3,8 +3,9 @@
 //! Nineteen variants upstream, of which a host renders a handful and the rest are either the
 //! turn's own text (handled as deltas) or vendor bookkeeping. The variants here are the ones that
 //! become an [`Activity`](mango_external_agents::Activity) or a piece of the answer; every other
-//! item deserialises into [`ThreadItem::Other`] with its `type` kept, so the reducer can drop it
-//! by name rather than by silence.
+//! item deserialises into [`ThreadItem::Other`] with its `type` and `id` kept, so the work it
+//! records can still be shown — or an echo of the client's own input dropped — by name rather
+//! than by silence.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -48,12 +49,15 @@ pub struct FileUpdateChange {
 }
 
 /// One unit of a turn's work, in the families this harness renders.
+///
+/// Non-exhaustive: a family that starts mattering becomes a variant here.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
+#[non_exhaustive]
 pub enum ThreadItem {
     /// A piece of the answer, as the whole message rather than a delta.
     AgentMessage {
@@ -176,16 +180,50 @@ pub enum ThreadItem {
         /// The item's own id.
         id: String,
     },
-    /// A family this harness does not render.
-    #[serde(other)]
-    Other,
+    /// A family this harness does not model, with the two fields every family shares.
+    ///
+    /// Untagged, so serde reaches it only when `type` names none of the variants above. A known
+    /// family whose own fields did not decode also lands here under its known name, which
+    /// [`ThreadItem::is_unmodelled_family`] tells apart.
+    #[serde(untagged)]
+    Other {
+        /// The vendor's own name for the family, such as `imageView`.
+        #[serde(rename = "type")]
+        item_type: String,
+        /// The item's own id, when it carried a string one.
+        #[serde(default)]
+        id: Option<String>,
+        /// How it ended, when the family states a status in the shared spelling.
+        #[serde(default)]
+        status: Option<ItemStatus>,
+    },
 }
+
+/// The `type` of every family [`ThreadItem`] models as its own variant.
+const MODELLED_FAMILIES: &[&str] = &[
+    "agentMessage",
+    "reasoning",
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "webSearch",
+    "plan",
+    "subAgentActivity",
+    "enteredReviewMode",
+    "exitedReviewMode",
+    "contextCompaction",
+];
+
+/// Families that echo what the client itself sent, rather than record work the agent did.
+///
+/// `userMessage` is the input of this turn, `hookPrompt` the user's own configuration replayed,
+/// and `functionCallOutput` tool output a client supplied through `turn/start.toolOutput`.
+const CLIENT_ECHO_FAMILIES: &[&str] = &["userMessage", "hookPrompt", "functionCallOutput"];
 
 impl ThreadItem {
     /// The vendor's own id for this item, when it has one.
     ///
-    /// `None` for [`ThreadItem::Other`]: the variant keeps no fields, because an id belonging to
-    /// an item nothing renders is an id nothing would echo back.
+    /// `None` only for a [`ThreadItem::Other`] that carried no string id.
     #[must_use]
     pub fn id(&self) -> Option<&str> {
         match self {
@@ -200,15 +238,32 @@ impl ThreadItem {
             | Self::EnteredReviewMode { id, .. }
             | Self::ExitedReviewMode { id, .. }
             | Self::ContextCompaction { id } => Some(id.as_str()),
-            Self::Other => None,
+            Self::Other { id, .. } => id.as_deref(),
+        }
+    }
+
+    /// Whether this is a family this build does not model and that records the agent's work.
+    ///
+    /// False for every modelled family — including one whose own fields did not decode, which is
+    /// a malformed item rather than a new kind of work — and for the echoes of the client's own
+    /// input. For example, an `imageView` item is unmodelled; a `userMessage` is not.
+    #[must_use]
+    pub fn is_unmodelled_family(&self) -> bool {
+        match self {
+            Self::Other { item_type, .. } => {
+                !MODELLED_FAMILIES.contains(&item_type.as_str())
+                    && !CLIENT_ECHO_FAMILIES.contains(&item_type.as_str())
+            }
+            _ => false,
         }
     }
 
     /// Whether this item's own lifecycle is the turn's text rather than an activity.
     ///
     /// The answer and the reasoning arrive twice: as deltas while they are being written, and as a
-    /// whole item when they finish. Rendering both would double every sentence, so the reducer
-    /// takes the deltas and drops these.
+    /// whole item when they finish. Rendering both would double every sentence, so neither becomes
+    /// an activity; a completed answer contributes only the text its deltas did not deliver (see
+    /// [`crate::turn_reducer`]).
     #[must_use]
     pub fn is_streamed_text(&self) -> bool {
         matches!(self, Self::AgentMessage { .. } | Self::Reasoning { .. })
@@ -262,17 +317,51 @@ mod tests {
     }
 
     /// A build newer than the pin sends families this one has never heard of. An item is a unit of
-    /// work to render, not a contract to enforce: an unknown one is dropped, not fatal.
+    /// work to render, not a contract to enforce: an unknown one keeps its name and id, not fatal.
     #[test]
-    fn an_item_family_this_harness_does_not_render_is_kept_as_other() {
+    fn an_item_family_this_harness_does_not_model_is_kept_as_other_with_its_name_and_id() {
         let item: ThreadItem = serde_json::from_value(json!({
             "type": "somethingTheNextReleaseAdded",
             "id": "x-1",
             "whatever": {"nested": true}
         }))
         .expect("expected an unknown item to survive");
-        assert_eq!(item, ThreadItem::Other);
-        assert_eq!(item.id(), None);
+        assert_eq!(
+            item,
+            ThreadItem::Other {
+                item_type: String::from("somethingTheNextReleaseAdded"),
+                id: Some(String::from("x-1")),
+                status: None,
+            }
+        );
+        assert_eq!(item.id(), Some("x-1"));
+        assert!(item.is_unmodelled_family());
+    }
+
+    /// A modelled family whose own fields did not decode is malformed, not a new kind of work.
+    #[test]
+    fn a_malformed_modelled_family_is_not_mistaken_for_an_unmodelled_one() {
+        let item: ThreadItem = serde_json::from_value(json!({
+            "type": "commandExecution", "id": "c-1", "command": 7
+        }))
+        .expect("expected the item to survive as data");
+        assert!(
+            !item.is_unmodelled_family(),
+            "expected a malformed commandExecution to stay unrendered, received {item:?}"
+        );
+    }
+
+    #[test]
+    fn an_echo_of_the_clients_own_input_is_not_an_unmodelled_family() {
+        for item_type in ["userMessage", "hookPrompt", "functionCallOutput"] {
+            let item: ThreadItem =
+                serde_json::from_value(json!({"type": item_type, "id": "e-1", "content": []}))
+                    .expect("expected an echo to survive");
+            assert!(
+                !item.is_unmodelled_family(),
+                "expected {item_type} to be an echo"
+            );
+        }
     }
 
     /// Four families spell their status the same way; a fifth spelling must not fail the item.

@@ -25,11 +25,13 @@ use mango_external_agents::transport::{ExecutablePath, StdioSpec, TransportKind}
 use mango_external_agents::transports::stdio;
 use mango_external_agents::{ClientInfo as HostClientInfo, HostContext};
 
+use crate::account::{AccountFingerprintKey, CodexAccount, CodexDiscovery};
 use crate::discovery::{self, LOGIN_HINT, PROGRAM};
 use crate::permissions::PermissionOverrides;
 use crate::protocol::requests::{
     AccountReadResponse, ApprovalsReviewer, ClientInfo, InitializeParams, InitializeResponse,
-    ModelListParams, ModelListResponse, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
+    ModelListParams, ModelListResponse, PermissionProfileListParams, PermissionProfileListResponse,
+    PermissionProfileSummary, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
     ThreadStartParams, ThreadStartResponse, ThreadSummary, empty_params,
 };
 use crate::protocol::schema::MINIMUM_CODEX_VERSION;
@@ -147,6 +149,96 @@ impl CodexHarness {
         self
     }
 
+    /// Discovers this machine's Codex, and fingerprints the signed-in account with the host's key.
+    ///
+    /// The same probe and the same bounding as
+    /// [`Harness::discover`], from one app-server
+    /// connection, plus the account facts a generic [`Discovery`] has no field for: the ChatGPT
+    /// plan and a fingerprint that is stable for one account under `key`, so a host can keep a
+    /// continuation for the same account and notice when it changed. The address the fingerprint
+    /// is computed from is read from `account/read` and returned nowhere; see
+    /// [`crate::account`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Harness::discover`] would return.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(host: &mango_external_agents::HostContext) -> mango_external_agents::Result<()> {
+    /// use mango_agent_codex::CodexHarness;
+    /// use mango_agent_codex::account::AccountFingerprintKey;
+    ///
+    /// let key = AccountFingerprintKey::new(b"host-local-key")?;
+    /// let found = CodexHarness::new().discover_with_account(host, &key).await?;
+    /// let fingerprint = found.account.and_then(|account| account.fingerprint);
+    /// # let _ = fingerprint;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn discover_with_account(
+        &self,
+        host: &HostContext,
+        key: &AccountFingerprintKey,
+    ) -> Result<CodexDiscovery> {
+        let (discovery, account) = self.probe_with(host, Some(key)).await?;
+        Ok(CodexDiscovery {
+            discovery: discovery
+                .normalized()
+                .bounded_by(&self.descriptor().capabilities, &self.permission_matrix()),
+            account,
+        })
+    }
+
+    /// The probe behind both [`Harness::probe`] and [`CodexHarness::discover_with_account`].
+    async fn probe_with(
+        &self,
+        host: &HostContext,
+        key: Option<&AccountFingerprintKey>,
+    ) -> Result<(Discovery, Option<CodexAccount>)> {
+        let version = match read_version(host, &self.executable).await? {
+            Some(version) => version,
+            // Nothing answered `--version`, so nothing is installed as far as a probe can tell. An
+            // executable the host resolved but cannot run is the same fact to a caller.
+            None => return Ok((Discovery::not_installed(), None)),
+        };
+        let gate = discovery::gate(Some(&version), MINIMUM_CODEX_VERSION);
+
+        // A build that would be refused is not worth a handshake: the app-server is a process, and
+        // spawning one to ask an account question whose answer cannot be acted on is a cost with
+        // no buyer.
+        if !matches!(gate, GateVerdict::Usable) {
+            let discovery = Discovery {
+                executable: self.executable.get().cloned(),
+                version: Some(version),
+                gate,
+                auth: AuthState::Unknown,
+                capabilities: DiscoveredCapabilities::none(),
+                permission_matrix: self.permission_matrix(),
+                models: Vec::new(),
+                configuration_catalog: ConfigurationCatalog::empty(),
+            };
+            return Ok((discovery, None));
+        }
+
+        let probed = probe_app_server(host, &self.executable, key).await?;
+        let discovery = Discovery {
+            executable: self.executable.get().cloned(),
+            version: Some(version),
+            gate,
+            auth: probed.auth,
+            capabilities: DiscoveredCapabilities::new(CAPABILITIES),
+            permission_matrix: probed.profiles.map_or_else(
+                || self.permission_matrix(),
+                |profiles| crate::permissions::matrix_allowed_by(&profiles),
+            ),
+            models: probed.models,
+            configuration_catalog: ConfigurationCatalog::empty(),
+        };
+        Ok((discovery, probed.account))
+    }
+
     /// The executable this session should spawn: the request's, then the harness's.
     fn program_for(&self, request: &OpenSession) -> ExecutablePath {
         request
@@ -168,41 +260,7 @@ impl Harness for CodexHarness {
     }
 
     async fn probe(&self, host: &HostContext) -> Result<Discovery> {
-        let version = match read_version(host, &self.executable).await? {
-            Some(version) => version,
-            // Nothing answered `--version`, so nothing is installed as far as a probe can tell. An
-            // executable the host resolved but cannot run is the same fact to a caller.
-            None => return Ok(Discovery::not_installed()),
-        };
-        let gate = discovery::gate(Some(&version), MINIMUM_CODEX_VERSION);
-
-        // A build that would be refused is not worth a handshake: the app-server is a process, and
-        // spawning one to ask an account question whose answer cannot be acted on is a cost with
-        // no buyer.
-        if !matches!(gate, GateVerdict::Usable) {
-            return Ok(Discovery {
-                executable: self.executable.get().cloned(),
-                version: Some(version),
-                gate,
-                auth: AuthState::Unknown,
-                capabilities: DiscoveredCapabilities::none(),
-                permission_matrix: self.permission_matrix(),
-                models: Vec::new(),
-                configuration_catalog: ConfigurationCatalog::empty(),
-            });
-        }
-
-        let (auth, models) = probe_app_server(host, &self.executable).await?;
-        Ok(Discovery {
-            executable: self.executable.get().cloned(),
-            version: Some(version),
-            gate,
-            auth,
-            capabilities: DiscoveredCapabilities::new(CAPABILITIES),
-            permission_matrix: self.permission_matrix(),
-            models,
-            configuration_catalog: ConfigurationCatalog::empty(),
-        })
+        Ok(self.probe_with(host, None).await?.0)
     }
 
     async fn open_session(
@@ -623,7 +681,87 @@ impl mango_external_agents::process::ByteSource for NoBytes {
     }
 }
 
-/// Auth state and the model catalog, from one short-lived app-server connection.
+/// What one short-lived app-server connection learned.
+struct Probed {
+    auth: AuthState,
+    /// The account facts, when a key was supplied and a ChatGPT account answered.
+    account: Option<CodexAccount>,
+    models: Vec<Model>,
+    /// The permission profiles, when the server answered the question at all.
+    profiles: Option<Vec<PermissionProfileSummary>>,
+}
+
+impl Probed {
+    fn unknown() -> Self {
+        Self {
+            auth: AuthState::Unknown,
+            account: None,
+            models: Vec::new(),
+            profiles: None,
+        }
+    }
+}
+
+/// How many pages of one paginated listing a probe walks, so a server that always returns a
+/// cursor cannot hold discovery open.
+const PROBE_PAGE_LIMIT: usize = 8;
+
+/// Every model the server lists, walking its cursor.
+///
+/// Bounded by [`PROBE_PAGE_LIMIT`] pages and the core's catalog cap. A page that fails mid-walk
+/// keeps what was already read rather than discarding the catalog.
+async fn read_model_catalog(client: &Client) -> Vec<crate::protocol::requests::Model> {
+    let mut models = Vec::new();
+    let mut cursor = None;
+    for _ in 0..PROBE_PAGE_LIMIT {
+        let Ok(page) = client
+            .request::<_, ModelListResponse>(method::MODEL_LIST, ModelListParams::page(cursor))
+            .await
+        else {
+            break;
+        };
+        // Hidden models never reach the picker, so they do not count against its cap.
+        models.extend(page.data.into_iter().filter(|model| !model.hidden));
+        cursor = page.next_cursor.filter(|cursor| !cursor.is_empty());
+        if cursor.is_none()
+            || models.len() >= mango_external_agents::normalize::MODEL_CATALOG_MAX_ITEMS
+        {
+            break;
+        }
+    }
+    models
+}
+
+/// Every permission profile the server lists for the host's project, or nothing when it would not
+/// answer or did not finish within the page limit: a build that cannot say has not forbidden
+/// anything.
+async fn read_permission_profiles(
+    client: &Client,
+    cwd: &str,
+) -> Option<Vec<PermissionProfileSummary>> {
+    let mut profiles = Vec::new();
+    let mut cursor = None;
+    for _ in 0..PROBE_PAGE_LIMIT {
+        let page: PermissionProfileListResponse = client
+            .request(
+                method::PERMISSION_PROFILE_LIST,
+                PermissionProfileListParams::for_project(cwd, cursor),
+            )
+            .await
+            .ok()?;
+        profiles.extend(page.data);
+        cursor = page.next_cursor.filter(|cursor| !cursor.is_empty());
+        if cursor.is_none() {
+            return Some(profiles);
+        }
+    }
+    // Cut off by the page limit: a profile missing from an unfinished listing is unknown, not
+    // forbidden.
+    None
+}
+
+/// Auth state, the model catalog and the allowed permission profiles, from one short-lived
+/// app-server connection.
 ///
 /// A probe that could not reach the server reports `Unknown` and no models rather than failing:
 /// the CLI is installed and the gate passed, and how a host treats an unreachable app-server is
@@ -631,37 +769,41 @@ impl mango_external_agents::process::ByteSource for NoBytes {
 async fn probe_app_server(
     host: &HostContext,
     executable: &ExecutablePath,
-) -> Result<(AuthState, Vec<Model>)> {
-    let unknown = (AuthState::Unknown, Vec::new());
+    key: Option<&AccountFingerprintKey>,
+) -> Result<Probed> {
     let connection = match ProbeConnection::open(host, executable).await {
         Ok(connection) => connection,
         Err(error) if error.cleanup_control().is_some() => return Err(error),
-        Err(_) => return Ok(unknown),
+        Err(_) => return Ok(Probed::unknown()),
     };
 
-    let account: AccountReadResponse = connection
+    // Read raw, so the address a ChatGPT answer carries can be digested without ever being
+    // modelled: it is borrowed from this value, which is dropped when the probe returns.
+    let raw_account: serde_json::Value = connection
         .client
         .request(method::ACCOUNT_READ, empty_params())
         .await
         .unwrap_or_default();
-    let models: ModelListResponse = connection
-        .client
-        .request(method::MODEL_LIST, ModelListParams { limit: None })
-        .await
-        .unwrap_or_default();
-    let probed = (
-        discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
-        models
-            .data
+    let account: AccountReadResponse =
+        serde_json::from_value(raw_account.clone()).unwrap_or_default();
+    let account_facts = key.and_then(|key| CodexAccount::from_account_read(&raw_account, key));
+    drop(raw_account);
+    let models = read_model_catalog(&connection.client).await;
+    let profiles = read_permission_profiles(&connection.client, host.absolute_cwd()?).await;
+    let probed = Probed {
+        auth: discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
+        account: account_facts,
+        models: models
             .into_iter()
             .filter(|model| !model.hidden)
             .map(to_model)
             .collect(),
-    );
+        profiles,
+    };
     match connection.close().await {
         Ok(()) => Ok(probed),
         Err(error) if error.cleanup_control().is_some() => Err(error),
-        Err(_) => Ok(unknown),
+        Err(_) => Ok(Probed::unknown()),
     }
 }
 

@@ -274,6 +274,17 @@ pub struct ThreadSummary {
     /// Unix seconds when it last changed.
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// Unix seconds when it was last used; `thread/list` sorts on it for `recency_at`.
+    #[serde(default)]
+    pub recency_at: Option<i64>,
+}
+
+impl ThreadSummary {
+    /// When the thread was last used, as the picker sorts it: `recencyAt`, else `updatedAt`.
+    #[must_use]
+    pub fn last_used_at(&self) -> Option<i64> {
+        self.recency_at.or(self.updated_at)
+    }
 }
 
 impl fmt::Debug for ThreadSummary {
@@ -286,6 +297,7 @@ impl fmt::Debug for ThreadSummary {
             .field("has_name", &self.name.is_some())
             .field("has_cwd", &self.cwd.is_some())
             .field("has_updated_at", &self.updated_at.is_some())
+            .field("has_recency_at", &self.recency_at.is_some())
             .finish()
     }
 }
@@ -415,6 +427,7 @@ pub enum TurnStatus {
 /// What the server said about a failed turn.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TurnError {
     /// The message it wrote.
     #[serde(default)]
@@ -422,6 +435,46 @@ pub struct TurnError {
     /// More, when it had more to say.
     #[serde(default)]
     pub additional_details: Option<String>,
+    /// The vendor's own classification: a string such as `usageLimitExceeded`, or a single-key
+    /// object such as `{"httpConnectionFailed": {"httpStatusCode": 502}}`.
+    #[serde(default)]
+    pub codex_error_info: Option<serde_json::Value>,
+}
+
+impl TurnError {
+    /// The vendor's classification as one label, when it gave one.
+    ///
+    /// A string member is its own label; an object member is labelled by its one key. Anything
+    /// else reads as `other`, the vendor's own catch-all.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_codex::protocol::requests::TurnError;
+    ///
+    /// let error: TurnError = serde_json::from_value(serde_json::json!({
+    ///     "message": "limit", "codexErrorInfo": "usageLimitExceeded"
+    /// })).unwrap();
+    /// assert_eq!(error.vendor_code().as_deref(), Some("usageLimitExceeded"));
+    /// ```
+    #[must_use]
+    pub fn vendor_code(&self) -> Option<String> {
+        self.codex_error_info.as_ref().map(codex_error_code)
+    }
+}
+
+/// One label for a `CodexErrorInfo` value, as [`TurnError::vendor_code`] describes.
+#[must_use]
+pub fn codex_error_code(info: &serde_json::Value) -> String {
+    match info {
+        serde_json::Value::String(code) if !code.is_empty() => code.clone(),
+        serde_json::Value::Object(members) => members
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| String::from("other")),
+        _ => String::from("other"),
+    }
 }
 
 /// One turn, as much of it as this harness reads.
@@ -539,9 +592,61 @@ pub struct ReviewStartResponse {
     pub review_thread_id: String,
 }
 
+/// How a thread listing is ordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ThreadSortKey {
+    /// When the thread was created, the server's default.
+    CreatedAt,
+    /// When it last changed.
+    UpdatedAt,
+    /// When it was last used, which is what a picker wants.
+    RecencyAt,
+}
+
+/// Which way a listing runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum SortDirection {
+    /// Newest first, the server's default.
+    Desc,
+    /// Oldest first.
+    Asc,
+}
+
+/// Where a thread came from, as `thread/list` filters on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum ThreadSourceKind {
+    /// The interactive CLI.
+    Cli,
+    /// The VS Code extension.
+    Vscode,
+    /// `codex exec`.
+    Exec,
+    /// An app-server client, such as a host built on this library.
+    AppServer,
+}
+
+/// The sources a person started, and a host's picker lists.
+///
+/// The server's default is interactive sources only (`cli` and `vscode`), which leaves out threads
+/// started by `codex exec` or by an app-server client. `vscode` is excluded on purpose, as the
+/// TypeScript adapter did: an editor-owned thread has a live owner the host cannot see. The
+/// subagent kinds are Codex's own machinery and never a conversation somebody chose.
+pub const USER_THREAD_SOURCES: &[ThreadSourceKind] = &[
+    ThreadSourceKind::Cli,
+    ThreadSourceKind::Exec,
+    ThreadSourceKind::AppServer,
+];
+
 /// Listing the conversations this machine already has.
 #[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ThreadListParams {
     /// Where to continue from.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -552,6 +657,45 @@ pub struct ThreadListParams {
     /// Only conversations opened in this directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// How to order them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_key: Option<ThreadSortKey>,
+    /// Which way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+    /// Only threads from these sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kinds: Option<Vec<ThreadSourceKind>>,
+    /// Archived threads only when true; non-archived only when false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+}
+
+impl ThreadListParams {
+    /// A picker page: the user's own non-archived threads in `cwd`, most recently used first.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_codex::protocol::requests::ThreadListParams;
+    ///
+    /// let params = ThreadListParams::picker(None, Some(20), "/workspace");
+    /// let wire = serde_json::to_value(&params).unwrap();
+    /// assert_eq!(wire["sortKey"], "recency_at");
+    /// assert_eq!(wire["archived"], false);
+    /// ```
+    #[must_use]
+    pub fn picker(cursor: Option<String>, limit: Option<usize>, cwd: &str) -> Self {
+        Self {
+            cursor,
+            limit,
+            cwd: Some(cwd.to_owned()),
+            sort_key: Some(ThreadSortKey::RecencyAt),
+            sort_direction: Some(SortDirection::Desc),
+            source_kinds: Some(USER_THREAD_SOURCES.to_vec()),
+            archived: Some(false),
+        }
+    }
 }
 
 impl fmt::Debug for ThreadListParams {
@@ -562,6 +706,12 @@ impl fmt::Debug for ThreadListParams {
             .field("has_cursor", &self.cursor.is_some())
             .field("limit", &self.limit)
             .field("has_cwd", &self.cwd.is_some())
+            .field("sort_key", &self.sort_key)
+            .field(
+                "source_kind_count",
+                &self.source_kinds.as_ref().map(Vec::len),
+            )
+            .field("archived", &self.archived)
             .finish()
     }
 }
@@ -592,10 +742,25 @@ impl fmt::Debug for ThreadListResponse {
 /// Asking which models this build accepts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ModelListParams {
+    /// Where to continue from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
     /// How many to return.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+impl ModelListParams {
+    /// The page that starts at `cursor`, or the first page for `None`, at the server's page size.
+    #[must_use]
+    pub fn page(cursor: Option<String>) -> Self {
+        Self {
+            cursor,
+            limit: None,
+        }
+    }
 }
 
 /// One reasoning choice a model offers.
@@ -639,10 +804,63 @@ pub struct Model {
 /// One page of models.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ModelListResponse {
     /// The rows.
     #[serde(default)]
     pub data: Vec<Model>,
+    /// Where the next page starts, when there is one.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// Asking which permission profiles this machine's configuration allows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PermissionProfileListParams {
+    /// Where to continue from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// The project directory, so its configuration layers apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl PermissionProfileListParams {
+    /// One page of profiles for the project at `cwd`, continuing from `cursor`.
+    #[must_use]
+    pub fn for_project(cwd: &str, cursor: Option<String>) -> Self {
+        Self {
+            cursor,
+            cwd: Some(cwd.to_owned()),
+        }
+    }
+}
+
+/// One permission profile, and whether the effective requirements allow selecting it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PermissionProfileSummary {
+    /// The profile's id, such as `:workspace`.
+    pub id: String,
+    /// Whether the effective requirements allow selecting it.
+    #[serde(default)]
+    pub allowed: bool,
+}
+
+/// One page of permission profiles.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PermissionProfileListResponse {
+    /// The profiles.
+    #[serde(default)]
+    pub data: Vec<PermissionProfileSummary>,
+    /// Where the next page starts, when there is one.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// How an account is signed in, as the app-server reports it.
@@ -800,6 +1018,7 @@ mod tests {
             name: Some(String::from("name-secret")),
             cwd: Some(String::from("/host-workspace-secret")),
             updated_at: Some(1_725_000_000),
+            recency_at: None,
         };
         let read = ThreadReadParams {
             thread_id: String::from("vendor-thread-secret"),
@@ -814,11 +1033,11 @@ mod tests {
             reasoning_effort: Some(String::from("effort-secret")),
             ..ThreadStartResponse::default()
         };
-        let list = ThreadListParams {
-            cursor: Some(String::from("vendor-cursor-secret")),
-            limit: Some(10),
-            cwd: Some(String::from("/host-workspace-secret")),
-        };
+        let list = ThreadListParams::picker(
+            Some(String::from("vendor-cursor-secret")),
+            Some(10),
+            "/host-workspace-secret",
+        );
         let list_response = ThreadListResponse {
             data: vec![thread],
             next_cursor: Some(String::from("vendor-cursor-secret")),

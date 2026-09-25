@@ -100,11 +100,18 @@ pub fn reduce(notification: &Notification, thread_id: &str, now: std::time::Syst
         Notification::ItemCompleted(completed) => item_completed(&completed.item),
         Notification::ThreadTokenUsage(usage) => usage_events(&usage.token_usage),
         // Quota belongs to the account rather than to a conversation, which is why it names no
-        // thread and is not routed by one.
+        // thread and is not routed by one. This is the snapshot as sent; a session does not route
+        // it here, but merges it onto its last full reading (`rate_limits::merge`) because an
+        // update may be sparse.
         Notification::RateLimits(update) => Outcome::one(EventKind::AccountLimits {
             limits: crate::rate_limits::to_account_limits(&update.rate_limits, now),
         }),
         Notification::TurnCompleted(completed) => finish(completed.turn.status, &completed.turn),
+        // Streamed progress needs to know which activities this turn announced, which is
+        // `TurnReducer`'s memory rather than this function's.
+        Notification::CommandOutputDelta(_)
+        | Notification::McpToolCallProgress(_)
+        | Notification::FileChangePatchUpdated(_) => Outcome::Ignore,
         // A turn beginning is the same turn the host already started; announcing it again would
         // be a second session start. An error notification is a report, never an ending.
         Notification::TurnStarted(_)
@@ -276,6 +283,7 @@ fn finish(status: Option<TurnStatus>, turn: &crate::protocol::requests::TurnHand
         },
         Some(TurnStatus::Failed) => {
             let error = turn.error.clone().unwrap_or_default();
+            let vendor_code = error.vendor_code();
             let message = match error.additional_details {
                 Some(details) if !details.is_empty() => format!("{}: {details}", error.message),
                 _ => error.message,
@@ -283,14 +291,22 @@ fn finish(status: Option<TurnStatus>, turn: &crate::protocol::requests::TurnHand
             Outcome::Finish {
                 events: Vec::new(),
                 cancelled: None,
-                failure: Some(VendorError::new(
-                    TURN_FAILED,
-                    if message.is_empty() {
-                        String::from("the turn failed without saying why")
-                    } else {
-                        message
-                    },
-                )),
+                failure: Some({
+                    let failure = VendorError::new(
+                        TURN_FAILED,
+                        if message.is_empty() {
+                            String::from("the turn failed without saying why")
+                        } else {
+                            message
+                        },
+                    );
+                    // The vendor already gave up on this turn, so the same request is not
+                    // retryable by itself.
+                    match vendor_code {
+                        Some(code) => failure.with_vendor_code(code, false),
+                        None => failure,
+                    }
+                }),
             }
         }
     }
@@ -758,6 +774,41 @@ mod tests {
         assert_eq!(failure.code.as_str(), "codex-turn-failed");
     }
 
+    /// The vendor's own classification survives, so a host can say "usage limit reached" rather
+    /// than "the turn failed".
+    #[test]
+    fn a_failed_turn_keeps_the_vendors_error_code() {
+        for (info, expected) in [
+            (json!("usageLimitExceeded"), "usageLimitExceeded"),
+            (
+                json!({"httpConnectionFailed": {"httpStatusCode": 502}}),
+                "httpConnectionFailed",
+            ),
+        ] {
+            let outcome = reduce(
+                &notification(
+                    method::TURN_COMPLETED,
+                    json!({"threadId": THREAD, "turn": {"id": "u", "status": "failed", "error": {
+                        "message": "limit", "codexErrorInfo": info
+                    }}}),
+                ),
+                THREAD,
+                now(),
+            );
+            let Outcome::Finish { failure, .. } = outcome else {
+                panic!("expected the turn to end, received {outcome:?}");
+            };
+            let failure = failure.expect("expected a failure");
+            assert_eq!(
+                failure.vendor_code.as_deref(),
+                Some(expected),
+                "expected the codexErrorInfo code, received {:?}",
+                failure.vendor_code
+            );
+            assert_eq!(failure.code.as_str(), "codex-turn-failed");
+        }
+    }
+
     /// The failure this module exists to prevent. `error` reads like an ending and is not one —
     /// `turn/completed` still follows, and ending here would end the host's turn twice.
     #[test]
@@ -818,6 +869,142 @@ mod tests {
     fn a_family_this_harness_does_not_act_on_produces_nothing() {
         let outcome = reduce(
             &notification("mcpServer/startupStatus/updated", json!({"name": "exa"})),
+            THREAD,
+            now(),
+        );
+        assert_eq!(outcome, Outcome::Ignore);
+    }
+
+    /// A newer Codex adds item families this build has never heard of. The work still happened,
+    /// so it is shown as an `Other` activity under the vendor's own type name rather than hidden.
+    #[test]
+    fn an_item_family_this_build_does_not_know_is_rendered_as_other_activity() {
+        let started = reduce(
+            &notification(
+                method::ITEM_STARTED,
+                json!({"threadId": THREAD, "turnId": "u",
+                       "item": {"type": "somethingTheNextReleaseAdded", "id": "x-1",
+                                "whatever": {"nested": true}}}),
+            ),
+            THREAD,
+            now(),
+        );
+        let Outcome::Emit(events) = &started else {
+            panic!("expected an activity for the unknown item, received {started:?}");
+        };
+        let [EventKind::ActivityStarted { call_id, activity }] = events.as_slice() else {
+            panic!("expected one ActivityStarted, received {events:?}");
+        };
+        assert_eq!(call_id, "x-1");
+        assert_eq!(activity.kind, ActivityKind::Other);
+        assert_eq!(activity.name, "somethingTheNextReleaseAdded");
+
+        let completed = reduce(
+            &notification(
+                method::ITEM_COMPLETED,
+                json!({"threadId": THREAD, "turnId": "u",
+                       "item": {"type": "somethingTheNextReleaseAdded", "id": "x-1"}}),
+            ),
+            THREAD,
+            now(),
+        );
+        assert!(
+            matches!(&completed, Outcome::Emit(events) if matches!(
+                events.as_slice(),
+                [EventKind::ActivityCompleted { call_id, result }]
+                    if call_id == "x-1" && result.status == ActivityStatus::Completed
+            )),
+            "expected the unknown item to complete its activity, received {completed:?}"
+        );
+    }
+
+    /// A recognised family whose params did not decode is ignored, not rendered and not fatal —
+    /// unless it is the terminal, which has its own tests.
+    #[test]
+    fn a_malformed_non_terminal_notification_is_ignored() {
+        for (family, params) in [
+            (
+                method::ITEM_STARTED,
+                json!({"threadId": THREAD, "turnId": "u", "item": 7}),
+            ),
+            (
+                method::AGENT_MESSAGE_DELTA,
+                json!({"threadId": THREAD, "turnId": 3}),
+            ),
+            (method::THREAD_TOKEN_USAGE_UPDATED, json!("not an object")),
+        ] {
+            let parsed = notification(family, params);
+            assert!(
+                matches!(parsed, Notification::Malformed { .. }),
+                "expected {family} to parse as malformed, received {parsed:?}"
+            );
+            assert_eq!(
+                super::reduce_for_active_turn(&parsed, THREAD, Some("u"), now()),
+                Outcome::Ignore,
+                "expected malformed {family} to be ignored"
+            );
+        }
+    }
+
+    /// An unmodelled family that states how it ended keeps that ending: a failed or declined
+    /// call must not be reported as completed.
+    #[test]
+    fn an_unmodelled_items_own_status_decides_how_its_activity_ends() {
+        for (status, expected) in [
+            ("failed", ActivityStatus::Failed),
+            ("declined", ActivityStatus::Cancelled),
+            ("completed", ActivityStatus::Completed),
+        ] {
+            let completed = reduce(
+                &notification(
+                    method::ITEM_COMPLETED,
+                    json!({"threadId": THREAD, "turnId": "u", "item": {
+                        "type": "dynamicToolCall", "id": "d-1", "tool": "lookup",
+                        "status": status}}),
+                ),
+                THREAD,
+                now(),
+            );
+            assert!(
+                matches!(&completed, Outcome::Emit(events) if matches!(
+                    events.as_slice(),
+                    [EventKind::ActivityCompleted { result, .. }] if result.status == expected
+                )),
+                "expected a {status} item to end as {expected:?}, received {completed:?}"
+            );
+        }
+    }
+
+    /// Echoes of what the client itself sent are not work the agent did.
+    #[test]
+    fn an_echo_of_the_clients_own_input_is_not_an_activity() {
+        for item_type in ["userMessage", "hookPrompt", "functionCallOutput"] {
+            let outcome = reduce(
+                &notification(
+                    method::ITEM_STARTED,
+                    json!({"threadId": THREAD, "turnId": "u",
+                           "item": {"type": item_type, "id": "echo-1"}}),
+                ),
+                THREAD,
+                now(),
+            );
+            assert_eq!(
+                outcome,
+                Outcome::Ignore,
+                "expected {item_type} to render nothing"
+            );
+        }
+    }
+
+    /// An unknown item with no id cannot be bracketed, so it renders nothing rather than an
+    /// activity the host could never see complete.
+    #[test]
+    fn an_unknown_item_without_an_id_renders_nothing() {
+        let outcome = reduce(
+            &notification(
+                method::ITEM_STARTED,
+                json!({"threadId": THREAD, "turnId": "u", "item": {"type": "somethingNew"}}),
+            ),
             THREAD,
             now(),
         );

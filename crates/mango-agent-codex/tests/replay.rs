@@ -937,6 +937,89 @@ async fn opening_with_explicit_effort_applies_it_on_the_thread_and_reports_accep
     );
 }
 
+/// The server may apply a model other than the one asked for, and no effort at all. What it
+/// echoes is the observed configuration; what was asked for stays the accepted one, and an effort
+/// the echo left null is not reported as observed.
+#[tokio::test]
+async fn the_thread_start_echo_is_what_is_observed_rather_than_the_request() {
+    let workspace = workspace_path().to_string_lossy().into_owned();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        Transcript::load("handshake").as_process_intercepting(move |frame| {
+            (frame["method"] == "thread/start").then(|| {
+                vec![
+                    serde_json::json!({"id": frame["id"], "result": {
+                        "thread": {"id": "echo-thread", "preview": "", "cwd": workspace},
+                        "model": "gpt-overridden", "reasoningEffort": null}})
+                    .to_string(),
+                ]
+            })
+        }),
+    );
+    let (host, _) = with_launcher(launcher, None);
+    let mut request = OpenSession::new("chat-1");
+    request.configuration = ConfigurationPatch::new()
+        .model(ConfigurationChange::Set(String::from("gpt-requested")))
+        .effort(ConfigurationChange::Set(String::from("high")));
+    let session = CodexHarness::new()
+        .open_session(&host, request)
+        .await
+        .expect("expected a session");
+
+    let snapshot = session.snapshot();
+    let configuration = &snapshot.configuration;
+    assert_eq!(
+        configuration.observed.model.as_deref(),
+        Some("gpt-overridden")
+    );
+    assert_eq!(
+        configuration.observed.effort, None,
+        "expected an effort the server did not apply to stay unobserved"
+    );
+    assert_eq!(
+        configuration.accepted.model.as_deref(),
+        Some("gpt-requested")
+    );
+    assert_eq!(configuration.accepted.effort.as_deref(), Some("high"));
+}
+
+/// The running build names itself in the handshake; one below the pinned floor is refused before
+/// any thread is opened, and its child is reaped.
+#[tokio::test]
+async fn opening_a_session_refuses_an_app_server_below_the_pinned_handshake_version() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(OldProbeHandshakeServer.process());
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+
+    let result = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await;
+
+    assert!(
+        matches!(
+            &result,
+            Err(error) if matches!(
+                error.cause(),
+                mango_external_agents::Error::VersionGate { found, .. } if found == "0.147.0"
+            )
+        ),
+        "expected the handshake version gate, received {:?}",
+        result.as_ref().map(|_| "a session")
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/start")),
+        "expected no thread to be opened after the version gate"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the app-server child reaped"
+    );
+}
+
 #[tokio::test]
 async fn malformed_explicit_effort_is_refused_before_opening_codex() {
     let (host, launcher) = host_replaying(&["handshake"]);
@@ -1268,11 +1351,13 @@ async fn a_recorded_turn_replays_as_a_turn_that_ends_exactly_once() {
             .any(|kind| matches!(kind, EventKind::Usage { .. })),
         "expected this turn's own usage, received {events:#?}"
     );
+    // The recording holds quota updates but no full `account/rateLimits/read`, so there is no
+    // baseline to merge them onto and no partial snapshot is shown; the merge has its own tests.
     assert!(
-        events
+        !events
             .iter()
             .any(|kind| matches!(kind, EventKind::AccountLimits { .. })),
-        "expected the account quota the server rolled forward, received {events:#?}"
+        "expected no quota reading without a baseline, received {events:#?}"
     );
 }
 
@@ -2531,6 +2616,925 @@ async fn traffic_for_another_conversation_does_not_extend_this_turns_idle_deadli
         .close(CloseReason::Shutdown)
         .await
         .expect("expected cleanup after idle cancellation");
+}
+
+/// A running turn the test speaks for, and everything needed to speak.
+struct AnnouncedTurn {
+    session: Box<dyn Session>,
+    launcher: Arc<FakeLauncher>,
+    announcer: Announcer,
+    turn: mango_external_agents::TurnStream,
+    thread_id: String,
+}
+
+impl AnnouncedTurn {
+    /// The native turn id every announced turn runs under.
+    const NATIVE_TURN_ID: &str = "announced-turn";
+
+    /// Opens the recorded interrupt conversation and starts one turn the server names
+    /// [`Self::NATIVE_TURN_ID`], leaving every later notification to [`Self::announce`].
+    async fn open(limits: mango_external_agents::Limits) -> Self {
+        Self::open_answering(limits, |_| None).await
+    }
+
+    /// [`Self::open`], with `answer` consulted first for every frame the library writes.
+    async fn open_answering(
+        limits: mango_external_agents::Limits,
+        answer: impl Fn(&serde_json::Value) -> Option<Vec<String>> + Send + Sync + 'static,
+    ) -> Self {
+        let transcript = Transcript::load("interrupt");
+        let thread_id = transcript
+            .thread_id()
+            .expect("expected the recorded thread id");
+        let announcer = Announcer::new();
+        let launcher = Arc::new(FakeLauncher::new());
+        let completed_thread = thread_id.clone();
+        launcher.push(
+            transcript
+                .as_process_intercepting(move |frame| {
+                    if let Some(answered) = answer(frame) {
+                        return Some(answered);
+                    }
+                    let method = frame.get("method").and_then(serde_json::Value::as_str);
+                    let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                    match method {
+                        Some("turn/start") => Some(vec![
+                            serde_json::json!({
+                                "id": id,
+                                "result": {"turn": {"id": Self::NATIVE_TURN_ID}},
+                            })
+                            .to_string(),
+                        ]),
+                        Some("turn/interrupt") => Some(vec![
+                            serde_json::json!({"id": id, "result": {}}).to_string(),
+                            serde_json::json!({
+                                "method": "turn/completed",
+                                "params": {
+                                    "threadId": completed_thread,
+                                    "turn": {"id": Self::NATIVE_TURN_ID, "status": "interrupted"},
+                                },
+                            })
+                            .to_string(),
+                        ]),
+                        _ => None,
+                    }
+                })
+                .announcing(announcer.clone()),
+        );
+        let (host, launcher) = with_launcher_limits(launcher, None, limits);
+        let session = CodexHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let turn = session
+            .start_turn(TurnRequest::new("turn-1", "one"))
+            .await
+            .expect("expected an active turn");
+        tokio::task::yield_now().await;
+        Self {
+            session,
+            launcher,
+            announcer,
+            turn,
+            thread_id,
+        }
+    }
+
+    /// Puts one notification for this turn's thread on the wire.
+    fn announce(&self, method: &str, mut params: serde_json::Value) {
+        params["threadId"] = serde_json::Value::String(self.thread_id.clone());
+        self.announcer
+            .announce(serde_json::json!({"method": method, "params": params}).to_string());
+    }
+
+    /// Ends the turn the way the server does when it finishes on its own.
+    fn complete(&self) {
+        self.announce(
+            "turn/completed",
+            serde_json::json!({"turn": {"id": Self::NATIVE_TURN_ID, "status": "completed"}}),
+        );
+    }
+
+    /// Every `turn/steer` frame the library wrote, in order.
+    fn steers(&self) -> Vec<serde_json::Value> {
+        self.launcher
+            .written()
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|frame| frame.get("method") == Some(&serde_json::json!("turn/steer")))
+            .collect()
+    }
+
+    /// A steer addressed to the running turn under the native id the host was given.
+    fn steer(input: &str) -> Steer {
+        Steer {
+            turn_id: mango_external_agents::TurnId::new("turn-1"),
+            native_turn_id: String::from(Self::NATIVE_TURN_ID),
+            input: String::from(input),
+        }
+    }
+
+    fn interrupted(&self) -> bool {
+        self.launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"turn/interrupt\""))
+    }
+}
+
+/// A command that is still printing is a turn that is still working.
+///
+/// Between a command's `item/started` and its `item/completed`, the only frames the app-server
+/// writes for it are `item/commandExecution/outputDelta`. A build or a test suite that runs past
+/// the idle deadline while printing must not be cancelled as idle.
+#[tokio::test(start_paused = true)]
+async fn a_command_that_keeps_printing_keeps_its_turn_alive_past_the_idle_deadline() {
+    let limits = replay_limits();
+    let mut running = AnnouncedTurn::open(limits).await;
+    running.announce(
+        "item/started",
+        serde_json::json!({"turnId": AnnouncedTurn::NATIVE_TURN_ID, "item": {
+            "type": "commandExecution", "id": "cmd-long", "command": "cargo build",
+            "status": "inProgress"}}),
+    );
+
+    // Output every 30 seconds for five minutes, against the default 120 second idle deadline.
+    let rounds = limits.idle_timeout.as_secs() * 5 / 2 / 30;
+    for round in 0..rounds {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert!(
+            !running.interrupted(),
+            "expected printing output to keep the turn alive, received turn/interrupt after round {round} ({}s)",
+            round * 30
+        );
+        running.announce(
+            "item/commandExecution/outputDelta",
+            serde_json::json!({"turnId": AnnouncedTurn::NATIVE_TURN_ID, "itemId": "cmd-long",
+                               "delta": format!("compiling crate {round}\n")}),
+        );
+    }
+    running.complete();
+
+    let events = drain(&mut running.turn).await;
+    assert!(
+        !running.interrupted(),
+        "expected no idle interrupt for a command that kept printing"
+    );
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the turn to complete on its own, received {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EventKind::Cancelled { .. })),
+        "expected no cancellation, received {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::ActivityUpdated { call_id, update }
+                if call_id == "cmd-long"
+                    && update.detail.as_deref().is_some_and(|detail| detail.contains("compiling"))
+        )),
+        "expected the printed output to reach the host as updates to the command, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// The answer's text, as a host would join its deltas.
+fn answer_text(events: &[EventKind]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A message the server never streamed still reaches the host, exactly once, from its completion.
+///
+/// A resumed or replayed conversation can deliver an `agentMessage` whose whole text is on
+/// `item/completed` and on no `item/agentMessage/delta` at all.
+#[tokio::test]
+async fn an_answer_that_arrives_only_on_its_completed_item_is_delivered_once() {
+    let mut running = AnnouncedTurn::open(replay_limits()).await;
+    let turn_id = AnnouncedTurn::NATIVE_TURN_ID;
+    running.announce(
+        "item/started",
+        serde_json::json!({"turnId": turn_id, "item": {"type": "agentMessage", "id": "msg-1", "text": ""}}),
+    );
+    running.announce(
+        "item/completed",
+        serde_json::json!({"turnId": turn_id,
+                           "item": {"type": "agentMessage", "id": "msg-1", "text": "all done"}}),
+    );
+    running.complete();
+
+    let events = drain(&mut running.turn).await;
+    assert_eq!(
+        answer_text(&events),
+        "all done",
+        "expected the completed item's text as the answer, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Deltas and the completion describe the same text; only what the deltas left out is added.
+#[tokio::test]
+async fn a_completed_answer_adds_only_what_its_deltas_did_not_deliver() {
+    let mut running = AnnouncedTurn::open(replay_limits()).await;
+    let turn_id = AnnouncedTurn::NATIVE_TURN_ID;
+    running.announce(
+        "item/agentMessage/delta",
+        serde_json::json!({"turnId": turn_id, "itemId": "msg-1", "delta": "all "}),
+    );
+    running.announce(
+        "item/completed",
+        serde_json::json!({"turnId": turn_id,
+                           "item": {"type": "agentMessage", "id": "msg-1", "text": "all done"}}),
+    );
+    running.announce(
+        "item/agentMessage/delta",
+        serde_json::json!({"turnId": turn_id, "itemId": "msg-2", "delta": "streamed"}),
+    );
+    running.announce(
+        "item/completed",
+        serde_json::json!({"turnId": turn_id,
+                           "item": {"type": "agentMessage", "id": "msg-2", "text": "streamed"}}),
+    );
+    running.complete();
+
+    let events = drain(&mut running.turn).await;
+    assert_eq!(
+        answer_text(&events),
+        "all donestreamed",
+        "expected each message's text exactly once, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Answers `turn/steer` with a continuation id, or with the steer's own id when `continued` is
+/// `None`.
+fn steer_answer(frame: &serde_json::Value, continued: Option<&str>) -> Option<Vec<String>> {
+    if frame.get("method") != Some(&serde_json::json!("turn/steer")) {
+        return None;
+    }
+    let expected = frame
+        .pointer("/params/expectedTurnId")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let turn_id = continued.map_or(expected, |id| serde_json::json!(id));
+    Some(vec![
+        serde_json::json!({"id": frame["id"], "result": {"turnId": turn_id}}).to_string(),
+    ])
+}
+
+/// A steer names the turn it is for, and the app-server may continue that turn under a new id.
+/// Later frames, later steers and the completion all use the id the steer answered with.
+#[tokio::test]
+async fn a_steer_adopts_the_continuation_turn_id_the_server_answers_with() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        steer_answer(frame, Some("continued-turn"))
+    })
+    .await;
+
+    let outcome = running
+        .session
+        .steer(AnnouncedTurn::steer("also this"))
+        .await
+        .expect("expected a steer outcome");
+    assert_eq!(outcome, mango_external_agents::SteerOutcome::Accepted);
+    let first = running.steers();
+    assert_eq!(
+        first.first().map(|frame| &frame["params"]),
+        Some(&serde_json::json!({
+            "threadId": running.thread_id,
+            "input": [{"type": "text", "text": "also this", "text_elements": []}],
+            "expectedTurnId": AnnouncedTurn::NATIVE_TURN_ID,
+        })),
+        "expected the steer to name the running turn, received {first:?}"
+    );
+
+    // The host still knows only the id the turn started under; the session accepts it and
+    // addresses the turn Codex is running now.
+    let again = running
+        .session
+        .steer(AnnouncedTurn::steer("and this"))
+        .await
+        .expect("expected a second steer outcome");
+    assert_eq!(again, mango_external_agents::SteerOutcome::Accepted);
+    assert_eq!(
+        running
+            .steers()
+            .get(1)
+            .map(|frame| &frame["params"]["expectedTurnId"]),
+        Some(&serde_json::json!("continued-turn")),
+        "expected the second steer to address the continuation id"
+    );
+
+    running.announce(
+        "item/agentMessage/delta",
+        serde_json::json!({"turnId": "continued-turn", "itemId": "m", "delta": "steered"}),
+    );
+    running.announce(
+        "turn/completed",
+        serde_json::json!({"turn": {"id": "continued-turn", "status": "completed"}}),
+    );
+    let events = drain(&mut running.turn).await;
+    assert_eq!(answer_text(&events), "steered");
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the continuation's completion to end the turn, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// The steer's answer and the continuation's first frames can arrive back to back, and the
+/// notification worker may reach those frames before the steer task has adopted the new id. They
+/// must still be this turn's, in order, and the continuation's completion must end the stream.
+#[tokio::test]
+async fn frames_right_behind_a_steer_answer_belong_to_the_continuation() {
+    for round in 0..20 {
+        let thread = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+        let answer_thread = std::sync::Arc::clone(&thread);
+        let mut running = AnnouncedTurn::open_answering(replay_limits(), move |frame| {
+            let mut lines = steer_answer(frame, Some("continued-turn"))?;
+            let thread_id = answer_thread.get().cloned().unwrap_or_default();
+            lines.push(
+                serde_json::json!({"method": "item/agentMessage/delta", "params": {
+                    "threadId": thread_id, "turnId": "continued-turn", "itemId": "m",
+                    "delta": "after"}})
+                .to_string(),
+            );
+            lines.push(
+                serde_json::json!({"method": "turn/completed", "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": "continued-turn", "status": "completed"}}})
+                .to_string(),
+            );
+            Some(lines)
+        })
+        .await;
+        let _ = thread.set(running.thread_id.clone());
+        let outcome = running
+            .session
+            .steer(AnnouncedTurn::steer("also this"))
+            .await
+            .expect("expected a steer outcome");
+        assert_eq!(outcome, mango_external_agents::SteerOutcome::Accepted);
+        let events = drain(&mut running.turn).await;
+        assert_eq!(
+            answer_text(&events),
+            "after",
+            "expected the continuation's delta in round {round}, received {events:#?}"
+        );
+        assert!(
+            matches!(events.last(), Some(EventKind::Completed)),
+            "expected the continuation's completion to end round {round}, received {events:#?}"
+        );
+        running
+            .session
+            .close(CloseReason::Shutdown)
+            .await
+            .expect("expected cleanup");
+    }
+}
+
+/// The host never learns a continuation id, so the id it was given at `TurnStarted` has to keep
+/// addressing the turn however many continuations follow.
+#[tokio::test]
+async fn the_announced_turn_id_still_steers_after_many_continuations() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let answer_counter = Arc::clone(&counter);
+    let running = AnnouncedTurn::open_answering(replay_limits(), move |frame| {
+        if frame.get("method") != Some(&serde_json::json!("turn/steer")) {
+            return None;
+        }
+        let next = answer_counter.fetch_add(1, Ordering::AcqRel);
+        steer_answer(frame, Some(&format!("continued-{next}")))
+    })
+    .await;
+    for round in 0..40 {
+        let outcome = running
+            .session
+            .steer(AnnouncedTurn::steer("more"))
+            .await
+            .expect("expected a steer outcome");
+        assert_eq!(
+            outcome,
+            mango_external_agents::SteerOutcome::Accepted,
+            "expected the announced id to steer in round {round}"
+        );
+    }
+    assert_eq!(
+        running
+            .steers()
+            .last()
+            .map(|frame| &frame["params"]["expectedTurnId"]),
+        Some(&serde_json::json!("continued-38")),
+        "expected the last steer to address the latest continuation"
+    );
+}
+
+/// Two steers issued together must not both read the turn id before either answer arrives: the
+/// first can move the turn to a continuation id the second would then miss.
+#[tokio::test]
+async fn concurrent_steers_are_serialized_so_the_second_sees_the_firsts_continuation() {
+    let running = Arc::new(
+        AnnouncedTurn::open_answering(replay_limits(), |frame| {
+            // Steers are answered by the test, through the announcer, so it controls the order.
+            (frame.get("method") == Some(&serde_json::json!("turn/steer"))).then(Vec::new)
+        })
+        .await,
+    );
+
+    let first = tokio::spawn({
+        let running = Arc::clone(&running);
+        async move { running.session.steer(AnnouncedTurn::steer("one")).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while running.steers().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the first steer on the wire");
+    let second = tokio::spawn({
+        let running = Arc::clone(&running);
+        async move { running.session.steer(AnnouncedTurn::steer("two")).await }
+    });
+    // Give an unserialized second steer every chance to reach the wire first.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let first_id = running.steers()[0]["id"].clone();
+    running.announcer.announce(
+        serde_json::json!({"id": first_id, "result": {"turnId": "continued-turn"}}).to_string(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while running.steers().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the second steer on the wire");
+    let steers = running.steers();
+    assert_eq!(
+        steers[1]["params"]["expectedTurnId"],
+        serde_json::json!("continued-turn"),
+        "expected the second steer to address the first steer's continuation, received {steers:?}"
+    );
+    running.announcer.announce(
+        serde_json::json!({"id": steers[1]["id"], "result": {"turnId": "continued-turn"}})
+            .to_string(),
+    );
+    for steer in [first, second] {
+        assert_eq!(
+            steer
+                .await
+                .expect("expected the steer task to finish")
+                .expect("expected a steer outcome"),
+            mango_external_agents::SteerOutcome::Accepted
+        );
+    }
+}
+
+/// The app-server refuses to steer a review or a compaction with a structured
+/// `activeTurnNotSteerable`; that is a turn that cannot be steered, not a failure.
+#[tokio::test]
+async fn an_unsteerable_active_turn_is_a_labelled_rejection_rather_than_an_error() {
+    let running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        (frame.get("method") == Some(&serde_json::json!("turn/steer"))).then(|| {
+            vec![
+                serde_json::json!({"id": frame["id"], "error": {
+                    "code": -32600, "message": "cannot steer a compact turn",
+                    "data": {"message": "cannot steer a compact turn", "codexErrorInfo":
+                        {"activeTurnNotSteerable": {"turnKind": "compact"}}}}})
+                .to_string(),
+            ]
+        })
+    })
+    .await;
+    let outcome = running
+        .session
+        .steer(AnnouncedTurn::steer("also this"))
+        .await
+        .expect("expected a labelled rejection rather than an error");
+    assert_eq!(
+        outcome,
+        mango_external_agents::SteerOutcome::Rejected {
+            reason: mango_external_agents::SteerRejection::TurnNotSteerable
+        }
+    );
+}
+
+/// The client keeps reading while the vendor waits on an approval, so a steer sent then still
+/// gets its own answer rather than waiting for the approval to resolve.
+#[tokio::test]
+async fn a_steer_during_a_pending_approval_is_answered_promptly() {
+    let mut running =
+        AnnouncedTurn::open_answering(replay_limits(), |frame| steer_answer(frame, None)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": 90, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": running.thread_id, "turnId": AnnouncedTurn::NATIVE_TURN_ID,
+                       "itemId": "cmd-1", "command": "rm -rf build", "cwd": "/workspace"}})
+        .to_string(),
+    );
+    let _ = await_approval(&mut running.turn).await;
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        running
+            .session
+            .steer(AnnouncedTurn::steer("wait, keep build")),
+    )
+    .await
+    .expect("expected the steer to be answered while the approval is pending")
+    .expect("expected a steer outcome");
+    assert_eq!(outcome, mango_external_agents::SteerOutcome::Accepted);
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Answers `account/rateLimits/read` with a full snapshot the tests can tell apart from updates.
+fn rate_limits_answer(frame: &serde_json::Value) -> Option<Vec<String>> {
+    (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(|| {
+        vec![
+            serde_json::json!({"id": frame["id"], "result": {"rateLimits": {
+                "primary": {"usedPercent": 10.0, "windowDurationMins": 300, "resetsAt": 1789301053},
+                "secondary": {"usedPercent": 20.0, "windowDurationMins": 10080,
+                              "resetsAt": 1789817658},
+                "planType": "plus"}}})
+            .to_string(),
+        ]
+    })
+}
+
+/// Every quota snapshot a turn reported, as (label, used percent) pairs.
+fn quota_readings(events: &[EventKind]) -> Vec<Vec<(String, f64)>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::AccountLimits { limits } => Some(
+                limits
+                    .windows
+                    .iter()
+                    .map(|window| {
+                        (
+                            window.label.clone().unwrap_or_default(),
+                            window.used_percent,
+                        )
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `account/rateLimits/updated` may carry only what changed. A window it leaves out or sends as
+/// `null` keeps its last reading instead of disappearing from the host's display.
+#[tokio::test]
+async fn a_sparse_quota_update_merges_onto_the_last_full_reading() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), rate_limits_answer).await;
+    running
+        .session
+        .refresh_account_usage()
+        .await
+        .expect("expected a baseline reading");
+    running.announcer.announce(
+        serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "primary": {"usedPercent": 30.0, "windowDurationMins": 300, "resetsAt": 1789301053},
+            "secondary": null}}})
+        .to_string(),
+    );
+    running.complete();
+    let events = drain(&mut running.turn).await;
+    assert_eq!(
+        quota_readings(&events),
+        vec![vec![
+            (String::from("primary"), 30.0),
+            (String::from("secondary"), 20.0)
+        ]],
+        "expected the update's primary window over the baseline's secondary, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Without a full reading there is nothing to merge a sparse update onto, so the session reads
+/// one and reports that instead of a partial snapshot.
+#[tokio::test]
+async fn a_quota_update_before_any_full_reading_reports_a_fresh_full_reading() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), rate_limits_answer).await;
+    running.announcer.announce(
+        serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "primary": {"usedPercent": 30.0}}}})
+        .to_string(),
+    );
+    let reading = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = running.turn.recv().await {
+            if let EventKind::AccountLimits { .. } = &event.kind {
+                return Some(event.kind);
+            }
+        }
+        None
+    })
+    .await
+    .expect("expected a quota reading within the deadline")
+    .expect("expected a quota reading on the turn");
+    assert_eq!(
+        quota_readings(&[reading]),
+        vec![vec![
+            (String::from("primary"), 10.0),
+            (String::from("secondary"), 20.0)
+        ]],
+        "expected the full reading rather than the sparse update"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// An update that arrives while the baseline is being read is not lost: it is merged onto the
+/// baseline once that answers.
+#[tokio::test]
+async fn a_quota_update_during_the_baseline_read_is_merged_onto_it() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        // The test answers the read itself, after the second update.
+        (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(Vec::new)
+    })
+    .await;
+    let update = |percent: f64| {
+        serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "primary": {"usedPercent": percent}}}})
+        .to_string()
+    };
+    running.announcer.announce(update(30.0));
+    let read_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(id) = running.launcher.written().iter().find_map(|line| {
+                let frame: serde_json::Value = serde_json::from_str(line).ok()?;
+                (frame["method"] == "account/rateLimits/read").then(|| frame["id"].clone())
+            }) {
+                return id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the baseline read on the wire");
+    running.announcer.announce(update(40.0));
+    // Let the second update reach the session before the read answers.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": read_id, "result": {"rateLimits": {
+            "primary": {"usedPercent": 10.0}, "secondary": {"usedPercent": 20.0}}}})
+        .to_string(),
+    );
+    let reading = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = running.turn.recv().await {
+            if let EventKind::AccountLimits { .. } = &event.kind {
+                return Some(event.kind);
+            }
+        }
+        None
+    })
+    .await
+    .expect("expected a quota reading within the deadline")
+    .expect("expected a quota reading on the turn");
+    assert_eq!(
+        quota_readings(&[reading]),
+        vec![vec![
+            (String::from("primary"), 40.0),
+            (String::from("secondary"), 20.0)
+        ]],
+        "expected the update that arrived during the read merged onto its answer"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Waits for the `n`th (0-based) `account/rateLimits/read` the library writes, and its id.
+async fn nth_rate_limits_read(running: &AnnouncedTurn, n: usize) -> serde_json::Value {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let reads: Vec<serde_json::Value> = running
+                .launcher
+                .written()
+                .iter()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|frame| frame["method"] == "account/rateLimits/read")
+                .map(|frame| frame["id"].clone())
+                .collect();
+            if let Some(id) = reads.get(n) {
+                return id.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected rate-limit read {n} on the wire"))
+}
+
+/// The next quota reading a turn reports.
+async fn next_quota(turn: &mut mango_external_agents::TurnStream) -> Vec<(String, f64)> {
+    let reading = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = turn.recv().await {
+            if let EventKind::AccountLimits { .. } = &event.kind {
+                return Some(event.kind);
+            }
+        }
+        None
+    })
+    .await
+    .expect("expected a quota reading within the deadline")
+    .expect("expected a quota reading on the turn");
+    quota_readings(&[reading]).remove(0)
+}
+
+fn primary_update(percent: f64) -> String {
+    serde_json::json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+        "primary": {"usedPercent": percent}}}})
+    .to_string()
+}
+
+/// An update held for a read that then failed belongs to no answer: laying it over a later,
+/// fresher read would report an older value as current.
+#[tokio::test]
+async fn an_update_held_for_a_failed_baseline_read_is_not_laid_over_a_later_one() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(Vec::new)
+    })
+    .await;
+    running.announcer.announce(primary_update(30.0));
+    let first = nth_rate_limits_read(&running, 0).await;
+    running.announcer.announce(primary_update(40.0));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": first, "error": {"code": -32603, "message": "busy"}}).to_string(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(primary_update(45.0));
+    let second = nth_rate_limits_read(&running, 1).await;
+    running.announcer.announce(
+        serde_json::json!({"id": second, "result": {"rateLimits": {
+            "primary": {"usedPercent": 50.0}}}})
+        .to_string(),
+    );
+    assert_eq!(
+        next_quota(&mut running.turn).await,
+        vec![(String::from("primary"), 50.0)],
+        "expected the later read's own answer, not the update held for the failed one"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A host refresh is a full read like the background one, so an update that lands while it is in
+/// flight is merged over its answer rather than lost to it — and one after it merges onto it.
+#[tokio::test]
+async fn a_refresh_merges_the_updates_that_land_while_it_is_in_flight() {
+    let running = Arc::new(
+        AnnouncedTurn::open_answering(replay_limits(), |frame| {
+            (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read")))
+                .then(Vec::new)
+        })
+        .await,
+    );
+    let refresh = tokio::spawn({
+        let running = Arc::clone(&running);
+        async move { running.session.refresh_account_usage().await }
+    });
+    let read = nth_rate_limits_read(&running, 0).await;
+    running.announcer.announce(primary_update(60.0));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": read, "result": {"rateLimits": {
+            "primary": {"usedPercent": 30.0}, "secondary": {"usedPercent": 20.0}}}})
+        .to_string(),
+    );
+    let usage = refresh
+        .await
+        .expect("expected the refresh task")
+        .expect("expected a reading");
+    let windows: Vec<(String, f64)> = usage
+        .limits
+        .expect("expected limits")
+        .windows
+        .iter()
+        .map(|window| {
+            (
+                window.label.clone().unwrap_or_default(),
+                window.used_percent,
+            )
+        })
+        .collect();
+    assert_eq!(
+        windows,
+        vec![
+            (String::from("primary"), 60.0),
+            (String::from("secondary"), 20.0)
+        ],
+        "expected the in-flight update merged over the refresh's answer"
+    );
+    running.announcer.announce(primary_update(70.0));
+    let mut running = Arc::into_inner(running).expect("expected the only handle");
+    assert_eq!(
+        next_quota(&mut running.turn).await,
+        vec![
+            (String::from("primary"), 70.0),
+            (String::from("secondary"), 20.0)
+        ],
+        "expected a later update merged onto the refreshed baseline"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// A background read and a host refresh can overlap. A read that was sent first but answers
+/// last is older than the baseline already adopted, and must not rewind it.
+#[tokio::test]
+async fn an_overlapping_older_quota_read_does_not_rewind_a_fresher_baseline() {
+    let running = Arc::new(
+        AnnouncedTurn::open_answering(replay_limits(), |frame| {
+            (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read")))
+                .then(Vec::new)
+        })
+        .await,
+    );
+    running.announcer.announce(primary_update(5.0));
+    let background = nth_rate_limits_read(&running, 0).await;
+    let refresh = tokio::spawn({
+        let running = Arc::clone(&running);
+        async move { running.session.refresh_account_usage().await }
+    });
+    let refreshed = nth_rate_limits_read(&running, 1).await;
+    running.announcer.announce(primary_update(60.0));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": refreshed, "result": {"rateLimits": {
+            "primary": {"usedPercent": 30.0}, "secondary": {"usedPercent": 20.0}}}})
+        .to_string(),
+    );
+    refresh
+        .await
+        .expect("expected the refresh task")
+        .expect("expected a reading");
+    running.announcer.announce(
+        serde_json::json!({"id": background, "result": {"rateLimits": {
+            "primary": {"usedPercent": 10.0}, "secondary": {"usedPercent": 5.0}}}})
+        .to_string(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.announcer.announce(primary_update(70.0));
+    let mut running = Arc::into_inner(running).expect("expected the only handle");
+    assert_eq!(
+        next_quota(&mut running.turn).await,
+        vec![
+            (String::from("primary"), 70.0),
+            (String::from("secondary"), 20.0)
+        ],
+        "expected the older read's late answer to leave the fresher baseline in place"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
 }
 
 /// A pending approval has its own deadline and does not consume the turn's idle budget.
@@ -3814,6 +4818,69 @@ async fn listing_discards_rows_outside_the_authorized_workspace() {
     assert_eq!(page.sessions[0].preview.as_deref(), Some("allowed"));
 }
 
+/// A picker is sorted by when a conversation was last used, lists the threads a person started
+/// from the CLI, `codex exec` or an app-server client, and leaves archived ones out. The vendor's
+/// own defaults are creation order and interactive sources only, so each is asked for explicitly.
+#[tokio::test]
+async fn the_picker_asks_for_recent_user_threads_and_dates_them_by_recency() {
+    let workspace = workspace_path().to_string_lossy().into_owned();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        Transcript::load("handshake").as_process_intercepting(move |frame| {
+            (frame["method"] == "thread/list").then(|| {
+                vec![
+                    serde_json::json!({"id": frame["id"], "result": {"data": [
+                        {"id": "recent", "preview": "p", "cwd": workspace,
+                         "createdAt": 100, "updatedAt": 200, "recencyAt": 300},
+                        {"id": "older-build", "preview": "q", "cwd": workspace,
+                         "createdAt": 100, "updatedAt": 250, "recencyAt": null}
+                    ], "nextCursor": null}})
+                    .to_string(),
+                ]
+            })
+        }),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+    let page = CodexHarness::new()
+        .list_sessions(&host, SessionQuery::default())
+        .await
+        .expect("expected a picker page");
+
+    let asked: serde_json::Value = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("thread/list"))
+        .and_then(|line| serde_json::from_str(&line).ok())
+        .expect("expected a thread/list frame");
+    let params = &asked["params"];
+    assert_eq!(
+        (
+            &params["sortKey"],
+            &params["sortDirection"],
+            &params["sourceKinds"],
+            &params["archived"],
+        ),
+        (
+            &serde_json::json!("recency_at"),
+            &serde_json::json!("desc"),
+            &serde_json::json!(["cli", "exec", "appServer"]),
+            &serde_json::json!(false),
+        ),
+        "expected an explicit recency sort, user sources and no archived threads, received {params}"
+    );
+    let seconds = |row: usize| {
+        page.sessions[row]
+            .updated_at
+            .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+    };
+    assert_eq!(
+        (seconds(0), seconds(1)),
+        (Some(300), Some(250)),
+        "expected recencyAt, falling back to updatedAt"
+    );
+}
+
 /// A responsive app-server that leaves the picker request unanswered.
 struct UnansweredListServer;
 
@@ -4516,7 +5583,256 @@ async fn an_older_codex_on_the_path_reports_the_gate_verdict() {
     );
 }
 
-/// The contract every harness must pass, run against the recorded conversation.
+/// A probe host whose app-server replays the recorded handshake, with `answer` consulted first.
+fn probe_host(
+    answer: impl Fn(&serde_json::Value) -> Option<Vec<String>> + Send + Sync + 'static,
+) -> (HostContext, Arc<FakeLauncher>) {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(version_answer());
+    launcher.push(
+        Transcript::load("handshake")
+            .as_process_intercepting(move |frame| answer(frame).or_else(|| last_model_page(frame))),
+    );
+    with_launcher(launcher, None)
+}
+
+/// Ends the model catalog after the recorded first page.
+///
+/// The handshake recording's `model/list` answer carries a `nextCursor`, and the recording holds
+/// no second page; answering it empty keeps a probe from waiting out its request timeout.
+fn last_model_page(frame: &serde_json::Value) -> Option<Vec<String>> {
+    (frame.get("method") == Some(&serde_json::json!("model/list"))
+        && frame.pointer("/params/cursor").is_some())
+    .then(|| {
+        vec![
+            serde_json::json!({"id": frame["id"], "result": {"data": [], "nextCursor": null}})
+                .to_string(),
+        ]
+    })
+}
+
+/// Answers `permissionProfile/list` with these profiles.
+fn profiles_answer(frame: &serde_json::Value, profiles: &serde_json::Value) -> Option<Vec<String>> {
+    (frame.get("method") == Some(&serde_json::json!("permissionProfile/list"))).then(|| {
+        vec![
+            serde_json::json!({"id": frame["id"],
+                               "result": {"data": profiles, "nextCursor": null}})
+            .to_string(),
+        ]
+    })
+}
+
+/// The machine's own Codex requirements can forbid a permission profile. Offering it anyway
+/// produces a choice that fails at `thread/start`; a profile reported `allowed: false`, or not
+/// listed at all, is reported unsupported for a policy reason instead.
+#[tokio::test]
+async fn discovery_offers_only_the_permission_profiles_the_machine_allows() {
+    let (host, launcher) = probe_host(|frame| {
+        profiles_answer(
+            frame,
+            &serde_json::json!([
+                {"id": ":read-only", "description": null, "allowed": true},
+                {"id": ":danger-full-access", "description": null, "allowed": false}
+            ]),
+        )
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+
+    let matrix = &discovery.permission_matrix;
+    for routing in [ApprovalRouting::User, ApprovalRouting::AutoReview] {
+        assert!(
+            matrix.supports(PermissionLevel::ReadOnly, routing),
+            "expected the allowed read-only profile to stay selectable with {routing:?}"
+        );
+        for level in [PermissionLevel::Default, PermissionLevel::FullAccess] {
+            let cell = matrix
+                .cell(level, routing)
+                .expect("expected every cell to be described");
+            assert!(
+                !cell.supported
+                    && matches!(
+                        &cell.unsupported_reason,
+                        Some(mango_external_agents::permission::UnsupportedReason::Other(reason))
+                            if reason == mango_agent_codex::permissions::PROFILE_DISALLOWED
+                    ),
+                "expected {level:?}/{routing:?} to be refused by policy, received {cell:?}"
+            );
+        }
+    }
+    let asked: serde_json::Value = launcher
+        .written()
+        .into_iter()
+        .find(|line| line.contains("permissionProfile/list"))
+        .and_then(|line| serde_json::from_str(&line).ok())
+        .expect("expected the profiles to be asked for");
+    assert_eq!(
+        asked["params"]["cwd"],
+        serde_json::json!(workspace_path().to_string_lossy()),
+        "expected the project cwd, so project config layers apply"
+    );
+}
+
+/// `model/list` is cursor-paginated with a server-chosen page size; reading only the first page
+/// hides every model past it.
+#[tokio::test]
+async fn discovery_walks_every_model_list_page() {
+    let (host, launcher) = probe_host(|frame| {
+        if frame.get("method") == Some(&serde_json::json!("model/list")) {
+            let page = match frame
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str)
+            {
+                None => serde_json::json!({"data": [{"id": "model-a", "isDefault": true}],
+                                           "nextCursor": "page-2"}),
+                Some("page-2") => {
+                    serde_json::json!({"data": [{"id": "model-b"}], "nextCursor": null})
+                }
+                Some(other) => panic!("expected the cursor the server returned, received {other}"),
+            };
+            return Some(vec![
+                serde_json::json!({"id": frame["id"], "result": page}).to_string(),
+            ]);
+        }
+        profiles_answer(frame, &serde_json::json!([]))
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+    let ids: Vec<&str> = discovery
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    assert_eq!(ids, ["model-a", "model-b"], "expected both pages of models");
+    let asked = launcher
+        .written()
+        .iter()
+        .filter(|line| line.contains("\"model/list\""))
+        .count();
+    assert_eq!(asked, 2, "expected one request per page");
+}
+
+/// A host keeps a continuation for the same account and notices a switch through a fingerprint
+/// keyed with its own secret; the address it is computed from reaches no returned value.
+#[tokio::test]
+async fn discovery_with_a_host_key_fingerprints_the_signed_in_account() {
+    let (host, _) = probe_host(|frame| profiles_answer(frame, &serde_json::json!([])));
+    let key = mango_agent_codex::account::AccountFingerprintKey::new(b"host-local-key")
+        .expect("expected a key");
+    let found = CodexHarness::new()
+        .discover_with_account(&host, &key)
+        .await
+        .expect("expected a discovery");
+
+    let account = found
+        .account
+        .expect("expected the recorded ChatGPT account's facts");
+    assert_eq!(account.plan_type.as_deref(), Some("prolite"));
+    // The capture redacts the address, so the recording's own text is what was digested.
+    assert_eq!(account.fingerprint, Some(key.fingerprint("[REDACTED]")));
+    assert!(
+        matches!(
+            found.discovery.auth,
+            mango_external_agents::AuthState::LoggedIn { .. }
+        ),
+        "expected the same auth reading plain discovery reports"
+    );
+}
+
+/// A profile listing cut off by the page limit is incomplete, not a statement that the missing
+/// built-in profiles are forbidden.
+#[tokio::test]
+async fn discovery_keeps_the_declared_matrix_when_the_profile_listing_never_ends() {
+    let (host, _) = probe_host(|frame| {
+        (frame.get("method") == Some(&serde_json::json!("permissionProfile/list"))).then(|| {
+            vec![
+                serde_json::json!({"id": frame["id"], "result": {
+                    "data": [{"id": "custom", "allowed": true}], "nextCursor": "again"}})
+                .to_string(),
+            ]
+        })
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+    assert_eq!(
+        discovery.permission_matrix,
+        mango_agent_codex::permissions::matrix(),
+        "expected an unfinished listing to leave the declared matrix alone"
+    );
+}
+
+/// Hidden models are left out of the picker, so they must not use up the catalog's budget before
+/// the visible ones on later pages are read.
+#[tokio::test]
+async fn hidden_models_do_not_use_up_the_catalog_before_visible_ones_are_read() {
+    let (host, _) = probe_host(|frame| {
+        if frame.get("method") == Some(&serde_json::json!("model/list")) {
+            let page = match frame
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str)
+            {
+                None => {
+                    let hidden: Vec<serde_json::Value> = (0..300)
+                        .map(|index| {
+                            serde_json::json!({"id": format!("hidden-{index}"),
+                                                        "hidden": true})
+                        })
+                        .collect();
+                    serde_json::json!({"data": hidden, "nextCursor": "page-2"})
+                }
+                Some(_) => serde_json::json!({"data": [{"id": "visible"}], "nextCursor": null}),
+            };
+            return Some(vec![
+                serde_json::json!({"id": frame["id"], "result": page}).to_string(),
+            ]);
+        }
+        profiles_answer(frame, &serde_json::json!([]))
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+    let ids: Vec<&str> = discovery
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["visible"],
+        "expected the visible model past the hidden page"
+    );
+}
+
+/// A build that cannot answer the profile question has not forbidden anything.
+#[tokio::test]
+async fn discovery_keeps_the_declared_matrix_when_the_profiles_cannot_be_read() {
+    let (host, _) = probe_host(|frame| {
+        (frame.get("method") == Some(&serde_json::json!("permissionProfile/list"))).then(|| {
+            vec![
+                serde_json::json!({"id": frame["id"],
+                                   "error": {"code": -32601, "message": "method not found"}})
+                .to_string(),
+            ]
+        })
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+    assert_eq!(
+        discovery.permission_matrix,
+        mango_agent_codex::permissions::matrix()
+    );
+}
+
+/// The contract every harness must pass, run against the recorded conversation./// The contract every harness must pass, run against the recorded conversation.
 #[tokio::test]
 async fn the_harness_passes_the_cores_conformance_suite() {
     // The suite probes before it opens anything, and a probe spawns `codex --version` first.
@@ -4528,7 +5844,19 @@ async fn the_harness_passes_the_cores_conformance_suite() {
     // trip the suite cannot prove anywhere else.
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(version_answer());
-    launcher.push(Transcript::load("handshake").as_process());
+    launcher.push(
+        Transcript::load("handshake").as_process_intercepting(|frame| {
+            profiles_answer(
+                frame,
+                &serde_json::json!([
+                    {"id": ":read-only", "allowed": true},
+                    {"id": ":workspace", "allowed": true},
+                    {"id": ":danger-full-access", "allowed": true}
+                ]),
+            )
+            .or_else(|| last_model_page(frame))
+        }),
+    );
     let transcript = Transcript::load("approval");
     let thread_id = transcript
         .thread_id()

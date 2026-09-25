@@ -20,6 +20,15 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
         return None;
     }
     let (name, kind, title, detail, content) = match item {
+        // A family this build does not model is still work the agent did: shown under the
+        // vendor's own name, and only when it carries an id a completion can address.
+        ThreadItem::Other { item_type, id, .. } if item.is_unmodelled_family() && id.is_some() => (
+            item_type.as_str(),
+            ActivityKind::Other,
+            item_type.clone(),
+            None,
+            None,
+        ),
         ThreadItem::CommandExecution { command, cwd, .. } => (
             "shell",
             ActivityKind::Command,
@@ -79,7 +88,9 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
             None,
             None,
         ),
-        ThreadItem::AgentMessage { .. } | ThreadItem::Reasoning { .. } | ThreadItem::Other => {
+        ThreadItem::AgentMessage { .. }
+        | ThreadItem::Reasoning { .. }
+        | ThreadItem::Other { .. } => {
             return None;
         }
     };
@@ -134,6 +145,9 @@ pub fn completed(item: &ThreadItem) -> Option<ActivityResult> {
             file_change_content(changes),
         ),
         ThreadItem::McpToolCall { status, .. } => (*status, None, None),
+        // An unmodelled family that states its ending keeps it; one that states none reached its
+        // completion notification, which is the whole report.
+        ThreadItem::Other { status, .. } => (status.unwrap_or(ItemStatus::Completed), None, None),
         // Families with no status of their own: reaching a completion notification is the whole
         // report, so they end as completed rather than as an unknown this harness invented.
         _ => (ItemStatus::Completed, None, None),
@@ -163,7 +177,7 @@ fn command_detail(output: Option<&str>, exit_code: Option<i64>) -> Option<String
     }
 }
 
-fn file_change_detail(changes: &[FileUpdateChange]) -> Option<String> {
+pub(crate) fn file_change_detail(changes: &[FileUpdateChange]) -> Option<String> {
     if changes.is_empty() {
         return None;
     }
@@ -180,7 +194,7 @@ fn file_change_detail(changes: &[FileUpdateChange]) -> Option<String> {
 ///
 /// `FileChange::kind` stays absent: at this pin the vendor states no per-file kind, and reading
 /// one off the diff text would be re-parsing vendor prose this module exists to avoid.
-fn file_change_content(changes: &[FileUpdateChange]) -> Option<ActivityContent> {
+pub(crate) fn file_change_content(changes: &[FileUpdateChange]) -> Option<ActivityContent> {
     if changes.is_empty() {
         return None;
     }
@@ -301,7 +315,7 @@ mod tests {
         for raw in [
             json!({"type": "agentMessage", "id": "m-1", "text": "hello"}),
             json!({"type": "reasoning", "id": "r-1", "summary": ["thinking"], "content": []}),
-            json!({"type": "somethingTheNextReleaseAdded", "id": "x-1"}),
+            json!({"type": "userMessage", "id": "u-1", "content": []}),
         ] {
             let item = item(raw.clone());
             assert!(started(&item).is_none(), "expected no activity for {raw}");

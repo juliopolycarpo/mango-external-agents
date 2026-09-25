@@ -154,6 +154,7 @@ mod tests {
                 method::MODEL_LIST,
                 method::ACCOUNT_READ,
                 method::ACCOUNT_RATE_LIMITS_READ,
+                method::PERMISSION_PROFILE_LIST,
             ],
         );
         assert_declares_methods("ClientNotification", &[method::INITIALIZED]);
@@ -183,6 +184,9 @@ mod tests {
                 notifications::method::AGENT_MESSAGE_DELTA,
                 notifications::method::REASONING_TEXT_DELTA,
                 notifications::method::REASONING_SUMMARY_TEXT_DELTA,
+                notifications::method::COMMAND_EXECUTION_OUTPUT_DELTA,
+                notifications::method::MCP_TOOL_CALL_PROGRESS,
+                notifications::method::FILE_CHANGE_PATCH_UPDATED,
                 notifications::method::THREAD_TOKEN_USAGE_UPDATED,
                 notifications::method::ACCOUNT_RATE_LIMITS_UPDATED,
                 notifications::method::SERVER_REQUEST_RESOLVED,
@@ -226,7 +230,22 @@ mod tests {
         assert_declares("Thread", &["id", "preview", "name", "cwd", "updatedAt"]);
         assert_declares("ThreadReadParams", &["threadId", "includeTurns"]);
         assert_declares("ThreadReadResponse", &["thread"]);
-        assert_declares("ThreadListParams", &["cursor", "limit", "cwd"]);
+        assert_declares(
+            "ThreadListParams",
+            &[
+                "cursor",
+                "limit",
+                "cwd",
+                "sortKey",
+                "sortDirection",
+                "sourceKinds",
+                "archived",
+            ],
+        );
+        assert_declares("Thread", &["recencyAt"]);
+        assert_accepts("ThreadSortKey", &["recency_at"]);
+        assert_accepts("SortDirection", &["desc"]);
+        assert_accepts("ThreadSourceKind", &["cli", "exec", "appServer"]);
         assert_declares("ThreadListResponse", &["data", "nextCursor"]);
     }
 
@@ -253,7 +272,15 @@ mod tests {
         // as a turn whose input the server silently refuses.
         assert_declares("UserInput", &["text", "text_elements", "url"]);
         assert_accepts("UserInput", &["text", "image"]);
-        assert_declares("TurnError", &["message", "additionalDetails"]);
+        assert_declares(
+            "TurnError",
+            &["message", "additionalDetails", "codexErrorInfo"],
+        );
+        assert_accepts("CodexErrorInfo", &["usageLimitExceeded", "other"]);
+        assert_declares(
+            "CodexErrorInfo",
+            &["activeTurnNotSteerable", "httpConnectionFailed"],
+        );
         assert_accepts(
             "TurnStatus",
             &["inProgress", "completed", "interrupted", "failed"],
@@ -343,7 +370,7 @@ mod tests {
         assert_declares("ItemCompletedNotification", &["threadId", "turnId", "item"]);
         assert_declares(
             "AgentMessageDeltaNotification",
-            &["threadId", "turnId", "delta"],
+            &["threadId", "turnId", "itemId", "delta"],
         );
         assert_declares(
             "ReasoningSummaryTextDeltaNotification",
@@ -353,6 +380,19 @@ mod tests {
             "CommandExecutionStatus",
             &["inProgress", "completed", "failed", "declined"],
         );
+        assert_declares(
+            "CommandExecutionOutputDeltaNotification",
+            &["threadId", "turnId", "itemId", "delta"],
+        );
+        assert_declares(
+            "McpToolCallProgressNotification",
+            &["threadId", "turnId", "itemId", "message"],
+        );
+        assert_declares(
+            "FileChangePatchUpdatedNotification",
+            &["threadId", "turnId", "itemId", "changes"],
+        );
+        assert_declares("FileUpdateChange", &["path", "diff"]);
     }
 
     #[test]
@@ -381,8 +421,8 @@ mod tests {
     fn the_account_and_model_fields_are_the_ones_the_pinned_build_declares() {
         assert_declares("GetAccountResponse", &["account", "requiresOpenaiAuth"]);
         assert_accepts("Account", &["apiKey", "chatgpt", "amazonBedrock"]);
-        assert_declares("ModelListParams", &["limit"]);
-        assert_declares("ModelListResponse", &["data"]);
+        assert_declares("ModelListParams", &["cursor", "limit"]);
+        assert_declares("ModelListResponse", &["data", "nextCursor"]);
         assert_declares(
             "Model",
             &[
@@ -396,6 +436,9 @@ mod tests {
             ],
         );
         assert_declares("ReasoningEffortOption", &["reasoningEffort", "description"]);
+        assert_declares("PermissionProfileListParams", &["cursor", "cwd"]);
+        assert_declares("PermissionProfileListResponse", &["data", "nextCursor"]);
+        assert_declares("PermissionProfileSummary", &["id", "allowed"]);
     }
 
     #[test]

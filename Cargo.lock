@@ -1003,6 +1003,7 @@ dependencies = [
  "async-trait",
  "http",
  "mango-external-agents",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
