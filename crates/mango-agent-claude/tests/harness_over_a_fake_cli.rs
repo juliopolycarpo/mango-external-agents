@@ -9,12 +9,13 @@ use std::time::Duration;
 use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::testing::FrozenClock;
 use mango_external_agents::{
-    ApprovalRouting, AuthMode, AuthState, CancelReason, CancelToken, CloseReason, Configuration,
-    ConfigurationChange, ConfigurationOptionId, ConfigurationPatch, ConfigurationValue,
-    DiscoveryReceipt, DiscoveryReceiptMeasurements, Dispatch, Error, EventKind, ExecutablePath,
-    GateVerdict, Harness, HarnessId, HostContext, InteractionId, LaunchSpec, Limits, LineLimits,
-    ManagedProcess, OpenSession, PermissionLevel, PermissionResponse, ProcessControl,
-    ProcessLauncher, Result, ResumeMode, Session, SessionStatus, TurnRequest, TurnStream,
+    ApprovalRouting, AuthMode, AuthState, ByteSink, CancelReason, CancelToken, CloseReason,
+    Configuration, ConfigurationChange, ConfigurationOptionId, ConfigurationPatch,
+    ConfigurationValue, DiscoveryReceipt, DiscoveryReceiptMeasurements, Dispatch, Error, EventKind,
+    ExecutablePath, GateVerdict, Harness, HarnessId, HostContext, InteractionId, LaunchSpec,
+    Limits, LineLimits, ManagedProcess, OpenSession, PermissionLevel, PermissionResponse,
+    ProcessControl, ProcessLauncher, Result, ResumeMode, Session, SessionStatus, TurnRequest,
+    TurnStream,
 };
 use support::{
     FakeClaudeCli, HELP_2_1_227, HELP_2_1_270, READ_TURN, Run, SIGNED_OUT, SpawnGate, host,
@@ -92,6 +93,44 @@ impl ProcessLauncher for FailingTurnLauncher {
             });
         }
         self.inner.spawn(spec).await
+    }
+}
+
+/// A `claude` whose turn children's stdin is already a broken pipe when the prompt is written.
+///
+/// What a child that exited, or closed its input, looks like to the writer: the kernel answers
+/// the write with `EPIPE`, and the Tokio launcher reports that as a [`Error::Link`] naming only
+/// the `io::ErrorKind`. Probes, stdout and the process itself stay the scripted fake's own.
+struct BrokenPipeLauncher {
+    inner: Arc<FakeClaudeCli>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for BrokenPipeLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        let is_turn = spec.argv.iter().any(|argument| argument == "--print");
+        let mut child = self.inner.spawn(spec).await?;
+        if is_turn {
+            child.stdin = Some(Box::new(BrokenPipeStdin));
+        }
+        Ok(child)
+    }
+}
+
+/// Refuses every write the way a closed pipe does, and closes without complaint.
+struct BrokenPipeStdin;
+
+#[async_trait::async_trait]
+impl ByteSink for BrokenPipeStdin {
+    async fn write_all(&mut self, _bytes: &[u8]) -> Result<()> {
+        Err(Error::Link {
+            peer: String::from("child stdin"),
+            message: format!("a write failure ({:?})", std::io::ErrorKind::BrokenPipe),
+        })
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1311,6 +1350,37 @@ mod opening_a_session {
         let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
         assert_eq!(argv[0], "/srv/claude");
     }
+
+    /// An opened session reports exactly the capabilities discovery reported for the same build.
+    ///
+    /// Both read the same probes but are returned by two different methods, and Claude has no
+    /// handshake that could legitimately narrow a session below discovery. A session that
+    /// disagreed would offer a model picker, or an MCP passthrough, the host never planned
+    /// against. Checked on three captured surfaces because the catalog and MCP flags differ
+    /// between them.
+    #[tokio::test]
+    async fn reports_the_same_capabilities_discovery_did() {
+        for (label, help) in [
+            ("2.1.227", HELP_2_1_227),
+            ("2.1.260", support::DEFAULT_HELP),
+            ("2.1.270", HELP_2_1_270),
+        ] {
+            let launcher = Arc::new(FakeClaudeCli::new().with_help(help));
+            let harness = ClaudeHarness::new();
+            let discovery = harness
+                .discover(&host(Arc::clone(&launcher)))
+                .await
+                .expect("expected a discovery");
+            let session = open(&launcher).await;
+
+            let expected = *discovery.capabilities.capabilities();
+            let received = *session.capabilities().capabilities();
+            assert_eq!(
+                received, expected,
+                "expected the {label} session to report discovery's capabilities"
+            );
+        }
+    }
 }
 
 mod a_turn {
@@ -1437,6 +1507,111 @@ mod a_turn {
                 .with_model("sonnet")
                 .with_level(PermissionLevel::Default)
                 .with_routing(ApprovalRouting::User)
+        );
+    }
+
+    /// A `system/init` that echoes `permissionMode: "auto"` never widens a later turn.
+    ///
+    /// The echo reports the mode a run went with — the account's own default when this harness
+    /// passed none, or the mode it chose when it did. Folding that echo back into the session
+    /// would teach it that a user who asked to be asked now means `auto`, and they would silently
+    /// stop being asked. Only what the host accepted may reach a later argv.
+    #[tokio::test]
+    async fn an_init_echo_of_auto_never_widens_a_later_turn() {
+        const AUTO_ECHO: &str = r#"{"type":"system","subtype":"init","permissionMode":"auto"}
+{"type":"result","is_error":false}"#;
+        const PLAIN: &str = r#"{"type":"result","is_error":false}"#;
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(Run::replaying(AUTO_ECHO))
+                .with_turn(Run::replaying(PLAIN))
+                .with_turn(Run::replaying(AUTO_ECHO))
+                .with_turn(Run::replaying(PLAIN)),
+        );
+        let session = open(&launcher).await;
+        let pair = |routing| {
+            ConfigurationPatch::new()
+                .level(ConfigurationChange::Set(PermissionLevel::Default))
+                .routing(ConfigurationChange::Set(routing))
+        };
+        let turns = [
+            TurnRequest::new("turn-1", "vendor default, echoed as auto"),
+            TurnRequest::new("turn-2", "still nothing chosen"),
+            TurnRequest::new("turn-3", "auto review, echoed as auto")
+                .with_configuration(pair(ApprovalRouting::AutoReview)),
+            TurnRequest::new("turn-4", "ask me").with_configuration(pair(ApprovalRouting::User)),
+        ];
+        for request in turns {
+            let mut turn = session
+                .start_turn(request)
+                .await
+                .expect("expected the turn to start");
+            let events = drain(&mut turn).await;
+            assert_eq!(
+                events.last(),
+                Some(&EventKind::Completed),
+                "expected each turn to complete | received: {events:?}"
+            );
+        }
+
+        let argvs = launcher.turn_argvs();
+        let modes: Vec<Option<&str>> = argvs
+            .iter()
+            .map(|argv| value_after(argv, "--permission-mode"))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![None, None, Some("auto"), Some("manual")],
+            "expected only the host's own choices on the argv, never the init echo | received: {argvs:?}"
+        );
+        assert_eq!(
+            session.snapshot().configuration.accepted,
+            Configuration::unknown()
+                .with_level(PermissionLevel::Default)
+                .with_routing(ApprovalRouting::User),
+            "expected the last accepted pair to be the one the host chose"
+        );
+    }
+
+    /// A 2.1.260-era build declares `--effort` and `--permission-prompts`, and a session opened
+    /// against it puts both on the turn's argv.
+    ///
+    /// The argv builder's own tests are handed the surface directly, which proves the rule and not
+    /// the wiring: nothing there would notice a session forgetting what its `--help` probe read.
+    /// `--effort` carries the level the host chose; `--permission-prompts none` states that nobody
+    /// answers a prompt, because this harness serves no approval
+    /// (<https://code.claude.com/docs/en/cli-reference.md>).
+    #[tokio::test]
+    async fn a_session_on_a_build_that_declares_them_passes_effort_and_permission_prompts() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(support::DEFAULT_HELP)
+                .with_turn(Run::replaying(READ_TURN)),
+        );
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(
+                TurnRequest::new("turn-1", "read note.txt").with_configuration(
+                    ConfigurationPatch::new()
+                        .level(ConfigurationChange::Set(PermissionLevel::Default))
+                        .routing(ConfigurationChange::Set(ApprovalRouting::User))
+                        .effort(ConfigurationChange::Set(String::from("high"))),
+                ),
+            )
+            .await
+            .expect("expected a turn");
+        drain(&mut turn).await;
+
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        assert_eq!(
+            value_after(&argv, "--effort"),
+            Some("high"),
+            "expected the chosen effort on the argv | received: {argv:?}"
+        );
+        assert_eq!(
+            value_after(&argv, "--permission-prompts"),
+            Some("none"),
+            "expected the declared prompt target to be stated | received: {argv:?}"
         );
     }
 
@@ -2048,6 +2223,63 @@ mod a_turn {
             launcher.turn_argvs().len(),
             1,
             "expected the unsafe continuation to be refused before launch"
+        );
+    }
+
+    /// A prompt write that fails with a broken pipe ends the turn with an error and ends the child.
+    ///
+    /// The prompt goes to stdin, which is the one input `claude --print` reads. A write the pipe
+    /// refuses is a turn the vendor will never answer, so the stream must still reach exactly one
+    /// terminal — an error naming the broken link — and the child the turn spawned must not
+    /// outlive it: the harness asks the launcher to stop it, once.
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_pipe_on_the_prompt_write_ends_the_turn_with_an_error_and_ends_the_child() {
+        let fake =
+            Arc::new(FakeClaudeCli::new().with_turn(Run::stalling::<[String; 0], String>([])));
+        let launcher = Arc::new(BrokenPipeLauncher {
+            inner: Arc::clone(&fake),
+        });
+        let host = host_under(launcher, Limits::default());
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hello"))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!("expected the turn to end with an error | received: {events:?}");
+        };
+        assert_eq!(
+            error.code.as_str(),
+            "claude-stream-broken",
+            "expected a broken-link error code | received: {error:?}"
+        );
+        assert!(
+            error.message.contains("BrokenPipe"),
+            "expected the error to name the broken pipe | received: {:?}",
+            error.message
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fake.a_child_is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected the turn child to be ended after the failed prompt write");
+        assert_eq!(
+            fake.kill_requests(),
+            1,
+            "expected one stop request for the turn child | received: {}",
+            fake.kill_requests()
+        );
+        assert!(
+            fake.written().is_empty(),
+            "expected no prompt to reach the child | received: {:?}",
+            fake.written()
         );
     }
 
