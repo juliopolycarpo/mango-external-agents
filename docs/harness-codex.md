@@ -113,7 +113,10 @@ anything reaches the vendor.
 
 `turn/steer` carries `expectedTurnId` as a precondition. A steer naming a turn that is not the one
 running is refused here rather than landing on whatever turn happens to be live; the app-server's
-own refusal (`-32600 "no active turn to steer"`) maps to `SteerRejection::TurnAlreadyCompleted`.
+own refusal (`-32600 "no active turn to steer"`) maps to `SteerRejection::TurnAlreadyCompleted`,
+and its structured `activeTurnNotSteerable` refusal (`-32600 "cannot steer a review turn"` or
+`"cannot steer a compact turn"`) maps to `SteerRejection::TurnNotSteerable`. The JSON-RPC client
+does not retain the error's `data`, so that refusal is recognised by code and message.
 
 The app-server answers a steer with "the accepted `turnId`" ([app-server][app-server]). When that
 differs from the id the steer expected, Codex continues the turn under it, and the session adopts
@@ -564,8 +567,8 @@ id renders nothing because no completion could address it. The item families are
 - `PermissionLevel` maps to the three plain `AskForApproval` values; the vendor's `granular`
   variant is neither sent nor modelled.
 - `thread/fork`, thread archival, the queue and the realtime families are not driven.
-- Vendor steering refusals other than the observed "no active turn" response retain the vendor
-  error; native reviews are rejected locally as `TurnNotSteerable`.
+- Vendor steering refusals other than "no active turn" and "cannot steer a review/compact turn"
+  retain the vendor error; native reviews are rejected locally as `TurnNotSteerable`.
 
 Compliance posture: see [compliance.md](compliance.md).
 

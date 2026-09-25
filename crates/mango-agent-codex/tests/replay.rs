@@ -2943,6 +2943,35 @@ async fn concurrent_steers_are_serialized_so_the_second_sees_the_firsts_continua
     }
 }
 
+/// The app-server refuses to steer a review or a compaction with a structured
+/// `activeTurnNotSteerable`; that is a turn that cannot be steered, not a failure.
+#[tokio::test]
+async fn an_unsteerable_active_turn_is_a_labelled_rejection_rather_than_an_error() {
+    let running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        (frame.get("method") == Some(&serde_json::json!("turn/steer"))).then(|| {
+            vec![
+                serde_json::json!({"id": frame["id"], "error": {
+                    "code": -32600, "message": "cannot steer a compact turn",
+                    "data": {"message": "cannot steer a compact turn", "codexErrorInfo":
+                        {"activeTurnNotSteerable": {"turnKind": "compact"}}}}})
+                .to_string(),
+            ]
+        })
+    })
+    .await;
+    let outcome = running
+        .session
+        .steer(AnnouncedTurn::steer("also this"))
+        .await
+        .expect("expected a labelled rejection rather than an error");
+    assert_eq!(
+        outcome,
+        mango_external_agents::SteerOutcome::Rejected {
+            reason: mango_external_agents::SteerRejection::TurnNotSteerable
+        }
+    );
+}
+
 /// The client keeps reading while the vendor waits on an approval, so a steer sent then still
 /// gets its own answer rather than waiting for the approval to resolve.
 #[tokio::test]

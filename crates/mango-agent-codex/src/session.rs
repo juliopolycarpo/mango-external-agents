@@ -3558,6 +3558,9 @@ impl Session for CodexSession {
             Err(Error::Vendor(error)) if is_no_active_turn(&error) => Ok(SteerOutcome::Rejected {
                 reason: SteerRejection::TurnAlreadyCompleted,
             }),
+            Err(Error::Vendor(error)) if is_not_steerable(&error) => Ok(SteerOutcome::Rejected {
+                reason: SteerRejection::TurnNotSteerable,
+            }),
             Err(error) => Err(error),
         }
     }
@@ -3752,6 +3755,17 @@ fn teardown_panicked(control: Arc<dyn ProcessControl>, joined: &tokio::task::Joi
 fn is_no_active_turn(error: &VendorError) -> bool {
     error.vendor_code.as_deref() == Some(NO_ACTIVE_TURN_CODE)
         && error.message.to_lowercase().contains("no active turn")
+}
+
+/// Whether a steer failed because the running turn is a review or a compaction.
+///
+/// The pinned app-server answers `-32600` with `cannot steer a review turn` or `cannot steer a
+/// compact turn`, and attaches `codexErrorInfo: {activeTurnNotSteerable: {turnKind}}` as data. The
+/// JSON-RPC client keeps the code and message but not the data, so both of those are checked, on
+/// the same terms as [`is_no_active_turn`].
+fn is_not_steerable(error: &VendorError) -> bool {
+    error.vendor_code.as_deref() == Some(NO_ACTIVE_TURN_CODE)
+        && error.message.starts_with("cannot steer a ")
 }
 
 /// The JSON-RPC code the app-server refuses a steer with: the generic invalid-request code.
