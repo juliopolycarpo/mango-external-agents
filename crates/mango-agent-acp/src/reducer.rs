@@ -19,10 +19,12 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
+use std::collections::HashSet;
+
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     SessionConfigOption, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolKind,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use mango_external_agents::event::{
     Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, EventKind,
@@ -40,6 +42,12 @@ use mango_external_agents::{
 /// so the plan gets one constant one and its revisions arrive as updates to it. Prefixed to stay
 /// clear of an agent's own tool call ids.
 pub const PLAN_CALL_ID: &str = "acp:plan";
+
+/// The title a tool call gets when its first frame named none.
+///
+/// Only reachable through a `tool_call_update` for a call this client never saw announced:
+/// `tool_call` itself requires a title. An empty label is what a host would otherwise render.
+pub const UNTITLED_TOOL_CALL: &str = "tool";
 
 /// A session-scoped fact one frame carried, alongside whatever it said about the turn.
 ///
@@ -59,13 +67,19 @@ pub enum SessionFact {
 
 /// Turns one agent's frames into events, remembering only what a frame alone cannot say.
 ///
-/// Two things: whether a reasoning block is open (ACP streams thought chunks with no start or end
+/// Three things: whether a reasoning block is open (ACP streams thought chunks with no start or end
 /// marker, and [`EventKind::ReasoningStarted`]/[`EventKind::ReasoningEnded`] are a pair a host
-/// relies on), and whether the plan activity has been announced yet.
+/// relies on), whether the plan activity has been announced yet, and which tool calls the host has
+/// been told about. The last one is what lets a call first reported through `tool_call_update`
+/// still open a bracket, and a frame for a call that already ended stay out of the transcript.
 #[derive(Debug, Default)]
 pub struct Reducer {
     reasoning_open: bool,
     plan_started: bool,
+    /// Tool calls the host saw start and has not yet seen end, by the agent's own call id.
+    open_calls: HashSet<String>,
+    /// Tool calls that already ended this turn, so a late frame cannot open a second bracket.
+    finished_calls: HashSet<String>,
 }
 
 impl Reducer {
@@ -146,8 +160,8 @@ impl Reducer {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => (text_delta(chunk), Vec::new()),
             SessionUpdate::AgentThoughtChunk(chunk) => (self.reasoning_delta(chunk), Vec::new()),
-            SessionUpdate::ToolCall(call) => (tool_call(call), Vec::new()),
-            SessionUpdate::ToolCallUpdate(update) => (tool_call_update(update), Vec::new()),
+            SessionUpdate::ToolCall(call) => (self.tool_call(call), Vec::new()),
+            SessionUpdate::ToolCallUpdate(update) => (self.tool_call_update(update), Vec::new()),
             SessionUpdate::Plan(plan) => (self.plan(plan), Vec::new()),
             SessionUpdate::AvailableCommandsUpdate(catalog) => (
                 Vec::new(),
@@ -188,6 +202,80 @@ impl Reducer {
             | SessionUpdate::SessionInfoUpdate(_)
             | _ => (Vec::new(), Vec::new()),
         }
+    }
+
+    /// A `tool_call` frame: a new bracket, or a revision of one this turn already opened.
+    ///
+    /// ACP describes `tool_call` as the frame that announces a call, but nothing stops an agent from
+    /// sending it again for a call that is still running. A second [`EventKind::ActivityStarted`]
+    /// under the same id would give a host two rows for one call, so the repeat arrives as an update
+    /// carrying everything the new frame said. A call that already ended stays ended.
+    fn tool_call(&mut self, call: ToolCall) -> Vec<EventKind> {
+        let call_id = call.tool_call_id.to_string();
+        if self.finished_calls.contains(&call_id) {
+            return Vec::new();
+        }
+        if self.open_calls.contains(&call_id) {
+            let fields = ToolCallUpdateFields::new()
+                .kind(call.kind)
+                .status(call.status)
+                .title(call.title)
+                .content(call.content)
+                .locations(call.locations);
+            return self.tool_call_update(ToolCallUpdate::new(call.tool_call_id, fields));
+        }
+        let finished = finished(call.status).is_some();
+        let events = tool_call(call);
+        self.track(call_id, finished);
+        events
+    }
+
+    /// A `tool_call_update` frame, opening the bracket first when this is the call's first frame.
+    ///
+    /// ACP permits a `tool_call_update` for a call this client never saw announced — a loaded
+    /// session's in-flight call is one — and a host applies updates only to a call it saw start. So
+    /// a first sighting through this channel is announced from whatever the update carries, with a
+    /// generic title when it names none, and completed in the same breath when it is already over.
+    fn tool_call_update(&mut self, update: ToolCallUpdate) -> Vec<EventKind> {
+        let call_id = update.tool_call_id.to_string();
+        if self.finished_calls.contains(&call_id) {
+            return Vec::new();
+        }
+        if !self.open_calls.contains(&call_id) {
+            let fields = update.fields;
+            let title = fields
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| String::from(UNTITLED_TOOL_CALL));
+            let mut call = ToolCall::new(update.tool_call_id, title)
+                .kind(fields.kind.unwrap_or_default())
+                .status(fields.status.unwrap_or_default());
+            if let Some(content) = fields.content {
+                call = call.content(content);
+            }
+            if let Some(locations) = fields.locations {
+                call = call.locations(locations);
+            }
+            return self.tool_call(call);
+        }
+        let events = tool_call_update(update);
+        let finished = events
+            .iter()
+            .any(|event| matches!(event, EventKind::ActivityCompleted { .. }));
+        if finished {
+            self.open_calls.remove(&call_id);
+            self.finished_calls.insert(call_id);
+        }
+        events
+    }
+
+    /// Records a call the host has just been told about, as running or as already over.
+    fn track(&mut self, call_id: String, finished: bool) {
+        if finished {
+            self.finished_calls.insert(call_id);
+            return;
+        }
+        self.open_calls.insert(call_id);
     }
 
     fn reasoning_delta(&mut self, chunk: ContentChunk) -> Vec<EventKind> {
@@ -587,6 +675,18 @@ mod tests {
         reduce_with_facts(values).0
     }
 
+    /// The `tool_call` frame that announces `call_id`, so a test about updates reads updates to a
+    /// call the host already saw start.
+    fn announced(call_id: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": call_id,
+            "title": "Tool",
+            "kind": "other",
+            "status": "in_progress"
+        })
+    }
+
     fn reduce_with_facts(values: Vec<serde_json::Value>) -> (Vec<EventKind>, Vec<SessionFact>) {
         let mut reducer = Reducer::new();
         let mut events = Vec::new();
@@ -766,6 +866,7 @@ mod tests {
     #[test]
     fn a_tool_call_update_completes_on_a_terminal_status_and_updates_otherwise() {
         let events = reduce(vec![
+            announced("call_3"),
             json!({
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "call_3",
@@ -779,10 +880,10 @@ mod tests {
             }),
         ]);
         assert!(
-            matches!(&events[0], EventKind::ActivityUpdated { call_id, .. } if call_id == "call_3"),
+            matches!(&events[1], EventKind::ActivityUpdated { call_id, .. } if call_id == "call_3"),
             "received {events:?}"
         );
-        let EventKind::ActivityCompleted { result, .. } = &events[1] else {
+        let EventKind::ActivityCompleted { result, .. } = &events[2] else {
             panic!("expected a completion, received {events:?}");
         };
         assert_eq!(result.status, ActivityStatus::Failed);
@@ -797,13 +898,17 @@ mod tests {
     /// update, because nothing here ever carries a raw vendor frame.
     #[test]
     fn a_status_only_move_to_in_progress_produces_nothing() {
+        let mut reducer = Reducer::new();
+        let _ = reducer.update(update(announced("call_4")));
         assert_eq!(
-            reduce(vec![json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "call_4",
-                "status": "in_progress",
-                "rawInput": { "command": "cargo test" }
-            })]),
+            reducer
+                .update(update(json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_4",
+                    "status": "in_progress",
+                    "rawInput": { "command": "cargo test" }
+                })))
+                .0,
             Vec::<EventKind>::new()
         );
     }
@@ -1077,13 +1182,16 @@ mod tests {
     /// supplied no content field at all.
     #[test]
     fn an_empty_terminal_tool_call_content_replacement_carries_empty_result_content() {
-        let events = reduce(vec![json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": "call_complete_empty",
-            "status": "completed",
-            "content": []
-        })]);
-        let [EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
+        let events = reduce(vec![
+            announced("call_complete_empty"),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_complete_empty",
+                "status": "completed",
+                "content": []
+            }),
+        ]);
+        let [_, EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
             panic!("expected one completion, received {events:?}");
         };
         assert_eq!(result.content, Some(ActivityContent::Empty));
@@ -1094,13 +1202,16 @@ mod tests {
     /// not just its detail.
     #[test]
     fn a_tool_call_update_that_completes_with_content_carries_it_on_the_result() {
-        let events = reduce(vec![json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": "call_10",
-            "status": "completed",
-            "content": [{ "type": "diff", "path": "/repo/src/lib.rs", "newText": "fn main() {}" }]
-        })]);
-        let [EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
+        let events = reduce(vec![
+            announced("call_10"),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_10",
+                "status": "completed",
+                "content": [{ "type": "diff", "path": "/repo/src/lib.rs", "newText": "fn main() {}" }]
+            }),
+        ]);
+        let [_, EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
             panic!("expected one completion, received {events:?}");
         };
         assert_eq!(result.status, ActivityStatus::Completed);
@@ -1111,6 +1222,131 @@ mod tests {
             );
         };
         assert_eq!(files[0].path, "/repo/src/lib.rs");
+    }
+
+    /// ACP lets an agent report a call through `tool_call_update` alone — a loaded session's
+    /// in-flight call, or an agent that skips the opening frame. A host applies an update only to a
+    /// call it saw start, so without a synthesised start the whole call would be invisible.
+    #[test]
+    fn a_tool_call_first_seen_through_an_update_opens_its_own_activity() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_late",
+                "title": "Read src/lib.rs",
+                "kind": "execute",
+                "status": "in_progress",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "reading" } }]
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_late",
+                "status": "completed"
+            }),
+        ]);
+        let [
+            EventKind::ActivityStarted { call_id, activity },
+            EventKind::ActivityCompleted {
+                call_id: completed,
+                result,
+            },
+        ] = events.as_slice()
+        else {
+            panic!(
+                "expected a start and a completion for the update-first call, received {events:?}"
+            );
+        };
+        assert_eq!(call_id, "call_late");
+        assert_eq!(completed, "call_late");
+        assert_eq!(activity.title, "Read src/lib.rs");
+        assert_eq!(activity.kind, ActivityKind::Command);
+        assert_eq!(activity.detail.as_deref(), Some("reading"));
+        assert_eq!(activity.item_id.as_deref(), Some("call_late"));
+        assert_eq!(result.status, ActivityStatus::Completed);
+    }
+
+    /// A terminal update for a call nobody saw start still needs both halves of the bracket, and
+    /// an update that names no title falls back to a generic one rather than an empty label.
+    #[test]
+    fn an_untitled_update_first_call_that_arrives_finished_is_started_and_completed() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_blind",
+            "status": "failed"
+        })]);
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { result, .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected a start and a completion, received {events:?}");
+        };
+        assert_eq!(activity.title, "tool");
+        assert_eq!(activity.kind, ActivityKind::Other);
+        assert_eq!(result.status, ActivityStatus::Failed);
+    }
+
+    /// A second `tool_call` for a call that is still open is a revision of it. Starting it again
+    /// would hand a host two rows for one call, which the core's conformance suite refuses.
+    #[test]
+    fn a_repeated_tool_call_for_an_open_call_updates_it_instead_of_starting_it_twice() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_twice",
+                "title": "Run",
+                "kind": "execute",
+                "status": "pending"
+            }),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_twice",
+                "title": "Run `cargo test`",
+                "kind": "execute",
+                "status": "in_progress"
+            }),
+        ]);
+        let starts = events
+            .iter()
+            .filter(|event| matches!(event, EventKind::ActivityStarted { .. }))
+            .count();
+        assert_eq!(
+            starts, 1,
+            "expected one start for one call, received {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EventKind::ActivityUpdated { update, .. }
+                    if update.title.as_deref() == Some("Run `cargo test`")
+            )),
+            "expected the repeated frame to arrive as an update, received {events:?}"
+        );
+    }
+
+    /// A frame for a call that already ended cannot reopen it: the host closed that row, and a
+    /// second bracket under the same id would render one call twice.
+    #[test]
+    fn a_late_update_for_a_finished_call_is_dropped() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_done",
+                "title": "Read",
+                "kind": "read",
+                "status": "completed"
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_done",
+                "title": "Read again"
+            }),
+        ]);
+        assert_eq!(
+            events.len(),
+            2,
+            "expected only the original bracket, received {events:?}"
+        );
     }
 
     /// ACP v1's plan is replaced wholesale and carries no id, so the first one opens an activity and

@@ -158,6 +158,15 @@ ACP calls them tool calls; they arrive as *activity* because nothing in this lib
 tool registry. The reasoning pair is synthesised: ACP streams thought chunks with no start or end
 marker, and a host relies on the pair to tell "still running" from "the agent withheld it".
 
+A tool call is bracketed by the agent's `toolCallId`. ACP allows a
+[`tool_call_update`](https://agentclientprotocol.com/protocol/v1/tool-calls#updating) for a call this
+client never saw announced — a loaded session's in-flight call is one — and a host applies updates
+only to a call it saw start, so the first frame for an unknown id emits `ActivityStarted` first,
+built from the update's own title and kind (title `tool` when it names none), and then its completion
+when the update is already terminal. A second `tool_call` for a call that is still open arrives as an
+update rather than a second start, and a frame for a call that already ended is dropped: the host
+closed that row.
+
 Two deliberate limits, each with a test pinning it:
 
 - A non-text block in an *agent message* — an image, audio, an embedded resource — produces no event.
