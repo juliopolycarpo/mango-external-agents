@@ -5084,23 +5084,137 @@ async fn refreshing_account_usage_reports_credits_resets_and_spend_control() {
     assert_eq!(spend.limit, None);
 }
 
+/// A fake app-server whose `account/rateLimits/read` answers with one fixed result.
+#[derive(Clone)]
+struct QuotaReadServer {
+    result: serde_json::Value,
+}
+
+impl QuotaReadServer {
+    fn answering(result: serde_json::Value) -> Self {
+        Self { result }
+    }
+
+    /// The answer to `frame`, when it is the quota read; everything else is left to the replay.
+    fn answer(&self, frame: &serde_json::Value) -> Option<Vec<String>> {
+        (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(|| {
+            vec![serde_json::json!({"id": frame["id"], "result": self.result}).to_string()]
+        })
+    }
+
+    async fn open(self) -> AnnouncedTurn {
+        AnnouncedTurn::open_answering(replay_limits(), move |frame| self.answer(frame)).await
+    }
+}
+
+/// The two quota fields are independently optional: a read with resets and no snapshot still
+/// reports the resets rather than nothing.
+#[tokio::test]
+async fn a_read_with_reset_credits_and_no_snapshot_still_reports_the_resets() {
+    let running = QuotaReadServer::answering(serde_json::json!({
+        "rateLimits": null,
+        "rateLimitResetCredits": {"availableCount": 4, "credits": null}}))
+    .open()
+    .await;
+    let limits = running
+        .session
+        .refresh_account_usage()
+        .await
+        .expect("expected a reading")
+        .limits
+        .expect("expected the resets as an otherwise unknown snapshot");
+    assert!(limits.windows.is_empty());
+    assert_eq!(
+        limits.reset_credits.map(|resets| resets.available_count),
+        Some(4)
+    );
+}
+
+/// A refresh returns quota to the host directly, so it is bounded the way a streamed reading is.
+#[tokio::test]
+async fn a_refreshed_reading_is_bounded_like_a_streamed_one() {
+    let rows: Vec<serde_json::Value> = (0..200)
+        .map(|index| serde_json::json!({"id": format!("r-{index}"), "status": "available"}))
+        .collect();
+    let running = QuotaReadServer::answering(serde_json::json!({
+        "rateLimits": {"primary": {"usedPercent": 10.0}},
+        "rateLimitResetCredits": {"availableCount": 200, "credits": rows}}))
+    .open()
+    .await;
+    let resets = running
+        .session
+        .refresh_account_usage()
+        .await
+        .expect("expected a reading")
+        .limits
+        .and_then(|limits| limits.reset_credits)
+        .expect("expected reset credits");
+    assert_eq!(resets.available_count, 200);
+    assert_eq!(
+        resets.credits.map(|rows| rows.len()),
+        Some(mango_external_agents::RESET_CREDIT_MAX_ITEMS),
+        "expected the detail rows capped like a streamed reading's"
+    );
+}
+
+/// Two overlapping refreshes: the one sent first answers last and is stale. It returns the
+/// fresher reading whole — that read's windows with that read's resets, never a mix.
+#[tokio::test]
+async fn a_stale_refresh_returns_the_adopted_reading_whole() {
+    let running = Arc::new(
+        AnnouncedTurn::open_answering(replay_limits(), |frame| {
+            (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read")))
+                .then(Vec::new)
+        })
+        .await,
+    );
+    let refresh = |running: &Arc<AnnouncedTurn>| {
+        let running = Arc::clone(running);
+        tokio::spawn(async move { running.session.refresh_account_usage().await })
+    };
+    let older = refresh(&running);
+    let older_id = nth_rate_limits_read(&running, 0).await;
+    let newer = refresh(&running);
+    let newer_id = nth_rate_limits_read(&running, 1).await;
+    let answer = |id: &serde_json::Value, percent: f64, resets: u64| {
+        serde_json::json!({"id": id, "result": {
+            "rateLimits": {"primary": {"usedPercent": percent}},
+            "rateLimitResetCredits": {"availableCount": resets, "credits": null}}})
+        .to_string()
+    };
+    running.announcer.announce(answer(&newer_id, 30.0, 7));
+    let newer = newer
+        .await
+        .expect("expected the newer refresh")
+        .expect("expected a reading");
+    running.announcer.announce(answer(&older_id, 10.0, 1));
+    let older = older
+        .await
+        .expect("expected the older refresh")
+        .expect("expected a reading");
+    for (name, usage) in [("newer", newer), ("older", older)] {
+        let limits = usage.limits.expect("expected limits");
+        assert_eq!(
+            (
+                limits.windows.first().map(|window| window.used_percent),
+                limits.reset_credits.map(|resets| resets.available_count),
+            ),
+            (Some(30.0), Some(7)),
+            "expected the {name} refresh to return the adopted reading whole"
+        );
+    }
+}
+
 /// Resets arrive only on a full read, and a sparse update that omits the credit balance keeps it:
 /// the reading the turn sees after an update still carries both.
 #[tokio::test]
 async fn a_sparse_update_keeps_the_resets_and_balance_the_full_read_reported() {
-    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
-        (frame.get("method") == Some(&serde_json::json!("account/rateLimits/read"))).then(|| {
-            vec![
-                serde_json::json!({"id": frame["id"], "result": {
-                    "rateLimits": {"primary": {"usedPercent": 10.0},
-                                   "credits": {"balance": "12.5", "hasCredits": true,
-                                               "unlimited": false},
-                                   "spendControlReached": false},
-                    "rateLimitResetCredits": {"availableCount": 2, "credits": null}}})
-                .to_string(),
-            ]
-        })
-    })
+    let mut running = QuotaReadServer::answering(serde_json::json!({
+        "rateLimits": {"primary": {"usedPercent": 10.0},
+                       "credits": {"balance": "12.5", "hasCredits": true, "unlimited": false},
+                       "spendControlReached": false},
+        "rateLimitResetCredits": {"availableCount": 2, "credits": null}}))
+    .open()
     .await;
     running
         .session

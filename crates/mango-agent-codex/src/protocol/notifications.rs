@@ -456,7 +456,7 @@ pub struct RateLimitSnapshot {
 }
 
 /// Pay-as-you-go credits, as the server reports them.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct CreditsSnapshot {
@@ -472,7 +472,7 @@ pub struct CreditsSnapshot {
 }
 
 /// A spend-control limit, as the server reports it.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SpendControlLimitSnapshot {
@@ -490,8 +490,53 @@ pub struct SpendControlLimitSnapshot {
     pub resets_at: Option<i64>,
 }
 
+impl std::fmt::Debug for CreditsSnapshot {
+    /// Reports credit shape without logging the balance.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreditsSnapshot")
+            .field("has_credits", &self.has_credits)
+            .field("unlimited", &self.unlimited)
+            .field("has_balance", &self.balance.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SpendControlLimitSnapshot {
+    /// Reports spend-control shape without logging vendor amounts.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpendControlLimitSnapshot")
+            .field("remaining_percent", &self.remaining_percent)
+            .field("resets_at", &self.resets_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RateLimitResetCreditsSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RateLimitResetCreditsSummary")
+            .field("available_count", &self.available_count)
+            .field("credit_count", &self.credits.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RateLimitResetCredit {
+    /// Reports the row's shape without logging vendor ids or text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RateLimitResetCredit")
+            .field("granted_at", &self.granted_at)
+            .field("expires_at", &self.expires_at)
+            .field("has_title", &self.title.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Earned rate-limit resets, as `account/rateLimits/read` reports them.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct RateLimitResetCreditsSummary {
@@ -504,7 +549,7 @@ pub struct RateLimitResetCreditsSummary {
 }
 
 /// One earned rate-limit reset.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct RateLimitResetCredit {
@@ -715,6 +760,42 @@ mod tests {
         assert_eq!(windows.primary.map(|window| window.used_percent), Some(4.0));
         assert_eq!(windows.secondary.and_then(|window| window.resets_at), None);
         assert_eq!(windows.plan_type.as_deref(), Some("plus"));
+    }
+
+    /// Credits, spend control and reset credits carry balances, amounts, vendor ids and text; a
+    /// stray `{:?}` on the wire types must print their shape only.
+    #[test]
+    fn quota_wire_types_debug_as_shape_without_vendor_values() {
+        let snapshot: super::RateLimitSnapshot = serde_json::from_value(json!({
+            "credits": {"balance": "balance-secret", "hasCredits": true, "unlimited": false},
+            "individualLimit": {"limit": "limit-secret", "used": "used-secret",
+                                "remainingPercent": 40.0, "resetsAt": 1},
+            "spendControlReached": false
+        }))
+        .expect("expected a snapshot");
+        let resets: super::RateLimitResetCreditsSummary = serde_json::from_value(json!({
+            "availableCount": 1,
+            "credits": [{"id": "id-secret", "resetType": "type-secret", "status": "status-secret",
+                         "grantedAt": 1, "expiresAt": null, "title": "title-secret",
+                         "description": "description-secret"}]
+        }))
+        .expect("expected a summary");
+        let rendered = format!("{snapshot:?} {resets:?}");
+        for secret in [
+            "balance-secret",
+            "limit-secret",
+            "used-secret",
+            "id-secret",
+            "type-secret",
+            "status-secret",
+            "title-secret",
+            "description-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "expected {secret} out of Debug, received {rendered}"
+            );
+        }
     }
 
     /// An error notification is a report, not a terminal: the server still sends `turn/completed`.
