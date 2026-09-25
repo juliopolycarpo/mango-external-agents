@@ -67,6 +67,9 @@ pub const CALL_FAILED: ErrorCode = ErrorCode::from_static("codex-call-failed");
 /// start still waits for its response.
 const RECENT_COMPLETED_TURNS: usize = 16;
 
+/// How many superseded native ids one turn remembers for steers that still name them.
+const EARLIER_NATIVE_TURN_IDS: usize = 16;
+
 /// One live conversation with a `codex app-server`.
 pub struct CodexSession {
     state: SessionState,
@@ -211,6 +214,8 @@ pub(crate) struct Shared {
     /// same connection. Both classifications share one lock so a normal confirmation cannot be
     /// recorded as an early resolution while its answer is being remembered.
     resolution_markers: Mutex<ResolutionMarkers>,
+    /// Serializes steers, so each one reads the native turn id the previous steer left behind.
+    steering: Mutex<()>,
     #[cfg(test)]
     resolution_marker_gate: Mutex<Option<Arc<ResolutionMarkerGate>>>,
     #[cfg(test)]
@@ -241,6 +246,7 @@ impl Shared {
             teardown_error: Mutex::new(None),
             teardown_done: Notify::new(),
             resolution_markers: Mutex::new(ResolutionMarkers::default()),
+            steering: Mutex::new(()),
             #[cfg(test)]
             resolution_marker_gate: Mutex::new(None),
             #[cfg(test)]
@@ -535,6 +541,11 @@ struct ActiveTurn {
     /// under the turn lock and announces; the other does nothing, which is what keeps the
     /// announcement to exactly once.
     announced: bool,
+    /// Native ids this attempt ran under before a steer continued it under `native_turn_id`.
+    ///
+    /// A host knows only the id the turn was announced with, so a steer naming any of these still
+    /// addresses this attempt. Bounded by [`EARLIER_NATIVE_TURN_IDS`].
+    earlier_native_turn_ids: VecDeque<String>,
     /// What this turn already announced, for the announcements that depend on it.
     reducer: crate::turn_reducer::TurnReducer,
     /// Native reviews have their own lifecycle and do not accept user steering.
@@ -894,6 +905,38 @@ impl Shared {
         // A stop worker waiting for this start can now name the turn it has to interrupt.
         self.turn_finished.notify_waiters();
         Ok(Some((sink, native_turn_id)))
+    }
+
+    /// Moves the attempt `owner` still runs from `previous` to the continuation id a steer named.
+    ///
+    /// The app-server answers `turn/steer` with "the accepted turnId"; when that differs from the
+    /// one the steer expected, Codex continues the turn under it, and later frames, steers and the
+    /// interrupt must use it. A turn that ended or moved on meanwhile is left alone.
+    async fn adopt_continuation(
+        &self,
+        owner: &Arc<()>,
+        previous: &str,
+        continued: &str,
+    ) -> Result<()> {
+        if continued.is_empty() || continued == previous {
+            return Ok(());
+        }
+        let continued =
+            mango_external_agents::normalize::opaque_id(continued, "continued native turn id")?;
+        let mut turn = self.turn.lock().await;
+        let Some(active) = turn.as_mut().filter(|active| {
+            !active.finishing
+                && Arc::ptr_eq(&active.owner, owner)
+                && active.native_turn_id == previous
+        }) else {
+            return Ok(());
+        };
+        let previous = std::mem::replace(&mut active.native_turn_id, continued);
+        if active.earlier_native_turn_ids.len() == EARLIER_NATIVE_TURN_IDS {
+            active.earlier_native_turn_ids.pop_front();
+        }
+        active.earlier_native_turn_ids.push_back(previous);
+        Ok(())
     }
 
     /// Reduces one announcement with the memory of the turn `route` still owns.
@@ -2980,6 +3023,7 @@ impl CodexSession {
                 attempt,
                 native_turn_id: String::new(),
                 announced: false,
+                earlier_native_turn_ids: VecDeque::new(),
                 reducer: crate::turn_reducer::TurnReducer::new(),
                 is_review: rpc_method == method::REVIEW_START,
                 start_unanswerable: false,
@@ -3455,17 +3499,27 @@ impl Session for CodexSession {
     }
 
     async fn steer(&self, steer: Steer) -> Result<SteerOutcome> {
+        // Held across the read, the request and the adoption: a second steer issued while the
+        // first is in flight must address the id the first one leaves behind.
+        let _steering = self.shared.steering.lock().await;
         let running = {
             let turn = self.shared.turn.lock().await;
-            turn.as_ref().map(|active| {
-                (
-                    active.turn_id.clone(),
-                    active.native_turn_id.clone(),
-                    active.is_review,
-                )
-            })
+            turn.as_ref()
+                .filter(|active| !active.finishing)
+                .map(|active| {
+                    (
+                        Arc::clone(&active.owner),
+                        active.turn_id.clone(),
+                        active.native_turn_id.clone(),
+                        active.native_turn_id == steer.native_turn_id
+                            || active
+                                .earlier_native_turn_ids
+                                .contains(&steer.native_turn_id),
+                        active.is_review,
+                    )
+                })
         };
-        let Some((turn_id, native_turn_id, is_review)) = running else {
+        let Some((owner, turn_id, native_turn_id, names_this_turn, is_review)) = running else {
             return Ok(SteerOutcome::Rejected {
                 reason: SteerRejection::TurnAlreadyCompleted,
             });
@@ -3475,7 +3529,7 @@ impl Session for CodexSession {
                 reason: SteerRejection::TurnNotSteerable,
             });
         }
-        if turn_id != steer.turn_id || native_turn_id != steer.native_turn_id {
+        if turn_id != steer.turn_id || native_turn_id.is_empty() || !names_this_turn {
             // The turn the host meant is not the one running. Steering the live one instead would
             // put the input on a turn nobody addressed.
             return Ok(SteerOutcome::Rejected {
@@ -3486,14 +3540,21 @@ impl Session for CodexSession {
         let params = TurnSteerParams {
             thread_id: self.shared.thread_id().to_owned(),
             input: vec![UserInput::text(steer.input)],
-            expected_turn_id: steer.native_turn_id,
+            // The id Codex is running now, which a continuation may have moved past the one the
+            // host named.
+            expected_turn_id: native_turn_id.clone(),
         };
         match self
             .client
             .request::<_, TurnSteerResponse>(method::TURN_STEER, params)
             .await
         {
-            Ok(_) => Ok(SteerOutcome::Accepted),
+            Ok(response) => {
+                self.shared
+                    .adopt_continuation(&owner, &native_turn_id, &response.turn_id)
+                    .await?;
+                Ok(SteerOutcome::Accepted)
+            }
             Err(Error::Vendor(error)) if is_no_active_turn(&error) => Ok(SteerOutcome::Rejected {
                 reason: SteerRejection::TurnAlreadyCompleted,
             }),
@@ -3981,6 +4042,7 @@ mod tests {
             native_turn_id: native_turn_id.to_owned(),
             // This helper installs a turn already past the point `begin` would have announced it.
             announced: true,
+            earlier_native_turn_ids: std::collections::VecDeque::new(),
             reducer: crate::turn_reducer::TurnReducer::new(),
             is_review: false,
             start_unanswerable: false,

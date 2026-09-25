@@ -115,6 +115,15 @@ anything reaches the vendor.
 running is refused here rather than landing on whatever turn happens to be live; the app-server's
 own refusal (`-32600 "no active turn to steer"`) maps to `SteerRejection::TurnAlreadyCompleted`.
 
+The app-server answers a steer with "the accepted `turnId`" ([app-server][app-server]). When that
+differs from the id the steer expected, Codex continues the turn under it, and the session adopts
+it: later frames are matched against it, the interrupt names it, and the next steer's
+`expectedTurnId` carries it. A host keeps steering with the native id it was given at
+`TurnStarted`; the session accepts that id, and the last few superseded ones, for the same attempt.
+Steers are serialized per session, so a second steer issued while the first is in flight reads the
+id the first one left behind. The JSON-RPC client keeps reading while an approval is pending, so a
+steer sent then is answered without waiting for the approval.
+
 `review/start` is sent without `delivery`, which the server reads as inline: a detached review runs
 on a thread this session is not subscribed to, and its events would arrive under an id the reducer
 drops. `ReviewStream::review_thread_id` reports whatever the server named.

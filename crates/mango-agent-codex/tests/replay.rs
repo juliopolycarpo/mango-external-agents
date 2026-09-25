@@ -2549,6 +2549,14 @@ impl AnnouncedTurn {
     /// Opens the recorded interrupt conversation and starts one turn the server names
     /// [`Self::NATIVE_TURN_ID`], leaving every later notification to [`Self::announce`].
     async fn open(limits: mango_external_agents::Limits) -> Self {
+        Self::open_answering(limits, |_| None).await
+    }
+
+    /// [`Self::open`], with `answer` consulted first for every frame the library writes.
+    async fn open_answering(
+        limits: mango_external_agents::Limits,
+        answer: impl Fn(&serde_json::Value) -> Option<Vec<String>> + Send + Sync + 'static,
+    ) -> Self {
         let transcript = Transcript::load("interrupt");
         let thread_id = transcript
             .thread_id()
@@ -2559,6 +2567,9 @@ impl AnnouncedTurn {
         launcher.push(
             transcript
                 .as_process_intercepting(move |frame| {
+                    if let Some(answered) = answer(frame) {
+                        return Some(answered);
+                    }
                     let method = frame.get("method").and_then(serde_json::Value::as_str);
                     let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
                     match method {
@@ -2617,6 +2628,25 @@ impl AnnouncedTurn {
             "turn/completed",
             serde_json::json!({"turn": {"id": Self::NATIVE_TURN_ID, "status": "completed"}}),
         );
+    }
+
+    /// Every `turn/steer` frame the library wrote, in order.
+    fn steers(&self) -> Vec<serde_json::Value> {
+        self.launcher
+            .written()
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|frame| frame.get("method") == Some(&serde_json::json!("turn/steer")))
+            .collect()
+    }
+
+    /// A steer addressed to the running turn under the native id the host was given.
+    fn steer(input: &str) -> Steer {
+        Steer {
+            turn_id: mango_external_agents::TurnId::new("turn-1"),
+            native_turn_id: String::from(Self::NATIVE_TURN_ID),
+            input: String::from(input),
+        }
     }
 
     fn interrupted(&self) -> bool {
@@ -2765,6 +2795,178 @@ async fn a_completed_answer_adds_only_what_its_deltas_did_not_deliver() {
         "all donestreamed",
         "expected each message's text exactly once, received {events:#?}"
     );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Answers `turn/steer` with a continuation id, or with the steer's own id when `continued` is
+/// `None`.
+fn steer_answer(frame: &serde_json::Value, continued: Option<&str>) -> Option<Vec<String>> {
+    if frame.get("method") != Some(&serde_json::json!("turn/steer")) {
+        return None;
+    }
+    let expected = frame
+        .pointer("/params/expectedTurnId")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let turn_id = continued.map_or(expected, |id| serde_json::json!(id));
+    Some(vec![
+        serde_json::json!({"id": frame["id"], "result": {"turnId": turn_id}}).to_string(),
+    ])
+}
+
+/// A steer names the turn it is for, and the app-server may continue that turn under a new id.
+/// Later frames, later steers and the completion all use the id the steer answered with.
+#[tokio::test]
+async fn a_steer_adopts_the_continuation_turn_id_the_server_answers_with() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        steer_answer(frame, Some("continued-turn"))
+    })
+    .await;
+
+    let outcome = running
+        .session
+        .steer(AnnouncedTurn::steer("also this"))
+        .await
+        .expect("expected a steer outcome");
+    assert_eq!(outcome, mango_external_agents::SteerOutcome::Accepted);
+    let first = running.steers();
+    assert_eq!(
+        first.first().map(|frame| &frame["params"]),
+        Some(&serde_json::json!({
+            "threadId": running.thread_id,
+            "input": [{"type": "text", "text": "also this", "text_elements": []}],
+            "expectedTurnId": AnnouncedTurn::NATIVE_TURN_ID,
+        })),
+        "expected the steer to name the running turn, received {first:?}"
+    );
+
+    // The host still knows only the id the turn started under; the session accepts it and
+    // addresses the turn Codex is running now.
+    let again = running
+        .session
+        .steer(AnnouncedTurn::steer("and this"))
+        .await
+        .expect("expected a second steer outcome");
+    assert_eq!(again, mango_external_agents::SteerOutcome::Accepted);
+    assert_eq!(
+        running
+            .steers()
+            .get(1)
+            .map(|frame| &frame["params"]["expectedTurnId"]),
+        Some(&serde_json::json!("continued-turn")),
+        "expected the second steer to address the continuation id"
+    );
+
+    running.announce(
+        "item/agentMessage/delta",
+        serde_json::json!({"turnId": "continued-turn", "itemId": "m", "delta": "steered"}),
+    );
+    running.announce(
+        "turn/completed",
+        serde_json::json!({"turn": {"id": "continued-turn", "status": "completed"}}),
+    );
+    let events = drain(&mut running.turn).await;
+    assert_eq!(answer_text(&events), "steered");
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the continuation's completion to end the turn, received {events:#?}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
+/// Two steers issued together must not both read the turn id before either answer arrives: the
+/// first can move the turn to a continuation id the second would then miss.
+#[tokio::test]
+async fn concurrent_steers_are_serialized_so_the_second_sees_the_firsts_continuation() {
+    let running = Arc::new(
+        AnnouncedTurn::open_answering(replay_limits(), |frame| {
+            // Steers are answered by the test, through the announcer, so it controls the order.
+            (frame.get("method") == Some(&serde_json::json!("turn/steer"))).then(Vec::new)
+        })
+        .await,
+    );
+
+    let first = tokio::spawn({
+        let running = Arc::clone(&running);
+        async move { running.session.steer(AnnouncedTurn::steer("one")).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while running.steers().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the first steer on the wire");
+    let second = tokio::spawn({
+        let running = Arc::clone(&running);
+        async move { running.session.steer(AnnouncedTurn::steer("two")).await }
+    });
+    // Give an unserialized second steer every chance to reach the wire first.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let first_id = running.steers()[0]["id"].clone();
+    running.announcer.announce(
+        serde_json::json!({"id": first_id, "result": {"turnId": "continued-turn"}}).to_string(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while running.steers().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected the second steer on the wire");
+    let steers = running.steers();
+    assert_eq!(
+        steers[1]["params"]["expectedTurnId"],
+        serde_json::json!("continued-turn"),
+        "expected the second steer to address the first steer's continuation, received {steers:?}"
+    );
+    running.announcer.announce(
+        serde_json::json!({"id": steers[1]["id"], "result": {"turnId": "continued-turn"}})
+            .to_string(),
+    );
+    for steer in [first, second] {
+        assert_eq!(
+            steer
+                .await
+                .expect("expected the steer task to finish")
+                .expect("expected a steer outcome"),
+            mango_external_agents::SteerOutcome::Accepted
+        );
+    }
+}
+
+/// The client keeps reading while the vendor waits on an approval, so a steer sent then still
+/// gets its own answer rather than waiting for the approval to resolve.
+#[tokio::test]
+async fn a_steer_during_a_pending_approval_is_answered_promptly() {
+    let mut running =
+        AnnouncedTurn::open_answering(replay_limits(), |frame| steer_answer(frame, None)).await;
+    running.announcer.announce(
+        serde_json::json!({"id": 90, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": running.thread_id, "turnId": AnnouncedTurn::NATIVE_TURN_ID,
+                       "itemId": "cmd-1", "command": "rm -rf build", "cwd": "/workspace"}})
+        .to_string(),
+    );
+    let _ = await_approval(&mut running.turn).await;
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        running
+            .session
+            .steer(AnnouncedTurn::steer("wait, keep build")),
+    )
+    .await
+    .expect("expected the steer to be answered while the approval is pending")
+    .expect("expected a steer outcome");
+    assert_eq!(outcome, mango_external_agents::SteerOutcome::Accepted);
     running
         .session
         .close(CloseReason::Shutdown)
