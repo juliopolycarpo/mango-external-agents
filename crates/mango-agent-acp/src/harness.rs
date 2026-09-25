@@ -517,6 +517,7 @@ impl Harness for AcpHarness {
         let (handshake, opened) = opened;
 
         session_state.set_native_session_id(opened.session_id.to_string());
+        connection_state.bind_native_session(opened.session_id.clone());
         let session_capabilities = mango_external_agents::SessionCapabilities::new(
             Self::capabilities_from(&handshake.capabilities),
         );

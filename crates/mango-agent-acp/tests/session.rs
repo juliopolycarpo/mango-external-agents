@@ -4646,3 +4646,93 @@ async fn a_vendor_side_stop_ends_the_turn_as_an_incomplete_error_naming_its_reas
         );
     }
 }
+
+/// One child serves one ACP session here, so a frame naming another `sessionId` is not this
+/// session's to act on. An update for it must not reach this turn's transcript, and a permission
+/// request for it is refused with ACP's `Cancelled` outcome rather than shown to this host, whose
+/// answer could otherwise grant work in a conversation it never opened.
+#[tokio::test]
+async fn frames_naming_another_session_are_ignored_or_refused() {
+    let announcer = mango_external_agents::testing::Announcer::new();
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .staying_silent()
+            .process()
+            .announcing(announcer.clone()),
+    );
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "go"))
+        .await
+        .expect("expected a turn");
+    announcer.announce(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_other",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "not yours" }
+                }
+            }
+        })
+        .to_string(),
+    );
+    announcer.announce(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7777,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess_other",
+                "toolCall": { "toolCallId": "call_x", "kind": "execute", "title": "Run `rm -rf /`" },
+                "options": [
+                    { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                    { "optionId": "reject", "name": "Reject", "kind": "reject_once" }
+                ]
+            }
+        })
+        .to_string(),
+    );
+    let refused = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let answered = launcher
+                .written()
+                .into_iter()
+                .find(|line| line.contains("\"id\":7777") && line.contains("\"outcome\""));
+            if let Some(line) = answered {
+                return line;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected the foreign permission request to be answered");
+    assert!(
+        refused.contains("\"cancelled\""),
+        "expected the foreign request refused as cancelled, received {refused}"
+    );
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to land");
+    let events = drain(&mut turn).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            EventKind::TextDelta { .. } | EventKind::ApprovalRequested { .. }
+        )),
+        "expected nothing from another session in this turn, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}

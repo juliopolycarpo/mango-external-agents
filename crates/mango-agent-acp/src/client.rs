@@ -337,6 +337,11 @@ pub(crate) struct SessionState {
     /// Bumped on every frame the agent sends and every change to the pending questions, so the
     /// idle deadline restarts on progress and re-reads whether a question is still open.
     activity: tokio::sync::watch::Sender<u64>,
+    /// The ACP session this connection serves, once `session/new` or `session/load` named it.
+    ///
+    /// Each session owns its own child, so a frame naming any other id is not this session's to
+    /// act on. Unset while the session opens: nothing is running a turn yet.
+    native_session_id: Mutex<Option<agent_client_protocol::schema::v1::SessionId>>,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -375,7 +380,34 @@ impl SessionState {
             pending: Mutex::new(HashMap::new()),
             next_approval: AtomicU64::new(0),
             activity: tokio::sync::watch::channel(0).0,
+            native_session_id: Mutex::new(None),
         }
+    }
+
+    /// Binds this connection to the ACP session the agent opened.
+    pub(crate) fn bind_native_session(&self, id: agent_client_protocol::schema::v1::SessionId) {
+        *self
+            .native_session_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(id);
+    }
+
+    /// Whether a frame naming `id` belongs to this session.
+    ///
+    /// True until the session is bound, and afterwards only for the id the agent opened.
+    ///
+    /// Accepting frames before the bind is deliberate. ACP sends session-scoped traffic ahead of
+    /// the open's own response: `session/load` replays the conversation as `session/update`
+    /// notifications before it answers, and Cursor announces its command catalog while
+    /// `session/new` is still in flight. Dropping them would lose that session state. Nothing
+    /// before the bind can reach a turn or a host: no turn exists yet, so an update produces only
+    /// session facts and a permission request is answered `Cancelled`.
+    fn serves(&self, id: &agent_client_protocol::schema::v1::SessionId) -> bool {
+        self.native_session_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|bound| bound == id)
     }
 
     /// Restarts idle accounting: the agent said something, or a question opened or closed.
@@ -967,6 +999,10 @@ impl SessionState {
 /// work before it releases this generation; freeing the slot here would let a second prompt onto a
 /// wire that has no way to tell two turns apart. The nonblocking sink makes later frames fail fast.
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
+    // Not this session's: neither transcript nor session state, and not progress either.
+    if !state.serves(&notification.session_id) {
+        return;
+    }
     // Capture the current owner before reducing session facts. Facts may arrive between turns;
     // their publication must not attach turn events to a newly admitted generation.
     let turn = state.turn();
@@ -1010,6 +1046,11 @@ async fn on_request_permission(
     responder: Responder<RequestPermissionResponse>,
     connection: ConnectionTo<Agent>,
 ) -> agent_client_protocol::Result<()> {
+    if !state.serves(&request.session_id) {
+        // Another session's question. Refused rather than shown: this host's answer would grant
+        // work in a conversation it never opened.
+        return responder.respond(permission::cancelled());
+    }
     let id = state.mint_approval_id();
     let Some(turn) = state.turn() else {
         // No turn: nobody is reading, and an unanswered request would hold the agent forever.

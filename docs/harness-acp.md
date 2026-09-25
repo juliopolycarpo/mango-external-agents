@@ -246,6 +246,11 @@ bounded by the core's `TextLimit::Detail`.
 
 ## Permissions
 
+Each session owns its own agent process, so a `session/update` or `session/request_permission`
+naming a `sessionId` other than the one `session/new` or `session/load` returned is not this
+session's: the update is dropped, and the request is answered with ACP's `Cancelled` outcome
+rather than shown to a host that never opened that conversation.
+
 A withdrawn question resolves on both sides. The agent hears ACP's own `Cancelled` outcome; a host
 that was shown the prompt hears `ApprovalResolved` with `DecisionSource::Cancelled` and an option id
 of `withdrawn`, which is not one of the request's own options — naming one would tell an audit trail
