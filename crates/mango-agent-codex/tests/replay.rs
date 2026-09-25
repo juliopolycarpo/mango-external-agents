@@ -937,6 +937,89 @@ async fn opening_with_explicit_effort_applies_it_on_the_thread_and_reports_accep
     );
 }
 
+/// The server may apply a model other than the one asked for, and no effort at all. What it
+/// echoes is the observed configuration; what was asked for stays the accepted one, and an effort
+/// the echo left null is not reported as observed.
+#[tokio::test]
+async fn the_thread_start_echo_is_what_is_observed_rather_than_the_request() {
+    let workspace = workspace_path().to_string_lossy().into_owned();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        Transcript::load("handshake").as_process_intercepting(move |frame| {
+            (frame["method"] == "thread/start").then(|| {
+                vec![
+                    serde_json::json!({"id": frame["id"], "result": {
+                        "thread": {"id": "echo-thread", "preview": "", "cwd": workspace},
+                        "model": "gpt-overridden", "reasoningEffort": null}})
+                    .to_string(),
+                ]
+            })
+        }),
+    );
+    let (host, _) = with_launcher(launcher, None);
+    let mut request = OpenSession::new("chat-1");
+    request.configuration = ConfigurationPatch::new()
+        .model(ConfigurationChange::Set(String::from("gpt-requested")))
+        .effort(ConfigurationChange::Set(String::from("high")));
+    let session = CodexHarness::new()
+        .open_session(&host, request)
+        .await
+        .expect("expected a session");
+
+    let snapshot = session.snapshot();
+    let configuration = &snapshot.configuration;
+    assert_eq!(
+        configuration.observed.model.as_deref(),
+        Some("gpt-overridden")
+    );
+    assert_eq!(
+        configuration.observed.effort, None,
+        "expected an effort the server did not apply to stay unobserved"
+    );
+    assert_eq!(
+        configuration.accepted.model.as_deref(),
+        Some("gpt-requested")
+    );
+    assert_eq!(configuration.accepted.effort.as_deref(), Some("high"));
+}
+
+/// The running build names itself in the handshake; one below the pinned floor is refused before
+/// any thread is opened, and its child is reaped.
+#[tokio::test]
+async fn opening_a_session_refuses_an_app_server_below_the_pinned_handshake_version() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(OldProbeHandshakeServer.process());
+    let (host, _) = with_launcher(Arc::clone(&launcher), None);
+
+    let result = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await;
+
+    assert!(
+        matches!(
+            &result,
+            Err(error) if matches!(
+                error.cause(),
+                mango_external_agents::Error::VersionGate { found, .. } if found == "0.147.0"
+            )
+        ),
+        "expected the handshake version gate, received {:?}",
+        result.as_ref().map(|_| "a session")
+    );
+    assert!(
+        !launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/start")),
+        "expected no thread to be opened after the version gate"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the app-server child reaped"
+    );
+}
+
 #[tokio::test]
 async fn malformed_explicit_effort_is_refused_before_opening_codex() {
     let (host, launcher) = host_replaying(&["handshake"]);

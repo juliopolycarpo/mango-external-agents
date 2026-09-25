@@ -918,6 +918,34 @@ mod tests {
         );
     }
 
+    /// A recognised family whose params did not decode is ignored, not rendered and not fatal —
+    /// unless it is the terminal, which has its own tests.
+    #[test]
+    fn a_malformed_non_terminal_notification_is_ignored() {
+        for (family, params) in [
+            (
+                method::ITEM_STARTED,
+                json!({"threadId": THREAD, "turnId": "u", "item": 7}),
+            ),
+            (
+                method::AGENT_MESSAGE_DELTA,
+                json!({"threadId": THREAD, "turnId": 3}),
+            ),
+            (method::THREAD_TOKEN_USAGE_UPDATED, json!("not an object")),
+        ] {
+            let parsed = notification(family, params);
+            assert!(
+                matches!(parsed, Notification::Malformed { .. }),
+                "expected {family} to parse as malformed, received {parsed:?}"
+            );
+            assert_eq!(
+                super::reduce_for_active_turn(&parsed, THREAD, Some("u"), now()),
+                Outcome::Ignore,
+                "expected malformed {family} to be ignored"
+            );
+        }
+    }
+
     /// Echoes of what the client itself sent are not work the agent did.
     #[test]
     fn an_echo_of_the_clients_own_input_is_not_an_activity() {
