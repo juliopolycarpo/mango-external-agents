@@ -38,11 +38,10 @@ pub fn to_account_limits(snapshot: &RateLimitSnapshot, observed_at: SystemTime) 
     .filter_map(|(label, window)| window.map(|window| to_window(label, window)))
     .collect();
 
-    AccountLimits {
-        windows,
-        plan_type: snapshot.plan_type.clone(),
-        observed_at,
-    }
+    let mut limits = AccountLimits::unknown(observed_at);
+    limits.windows = windows;
+    limits.plan_type = snapshot.plan_type.clone();
+    limits
 }
 
 /// A sparse `account/rateLimits/updated` snapshot, laid over the last full reading.

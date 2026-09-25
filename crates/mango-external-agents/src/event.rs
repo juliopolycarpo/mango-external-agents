@@ -1029,17 +1029,208 @@ impl fmt::Debug for RateLimitWindow {
     }
 }
 
+/// Pay-as-you-go credits the vendor reported for the account.
+///
+/// Every field optional: absence is unknown, never zero or false.
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct Credits {
+    /// Whether the account has any credits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_credits: Option<bool>,
+    /// Whether usage is unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlimited: Option<bool>,
+    /// The balance as the vendor wrote it, never parsed into a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
+}
+
+impl fmt::Debug for Credits {
+    /// Reports credit shape without logging the balance.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Credits")
+            .field("has_credits", &self.has_credits)
+            .field("unlimited", &self.unlimited)
+            .field("has_balance", &self.balance.is_some())
+            .finish()
+    }
+}
+
+/// A spend-control limit on the account.
+///
+/// Every field optional: absence is unavailable, not "recovered". A vendor that stops reporting
+/// the limit has not said the limit went away.
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SpendControl {
+    /// The limit, as the vendor wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// How much of it is used, as the vendor wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<String>,
+    /// How much remains, as a percentage the vendor computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_percent: Option<f64>,
+    /// When it resets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<SystemTime>,
+    /// Whether the vendor reports the limit reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached: Option<bool>,
+}
+
+impl fmt::Debug for SpendControl {
+    /// Reports spend-control shape without logging vendor amounts.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpendControl")
+            .field("has_limit", &self.limit.is_some())
+            .field("has_used", &self.used.is_some())
+            .field("remaining_percent", &self.remaining_percent)
+            .field("resets_at", &self.resets_at)
+            .field("reached", &self.reached)
+            .finish()
+    }
+}
+
+/// Earned rate-limit resets the account can redeem.
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ResetCredits {
+    /// How many are available. Authoritative: `credits` may be capped by the vendor.
+    pub available_count: u64,
+    /// The detail rows, when the vendor provided them.
+    ///
+    /// `None` means only the count is known; an empty list means details were fetched and none
+    /// were available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<Vec<ResetCredit>>,
+}
+
+impl fmt::Debug for ResetCredits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResetCredits")
+            .field("available_count", &self.available_count)
+            .field("credit_count", &self.credits.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+impl ResetCredits {
+    /// A count with no detail rows.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::ResetCredits;
+    ///
+    /// let resets = ResetCredits::new(2);
+    /// assert_eq!(resets.available_count, 2);
+    /// assert!(resets.credits.is_none());
+    /// ```
+    #[must_use]
+    pub fn new(available_count: u64) -> Self {
+        Self {
+            available_count,
+            credits: None,
+        }
+    }
+}
+
+/// One redeemable rate-limit reset.
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ResetCredit {
+    /// The vendor's opaque id for it.
+    pub id: String,
+    /// What it resets, in the vendor's spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_type: Option<String>,
+    /// Its state, in the vendor's spelling, such as `available`.
+    pub status: String,
+    /// When it was granted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<SystemTime>,
+    /// When it expires; `None` when it does not, or the vendor did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<SystemTime>,
+    /// A display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// A display description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl fmt::Debug for ResetCredit {
+    /// Reports the row's shape without logging vendor ids or text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResetCredit")
+            .field("has_reset_type", &self.reset_type.is_some())
+            .field("granted_at", &self.granted_at)
+            .field("expires_at", &self.expires_at)
+            .field("has_title", &self.title.is_some())
+            .field("has_description", &self.description.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResetCredit {
+    /// A row with its two required fields.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::ResetCredit;
+    ///
+    /// let credit = ResetCredit::new("credit-1", "available");
+    /// assert_eq!(credit.status, "available");
+    /// ```
+    #[must_use]
+    pub fn new(id: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: status.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// How many reset-credit detail rows a snapshot carries.
+pub const RESET_CREDIT_MAX_ITEMS: usize = 64;
+
 /// Account-level plan quota.
 ///
 /// A stale snapshot renders as unknown, never as zero, which is why `observed_at` travels with it.
+/// Non-exhaustive: a vendor quota surface that grows a fact gains a field here. Start from
+/// [`AccountLimits::unknown`] and set the fields a vendor reported.
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AccountLimits {
     /// Every metered window the vendor reported, in its own order.
     pub windows: Vec<RateLimitWindow>,
     /// The plan the vendor named, when it named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_type: Option<String>,
+    /// Pay-as-you-go credits, when the vendor reported them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<Credits>,
+    /// Earned rate-limit resets, when the vendor reported them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<ResetCredits>,
+    /// A spend-control limit, when the vendor reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_control: Option<SpendControl>,
     /// When this snapshot was read.
     pub observed_at: SystemTime,
 }
@@ -1051,6 +1242,9 @@ impl fmt::Debug for AccountLimits {
             .debug_struct("AccountLimits")
             .field("window_count", &self.windows.len())
             .field("has_plan_type", &self.plan_type.is_some())
+            .field("credits", &self.credits)
+            .field("reset_credits", &self.reset_credits)
+            .field("spend_control", &self.spend_control)
             .field("observed_at", &self.observed_at)
             .finish()
     }
@@ -1062,6 +1256,9 @@ impl AccountLimits {
         Self {
             windows: Vec::new(),
             plan_type: None,
+            credits: None,
+            reset_credits: None,
+            spend_control: None,
             observed_at,
         }
     }
@@ -1090,9 +1287,48 @@ impl AccountLimits {
             plan_type: self
                 .plan_type
                 .map(|plan| normalize::bound_text(&plan, TextLimit::AccountLabel).text),
+            credits: self.credits.map(|credits| Credits {
+                balance: credits.balance.map(label),
+                ..credits
+            }),
+            reset_credits: self.reset_credits.map(|resets| ResetCredits {
+                credits: resets.credits.map(|credits| {
+                    credits
+                        .into_iter()
+                        .take(RESET_CREDIT_MAX_ITEMS)
+                        .map(|credit| ResetCredit {
+                            id: normalize::bound_text(&credit.id, TextLimit::VendorId).text,
+                            reset_type: credit.reset_type.map(label),
+                            status: label(credit.status),
+                            title: credit
+                                .title
+                                .map(|title| normalize::bound_text(&title, TextLimit::Title).text),
+                            description: credit.description.map(|description| {
+                                normalize::bound_text(&description, TextLimit::Detail).text
+                            }),
+                            ..credit
+                        })
+                        .collect()
+                }),
+                ..resets
+            }),
+            spend_control: self.spend_control.map(|spend| SpendControl {
+                limit: spend.limit.map(label),
+                used: spend.used.map(label),
+                remaining_percent: spend
+                    .remaining_percent
+                    .filter(|percent| percent.is_finite())
+                    .map(|percent| percent.clamp(0.0, 100.0)),
+                ..spend
+            }),
             observed_at: self.observed_at,
         }
     }
+}
+
+/// A vendor label, bounded like every other account label.
+fn label(text: String) -> String {
+    normalize::bound_text(&text, TextLimit::AccountLabel).text
 }
 
 /// A percentage that can be written and rendered: finite, and inside the scale it names.
@@ -1178,7 +1414,7 @@ fn normalize_error(error: VendorError) -> VendorError {
 mod tests {
     use super::{
         AccountLimits, Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
-        Command, EventKind, RateLimitWindow,
+        Command, Credits, EventKind, RateLimitWindow, ResetCredit, ResetCredits, SpendControl,
     };
     use crate::content::{ActivityContent, FileChange, PlanStep, PlanStepStatus};
     use crate::error::{Error, ErrorCode, VendorError};
@@ -1274,11 +1510,24 @@ mod tests {
             label: Some(String::from("window-label-secret")),
             ..RateLimitWindow::default()
         };
-        let limits = AccountLimits {
-            windows: vec![window.clone()],
-            plan_type: Some(String::from("plan-type-secret")),
-            observed_at: std::time::SystemTime::UNIX_EPOCH,
-        };
+        let mut limits = AccountLimits::unknown(std::time::SystemTime::UNIX_EPOCH);
+        limits.windows = vec![window.clone()];
+        limits.plan_type = Some(String::from("plan-type-secret"));
+        limits.credits = Some(Credits {
+            balance: Some(String::from("balance-secret")),
+            ..Credits::default()
+        });
+        limits.spend_control = Some(SpendControl {
+            limit: Some(String::from("spend-limit-secret")),
+            used: Some(String::from("spend-used-secret")),
+            ..SpendControl::default()
+        });
+        let mut credit = ResetCredit::new("reset-id-secret", "reset-status-secret");
+        credit.title = Some(String::from("reset-title-secret"));
+        limits.reset_credits = Some(ResetCredits {
+            available_count: 1,
+            credits: Some(vec![credit]),
+        });
 
         for rendered in [
             format!("{command:?}"),
@@ -1303,6 +1552,12 @@ mod tests {
                 "result-output-secret",
                 "window-label-secret",
                 "plan-type-secret",
+                "balance-secret",
+                "spend-limit-secret",
+                "spend-used-secret",
+                "reset-id-secret",
+                "reset-status-secret",
+                "reset-title-secret",
             ] {
                 assert!(
                     !rendered.contains(secret),
@@ -1819,25 +2074,22 @@ mod tests {
         use super::{AccountLimits, RateLimitWindow};
         use std::time::SystemTime;
 
-        let limits = AccountLimits {
-            windows: vec![
-                RateLimitWindow {
-                    used_percent: f64::NAN,
-                    ..RateLimitWindow::default()
-                },
-                RateLimitWindow {
-                    used_percent: 412.5,
-                    ..RateLimitWindow::default()
-                },
-                RateLimitWindow {
-                    used_percent: -1.0,
-                    ..RateLimitWindow::default()
-                },
-            ],
-            plan_type: None,
-            observed_at: SystemTime::UNIX_EPOCH,
-        }
-        .normalized();
+        let mut limits = AccountLimits::unknown(SystemTime::UNIX_EPOCH);
+        limits.windows = vec![
+            RateLimitWindow {
+                used_percent: f64::NAN,
+                ..RateLimitWindow::default()
+            },
+            RateLimitWindow {
+                used_percent: 412.5,
+                ..RateLimitWindow::default()
+            },
+            RateLimitWindow {
+                used_percent: -1.0,
+                ..RateLimitWindow::default()
+            },
+        ];
+        let limits = limits.normalized();
 
         let percentages: Vec<f64> = limits
             .windows
@@ -1865,5 +2117,65 @@ mod tests {
             }
             other => panic!("expected an error, received {other:?}"),
         }
+    }
+
+    /// Credits, resets and spend control are bounded like every other vendor value, and a
+    /// percentage that could not be written reads as unknown rather than failing the event.
+    #[test]
+    fn credits_resets_and_spend_control_are_bounded_and_writable() {
+        use super::{
+            AccountLimits, Credits, RESET_CREDIT_MAX_ITEMS, ResetCredit, ResetCredits, SpendControl,
+        };
+        use std::time::SystemTime;
+
+        let mut limits = AccountLimits::unknown(SystemTime::UNIX_EPOCH);
+        limits.credits = Some(Credits {
+            balance: Some("9".repeat(10_000)),
+            ..Credits::default()
+        });
+        limits.spend_control = Some(SpendControl {
+            remaining_percent: Some(f64::NAN),
+            reached: Some(true),
+            ..SpendControl::default()
+        });
+        limits.reset_credits = Some(ResetCredits {
+            available_count: 500,
+            credits: Some(vec![ResetCredit::new("credit", "available"); 500]),
+        });
+        let limits = limits.normalized();
+
+        assert!(
+            limits
+                .credits
+                .as_ref()
+                .and_then(|credits| credits.balance.as_ref())
+                .is_some_and(|balance| balance.len() < 10_000),
+            "expected the balance bounded as a label"
+        );
+        let spend = limits
+            .spend_control
+            .as_ref()
+            .expect("expected spend control");
+        assert_eq!(spend.remaining_percent, None);
+        assert_eq!(spend.reached, Some(true));
+        let resets = limits
+            .reset_credits
+            .as_ref()
+            .expect("expected reset credits");
+        assert_eq!(
+            resets.available_count, 500,
+            "expected the count kept authoritative"
+        );
+        assert_eq!(
+            resets.credits.as_ref().map(Vec::len),
+            Some(RESET_CREDIT_MAX_ITEMS)
+        );
+        let written = serde_json::to_value(&limits).expect("expected a writable snapshot");
+        assert_eq!(written["resetCredits"]["availableCount"], 500);
+        assert_eq!(written["spendControl"]["reached"], true);
+        assert!(
+            written["credits"].get("hasCredits").is_none(),
+            "expected absence to stay absent"
+        );
     }
 }
