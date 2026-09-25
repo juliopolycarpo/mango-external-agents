@@ -67,6 +67,9 @@ pub struct FakeAcpAgent {
     load_session_error: Option<(i32, String)>,
     /// Streams a turn's updates and never answers its `session/prompt`.
     never_finishes: bool,
+    /// Holds each turn open after its updates and after any permission answer, ending it only
+    /// when the client sends `session/cancel`.
+    stays_silent: bool,
     /// Raises a permission request when the client sends `session/close`.
     asks_when_closing: bool,
     /// Once the first `session/request_permission` is answered, raises a second one reusing the
@@ -89,6 +92,11 @@ pub struct FakeAcpAgent {
     batch_updates: bool,
     stop_reason: String,
     version_output: String,
+    /// Replaces the `agentCapabilities` value `initialize` answers with; `Some(None)` omits it.
+    capabilities_override: Option<Option<serde_json::Value>>,
+    /// `session/update` payloads `session/load` sends, naming the requested session, before it
+    /// answers — whether it then loads or refuses.
+    load_replay: Vec<serde_json::Value>,
 }
 
 impl Default for FakeAcpAgent {
@@ -114,6 +122,7 @@ impl FakeAcpAgent {
             new_session_error: None,
             load_session_error: None,
             never_finishes: false,
+            stays_silent: false,
             asks_when_closing: false,
             reuse_request_id_for_second_ask: false,
             config_options: None,
@@ -148,6 +157,8 @@ impl FakeAcpAgent {
             ],
             stop_reason: String::from("end_turn"),
             version_output: String::from("fake-acp 1.2.3"),
+            capabilities_override: None,
+            load_replay: Vec::new(),
         }
     }
 
@@ -173,6 +184,24 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn never_finishing_turns(mut self) -> Self {
         self.never_finishes = true;
+        self
+    }
+
+    /// Streams a turn's updates, then goes silent: the prompt stays open, a permission answer ends
+    /// nothing, and only `session/cancel` ends the turn, as `stop_reason: cancelled`.
+    ///
+    /// An agent stuck in a tool call that reports nothing. It is what a host's idle deadline has to
+    /// be tested against, and it still honours cancellation so the deadline's own stop lands.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let _process = FakeAcpAgent::new().with_updates(Vec::new()).staying_silent().process();
+    /// ```
+    #[must_use]
+    pub fn staying_silent(mut self) -> Self {
+        self.stays_silent = true;
         self
     }
 
@@ -341,6 +370,47 @@ impl FakeAcpAgent {
         self
     }
 
+    /// Answers `initialize` with this `agentCapabilities` value, or with none at all for `None`.
+    ///
+    /// For an agent whose handshake is malformed or from a later protocol revision: the value is
+    /// written as given, so it need not be an object.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let _process = FakeAcpAgent::new().with_agent_capabilities(None).process();
+    /// ```
+    #[must_use]
+    pub fn with_agent_capabilities(mut self, capabilities: Option<serde_json::Value>) -> Self {
+        self.capabilities_override = Some(capabilities);
+        self
+    }
+
+    /// Sends these `session/update` payloads from `session/load`, naming the session it was asked
+    /// to load, before answering it.
+    ///
+    /// ACP's `session/load` replays the conversation this way before it responds. Combined with
+    /// [`refusing_load_session`](Self::refusing_load_session) it is an agent that talked about a
+    /// session it then failed to load.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let _process = FakeAcpAgent::new()
+    ///     .replaying_on_load(vec![serde_json::json!({
+    ///         "sessionUpdate": "agent_message_chunk",
+    ///         "content": { "type": "text", "text": "earlier" }
+    ///     })])
+    ///     .process();
+    /// ```
+    #[must_use]
+    pub fn replaying_on_load(mut self, updates: Vec<serde_json::Value>) -> Self {
+        self.load_replay = updates;
+        self
+    }
+
     /// Prints this for a version probe.
     #[must_use]
     pub fn printing_version(mut self, output: impl Into<String>) -> Self {
@@ -378,12 +448,28 @@ impl FakeAcpAgent {
         match (method, id) {
             (Some("initialize"), Some(id)) => vec![result(id, self.initialize_result())],
             (Some("session/new"), Some(id)) => vec![self.session_result(id, config_options)],
-            (Some("session/load"), Some(id)) => match (self.load_session, &self.load_session_error)
-            {
-                (true, Some((code, message))) => vec![error(id, *code, message)],
-                (true, None) => vec![self.load_session_result(id, config_options)],
-                (false, _) => vec![error(id, -32601, "method not found")],
-            },
+            (Some("session/load"), Some(id)) => {
+                let loading = message["params"]["sessionId"].clone();
+                let mut lines: Vec<String> = match self.load_session {
+                    true => self
+                        .load_replay
+                        .iter()
+                        .map(|update| {
+                            notification(
+                                "session/update",
+                                serde_json::json!({ "sessionId": loading, "update": update }),
+                            )
+                        })
+                        .collect(),
+                    false => Vec::new(),
+                };
+                lines.push(match (self.load_session, &self.load_session_error) {
+                    (true, Some((code, message))) => error(id, *code, message),
+                    (true, None) => self.load_session_result(id, config_options),
+                    (false, _) => error(id, -32601, "method not found"),
+                });
+                lines
+            }
             (Some("session/list"), Some(_id)) if self.holds_listing => Vec::new(),
             (Some("session/list"), Some(id)) => vec![result(id, self.list_result(&message))],
             (Some("session/set_mode"), Some(id)) => match &self.set_mode_error {
@@ -438,7 +524,7 @@ impl FakeAcpAgent {
         if self.supports_close {
             session_capabilities.insert(String::from("close"), serde_json::json!({}));
         }
-        serde_json::json!({
+        let mut response = serde_json::json!({
             "protocolVersion": self.protocol_version,
             "agentInfo": { "name": "fake-acp", "version": "1.2.3" },
             "agentCapabilities": {
@@ -448,7 +534,17 @@ impl FakeAcpAgent {
                 "sessionCapabilities": session_capabilities,
             },
             "authMethods": [],
-        })
+        });
+        match &self.capabilities_override {
+            None => {}
+            Some(None) => {
+                if let Some(object) = response.as_object_mut() {
+                    object.remove("agentCapabilities");
+                }
+            }
+            Some(Some(value)) => response["agentCapabilities"] = value.clone(),
+        }
+        response
     }
 
     fn list_result(&self, request: &serde_json::Value) -> serde_json::Value {
@@ -565,6 +661,14 @@ impl FakeAcpAgent {
             return lines;
         }
 
+        if self.approval == Approval::Never && self.stays_silent {
+            pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .hold(id);
+            return lines;
+        }
+
         if self.approval == Approval::Never {
             lines.push(result(
                 id,
@@ -660,6 +764,13 @@ impl FakeAcpAgent {
             }
         }
 
+        if self.stays_silent && !withdrawn {
+            pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .question_open = false;
+            return Vec::new();
+        }
         let turn = pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -723,6 +834,12 @@ impl PendingTurn {
         let id = self.next_request_id();
         self.last_request_id = Some(id);
         id
+    }
+
+    /// Holds a prompt open with no question outstanding, for a silent agent.
+    fn hold(&mut self, prompt_id: serde_json::Value) {
+        self.prompt_id = Some(prompt_id);
+        self.question_open = false;
     }
 
     /// Raises a second question in the same turn, on the same JSON-RPC id the first one used.

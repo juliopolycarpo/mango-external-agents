@@ -19,18 +19,21 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     SessionConfigOption, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolKind,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use mango_external_agents::event::{
     Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, EventKind,
     ThreadUsage, Usage,
 };
 use mango_external_agents::{
-    ActivityContent, ExtensionValue, Extensions, FileChange, PlanStep, PlanStepPriority,
-    PlanStepStatus,
+    ActivityContent, ErrorCode, ExtensionValue, Extensions, FileChange, PlanStep, PlanStepPriority,
+    PlanStepStatus, VendorError,
 };
 
 /// The call id every plan update shares.
@@ -40,6 +43,12 @@ use mango_external_agents::{
 /// so the plan gets one constant one and its revisions arrive as updates to it. Prefixed to stay
 /// clear of an agent's own tool call ids.
 pub const PLAN_CALL_ID: &str = "acp:plan";
+
+/// The title a tool call gets when its first frame named none.
+///
+/// Only reachable through a `tool_call_update` for a call this client never saw announced:
+/// `tool_call` itself requires a title. An empty label is what a host would otherwise render.
+pub const UNTITLED_TOOL_CALL: &str = "tool";
 
 /// A session-scoped fact one frame carried, alongside whatever it said about the turn.
 ///
@@ -59,13 +68,62 @@ pub enum SessionFact {
 
 /// Turns one agent's frames into events, remembering only what a frame alone cannot say.
 ///
-/// Two things: whether a reasoning block is open (ACP streams thought chunks with no start or end
+/// Three things: whether a reasoning block is open (ACP streams thought chunks with no start or end
 /// marker, and [`EventKind::ReasoningStarted`]/[`EventKind::ReasoningEnded`] are a pair a host
-/// relies on), and whether the plan activity has been announced yet.
-#[derive(Debug, Default)]
+/// relies on), whether the plan activity has been announced yet, and which tool calls the host has
+/// been told about. The last one is what lets a call first reported through `tool_call_update`
+/// still open a bracket, a frame for a call that already ended stay out of the transcript, and a
+/// running call's updates be coalesced (see [`TOOL_UPDATE_INTERVAL`]).
+#[derive(Debug)]
 pub struct Reducer {
     reasoning_open: bool,
     plan_started: bool,
+    /// Tool calls the host saw start and has not yet seen end, by the agent's own call id.
+    open_calls: HashMap<String, OpenCall>,
+    /// Tool calls that already ended this turn, so a late frame cannot open a second bracket.
+    finished_calls: HashSet<String>,
+    /// Source of [`OpenCall::opened`], so the calls a turn ends owing are closed in the order the
+    /// agent opened them rather than in a hash map's.
+    next_call: u64,
+    /// The shortest gap between two updates one running call sends a host.
+    update_interval: Duration,
+}
+
+/// How often one running tool call may send a host an update.
+///
+/// ACP [replaces a call's whole content collection](https://agentclientprotocol.com/protocol/v1/tool-calls#updating)
+/// on every `tool_call_update`, so an agent streaming a build log re-sends the complete log with
+/// each line. Forwarding every one spends a host's persisted payload on copies it overwrites at
+/// once. Within one interval the updates are merged, latest field wins, and held; the next update
+/// after the interval carries the merge, and anything still held is delivered ahead of the call's
+/// completion and ahead of the turn's end, so the host always ends with the agent's final word.
+///
+/// Five seconds, as the TypeScript adapter this harness replaces used: a liveness interval rather
+/// than a rendering one. Change it per reducer with [`Reducer::with_update_interval`].
+pub const TOOL_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+
+impl Default for Reducer {
+    fn default() -> Self {
+        Self {
+            reasoning_open: false,
+            plan_started: false,
+            open_calls: HashMap::new(),
+            finished_calls: HashSet::new(),
+            next_call: 0,
+            update_interval: TOOL_UPDATE_INTERVAL,
+        }
+    }
+}
+
+/// One tool call a host is rendering as running.
+#[derive(Debug)]
+struct OpenCall {
+    /// When it opened, relative to the turn's other calls.
+    opened: u64,
+    /// When the host last received an update for it, if it has.
+    last_update: Option<Instant>,
+    /// What arrived since then and has not been sent, merged latest-wins.
+    held: Option<ActivityUpdate>,
 }
 
 impl Reducer {
@@ -73,6 +131,26 @@ impl Reducer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This reducer, sending one running tool call's updates no more often than `interval`.
+    ///
+    /// `Duration::ZERO` forwards every update as it arrives.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use mango_agent_acp::reducer::Reducer;
+    ///
+    /// let reducer = Reducer::new().with_update_interval(Duration::from_millis(250));
+    /// # let _ = reducer;
+    /// ```
+    #[must_use]
+    pub fn with_update_interval(mut self, interval: Duration) -> Self {
+        self.update_interval = interval;
+        self
     }
 
     /// The events and session facts one `session/update` produces, in order.
@@ -96,6 +174,36 @@ impl Reducer {
     /// assert!(facts.is_empty());
     /// ```
     pub fn update(&mut self, update: SessionUpdate) -> (Vec<EventKind>, Vec<SessionFact>) {
+        self.update_at(update, Instant::now())
+    }
+
+    /// [`Self::update`], for a frame that arrived at `now`.
+    ///
+    /// The clock is the caller's, which keeps the reducer free of one: `now` is only compared with
+    /// the instants earlier frames were given, to coalesce a running call's updates (see
+    /// [`TOOL_UPDATE_INTERVAL`]).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Instant;
+    ///
+    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use mango_agent_acp::reducer::Reducer;
+    ///
+    /// let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+    ///     "sessionUpdate": "agent_message_chunk",
+    ///     "content": { "type": "text", "text": "hello" }
+    /// }))
+    /// .expect("a v1 agent message chunk");
+    /// let (events, _) = Reducer::new().update_at(update, Instant::now());
+    /// assert_eq!(events.len(), 1);
+    /// ```
+    pub fn update_at(
+        &mut self,
+        update: SessionUpdate,
+        now: Instant,
+    ) -> (Vec<EventKind>, Vec<SessionFact>) {
         // A transcript frame closes an open reasoning block: a host that never saw `ReasoningEnded`
         // would render a reasoning phase that stays open for the rest of the turn. A frame that
         // produces no transcript must *not*, or a usage report or a mode change arriving between two
@@ -104,24 +212,80 @@ impl Reducer {
             true => self.close_reasoning(),
             false => Vec::new(),
         };
-        let (body_events, facts) = self.body(update);
+        let (body_events, facts) = self.body(update, now);
         events.extend(body_events);
         (events, facts)
     }
 
-    /// The events that close out a turn, before its terminal.
+    /// The events that close out a turn that completed, before its terminal.
     ///
-    /// Two debts a turn can end owing. A turn that stopped mid-thought owes the other half of the
-    /// reasoning pair; and a turn that opened the plan activity owes its completion, because ACP never
-    /// sends one — the plan is session state that is replaced wholesale, so nothing on the wire marks
-    /// it done. Without this, every turn that wrote a plan leaves a host rendering an activity that
-    /// runs forever.
+    /// [`Self::finish_with`] with [`ActivityStatus::Completed`]: see there for what a turn can end
+    /// owing.
+    pub fn finish(&mut self) -> Vec<EventKind> {
+        self.finish_with(ActivityStatus::Completed)
+    }
+
+    /// The events that close out a turn, before its terminal, with the tool calls the agent left
+    /// running ending as `calls`.
+    ///
+    /// Three debts a turn can end owing. A turn that stopped mid-thought owes the other half of the
+    /// reasoning pair. A tool call the agent announced and never reported as ended owes its
+    /// completion: ACP ends a turn with the `session/prompt` response rather than a frame per call,
+    /// so without this the host renders that call as running forever. And a turn that opened the
+    /// plan activity owes its completion, because ACP never sends one — the plan is session state
+    /// that is replaced wholesale, so nothing on the wire marks it done.
+    ///
+    /// The open calls end as `calls`, in the order the agent opened them. The caller passes the
+    /// status that agrees with the turn's terminal: a call the agent never reported on did not
+    /// demonstrably succeed, so a turn that failed closes it as [`ActivityStatus::Failed`] and a
+    /// cancelled one as [`ActivityStatus::Cancelled`].
     ///
     /// The plan completes as [`ActivityStatus::Completed`] whatever its entries say. The activity is
     /// the *display* of the plan, and the turn ending is what ends it; reporting `Failed` because some
     /// entry was still pending would claim the agent failed at something it merely did not finish.
-    pub fn finish(&mut self) -> Vec<EventKind> {
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use mango_agent_acp::reducer::Reducer;
+    /// use mango_external_agents::event::{ActivityStatus, EventKind};
+    ///
+    /// let running: SessionUpdate = serde_json::from_value(serde_json::json!({
+    ///     "sessionUpdate": "tool_call",
+    ///     "toolCallId": "call_1",
+    ///     "title": "Run `cargo build`",
+    ///     "kind": "execute",
+    ///     "status": "in_progress"
+    /// }))
+    /// .expect("a v1 tool call");
+    ///
+    /// let mut reducer = Reducer::new();
+    /// let _ = reducer.update(running);
+    /// let closing = reducer.finish_with(ActivityStatus::Failed);
+    /// assert!(matches!(
+    ///     closing.as_slice(),
+    ///     [EventKind::ActivityCompleted { call_id, result }]
+    ///         if call_id == "call_1" && result.status == ActivityStatus::Failed
+    /// ));
+    /// ```
+    pub fn finish_with(&mut self, calls: ActivityStatus) -> Vec<EventKind> {
         let mut events = self.close_reasoning();
+        let mut open: Vec<(String, OpenCall)> = self.open_calls.drain().collect();
+        open.sort_by_key(|(_, call)| call.opened);
+        for (call_id, call) in open {
+            self.finished_calls.insert(call_id.clone());
+            if let Some(update) = call.held.filter(|update| !update.is_empty()) {
+                events.push(EventKind::ActivityUpdated {
+                    call_id: call_id.clone(),
+                    update,
+                });
+            }
+            events.push(EventKind::ActivityCompleted {
+                call_id,
+                result: ActivityResult::new(calls),
+            });
+        }
         if std::mem::take(&mut self.plan_started) {
             events.push(EventKind::ActivityCompleted {
                 call_id: String::from(PLAN_CALL_ID),
@@ -142,12 +306,14 @@ impl Reducer {
     ///
     /// Every arm added here needs a matching decision in [`transcript`]: whether the frame is part of
     /// the turn's transcript, and so whether it closes an open reasoning block.
-    fn body(&mut self, update: SessionUpdate) -> (Vec<EventKind>, Vec<SessionFact>) {
+    fn body(&mut self, update: SessionUpdate, now: Instant) -> (Vec<EventKind>, Vec<SessionFact>) {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => (text_delta(chunk), Vec::new()),
             SessionUpdate::AgentThoughtChunk(chunk) => (self.reasoning_delta(chunk), Vec::new()),
-            SessionUpdate::ToolCall(call) => (tool_call(call), Vec::new()),
-            SessionUpdate::ToolCallUpdate(update) => (tool_call_update(update), Vec::new()),
+            SessionUpdate::ToolCall(call) => (self.tool_call(call, now), Vec::new()),
+            SessionUpdate::ToolCallUpdate(update) => {
+                (self.tool_call_update(update, now), Vec::new())
+            }
             SessionUpdate::Plan(plan) => (self.plan(plan), Vec::new()),
             SessionUpdate::AvailableCommandsUpdate(catalog) => (
                 Vec::new(),
@@ -188,6 +354,132 @@ impl Reducer {
             | SessionUpdate::SessionInfoUpdate(_)
             | _ => (Vec::new(), Vec::new()),
         }
+    }
+
+    /// A `tool_call` frame: a new bracket, or a revision of one this turn already opened.
+    ///
+    /// ACP describes `tool_call` as the frame that announces a call, but nothing stops an agent from
+    /// sending it again for a call that is still running. A second [`EventKind::ActivityStarted`]
+    /// under the same id would give a host two rows for one call, so the repeat arrives as an update
+    /// carrying everything the new frame said, except an empty content or locations collection,
+    /// which leaves the host's copy alone. A call that already ended stays ended.
+    fn tool_call(&mut self, call: ToolCall, now: Instant) -> Vec<EventKind> {
+        let call_id = call.tool_call_id.to_string();
+        if self.finished_calls.contains(&call_id) {
+            return Vec::new();
+        }
+        if self.open_calls.contains_key(&call_id) {
+            // `tool_call` has no way to say "unchanged": an absent collection deserialises as an
+            // empty one. So only a non-empty collection replaces what the host holds; an empty one
+            // on a repeat is the agent saying nothing about it, not clearing it.
+            let mut fields = ToolCallUpdateFields::new()
+                .kind(call.kind)
+                .status(call.status)
+                .title(call.title);
+            if !call.content.is_empty() {
+                fields = fields.content(call.content);
+            }
+            if !call.locations.is_empty() {
+                fields = fields.locations(call.locations);
+            }
+            return self.tool_call_update(ToolCallUpdate::new(call.tool_call_id, fields), now);
+        }
+        let finished = finished(call.status).is_some();
+        let events = tool_call(call);
+        self.track(call_id, finished);
+        events
+    }
+
+    /// A `tool_call_update` frame, opening the bracket first when this is the call's first frame.
+    ///
+    /// ACP permits a `tool_call_update` for a call this client never saw announced — a loaded
+    /// session's in-flight call is one — and a host applies updates only to a call it saw start. So
+    /// a first sighting through this channel is announced from whatever the update carries, with a
+    /// generic title when it names none, and completed in the same breath when it is already over.
+    ///
+    /// For a call already running, a non-terminal update is coalesced (see
+    /// [`TOOL_UPDATE_INTERVAL`]), and a terminal one first delivers whatever is still held.
+    fn tool_call_update(&mut self, update: ToolCallUpdate, now: Instant) -> Vec<EventKind> {
+        let call_id = update.tool_call_id.to_string();
+        if self.finished_calls.contains(&call_id) {
+            return Vec::new();
+        }
+        if !self.open_calls.contains_key(&call_id) {
+            let fields = update.fields;
+            let title = fields
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| String::from(UNTITLED_TOOL_CALL));
+            let mut call = ToolCall::new(update.tool_call_id, title)
+                .kind(fields.kind.unwrap_or_default())
+                .status(fields.status.unwrap_or_default());
+            if let Some(content) = fields.content {
+                call = call.content(content);
+            }
+            if let Some(locations) = fields.locations {
+                call = call.locations(locations);
+            }
+            return self.tool_call(call, now);
+        }
+        let interval = self.update_interval;
+        let Some(open) = self.open_calls.get_mut(&call_id) else {
+            return Vec::new();
+        };
+        match tool_call_update(update).pop() {
+            Some(EventKind::ActivityUpdated { call_id, update }) => {
+                let merged = match open.held.take() {
+                    Some(held) => merged_update(held, update),
+                    None => update,
+                };
+                let recent = open
+                    .last_update
+                    .is_some_and(|last| now.saturating_duration_since(last) < interval);
+                if recent {
+                    open.held = Some(merged);
+                    return Vec::new();
+                }
+                open.last_update = Some(now);
+                vec![EventKind::ActivityUpdated {
+                    call_id,
+                    update: merged,
+                }]
+            }
+            Some(EventKind::ActivityCompleted { call_id, result }) => {
+                let mut events = Vec::with_capacity(2);
+                if let Some(held) = open.held.take() {
+                    let held = superseded_by(held, &result);
+                    if !held.is_empty() {
+                        events.push(EventKind::ActivityUpdated {
+                            call_id: call_id.clone(),
+                            update: held,
+                        });
+                    }
+                }
+                self.open_calls.remove(&call_id);
+                self.finished_calls.insert(call_id.clone());
+                events.push(EventKind::ActivityCompleted { call_id, result });
+                events
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Records a call the host has just been told about, as running or as already over.
+    fn track(&mut self, call_id: String, finished: bool) {
+        if finished {
+            self.finished_calls.insert(call_id);
+            return;
+        }
+        let opened = self.next_call;
+        self.next_call = self.next_call.wrapping_add(1);
+        self.open_calls.insert(
+            call_id,
+            OpenCall {
+                opened,
+                last_update: None,
+                held: None,
+            },
+        );
     }
 
     fn reasoning_delta(&mut self, chunk: ContentChunk) -> Vec<EventKind> {
@@ -347,6 +639,39 @@ fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
         return Vec::new();
     }
     vec![EventKind::ActivityUpdated { call_id, update }]
+}
+
+/// Two updates to one call as one, the later one's fields winning.
+///
+/// Every [`ActivityUpdate`] field is a replacement, so a field the later update carries makes the
+/// earlier value unobservable, and a field it leaves out keeps the earlier one.
+fn merged_update(earlier: ActivityUpdate, later: ActivityUpdate) -> ActivityUpdate {
+    let mut merged = earlier;
+    if later.title.is_some() {
+        merged.title = later.title;
+    }
+    if later.detail.is_some() {
+        merged.detail = later.detail;
+    }
+    if later.content.is_some() {
+        merged.content = later.content;
+    }
+    merged.truncated |= later.truncated;
+    merged
+}
+
+/// What of a held update a call's completion does not already replace.
+///
+/// A completion that carries content or detail replaces those, so the held copies would only be
+/// overwritten; a title has no slot on [`ActivityResult`] and survives.
+fn superseded_by(mut held: ActivityUpdate, result: &ActivityResult) -> ActivityUpdate {
+    if result.content.is_some() {
+        held.content = None;
+    }
+    if result.detail.is_some() {
+        held.detail = None;
+    }
+    held
 }
 
 /// The outcome of a terminal tool-call status, or nothing while it is still running.
@@ -558,24 +883,72 @@ fn plan_step_priority(priority: &PlanEntryPriority) -> Option<PlanStepPriority> 
 /// Whether a stop reason means somebody stopped the turn rather than the agent finishing it.
 ///
 /// The other four — `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` — are the agent ending
-/// its own turn, so they complete it. A refusal in particular is not a failure of the link, and
-/// reporting one as [`EventKind::Error`] would tell a host to retry something the agent decided.
+/// its own turn. Only `end_turn` completes it; the other three end it short, which
+/// [`stop_failure`] reports.
 #[must_use]
 pub fn was_cancelled(stop_reason: StopReason) -> bool {
     matches!(stop_reason, StopReason::Cancelled)
 }
 
+/// The code a turn ends with when the agent stopped it short of finishing.
+pub const TURN_INCOMPLETE_CODE: &str = "vendor-turn-incomplete";
+
+/// The failure a turn ends with when the agent stopped it short, or nothing when it did not.
+///
+/// ACP's `max_tokens`, `max_turn_requests` and `refusal` are the agent ending its own turn without
+/// finishing it: the answer is truncated, or absent. Completing the turn would render that as a
+/// success, so it ends as [`TURN_INCOMPLETE_CODE`] with the wire's own spelling of the stop reason as
+/// the vendor code. It is not retryable: an identical prompt meets the same limit or the same
+/// refusal. `end_turn` and `cancelled` produce nothing here — the first completes the turn and the
+/// second is a cancellation (see [`was_cancelled`]).
+///
+/// # Example
+///
+/// ```
+/// use agent_client_protocol::schema::v1::StopReason;
+/// use mango_agent_acp::reducer::stop_failure;
+///
+/// let failure = stop_failure(StopReason::MaxTokens).expect("a truncated turn is a failure");
+/// assert_eq!(failure.code.as_str(), "vendor-turn-incomplete");
+/// assert_eq!(failure.vendor_code.as_deref(), Some("max_tokens"));
+/// assert!(stop_failure(StopReason::EndTurn).is_none());
+/// ```
+#[must_use]
+pub fn stop_failure(stop_reason: StopReason) -> Option<VendorError> {
+    let message = match stop_reason {
+        StopReason::EndTurn | StopReason::Cancelled => return None,
+        StopReason::MaxTokens => "the agent stopped the turn at its token limit",
+        StopReason::MaxTurnRequests => "the agent stopped the turn at its request limit",
+        StopReason::Refusal => "the agent refused to continue the turn",
+        // `#[non_exhaustive]`: a stop reason this build does not know is still not `end_turn`, and
+        // reading it as one would render an unfinished turn as a finished one.
+        _ => "the agent ended the turn before finishing it",
+    };
+    let wire = serde_json::to_value(stop_reason)
+        .ok()
+        .and_then(|value| value.as_str().map(String::from))
+        .unwrap_or_else(|| String::from("unknown"));
+    Some(
+        VendorError::new(ErrorCode::from_static(TURN_INCOMPLETE_CODE), message)
+            .with_vendor_code(wire, false),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PLAN_CALL_ID, Reducer, SessionFact, activity_kind, was_cancelled};
+    use super::{
+        PLAN_CALL_ID, Reducer, SessionFact, TURN_INCOMPLETE_CODE, activity_kind, stop_failure,
+        was_cancelled,
+    };
     use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolKind};
     use mango_external_agents::event::{
-        ActivityKind, ActivityStatus, Command, EventKind, ThreadUsage, Usage,
+        ActivityKind, ActivityStatus, ActivityUpdate, Command, EventKind, ThreadUsage, Usage,
     };
     use mango_external_agents::{
         ActivityContent, ExtensionValue, FileChangeKind, PlanStepPriority, PlanStepStatus,
     };
     use serde_json::json;
+    use std::time::{Duration, Instant};
 
     /// Every case parses the wire rather than building a Rust value, so a rename or a reshape in the
     /// schema crate fails here instead of compiling into a mapping that no longer matches the JSON.
@@ -585,6 +958,18 @@ mod tests {
 
     fn reduce(values: Vec<serde_json::Value>) -> Vec<EventKind> {
         reduce_with_facts(values).0
+    }
+
+    /// The `tool_call` frame that announces `call_id`, so a test about updates reads updates to a
+    /// call the host already saw start.
+    fn announced(call_id: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": call_id,
+            "title": "Tool",
+            "kind": "other",
+            "status": "in_progress"
+        })
     }
 
     fn reduce_with_facts(values: Vec<serde_json::Value>) -> (Vec<EventKind>, Vec<SessionFact>) {
@@ -730,7 +1115,11 @@ mod tests {
             "kind": "execute",
             "status": "in_progress"
         })]);
-        let [EventKind::ActivityStarted { call_id, activity }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { call_id, activity },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one started activity, received {events:?}");
         };
         assert_eq!(call_id, "call_1");
@@ -766,6 +1155,7 @@ mod tests {
     #[test]
     fn a_tool_call_update_completes_on_a_terminal_status_and_updates_otherwise() {
         let events = reduce(vec![
+            announced("call_3"),
             json!({
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "call_3",
@@ -779,10 +1169,10 @@ mod tests {
             }),
         ]);
         assert!(
-            matches!(&events[0], EventKind::ActivityUpdated { call_id, .. } if call_id == "call_3"),
+            matches!(&events[1], EventKind::ActivityUpdated { call_id, .. } if call_id == "call_3"),
             "received {events:?}"
         );
-        let EventKind::ActivityCompleted { result, .. } = &events[1] else {
+        let EventKind::ActivityCompleted { result, .. } = &events[2] else {
             panic!("expected a completion, received {events:?}");
         };
         assert_eq!(result.status, ActivityStatus::Failed);
@@ -797,13 +1187,17 @@ mod tests {
     /// update, because nothing here ever carries a raw vendor frame.
     #[test]
     fn a_status_only_move_to_in_progress_produces_nothing() {
+        let mut reducer = Reducer::new();
+        let _ = reducer.update(update(announced("call_4")));
         assert_eq!(
-            reduce(vec![json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "call_4",
-                "status": "in_progress",
-                "rawInput": { "command": "cargo test" }
-            })]),
+            reducer
+                .update(update(json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_4",
+                    "status": "in_progress",
+                    "rawInput": { "command": "cargo test" }
+                })))
+                .0,
             Vec::<EventKind>::new()
         );
     }
@@ -826,7 +1220,11 @@ mod tests {
                 "newText": "fn main() { println!(\"hi\"); }"
             }]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(activity.detail.as_deref(), Some("/repo/src/lib.rs"));
@@ -859,7 +1257,11 @@ mod tests {
             "status": "pending",
             "content": [{ "type": "diff", "path": "/repo/src/new.rs", "newText": "fn new() {}" }]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         let Some(ActivityContent::Diff { files }) = &activity.content else {
@@ -885,7 +1287,11 @@ mod tests {
                 { "type": "content", "content": { "type": "text", "text": "rewrote the entry point" } }
             ]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(
@@ -915,7 +1321,11 @@ mod tests {
             "status": "pending",
             "content": [{ "type": "content", "content": { "type": "text", "text": "2 tests passed" } }]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(activity.detail.as_deref(), Some("2 tests passed"));
@@ -940,7 +1350,11 @@ mod tests {
             "status": "pending",
             "locations": [{ "path": "/repo/src/a.rs" }, { "path": "/repo/src/b.rs" }]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(
@@ -961,7 +1375,11 @@ mod tests {
             "kind": "search",
             "status": "pending"
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert!(
@@ -1030,7 +1448,7 @@ mod tests {
                 "content": []
             }),
         ]);
-        let Some(EventKind::ActivityUpdated { update, .. }) = events.last() else {
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.get(1) else {
             panic!("expected an activity update that clears content, received {events:?}");
         };
         assert!(
@@ -1064,7 +1482,7 @@ mod tests {
                 "title": "Editing src/lib.rs"
             }),
         ]);
-        let Some(EventKind::ActivityUpdated { update, .. }) = events.last() else {
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.get(1) else {
             panic!("expected a title update that retains content, received {events:?}");
         };
         assert_eq!(update.title.as_deref(), Some("Editing src/lib.rs"));
@@ -1077,13 +1495,16 @@ mod tests {
     /// supplied no content field at all.
     #[test]
     fn an_empty_terminal_tool_call_content_replacement_carries_empty_result_content() {
-        let events = reduce(vec![json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": "call_complete_empty",
-            "status": "completed",
-            "content": []
-        })]);
-        let [EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
+        let events = reduce(vec![
+            announced("call_complete_empty"),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_complete_empty",
+                "status": "completed",
+                "content": []
+            }),
+        ]);
+        let [_, EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
             panic!("expected one completion, received {events:?}");
         };
         assert_eq!(result.content, Some(ActivityContent::Empty));
@@ -1094,13 +1515,16 @@ mod tests {
     /// not just its detail.
     #[test]
     fn a_tool_call_update_that_completes_with_content_carries_it_on_the_result() {
-        let events = reduce(vec![json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": "call_10",
-            "status": "completed",
-            "content": [{ "type": "diff", "path": "/repo/src/lib.rs", "newText": "fn main() {}" }]
-        })]);
-        let [EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
+        let events = reduce(vec![
+            announced("call_10"),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_10",
+                "status": "completed",
+                "content": [{ "type": "diff", "path": "/repo/src/lib.rs", "newText": "fn main() {}" }]
+            }),
+        ]);
+        let [_, EventKind::ActivityCompleted { result, .. }] = events.as_slice() else {
             panic!("expected one completion, received {events:?}");
         };
         assert_eq!(result.status, ActivityStatus::Completed);
@@ -1111,6 +1535,391 @@ mod tests {
             );
         };
         assert_eq!(files[0].path, "/repo/src/lib.rs");
+    }
+
+    /// ACP lets an agent report a call through `tool_call_update` alone — a loaded session's
+    /// in-flight call, or an agent that skips the opening frame. A host applies an update only to a
+    /// call it saw start, so without a synthesised start the whole call would be invisible.
+    #[test]
+    fn a_tool_call_first_seen_through_an_update_opens_its_own_activity() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_late",
+                "title": "Read src/lib.rs",
+                "kind": "execute",
+                "status": "in_progress",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "reading" } }]
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_late",
+                "status": "completed"
+            }),
+        ]);
+        let [
+            EventKind::ActivityStarted { call_id, activity },
+            EventKind::ActivityCompleted {
+                call_id: completed,
+                result,
+            },
+        ] = events.as_slice()
+        else {
+            panic!(
+                "expected a start and a completion for the update-first call, received {events:?}"
+            );
+        };
+        assert_eq!(call_id, "call_late");
+        assert_eq!(completed, "call_late");
+        assert_eq!(activity.title, "Read src/lib.rs");
+        assert_eq!(activity.kind, ActivityKind::Command);
+        assert_eq!(activity.detail.as_deref(), Some("reading"));
+        assert_eq!(activity.item_id.as_deref(), Some("call_late"));
+        assert_eq!(result.status, ActivityStatus::Completed);
+    }
+
+    /// A terminal update for a call nobody saw start still needs both halves of the bracket, and
+    /// an update that names no title falls back to a generic one rather than an empty label.
+    #[test]
+    fn an_untitled_update_first_call_that_arrives_finished_is_started_and_completed() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_blind",
+            "status": "failed"
+        })]);
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { result, .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected a start and a completion, received {events:?}");
+        };
+        assert_eq!(activity.title, "tool");
+        assert_eq!(activity.kind, ActivityKind::Other);
+        assert_eq!(result.status, ActivityStatus::Failed);
+    }
+
+    /// A second `tool_call` for a call that is still open is a revision of it. Starting it again
+    /// would hand a host two rows for one call, which the core's conformance suite refuses.
+    #[test]
+    fn a_repeated_tool_call_for_an_open_call_updates_it_instead_of_starting_it_twice() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_twice",
+                "title": "Run",
+                "kind": "execute",
+                "status": "pending"
+            }),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_twice",
+                "title": "Run `cargo test`",
+                "kind": "execute",
+                "status": "in_progress"
+            }),
+        ]);
+        let starts = events
+            .iter()
+            .filter(|event| matches!(event, EventKind::ActivityStarted { .. }))
+            .count();
+        assert_eq!(
+            starts, 1,
+            "expected one start for one call, received {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EventKind::ActivityUpdated { update, .. }
+                    if update.title.as_deref() == Some("Run `cargo test`")
+            )),
+            "expected the repeated frame to arrive as an update, received {events:?}"
+        );
+    }
+
+    /// A frame for a call that already ended cannot reopen it: the host closed that row, and a
+    /// second bracket under the same id would render one call twice.
+    #[test]
+    fn a_late_update_for_a_finished_call_is_dropped() {
+        let events = reduce(vec![
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_done",
+                "title": "Read",
+                "kind": "read",
+                "status": "completed"
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_done",
+                "title": "Read again"
+            }),
+        ]);
+        assert_eq!(
+            events.len(),
+            2,
+            "expected only the original bracket, received {events:?}"
+        );
+    }
+
+    /// ACP ends a turn with the `session/prompt` response, not with a frame per call, so a call the
+    /// agent never reported as ended would otherwise stay running in the host's transcript for
+    /// good. The turn's end closes it, in the order the agent opened its calls.
+    #[test]
+    fn a_call_the_agent_never_ended_is_completed_when_the_turn_completes() {
+        let events = reduce(vec![
+            announced("call_first"),
+            announced("call_second"),
+            announced("call_ended"),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_ended",
+                "status": "completed"
+            }),
+        ]);
+        let closed: Vec<(&str, ActivityStatus)> = events
+            .iter()
+            .skip(4)
+            .filter_map(|event| match event {
+                EventKind::ActivityCompleted { call_id, result } => {
+                    Some((call_id.as_str(), result.status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            vec![
+                ("call_first", ActivityStatus::Completed),
+                ("call_second", ActivityStatus::Completed),
+            ],
+            "expected the two unended calls closed at the turn's end, received {events:?}"
+        );
+    }
+
+    /// A turn that did not complete does not get to claim its unended calls succeeded: they close
+    /// with the status the caller passes, while the plan still completes because the turn ending is
+    /// what ends its display.
+    #[test]
+    fn unended_calls_take_the_turns_status_and_the_plan_still_completes() {
+        for status in [ActivityStatus::Failed, ActivityStatus::Cancelled] {
+            let mut reducer = Reducer::new();
+            let _ = reducer.update(update(announced("call_open")));
+            let _ = reducer.update(update(json!({
+                "sessionUpdate": "plan",
+                "entries": [{ "content": "build", "priority": "high", "status": "pending" }]
+            })));
+            let closing = reducer.finish_with(status);
+            let statuses: Vec<(&str, ActivityStatus)> = closing
+                .iter()
+                .filter_map(|event| match event {
+                    EventKind::ActivityCompleted { call_id, result } => {
+                        Some((call_id.as_str(), result.status))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                statuses,
+                vec![
+                    ("call_open", status),
+                    (PLAN_CALL_ID, ActivityStatus::Completed)
+                ],
+                "expected the call to take {status:?} and the plan to complete, received {closing:?}"
+            );
+            assert!(
+                reducer.finish_with(status).is_empty(),
+                "expected a second finish to owe nothing"
+            );
+        }
+    }
+
+    /// ACP replaces a call's whole content on every `tool_call_update`, so an agent streaming a
+    /// build log sends the full log again with each line. Forwarding each one spends the turn's
+    /// payload budget on copies a host overwrites at once; a burst inside one window reaches the
+    /// host as one update, and the latest content still arrives before the completion.
+    #[test]
+    fn a_burst_of_tool_output_updates_reaches_the_host_coalesced() {
+        let mut frames = vec![announced("call_log")];
+        frames.extend((0..1_000).map(|line| {
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_log",
+                "content": [{ "type": "content", "content": { "type": "text", "text": format!("line {line}") } }]
+            })
+        }));
+        frames.push(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_log",
+            "status": "completed"
+        }));
+        let events = reduce(frames);
+        let updates: Vec<&ActivityUpdate> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityUpdated { update, .. } => Some(update),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            updates.len() <= 2,
+            "expected the burst coalesced to at most 2 updates, received {}",
+            updates.len()
+        );
+        assert_eq!(
+            updates.last().and_then(|update| update.content.clone()),
+            Some(ActivityContent::Output {
+                text: String::from("line 999")
+            }),
+            "expected the latest output delivered before the completion"
+        );
+        assert!(
+            matches!(events.last(), Some(EventKind::ActivityCompleted { .. })),
+            "received {events:?}"
+        );
+    }
+
+    fn output(call_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call_id,
+            "content": [{ "type": "content", "content": { "type": "text", "text": text } }]
+        })
+    }
+
+    fn update_texts(events: &[EventKind]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityUpdated { update, .. } => Some(match &update.content {
+                    Some(ActivityContent::Output { text }) => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The first update after a quiet interval goes out at once, carrying everything held since the
+    /// last one; an update inside the interval is held rather than dropped.
+    #[test]
+    fn updates_inside_the_interval_are_held_and_the_next_one_after_it_carries_them() {
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut reducer = Reducer::new().with_update_interval(Duration::from_secs(5));
+        let mut events = reducer.update_at(update(announced("call_log")), start).0;
+        for (at, text) in [(0, "a"), (1, "b"), (2, "c"), (6, "d"), (7, "e")] {
+            events.extend(
+                reducer
+                    .update_at(update(output("call_log", text)), start + second * at)
+                    .0,
+            );
+        }
+        assert_eq!(
+            update_texts(&events),
+            vec![Some(String::from("a")), Some(String::from("d"))],
+            "expected the first update and the first after the interval, received {events:?}"
+        );
+        let closing = reducer.finish_with(ActivityStatus::Completed);
+        assert_eq!(
+            update_texts(&closing),
+            vec![Some(String::from("e"))],
+            "expected the held update delivered at the turn's end, received {closing:?}"
+        );
+        assert!(
+            matches!(closing.last(), Some(EventKind::ActivityCompleted { .. })),
+            "expected the call closed after its held update, received {closing:?}"
+        );
+    }
+
+    /// A completion that carries its own content replaces the held content, so only what it does
+    /// not replace — here the title — is delivered ahead of it.
+    #[test]
+    fn a_completion_with_content_supersedes_the_held_content_but_not_the_title() {
+        let start = Instant::now();
+        let mut reducer = Reducer::new().with_update_interval(Duration::from_secs(5));
+        let _ = reducer.update_at(update(announced("call_log")), start);
+        let _ = reducer.update_at(update(output("call_log", "first")), start);
+        let _ = reducer.update_at(
+            update(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_log",
+                "title": "Building",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "held" } }]
+            })),
+            start,
+        );
+        let (events, _) = reducer.update_at(
+            update(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_log",
+                "status": "completed",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "done" } }]
+            })),
+            start,
+        );
+        let [
+            EventKind::ActivityUpdated { update: held, .. },
+            EventKind::ActivityCompleted { result, .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected the held title then the completion, received {events:?}");
+        };
+        assert_eq!(held.title.as_deref(), Some("Building"));
+        assert_eq!(held.content, None, "expected the held content superseded");
+        assert_eq!(held.detail, None, "expected the held detail superseded");
+        assert_eq!(
+            result.content,
+            Some(ActivityContent::Output {
+                text: String::from("done")
+            })
+        );
+    }
+
+    /// ACP's `tool_call` carries its content collection even when the agent has nothing new to
+    /// say, so a repeated announcement with no content is a status or title change, not an order to
+    /// clear the output. A terminal repeat after held output must leave the host with that output.
+    #[test]
+    fn a_repeat_terminal_tool_call_after_held_output_keeps_the_last_output() {
+        let start = Instant::now();
+        let mut reducer = Reducer::new().with_update_interval(Duration::from_secs(5));
+        let _ = reducer.update_at(update(announced("call_log")), start);
+        let _ = reducer.update_at(update(output("call_log", "first")), start);
+        let _ = reducer.update_at(update(output("call_log", "last")), start);
+        let (events, _) = reducer.update_at(
+            update(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_log",
+                "title": "Tool",
+                "kind": "other",
+                "status": "completed"
+            })),
+            start,
+        );
+        assert_eq!(
+            update_texts(&events),
+            vec![Some(String::from("last"))],
+            "expected the held output delivered before the completion, received {events:?}"
+        );
+        let Some(EventKind::ActivityCompleted { result, .. }) = events.last() else {
+            panic!("expected the repeat to complete the call, received {events:?}");
+        };
+        assert_eq!(
+            result.content, None,
+            "expected the empty repeat not to clear the output, received {result:?}"
+        );
+    }
+
+    /// `Duration::ZERO` turns coalescing off, for a host that wants every replacement.
+    #[test]
+    fn a_zero_interval_forwards_every_update() {
+        let start = Instant::now();
+        let mut reducer = Reducer::new().with_update_interval(Duration::ZERO);
+        let mut events = reducer.update_at(update(announced("call_log")), start).0;
+        for text in ["a", "b", "c"] {
+            events.extend(reducer.update_at(update(output("call_log", text)), start).0);
+        }
+        assert_eq!(update_texts(&events).len(), 3, "received {events:?}");
     }
 
     /// ACP v1's plan is replaced wholesale and carries no id, so the first one opens an activity and
@@ -1294,8 +2103,8 @@ mod tests {
         }
     }
 
-    /// Only a cancellation is somebody stopping the turn. A refusal is the agent ending its own, and
-    /// reporting it as an error would tell a host to retry a decision.
+    /// Only a cancellation is somebody stopping the turn. A refusal or a limit is the agent ending
+    /// its own — short, which [`stop_failure`] reports, but not a cancellation.
     #[test]
     fn only_a_cancelled_stop_reason_counts_as_a_cancellation() {
         assert!(was_cancelled(StopReason::Cancelled));
@@ -1306,6 +2115,37 @@ mod tests {
             StopReason::Refusal,
         ] {
             assert!(!was_cancelled(reason), "received {reason:?}");
+        }
+    }
+
+    /// A refused, token-limited or request-limited turn is not a success: its answer is truncated or
+    /// absent. Each ends as the incomplete-turn failure carrying the wire's own stop reason, while a
+    /// finished or cancelled turn produces no failure at all.
+    #[test]
+    fn a_stop_short_of_the_end_is_an_incomplete_turn_naming_its_reason() {
+        for (reason, wire) in [
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::MaxTurnRequests, "max_turn_requests"),
+            (StopReason::Refusal, "refusal"),
+        ] {
+            let failure = stop_failure(reason)
+                .unwrap_or_else(|| panic!("expected a failure for {reason:?}, received none"));
+            assert_eq!(failure.code.as_str(), TURN_INCOMPLETE_CODE);
+            assert_eq!(
+                failure.vendor_code.as_deref(),
+                Some(wire),
+                "expected the wire spelling for {reason:?}, received {failure:?}"
+            );
+            assert!(
+                !failure.retryable,
+                "expected {reason:?} not to invite a retry"
+            );
+        }
+        for reason in [StopReason::EndTurn, StopReason::Cancelled] {
+            assert!(
+                stop_failure(reason).is_none(),
+                "expected no failure for {reason:?}"
+            );
         }
     }
 }

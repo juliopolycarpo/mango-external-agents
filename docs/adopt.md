@@ -317,7 +317,8 @@ It checks what a host is entitled to assume: a turn ends exactly once and nothin
 terminal, every event names its own session, turn and attempt, an approval can be answered, a
 cancelled turn still completes, closing twice is not an error, session state is readable before any
 turn has run, a session update reaches a subscriber, every capability the descriptor did not
-declare refuses as unsupported, and a probe never claims more than the descriptor's ceiling. A
+declare refuses as unsupported, a declared native review is not refused as unsupported, and a
+probe never claims more than the descriptor's ceiling. A
 check that cannot run on your fixture is reported as skipped rather than passed.
 
 ## Worked integration: mangostudio runtime

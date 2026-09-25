@@ -4505,3 +4505,237 @@ mod contracts;
 
 #[path = "session/burst.rs"]
 mod burst;
+
+#[path = "session/edges.rs"]
+mod edges;
+
+/// The `tool_call` frame for a call the agent reports as running and never ends.
+fn running_call(call_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "title": "Run `cargo build`",
+        "kind": "execute",
+        "status": "in_progress"
+    })
+}
+
+/// How the turn closed `call_id`, if it did, and whether that happened before the terminal.
+fn closing_status(
+    events: &[EventKind],
+    call_id: &str,
+) -> Option<mango_external_agents::ActivityStatus> {
+    let terminal = events.iter().position(|event| {
+        matches!(
+            event,
+            EventKind::Completed | EventKind::Error { .. } | EventKind::Cancelled { .. }
+        )
+    })?;
+    events[..terminal].iter().find_map(|event| match event {
+        EventKind::ActivityCompleted {
+            call_id: id,
+            result,
+        } if id == call_id => Some(result.status),
+        _ => None,
+    })
+}
+
+/// ACP ends a turn with the `session/prompt` response, and nothing on the wire closes a call the
+/// agent left running. The turn's own end has to, or the host renders that call as running forever.
+#[tokio::test]
+async fn a_call_the_agent_left_running_is_completed_before_the_turn_completes() {
+    let (session, _launcher) = open(
+        FakeAcpAgent::new().with_updates(vec![running_call("call_open")]),
+        permissive(),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "build it"))
+        .await
+        .expect("expected a turn");
+    let events = drain(&mut turn).await;
+
+    assert_eq!(
+        closing_status(&events, "call_open"),
+        Some(mango_external_agents::ActivityStatus::Completed),
+        "expected the running call completed ahead of the terminal, received {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "received {events:?}"
+    );
+}
+
+/// A cancelled turn did not let its running calls finish, so they close as cancelled rather than
+/// claiming a success nobody observed.
+#[tokio::test]
+async fn a_call_left_running_by_a_cancelled_turn_is_closed_as_cancelled() {
+    let (session, _launcher) = open(
+        FakeAcpAgent::new()
+            .with_updates(vec![running_call("call_open")])
+            .asking_for_approval(Approval::Once),
+        permissive(),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "build it"))
+        .await
+        .expect("expected a turn");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = turn.recv().await {
+            let asked = matches!(event.kind, EventKind::ApprovalRequested { .. });
+            events.push(event.kind);
+            if asked {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("expected the agent to ask");
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to land");
+    events.extend(drain(&mut turn).await);
+
+    assert_eq!(
+        closing_status(&events, "call_open"),
+        Some(mango_external_agents::ActivityStatus::Cancelled),
+        "expected the running call cancelled ahead of the terminal, received {events:?}"
+    );
+}
+
+/// A turn the agent stopped short — a refusal, a token or request limit — is not a success: its
+/// answer is truncated or absent. It ends as an error naming the stop reason, and a call the agent
+/// left running closes as failed with it.
+#[tokio::test]
+async fn a_vendor_side_stop_ends_the_turn_as_an_incomplete_error_naming_its_reason() {
+    for stop_reason in ["refusal", "max_tokens", "max_turn_requests"] {
+        let (session, _launcher) = open(
+            FakeAcpAgent::new()
+                .with_updates(vec![running_call("call_open")])
+                .with_stop_reason(stop_reason),
+            permissive(),
+        )
+        .await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "go"))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!("expected {stop_reason} to end the turn as an error, received {events:?}");
+        };
+        assert_eq!(
+            error.code.as_str(),
+            "vendor-turn-incomplete",
+            "expected the incomplete-turn code for {stop_reason}, received {error:?}"
+        );
+        assert_eq!(
+            error.vendor_code.as_deref(),
+            Some(stop_reason),
+            "expected the stop reason as the vendor code, received {error:?}"
+        );
+        assert!(
+            !error.retryable,
+            "expected {stop_reason} not to invite a retry"
+        );
+        assert_eq!(
+            closing_status(&events, "call_open"),
+            Some(mango_external_agents::ActivityStatus::Failed),
+            "expected the running call to fail with the turn, received {events:?}"
+        );
+    }
+}
+
+/// One child serves one ACP session here, so a frame naming another `sessionId` is not this
+/// session's to act on. An update for it must not reach this turn's transcript, and a permission
+/// request for it is refused with ACP's `Cancelled` outcome rather than shown to this host, whose
+/// answer could otherwise grant work in a conversation it never opened.
+#[tokio::test]
+async fn frames_naming_another_session_are_ignored_or_refused() {
+    let announcer = mango_external_agents::testing::Announcer::new();
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .staying_silent()
+            .process()
+            .announcing(announcer.clone()),
+    );
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "go"))
+        .await
+        .expect("expected a turn");
+    announcer.announce(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_other",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "not yours" }
+                }
+            }
+        })
+        .to_string(),
+    );
+    announcer.announce(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7777,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess_other",
+                "toolCall": { "toolCallId": "call_x", "kind": "execute", "title": "Run `rm -rf /`" },
+                "options": [
+                    { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                    { "optionId": "reject", "name": "Reject", "kind": "reject_once" }
+                ]
+            }
+        })
+        .to_string(),
+    );
+    let refused = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let answered = launcher
+                .written()
+                .into_iter()
+                .find(|line| line.contains("\"id\":7777") && line.contains("\"outcome\""));
+            if let Some(line) = answered {
+                return line;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected the foreign permission request to be answered");
+    assert!(
+        refused.contains("\"cancelled\""),
+        "expected the foreign request refused as cancelled, received {refused}"
+    );
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to land");
+    let events = drain(&mut turn).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            EventKind::TextDelta { .. } | EventKind::ApprovalRequested { .. }
+        )),
+        "expected nothing from another session in this turn, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}

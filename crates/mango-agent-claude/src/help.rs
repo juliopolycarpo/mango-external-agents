@@ -374,6 +374,71 @@ Commands:
         assert_eq!(quoted_examples(&option("--print").block), None);
     }
 
+    /// A build that adds a permission mode this harness never passes is read, not rejected.
+    ///
+    /// Claude gains modes between releases. The parser keeps every choice verbatim — the unknown
+    /// one included — so the known modes stay readable and nothing downstream mistakes a newer
+    /// build for drift. Whether the extra mode narrows the matrix is `permissions`' question, and
+    /// its own test answers it.
+    #[test]
+    fn keeps_every_choice_when_the_build_lists_a_mode_it_does_not_know() {
+        let block = "--permission-mode <mode>  Permission mode (choices: \"manual\", \
+                     \"somethingNewer\", \"plan\", \"bypassPermissions\")";
+        let received = choice_list(block);
+        assert_eq!(
+            received,
+            Some(vec![
+                String::from("manual"),
+                String::from("somethingNewer"),
+                String::from("plan"),
+                String::from("bypassPermissions"),
+            ]),
+            "expected the unknown mode kept beside the known ones | received: {received:?}"
+        );
+    }
+
+    /// The help parser reads a subprocess's stdout, so adversarial input has to stay linear.
+    ///
+    /// Two shapes, as the module documentation describes: one `(choices:` followed by a long
+    /// unterminated run, and the prefix repeated with no `)` anywhere. A quadratic scan over 64 KiB
+    /// of either is billions of byte comparisons; a linear one is a few hundred thousand. The bound
+    /// is deliberately generous — far above linear, far below quadratic — so it catches a regression
+    /// to a rescanning parser without turning into a microbenchmark that flakes on a loaded runner.
+    #[test]
+    fn stays_linear_on_an_unterminated_choices_run_of_64_kib() {
+        const SIZE: usize = 64 * 1024;
+        let shapes = [
+            (
+                "one long unterminated run",
+                format!("(choices:{}", " ".repeat(SIZE)),
+            ),
+            (
+                "a repeated unterminated prefix",
+                "(choices:".repeat(SIZE / "(choices:".len()),
+            ),
+        ];
+        for (label, body) in shapes {
+            let help = format!("Options:\n  --permission-mode <mode>   {body}\n");
+            let started = std::time::Instant::now();
+            let options = declared_options(&help);
+            let choices = option_for(&options, "--permission-mode")
+                .and_then(|option| choice_list(&option.block));
+            let bare = option_for(&options, "--permission-mode")
+                .and_then(|option| bare_choice_list(&option.block));
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                (choices, bare),
+                (None, None),
+                "expected {label} to yield no vocabulary"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "expected {label} of {SIZE} bytes to parse in under 2s | received: {elapsed:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_unclosed_group_ends_the_scan_rather_than_running_away() {
         assert_eq!(choice_list("(choices: \"a\""), None);

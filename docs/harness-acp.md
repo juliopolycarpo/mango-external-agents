@@ -136,6 +136,18 @@ names no turn handle of its own. It is minted synchronously, before the prompt r
 arrives only if the agent answers. The cost is that this id appears in no captured transcript: it is
 the harness's own counter, not something a vendor said.
 
+`Limits::idle_timeout` bounds how long a turn may stay silent. Every `session/update` the agent
+sends restarts it, and so does every change to the pending questions. While a
+`session/request_permission` is waiting on an answer the deadline is paused, not consumed: the
+approval has its own `Limits::approval_timeout`, and waiting for a person is not the agent going
+quiet. Once that question is answered, withdrawn or expires, the deadline restarts from that moment,
+so a turn whose approval lapsed stops waiting one idle period later. At the deadline the harness
+sends [`session/cancel`](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation)
+exactly as a host cancel would. The turn ends as `Cancelled { reason: Timeout }` when the agent
+answers with `stop_reason: cancelled`, or after `Limits::kill_grace` and a reap when it does not.
+There is no floor, unlike the Claude harness's ten minutes: an ACP agent reports a running tool call
+through `tool_call_update`, so a silent one is not a working one.
+
 Steering is `Error::NotSupported` on every profile: ACP v1 has no surface for adding to a turn that is
 already running.
 
@@ -158,6 +170,23 @@ ACP calls them tool calls; they arrive as *activity* because nothing in this lib
 tool registry. The reasoning pair is synthesised: ACP streams thought chunks with no start or end
 marker, and a host relies on the pair to tell "still running" from "the agent withheld it".
 
+A tool call is bracketed by the agent's `toolCallId`. ACP allows a
+[`tool_call_update`](https://agentclientprotocol.com/protocol/v1/tool-calls#updating) for a call this
+client never saw announced — a loaded session's in-flight call is one — and a host applies updates
+only to a call it saw start, so the first frame for an unknown id emits `ActivityStarted` first,
+built from the update's own title and kind (title `tool` when it names none), and then its completion
+when the update is already terminal. A second `tool_call` for a call that is still open arrives as an
+update rather than a second start; an empty `content` or `locations` on it leaves the host's copy
+alone, because `tool_call` cannot say "unchanged" any other way. A frame for a call that already
+ended is dropped: the host closed that row.
+
+ACP ends a turn with the `session/prompt` response, not with a frame per call, so a call the agent
+never reported as `completed` or `failed` is closed by the turn's own end, before its terminal and in
+the order the agent opened its calls. It closes with the status that agrees with that terminal:
+`Completed` for a completed turn, `Cancelled` for a cancelled one and `Failed` for a failed one — a
+call nobody saw finish did not demonstrably succeed. The plan activity completes either way; it is
+the display of the plan, and the turn ending is what ends it.
+
 Two deliberate limits, each with a test pinning it:
 
 - A non-text block in an *agent message* — an image, audio, an embedded resource — produces no event.
@@ -169,8 +198,12 @@ Two deliberate limits, each with a test pinning it:
 
 A `stop_reason` of `cancelled` ends the turn as a cancellation carrying the reason the *host* gave —
 ACP supplies none of its own, and flattening it would report a shutdown as "you stopped this turn".
-Every other reason, `refusal` included, completes the turn: a refusal is the agent ending its own turn,
-and reporting it as an error would tell a host to retry a decision.
+`end_turn` completes the turn. The three reasons that end it short of finishing — `max_tokens`,
+`max_turn_requests` and `refusal` — end it as `EventKind::Error` with the code
+`vendor-turn-incomplete`, the wire's own spelling of the reason as `vendor_code` and
+`retryable: false`: the answer is truncated or absent, so completing the turn would render it as a
+success, and an identical prompt meets the same limit or the same refusal. See the
+[stop reasons](https://agentclientprotocol.com/protocol/v1/prompt-turn#stop-reasons).
 
 ### Structured activity content
 
@@ -202,7 +235,25 @@ id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, 
 
 ACP says a [`tool_call_update` collection replaces the previous collection](https://agentclientprotocol.com/protocol/v1/tool-calls#updating), rather than extending it. An omitted `content` field therefore leaves the host's structured content and detail untouched. An explicit empty collection emits `Some(ActivityContent::Empty)` and an empty detail, so the host removes the prior diff or output instead of retaining it.
 
+Because each update replaces the whole collection, an agent streaming a build log re-sends the complete
+log with every line. A running call's updates are therefore coalesced: the first goes out at once,
+later ones within `reducer::TOOL_UPDATE_INTERVAL` (five seconds, as the TypeScript adapter used) are
+merged latest-field-wins and held, and the next update after the interval carries the merge. Anything
+still held is delivered ahead of the call's completion — minus the content and detail a completion
+that carries its own replaces — and ahead of the turn's end, so the host always ends with the agent's
+final output. `Reducer::with_update_interval` changes the interval; `Duration::ZERO` forwards every
+update. This bounds how often one call reaches a host, not how large one update is: each is still
+bounded by the core's `TextLimit::Detail`.
+
 ## Permissions
+
+Each session owns its own agent process, so a `session/update` or `session/request_permission`
+naming a `sessionId` other than the one `session/new` or `session/load` returned is not this
+session's: the update is dropped, and the request is answered with ACP's `Cancelled` outcome
+rather than shown to a host that never opened that conversation. A resume binds to the requested
+id before `session/load` is sent. If the load fails and `ResumeMode::Fallback` opens a fresh session,
+the failed id is refused from then on, and whatever its replay already announced (commands,
+configuration options) is cleared rather than inherited by the new session.
 
 A withdrawn question resolves on both sides. The agent hears ACP's own `Cancelled` outcome; a host
 that was shown the prompt hears `ApprovalResolved` with `DecisionSource::Cancelled` and an option id
@@ -340,6 +391,15 @@ install locations without editing the profile or changing a user's `PATH`.
   only knowable from `initialize`. What the agent actually advertised arrives as the session-effective
   tier on `Session::snapshot().capabilities` after `open_session` — which is the case the three
   capability tiers exist for.
+  An agent whose `initialize` omits `agentCapabilities`, or sends one that is not an object, opens
+  with every optional surface off rather than being refused: the ACP schema defines the field's
+  default as the empty capability set, and the official schema crate reads a malformed value the
+  same way. Narrowing fails closed; an unknown key beside the known ones is ignored.
+- Capabilities and catalogs narrow only when a session opens; there is no discovery-time handshake,
+  because one would start the agent's auth and network path on every probe. `Discovery`'s
+  configuration catalog is therefore empty, and the agent's model and mode options (Cursor's `model`
+  and `mode` config options) arrive on the session's catalog when `session/new` or `session/load`
+  answers.
 
 ## Client capabilities
 

@@ -156,6 +156,13 @@ pub(crate) struct TurnHandle {
     pub(crate) approvals: Arc<ApprovalEvents>,
 }
 
+/// The ACP session a connection is bound to, and the one a failed load abandoned.
+#[derive(Debug, Default)]
+struct NativeBinding {
+    bound: Option<agent_client_protocol::schema::v1::SessionId>,
+    abandoned: Option<agent_client_protocol::schema::v1::SessionId>,
+}
+
 /// Settles the questions a cancellation owes, however its own answer turns out.
 ///
 /// The expiry path answers one question and notifies the agent, and either call can fail on a
@@ -334,6 +341,14 @@ pub(crate) struct SessionState {
     pending: Mutex<HashMap<String, PendingApproval>>,
     /// Source of [`Self::mint_approval_id`]'s ids. Separate from `generations`, which stamps turns.
     next_approval: AtomicU64,
+    /// Bumped on every frame the agent sends and every change to the pending questions, so the
+    /// idle deadline restarts on progress and re-reads whether a question is still open.
+    activity: tokio::sync::watch::Sender<u64>,
+    /// Which ACP session this connection serves, and which one it gave up on.
+    ///
+    /// Each session owns its own child, so a frame naming any other id is not this session's to
+    /// act on. See [`Self::serves`].
+    native_session: Mutex<NativeBinding>,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -371,6 +386,110 @@ impl SessionState {
             reducer: Mutex::new(Reducer::new()),
             pending: Mutex::new(HashMap::new()),
             next_approval: AtomicU64::new(0),
+            activity: tokio::sync::watch::channel(0).0,
+            native_session: Mutex::new(NativeBinding::default()),
+        }
+    }
+
+    /// Binds this connection to one ACP session: the one being loaded, or the one opened.
+    pub(crate) fn bind_native_session(&self, id: agent_client_protocol::schema::v1::SessionId) {
+        self.lock_native_session().bound = Some(id);
+    }
+
+    /// Gives up on the session a failed `session/load` named, before a fallback opens a new one.
+    ///
+    /// Frames naming it are refused from here on. And whatever its replay already announced — a
+    /// command catalog, configuration options — was that session's state, not the one the host is
+    /// about to get, so it is cleared rather than inherited.
+    ///
+    /// ```ignore
+    /// state.bind_native_session(loading.clone());
+    /// // session/load refused, falling back:
+    /// state.abandon_native_session();
+    /// ```
+    pub(crate) fn abandon_native_session(&self) {
+        {
+            let mut binding = self.lock_native_session();
+            binding.abandoned = binding.bound.take();
+        }
+        let mut revision = self.lock_catalog_revision();
+        *revision = revision.wrapping_add(1);
+        self.core_state.update(|snapshot| {
+            snapshot.commands = Vec::new();
+            snapshot.catalog = ConfigurationCatalog::empty();
+            snapshot.configuration.observed = Configuration::unknown();
+        });
+    }
+
+    fn lock_native_session(&self) -> std::sync::MutexGuard<'_, NativeBinding> {
+        self.native_session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether a frame naming `id` belongs to this session.
+    ///
+    /// Once bound, only for the bound id. Before that, for any id except one a failed load
+    /// abandoned: a fallback's `session/new` has not named its session yet.
+    ///
+    /// Accepting frames before the bind is deliberate. ACP sends session-scoped traffic ahead of
+    /// the open's own response: `session/load` replays the conversation as `session/update`
+    /// notifications before it answers, and Cursor announces its command catalog while
+    /// `session/new` is still in flight. Dropping them would lose that session state. Nothing
+    /// before the bind can reach a turn or a host: no turn exists yet, so an update produces only
+    /// session facts and a permission request is answered `Cancelled`.
+    fn serves(&self, id: &agent_client_protocol::schema::v1::SessionId) -> bool {
+        let binding = self.lock_native_session();
+        match &binding.bound {
+            Some(bound) => bound == id,
+            None => binding.abandoned.as_ref() != Some(id),
+        }
+    }
+
+    /// Restarts idle accounting: the agent said something, or a question opened or closed.
+    fn touch(&self) {
+        self.activity
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    /// Resolves once the running turn has spent `idle` with no frame from the agent and no
+    /// question waiting on an answer.
+    ///
+    /// A pending question pauses the deadline rather than consuming it: the approval has its own
+    /// deadline (`Limits::approval_timeout`), and waiting for a person is not the agent going
+    /// quiet. When that question is answered, withdrawn or expires, the deadline restarts from
+    /// that moment, so a turn whose approval lapsed stops waiting one idle period later.
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     () = state.idle_expired(limits.idle_timeout) => { /* cancel with Timeout */ }
+    ///     outcome = &mut prompt => { /* the turn ended on its own */ }
+    /// }
+    /// ```
+    pub(crate) async fn idle_expired(&self, idle: std::time::Duration) {
+        let mut changes = self.activity.subscribe();
+        loop {
+            if self.pending_count() > 0 {
+                if changes.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+                continue;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(idle) => {
+                    // `select!` picks among ready branches at random, so the sleep can win on the
+                    // same tick a frame arrived. A change it has not consumed is progress: loop, and
+                    // the change branch restarts the deadline.
+                    if self.pending_count() == 0 && !changes.has_changed().unwrap_or(false) {
+                        return;
+                    }
+                }
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return std::future::pending().await;
+                    }
+                }
+            }
         }
     }
 
@@ -551,10 +670,13 @@ impl SessionState {
     /// What a `session/prompt` task calls. Its own turn may already have been ended by a `close`, and
     /// a *later* turn may have started in the meantime — so an unconditional take would let a task
     /// that answered late end, and emit the terminal of, a conversation that is not its own.
+    ///
+    /// Hands back the turn's own reducer rather than its closing events: what the calls the agent
+    /// left running end as depends on the terminal, which the caller decides after this returns.
     pub(crate) fn prepare_terminal_matching(
         &self,
         handle: &TurnHandle,
-    ) -> Option<(TurnHandle, Option<CancelReason>, Vec<EventKind>)> {
+    ) -> Option<(TurnHandle, Option<CancelReason>, Reducer)> {
         let (turn, reason, pending, closing) = {
             let active = self.lock_turn();
             if active.as_ref()?.generation != handle.generation {
@@ -565,7 +687,7 @@ impl SessionState {
             // newly started prompt clears the reducer and may park approvals of its own.
             let reason = self.lock_cancel_reason().take();
             let pending = self.take_pending();
-            let closing = self.lock_reducer().finish();
+            let closing = std::mem::take(&mut *self.lock_reducer());
             (turn, reason, pending, closing)
         };
         for pending in pending {
@@ -623,7 +745,10 @@ impl SessionState {
     /// The events and session facts one frame produces, computed under the guard because the
     /// reducer is pure.
     fn reduce(&self, notification: SessionNotification) -> (Vec<EventKind>, Vec<SessionFact>) {
-        self.lock_reducer().update(notification.update)
+        // Tokio's clock rather than the host's: this instant only spaces a running call's updates,
+        // and a runtime with paused time has to see that spacing move with it.
+        self.lock_reducer()
+            .update_at(notification.update, tokio::time::Instant::now().into_std())
     }
 
     /// Publishes a session-scoped fact the reducer surfaced.
@@ -670,7 +795,12 @@ impl SessionState {
     /// The four places a turn can end all owe the same debt, and each of them takes the requests
     /// out in one statement so nothing is held while the answers go out.
     fn take_pending(&self) -> Vec<PendingApproval> {
-        self.lock_pending().drain().map(|(_, held)| held).collect()
+        let taken: Vec<PendingApproval> =
+            self.lock_pending().drain().map(|(_, held)| held).collect();
+        if !taken.is_empty() {
+            self.touch();
+        }
+        taken
     }
 
     /// Parks an agent question unless cancellation already won its race.
@@ -696,6 +826,8 @@ impl SessionState {
             return Ok(false);
         }
         parked.insert(id, pending);
+        drop(parked);
+        self.touch();
         Ok(true)
     }
 
@@ -729,6 +861,7 @@ impl SessionState {
         let Some(mut pending) = pending else {
             return Ok(Answered::AlreadyResolved);
         };
+        self.touch();
         if cancelling.is_some() {
             pending.responder.respond(permission::cancelled())?;
             return Ok(Answered::AlreadyResolved);
@@ -771,7 +904,10 @@ impl SessionState {
     pub(crate) fn withdraw_pending_by_id(&self, id: &str) -> agent_client_protocol::Result<()> {
         let pending = self.lock_pending().remove(id);
         match pending {
-            Some(pending) => pending.responder.respond(permission::cancelled()),
+            Some(pending) => {
+                self.touch();
+                pending.responder.respond(permission::cancelled())
+            }
             None => Ok(()),
         }
     }
@@ -902,9 +1038,14 @@ impl SessionState {
 /// work before it releases this generation; freeing the slot here would let a second prompt onto a
 /// wire that has no way to tell two turns apart. The nonblocking sink makes later frames fail fast.
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
+    // Not this session's: neither transcript nor session state, and not progress either.
+    if !state.serves(&notification.session_id) {
+        return;
+    }
     // Capture the current owner before reducing session facts. Facts may arrive between turns;
     // their publication must not attach turn events to a newly admitted generation.
     let turn = state.turn();
+    state.touch();
     let (events, facts) = state.reduce(notification);
     // Published before the turn events: a session fact is true the moment the agent announced it,
     // not only once a host has read every event that preceded it on this turn's own stream.
@@ -944,6 +1085,11 @@ async fn on_request_permission(
     responder: Responder<RequestPermissionResponse>,
     connection: ConnectionTo<Agent>,
 ) -> agent_client_protocol::Result<()> {
+    if !state.serves(&request.session_id) {
+        // Another session's question. Refused rather than shown: this host's answer would grant
+        // work in a conversation it never opened.
+        return responder.respond(permission::cancelled());
+    }
     let id = state.mint_approval_id();
     let Some(turn) = state.turn() else {
         // No turn: nobody is reading, and an unanswered request would hold the agent forever.
@@ -2448,6 +2594,84 @@ mod tests {
 
     /// A slot the prompt task never releases turns into a typed timeout naming what was held,
     /// rather than an `Ok` that would let the session look settled.
+    /// The binding follows a fallback resume: frames for the session being loaded are this
+    /// session's, frames for it once the load is abandoned are not — even before the fresh
+    /// session names itself — and once that one binds, only it is.
+    #[test]
+    fn a_fallback_refuses_the_abandoned_session_until_and_after_the_new_one_binds() {
+        use agent_client_protocol::schema::v1::SessionId as AcpSessionId;
+        let (state, _host) = state();
+        let loading = AcpSessionId::new("sess_loading");
+        let fresh = AcpSessionId::new("sess_fresh");
+        assert!(
+            state.serves(&loading),
+            "expected an unbound session to accept any id"
+        );
+
+        state.bind_native_session(loading.clone());
+        assert!(state.serves(&loading));
+        assert!(
+            !state.serves(&fresh),
+            "expected only the loading id while bound"
+        );
+
+        state.abandon_native_session();
+        assert!(
+            !state.serves(&loading),
+            "expected the abandoned id refused while the fallback opens"
+        );
+        assert!(
+            state.serves(&fresh),
+            "expected the fallback's own early frames accepted before it binds"
+        );
+
+        state.bind_native_session(fresh.clone());
+        assert!(state.serves(&fresh));
+        assert!(
+            !state.serves(&loading),
+            "expected the abandoned id still refused"
+        );
+    }
+
+    /// A frame that arrives on the same timer tick as the idle deadline is progress, not silence.
+    ///
+    /// The frame's task sleeps a shade less than the deadline, so both timers fall due on one
+    /// tick and the frame's runs first; the idle wait is then polled with its sleep and its change
+    /// both ready. `select!` picks between ready branches at random, so the case repeats until an
+    /// unguarded sleep would have won at least once.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_on_the_idle_deadline_tick_restarts_the_deadline() {
+        let idle = Duration::from_secs(5);
+        for round in 0..32 {
+            let (state, _host) = state();
+            let state = Arc::new(state);
+            let frame = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move {
+                    tokio::time::sleep(idle - Duration::from_micros(500)).await;
+                    state.touch();
+                }
+            });
+            let waiter = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move { state.idle_expired(idle).await }
+            });
+            tokio::time::sleep(idle + Duration::from_millis(1)).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                frame.is_finished(),
+                "expected the frame to have arrived in round {round}"
+            );
+            assert!(
+                !waiter.is_finished(),
+                "expected idle state: waiting after a frame on the deadline tick | received: expired, in round {round}"
+            );
+            waiter.abort();
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_unreleased_turn_slot_is_a_typed_timeout() {
         let (state, host) = state();

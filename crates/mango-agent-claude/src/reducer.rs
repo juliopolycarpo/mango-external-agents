@@ -985,6 +985,24 @@ mod tests {
         );
     }
 
+    /// The two buckets a host renders most often, pinned as a test rather than only as the
+    /// doctest beside [`activity_kind`]: `Bash` is a shell command, and anything the CLI namespaced
+    /// `mcp__<server>__<tool>` is an MCP call, whichever server or tool it names.
+    #[test]
+    fn maps_bash_to_a_command_and_a_namespaced_tool_to_mcp() {
+        for (tool, expected) in [
+            ("Bash", ActivityKind::Command),
+            ("mcp__playwright__navigate", ActivityKind::Mcp),
+            ("mcp__github__list_prs", ActivityKind::Mcp),
+        ] {
+            let received = activity_kind(tool);
+            assert_eq!(
+                received, expected,
+                "expected {tool} to map to {expected:?} | received: {received:?}"
+            );
+        }
+    }
+
     #[test]
     fn falls_back_to_other_for_a_tool_it_does_not_recognise() {
         assert_eq!(activity_kind("Read"), ActivityKind::Other);

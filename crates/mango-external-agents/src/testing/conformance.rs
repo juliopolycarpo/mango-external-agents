@@ -160,6 +160,7 @@ pub async fn run(harness: &dyn Harness, host: &HostContext, options: Options) ->
     check_questions(session.as_ref(), &options, &mut report).await;
     check_cancelled_turn(session.as_ref(), &options, &mut report).await;
     check_optional_methods(session.as_ref(), &mut report).await;
+    check_declared_review(session.as_ref(), &options, &mut report).await;
     check_close(session.as_ref(), &mut report).await;
     report
 }
@@ -895,6 +896,57 @@ async fn check_close(session: &dyn Session, report: &mut Report) {
     report.record("closing twice is not an error", outcome);
 }
 
+/// How long the declared-review check waits for `start_review` to answer.
+///
+/// Short on purpose: the refusal it looks for is the default `Session::start_review`, which answers
+/// at once. A harness that serves reviews against a recorded conversation with no review in it
+/// would otherwise hold the suite for a whole turn timeout.
+const REVIEW_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Whether a declared native review is actually served.
+///
+/// [`check_optional_methods`] holds an *undeclared* review to its refusal; this is the other
+/// direction. A harness that declares [`Capability::NativeReview`] and then answers
+/// `start_review` with that same `NotSupported` has told a host to offer a button that can only
+/// fail. Only that refusal fails the check: a review that starts is cancelled and drained within
+/// the turn timeout, and any other outcome — a vendor error, no answer within
+/// [`REVIEW_PROBE_TIMEOUT`] — is the vendor's answer to a review it does serve, which this suite
+/// has no fixture to judge.
+async fn check_declared_review(session: &dyn Session, options: &Options, report: &mut Report) {
+    if !session.capabilities().has(Capability::NativeReview) {
+        return;
+    }
+    let started = tokio::time::timeout(
+        REVIEW_PROBE_TIMEOUT.min(options.turn_timeout),
+        session.start_review(ReviewRequest {
+            turn_id: crate::event::TurnId::new("conformance-review-declared"),
+            target: ReviewTarget::UncommittedChanges,
+        }),
+    )
+    .await;
+    let outcome = match started {
+        Ok(Err(error)) if matches!(error.cause(), Error::NotSupported { capability } if *capability == Capability::NativeReview) => {
+            Outcome::Failed(String::from(
+                "expected a declared native review to be served | received: refused as unsupported",
+            ))
+        }
+        Ok(Ok(mut review)) => {
+            let _ = session.cancel(CancelReason::Requested).await;
+            let _ = tokio::time::timeout(options.turn_timeout, async {
+                while let Some(event) = review.turn.recv().await {
+                    if event.is_terminal() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            Outcome::Passed
+        }
+        _ => Outcome::Passed,
+    };
+    report.record("a declared native review is served", outcome);
+}
+
 fn refuses_as_unsupported<T>(outcome: &crate::error::Result<T>, capability: Capability) -> bool {
     matches!(
         outcome,
@@ -1441,6 +1493,32 @@ mod tests {
                 kind,
             })
             .collect()
+    }
+
+    /// A declared native review that the session refuses fails the suite.
+    ///
+    /// The descriptor is a promise a host plans against: advertising `nativeReview` puts a review
+    /// action in front of a person. A session that then answers `start_review` with
+    /// `NotSupported` has declared a capability it does not serve, and the suite must say so
+    /// rather than pass a harness whose only evidence for the capability is a check that never ran.
+    #[tokio::test]
+    async fn a_declared_native_review_the_session_does_not_serve_fails_the_suite() {
+        let report = run(
+            &FakeHarness::new().advertising_a_review_it_does_not_serve(),
+            &host(),
+            Options::default(),
+        )
+        .await;
+
+        let failures = report.failures();
+        assert!(
+            failures.iter().any(|check| matches!(
+                &check.outcome,
+                Outcome::Failed(message) if message.contains("native review")
+            )),
+            "expected a failed check naming the unserved native review | received failures: \
+             {failures:#?}"
+        );
     }
 
     #[tokio::test]

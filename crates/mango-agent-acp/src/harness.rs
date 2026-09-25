@@ -517,6 +517,7 @@ impl Harness for AcpHarness {
         let (handshake, opened) = opened;
 
         session_state.set_native_session_id(opened.session_id.to_string());
+        connection_state.bind_native_session(opened.session_id.clone());
         let session_capabilities = mango_external_agents::SessionCapabilities::new(
             Self::capabilities_from(&handshake.capabilities),
         );
@@ -854,6 +855,9 @@ impl AcpHarness {
             ));
         }
 
+        // Bound before the request, so a replay naming any other session is refused while this one
+        // loads; a fallback below abandons it before opening a fresh one.
+        connection_state.bind_native_session(AcpSessionId::new(resume.native_session_id.clone()));
         let (catalog_revision, sent) = connection_state.with_catalog_revision(|revision| {
             let sent = client::submit(
                 connection,
@@ -887,6 +891,7 @@ impl AcpHarness {
             // that its history disappeared.
             Err(error) if resume_failure_is_conclusive(&error) => {
                 let reason = resume_fallback_reason("session/load", &error);
+                connection_state.abandon_native_session();
                 let mut opened = self
                     .new_session(connection, connection_state, host, cwd, mcp_servers)
                     .await?;

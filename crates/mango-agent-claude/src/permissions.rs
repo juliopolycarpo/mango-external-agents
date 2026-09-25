@@ -499,6 +499,33 @@ mod tests {
         assert!(kept.supported, "expected every other pair to survive");
     }
 
+    /// A build that lists a mode this harness never passes narrows nothing because of it.
+    ///
+    /// The extra entry is vocabulary this harness has no use for, not drift: every pair a build
+    /// with only the known modes supports stays supported, cell for cell.
+    #[test]
+    fn tolerates_a_mode_this_harness_never_passes() {
+        let known = ["manual", "acceptEdits", "auto", "bypassPermissions", "plan"];
+        let with = |modes: &[&str]| ModeAvailability {
+            accepted_modes: Some(modes.iter().copied().map(String::from).collect()),
+            ..subscription()
+        };
+        let mut widened = known.to_vec();
+        widened.push("somethingNewer");
+
+        let expected = matrix(&with(&known));
+        let received = matrix(&with(&widened));
+        assert_eq!(
+            received, expected,
+            "expected an unknown extra mode to leave the matrix unchanged | received: {received:?}"
+        );
+        let unnarrowed = matrix(&subscription());
+        assert_eq!(
+            received, unnarrowed,
+            "expected every known mode listed to narrow nothing | received: {received:?}"
+        );
+    }
+
     #[test]
     fn an_unread_vocabulary_narrows_nothing() {
         let availability = subscription();
