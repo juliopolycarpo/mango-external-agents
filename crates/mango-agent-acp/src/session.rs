@@ -23,7 +23,7 @@ use mango_external_agents::configuration::{
     ConfigurationPatch, ConfigurationState, ConfigurationValue, ConfigurationValueType,
     RejectedSetting, Rollback, SettingRejection,
 };
-use mango_external_agents::event::EventKind;
+use mango_external_agents::event::{ActivityStatus, EventKind};
 use mango_external_agents::session::{
     AccountUsage, CancelReason, CloseReason, NativeSession, SESSION_PAGE_LIMIT, Session,
     SessionIds, SessionPage, SessionQuery, TurnRequest,
@@ -1240,64 +1240,57 @@ impl Session for AcpSession {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            let _ = turn.approvals.flush(&turn.sink).await;
-            for kind in closing {
-                let _ = turn.sink.emit(kind).await;
-            }
-            if let Some(error) = cleanup_error {
-                let _ = turn
-                    .sink
-                    .fail(link_failure(format!("ACP process cleanup failed: {error}")))
-                    .await;
+            // Decided before anything is emitted, so the calls the agent left running close with a
+            // status that agrees with the terminal that follows them.
+            let (ending, release) = if let Some(error) = cleanup_error {
                 // The process may still be live. Keep this generation installed so admission
                 // remains closed until a later session close can retry teardown.
-                return;
-            }
-            let overflow = match outcome {
+                (
+                    Some(Ending::Fail(link_failure(format!(
+                        "ACP process cleanup failed: {error}"
+                    )))),
+                    false,
+                )
+            } else if let Some(overflow) = match outcome {
                 None | Some(Err(_)) => connection.overflow(),
                 Some(Ok(_)) => None,
+            } {
+                (Some(Ending::Fail(overflow_failure(overflow))), true)
+            } else {
+                let ending = match outcome {
+                    None => match cancel_failure {
+                        Some(message) => Some(Ending::Fail(link_failure(message))),
+                        None if turn.sink.is_terminal() => None,
+                        None => Some(Ending::Cancel(
+                            cancel_reason.unwrap_or(CancelReason::Requested),
+                        )),
+                    },
+                    Some(Ok(response)) if reducer::was_cancelled(response.stop_reason) => Some(
+                        Ending::Cancel(cancel_reason.unwrap_or(CancelReason::Requested)),
+                    ),
+                    Some(Ok(_)) => Some(Ending::Complete),
+                    Some(Err(error)) => Some(match cancel_reason {
+                        Some(reason) => Ending::Cancel(reason),
+                        None => {
+                            let message =
+                                if agent_client_protocol::is_incoming_transport_closed(&error) {
+                                    with_stderr(&error.message, control.as_ref())
+                                } else {
+                                    error.message.clone()
+                                };
+                            Ending::Fail(link_failure(format!("{}: {message}", profile.id)))
+                        }
+                    }),
+                };
+                (ending, true)
             };
-            if let Some(overflow) = overflow {
-                let _ = turn.sink.fail(overflow_failure(overflow)).await;
+            let _ = turn.approvals.flush(&turn.sink).await;
+            if let Some(ending) = ending {
+                ending.emit(&turn.sink, closing).await;
+            }
+            if release {
                 state.release_turn_matching(&handle);
-                return;
             }
-            match outcome {
-                None => {
-                    if let Some(message) = cancel_failure {
-                        let _ = turn.sink.fail(link_failure(message)).await;
-                    } else if !turn.sink.is_terminal() {
-                        let _ = turn
-                            .sink
-                            .cancel(cancel_reason.unwrap_or(CancelReason::Requested))
-                            .await;
-                    }
-                }
-                Some(Ok(response)) if reducer::was_cancelled(response.stop_reason) => {
-                    let reason = cancel_reason.unwrap_or(CancelReason::Requested);
-                    let _ = turn.sink.cancel(reason).await;
-                }
-                Some(Ok(_)) => {
-                    let _ = turn.sink.complete().await;
-                }
-                Some(Err(error)) => {
-                    if let Some(reason) = cancel_reason {
-                        let _ = turn.sink.cancel(reason).await;
-                    } else {
-                        let message = if agent_client_protocol::is_incoming_transport_closed(&error)
-                        {
-                            with_stderr(&error.message, control.as_ref())
-                        } else {
-                            error.message.clone()
-                        };
-                        let _ = turn
-                            .sink
-                            .fail(link_failure(format!("{}: {message}", profile.id)))
-                            .await;
-                    }
-                }
-            }
-            state.release_turn_matching(&handle);
         });
 
         Ok(stream)
@@ -1417,7 +1410,7 @@ fn detach_retry_cancel_cleanup(
 ) {
     tokio::spawn(async move {
         let cleanup_error = connection.wait_shutdown().await.err();
-        let Some((turn, _, _)) = state.prepare_terminal_matching(&handle) else {
+        let Some((turn, _, closing)) = state.prepare_terminal_matching(&handle) else {
             return;
         };
         if !turn.finish() {
@@ -1427,9 +1420,53 @@ fn detach_retry_cancel_cleanup(
             || String::from("ACP session/cancel could not be queued after prompt admission"),
             |error| format!("ACP process cleanup failed: {error}"),
         );
-        let _ = turn.sink.fail(link_failure(message)).await;
+        let _ = turn.approvals.flush(&turn.sink).await;
+        Ending::Fail(link_failure(message))
+            .emit(&turn.sink, closing)
+            .await;
         state.release_turn_matching(&handle);
     });
+}
+
+/// How one ACP turn ends, decided before anything is emitted.
+///
+/// Deciding first is what lets the calls the agent left running close with a status that agrees
+/// with the terminal after them: a call nobody saw finish did not demonstrably succeed, so a failed
+/// turn closes it as failed and a cancelled one as cancelled.
+enum Ending {
+    /// The agent ended its own turn.
+    Complete,
+    /// Somebody stopped it, for this reason.
+    Cancel(CancelReason),
+    /// It failed.
+    Fail(mango_external_agents::VendorError),
+}
+
+impl Ending {
+    /// The status every call the agent left running ends with.
+    fn call_status(&self) -> ActivityStatus {
+        match self {
+            Self::Complete => ActivityStatus::Completed,
+            Self::Cancel(_) => ActivityStatus::Cancelled,
+            Self::Fail(_) => ActivityStatus::Failed,
+        }
+    }
+
+    /// Emits what the turn's reducer still owes, then the terminal itself.
+    ///
+    /// ```ignore
+    /// Ending::Complete.emit(&turn.sink, reducer).await;
+    /// ```
+    async fn emit(self, sink: &EventSink, mut reducer: reducer::Reducer) {
+        for kind in reducer.finish_with(self.call_status()) {
+            let _ = sink.emit(kind).await;
+        }
+        let _ = match self {
+            Self::Complete => sink.complete().await,
+            Self::Cancel(reason) => sink.cancel(reason).await,
+            Self::Fail(error) => sink.fail(error).await,
+        };
+    }
 }
 
 /// Completes the one close operation after it has claimed the session lifecycle.
@@ -1486,27 +1523,18 @@ async fn finish_close(
         let owned = turn.finish();
         if owned {
             let _ = turn.approvals.flush(&turn.sink).await;
-            for kind in closing {
-                let _ = turn.sink.emit(kind).await;
-            }
-            match &result {
+            let ending = match &result {
                 // A budget that already failed the link is why the turn ended, even when a
                 // host close raced its cleanup and took the terminal over.
                 Ok(()) => match connection.overflow() {
-                    Some(overflow) => {
-                        let _ = turn.sink.fail(overflow_failure(overflow)).await;
-                    }
-                    None => {
-                        let _ = turn.sink.cancel(reason.into()).await;
-                    }
+                    Some(overflow) => Ending::Fail(overflow_failure(overflow)),
+                    None => Ending::Cancel(reason.into()),
                 },
                 Err(error) => {
-                    let _ = turn
-                        .sink
-                        .fail(link_failure(format!("ACP process cleanup failed: {error}")))
-                        .await;
+                    Ending::Fail(link_failure(format!("ACP process cleanup failed: {error}")))
                 }
-            }
+            };
+            ending.emit(&turn.sink, closing).await;
         }
         if owned {
             state.release_turn_matching(&handle);

@@ -19,7 +19,7 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
@@ -77,9 +77,19 @@ pub struct Reducer {
     reasoning_open: bool,
     plan_started: bool,
     /// Tool calls the host saw start and has not yet seen end, by the agent's own call id.
-    open_calls: HashSet<String>,
+    open_calls: HashMap<String, OpenCall>,
     /// Tool calls that already ended this turn, so a late frame cannot open a second bracket.
     finished_calls: HashSet<String>,
+    /// Source of [`OpenCall::opened`], so the calls a turn ends owing are closed in the order the
+    /// agent opened them rather than in a hash map's.
+    next_call: u64,
+}
+
+/// One tool call a host is rendering as running.
+#[derive(Debug)]
+struct OpenCall {
+    /// When it opened, relative to the turn's other calls.
+    opened: u64,
 }
 
 impl Reducer {
@@ -123,19 +133,69 @@ impl Reducer {
         (events, facts)
     }
 
-    /// The events that close out a turn, before its terminal.
+    /// The events that close out a turn that completed, before its terminal.
     ///
-    /// Two debts a turn can end owing. A turn that stopped mid-thought owes the other half of the
-    /// reasoning pair; and a turn that opened the plan activity owes its completion, because ACP never
-    /// sends one — the plan is session state that is replaced wholesale, so nothing on the wire marks
-    /// it done. Without this, every turn that wrote a plan leaves a host rendering an activity that
-    /// runs forever.
+    /// [`Self::finish_with`] with [`ActivityStatus::Completed`]: see there for what a turn can end
+    /// owing.
+    pub fn finish(&mut self) -> Vec<EventKind> {
+        self.finish_with(ActivityStatus::Completed)
+    }
+
+    /// The events that close out a turn, before its terminal, with the tool calls the agent left
+    /// running ending as `calls`.
+    ///
+    /// Three debts a turn can end owing. A turn that stopped mid-thought owes the other half of the
+    /// reasoning pair. A tool call the agent announced and never reported as ended owes its
+    /// completion: ACP ends a turn with the `session/prompt` response rather than a frame per call,
+    /// so without this the host renders that call as running forever. And a turn that opened the
+    /// plan activity owes its completion, because ACP never sends one — the plan is session state
+    /// that is replaced wholesale, so nothing on the wire marks it done.
+    ///
+    /// The open calls end as `calls`, in the order the agent opened them. The caller passes the
+    /// status that agrees with the turn's terminal: a call the agent never reported on did not
+    /// demonstrably succeed, so a turn that failed closes it as [`ActivityStatus::Failed`] and a
+    /// cancelled one as [`ActivityStatus::Cancelled`].
     ///
     /// The plan completes as [`ActivityStatus::Completed`] whatever its entries say. The activity is
     /// the *display* of the plan, and the turn ending is what ends it; reporting `Failed` because some
     /// entry was still pending would claim the agent failed at something it merely did not finish.
-    pub fn finish(&mut self) -> Vec<EventKind> {
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use mango_agent_acp::reducer::Reducer;
+    /// use mango_external_agents::event::{ActivityStatus, EventKind};
+    ///
+    /// let running: SessionUpdate = serde_json::from_value(serde_json::json!({
+    ///     "sessionUpdate": "tool_call",
+    ///     "toolCallId": "call_1",
+    ///     "title": "Run `cargo build`",
+    ///     "kind": "execute",
+    ///     "status": "in_progress"
+    /// }))
+    /// .expect("a v1 tool call");
+    ///
+    /// let mut reducer = Reducer::new();
+    /// let _ = reducer.update(running);
+    /// let closing = reducer.finish_with(ActivityStatus::Failed);
+    /// assert!(matches!(
+    ///     closing.as_slice(),
+    ///     [EventKind::ActivityCompleted { call_id, result }]
+    ///         if call_id == "call_1" && result.status == ActivityStatus::Failed
+    /// ));
+    /// ```
+    pub fn finish_with(&mut self, calls: ActivityStatus) -> Vec<EventKind> {
         let mut events = self.close_reasoning();
+        let mut open: Vec<(String, OpenCall)> = self.open_calls.drain().collect();
+        open.sort_by_key(|(_, call)| call.opened);
+        for (call_id, _) in open {
+            self.finished_calls.insert(call_id.clone());
+            events.push(EventKind::ActivityCompleted {
+                call_id,
+                result: ActivityResult::new(calls),
+            });
+        }
         if std::mem::take(&mut self.plan_started) {
             events.push(EventKind::ActivityCompleted {
                 call_id: String::from(PLAN_CALL_ID),
@@ -215,7 +275,7 @@ impl Reducer {
         if self.finished_calls.contains(&call_id) {
             return Vec::new();
         }
-        if self.open_calls.contains(&call_id) {
+        if self.open_calls.contains_key(&call_id) {
             let fields = ToolCallUpdateFields::new()
                 .kind(call.kind)
                 .status(call.status)
@@ -241,7 +301,7 @@ impl Reducer {
         if self.finished_calls.contains(&call_id) {
             return Vec::new();
         }
-        if !self.open_calls.contains(&call_id) {
+        if !self.open_calls.contains_key(&call_id) {
             let fields = update.fields;
             let title = fields
                 .title
@@ -275,7 +335,9 @@ impl Reducer {
             self.finished_calls.insert(call_id);
             return;
         }
-        self.open_calls.insert(call_id);
+        let opened = self.next_call;
+        self.next_call = self.next_call.wrapping_add(1);
+        self.open_calls.insert(call_id, OpenCall { opened });
     }
 
     fn reasoning_delta(&mut self, chunk: ContentChunk) -> Vec<EventKind> {
@@ -830,7 +892,11 @@ mod tests {
             "kind": "execute",
             "status": "in_progress"
         })]);
-        let [EventKind::ActivityStarted { call_id, activity }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { call_id, activity },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one started activity, received {events:?}");
         };
         assert_eq!(call_id, "call_1");
@@ -931,7 +997,11 @@ mod tests {
                 "newText": "fn main() { println!(\"hi\"); }"
             }]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(activity.detail.as_deref(), Some("/repo/src/lib.rs"));
@@ -964,7 +1034,11 @@ mod tests {
             "status": "pending",
             "content": [{ "type": "diff", "path": "/repo/src/new.rs", "newText": "fn new() {}" }]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         let Some(ActivityContent::Diff { files }) = &activity.content else {
@@ -990,7 +1064,11 @@ mod tests {
                 { "type": "content", "content": { "type": "text", "text": "rewrote the entry point" } }
             ]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(
@@ -1020,7 +1098,11 @@ mod tests {
             "status": "pending",
             "content": [{ "type": "content", "content": { "type": "text", "text": "2 tests passed" } }]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(activity.detail.as_deref(), Some("2 tests passed"));
@@ -1045,7 +1127,11 @@ mod tests {
             "status": "pending",
             "locations": [{ "path": "/repo/src/a.rs" }, { "path": "/repo/src/b.rs" }]
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert_eq!(
@@ -1066,7 +1152,11 @@ mod tests {
             "kind": "search",
             "status": "pending"
         })]);
-        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
             panic!("expected one activity, received {events:?}");
         };
         assert!(
@@ -1135,7 +1225,7 @@ mod tests {
                 "content": []
             }),
         ]);
-        let Some(EventKind::ActivityUpdated { update, .. }) = events.last() else {
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.get(1) else {
             panic!("expected an activity update that clears content, received {events:?}");
         };
         assert!(
@@ -1169,7 +1259,7 @@ mod tests {
                 "title": "Editing src/lib.rs"
             }),
         ]);
-        let Some(EventKind::ActivityUpdated { update, .. }) = events.last() else {
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.get(1) else {
             panic!("expected a title update that retains content, received {events:?}");
         };
         assert_eq!(update.title.as_deref(), Some("Editing src/lib.rs"));
@@ -1347,6 +1437,78 @@ mod tests {
             2,
             "expected only the original bracket, received {events:?}"
         );
+    }
+
+    /// ACP ends a turn with the `session/prompt` response, not with a frame per call, so a call the
+    /// agent never reported as ended would otherwise stay running in the host's transcript for
+    /// good. The turn's end closes it, in the order the agent opened its calls.
+    #[test]
+    fn a_call_the_agent_never_ended_is_completed_when_the_turn_completes() {
+        let events = reduce(vec![
+            announced("call_first"),
+            announced("call_second"),
+            announced("call_ended"),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_ended",
+                "status": "completed"
+            }),
+        ]);
+        let closed: Vec<(&str, ActivityStatus)> = events
+            .iter()
+            .skip(4)
+            .filter_map(|event| match event {
+                EventKind::ActivityCompleted { call_id, result } => {
+                    Some((call_id.as_str(), result.status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            vec![
+                ("call_first", ActivityStatus::Completed),
+                ("call_second", ActivityStatus::Completed),
+            ],
+            "expected the two unended calls closed at the turn's end, received {events:?}"
+        );
+    }
+
+    /// A turn that did not complete does not get to claim its unended calls succeeded: they close
+    /// with the status the caller passes, while the plan still completes because the turn ending is
+    /// what ends its display.
+    #[test]
+    fn unended_calls_take_the_turns_status_and_the_plan_still_completes() {
+        for status in [ActivityStatus::Failed, ActivityStatus::Cancelled] {
+            let mut reducer = Reducer::new();
+            let _ = reducer.update(update(announced("call_open")));
+            let _ = reducer.update(update(json!({
+                "sessionUpdate": "plan",
+                "entries": [{ "content": "build", "priority": "high", "status": "pending" }]
+            })));
+            let closing = reducer.finish_with(status);
+            let statuses: Vec<(&str, ActivityStatus)> = closing
+                .iter()
+                .filter_map(|event| match event {
+                    EventKind::ActivityCompleted { call_id, result } => {
+                        Some((call_id.as_str(), result.status))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                statuses,
+                vec![
+                    ("call_open", status),
+                    (PLAN_CALL_ID, ActivityStatus::Completed)
+                ],
+                "expected the call to take {status:?} and the plan to complete, received {closing:?}"
+            );
+            assert!(
+                reducer.finish_with(status).is_empty(),
+                "expected a second finish to owe nothing"
+            );
+        }
     }
 
     /// ACP v1's plan is replaced wholesale and carries no id, so the first one opens an activity and

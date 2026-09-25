@@ -551,10 +551,13 @@ impl SessionState {
     /// What a `session/prompt` task calls. Its own turn may already have been ended by a `close`, and
     /// a *later* turn may have started in the meantime — so an unconditional take would let a task
     /// that answered late end, and emit the terminal of, a conversation that is not its own.
+    ///
+    /// Hands back the turn's own reducer rather than its closing events: what the calls the agent
+    /// left running end as depends on the terminal, which the caller decides after this returns.
     pub(crate) fn prepare_terminal_matching(
         &self,
         handle: &TurnHandle,
-    ) -> Option<(TurnHandle, Option<CancelReason>, Vec<EventKind>)> {
+    ) -> Option<(TurnHandle, Option<CancelReason>, Reducer)> {
         let (turn, reason, pending, closing) = {
             let active = self.lock_turn();
             if active.as_ref()?.generation != handle.generation {
@@ -565,7 +568,7 @@ impl SessionState {
             // newly started prompt clears the reducer and may park approvals of its own.
             let reason = self.lock_cancel_reason().take();
             let pending = self.take_pending();
-            let closing = self.lock_reducer().finish();
+            let closing = std::mem::take(&mut *self.lock_reducer());
             (turn, reason, pending, closing)
         };
         for pending in pending {

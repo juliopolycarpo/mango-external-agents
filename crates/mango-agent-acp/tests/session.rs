@@ -4505,3 +4505,100 @@ mod contracts;
 
 #[path = "session/burst.rs"]
 mod burst;
+
+/// The `tool_call` frame for a call the agent reports as running and never ends.
+fn running_call(call_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "title": "Run `cargo build`",
+        "kind": "execute",
+        "status": "in_progress"
+    })
+}
+
+/// How the turn closed `call_id`, if it did, and whether that happened before the terminal.
+fn closing_status(
+    events: &[EventKind],
+    call_id: &str,
+) -> Option<mango_external_agents::ActivityStatus> {
+    let terminal = events.iter().position(|event| {
+        matches!(
+            event,
+            EventKind::Completed | EventKind::Error { .. } | EventKind::Cancelled { .. }
+        )
+    })?;
+    events[..terminal].iter().find_map(|event| match event {
+        EventKind::ActivityCompleted {
+            call_id: id,
+            result,
+        } if id == call_id => Some(result.status),
+        _ => None,
+    })
+}
+
+/// ACP ends a turn with the `session/prompt` response, and nothing on the wire closes a call the
+/// agent left running. The turn's own end has to, or the host renders that call as running forever.
+#[tokio::test]
+async fn a_call_the_agent_left_running_is_completed_before_the_turn_completes() {
+    let (session, _launcher) = open(
+        FakeAcpAgent::new().with_updates(vec![running_call("call_open")]),
+        permissive(),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "build it"))
+        .await
+        .expect("expected a turn");
+    let events = drain(&mut turn).await;
+
+    assert_eq!(
+        closing_status(&events, "call_open"),
+        Some(mango_external_agents::ActivityStatus::Completed),
+        "expected the running call completed ahead of the terminal, received {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "received {events:?}"
+    );
+}
+
+/// A cancelled turn did not let its running calls finish, so they close as cancelled rather than
+/// claiming a success nobody observed.
+#[tokio::test]
+async fn a_call_left_running_by_a_cancelled_turn_is_closed_as_cancelled() {
+    let (session, _launcher) = open(
+        FakeAcpAgent::new()
+            .with_updates(vec![running_call("call_open")])
+            .asking_for_approval(Approval::Once),
+        permissive(),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "build it"))
+        .await
+        .expect("expected a turn");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = turn.recv().await {
+            let asked = matches!(event.kind, EventKind::ApprovalRequested { .. });
+            events.push(event.kind);
+            if asked {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("expected the agent to ask");
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to land");
+    events.extend(drain(&mut turn).await);
+
+    assert_eq!(
+        closing_status(&events, "call_open"),
+        Some(mango_external_agents::ActivityStatus::Cancelled),
+        "expected the running call cancelled ahead of the terminal, received {events:?}"
+    );
+}

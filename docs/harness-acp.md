@@ -167,6 +167,13 @@ when the update is already terminal. A second `tool_call` for a call that is sti
 update rather than a second start, and a frame for a call that already ended is dropped: the host
 closed that row.
 
+ACP ends a turn with the `session/prompt` response, not with a frame per call, so a call the agent
+never reported as `completed` or `failed` is closed by the turn's own end, before its terminal and in
+the order the agent opened its calls. It closes with the status that agrees with that terminal:
+`Completed` for a completed turn, `Cancelled` for a cancelled one and `Failed` for a failed one — a
+call nobody saw finish did not demonstrably succeed. The plan activity completes either way; it is
+the display of the plan, and the turn ending is what ends it.
+
 Two deliberate limits, each with a test pinning it:
 
 - A non-text block in an *agent message* — an image, audio, an embedded resource — produces no event.
