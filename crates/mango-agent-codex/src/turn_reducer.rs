@@ -17,6 +17,10 @@
 //!   which a resumed conversation can deliver. The completion therefore adds exactly the text its
 //!   deltas did not.
 //!
+//! - **The vendor's error code.** The documented failure order is an `error` notification carrying
+//!   `codexErrorInfo`, then `turn/completed` with status `failed`. A completion that names no code
+//!   of its own keeps the one the last non-retried report named.
+//!
 //! One [`TurnReducer`] belongs to one turn, and is dropped with it.
 
 use std::collections::HashMap;
@@ -68,6 +72,8 @@ pub struct TurnReducer {
     activities: HashMap<String, OpenActivity>,
     /// The answer text already emitted per message item, until that item completes.
     streamed: HashMap<String, String>,
+    /// The vendor code of the last error report the server did not mean to retry.
+    reported_code: Option<String>,
 }
 
 /// One activity the host was told about and has not seen complete.
@@ -141,12 +147,28 @@ impl TurnReducer {
             return self.completed_message(id, text);
         }
 
-        let outcome = reducer::reduce_for_active_turn(
+        let mut outcome = reducer::reduce_for_active_turn(
             notification,
             thread_id,
             active_native_turn_id,
             observed_at,
         );
+        if let Notification::Error(report) = notification
+            && !report.will_retry
+            && reducer::routes_to_active_turn(notification, thread_id, active_native_turn_id)
+            && let Some(code) = report.error.vendor_code()
+        {
+            self.reported_code = Some(code);
+        }
+        if let Outcome::Finish {
+            failure: Some(failure),
+            ..
+        } = &mut outcome
+            && failure.vendor_code.is_none()
+            && let Some(code) = self.reported_code.take()
+        {
+            *failure = failure.clone().with_vendor_code(code, false);
+        }
         if let (Notification::AgentMessageDelta(delta), Outcome::Emit(_)) = (notification, &outcome)
         {
             self.streamed
@@ -550,6 +572,54 @@ mod tests {
             reduce_at(&mut turn, &foreign, tokio::time::Instant::now()),
             Outcome::Ignore
         );
+    }
+
+    /// The documented order is an `error` notification carrying `codexErrorInfo`, then a failed
+    /// `turn/completed`. A completion without a code of its own keeps the one the report named.
+    #[test]
+    fn a_failed_completion_without_a_code_keeps_the_one_its_error_report_named() {
+        let mut turn = TurnReducer::new();
+        let at = tokio::time::Instant::now();
+        let reported = Notification::parse(
+            method::ERROR,
+            json!({"threadId": THREAD, "turnId": TURN, "willRetry": false,
+                   "error": {"message": "limit", "codexErrorInfo": "usageLimitExceeded"}}),
+        );
+        assert_eq!(reduce_at(&mut turn, &reported, at), Outcome::Ignore);
+        let completed = Notification::parse(
+            method::TURN_COMPLETED,
+            json!({"threadId": THREAD, "turn": {"id": TURN, "status": "failed",
+                   "error": {"message": "limit"}}}),
+        );
+        let Outcome::Finish { failure, .. } = reduce_at(&mut turn, &completed, at) else {
+            panic!("expected the turn to end");
+        };
+        assert_eq!(
+            failure.and_then(|failure| failure.vendor_code).as_deref(),
+            Some("usageLimitExceeded")
+        );
+    }
+
+    /// A report the server means to retry says nothing about how the turn ends.
+    #[test]
+    fn a_retried_error_report_does_not_name_the_turns_failure() {
+        let mut turn = TurnReducer::new();
+        let at = tokio::time::Instant::now();
+        let reported = Notification::parse(
+            method::ERROR,
+            json!({"threadId": THREAD, "turnId": TURN, "willRetry": true,
+                   "error": {"message": "busy", "codexErrorInfo": "serverOverloaded"}}),
+        );
+        let _ = reduce_at(&mut turn, &reported, at);
+        let completed = Notification::parse(
+            method::TURN_COMPLETED,
+            json!({"threadId": THREAD, "turn": {"id": TURN, "status": "failed",
+                   "error": {"message": "gave up"}}}),
+        );
+        let Outcome::Finish { failure, .. } = reduce_at(&mut turn, &completed, at) else {
+            panic!("expected the turn to end");
+        };
+        assert_eq!(failure.and_then(|failure| failure.vendor_code), None);
     }
 
     #[test]

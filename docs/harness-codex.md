@@ -74,6 +74,14 @@ Notifications acted on: `turn/started`, `turn/completed`, `item/started`, `item/
 `thread/tokenUsage/updated`, `account/rateLimits/updated`, `serverRequest/resolved`, `error`.
 Everything else is dropped by name.
 
+**A failed turn keeps the vendor's classification.** The app-server documents failures as an
+`error` notification with `{ error: { message, codexErrorInfo?, additionalDetails? } }` followed by
+`turn/completed` with status `failed` ([app-server][app-server]). The `codexErrorInfo` label — a
+string such as `usageLimitExceeded`, or the one key of an object such as `httpConnectionFailed` —
+becomes `VendorError::vendor_code` on the turn's failure, taken from the completion's own error or,
+when that names none, from the last report the server did not mean to retry. The harness code stays
+`codex-turn-failed`.
+
 **`turn/completed` is the only terminal.** The `error` notification reads like an ending and is
 not one — it carries `willRetry`, and the turn's own completion still follows. Ending a turn there
 would end the host's turn twice.

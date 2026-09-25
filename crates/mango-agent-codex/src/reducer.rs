@@ -281,6 +281,7 @@ fn finish(status: Option<TurnStatus>, turn: &crate::protocol::requests::TurnHand
         },
         Some(TurnStatus::Failed) => {
             let error = turn.error.clone().unwrap_or_default();
+            let vendor_code = error.vendor_code();
             let message = match error.additional_details {
                 Some(details) if !details.is_empty() => format!("{}: {details}", error.message),
                 _ => error.message,
@@ -288,14 +289,22 @@ fn finish(status: Option<TurnStatus>, turn: &crate::protocol::requests::TurnHand
             Outcome::Finish {
                 events: Vec::new(),
                 cancelled: None,
-                failure: Some(VendorError::new(
-                    TURN_FAILED,
-                    if message.is_empty() {
-                        String::from("the turn failed without saying why")
-                    } else {
-                        message
-                    },
-                )),
+                failure: Some({
+                    let failure = VendorError::new(
+                        TURN_FAILED,
+                        if message.is_empty() {
+                            String::from("the turn failed without saying why")
+                        } else {
+                            message
+                        },
+                    );
+                    // The vendor already gave up on this turn, so the same request is not
+                    // retryable by itself.
+                    match vendor_code {
+                        Some(code) => failure.with_vendor_code(code, false),
+                        None => failure,
+                    }
+                }),
             }
         }
     }
@@ -761,6 +770,41 @@ mod tests {
         let failure = failure.expect("expected a failure");
         assert_eq!(failure.message, "upstream refused: 429");
         assert_eq!(failure.code.as_str(), "codex-turn-failed");
+    }
+
+    /// The vendor's own classification survives, so a host can say "usage limit reached" rather
+    /// than "the turn failed".
+    #[test]
+    fn a_failed_turn_keeps_the_vendors_error_code() {
+        for (info, expected) in [
+            (json!("usageLimitExceeded"), "usageLimitExceeded"),
+            (
+                json!({"httpConnectionFailed": {"httpStatusCode": 502}}),
+                "httpConnectionFailed",
+            ),
+        ] {
+            let outcome = reduce(
+                &notification(
+                    method::TURN_COMPLETED,
+                    json!({"threadId": THREAD, "turn": {"id": "u", "status": "failed", "error": {
+                        "message": "limit", "codexErrorInfo": info
+                    }}}),
+                ),
+                THREAD,
+                now(),
+            );
+            let Outcome::Finish { failure, .. } = outcome else {
+                panic!("expected the turn to end, received {outcome:?}");
+            };
+            let failure = failure.expect("expected a failure");
+            assert_eq!(
+                failure.vendor_code.as_deref(),
+                Some(expected),
+                "expected the codexErrorInfo code, received {:?}",
+                failure.vendor_code
+            );
+            assert_eq!(failure.code.as_str(), "codex-turn-failed");
+        }
     }
 
     /// The failure this module exists to prevent. `error` reads like an ending and is not one —

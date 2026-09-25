@@ -256,7 +256,15 @@ mod tests {
         // as a turn whose input the server silently refuses.
         assert_declares("UserInput", &["text", "text_elements", "url"]);
         assert_accepts("UserInput", &["text", "image"]);
-        assert_declares("TurnError", &["message", "additionalDetails"]);
+        assert_declares(
+            "TurnError",
+            &["message", "additionalDetails", "codexErrorInfo"],
+        );
+        assert_accepts("CodexErrorInfo", &["usageLimitExceeded", "other"]);
+        assert_declares(
+            "CodexErrorInfo",
+            &["activeTurnNotSteerable", "httpConnectionFailed"],
+        );
         assert_accepts(
             "TurnStatus",
             &["inProgress", "completed", "interrupted", "failed"],

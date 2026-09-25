@@ -415,6 +415,7 @@ pub enum TurnStatus {
 /// What the server said about a failed turn.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TurnError {
     /// The message it wrote.
     #[serde(default)]
@@ -422,6 +423,46 @@ pub struct TurnError {
     /// More, when it had more to say.
     #[serde(default)]
     pub additional_details: Option<String>,
+    /// The vendor's own classification: a string such as `usageLimitExceeded`, or a single-key
+    /// object such as `{"httpConnectionFailed": {"httpStatusCode": 502}}`.
+    #[serde(default)]
+    pub codex_error_info: Option<serde_json::Value>,
+}
+
+impl TurnError {
+    /// The vendor's classification as one label, when it gave one.
+    ///
+    /// A string member is its own label; an object member is labelled by its one key. Anything
+    /// else reads as `other`, the vendor's own catch-all.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_codex::protocol::requests::TurnError;
+    ///
+    /// let error: TurnError = serde_json::from_value(serde_json::json!({
+    ///     "message": "limit", "codexErrorInfo": "usageLimitExceeded"
+    /// })).unwrap();
+    /// assert_eq!(error.vendor_code().as_deref(), Some("usageLimitExceeded"));
+    /// ```
+    #[must_use]
+    pub fn vendor_code(&self) -> Option<String> {
+        self.codex_error_info.as_ref().map(codex_error_code)
+    }
+}
+
+/// One label for a `CodexErrorInfo` value, as [`TurnError::vendor_code`] describes.
+#[must_use]
+pub fn codex_error_code(info: &serde_json::Value) -> String {
+    match info {
+        serde_json::Value::String(code) if !code.is_empty() => code.clone(),
+        serde_json::Value::Object(members) => members
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| String::from("other")),
+        _ => String::from("other"),
+    }
 }
 
 /// One turn, as much of it as this harness reads.
