@@ -20,6 +20,15 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
         return None;
     }
     let (name, kind, title, detail, content) = match item {
+        // A family this build does not model is still work the agent did: shown under the
+        // vendor's own name, and only when it carries an id a completion can address.
+        ThreadItem::Other { item_type, id } if item.is_unmodelled_family() && id.is_some() => (
+            item_type.as_str(),
+            ActivityKind::Other,
+            item_type.clone(),
+            None,
+            None,
+        ),
         ThreadItem::CommandExecution { command, cwd, .. } => (
             "shell",
             ActivityKind::Command,
@@ -79,7 +88,9 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
             None,
             None,
         ),
-        ThreadItem::AgentMessage { .. } | ThreadItem::Reasoning { .. } | ThreadItem::Other => {
+        ThreadItem::AgentMessage { .. }
+        | ThreadItem::Reasoning { .. }
+        | ThreadItem::Other { .. } => {
             return None;
         }
     };
@@ -301,7 +312,7 @@ mod tests {
         for raw in [
             json!({"type": "agentMessage", "id": "m-1", "text": "hello"}),
             json!({"type": "reasoning", "id": "r-1", "summary": ["thinking"], "content": []}),
-            json!({"type": "somethingTheNextReleaseAdded", "id": "x-1"}),
+            json!({"type": "userMessage", "id": "u-1", "content": []}),
         ] {
             let item = item(raw.clone());
             assert!(started(&item).is_none(), "expected no activity for {raw}");

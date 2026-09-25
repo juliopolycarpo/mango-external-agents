@@ -532,6 +532,13 @@ own id in `item_id`. A subagent's thread id is not carried either — the vendor
 flattened property union across all nineteen item families, so it cannot say which family owns
 `agentThreadId`, and no captured frame carries it.
 
+An item family this build does not model — `imageView`, `dynamicToolCall`, `sleep`, or one a
+newer Codex adds — is still work the agent did, so it renders as an `ActivityKind::Other` activity
+named by the vendor's own `type`, bracketed by its `id`. Echoes of the client's own input
+(`userMessage`, `hookPrompt`, `functionCallOutput`) render nothing, and an unknown item without an
+id renders nothing because no completion could address it. The item families are listed in the
+[app-server documentation][app-server].
+
 ## Known gaps
 
 - No websocket or unix-socket transport (see above).

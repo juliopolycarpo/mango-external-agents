@@ -828,4 +828,83 @@ mod tests {
         );
         assert_eq!(outcome, Outcome::Ignore);
     }
+
+    /// A newer Codex adds item families this build has never heard of. The work still happened,
+    /// so it is shown as an `Other` activity under the vendor's own type name rather than hidden.
+    #[test]
+    fn an_item_family_this_build_does_not_know_is_rendered_as_other_activity() {
+        let started = reduce(
+            &notification(
+                method::ITEM_STARTED,
+                json!({"threadId": THREAD, "turnId": "u",
+                       "item": {"type": "somethingTheNextReleaseAdded", "id": "x-1",
+                                "whatever": {"nested": true}}}),
+            ),
+            THREAD,
+            now(),
+        );
+        let Outcome::Emit(events) = &started else {
+            panic!("expected an activity for the unknown item, received {started:?}");
+        };
+        let [EventKind::ActivityStarted { call_id, activity }] = events.as_slice() else {
+            panic!("expected one ActivityStarted, received {events:?}");
+        };
+        assert_eq!(call_id, "x-1");
+        assert_eq!(activity.kind, ActivityKind::Other);
+        assert_eq!(activity.name, "somethingTheNextReleaseAdded");
+
+        let completed = reduce(
+            &notification(
+                method::ITEM_COMPLETED,
+                json!({"threadId": THREAD, "turnId": "u",
+                       "item": {"type": "somethingTheNextReleaseAdded", "id": "x-1"}}),
+            ),
+            THREAD,
+            now(),
+        );
+        assert!(
+            matches!(&completed, Outcome::Emit(events) if matches!(
+                events.as_slice(),
+                [EventKind::ActivityCompleted { call_id, result }]
+                    if call_id == "x-1" && result.status == ActivityStatus::Completed
+            )),
+            "expected the unknown item to complete its activity, received {completed:?}"
+        );
+    }
+
+    /// Echoes of what the client itself sent are not work the agent did.
+    #[test]
+    fn an_echo_of_the_clients_own_input_is_not_an_activity() {
+        for item_type in ["userMessage", "hookPrompt", "functionCallOutput"] {
+            let outcome = reduce(
+                &notification(
+                    method::ITEM_STARTED,
+                    json!({"threadId": THREAD, "turnId": "u",
+                           "item": {"type": item_type, "id": "echo-1"}}),
+                ),
+                THREAD,
+                now(),
+            );
+            assert_eq!(
+                outcome,
+                Outcome::Ignore,
+                "expected {item_type} to render nothing"
+            );
+        }
+    }
+
+    /// An unknown item with no id cannot be bracketed, so it renders nothing rather than an
+    /// activity the host could never see complete.
+    #[test]
+    fn an_unknown_item_without_an_id_renders_nothing() {
+        let outcome = reduce(
+            &notification(
+                method::ITEM_STARTED,
+                json!({"threadId": THREAD, "turnId": "u", "item": {"type": "somethingNew"}}),
+            ),
+            THREAD,
+            now(),
+        );
+        assert_eq!(outcome, Outcome::Ignore);
+    }
 }
