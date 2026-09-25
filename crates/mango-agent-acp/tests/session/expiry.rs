@@ -729,3 +729,260 @@ async fn expiry_refuses_with_a_standing_option_when_the_agent_offers_no_one_time
     );
     session.close(CloseReason::Shutdown).await.expect("close");
 }
+
+/// A host whose idle and approval deadlines are short enough to reach on paused time.
+fn idle_host(launcher: &FakeLauncher, idle: Duration, approval: Duration) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            idle_timeout: idle,
+            approval_timeout: approval,
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+async fn open_idle(
+    agent: mango_external_agents::testing::FakeProcess,
+    idle: Duration,
+    approval: Duration,
+) -> (Box<dyn Session>, FakeLauncher) {
+    let launcher = FakeLauncher::new();
+    launcher.push(agent);
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &idle_host(&launcher, idle, approval),
+            OpenSession::new("chat-idle").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+    (session, launcher)
+}
+
+/// Lets every task that the last time step woke run to its next await.
+async fn settle() {
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn cancel_sent(launcher: &FakeLauncher) -> bool {
+    launcher
+        .written()
+        .iter()
+        .any(|line| line.contains("\"session/cancel\""))
+}
+
+fn timed_out(events: &[EventKind]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            EventKind::Cancelled {
+                reason: CancelReason::Timeout
+            }
+        )
+    })
+}
+
+/// An agent that stops reporting mid-turn cannot hold the turn until a host's hard cap: at the
+/// host's idle deadline the turn is cancelled natively, with the timeout named as its reason.
+#[tokio::test(start_paused = true)]
+async fn a_silent_agent_is_cancelled_at_the_idle_deadline() {
+    let idle = Duration::from_secs(5);
+    let (session, launcher) = open_idle(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .staying_silent()
+            .process(),
+        idle,
+        Duration::from_secs(600),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("idle", "go quiet"))
+        .await
+        .expect("expected a turn");
+    settle().await;
+    tokio::time::advance(idle - Duration::from_secs(1)).await;
+    settle().await;
+    assert!(
+        !cancel_sent(&launcher),
+        "expected no cancel before the idle deadline, received {:?}",
+        launcher.written()
+    );
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    settle().await;
+    let events = drain(&mut turn).await;
+    assert!(
+        cancel_sent(&launcher),
+        "expected session/cancel at the idle deadline, received {:?}",
+        launcher.written()
+    );
+    assert!(
+        timed_out(&events),
+        "expected the idle deadline to name its timeout reason, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
+
+/// Progress is what the deadline measures: an agent that keeps reporting inside every idle window
+/// is working, however long the whole turn takes.
+#[tokio::test(start_paused = true)]
+async fn each_update_restarts_the_idle_deadline() {
+    let idle = Duration::from_secs(5);
+    let announcer = mango_external_agents::testing::Announcer::new();
+    let (session, launcher) = open_idle(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .staying_silent()
+            .process()
+            .announcing(announcer.clone()),
+        idle,
+        Duration::from_secs(600),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("idle", "keep talking"))
+        .await
+        .expect("expected a turn");
+    settle().await;
+    for round in 0..6 {
+        tokio::time::advance(Duration::from_secs(3)).await;
+        announcer.announce(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess_fake",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": format!("still here {round}") }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        settle().await;
+    }
+    assert!(
+        !cancel_sent(&launcher),
+        "expected 18s of steady progress to outlive a 5s idle deadline, received {:?}",
+        launcher.written()
+    );
+
+    tokio::time::advance(idle + Duration::from_secs(1)).await;
+    settle().await;
+    let events = drain(&mut turn).await;
+    assert!(
+        timed_out(&events),
+        "expected the deadline to fire once the agent went quiet, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
+
+/// A pending approval has its own deadline. Waiting for a person is not the agent going quiet, so
+/// the idle deadline does not run while the question is open, and the turn finishes normally once
+/// it is answered.
+#[tokio::test(start_paused = true)]
+async fn a_pending_approval_pauses_the_idle_deadline() {
+    let idle = Duration::from_secs(5);
+    let (session, launcher) = open_idle(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .asking_for_approval(Approval::Once)
+            .process(),
+        idle,
+        Duration::from_secs(600),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("idle", "ask first"))
+        .await
+        .expect("expected a turn");
+    let question = loop {
+        let event = turn.recv().await.expect("expected an approval request");
+        if let EventKind::ApprovalRequested { request } = event.kind {
+            break request;
+        }
+    };
+    tokio::time::advance(idle * 6).await;
+    settle().await;
+    assert!(
+        !cancel_sent(&launcher),
+        "expected the approval, not the idle deadline, to own this wait, received {:?}",
+        launcher.written()
+    );
+
+    session
+        .respond(question.allow().expect("expected an allow option"))
+        .await
+        .expect("expected the answer to land");
+    let events = drain(&mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the answered turn to complete, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
+
+/// Once the approval's own deadline has expired the turn is no longer waiting for anybody, so the
+/// idle deadline resumes from that moment: an agent that goes quiet after its refusal is cancelled
+/// one idle period later, not left to run until a host's hard cap.
+#[tokio::test(start_paused = true)]
+async fn the_idle_deadline_resumes_once_an_approval_expires() {
+    let idle = Duration::from_secs(5);
+    let approval = Duration::from_secs(10);
+    let (session, launcher) = open_idle(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .asking_for_approval(Approval::Once)
+            .staying_silent()
+            .process(),
+        idle,
+        approval,
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("idle", "ask and stall"))
+        .await
+        .expect("expected a turn");
+    loop {
+        let event = turn.recv().await.expect("expected an approval request");
+        if matches!(event.kind, EventKind::ApprovalRequested { .. }) {
+            break;
+        }
+    }
+    tokio::time::advance(approval + Duration::from_secs(1)).await;
+    settle().await;
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("\"optionId\":\"reject\"")),
+        "expected the approval to expire with its refusal, received {:?}",
+        launcher.written()
+    );
+    assert!(
+        !cancel_sent(&launcher),
+        "expected no idle cancel inside the approval's own window, received {:?}",
+        launcher.written()
+    );
+
+    tokio::time::advance(idle + Duration::from_secs(1)).await;
+    settle().await;
+    let events = drain(&mut turn).await;
+    assert!(
+        cancel_sent(&launcher),
+        "expected session/cancel one idle period after the expiry, received {:?}",
+        launcher.written()
+    );
+    assert!(
+        timed_out(&events),
+        "expected the resumed idle deadline to name its timeout reason, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}

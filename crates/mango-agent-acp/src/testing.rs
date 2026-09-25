@@ -67,6 +67,9 @@ pub struct FakeAcpAgent {
     load_session_error: Option<(i32, String)>,
     /// Streams a turn's updates and never answers its `session/prompt`.
     never_finishes: bool,
+    /// Holds each turn open after its updates and after any permission answer, ending it only
+    /// when the client sends `session/cancel`.
+    stays_silent: bool,
     /// Raises a permission request when the client sends `session/close`.
     asks_when_closing: bool,
     /// Once the first `session/request_permission` is answered, raises a second one reusing the
@@ -114,6 +117,7 @@ impl FakeAcpAgent {
             new_session_error: None,
             load_session_error: None,
             never_finishes: false,
+            stays_silent: false,
             asks_when_closing: false,
             reuse_request_id_for_second_ask: false,
             config_options: None,
@@ -173,6 +177,24 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn never_finishing_turns(mut self) -> Self {
         self.never_finishes = true;
+        self
+    }
+
+    /// Streams a turn's updates, then goes silent: the prompt stays open, a permission answer ends
+    /// nothing, and only `session/cancel` ends the turn, as `stop_reason: cancelled`.
+    ///
+    /// An agent stuck in a tool call that reports nothing. It is what a host's idle deadline has to
+    /// be tested against, and it still honours cancellation so the deadline's own stop lands.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let _process = FakeAcpAgent::new().with_updates(Vec::new()).staying_silent().process();
+    /// ```
+    #[must_use]
+    pub fn staying_silent(mut self) -> Self {
+        self.stays_silent = true;
         self
     }
 
@@ -565,6 +587,14 @@ impl FakeAcpAgent {
             return lines;
         }
 
+        if self.approval == Approval::Never && self.stays_silent {
+            pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .hold(id);
+            return lines;
+        }
+
         if self.approval == Approval::Never {
             lines.push(result(
                 id,
@@ -660,6 +690,13 @@ impl FakeAcpAgent {
             }
         }
 
+        if self.stays_silent && !withdrawn {
+            pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .question_open = false;
+            return Vec::new();
+        }
         let turn = pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -723,6 +760,12 @@ impl PendingTurn {
         let id = self.next_request_id();
         self.last_request_id = Some(id);
         id
+    }
+
+    /// Holds a prompt open with no question outstanding, for a silent agent.
+    fn hold(&mut self, prompt_id: serde_json::Value) {
+        self.prompt_id = Some(prompt_id);
+        self.question_open = false;
     }
 
     /// Raises a second question in the same turn, on the same JSON-RPC id the first one used.

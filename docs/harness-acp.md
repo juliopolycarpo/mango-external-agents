@@ -136,6 +136,18 @@ names no turn handle of its own. It is minted synchronously, before the prompt r
 arrives only if the agent answers. The cost is that this id appears in no captured transcript: it is
 the harness's own counter, not something a vendor said.
 
+`Limits::idle_timeout` bounds how long a turn may stay silent. Every `session/update` the agent
+sends restarts it, and so does every change to the pending questions. While a
+`session/request_permission` is waiting on an answer the deadline is paused, not consumed: the
+approval has its own `Limits::approval_timeout`, and waiting for a person is not the agent going
+quiet. Once that question is answered, withdrawn or expires, the deadline restarts from that moment,
+so a turn whose approval lapsed stops waiting one idle period later. At the deadline the harness
+sends [`session/cancel`](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation)
+exactly as a host cancel would. The turn ends as `Cancelled { reason: Timeout }` when the agent
+answers with `stop_reason: cancelled`, or after `Limits::kill_grace` and a reap when it does not.
+There is no floor, unlike the Claude harness's ten minutes: an ACP agent reports a running tool call
+through `tool_call_update`, so a silent one is not a working one.
+
 Steering is `Error::NotSupported` on every profile: ACP v1 has no surface for adding to a turn that is
 already running.
 

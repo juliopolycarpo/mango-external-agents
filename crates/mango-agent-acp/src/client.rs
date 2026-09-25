@@ -334,6 +334,9 @@ pub(crate) struct SessionState {
     pending: Mutex<HashMap<String, PendingApproval>>,
     /// Source of [`Self::mint_approval_id`]'s ids. Separate from `generations`, which stamps turns.
     next_approval: AtomicU64,
+    /// Bumped on every frame the agent sends and every change to the pending questions, so the
+    /// idle deadline restarts on progress and re-reads whether a question is still open.
+    activity: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -371,6 +374,51 @@ impl SessionState {
             reducer: Mutex::new(Reducer::new()),
             pending: Mutex::new(HashMap::new()),
             next_approval: AtomicU64::new(0),
+            activity: tokio::sync::watch::channel(0).0,
+        }
+    }
+
+    /// Restarts idle accounting: the agent said something, or a question opened or closed.
+    fn touch(&self) {
+        self.activity
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    /// Resolves once the running turn has spent `idle` with no frame from the agent and no
+    /// question waiting on an answer.
+    ///
+    /// A pending question pauses the deadline rather than consuming it: the approval has its own
+    /// deadline (`Limits::approval_timeout`), and waiting for a person is not the agent going
+    /// quiet. When that question is answered, withdrawn or expires, the deadline restarts from
+    /// that moment, so a turn whose approval lapsed stops waiting one idle period later.
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     () = state.idle_expired(limits.idle_timeout) => { /* cancel with Timeout */ }
+    ///     outcome = &mut prompt => { /* the turn ended on its own */ }
+    /// }
+    /// ```
+    pub(crate) async fn idle_expired(&self, idle: std::time::Duration) {
+        let mut changes = self.activity.subscribe();
+        loop {
+            if self.pending_count() > 0 {
+                if changes.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+                continue;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(idle) => {
+                    if self.pending_count() == 0 {
+                        return;
+                    }
+                }
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return std::future::pending().await;
+                    }
+                }
+            }
         }
     }
 
@@ -676,7 +724,12 @@ impl SessionState {
     /// The four places a turn can end all owe the same debt, and each of them takes the requests
     /// out in one statement so nothing is held while the answers go out.
     fn take_pending(&self) -> Vec<PendingApproval> {
-        self.lock_pending().drain().map(|(_, held)| held).collect()
+        let taken: Vec<PendingApproval> =
+            self.lock_pending().drain().map(|(_, held)| held).collect();
+        if !taken.is_empty() {
+            self.touch();
+        }
+        taken
     }
 
     /// Parks an agent question unless cancellation already won its race.
@@ -702,6 +755,8 @@ impl SessionState {
             return Ok(false);
         }
         parked.insert(id, pending);
+        drop(parked);
+        self.touch();
         Ok(true)
     }
 
@@ -735,6 +790,7 @@ impl SessionState {
         let Some(mut pending) = pending else {
             return Ok(Answered::AlreadyResolved);
         };
+        self.touch();
         if cancelling.is_some() {
             pending.responder.respond(permission::cancelled())?;
             return Ok(Answered::AlreadyResolved);
@@ -777,7 +833,10 @@ impl SessionState {
     pub(crate) fn withdraw_pending_by_id(&self, id: &str) -> agent_client_protocol::Result<()> {
         let pending = self.lock_pending().remove(id);
         match pending {
-            Some(pending) => pending.responder.respond(permission::cancelled()),
+            Some(pending) => {
+                self.touch();
+                pending.responder.respond(permission::cancelled())
+            }
             None => Ok(()),
         }
     }
@@ -911,6 +970,7 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     // Capture the current owner before reducing session facts. Facts may arrive between turns;
     // their publication must not attach turn events to a newly admitted generation.
     let turn = state.turn();
+    state.touch();
     let (events, facts) = state.reduce(notification);
     // Published before the turn events: a session fact is true the moment the agent announced it,
     // not only once a host has read every event that preceded it on this turn's own stream.

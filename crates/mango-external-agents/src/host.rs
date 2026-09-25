@@ -180,6 +180,10 @@ pub struct Limits {
     /// How long one request waits for its answer before it is a failure.
     pub request_timeout: Duration,
     /// Maximum time a turn may remain silent without an outstanding host interaction.
+    ///
+    /// Honoured by the Codex and ACP harnesses. Both pause it while an approval waits on an answer
+    /// and restart it once that approval is settled or expires. The Claude harness floors it at
+    /// ten minutes.
     pub idle_timeout: Duration,
     /// Maximum time allowed for a session shutdown stage.
     ///

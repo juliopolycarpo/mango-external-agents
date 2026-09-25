@@ -1212,6 +1212,16 @@ impl Session for AcpSession {
                     drop(_starting);
                     tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
                 },
+                () = state.idle_expired(limits.idle_timeout) => {
+                    // The agent went quiet with nothing waiting on the host. Stopped the same way a
+                    // host cancel is, so an agent that honours `session/cancel` ends its own turn and
+                    // one that does not is reaped after the kill grace.
+                    if request_native_cancel(&state, &outgoing, native_session_id.clone(), CancelReason::Timeout) {
+                        tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
+                    } else {
+                        None
+                    }
+                },
                 () = driver_done.cancelled() => None,
             };
             let cleanup_error = if outcome.is_none() || matches!(outcome, Some(Err(_))) {
