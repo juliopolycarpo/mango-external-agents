@@ -742,10 +742,25 @@ impl fmt::Debug for ThreadListResponse {
 /// Asking which models this build accepts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ModelListParams {
+    /// Where to continue from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
     /// How many to return.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+impl ModelListParams {
+    /// The page that starts at `cursor`, or the first page for `None`, at the server's page size.
+    #[must_use]
+    pub fn page(cursor: Option<String>) -> Self {
+        Self {
+            cursor,
+            limit: None,
+        }
+    }
 }
 
 /// One reasoning choice a model offers.
@@ -789,10 +804,14 @@ pub struct Model {
 /// One page of models.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ModelListResponse {
     /// The rows.
     #[serde(default)]
     pub data: Vec<Model>,
+    /// Where the next page starts, when there is one.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// Asking which permission profiles this machine's configuration allows.

@@ -649,6 +649,31 @@ impl Probed {
 /// cursor cannot hold discovery open.
 const PROBE_PAGE_LIMIT: usize = 8;
 
+/// Every model the server lists, walking its cursor.
+///
+/// Bounded by [`PROBE_PAGE_LIMIT`] pages and the core's catalog cap. A page that fails mid-walk
+/// keeps what was already read rather than discarding the catalog.
+async fn read_model_catalog(client: &Client) -> Vec<crate::protocol::requests::Model> {
+    let mut models = Vec::new();
+    let mut cursor = None;
+    for _ in 0..PROBE_PAGE_LIMIT {
+        let Ok(page) = client
+            .request::<_, ModelListResponse>(method::MODEL_LIST, ModelListParams::page(cursor))
+            .await
+        else {
+            break;
+        };
+        models.extend(page.data);
+        cursor = page.next_cursor.filter(|cursor| !cursor.is_empty());
+        if cursor.is_none()
+            || models.len() >= mango_external_agents::normalize::MODEL_CATALOG_MAX_ITEMS
+        {
+            break;
+        }
+    }
+    models
+}
+
 /// Every permission profile the server lists for the host's project, or nothing when it would not
 /// answer: a build that cannot say has not forbidden anything.
 async fn read_permission_profiles(
@@ -692,16 +717,11 @@ async fn probe_app_server(host: &HostContext, executable: &ExecutablePath) -> Re
         .request(method::ACCOUNT_READ, empty_params())
         .await
         .unwrap_or_default();
-    let models: ModelListResponse = connection
-        .client
-        .request(method::MODEL_LIST, ModelListParams { limit: None })
-        .await
-        .unwrap_or_default();
+    let models = read_model_catalog(&connection.client).await;
     let profiles = read_permission_profiles(&connection.client, host.absolute_cwd()?).await;
     let probed = Probed {
         auth: discovery::auth_state(account.account.as_ref(), account.requires_openai_auth),
         models: models
-            .data
             .into_iter()
             .filter(|model| !model.hidden)
             .map(to_model)

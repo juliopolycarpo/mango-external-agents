@@ -421,8 +421,8 @@ mod tests {
     fn the_account_and_model_fields_are_the_ones_the_pinned_build_declares() {
         assert_declares("GetAccountResponse", &["account", "requiresOpenaiAuth"]);
         assert_accepts("Account", &["apiKey", "chatgpt", "amazonBedrock"]);
-        assert_declares("ModelListParams", &["limit"]);
-        assert_declares("ModelListResponse", &["data"]);
+        assert_declares("ModelListParams", &["cursor", "limit"]);
+        assert_declares("ModelListResponse", &["data", "nextCursor"]);
         assert_declares(
             "Model",
             &[

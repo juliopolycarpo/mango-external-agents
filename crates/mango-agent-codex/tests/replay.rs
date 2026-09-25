@@ -5162,8 +5162,26 @@ fn probe_host(
 ) -> (HostContext, Arc<FakeLauncher>) {
     let launcher = Arc::new(FakeLauncher::new());
     launcher.push(version_answer());
-    launcher.push(Transcript::load("handshake").as_process_intercepting(answer));
+    launcher.push(
+        Transcript::load("handshake")
+            .as_process_intercepting(move |frame| answer(frame).or_else(|| last_model_page(frame))),
+    );
     with_launcher(launcher, None)
+}
+
+/// Ends the model catalog after the recorded first page.
+///
+/// The handshake recording's `model/list` answer carries a `nextCursor`, and the recording holds
+/// no second page; answering it empty keeps a probe from waiting out its request timeout.
+fn last_model_page(frame: &serde_json::Value) -> Option<Vec<String>> {
+    (frame.get("method") == Some(&serde_json::json!("model/list"))
+        && frame.pointer("/params/cursor").is_some())
+    .then(|| {
+        vec![
+            serde_json::json!({"id": frame["id"], "result": {"data": [], "nextCursor": null}})
+                .to_string(),
+        ]
+    })
 }
 
 /// Answers `permissionProfile/list` with these profiles.
@@ -5230,6 +5248,47 @@ async fn discovery_offers_only_the_permission_profiles_the_machine_allows() {
     );
 }
 
+/// `model/list` is cursor-paginated with a server-chosen page size; reading only the first page
+/// hides every model past it.
+#[tokio::test]
+async fn discovery_walks_every_model_list_page() {
+    let (host, launcher) = probe_host(|frame| {
+        if frame.get("method") == Some(&serde_json::json!("model/list")) {
+            let page = match frame
+                .pointer("/params/cursor")
+                .and_then(serde_json::Value::as_str)
+            {
+                None => serde_json::json!({"data": [{"id": "model-a", "isDefault": true}],
+                                           "nextCursor": "page-2"}),
+                Some("page-2") => {
+                    serde_json::json!({"data": [{"id": "model-b"}], "nextCursor": null})
+                }
+                Some(other) => panic!("expected the cursor the server returned, received {other}"),
+            };
+            return Some(vec![
+                serde_json::json!({"id": frame["id"], "result": page}).to_string(),
+            ]);
+        }
+        profiles_answer(frame, &serde_json::json!([]))
+    });
+    let discovery = CodexHarness::new()
+        .discover(&host)
+        .await
+        .expect("expected a discovery");
+    let ids: Vec<&str> = discovery
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    assert_eq!(ids, ["model-a", "model-b"], "expected both pages of models");
+    let asked = launcher
+        .written()
+        .iter()
+        .filter(|line| line.contains("\"model/list\""))
+        .count();
+    assert_eq!(asked, 2, "expected one request per page");
+}
+
 /// A build that cannot answer the profile question has not forbidden anything.
 #[tokio::test]
 async fn discovery_keeps_the_declared_matrix_when_the_profiles_cannot_be_read() {
@@ -5274,6 +5333,7 @@ async fn the_harness_passes_the_cores_conformance_suite() {
                     {"id": ":danger-full-access", "allowed": true}
                 ]),
             )
+            .or_else(|| last_model_page(frame))
         }),
     );
     let transcript = Transcript::load("approval");

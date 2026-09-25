@@ -231,6 +231,11 @@ Native reviews reject steering with `TurnNotSteerable`. Cancellation and close r
 reason when they win the terminal race; when Codex completed first, its completed outcome remains
 the one terminal fact.
 
+`model/list` and `permissionProfile/list` are cursor-paginated with a server-chosen page size
+([app-server][app-server]). The probe follows `nextCursor` for up to eight pages each, and the
+model catalog also stops at the core's 256-model cap. A page that fails mid-walk keeps the models
+already read.
+
 ## The permission matrix
 
 All six explicit (level, routing) pairs are supported. Omitted permission fields leave the user's
