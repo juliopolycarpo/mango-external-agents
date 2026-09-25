@@ -193,6 +193,9 @@ pub enum ThreadItem {
         /// The item's own id, when it carried a string one.
         #[serde(default)]
         id: Option<String>,
+        /// How it ended, when the family states a status in the shared spelling.
+        #[serde(default)]
+        status: Option<ItemStatus>,
     },
 }
 
@@ -328,6 +331,7 @@ mod tests {
             ThreadItem::Other {
                 item_type: String::from("somethingTheNextReleaseAdded"),
                 id: Some(String::from("x-1")),
+                status: None,
             }
         );
         assert_eq!(item.id(), Some("x-1"));

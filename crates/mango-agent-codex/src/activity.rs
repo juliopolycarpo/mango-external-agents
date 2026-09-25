@@ -22,7 +22,7 @@ pub fn started(item: &ThreadItem) -> Option<Activity> {
     let (name, kind, title, detail, content) = match item {
         // A family this build does not model is still work the agent did: shown under the
         // vendor's own name, and only when it carries an id a completion can address.
-        ThreadItem::Other { item_type, id } if item.is_unmodelled_family() && id.is_some() => (
+        ThreadItem::Other { item_type, id, .. } if item.is_unmodelled_family() && id.is_some() => (
             item_type.as_str(),
             ActivityKind::Other,
             item_type.clone(),
@@ -145,6 +145,9 @@ pub fn completed(item: &ThreadItem) -> Option<ActivityResult> {
             file_change_content(changes),
         ),
         ThreadItem::McpToolCall { status, .. } => (*status, None, None),
+        // An unmodelled family that states its ending keeps it; one that states none reached its
+        // completion notification, which is the whole report.
+        ThreadItem::Other { status, .. } => (status.unwrap_or(ItemStatus::Completed), None, None),
         // Families with no status of their own: reaching a completion notification is the whole
         // report, so they end as completed rather than as an unknown this harness invented.
         _ => (ItemStatus::Completed, None, None),

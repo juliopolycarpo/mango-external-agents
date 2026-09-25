@@ -946,6 +946,35 @@ mod tests {
         }
     }
 
+    /// An unmodelled family that states how it ended keeps that ending: a failed or declined
+    /// call must not be reported as completed.
+    #[test]
+    fn an_unmodelled_items_own_status_decides_how_its_activity_ends() {
+        for (status, expected) in [
+            ("failed", ActivityStatus::Failed),
+            ("declined", ActivityStatus::Cancelled),
+            ("completed", ActivityStatus::Completed),
+        ] {
+            let completed = reduce(
+                &notification(
+                    method::ITEM_COMPLETED,
+                    json!({"threadId": THREAD, "turnId": "u", "item": {
+                        "type": "dynamicToolCall", "id": "d-1", "tool": "lookup",
+                        "status": status}}),
+                ),
+                THREAD,
+                now(),
+            );
+            assert!(
+                matches!(&completed, Outcome::Emit(events) if matches!(
+                    events.as_slice(),
+                    [EventKind::ActivityCompleted { result, .. }] if result.status == expected
+                )),
+                "expected a {status} item to end as {expected:?}, received {completed:?}"
+            );
+        }
+    }
+
     /// Echoes of what the client itself sent are not work the agent did.
     #[test]
     fn an_echo_of_the_clients_own_input_is_not_an_activity() {
