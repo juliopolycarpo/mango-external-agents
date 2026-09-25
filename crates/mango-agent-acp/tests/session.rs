@@ -4602,3 +4602,47 @@ async fn a_call_left_running_by_a_cancelled_turn_is_closed_as_cancelled() {
         "expected the running call cancelled ahead of the terminal, received {events:?}"
     );
 }
+
+/// A turn the agent stopped short — a refusal, a token or request limit — is not a success: its
+/// answer is truncated or absent. It ends as an error naming the stop reason, and a call the agent
+/// left running closes as failed with it.
+#[tokio::test]
+async fn a_vendor_side_stop_ends_the_turn_as_an_incomplete_error_naming_its_reason() {
+    for stop_reason in ["refusal", "max_tokens", "max_turn_requests"] {
+        let (session, _launcher) = open(
+            FakeAcpAgent::new()
+                .with_updates(vec![running_call("call_open")])
+                .with_stop_reason(stop_reason),
+            permissive(),
+        )
+        .await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "go"))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!("expected {stop_reason} to end the turn as an error, received {events:?}");
+        };
+        assert_eq!(
+            error.code.as_str(),
+            "vendor-turn-incomplete",
+            "expected the incomplete-turn code for {stop_reason}, received {error:?}"
+        );
+        assert_eq!(
+            error.vendor_code.as_deref(),
+            Some(stop_reason),
+            "expected the stop reason as the vendor code, received {error:?}"
+        );
+        assert!(
+            !error.retryable,
+            "expected {stop_reason} not to invite a retry"
+        );
+        assert_eq!(
+            closing_status(&events, "call_open"),
+            Some(mango_external_agents::ActivityStatus::Failed),
+            "expected the running call to fail with the turn, received {events:?}"
+        );
+    }
+}

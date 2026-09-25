@@ -1268,7 +1268,10 @@ impl Session for AcpSession {
                     Some(Ok(response)) if reducer::was_cancelled(response.stop_reason) => Some(
                         Ending::Cancel(cancel_reason.unwrap_or(CancelReason::Requested)),
                     ),
-                    Some(Ok(_)) => Some(Ending::Complete),
+                    Some(Ok(response)) => Some(match reducer::stop_failure(response.stop_reason) {
+                        Some(failure) => Ending::Fail(failure),
+                        None => Ending::Complete,
+                    }),
                     Some(Err(error)) => Some(match cancel_reason {
                         Some(reason) => Ending::Cancel(reason),
                         None => {

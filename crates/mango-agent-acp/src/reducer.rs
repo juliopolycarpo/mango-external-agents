@@ -31,8 +31,8 @@ use mango_external_agents::event::{
     ThreadUsage, Usage,
 };
 use mango_external_agents::{
-    ActivityContent, ExtensionValue, Extensions, FileChange, PlanStep, PlanStepPriority,
-    PlanStepStatus,
+    ActivityContent, ErrorCode, ExtensionValue, Extensions, FileChange, PlanStep, PlanStepPriority,
+    PlanStepStatus, VendorError,
 };
 
 /// The call id every plan update shares.
@@ -708,16 +708,63 @@ fn plan_step_priority(priority: &PlanEntryPriority) -> Option<PlanStepPriority> 
 /// Whether a stop reason means somebody stopped the turn rather than the agent finishing it.
 ///
 /// The other four — `end_turn`, `max_tokens`, `max_turn_requests`, `refusal` — are the agent ending
-/// its own turn, so they complete it. A refusal in particular is not a failure of the link, and
-/// reporting one as [`EventKind::Error`] would tell a host to retry something the agent decided.
+/// its own turn. Only `end_turn` completes it; the other three end it short, which
+/// [`stop_failure`] reports.
 #[must_use]
 pub fn was_cancelled(stop_reason: StopReason) -> bool {
     matches!(stop_reason, StopReason::Cancelled)
 }
 
+/// The code a turn ends with when the agent stopped it short of finishing.
+pub const TURN_INCOMPLETE_CODE: &str = "vendor-turn-incomplete";
+
+/// The failure a turn ends with when the agent stopped it short, or nothing when it did not.
+///
+/// ACP's `max_tokens`, `max_turn_requests` and `refusal` are the agent ending its own turn without
+/// finishing it: the answer is truncated, or absent. Completing the turn would render that as a
+/// success, so it ends as [`TURN_INCOMPLETE_CODE`] with the wire's own spelling of the stop reason as
+/// the vendor code. It is not retryable: an identical prompt meets the same limit or the same
+/// refusal. `end_turn` and `cancelled` produce nothing here — the first completes the turn and the
+/// second is a cancellation (see [`was_cancelled`]).
+///
+/// # Example
+///
+/// ```
+/// use agent_client_protocol::schema::v1::StopReason;
+/// use mango_agent_acp::reducer::stop_failure;
+///
+/// let failure = stop_failure(StopReason::MaxTokens).expect("a truncated turn is a failure");
+/// assert_eq!(failure.code.as_str(), "vendor-turn-incomplete");
+/// assert_eq!(failure.vendor_code.as_deref(), Some("max_tokens"));
+/// assert!(stop_failure(StopReason::EndTurn).is_none());
+/// ```
+#[must_use]
+pub fn stop_failure(stop_reason: StopReason) -> Option<VendorError> {
+    let message = match stop_reason {
+        StopReason::EndTurn | StopReason::Cancelled => return None,
+        StopReason::MaxTokens => "the agent stopped the turn at its token limit",
+        StopReason::MaxTurnRequests => "the agent stopped the turn at its request limit",
+        StopReason::Refusal => "the agent refused to continue the turn",
+        // `#[non_exhaustive]`: a stop reason this build does not know is still not `end_turn`, and
+        // reading it as one would render an unfinished turn as a finished one.
+        _ => "the agent ended the turn before finishing it",
+    };
+    let wire = serde_json::to_value(stop_reason)
+        .ok()
+        .and_then(|value| value.as_str().map(String::from))
+        .unwrap_or_else(|| String::from("unknown"));
+    Some(
+        VendorError::new(ErrorCode::from_static(TURN_INCOMPLETE_CODE), message)
+            .with_vendor_code(wire, false),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PLAN_CALL_ID, Reducer, SessionFact, activity_kind, was_cancelled};
+    use super::{
+        PLAN_CALL_ID, Reducer, SessionFact, TURN_INCOMPLETE_CODE, activity_kind, stop_failure,
+        was_cancelled,
+    };
     use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolKind};
     use mango_external_agents::event::{
         ActivityKind, ActivityStatus, Command, EventKind, ThreadUsage, Usage,
@@ -1692,8 +1739,8 @@ mod tests {
         }
     }
 
-    /// Only a cancellation is somebody stopping the turn. A refusal is the agent ending its own, and
-    /// reporting it as an error would tell a host to retry a decision.
+    /// Only a cancellation is somebody stopping the turn. A refusal or a limit is the agent ending
+    /// its own — short, which [`stop_failure`] reports, but not a cancellation.
     #[test]
     fn only_a_cancelled_stop_reason_counts_as_a_cancellation() {
         assert!(was_cancelled(StopReason::Cancelled));
@@ -1704,6 +1751,37 @@ mod tests {
             StopReason::Refusal,
         ] {
             assert!(!was_cancelled(reason), "received {reason:?}");
+        }
+    }
+
+    /// A refused, token-limited or request-limited turn is not a success: its answer is truncated or
+    /// absent. Each ends as the incomplete-turn failure carrying the wire's own stop reason, while a
+    /// finished or cancelled turn produces no failure at all.
+    #[test]
+    fn a_stop_short_of_the_end_is_an_incomplete_turn_naming_its_reason() {
+        for (reason, wire) in [
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::MaxTurnRequests, "max_turn_requests"),
+            (StopReason::Refusal, "refusal"),
+        ] {
+            let failure = stop_failure(reason)
+                .unwrap_or_else(|| panic!("expected a failure for {reason:?}, received none"));
+            assert_eq!(failure.code.as_str(), TURN_INCOMPLETE_CODE);
+            assert_eq!(
+                failure.vendor_code.as_deref(),
+                Some(wire),
+                "expected the wire spelling for {reason:?}, received {failure:?}"
+            );
+            assert!(
+                !failure.retryable,
+                "expected {reason:?} not to invite a retry"
+            );
+        }
+        for reason in [StopReason::EndTurn, StopReason::Cancelled] {
+            assert!(
+                stop_failure(reason).is_none(),
+                "expected no failure for {reason:?}"
+            );
         }
     }
 }

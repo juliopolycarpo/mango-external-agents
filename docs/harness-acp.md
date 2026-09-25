@@ -185,8 +185,12 @@ Two deliberate limits, each with a test pinning it:
 
 A `stop_reason` of `cancelled` ends the turn as a cancellation carrying the reason the *host* gave —
 ACP supplies none of its own, and flattening it would report a shutdown as "you stopped this turn".
-Every other reason, `refusal` included, completes the turn: a refusal is the agent ending its own turn,
-and reporting it as an error would tell a host to retry a decision.
+`end_turn` completes the turn. The three reasons that end it short of finishing — `max_tokens`,
+`max_turn_requests` and `refusal` — end it as `EventKind::Error` with the code
+`vendor-turn-incomplete`, the wire's own spelling of the reason as `vendor_code` and
+`retryable: false`: the answer is truncated or absent, so completing the turn would render it as a
+success, and an identical prompt meets the same limit or the same refusal. See the
+[stop reasons](https://agentclientprotocol.com/protocol/v1/prompt-turn#stop-reasons).
 
 ### Structured activity content
 
