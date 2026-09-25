@@ -5289,6 +5289,33 @@ async fn discovery_walks_every_model_list_page() {
     assert_eq!(asked, 2, "expected one request per page");
 }
 
+/// A host keeps a continuation for the same account and notices a switch through a fingerprint
+/// keyed with its own secret; the address it is computed from reaches no returned value.
+#[tokio::test]
+async fn discovery_with_a_host_key_fingerprints_the_signed_in_account() {
+    let (host, _) = probe_host(|frame| profiles_answer(frame, &serde_json::json!([])));
+    let key = mango_agent_codex::account::AccountFingerprintKey::new(b"host-local-key")
+        .expect("expected a key");
+    let found = CodexHarness::new()
+        .discover_with_account(&host, &key)
+        .await
+        .expect("expected a discovery");
+
+    let account = found
+        .account
+        .expect("expected the recorded ChatGPT account's facts");
+    assert_eq!(account.plan_type.as_deref(), Some("prolite"));
+    // The capture redacts the address, so the recording's own text is what was digested.
+    assert_eq!(account.fingerprint, Some(key.fingerprint("[REDACTED]")));
+    assert!(
+        matches!(
+            found.discovery.auth,
+            mango_external_agents::AuthState::LoggedIn { .. }
+        ),
+        "expected the same auth reading plain discovery reports"
+    );
+}
+
 /// A build that cannot answer the profile question has not forbidden anything.
 #[tokio::test]
 async fn discovery_keeps_the_declared_matrix_when_the_profiles_cannot_be_read() {

@@ -136,8 +136,14 @@ at `rust-v0.154.0`:
   workloads." — which is why the harness declares `stdio` only.
 
 **What this harness reads about an account:** `account/read`, and only the account *kind* plus, for
-a ChatGPT sign-in, the plan name. The email that call also returns is not modelled; a test asserts
-nothing of it survives into a value the harness holds. `~/.codex/auth.json` is never opened. The
+a ChatGPT sign-in, the plan name and — only when the host calls
+`CodexHarness::discover_with_account` with a key of its own — the email as the input to a keyed
+digest. The email is personal data, not a credential: it is read from the same documented,
+non-secret `account/read` answer, used for exactly one HMAC-SHA256 under the host's key, and then
+dropped. It is never modelled in a protocol type, stored in a returned value, formatted into a
+diagnostic, or forwarded; what the host receives is the digest, which is meaningless without the key
+that stays on the host's machine. A test asserts nothing of the address survives. No token is read,
+stored, copied or forwarded, and `~/.codex/auth.json` is never opened. The
 server's `account/chatgptAuthTokens/refresh` request — which asks a client to hand over a refreshed
 credential — is refused with a JSON-RPC error, unread.
 

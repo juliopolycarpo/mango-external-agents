@@ -426,9 +426,21 @@ Every other server-initiated request is refused with a JSON-RPC error rather tha
 
 ## Auth, without reading a credential
 
-`account/read` answers with the kind of account and, for a ChatGPT sign-in, a plan name. That is
-all this harness reads — `~/.codex/auth.json` is never opened, the email the same call returns is
-not modelled, and there is no login method anywhere.
+`account/read` answers with the kind of account and, for a ChatGPT sign-in, a plan name and an
+email. `~/.codex/auth.json` is never opened, the email is never modelled, and there is no login
+method anywhere.
+
+**The account fingerprint.** A host that keeps a Codex continuation across restarts has to notice
+when the signed-in account changed, and the email is the only non-secret account identity the
+app-server reports ([app-server][app-server]: "`email` is null when the ChatGPT account doesn't have
+an email address"). `CodexHarness::discover_with_account(host, key)` runs the ordinary probe and also
+returns `CodexAccount { plan_type, fingerprint }`, where the fingerprint is
+`hex(HMAC-SHA256(key, "codex:" + email))[..32]` — the value the TypeScript adapter stored, so a
+migrating host keeps matching its continuations. The address is borrowed from the raw `account/read`
+answer for that one digest and returned nowhere. A plain hash is refused on purpose: anyone holding it
+could test a guessed address offline, so the key is required (`AccountFingerprintKey` refuses an
+empty one) and never leaves the host. `Harness::discover`, which has no key, computes nothing. A
+ChatGPT account without an email, an API-key account and a Bedrock account have no fingerprint.
 
 | `account/read`                      | `AuthState`                               |
 | ----------------------------------- | ----------------------------------------- |
