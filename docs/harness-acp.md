@@ -222,6 +222,16 @@ id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, 
 
 ACP says a [`tool_call_update` collection replaces the previous collection](https://agentclientprotocol.com/protocol/v1/tool-calls#updating), rather than extending it. An omitted `content` field therefore leaves the host's structured content and detail untouched. An explicit empty collection emits `Some(ActivityContent::Empty)` and an empty detail, so the host removes the prior diff or output instead of retaining it.
 
+Because each update replaces the whole collection, an agent streaming a build log re-sends the complete
+log with every line. A running call's updates are therefore coalesced: the first goes out at once,
+later ones within `reducer::TOOL_UPDATE_INTERVAL` (five seconds, as the TypeScript adapter used) are
+merged latest-field-wins and held, and the next update after the interval carries the merge. Anything
+still held is delivered ahead of the call's completion — minus the content and detail a completion
+that carries its own replaces — and ahead of the turn's end, so the host always ends with the agent's
+final output. `Reducer::with_update_interval` changes the interval; `Duration::ZERO` forwards every
+update. This bounds how often one call reaches a host, not how large one update is: each is still
+bounded by the core's `TextLimit::Detail`.
+
 ## Permissions
 
 A withdrawn question resolves on both sides. The agent hears ACP's own `Cancelled` outcome; a host

@@ -260,3 +260,75 @@ async fn a_close_racing_a_budget_overflow_still_reports_the_budget() {
         inner.live_children()
     );
 }
+
+/// Tool output an agent re-sends whole with every line, as ACP's replace-the-collection rule has it.
+fn streamed_output(count: usize) -> Vec<serde_json::Value> {
+    let mut frames = vec![serde_json::json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call_build",
+        "title": "Run `cargo build`",
+        "kind": "execute",
+        "status": "in_progress"
+    })];
+    frames.extend((0..count).map(|line| {
+        serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_build",
+            "content": [{
+                "type": "content",
+                "content": { "type": "text", "text": format!("{line:04} {}", "x".repeat(2_000)) }
+            }]
+        })
+    }));
+    frames.push(serde_json::json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "call_build",
+        "status": "completed"
+    }));
+    frames
+}
+
+/// A build log streamed through one call is the case that spent a host's persisted-payload budget
+/// on copies of the same output: 300 full replacements of a 2 KB log are over a megabyte that a
+/// host stores and immediately overwrites. Coalesced, the host receives a handful of updates, the
+/// last of them carrying the final output, and the turn completes.
+#[tokio::test]
+async fn streaming_tool_output_reaches_the_host_coalesced() {
+    let (session, _launcher) = open_with(
+        FakeAcpAgent::new().with_updates(streamed_output(300)),
+        Limits::default(),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "build it"))
+        .await
+        .expect("expected a turn");
+    let events = drain(&mut turn).await;
+
+    let updates: Vec<&mango_external_agents::ActivityUpdate> = events
+        .iter()
+        .filter_map(|kind| match kind {
+            EventKind::ActivityUpdated { update, .. } => Some(update),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the turn to complete, received {:?}",
+        events.last()
+    );
+    assert!(
+        updates.len() <= 4,
+        "expected 300 replacements coalesced to a handful of updates, received {}",
+        updates.len()
+    );
+    let last_output = updates.last().and_then(|update| match &update.content {
+        Some(mango_external_agents::ActivityContent::Output { text }) => Some(text.as_str()),
+        _ => None,
+    });
+    assert!(
+        last_output.is_some_and(|text| text.starts_with("0299 ")),
+        "expected the final output delivered, received {:?}",
+        last_output.map(|text| text.chars().take(8).collect::<String>())
+    );
+}

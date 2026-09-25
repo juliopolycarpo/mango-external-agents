@@ -20,6 +20,7 @@
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
@@ -71,8 +72,9 @@ pub enum SessionFact {
 /// marker, and [`EventKind::ReasoningStarted`]/[`EventKind::ReasoningEnded`] are a pair a host
 /// relies on), whether the plan activity has been announced yet, and which tool calls the host has
 /// been told about. The last one is what lets a call first reported through `tool_call_update`
-/// still open a bracket, and a frame for a call that already ended stay out of the transcript.
-#[derive(Debug, Default)]
+/// still open a bracket, a frame for a call that already ended stay out of the transcript, and a
+/// running call's updates be coalesced (see [`TOOL_UPDATE_INTERVAL`]).
+#[derive(Debug)]
 pub struct Reducer {
     reasoning_open: bool,
     plan_started: bool,
@@ -83,6 +85,34 @@ pub struct Reducer {
     /// Source of [`OpenCall::opened`], so the calls a turn ends owing are closed in the order the
     /// agent opened them rather than in a hash map's.
     next_call: u64,
+    /// The shortest gap between two updates one running call sends a host.
+    update_interval: Duration,
+}
+
+/// How often one running tool call may send a host an update.
+///
+/// ACP [replaces a call's whole content collection](https://agentclientprotocol.com/protocol/v1/tool-calls#updating)
+/// on every `tool_call_update`, so an agent streaming a build log re-sends the complete log with
+/// each line. Forwarding every one spends a host's persisted payload on copies it overwrites at
+/// once. Within one interval the updates are merged, latest field wins, and held; the next update
+/// after the interval carries the merge, and anything still held is delivered ahead of the call's
+/// completion and ahead of the turn's end, so the host always ends with the agent's final word.
+///
+/// Five seconds, as the TypeScript adapter this harness replaces used: a liveness interval rather
+/// than a rendering one. Change it per reducer with [`Reducer::with_update_interval`].
+pub const TOOL_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+
+impl Default for Reducer {
+    fn default() -> Self {
+        Self {
+            reasoning_open: false,
+            plan_started: false,
+            open_calls: HashMap::new(),
+            finished_calls: HashSet::new(),
+            next_call: 0,
+            update_interval: TOOL_UPDATE_INTERVAL,
+        }
+    }
 }
 
 /// One tool call a host is rendering as running.
@@ -90,6 +120,10 @@ pub struct Reducer {
 struct OpenCall {
     /// When it opened, relative to the turn's other calls.
     opened: u64,
+    /// When the host last received an update for it, if it has.
+    last_update: Option<Instant>,
+    /// What arrived since then and has not been sent, merged latest-wins.
+    held: Option<ActivityUpdate>,
 }
 
 impl Reducer {
@@ -97,6 +131,26 @@ impl Reducer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This reducer, sending one running tool call's updates no more often than `interval`.
+    ///
+    /// `Duration::ZERO` forwards every update as it arrives.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use mango_agent_acp::reducer::Reducer;
+    ///
+    /// let reducer = Reducer::new().with_update_interval(Duration::from_millis(250));
+    /// # let _ = reducer;
+    /// ```
+    #[must_use]
+    pub fn with_update_interval(mut self, interval: Duration) -> Self {
+        self.update_interval = interval;
+        self
     }
 
     /// The events and session facts one `session/update` produces, in order.
@@ -120,6 +174,36 @@ impl Reducer {
     /// assert!(facts.is_empty());
     /// ```
     pub fn update(&mut self, update: SessionUpdate) -> (Vec<EventKind>, Vec<SessionFact>) {
+        self.update_at(update, Instant::now())
+    }
+
+    /// [`Self::update`], for a frame that arrived at `now`.
+    ///
+    /// The clock is the caller's, which keeps the reducer free of one: `now` is only compared with
+    /// the instants earlier frames were given, to coalesce a running call's updates (see
+    /// [`TOOL_UPDATE_INTERVAL`]).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Instant;
+    ///
+    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use mango_agent_acp::reducer::Reducer;
+    ///
+    /// let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+    ///     "sessionUpdate": "agent_message_chunk",
+    ///     "content": { "type": "text", "text": "hello" }
+    /// }))
+    /// .expect("a v1 agent message chunk");
+    /// let (events, _) = Reducer::new().update_at(update, Instant::now());
+    /// assert_eq!(events.len(), 1);
+    /// ```
+    pub fn update_at(
+        &mut self,
+        update: SessionUpdate,
+        now: Instant,
+    ) -> (Vec<EventKind>, Vec<SessionFact>) {
         // A transcript frame closes an open reasoning block: a host that never saw `ReasoningEnded`
         // would render a reasoning phase that stays open for the rest of the turn. A frame that
         // produces no transcript must *not*, or a usage report or a mode change arriving between two
@@ -128,7 +212,7 @@ impl Reducer {
             true => self.close_reasoning(),
             false => Vec::new(),
         };
-        let (body_events, facts) = self.body(update);
+        let (body_events, facts) = self.body(update, now);
         events.extend(body_events);
         (events, facts)
     }
@@ -189,8 +273,14 @@ impl Reducer {
         let mut events = self.close_reasoning();
         let mut open: Vec<(String, OpenCall)> = self.open_calls.drain().collect();
         open.sort_by_key(|(_, call)| call.opened);
-        for (call_id, _) in open {
+        for (call_id, call) in open {
             self.finished_calls.insert(call_id.clone());
+            if let Some(update) = call.held.filter(|update| !update.is_empty()) {
+                events.push(EventKind::ActivityUpdated {
+                    call_id: call_id.clone(),
+                    update,
+                });
+            }
             events.push(EventKind::ActivityCompleted {
                 call_id,
                 result: ActivityResult::new(calls),
@@ -216,12 +306,14 @@ impl Reducer {
     ///
     /// Every arm added here needs a matching decision in [`transcript`]: whether the frame is part of
     /// the turn's transcript, and so whether it closes an open reasoning block.
-    fn body(&mut self, update: SessionUpdate) -> (Vec<EventKind>, Vec<SessionFact>) {
+    fn body(&mut self, update: SessionUpdate, now: Instant) -> (Vec<EventKind>, Vec<SessionFact>) {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => (text_delta(chunk), Vec::new()),
             SessionUpdate::AgentThoughtChunk(chunk) => (self.reasoning_delta(chunk), Vec::new()),
-            SessionUpdate::ToolCall(call) => (self.tool_call(call), Vec::new()),
-            SessionUpdate::ToolCallUpdate(update) => (self.tool_call_update(update), Vec::new()),
+            SessionUpdate::ToolCall(call) => (self.tool_call(call, now), Vec::new()),
+            SessionUpdate::ToolCallUpdate(update) => {
+                (self.tool_call_update(update, now), Vec::new())
+            }
             SessionUpdate::Plan(plan) => (self.plan(plan), Vec::new()),
             SessionUpdate::AvailableCommandsUpdate(catalog) => (
                 Vec::new(),
@@ -270,7 +362,7 @@ impl Reducer {
     /// sending it again for a call that is still running. A second [`EventKind::ActivityStarted`]
     /// under the same id would give a host two rows for one call, so the repeat arrives as an update
     /// carrying everything the new frame said. A call that already ended stays ended.
-    fn tool_call(&mut self, call: ToolCall) -> Vec<EventKind> {
+    fn tool_call(&mut self, call: ToolCall, now: Instant) -> Vec<EventKind> {
         let call_id = call.tool_call_id.to_string();
         if self.finished_calls.contains(&call_id) {
             return Vec::new();
@@ -282,7 +374,7 @@ impl Reducer {
                 .title(call.title)
                 .content(call.content)
                 .locations(call.locations);
-            return self.tool_call_update(ToolCallUpdate::new(call.tool_call_id, fields));
+            return self.tool_call_update(ToolCallUpdate::new(call.tool_call_id, fields), now);
         }
         let finished = finished(call.status).is_some();
         let events = tool_call(call);
@@ -296,7 +388,10 @@ impl Reducer {
     /// session's in-flight call is one — and a host applies updates only to a call it saw start. So
     /// a first sighting through this channel is announced from whatever the update carries, with a
     /// generic title when it names none, and completed in the same breath when it is already over.
-    fn tool_call_update(&mut self, update: ToolCallUpdate) -> Vec<EventKind> {
+    ///
+    /// For a call already running, a non-terminal update is coalesced (see
+    /// [`TOOL_UPDATE_INTERVAL`]), and a terminal one first delivers whatever is still held.
+    fn tool_call_update(&mut self, update: ToolCallUpdate, now: Instant) -> Vec<EventKind> {
         let call_id = update.tool_call_id.to_string();
         if self.finished_calls.contains(&call_id) {
             return Vec::new();
@@ -316,17 +411,49 @@ impl Reducer {
             if let Some(locations) = fields.locations {
                 call = call.locations(locations);
             }
-            return self.tool_call(call);
+            return self.tool_call(call, now);
         }
-        let events = tool_call_update(update);
-        let finished = events
-            .iter()
-            .any(|event| matches!(event, EventKind::ActivityCompleted { .. }));
-        if finished {
-            self.open_calls.remove(&call_id);
-            self.finished_calls.insert(call_id);
+        let interval = self.update_interval;
+        let Some(open) = self.open_calls.get_mut(&call_id) else {
+            return Vec::new();
+        };
+        match tool_call_update(update).pop() {
+            Some(EventKind::ActivityUpdated { call_id, update }) => {
+                let merged = match open.held.take() {
+                    Some(held) => merged_update(held, update),
+                    None => update,
+                };
+                let recent = open
+                    .last_update
+                    .is_some_and(|last| now.saturating_duration_since(last) < interval);
+                if recent {
+                    open.held = Some(merged);
+                    return Vec::new();
+                }
+                open.last_update = Some(now);
+                vec![EventKind::ActivityUpdated {
+                    call_id,
+                    update: merged,
+                }]
+            }
+            Some(EventKind::ActivityCompleted { call_id, result }) => {
+                let mut events = Vec::with_capacity(2);
+                if let Some(held) = open.held.take() {
+                    let held = superseded_by(held, &result);
+                    if !held.is_empty() {
+                        events.push(EventKind::ActivityUpdated {
+                            call_id: call_id.clone(),
+                            update: held,
+                        });
+                    }
+                }
+                self.open_calls.remove(&call_id);
+                self.finished_calls.insert(call_id.clone());
+                events.push(EventKind::ActivityCompleted { call_id, result });
+                events
+            }
+            _ => Vec::new(),
         }
-        events
     }
 
     /// Records a call the host has just been told about, as running or as already over.
@@ -337,7 +464,14 @@ impl Reducer {
         }
         let opened = self.next_call;
         self.next_call = self.next_call.wrapping_add(1);
-        self.open_calls.insert(call_id, OpenCall { opened });
+        self.open_calls.insert(
+            call_id,
+            OpenCall {
+                opened,
+                last_update: None,
+                held: None,
+            },
+        );
     }
 
     fn reasoning_delta(&mut self, chunk: ContentChunk) -> Vec<EventKind> {
@@ -497,6 +631,39 @@ fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
         return Vec::new();
     }
     vec![EventKind::ActivityUpdated { call_id, update }]
+}
+
+/// Two updates to one call as one, the later one's fields winning.
+///
+/// Every [`ActivityUpdate`] field is a replacement, so a field the later update carries makes the
+/// earlier value unobservable, and a field it leaves out keeps the earlier one.
+fn merged_update(earlier: ActivityUpdate, later: ActivityUpdate) -> ActivityUpdate {
+    let mut merged = earlier;
+    if later.title.is_some() {
+        merged.title = later.title;
+    }
+    if later.detail.is_some() {
+        merged.detail = later.detail;
+    }
+    if later.content.is_some() {
+        merged.content = later.content;
+    }
+    merged.truncated |= later.truncated;
+    merged
+}
+
+/// What of a held update a call's completion does not already replace.
+///
+/// A completion that carries content or detail replaces those, so the held copies would only be
+/// overwritten; a title has no slot on [`ActivityResult`] and survives.
+fn superseded_by(mut held: ActivityUpdate, result: &ActivityResult) -> ActivityUpdate {
+    if result.content.is_some() {
+        held.content = None;
+    }
+    if result.detail.is_some() {
+        held.detail = None;
+    }
+    held
 }
 
 /// The outcome of a terminal tool-call status, or nothing while it is still running.
@@ -767,12 +934,13 @@ mod tests {
     };
     use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolKind};
     use mango_external_agents::event::{
-        ActivityKind, ActivityStatus, Command, EventKind, ThreadUsage, Usage,
+        ActivityKind, ActivityStatus, ActivityUpdate, Command, EventKind, ThreadUsage, Usage,
     };
     use mango_external_agents::{
         ActivityContent, ExtensionValue, FileChangeKind, PlanStepPriority, PlanStepStatus,
     };
     use serde_json::json;
+    use std::time::{Duration, Instant};
 
     /// Every case parses the wire rather than building a Rust value, so a rename or a reshape in the
     /// schema crate fails here instead of compiling into a mapping that no longer matches the JSON.
@@ -1556,6 +1724,160 @@ mod tests {
                 "expected a second finish to owe nothing"
             );
         }
+    }
+
+    /// ACP replaces a call's whole content on every `tool_call_update`, so an agent streaming a
+    /// build log sends the full log again with each line. Forwarding each one spends the turn's
+    /// payload budget on copies a host overwrites at once; a burst inside one window reaches the
+    /// host as one update, and the latest content still arrives before the completion.
+    #[test]
+    fn a_burst_of_tool_output_updates_reaches_the_host_coalesced() {
+        let mut frames = vec![announced("call_log")];
+        frames.extend((0..1_000).map(|line| {
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_log",
+                "content": [{ "type": "content", "content": { "type": "text", "text": format!("line {line}") } }]
+            })
+        }));
+        frames.push(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_log",
+            "status": "completed"
+        }));
+        let events = reduce(frames);
+        let updates: Vec<&ActivityUpdate> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityUpdated { update, .. } => Some(update),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            updates.len() <= 2,
+            "expected the burst coalesced to at most 2 updates, received {}",
+            updates.len()
+        );
+        assert_eq!(
+            updates.last().and_then(|update| update.content.clone()),
+            Some(ActivityContent::Output {
+                text: String::from("line 999")
+            }),
+            "expected the latest output delivered before the completion"
+        );
+        assert!(
+            matches!(events.last(), Some(EventKind::ActivityCompleted { .. })),
+            "received {events:?}"
+        );
+    }
+
+    fn output(call_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call_id,
+            "content": [{ "type": "content", "content": { "type": "text", "text": text } }]
+        })
+    }
+
+    fn update_texts(events: &[EventKind]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityUpdated { update, .. } => Some(match &update.content {
+                    Some(ActivityContent::Output { text }) => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The first update after a quiet interval goes out at once, carrying everything held since the
+    /// last one; an update inside the interval is held rather than dropped.
+    #[test]
+    fn updates_inside_the_interval_are_held_and_the_next_one_after_it_carries_them() {
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut reducer = Reducer::new().with_update_interval(Duration::from_secs(5));
+        let mut events = reducer.update_at(update(announced("call_log")), start).0;
+        for (at, text) in [(0, "a"), (1, "b"), (2, "c"), (6, "d"), (7, "e")] {
+            events.extend(
+                reducer
+                    .update_at(update(output("call_log", text)), start + second * at)
+                    .0,
+            );
+        }
+        assert_eq!(
+            update_texts(&events),
+            vec![Some(String::from("a")), Some(String::from("d"))],
+            "expected the first update and the first after the interval, received {events:?}"
+        );
+        let closing = reducer.finish_with(ActivityStatus::Completed);
+        assert_eq!(
+            update_texts(&closing),
+            vec![Some(String::from("e"))],
+            "expected the held update delivered at the turn's end, received {closing:?}"
+        );
+        assert!(
+            matches!(closing.last(), Some(EventKind::ActivityCompleted { .. })),
+            "expected the call closed after its held update, received {closing:?}"
+        );
+    }
+
+    /// A completion that carries its own content replaces the held content, so only what it does
+    /// not replace — here the title — is delivered ahead of it.
+    #[test]
+    fn a_completion_with_content_supersedes_the_held_content_but_not_the_title() {
+        let start = Instant::now();
+        let mut reducer = Reducer::new().with_update_interval(Duration::from_secs(5));
+        let _ = reducer.update_at(update(announced("call_log")), start);
+        let _ = reducer.update_at(update(output("call_log", "first")), start);
+        let _ = reducer.update_at(
+            update(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_log",
+                "title": "Building",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "held" } }]
+            })),
+            start,
+        );
+        let (events, _) = reducer.update_at(
+            update(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_log",
+                "status": "completed",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "done" } }]
+            })),
+            start,
+        );
+        let [
+            EventKind::ActivityUpdated { update: held, .. },
+            EventKind::ActivityCompleted { result, .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected the held title then the completion, received {events:?}");
+        };
+        assert_eq!(held.title.as_deref(), Some("Building"));
+        assert_eq!(held.content, None, "expected the held content superseded");
+        assert_eq!(held.detail, None, "expected the held detail superseded");
+        assert_eq!(
+            result.content,
+            Some(ActivityContent::Output {
+                text: String::from("done")
+            })
+        );
+    }
+
+    /// `Duration::ZERO` turns coalescing off, for a host that wants every replacement.
+    #[test]
+    fn a_zero_interval_forwards_every_update() {
+        let start = Instant::now();
+        let mut reducer = Reducer::new().with_update_interval(Duration::ZERO);
+        let mut events = reducer.update_at(update(announced("call_log")), start).0;
+        for text in ["a", "b", "c"] {
+            events.extend(reducer.update_at(update(output("call_log", text)), start).0);
+        }
+        assert_eq!(update_texts(&events).len(), 3, "received {events:?}");
     }
 
     /// ACP v1's plan is replaced wholesale and carries no id, so the first one opens an activity and

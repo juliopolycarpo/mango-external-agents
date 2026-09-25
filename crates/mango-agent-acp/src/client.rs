@@ -626,7 +626,10 @@ impl SessionState {
     /// The events and session facts one frame produces, computed under the guard because the
     /// reducer is pure.
     fn reduce(&self, notification: SessionNotification) -> (Vec<EventKind>, Vec<SessionFact>) {
-        self.lock_reducer().update(notification.update)
+        // Tokio's clock rather than the host's: this instant only spaces a running call's updates,
+        // and a runtime with paused time has to see that spacing move with it.
+        self.lock_reducer()
+            .update_at(notification.update, tokio::time::Instant::now().into_std())
     }
 
     /// Publishes a session-scoped fact the reducer surfaced.
