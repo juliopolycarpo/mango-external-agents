@@ -549,13 +549,29 @@ const STEER_HOLD_LIMIT: usize = 1024;
 /// adopted and would be dropped as another turn's. Holding every notification until the answer
 /// is handled, then replaying them in order, makes the transition visible before any of them is
 /// routed.
+///
+/// Held frames are outside the connection's own byte budget, so the hold is bounded by count and
+/// by [`Limits::turn_buffer_bytes`](mango_external_agents::Limits::turn_buffer_bytes); exceeding
+/// either poisons the session.
 #[derive(Default)]
 struct SteerHold {
-    active: bool,
-    held: VecDeque<(String, Value)>,
+    /// Steers whose answer has not been handled yet. Steers are serialized, but a dropped steer
+    /// future can leave its replay running while the next steer begins.
+    holders: usize,
+    /// Whether a replay task owns the queue. At most one exists, so frames leave in order.
+    draining: bool,
+    held: VecDeque<(String, Value, usize)>,
+    held_bytes: usize,
 }
 
-/// Replays what a steer held if the steer future is dropped before it could.
+impl SteerHold {
+    /// Whether a new frame has to join the queue rather than be routed now.
+    fn is_holding(&self) -> bool {
+        self.holders > 0 || self.draining
+    }
+}
+
+/// One steer's claim on the hold; released exactly once, whether or not the steer finishes.
 struct SteerHoldGuard {
     shared: Option<Arc<Shared>>,
 }
@@ -566,41 +582,62 @@ impl SteerHoldGuard {
             .steer_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active = true;
+            .holders += 1;
         Self {
             shared: Some(Arc::clone(shared)),
         }
     }
 
-    /// Replays every held notification in order, then routes live again.
+    /// Releases this steer's claim and waits for the replay it may have started.
+    ///
+    /// The replay runs in its own task, so dropping this future — a host's timeout wrapper, a
+    /// disconnect — only stops the waiting; the replay still finishes and routing reopens.
     async fn release(mut self) {
-        if let Some(shared) = self.shared.take() {
-            release_steer_hold(shared).await;
+        let Some(shared) = self.shared.take() else {
+            return;
+        };
+        if let Some(replay) = release_claim(shared) {
+            let _ = replay.await;
         }
     }
 }
 
 impl Drop for SteerHoldGuard {
     fn drop(&mut self) {
-        let Some(shared) = self.shared.take() else {
-            return;
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(release_steer_hold(shared));
-        } else {
-            let mut hold = shared
-                .steer_hold
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            hold.active = false;
-            hold.held.clear();
+        if let Some(shared) = self.shared.take() {
+            let _ = release_claim(shared);
         }
     }
 }
 
-/// Drains the hold one notification at a time; clears it only when empty, under the same lock
-/// the worker checks, so no live frame can overtake a held one.
-async fn release_steer_hold(shared: Arc<Shared>) {
+/// Gives up one claim and, when it was the last and nobody is replaying, starts the replay.
+fn release_claim(shared: Arc<Shared>) -> Option<tokio::task::JoinHandle<()>> {
+    let mut hold = shared
+        .steer_hold
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hold.holders = hold.holders.saturating_sub(1);
+    if hold.holders > 0 || hold.draining {
+        return None;
+    }
+    if hold.held.is_empty() {
+        return None;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // No runtime left to route on: the connection is going away with it.
+        hold.held.clear();
+        hold.held_bytes = 0;
+        return None;
+    };
+    hold.draining = true;
+    drop(hold);
+    Some(runtime.spawn(replay_steer_hold(shared)))
+}
+
+/// Routes the held frames one at a time and reopens live routing only once the queue is empty,
+/// under the same lock the worker checks, so no live frame can overtake a held one. A steer that
+/// takes a new claim meanwhile leaves the rest queued for its own release.
+async fn replay_steer_hold(shared: Arc<Shared>) {
     let handler = CodexHandler {
         shared: Arc::clone(&shared),
     };
@@ -610,10 +647,18 @@ async fn release_steer_hold(shared: Arc<Shared>) {
                 .steer_hold
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match hold.held.pop_front() {
-                Some(next) => next,
+            let next = if hold.holders > 0 {
+                None
+            } else {
+                hold.held.pop_front()
+            };
+            match next {
+                Some((method, params, bytes)) => {
+                    hold.held_bytes = hold.held_bytes.saturating_sub(bytes);
+                    (method, params)
+                }
                 None => {
-                    hold.active = false;
+                    hold.draining = false;
                     return;
                 }
             }
@@ -1617,28 +1662,49 @@ fn to_wire_answers(response: &QuestionResponse) -> ToolRequestUserInputResponse 
 #[async_trait::async_trait]
 impl PeerHandler for CodexHandler {
     async fn on_notification(&self, method: String, params: Value) {
+        let routed_here = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .is_some_and(|thread| thread == self.shared.thread_id());
         let live = {
             let mut hold = self
                 .shared
                 .steer_hold
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !hold.active {
-                Some((method, params))
-            } else if hold.held.len() < STEER_HOLD_LIMIT {
-                hold.held.push_back((method, params));
-                return;
+            if hold.is_holding() {
+                // Held frames left the connection's byte budget when this call returns, so the
+                // hold counts them against the turn's own.
+                let bytes =
+                    method.len() + serde_json::to_string(&params).map_or(0, |raw| raw.len());
+                let budget = self.shared.host.limits().turn_buffer_bytes;
+                if hold.held.len() >= STEER_HOLD_LIMIT
+                    || hold.held_bytes.saturating_add(bytes) > budget
+                {
+                    None
+                } else {
+                    hold.held_bytes += bytes;
+                    hold.held.push_back((method, params, bytes));
+                    Some(None)
+                }
             } else {
-                None
+                Some(Some((method, params)))
             }
         };
         match live {
-            Some((method, params)) => self.handle_notification(method, params).await,
+            Some(Some((method, params))) => self.handle_notification(method, params).await,
+            Some(None) => {
+                // Queued progress for this conversation is still progress: a slow steer answer
+                // must not let the idle deadline stop a turn that is working.
+                if routed_here {
+                    self.shared.signal_idle_change();
+                }
+            }
             None => {
                 self.shared
                     .poison(VendorError::new(
                         reducer::PROTOCOL_ERROR,
-                        "expected a bounded set of notifications during a steer, received more",
+                        "expected notifications held during a steer to fit the turn's count and byte budget, received more",
                     ))
                     .await;
             }
@@ -4301,6 +4367,119 @@ mod tests {
                 events,
             ),
         )
+    }
+
+    fn held_delta(delta: &str) -> serde_json::Value {
+        serde_json::json!({"threadId": "thread-1", "turnId": "vendor-turn-1", "itemId": "m",
+                           "delta": delta})
+    }
+
+    /// Reads the next answer text off a turn, or fails naming what was expected.
+    async fn next_text(stream: &mut mango_external_agents::stream::TurnStream, expected: &str) {
+        let text = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = stream.recv().await {
+                if let EventKind::TextDelta { text } = event.kind {
+                    return Some(text);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        assert_eq!(
+            text.as_deref(),
+            Some(expected),
+            "expected the next answer text on the turn"
+        );
+    }
+
+    /// A host may drop its steer future while the hold is being replayed, through a timeout
+    /// wrapper or a disconnect. The replay must still finish and routing must go live again, or
+    /// every later frame — the terminal included — is queued forever.
+    #[tokio::test]
+    async fn dropping_a_steer_mid_release_still_replays_and_reopens_routing_in_order() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+        let handler = super::CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let guard = super::SteerHoldGuard::hold(&shared);
+        handler
+            .on_notification(String::from("item/agentMessage/delta"), held_delta("a"))
+            .await;
+
+        // The replay needs the turn lock, so holding it here makes the release pend; the
+        // timeout then drops the release future mid-way, as a host's wrapper would.
+        let turn = shared.turn.lock().await;
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(20), guard.release()).await;
+        assert!(dropped.is_err(), "expected the release to be cut off");
+        drop(turn);
+
+        handler
+            .on_notification(String::from("item/agentMessage/delta"), held_delta("b"))
+            .await;
+        next_text(&mut stream, "a").await;
+        next_text(&mut stream, "b").await;
+    }
+
+    /// Held frames are outside the connection's own byte budget, so the hold has one of its own.
+    #[tokio::test]
+    async fn a_steer_hold_past_its_byte_budget_fails_the_session_cleanly() {
+        let host = HostContext::builder()
+            .launcher(Arc::new(FakeLauncher::new()))
+            .cwd("/workspace")
+            .client_info("mango-test", "0.0.1")
+            .limits(Limits {
+                turn_buffer_bytes: 4096,
+                ..Limits::default()
+            })
+            .build()
+            .expect("expected a host");
+        let shared = Arc::new(Shared::new(
+            host,
+            mango_external_agents::SessionId::new("chat-1"),
+        ));
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+        let handler = super::CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let _guard = super::SteerHoldGuard::hold(&shared);
+        for _ in 0..8 {
+            handler
+                .on_notification(
+                    String::from("item/agentMessage/delta"),
+                    held_delta(&"x".repeat(1024)),
+                )
+                .await;
+        }
+        assert!(
+            shared.is_shutting_down(),
+            "expected a hold past its byte budget to fail the session"
+        );
+    }
+
+    /// A slow steer answer must not let the idle deadline kill a turn whose progress is queued.
+    #[tokio::test]
+    async fn a_held_frame_for_this_conversation_still_counts_as_progress() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+        let handler = super::CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let changes = shared.idle_changes.subscribe();
+        let _guard = super::SteerHoldGuard::hold(&shared);
+        handler
+            .on_notification(String::from("item/agentMessage/delta"), held_delta("a"))
+            .await;
+        assert!(
+            changes.has_changed().unwrap_or(false),
+            "expected a held frame for this conversation to restart the idle deadline"
+        );
     }
 
     /// The trap the running-turn guard exists to close. A host that drops its stream stops

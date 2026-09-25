@@ -132,7 +132,10 @@ it: later frames are matched against it, the interrupt names it, and the next st
 `TurnStarted`; the session accepts that id for the whole turn, and the last few superseded ones,
 for the same attempt. The steer's answer and the continuation's first frames can arrive back to
 back on separate workers, so notifications arriving while a steer is in flight are held in order
-and replayed once its answer is handled; none is routed against the id the steer replaced.
+and replayed once its answer is handled; none is routed against the id the steer replaced. The
+replay runs in its own task, so a host that drops its steer future mid-way does not strand the
+queue. Held frames are bounded by count and by `Limits::turn_buffer_bytes`, and exceeding either
+fails the session; a held frame for this conversation still restarts the idle deadline.
 Steers are serialized per session, so a second steer issued while the first is in flight reads the
 id the first one left behind. The JSON-RPC client keeps reading while an approval is pending, so a
 steer sent then is answered without waiting for the approval.
