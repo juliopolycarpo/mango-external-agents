@@ -28,6 +28,12 @@ use tokio::sync::broadcast;
 /// for the operation, because the stream itself cannot be replayed. A subscriber that only
 /// renders a live view may instead show the answer as truncated.
 ///
+/// A gap names no operation. One broadcast serves every turn a supervisor runs, so the dropped
+/// events may include an earlier turn's terminal, and the next retained event may already belong
+/// to a later turn. Treat a gap as invalidating *every* in-flight view the subscriber holds, and
+/// resync each operation it cares about from the durable record, unless it has already seen that
+/// operation's terminal.
+///
 /// `missed` counts events dropped for *any* reason, such as a history that has to forget its
 /// oldest events, so a subscriber handles every cause the same way.
 ///

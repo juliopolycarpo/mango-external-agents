@@ -274,3 +274,30 @@ async fn publishing_past_a_stalled_subscriber_neither_blocks_nor_fails() {
 
     assert_eq!(events.subscriber_count(), 1);
 }
+
+/// A subscriber that lags, catches up and lags again is told about each episode separately.
+#[tokio::test]
+async fn each_lag_episode_is_reported_on_its_own() {
+    let events = TurnBroadcast::new(2);
+    let mut watcher = events.subscribe();
+    let mut published = turn_events(9).await.into_iter();
+    for event in published.by_ref().take(5) {
+        events.publish(event);
+    }
+    let first = drain_sync(&mut watcher);
+    for event in published {
+        events.publish(event);
+    }
+    let second = drain_sync(&mut watcher);
+
+    assert_eq!(
+        first,
+        ["gap:3", "text:3", "text:4"],
+        "expected a gap of 3 for the first episode | received {first:?}"
+    );
+    assert_eq!(
+        second,
+        ["gap:3", "text:8", "completed"],
+        "expected a gap of 3 for the second episode | received {second:?}"
+    );
+}
