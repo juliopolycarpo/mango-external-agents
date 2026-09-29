@@ -385,8 +385,8 @@ install locations without editing the profile or changing a user's `PATH`.
 - A launcher that could not start the program is `GateVerdict::NotInstalled`.
 - Output with no dotted number is `GateVerdict::Unknown`. An agent that changed the shape of
   `--version` is not an agent that stopped working.
-- The probe reads at most 64 KiB of output, and parses each line once. A version that only appears
-  after that is `GateVerdict::Unknown` as well: a working agent is never failed for being chatty, and
+- The probe reads at most 64 KiB of output, one line included, and parses each line once. A version
+  that only appears after that, or on a line longer than that, is `GateVerdict::Unknown` as well: a working agent is never failed for being chatty, and
   the child is ended on every path.
 - Versions compare as dotted numbers of any length rather than as semver, because Cursor versions by
   date; a semver parser would call `2026.08.25-3e8eec8` unparseable and gate a build that works.

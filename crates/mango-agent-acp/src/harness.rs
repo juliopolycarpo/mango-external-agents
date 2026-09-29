@@ -43,7 +43,7 @@ use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
     AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery, Error,
     ExecutablePath, GateVerdict, Harness, HarnessDescriptor, HarnessIdentity, HostContext,
-    LaunchSpec, LineStream, Result, SessionId, StdioSpec,
+    LaunchSpec, LineLimits, LineStream, Result, SessionId, StdioSpec,
 };
 
 use crate::client::{self, SessionState};
@@ -1039,7 +1039,7 @@ async fn run_version(
         })
         .await?;
 
-    let mut lines = LineStream::new(process.stdout, host.limits().line);
+    let mut lines = LineStream::new(process.stdout, probe_line_limits(host.limits().line));
     // Bounded by the host's own request timeout: an agent that prints nothing and does not exit must
     // not hold a discovery open.
     let read = tokio::time::timeout(
@@ -1059,15 +1059,34 @@ async fn run_version(
     }
 }
 
-/// The first version found in `lines`, or `None` when the stream ends or passes `max_bytes`
-/// (terminators counted) without one.
+/// The host's line limits, with one line held to the probe's cap.
+///
+/// The byte count in [`first_version`] only sees complete lines. Capping a line here stops an agent
+/// that never prints a newline from being buffered up to the host's own (larger) line limit.
+fn probe_line_limits(limits: LineLimits) -> LineLimits {
+    LineLimits {
+        max_line_bytes: limits.max_line_bytes.min(VERSION_PROBE_MAX_BYTES),
+        ..limits
+    }
+}
+
+/// The first version found in `lines`, or `None` when the stream ends, passes `max_bytes`
+/// (terminators counted) or overruns the stream's line limit without one.
 ///
 /// Each line is parsed once. [`version::parse`] takes the first version-shaped token of whitespace
 /// separated text and a line break is whitespace, so the first line that holds one yields the same
 /// answer as parsing everything read so far, at a cost linear in the output.
 async fn first_version(lines: &mut LineStream, max_bytes: usize) -> Result<Option<String>> {
     let mut read = 0_usize;
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return Ok(None),
+            // A line past the stream's limit is more output than the probe reads, which is the
+            // same answer as passing `max_bytes`.
+            Err(Error::LimitExceeded { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         read = read.saturating_add(line.len() + 1);
         if read > max_bytes {
             return Ok(None);
@@ -1076,7 +1095,6 @@ async fn first_version(lines: &mut LineStream, max_bytes: usize) -> Result<Optio
             return Ok(Some(found));
         }
     }
-    Ok(None)
 }
 
 /// Whether a reported version clears the floor a profile pinned.
@@ -1103,8 +1121,62 @@ fn gate(version: Option<&str>, minimum: Option<&str>) -> GateVerdict {
 mod tests {
     use serde_json::Value;
 
-    use super::{AcpHarness, ceiling, gate};
-    use mango_external_agents::{Capabilities, CapabilityCeiling, GateVerdict, Harness};
+    use super::{
+        AcpHarness, VERSION_PROBE_MAX_BYTES, ceiling, first_version, gate, probe_line_limits,
+    };
+    use mango_external_agents::{
+        ByteSource, Capabilities, CapabilityCeiling, GateVerdict, Harness, LineLimits, LineStream,
+        Result,
+    };
+
+    /// An agent that writes chunks forever and never prints a newline.
+    struct UnterminatedOutput {
+        chunks_served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for UnterminatedOutput {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            self.chunks_served
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(vec![b'x'; 8 * 1024]))
+        }
+    }
+
+    #[test]
+    fn the_probe_holds_one_line_to_its_cap_without_loosening_the_hosts_limits() {
+        let limits = probe_line_limits(LineLimits::default());
+        assert_eq!(limits.max_line_bytes, VERSION_PROBE_MAX_BYTES);
+        assert_eq!(
+            limits.max_buffered_bytes,
+            LineLimits::default().max_buffered_bytes
+        );
+        let tight = LineLimits {
+            max_line_bytes: 100,
+            max_buffered_bytes: 200,
+        };
+        assert_eq!(probe_line_limits(tight), tight);
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_line_stops_the_probe_at_its_cap_with_no_version() {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = UnterminatedOutput {
+            chunks_served: served.clone(),
+        };
+        let mut lines = LineStream::new(Box::new(source), probe_line_limits(LineLimits::default()));
+        let found = first_version(&mut lines, VERSION_PROBE_MAX_BYTES).await;
+        let chunks = served.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            matches!(found, Ok(None)),
+            "expected Ok(None) for output that never ends a line | received {found:?}"
+        );
+        assert!(
+            chunks * 8 * 1024 <= VERSION_PROBE_MAX_BYTES + 8 * 1024,
+            "expected at most {VERSION_PROBE_MAX_BYTES} bytes plus one chunk read | received {} bytes",
+            chunks * 8 * 1024
+        );
+    }
 
     #[test]
     fn a_harness_is_named_by_its_profile() {

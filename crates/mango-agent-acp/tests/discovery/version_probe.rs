@@ -70,3 +70,18 @@ async fn output_over_the_cap_reports_unknown_and_reaps_the_child() {
         launcher.live_children()
     );
 }
+
+#[tokio::test]
+async fn one_line_over_the_cap_reports_unknown_and_reaps_the_child() {
+    let process = FakeProcess::responding(|_| Vec::new()).with_greeting([
+        "x".repeat(PROBE_CAP_BYTES * 2),
+        String::from("cursor-agent 2026.09.10"),
+    ]);
+    let (discovery, launcher) = probe(process).await;
+    assert_eq!(
+        discovery.version, None,
+        "expected no version from a line longer than {PROBE_CAP_BYTES} bytes | received {:?}",
+        discovery.version
+    );
+    assert_eq!(launcher.live_children(), 0, "expected the child reaped");
+}
