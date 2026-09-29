@@ -589,8 +589,12 @@ frame. Refused there, the turn has already started: the connection fails, the se
 host is left with `AcceptanceUnknown`. So `start_turn` measures the exact `session/prompt` frame the
 official crate will write, before it submits anything, and answers `LimitExceeded` ("bytes in one
 frame to the ACP agent") with `Dispatch::NotSubmitted`. The session stays usable for the next turn.
-The count is exact, not a bound: a frame of exactly `turn_buffer_bytes` bytes is sent, one byte more
-is refused, and nothing that fits today is refused. It serialises into a counting sink, so no second
+The count is exact, not a bound: the check accepts a frame of exactly `turn_buffer_bytes` bytes,
+refuses one byte more, and refuses nothing that fits the frame budget today. It guarantees only that
+the frame fits alone. The outgoing byte budget is shared by every frame queued for the agent until it
+is written, so a near-budget prompt can still fail the connection after submission when another
+outgoing frame is queued at the same moment (a `session/cancel`, a permission or file response).
+That is the transport's queue cap described above, not a prompt-size refusal. It serialises into a counting sink, so no second
 copy of an attachment is built. It is one extra serialisation pass per turn, cheaper than the
 official crate's own encoding of the same request. A host that wants larger prompts raises
 `Limits::turn_buffer_bytes` itself.
