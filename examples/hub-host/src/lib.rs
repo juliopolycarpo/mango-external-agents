@@ -74,7 +74,7 @@ pub mod testing;
 pub use hub::{Commit, HubApi, HubError, HubReceipt, HubStatus, Reconciliation, RetryHint};
 pub use retry::{HashJitter, Jitter, RetryPolicy, WaitOutcome};
 pub use stop::Stop;
-pub use subscriber::{TurnBroadcast, TurnSubscriber};
+pub use subscriber::{Delivery, TurnBroadcast, TurnSubscriber};
 pub use supervisor::{
     SUGGESTED_ATTEMPT_DEADLINE, SUGGESTED_BASE_DELAY, SUGGESTED_MAX_DELAY, Settled, Supervisor,
 };
