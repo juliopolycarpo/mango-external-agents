@@ -402,6 +402,39 @@ mod discovery {
         );
     }
 
+    /// The regression behind the probe's own contract: a help listing cut off by a read error is
+    /// not a listing that lacks flags, so it must not be read as one.
+    #[tokio::test]
+    async fn a_help_listing_cut_off_by_a_read_error_is_unknown_rather_than_missing_a_surface() {
+        // The cut lands after the permission modes and before a required flag, so the printed prefix
+        // lacks it while the whole listing does not.
+        let cut_at = HELP_2_1_270
+            .lines()
+            .position(|line| line.trim_start().starts_with("--permission-prompts"))
+            .expect("expected the captured help to declare --permission-prompts");
+        let mut lines: Vec<String> = HELP_2_1_270.lines().map(String::from).collect();
+        lines.insert(cut_at, "x".repeat(8192));
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(&lines.join("\n")));
+        let narrow = Limits {
+            line: LineLimits {
+                max_line_bytes: 4096,
+                max_buffered_bytes: 8192,
+            },
+            ..Limits::default()
+        };
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected a help listing that could not be read whole to be unknown | received {:?}",
+            discovery.gate
+        );
+    }
+
     #[tokio::test]
     async fn a_cli_that_is_not_there_is_not_installed_rather_than_an_error() {
         // The fake answers nothing, because a launcher that cannot spawn returns no output.

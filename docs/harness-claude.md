@@ -35,7 +35,14 @@ reports `GateVerdict::VersionTooOld`, while a current or unreadable version repo
 `GateVerdict::Unknown` and opening returns a distinct safe `Error::Protocol` refusal. A multi-line
 wrapper banner can include its own semver, so discovery reads the semver from the line that
 identifies Claude Code rather than accepting the first semver in all stdout. A single bare version
-remains accepted for the documented compact form.
+remains accepted for the documented compact form. A probe whose output may be incomplete is
+treated the same way as one that printed nothing: a read error before the CLI closed stdout, a
+line over the host's line cap, or more than 1 MiB of stdout all leave that probe unestablished, so
+a cut-off `--help` reports `GateVerdict::Unknown` rather than `MissingRequiredSurface`. The same
+rule covers the other two probes: an incomplete `--version` reads like a `--version` that never answered (the CLI is reported as not
+installed, as it already is for a probe that times out), and an
+incomplete `auth status` as unknown authentication. The largest captured help is 21,401 bytes,
+about 2% of that cap.
 
 Anthropic's [CLI reference](https://code.claude.com/docs/en/cli-reference.md#cli-flags) cautions
 that `claude --help` does not list every supported flag. This harness deliberately applies the
