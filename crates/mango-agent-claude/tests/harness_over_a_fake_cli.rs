@@ -435,6 +435,29 @@ mod discovery {
         );
     }
 
+    /// The same rule for the total cap: a runaway listing made of legal lines is not a listing that
+    /// lacks flags either, and discovery stops holding it once it passes the cap.
+    #[tokio::test]
+    async fn a_help_listing_over_the_total_cap_is_unknown_rather_than_missing_a_surface() {
+        // The whole captured listing, then legal filler past the cap. Parsing everything that
+        // arrived would report `Usable`; a listing that was not read whole must report `Unknown`.
+        let filler = "y".repeat(999);
+        let runaway = format!("{HELP_2_1_270}\n{}", vec![filler; 1200].join("\n"));
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(&runaway));
+        let discovery = ClaudeHarness::new()
+            .discover(&host(launcher))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected {} bytes of help, over the probe's total cap, to be unknown | received {:?}",
+            runaway.len(),
+            discovery.gate
+        );
+    }
+
     #[tokio::test]
     async fn a_cli_that_is_not_there_is_not_installed_rather_than_an_error() {
         // The fake answers nothing, because a launcher that cannot spawn returns no output.
