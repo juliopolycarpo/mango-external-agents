@@ -119,8 +119,21 @@ requests reserve admission before entering the SDK queue.
 Framed transports also enforce `Limits::line`, and stderr has its own bounded tail. These are
 per-stream and per-connection budgets, not a total host-memory limit. The host caps the number of
 sessions, retained completed streams, attachments and source buffers it supplies through its
-launcher. Encoded byte accounting excludes Rust container overhead, which is bounded separately
-by event and request counts.
+launcher.
+
+Every byte budget in this library, including `turn_buffer_bytes`, `max_pending_bytes` and the line
+caps, counts encoded (wire) bytes. None of them measures parsed memory, and event and request
+counts do not bound it either: one large message is a single event however much it expands once
+parsed. How much a message expands depends on its shape and on the build. As a lower bound, a
+`serde_json::Value` is 32 bytes, or 72 bytes when any crate in the build enables
+`serde_json/preserve_order`; `mango-agent-acp` does, through the `agent-client-protocol` crate.
+Object members, array capacity and allocator rounding come on top. In one measurement of a 1 MB
+message on x86_64 (release build, `serde_json` 1.0.151), a single string parsed to about 1 MB,
+while a 1 MB array of `0`, `[]` or `{}` elements held about 17 MB (32-byte values) or 38 MB
+(72-byte values), and a 1 MB array of `{"a":1}` objects held about 83 MB or 55 MB. Those are
+worst-case shapes, not typical ones, and ordinary text stays close to its wire size. Treat the
+figures as an illustration, not a multiplier. A host that needs a hard memory cap must enforce it
+itself, for example with an operating-system memory limit on the process that embeds the library.
 
 ## Safe host retries
 

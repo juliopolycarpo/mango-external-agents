@@ -95,6 +95,18 @@ pub const REASONING_EFFORT_MAX_ITEMS: usize = 32;
 pub const APPROVAL_MAX_OPTIONS: usize = 16;
 
 /// The longest filesystem path the library will carry for a vendor session.
+///
+/// The unit depends on the check, and the two are not interchangeable for a non-ASCII path:
+///
+/// - [`vendor_path`], which admits a path a vendor reported, counts UTF-8 **bytes** of the
+///   sanitised text. At most 4,096 bytes is 1,365 three-byte characters.
+/// - [`is_argv_value_with_max`], given this constant by the Claude harness for the `--mcp-config`
+///   path (and its generated scratch path) and by the ACP harness for MCP stdio command paths,
+///   counts Unicode **code points**, so it accepts up to 4,096 characters however many bytes they
+///   encode to.
+///
+/// For an all-ASCII path the two agree. This is documented rather than unified because unifying
+/// them would change which paths are accepted.
 pub const MAX_PATH_LENGTH: usize = 4_096;
 
 /// The longest value the library accepts for one vendor command-line option.
@@ -212,6 +224,9 @@ pub fn opaque_id(raw: &str, field: &'static str) -> Result<String> {
 ///
 /// A path is something the vendor will be asked about again, and a shortened one names nothing —
 /// so an over-long or unsanitisable path is dropped by the caller rather than cut here.
+///
+/// The length cap, [`MAX_PATH_LENGTH`], is measured in UTF-8 bytes of the sanitised text, not in
+/// code points; see that constant for where the other unit applies.
 pub fn vendor_path(raw: &str) -> Option<String> {
     let sanitised = sanitize_field(raw);
     if sanitised.truncated || sanitised.text.is_empty() || sanitised.text.len() > MAX_PATH_LENGTH {
@@ -244,6 +259,9 @@ pub fn is_argv_value(raw: &str) -> bool {
 ///
 /// Use [`is_argv_value`] for ordinary options. Filesystem paths retain their own documented cap,
 /// so a harness may pass [`MAX_PATH_LENGTH`] here without shrinking a host-owned absolute path.
+///
+/// `max_code_points` counts Unicode code points, not bytes. A path near [`MAX_PATH_LENGTH`] that
+/// [`vendor_path`] would refuse for its byte length can therefore still pass this check.
 #[must_use]
 pub fn is_argv_value_with_max(raw: &str, max_code_points: usize) -> bool {
     !raw.is_empty()
