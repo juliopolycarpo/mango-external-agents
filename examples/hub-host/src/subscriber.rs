@@ -11,6 +11,78 @@ use std::sync::Arc;
 use mango_external_agents::AgentEvent;
 use tokio::sync::broadcast;
 
+/// One thing a subscriber reads: an event, or the news that events were lost before it.
+///
+/// [`AgentEvent`] carries no sequence number, so a subscriber cannot notice a hole by itself. A
+/// slow watcher would otherwise render `4, 5, 6, 7` after missing `0..=3` as a complete answer.
+/// [`Delivery::Gap`] is that notice, delivered in order: it arrives where the missing events
+/// would have been, before the oldest event that is still held.
+///
+/// # Resync contract
+///
+/// On a [`Delivery::Gap`] the subscriber must stop treating what it accumulated for the current
+/// operation as complete. Text deltas are not idempotent, so it cannot patch the hole. It should
+/// mark the view as incomplete and keep reading: the remaining events, including the terminal,
+/// are still delivered after the gap, so the operation's end is never lost. It then replaces the
+/// incomplete view with the authoritative outcome from whatever durable record the host keeps
+/// for the operation, because the stream itself cannot be replayed. A subscriber that only
+/// renders a live view may instead show the answer as truncated.
+///
+/// `missed` counts events dropped for *any* reason, such as a history that has to forget its
+/// oldest events, so a subscriber handles every cause the same way.
+///
+/// # Example
+///
+/// ```
+/// use hub_host::{Delivery, TurnBroadcast};
+/// use mango_external_agents::{AttemptId, EventKind, EventSink, SessionId, SystemClock, TurnId};
+/// use std::sync::Arc;
+///
+/// let runtime = tokio::runtime::Builder::new_current_thread()
+///     .build()
+///     .expect("expected a current-thread runtime");
+/// runtime.block_on(async {
+///     let (sink, mut source) = EventSink::new(
+///         SessionId::new("chat-1"),
+///         TurnId::new("turn-1"),
+///         AttemptId::FIRST,
+///         Arc::new(SystemClock),
+///         4,
+///     );
+///     let events = TurnBroadcast::new(1);
+///     let mut watcher = events.subscribe();
+///     for text in ["a", "b", "c"] {
+///         sink.emit(EventKind::TextDelta { text: String::from(text) })
+///             .await
+///             .expect("expected the sink to take the event");
+///         events.publish(source.try_recv().expect("expected the event back"));
+///     }
+///
+///     // Room for one event and three were published: two were missed.
+///     let mut complete = true;
+///     while let Some(item) = watcher.try_recv() {
+///         match item {
+///             Delivery::Gap { missed } => {
+///                 assert_eq!(missed, 2);
+///                 complete = false;
+///             }
+///             Delivery::Event(_) => {}
+///         }
+///     }
+///     assert!(!complete, "expected the watcher to know its view is incomplete");
+/// });
+/// ```
+#[derive(Debug, Clone)]
+pub enum Delivery {
+    /// The next event.
+    Event(Arc<AgentEvent>),
+    /// Events were dropped before this subscriber read them.
+    Gap {
+        /// How many events were dropped, always at least one.
+        missed: u64,
+    },
+}
+
 /// The supervisor's side of the fan-out.
 ///
 /// Publishing to nobody succeeds. `broadcast::Sender::send` reports "no receivers" as an `Err`,
@@ -109,17 +181,18 @@ impl TurnBroadcast {
 /// One watcher's handle on a running operation.
 ///
 /// Dropping it detaches that watcher. It does not cancel, abandon or even slow the operation: a
-/// lagged subscriber is told it lagged and carries on.
+/// lagged subscriber is told it lagged, through [`Delivery::Gap`], and carries on.
 #[derive(Debug)]
 pub struct TurnSubscriber {
     receiver: broadcast::Receiver<Arc<AgentEvent>>,
 }
 
 impl TurnSubscriber {
-    /// The next event, or `None` once the supervisor has finished publishing.
+    /// The next delivery, or `None` once the supervisor has finished publishing.
     ///
-    /// A watcher that fell too far behind skips to the oldest event still held rather than being
-    /// disconnected, because a UI that missed three deltas still wants the fourth.
+    /// A watcher that fell too far behind is not disconnected, because a UI that missed three
+    /// deltas still wants the fourth. It receives one [`Delivery::Gap`] counting what it missed,
+    /// then continues from the oldest event still held.
     ///
     /// # Example
     ///
@@ -136,17 +209,17 @@ impl TurnSubscriber {
     ///     assert!(watcher.recv().await.is_none());
     /// });
     /// ```
-    pub async fn recv(&mut self) -> Option<Arc<AgentEvent>> {
-        loop {
-            return match self.receiver.recv().await {
-                Ok(event) => Some(event),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => None,
-            };
+    pub async fn recv(&mut self) -> Option<Delivery> {
+        match self.receiver.recv().await {
+            Ok(event) => Some(Delivery::Event(event)),
+            Err(broadcast::error::RecvError::Lagged(missed)) => Some(Delivery::Gap { missed }),
+            Err(broadcast::error::RecvError::Closed) => None,
         }
     }
 
-    /// The next event if one is already waiting, without suspending the caller.
+    /// The next delivery if one is already waiting, without suspending the caller.
+    ///
+    /// Reports a [`Delivery::Gap`] exactly as [`recv`](Self::recv) does.
     ///
     /// # Example
     ///
@@ -157,15 +230,13 @@ impl TurnSubscriber {
     /// let mut watcher = events.subscribe();
     /// assert!(watcher.try_recv().is_none());
     /// ```
-    pub fn try_recv(&mut self) -> Option<Arc<AgentEvent>> {
-        loop {
-            return match self.receiver.try_recv() {
-                Ok(event) => Some(event),
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(
-                    broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed,
-                ) => None,
-            };
+    pub fn try_recv(&mut self) -> Option<Delivery> {
+        match self.receiver.try_recv() {
+            Ok(event) => Some(Delivery::Event(event)),
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => Some(Delivery::Gap { missed }),
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                None
+            }
         }
     }
 }
