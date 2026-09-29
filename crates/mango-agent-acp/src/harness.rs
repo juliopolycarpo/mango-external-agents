@@ -375,15 +375,14 @@ impl Harness for AcpHarness {
         if argv.is_empty() {
             return Ok(Discovery::not_installed());
         }
-        let printed = match run_version(host, &self.descriptor, argv).await {
-            Ok(printed) => printed,
+        let version = match run_version(host, &self.descriptor, argv).await {
+            Ok(version) => version,
             // A launcher that could not start it is the definition of not installed here: the
             // library does not search `PATH`, so "no such program" is what it learns instead.
             Err(Error::Launch { .. }) => return Ok(Discovery::not_installed()),
             Err(error) => return Err(error),
         };
 
-        let version = version::parse(&printed);
         Ok(Discovery {
             executable: self.executable.get().cloned(),
             version: version.clone(),
@@ -1014,12 +1013,19 @@ fn resume_failure_is_conclusive(error: &Error) -> bool {
     )
 }
 
-/// Runs the profile's version argv and returns what it printed.
+/// The most output a version probe reads before it stops looking for a version.
+///
+/// A real `--version` prints one line; 64 KiB leaves room for a banner far longer than any agent
+/// prints. Past it the probe reports no version rather than reading for the whole request timeout.
+const VERSION_PROBE_MAX_BYTES: usize = 64 * 1024;
+
+/// Runs the profile's version argv and returns the version it printed, if it printed one within
+/// [`VERSION_PROBE_MAX_BYTES`].
 async fn run_version(
     host: &HostContext,
     descriptor: &HarnessDescriptor,
     argv: Vec<String>,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let process = host
         .launcher()
         .spawn(LaunchSpec {
@@ -1034,19 +1040,12 @@ async fn run_version(
         .await?;
 
     let mut lines = LineStream::new(process.stdout, host.limits().line);
-    let mut printed = String::new();
     // Bounded by the host's own request timeout: an agent that prints nothing and does not exit must
     // not hold a discovery open.
-    let read = tokio::time::timeout(host.limits().request_timeout, async {
-        while let Some(line) = lines.next_line().await? {
-            printed.push_str(&line);
-            printed.push('\n');
-            if version::parse(&printed).is_some() {
-                break;
-            }
-        }
-        Ok::<(), Error>(())
-    })
+    let read = tokio::time::timeout(
+        host.limits().request_timeout,
+        first_version(&mut lines, VERSION_PROBE_MAX_BYTES),
+    )
     .await;
 
     // The child is ended either way: a probe that left one running would leak a process per probe.
@@ -1055,9 +1054,29 @@ async fn run_version(
         .kill(mango_external_agents::CancelReason::Requested)
         .await;
     match read {
-        Ok(Ok(())) | Err(_) => Ok(printed),
-        Ok(Err(error)) => Err(error),
+        Ok(result) => result,
+        Err(_) => Ok(None),
     }
+}
+
+/// The first version found in `lines`, or `None` when the stream ends or passes `max_bytes`
+/// (terminators counted) without one.
+///
+/// Each line is parsed once. [`version::parse`] takes the first version-shaped token of whitespace
+/// separated text and a line break is whitespace, so the first line that holds one yields the same
+/// answer as parsing everything read so far, at a cost linear in the output.
+async fn first_version(lines: &mut LineStream, max_bytes: usize) -> Result<Option<String>> {
+    let mut read = 0_usize;
+    while let Some(line) = lines.next_line().await? {
+        read = read.saturating_add(line.len() + 1);
+        if read > max_bytes {
+            return Ok(None);
+        }
+        if let Some(found) = version::parse(&line) {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a reported version clears the floor a profile pinned.
