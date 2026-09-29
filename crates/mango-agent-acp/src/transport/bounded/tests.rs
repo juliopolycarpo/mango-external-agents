@@ -527,3 +527,32 @@ async fn the_overflow_is_recorded_before_the_incoming_channel_closes() {
         "expected one close wake with the overflow already recorded, received {seen:?}"
     );
 }
+
+#[test]
+fn the_outgoing_frame_limit_is_the_turn_buffer_capped_to_the_permit_range() {
+    let default = Limits::default();
+    assert_eq!(
+        outgoing_frame_limit(&default),
+        default.turn_buffer_bytes,
+        "expected the default budget to pass through"
+    );
+    let unbounded = Limits {
+        turn_buffer_bytes: usize::MAX,
+        ..Limits::default()
+    };
+    assert_eq!(
+        outgoing_frame_limit(&unbounded),
+        u32::MAX as usize,
+        "expected a budget beyond the permit range to be capped"
+    );
+}
+
+#[test]
+fn an_outgoing_frame_overflow_reads_as_the_frame_budget_error() {
+    let error = Overflow::outgoing_frame(8, 9).error();
+    assert_eq!(
+        error.to_string(),
+        "expected at most 8 bytes in one frame to the ACP agent, received 9",
+        "expected the outgoing frame budget sentence | received {error}"
+    );
+}

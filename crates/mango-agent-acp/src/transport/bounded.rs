@@ -69,6 +69,18 @@ impl Overflow {
         }
     }
 
+    /// The overflow of one outgoing frame of `received` bytes under `limit`, for the caller that
+    /// measures a frame before the transport does.
+    ///
+    /// For example, `Overflow::outgoing_frame(outgoing_frame_limit(&limits), 9_000_000).error()`.
+    pub(crate) fn outgoing_frame(limit: usize, received: usize) -> Self {
+        Self {
+            budget: Budget::OutgoingFrameBytes,
+            limit,
+            received,
+        }
+    }
+
     /// The typed error a host sees for this budget.
     ///
     /// For example, 50 queued messages under an 8-message cap displays as
@@ -122,9 +134,7 @@ impl BoundedTransport {
         } = self;
         let future = async move {
             let (pending, writing) = mpsc::channel(outgoing_capacity(&limits));
-            let budget = Arc::new(Semaphore::new(
-                limits.turn_buffer_bytes.min(u32::MAX as usize),
-            ));
+            let budget = Arc::new(Semaphore::new(outgoing_frame_limit(&limits)));
             futures::try_join!(
                 read_frames(incoming, transport.tx, limits, &overflow),
                 queue_output(transport.rx, pending, budget, limits, &overflow),
@@ -245,13 +255,9 @@ async fn queue_output(
 ) -> agent_client_protocol::Result<()> {
     while let Some(frame) = frames.next().await {
         let line = frame.to_json()?;
-        let byte_limit = limits.turn_buffer_bytes.min(u32::MAX as usize);
+        let byte_limit = outgoing_frame_limit(&limits);
         if line.len() > byte_limit {
-            let overflow = Overflow {
-                budget: Budget::OutgoingFrameBytes,
-                limit: byte_limit,
-                received: line.len(),
-            };
+            let overflow = Overflow::outgoing_frame(byte_limit, line.len());
             return Err(overflow.fail(slot, format!(
                 "ACP output frame exceeded the byte budget: received {} bytes; expected at most {byte_limit}",
                 line.len(),
@@ -325,6 +331,17 @@ fn frame_limit(limits: &Limits) -> usize {
         .turn_channel_capacity
         .max(limits.max_pending_requests)
         .max(1)
+}
+
+/// The most bytes one outgoing frame may carry: `Limits::turn_buffer_bytes`, capped to what the
+/// byte budget's permits can express.
+///
+/// The transport refuses a longer frame after the turn has started; a caller that measures its
+/// frame first compares against this same number.
+///
+/// For example, the default 8 MiB budget gives `8 * 1024 * 1024`.
+pub(crate) fn outgoing_frame_limit(limits: &Limits) -> usize {
+    limits.turn_buffer_bytes.min(u32::MAX as usize)
 }
 
 /// The outgoing writer queue's capacity: the message cap, clamped to what tokio can allocate.
