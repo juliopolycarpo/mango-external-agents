@@ -455,6 +455,10 @@ pub fn resume_fallback_reason(operation: &str, error: &Error) -> String {
 }
 
 /// The largest attachment the vendor wire carries, and how many of them.
+///
+/// This caps one attachment's raw bytes, not the encoded turn, which a harness's transport can
+/// limit further. The ACP harness refuses a prompt whose encoded request exceeds
+/// `Limits::turn_buffer_bytes` with `LimitExceeded` before the turn is submitted.
 pub const ATTACHMENT_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// How many attachments one turn may carry.
 pub const TURN_MAX_ATTACHMENTS: usize = 4;

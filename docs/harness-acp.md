@@ -579,6 +579,20 @@ An attachment whose kind the agent never advertised in `promptCapabilities` is r
 turn starts. Rejected mid-turn it reads to a user as the agent breaking rather than as a file that was
 never going to work.
 
+The whole prompt is checked too, not only each attachment. The transport refuses any outgoing frame
+over `Limits::turn_buffer_bytes` (8 MiB by default), and the encoding grows what it carries: base64
+adds a third, and a control character in a text attachment becomes a six-byte `\u00XX` escape. Three
+2 MiB images or one 2 MiB text of control characters pass the per-attachment cap and still exceed the
+frame. Refused there, the turn has already started: the connection fails, the session closes and the
+host is left with `AcceptanceUnknown`. So `start_turn` measures the exact `session/prompt` frame the
+official crate will write, before it submits anything, and answers `LimitExceeded` ("bytes in one
+frame to the ACP agent") with `Dispatch::NotSubmitted`. The session stays usable for the next turn.
+The count is exact, not a bound: a frame of exactly `turn_buffer_bytes` bytes is sent, one byte more
+is refused, and nothing that fits today is refused. It serialises into a counting sink, so no second
+copy of an attachment is built. It is one extra serialisation pass per turn, cheaper than the
+official crate's own encoding of the same request. A host that wants larger prompts raises
+`Limits::turn_buffer_bytes` itself.
+
 ## Known caveats
 
 - **MCP passthrough.** `OpenSession::mcp_servers` maps to `session/new.mcpServers` and
