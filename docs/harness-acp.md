@@ -61,7 +61,9 @@ queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking.
 
 Output bytes remain charged through the physical write. A single frame larger than the byte
 budget, or a queue that would exceed either bound, fails the connection with an error naming the
-received count or size and the limit; the session then closes and its child is released.
+received count or size and the limit; the session then closes and its child is released. A prompt
+too large for one frame does not reach that path: `start_turn` measures it first and refuses it
+before submission (see [Attachments](#attachments)).
 
 What the host observes: the turn in flight ends with one `EventKind::Error` whose code is
 `acp-transport-overflow` and whose message is the core `Error::LimitExceeded` text, for example
