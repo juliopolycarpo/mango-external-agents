@@ -1087,12 +1087,14 @@ async fn first_version(lines: &mut LineStream, max_bytes: usize) -> Result<Optio
             Err(Error::LimitExceeded { .. }) => return Ok(None),
             Err(error) => return Err(error),
         };
+        // Parsed before the cap is checked: a line that starts inside the first `max_bytes` and
+        // ends past them is read whole (a line is itself held to the cap by `probe_line_limits`).
+        if let Some(found) = version::parse(&line) {
+            return Ok(Some(found));
+        }
         read = read.saturating_add(line.len() + 1);
         if read > max_bytes {
             return Ok(None);
-        }
-        if let Some(found) = version::parse(&line) {
-            return Ok(Some(found));
         }
     }
 }
@@ -1156,6 +1158,33 @@ mod tests {
             max_buffered_bytes: 200,
         };
         assert_eq!(probe_line_limits(tight), tight);
+    }
+
+    /// An agent that writes these chunks, in order, then ends its output.
+    struct ScriptedOutput {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for ScriptedOutput {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            Ok(self.chunks.pop_front())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_that_starts_a_line_crossing_the_cap_is_still_read() {
+        let filler = "banner line\n".repeat((VERSION_PROBE_MAX_BYTES - 1_000) / 12);
+        let crossing = format!("cursor-agent 2026.09.10 {}\n", "y".repeat(2_000));
+        let source = ScriptedOutput {
+            chunks: [filler.into_bytes(), crossing.into_bytes()].into(),
+        };
+        let mut lines = LineStream::new(Box::new(source), probe_line_limits(LineLimits::default()));
+        let found = first_version(&mut lines, VERSION_PROBE_MAX_BYTES).await;
+        assert!(
+            matches!(&found, Ok(Some(version)) if version == "2026.09.10"),
+            "expected Ok(Some(\"2026.09.10\")) from a version inside the first {VERSION_PROBE_MAX_BYTES} bytes | received {found:?}"
+        );
     }
 
     #[tokio::test]
