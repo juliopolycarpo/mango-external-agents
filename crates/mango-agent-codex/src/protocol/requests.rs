@@ -425,7 +425,7 @@ pub enum TurnStatus {
 }
 
 /// What the server said about a failed turn.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct TurnError {
@@ -439,6 +439,25 @@ pub struct TurnError {
     /// object such as `{"httpConnectionFailed": {"httpStatusCode": 502}}`.
     #[serde(default)]
     pub codex_error_info: Option<serde_json::Value>,
+}
+
+impl fmt::Debug for TurnError {
+    /// The error's shape and the size of what the vendor wrote, never its message, details or
+    /// classification payload.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnError")
+            .field("message", &crate::redacted::text(&self.message))
+            .field(
+                "additional_details",
+                &crate::redacted::opt_text(self.additional_details.as_deref()),
+            )
+            .field(
+                "codex_error_info",
+                &crate::redacted::opt_json(self.codex_error_info.as_ref()),
+            )
+            .finish()
+    }
 }
 
 impl TurnError {
