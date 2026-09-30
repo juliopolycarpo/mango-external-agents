@@ -22,7 +22,10 @@ pub use bounded::BoundedTransport;
 pub(crate) use bounded::{Overflow, OverflowSlot, outgoing_frame_limit};
 use futures::stream::BoxStream;
 use mango_external_agents::process::{ByteSink, LineStream};
-use mango_external_agents::{AcpSpec, Error, HostContext, LaunchSpec, ManagedProcess, Result};
+use mango_external_agents::{
+    AcpSpec, CancelReason, Error, HostContext, LaunchSpec, ManagedProcess, ProcessCleanupGuard,
+    Result,
+};
 
 /// The outgoing half: one JSON-RPC message per line, written to the child's stdin.
 type OutgoingLines = Pin<Box<dyn futures::Sink<String, Error = std::io::Error> + Send>>;
@@ -62,7 +65,9 @@ impl std::fmt::Debug for LaunchedAgent {
 ///
 /// [`Error::UnsupportedTransport`] for [`AcpSpec::Http`], which 0.1 does not carry;
 /// [`Error::HostConfiguration`] for an empty argv; [`Error::Launch`] when the host's launcher
-/// refused; and [`Error::Link`] when the launcher returned a child with no stdin.
+/// refused; [`Error::Link`] when the launcher returned a child with no stdin, after that child has
+/// been stopped; and [`Error::CleanupRequired`], carrying the child's control, when stopping it
+/// failed.
 ///
 /// # Example
 ///
@@ -108,7 +113,20 @@ pub async fn connect(
             hide_window: true,
         })
         .await?;
-    frame(process, host)
+    let control = std::sync::Arc::clone(&process.control);
+    match frame(process, host) {
+        Ok(launched) => Ok(launched),
+        // `frame` refuses a child it cannot write to, and it consumes the process. The child is
+        // live and the host owns it only through this control, so it is stopped here, within the
+        // host's bounds, rather than left running behind an error. If that fails, the host gets
+        // the control back in `Error::CleanupRequired`, as `docs/lifecycle.md` promises.
+        Err(error) => {
+            ProcessCleanupGuard::new(control, *host.limits(), CancelReason::Shutdown)
+                .finish()
+                .await?;
+            Err(error)
+        }
+    }
 }
 
 /// Frames an already-spawned child, so a test can drive the transport without a launcher.

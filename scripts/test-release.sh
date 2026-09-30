@@ -63,6 +63,62 @@ if scripts/check-pr-title.sh >/dev/null 2>&1; then
 fi
 echo 'pull request title checks passed'
 
+# The release tag must be an annotated tag GitHub verified. The fake `gh` answers for one tag; every
+# refusal has to name the tag and what GitHub reported, so a maintainer can act on the log alone.
+tag_bin=$(mktemp -d)
+tag_log=$tag_bin/gh.log
+ln -s "$PWD/scripts/test-fixtures/fake-tag-verification-cli.sh" "$tag_bin/gh"
+check_tag() {
+  env PATH="$tag_bin:$PATH" FAKE_GH_LOG=$tag_log FAKE_TAG_NAME=v0.4.0 "$@" \
+    scripts/check-release-tag-signature.sh owner/repository "$TAG_VERSION" "$RELEASE_COMMIT"
+}
+expect_tag_refusal() {
+  local status=$1
+  local expected=$2
+  shift 2
+  local output
+  local received
+  set +e
+  output=$(check_tag "$@" 2>&1)
+  received=$?
+  set -e
+  if [ "$received" != "$status" ]; then
+    echo "expected exit $status from the tag check, received $received: $output" >&2
+    exit 1
+  fi
+  case "$output" in
+    *"$expected"*) ;;
+    *)
+      echo "expected the tag check to say '$expected', received: $output" >&2
+      exit 1
+      ;;
+  esac
+}
+TAG_VERSION=0.4.0
+RELEASE_COMMIT=56307d67182e53594382e04682800b36eb421689
+check_tag FAKE_TAG_VERIFIED=true FAKE_TAG_REASON=valid >/dev/null || {
+  echo 'expected a verified annotated tag to pass, received a refusal' >&2
+  exit 1
+}
+expect_tag_refusal 1 'expected tag v0.4.0 to be signed and verified by GitHub, received verified=false reason=unsigned' \
+  FAKE_TAG_VERIFIED=false FAKE_TAG_REASON=unsigned
+expect_tag_refusal 1 'received verified=false reason=unknown_key' \
+  FAKE_TAG_VERIFIED=false FAKE_TAG_REASON=unknown_key
+expect_tag_refusal 1 'expected v0.4.0 to be an annotated signed tag, received a commit object' \
+  FAKE_TAG_OBJECT=commit
+expect_tag_refusal 1 'expected tag v0.4.0 to be signed under that name, received a signature over the name candidate' \
+  FAKE_TAG_SIGNED_NAME=candidate
+expect_tag_refusal 1 'expected tag v0.4.0 to point at the commit being released 56307d67182e53594382e04682800b36eb421689, received 1111111111111111111111111111111111111111' \
+  FAKE_TAG_COMMIT=1111111111111111111111111111111111111111
+TAG_VERSION=0.9.0
+expect_tag_refusal 2 'expected tag v0.9.0 to exist in owner/repository' FAKE_TAG_VERIFIED=true
+if scripts/check-release-tag-signature.sh owner/repository 0.4.0 >/dev/null 2>&1; then
+  echo 'expected the tag check to refuse a missing version, received success' >&2
+  exit 1
+fi
+rm -rf "$tag_bin"
+echo 'release tag signature checks passed'
+
 # What the title gate protects: git-cliff has to keep a squash subject that carries no Conventional
 # Commit type, show only its first line, and mark a breaking change. `filter_unconventional = true`
 # — the setting that kept #18 out of v0.1.0's notes — fails the first assertion, dropping the
@@ -104,3 +160,27 @@ else
   trap - EXIT
   echo 'changelog rendering checks passed'
 fi
+
+# A path-only dev-dependency vanishes from the packaged manifest, taking its features with it.
+# `workspace = true` and a version beside the path both survive; a bare path does not.
+dev_fixture=$(mktemp -d)
+trap 'rm -rf "$dev_fixture"' EXIT
+printf '[dev-dependencies]\n# path = "../commented" is only a comment\nsibling = { workspace = true, features = ["testing"] }\nother = { path = "../other", version = "0.3.0" }\n' > "$dev_fixture/kept.toml"
+printf '[dev-dependencies]\nsibling = { features = ["testing"], path = "../sibling" }\n' > "$dev_fixture/dropped.toml"
+printf 'dev-dependencies.sibling.path = "../sibling"\n\n[package]\nname = "x"\n' > "$dev_fixture/dotted.toml"
+printf '[target.x86_64-unknown-linux-gnu.dev-dependencies]\nsibling = { path = "../sibling" }\n' > "$dev_fixture/target.toml"
+scripts/check-dev-dependencies.sh "$dev_fixture/kept.toml" >/dev/null
+for rejected in dropped dotted target; do
+  if scripts/check-dev-dependencies.sh "$dev_fixture/$rejected.toml" >/dev/null 2>"$dev_fixture/$rejected.err"; then
+    echo "expected rejection of the path-only dev-dependency in $rejected.toml, received success" >&2
+    exit 1
+  fi
+  grep -q "$rejected.toml: \[.*dev-dependencies\] sibling = " "$dev_fixture/$rejected.err" || {
+    echo "expected the rejection to name $rejected.toml and the dependency, received: $(cat "$dev_fixture/$rejected.err")" >&2
+    exit 1
+  }
+done
+rm -rf "$dev_fixture"
+trap - EXIT
+scripts/check-dev-dependencies.sh >/dev/null
+echo 'dev-dependency packaging checks passed'

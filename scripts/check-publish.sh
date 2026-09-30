@@ -40,6 +40,10 @@ fi
 
 run() { echo "▶ $*"; "$@"; }
 
+echo "== every dev-dependency survives packaging =="
+run scripts/check-dev-dependencies.sh
+
+echo
 echo "== every publishable package builds from its own tarball =="
 run cargo publish --workspace --dry-run --locked
 
