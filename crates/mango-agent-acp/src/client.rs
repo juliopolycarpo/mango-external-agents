@@ -39,7 +39,7 @@ use mango_external_agents::approval::ApprovalDeadline;
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
 };
-use mango_external_agents::event::{EventKind, SessionId};
+use mango_external_agents::event::{ActivityStatus, EventKind, SessionId};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
     broker_response,
@@ -753,13 +753,29 @@ impl SessionState {
         }
     }
 
-    /// The events and session facts one frame produces, computed under the guard because the
-    /// reducer is pure.
-    fn reduce(&self, notification: SessionNotification) -> (Vec<EventKind>, Vec<SessionFact>) {
+    /// The events and session facts one frame produces for `turn`, computed under the guard because
+    /// the reducer is pure.
+    ///
+    /// `turn` is the owner the caller read before getting here, and it may have ended since: its
+    /// terminal is claimed before its slot is released, and the slot is released before a later
+    /// turn resets the reducer. A frame for a turn that already claimed its terminal has nowhere to
+    /// go (the caller drops its events), and reducing it would leave a call open in a reducer the
+    /// next turn then owns, to be closed there as a call its host never saw start. So such a frame
+    /// contributes only its session facts. The claim is read under the reducer's own guard, which
+    /// is what the next turn's reset waits for, so a turn that has replaced `turn` is always seen
+    /// as ended here.
+    fn reduce(
+        &self,
+        turn: &TurnHandle,
+        notification: SessionNotification,
+    ) -> (Vec<EventKind>, Vec<SessionFact>) {
+        let mut reducer = self.lock_reducer();
+        if turn.is_finished() {
+            return (Vec::new(), Reducer::session_facts(notification.update));
+        }
         // Tokio's clock rather than the host's: this instant only spaces a running call's updates,
         // and a runtime with paused time has to see that spacing move with it.
-        self.lock_reducer()
-            .update_at(notification.update, tokio::time::Instant::now().into_std())
+        reducer.update_at(notification.update, tokio::time::Instant::now().into_std())
     }
 
     /// How many tool calls the turn reducer holds open, for the tests that prove a turnless frame
@@ -1082,7 +1098,7 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
         }
         return;
     };
-    let (events, facts) = state.reduce(notification);
+    let (events, facts) = state.reduce(&turn, notification);
     // Published before the turn events: a session fact is true the moment the agent announced it,
     // not only once a host has read every event that preceded it on this turn's own stream.
     for fact in facts {
@@ -1091,10 +1107,49 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     for kind in events {
         // Re-checked each time round: close can commit the terminal after reduction, and no later
         // event may follow it.
-        if turn.is_finished() || turn.sink.emit(kind).await.is_err() {
+        if turn.is_finished() {
+            return;
+        }
+        if let Err(error) = turn.sink.emit(kind).await {
+            report_refused_event(state, &turn, &error).await;
             return;
         }
     }
+}
+
+/// Fails the turn when the core refused to publish one of its events, so the host is told.
+///
+/// Only a value the core cannot make safe (an agent's call id that is blank or longer than the
+/// bound) is reported: it means a part of the turn can never reach the host, and dropping it in
+/// silence leaves a host rendering a turn that is missing something. Every other refusal is an
+/// ordinary end of the turn's stream (a closed or already-terminal sink) or was already turned
+/// into a failure by the sink itself (an overflow), so it stays silent. An already-terminal turn
+/// keeps its outcome, because a terminal commits once.
+///
+/// The failure is committed on the sink, so the prompt owner sees the terminal and stops native
+/// work before it releases the generation. That owner adds nothing to a terminal it did not write,
+/// so what the turn still owes is settled here first, in the order the prompt owner would have
+/// used: the questions still waiting are withdrawn and their resolutions flushed, the calls,
+/// reasoning and plan the agent left running are closed as failed, and only then does the terminal
+/// commit. A host therefore never sees a transcript that ends with an activity still running or a
+/// question still waiting.
+async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &Error) {
+    if !matches!(error, Error::InvalidVendorValue { .. }) || turn.sink.is_terminal() {
+        return;
+    }
+    if let Some((_, _, mut closing)) = state.prepare_terminal_matching(turn) {
+        let _ = turn.approvals.flush(&turn.sink).await;
+        for kind in closing.finish_with(ActivityStatus::Failed) {
+            let _ = turn.sink.emit(kind).await;
+        }
+    }
+    let _ = turn
+        .sink
+        .fail(VendorError::new(
+            mango_external_agents::ErrorCode::from_static("acp-refused-event"),
+            format!("the ACP agent sent an event the core refused to publish: {error}"),
+        ))
+        .await;
 }
 
 /// One `session/request_permission` request, brokered.
@@ -2749,7 +2804,7 @@ mod tests {
         use super::{SessionId, state};
 
         /// One `session/update` notification for `session-1`, composed as the agent's JSON.
-        fn notification(
+        pub(super) fn notification(
             update: serde_json::Value,
         ) -> agent_client_protocol::schema::v1::SessionNotification {
             serde_json::from_value(serde_json::json!({
@@ -2759,7 +2814,9 @@ mod tests {
             .expect("expected the test frame to be a v1 session notification")
         }
 
-        fn running_call(index: usize) -> agent_client_protocol::schema::v1::SessionNotification {
+        pub(super) fn running_call(
+            index: usize,
+        ) -> agent_client_protocol::schema::v1::SessionNotification {
             notification(serde_json::json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": format!("call-{index}"),
@@ -2879,6 +2936,297 @@ mod tests {
             assert_eq!(
                 replayed, fresh,
                 "expected a turn after replay to match a fresh session: {fresh:?} | received: {replayed:?}"
+            );
+        }
+    }
+
+    /// An event the core refuses to publish reaches the host as the turn's failure, not as silence.
+    mod refused {
+        use std::sync::Arc;
+
+        use mango_external_agents::{
+            AttemptId, EventKind, EventReceiver, EventSink, TerminalStatus, TurnId,
+        };
+
+        use super::replay::{notification, running_call};
+        use super::{SessionId, SessionState, state};
+
+        fn call_named(id: &str) -> agent_client_protocol::schema::v1::SessionNotification {
+            notification(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "title": "Run tests",
+                "kind": "execute",
+                "status": "in_progress",
+            }))
+        }
+
+        /// A state with a turn running on it, and the receiver the host reads that turn from.
+        fn running_turn() -> (Arc<SessionState>, EventSink, EventReceiver) {
+            let (state, host) = state();
+            let state = Arc::new(state);
+            let (sink, events) = EventSink::new(
+                SessionId::new("session-1"),
+                TurnId::new("turn-1"),
+                AttemptId::default(),
+                Arc::clone(host.clock()),
+                16,
+            );
+            state
+                .begin_turn(sink.clone(), None)
+                .expect("expected the turn to be admitted");
+            (state, sink, events)
+        }
+
+        /// The failure code the turn ended with, or what it is doing instead.
+        fn outcome(events: &EventReceiver) -> String {
+            match events.terminal_status() {
+                Some(TerminalStatus::Failed { code }) => code.as_str().to_owned(),
+                Some(other) => format!("{other:?}"),
+                None => String::from("still running"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_call_id_the_core_refuses_fails_the_turn_with_a_named_error() {
+            let (state, _sink, mut events) = running_turn();
+            crate::client::on_session_update(&state, call_named(&"c".repeat(129))).await;
+            let outcome = outcome(&events);
+            assert_eq!(
+                outcome, "acp-refused-event",
+                "expected the turn to fail with acp-refused-event | received: {outcome}"
+            );
+            let mut message = None;
+            while let Ok(event) = events.try_recv() {
+                if let EventKind::Error { error } = event.kind {
+                    message = Some(error.message);
+                }
+            }
+            let message = message.unwrap_or_default();
+            assert!(
+                message.contains("activity call id"),
+                "expected the failure to name the refused activity call id | received: {message:?}"
+            );
+        }
+
+        /// What the turn still owes when a refused event ends it is settled before the terminal, so
+        /// the host's transcript never ends with a call running, a plan open or a thought unended.
+        #[tokio::test]
+        async fn a_refusal_closes_what_the_turn_left_running_before_the_terminal() {
+            use mango_external_agents::ActivityStatus;
+
+            let (state, _sink, mut events) = running_turn();
+            for frame in [
+                running_call(0),
+                notification(serde_json::json!({
+                    "sessionUpdate": "plan",
+                    "entries": [{ "content": "build", "priority": "high", "status": "pending" }]
+                })),
+                notification(serde_json::json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "thinking" }
+                })),
+                call_named(&"c".repeat(129)),
+            ] {
+                crate::client::on_session_update(&state, frame).await;
+            }
+            let mut sequence = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                sequence.push(match event.kind {
+                    EventKind::ActivityStarted { call_id, .. } => format!("started {call_id}"),
+                    EventKind::ActivityCompleted { call_id, result } => {
+                        format!("completed {call_id} {:?}", result.status)
+                    }
+                    EventKind::ReasoningEnded => String::from("reasoning ended"),
+                    EventKind::Error { error } => format!("error {}", error.code.as_str()),
+                    _ => continue,
+                });
+            }
+            let failed = format!("{:?}", ActivityStatus::Failed);
+            let mut closed = vec![
+                format!("completed call-0 {failed}"),
+                format!("completed acp:plan {:?}", ActivityStatus::Completed),
+                String::from("reasoning ended"),
+            ];
+            let (last, before) = sequence.split_last().expect("expected events");
+            let mut owed: Vec<String> = before
+                .iter()
+                .filter(|entry| !entry.starts_with("started"))
+                .cloned()
+                .collect();
+            owed.sort();
+            closed.sort();
+            assert!(
+                last == "error acp-refused-event" && owed == closed,
+                "expected the running call, plan and thought closed before acp-refused-event | received {sequence:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_blank_call_id_fails_the_turn_too() {
+            let (state, _sink, events) = running_turn();
+            crate::client::on_session_update(&state, call_named("   ")).await;
+            let outcome = outcome(&events);
+            assert_eq!(
+                outcome, "acp-refused-event",
+                "expected the turn to fail with acp-refused-event | received: {outcome}"
+            );
+        }
+
+        /// Frames an ordinary agent sends do not fail a turn, including an id at the limit.
+        #[tokio::test]
+        async fn ordinary_and_at_the_limit_call_ids_leave_the_turn_running() {
+            let (state, _sink, events) = running_turn();
+            crate::client::on_session_update(&state, running_call(0)).await;
+            crate::client::on_session_update(&state, call_named(&"c".repeat(128))).await;
+            let outcome = outcome(&events);
+            assert_eq!(
+                outcome, "still running",
+                "expected the turn still running | received: {outcome}"
+            );
+        }
+
+        /// Only a value the core cannot make safe is reported; a closed stream or an overflow is not.
+        #[tokio::test]
+        async fn only_an_invalid_vendor_value_is_reported() {
+            let (state, _sink, events) = running_turn();
+            let turn = state.turn().expect("expected the turn to be running");
+            for error in [
+                mango_external_agents::Error::Closed {
+                    subject: "turn stream",
+                },
+                mango_external_agents::Error::LimitExceeded {
+                    subject: "queued turn events",
+                    limit: 1,
+                    received: 2,
+                },
+            ] {
+                crate::client::report_refused_event(&state, &turn, &error).await;
+                let outcome = outcome(&events);
+                assert_eq!(
+                    outcome, "still running",
+                    "expected {error:?} not to fail the turn | received: {outcome}"
+                );
+            }
+            let invalid = mango_external_agents::Error::InvalidVendorValue {
+                field: "activity call id",
+                received: String::from("x"),
+            };
+            crate::client::report_refused_event(&state, &turn, &invalid).await;
+            let outcome = outcome(&events);
+            assert_eq!(
+                outcome, "acp-refused-event",
+                "expected {invalid:?} to fail the turn | received: {outcome}"
+            );
+        }
+
+        /// A turn that already ended keeps its outcome: a late refused frame is the ordinary race.
+        #[tokio::test]
+        async fn a_refused_frame_after_the_terminal_does_not_replace_it() {
+            let (state, sink, events) = running_turn();
+            sink.complete()
+                .await
+                .expect("expected the turn to complete");
+            crate::client::on_session_update(&state, call_named(&"c".repeat(129))).await;
+            let outcome = outcome(&events);
+            assert_eq!(
+                outcome, "Completed",
+                "expected the terminal to stay Completed | received: {outcome}"
+            );
+        }
+    }
+
+    /// A frame read for a turn that has since ended must not reach the reducer of the turn that
+    /// replaced it: the read of the owner and the reduction are two steps, and a turn can end and
+    /// another begin between them.
+    mod stale {
+        use std::sync::Arc;
+
+        use mango_external_agents::{AttemptId, EventSink, TurnId};
+
+        use super::replay::{notification, running_call};
+        use super::{SessionId, SessionState, state};
+        use crate::client::TurnHandle;
+
+        fn sink(host: &mango_external_agents::HostContext, turn_id: &str) -> EventSink {
+            EventSink::new(
+                SessionId::new("session-1"),
+                TurnId::new(turn_id),
+                AttemptId::default(),
+                Arc::clone(host.clock()),
+                16,
+            )
+            .0
+        }
+
+        /// A state whose first turn has ended and a second one begun, with the first turn's handle
+        /// as a handler that had already read it would still hold it.
+        fn second_turn_after_first() -> (Arc<SessionState>, TurnHandle) {
+            let (state, host) = state();
+            let state = Arc::new(state);
+            let first = state
+                .begin_turn(sink(&host, "turn-1"), None)
+                .expect("expected the first turn to be admitted");
+            assert!(first.finish(), "expected the first turn's terminal claim");
+            let _ = state.prepare_terminal_matching(&first);
+            state.release_turn_matching(&first);
+            state
+                .begin_turn(sink(&host, "turn-2"), None)
+                .expect("expected the second turn to be admitted");
+            (state, first)
+        }
+
+        #[test]
+        fn a_frame_for_an_ended_turn_leaves_no_call_in_the_next_turns_reducer() {
+            let (state, first) = second_turn_after_first();
+            let _ = state.reduce(&first, running_call(0));
+            let open = state.open_call_count();
+            assert_eq!(
+                open, 0,
+                "expected open calls in the next turn after a stale frame: 0 | received: {open}"
+            );
+            let second = state
+                .turn()
+                .expect("expected the second turn to be running");
+            let owed = state
+                .prepare_terminal_matching(&second)
+                .map(|(_, _, mut reducer)| reducer.finish());
+            assert_eq!(
+                owed,
+                Some(Vec::new()),
+                "expected the next turn to owe no call closing | received: {owed:?}"
+            );
+        }
+
+        /// What the agent said about the session itself is still true whichever turn it was read for.
+        #[test]
+        fn a_frame_for_an_ended_turn_still_yields_its_session_facts() {
+            let (state, first) = second_turn_after_first();
+            let (events, facts) = state.reduce(
+                &first,
+                notification(serde_json::json!({
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{ "name": "review", "description": "Review" }],
+                })),
+            );
+            assert!(
+                events.is_empty() && facts.len() == 1,
+                "expected no events and one session fact | received: {events:?} and {facts:?}"
+            );
+        }
+
+        /// The turn that owns the slot reduces its own frames as before.
+        #[test]
+        fn a_frame_for_the_running_turn_is_reduced() {
+            let (state, _first) = second_turn_after_first();
+            let current = state
+                .turn()
+                .expect("expected the second turn to be running");
+            let (events, _) = state.reduce(&current, running_call(0));
+            let open = state.open_call_count();
+            assert!(
+                events.len() == 1 && open == 1,
+                "expected one event and one open call | received: {events:?} and {open}"
             );
         }
     }

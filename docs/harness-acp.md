@@ -239,6 +239,11 @@ key called `locations` holding a number tells a host the paths are in there and 
 extension channel means they never can be. `raw_input`/`raw_output` never reach a host: both are unbounded vendor
 payloads. The tool-call activity's `item_id` is the same string as its call id, ACP naming no separate
 id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, not the agent's.
+Because an ACP `toolCallId` is an opaque string, the reducer keeps agent ids out of the plan's
+namespace: an agent id that starts with `acp:` is published with `acp:vendor:` in front (so a tool
+call named `acp:plan` becomes `acp:vendor:acp:plan`, and the plan keeps `acp:plan`). No other id
+changes, the rewrite is reversible so two agent ids never merge, and a call has one id from its
+start to its completion. No agent with a shipped profile sends such an id.
 
 ACP says a [`tool_call_update` collection replaces the previous collection](https://agentclientprotocol.com/protocol/v1/tool-calls#updating), rather than extending it. An omitted `content` field therefore leaves the host's structured content and detail untouched. An explicit empty collection emits `Some(ActivityContent::Empty)` and an empty detail, so the host removes the prior diff or output instead of retaining it.
 
@@ -252,13 +257,31 @@ final output. `Reducer::with_update_interval` changes the interval; `Duration::Z
 update. This bounds how often one call reaches a host, not how large one update is: each is still
 bounded by the core's `TextLimit::Detail`.
 
+A [tool call's](https://agentclientprotocol.com/protocol/v1/tool-calls) `toolCallId` is an opaque
+string the agent chooses, and the core publishes an id only when it is not blank and is at most 128
+code points; it refuses rather than shortens one, because a cut id would name a different call. Such
+an id is refused on every event that names it, so the reducer does not track it as a running call
+(it is remembered as ended, at the fixed size of a digest, so a repeat frame is dropped rather than
+announced again), and the turn ends with an `EventKind::Error` whose code is `acp-refused-event`, for
+example `the ACP agent sent an event the core refused to publish: expected a usable activity call id,
+received invalid vendor data`. The turn is failed rather than left running with the call missing
+from the host's transcript. What the turn still owes is settled first, in the order a normal ending
+uses: waiting questions are withdrawn and their resolutions sent, then the calls the agent left
+running are closed as failed, an open thought is ended and the plan is completed, and only then
+does the failure commit, so the transcript never ends with an activity still running. Only a value
+the core cannot make safe is reported this way; a stream
+that is already closed or terminal, and an overflow (which the sink already turns into its own
+failure), are not. The longest id seen from a live agent is Cursor's, 85 code points.
+
 A `session/update` that arrives while no turn exists is not transcript. ACP's
 [`session/load`](https://agentclientprotocol.com/protocol/v1/session-setup) has the agent replay the
 whole conversation through `session/update` before it answers, and a frame between two turns is the
 same case. No host stream is open to receive those events, so the turn reducer is not fed: such a frame
 contributes only its session facts (the command catalog and the configuration catalog, which
 `Reducer::session_facts` reads), and a replayed tool call leaves no open call behind for the next turn
-to reset. `current_mode_update` produces no fact on either path.
+to reset. `current_mode_update` produces no fact on either path. A frame the client read for a turn
+that has since claimed its terminal is treated the same way, so it cannot leave a call open in the
+reducer of the turn that replaced it.
 
 ## Permissions
 

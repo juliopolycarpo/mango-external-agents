@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema::v1::{
     AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, ContentChunk, Diff, Plan, PlanEntry,
     PlanEntryPriority, PlanEntryStatus, SessionConfigOption, SessionUpdate, StopReason, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use mango_external_agents::event::{
     Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, EventKind,
@@ -36,16 +36,41 @@ use mango_external_agents::event::{
 };
 use mango_external_agents::{
     ActivityContent, ErrorCode, ExtensionValue, Extensions, FileChange, PlanStep, PlanStepPriority,
-    PlanStepStatus, VendorError,
+    PlanStepStatus, VendorError, normalize,
 };
 
 /// The call id every plan update shares.
 ///
 /// ACP v1's `plan` update carries the whole plan and no identity of its own — the plan is a property
 /// of the session, replaced wholesale each time it changes. The activity vocabulary needs a call id,
-/// so the plan gets one constant one and its revisions arrive as updates to it. Prefixed to stay
-/// clear of an agent's own tool call ids.
+/// so the plan gets one constant one and its revisions arrive as updates to it.
+///
+/// Prefixed with `acp:`, and the reducer gives every agent tool call id with that prefix an extra
+/// `acp:vendor:` in front, so no id an agent sends can equal this one.
 pub const PLAN_CALL_ID: &str = "acp:plan";
+
+/// The prefix [`PLAN_CALL_ID`] shares with every id this crate mints.
+const MINTED_ID_PREFIX: &str = "acp:";
+
+/// What an agent's tool call id is called in the events a host receives.
+///
+/// An ACP `toolCallId` is an opaque string the agent picks, so it can be [`PLAN_CALL_ID`] itself,
+/// and two activities would then share one id. Every id that starts with [`MINTED_ID_PREFIX`] is
+/// therefore given `acp:vendor:` in front, and no other id changes. Nothing the agent sends can
+/// then equal the plan's id: the results start either with something other than `acp:`, or with
+/// `acp:vendor:`, and the plan's id is neither. The rewrite is injective (strip the prefix to undo
+/// it), so two agent ids never merge, and it is a function of the id alone, so a call keeps one id
+/// from its start to its completion whatever order the frames arrive in.
+///
+/// No agent this crate ships a profile for sends an id with that prefix (their ids look like
+/// `toolu_…` or `call_…`), so in practice nothing is renamed. A rewritten id can be longer than the
+/// core publishes, which the core refuses like any other over-long id.
+fn clear_of_plan(id: ToolCallId) -> ToolCallId {
+    match id.0.starts_with(MINTED_ID_PREFIX) {
+        true => ToolCallId::new(format!("{MINTED_ID_PREFIX}vendor:{}", id.0)),
+        false => id,
+    }
+}
 
 /// The title a tool call gets when its first frame named none.
 ///
@@ -392,8 +417,12 @@ impl Reducer {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => (text_delta(chunk), Vec::new()),
             SessionUpdate::AgentThoughtChunk(chunk) => (self.reasoning_delta(chunk), Vec::new()),
-            SessionUpdate::ToolCall(call) => (self.tool_call(call, now), Vec::new()),
-            SessionUpdate::ToolCallUpdate(update) => {
+            SessionUpdate::ToolCall(mut call) => {
+                call.tool_call_id = clear_of_plan(call.tool_call_id);
+                (self.tool_call(call, now), Vec::new())
+            }
+            SessionUpdate::ToolCallUpdate(mut update) => {
+                update.tool_call_id = clear_of_plan(update.tool_call_id);
                 (self.tool_call_update(update, now), Vec::new())
             }
             SessionUpdate::Plan(plan) => (self.plan(plan), Vec::new()),
@@ -459,7 +488,12 @@ impl Reducer {
         }
         let finished = finished(call.status).is_some();
         let events = tool_call(call);
-        self.track(call_id, finished);
+        // An id the core refuses is refused on every event that names it, so this call can never
+        // reach a host and a running entry for it would only hold its id and any held update for a
+        // call nobody can follow. It is remembered as ended instead, at the fixed size of a digest,
+        // so later frames for the same id stay one dropped bracket rather than a new one each.
+        let refused = normalize::opaque_id(&call_id, "activity call id").is_err();
+        self.track(call_id, finished || refused);
         events
     }
 
@@ -2006,7 +2040,8 @@ mod tests {
     /// while it runs and be dropped once it ends, whichever frame kind arrives.
     #[test]
     fn a_running_call_with_a_long_id_ends_once_and_then_stays_ended() {
-        let call_id = long_call_id(0, 128 * 1024);
+        // As long as the core publishes: a longer id is refused, so it is not a running call.
+        let call_id = long_call_id(0, 128);
         let mut reducer = Reducer::new().with_update_interval(Duration::ZERO);
         let mut frames = |value: serde_json::Value| reducer.update(update(value)).0;
         let started = frames(json!({
@@ -2637,5 +2672,193 @@ mod tests {
                 "expected no failure for {reason:?}"
             );
         }
+    }
+
+    fn plan_frame() -> serde_json::Value {
+        json!({
+            "sessionUpdate": "plan",
+            "entries": [{ "content": "build", "priority": "high", "status": "pending" }]
+        })
+    }
+
+    /// The ids of every `ActivityStarted`, with their activity kinds, in order.
+    fn started_ids(events: &[EventKind]) -> Vec<(String, ActivityKind)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityStarted { call_id, activity } => {
+                    Some((call_id.clone(), activity.kind))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An ACP `toolCallId` is an opaque string the agent picks, so one can be the plan's own id. The
+    /// two must still be two activities, whichever arrives first.
+    #[test]
+    fn a_vendor_call_id_equal_to_the_plan_id_does_not_share_the_plans_activity() {
+        for frames in [
+            vec![announced(PLAN_CALL_ID), plan_frame()],
+            vec![plan_frame(), announced(PLAN_CALL_ID)],
+        ] {
+            let events = reduce(frames);
+            let started = started_ids(&events);
+            let ids: Vec<&str> = started.iter().map(|(id, _)| id.as_str()).collect();
+            assert!(
+                ids.len() == 2 && ids[0] != ids[1],
+                "expected two starts under two distinct ids | received {started:?}"
+            );
+            assert!(
+                started
+                    .iter()
+                    .any(|(id, kind)| id == PLAN_CALL_ID && *kind == ActivityKind::Plan),
+                "expected the plan to keep the id {PLAN_CALL_ID} | received {started:?}"
+            );
+        }
+    }
+
+    /// A call id the core refuses to publish is never a running call, so it cannot hold state.
+    #[test]
+    fn a_call_id_the_core_refuses_is_not_tracked_as_running() {
+        for refused in ["c".repeat(129), String::from("  ")] {
+            let mut reducer = Reducer::new();
+            let (events, _) = reducer.update_at(update(announced(&refused)), Instant::now());
+            let open = reducer.open_calls_len();
+            assert_eq!(
+                open, 0,
+                "expected open calls for the refused id {refused:?}: 0 | received: {open}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, EventKind::ActivityStarted { .. })),
+                "expected the refused call still reported, for the sink to refuse | received: {events:?}"
+            );
+        }
+    }
+
+    /// No agent id, however it is spelled, lands on the plan's id or on another agent's.
+    #[test]
+    fn no_vendor_call_id_shares_an_id_with_the_plan_or_another_call() {
+        let vendor = [
+            "call_1",
+            PLAN_CALL_ID,
+            "acp:vendor:acp:plan",
+            "acp:plan:extra",
+            "acp:",
+            "Acp:plan",
+        ];
+        let mut frames: Vec<serde_json::Value> = vendor.iter().map(|id| announced(id)).collect();
+        frames.push(plan_frame());
+        let started = started_ids(&reduce(frames));
+        let mut ids: Vec<&str> = started.iter().map(|(id, _)| id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            vendor.len() + 1,
+            "expected {} distinct ids for {} agent calls and the plan | received {started:?}",
+            vendor.len() + 1,
+            vendor.len()
+        );
+    }
+
+    /// An id outside the plan's namespace reaches the host exactly as the agent sent it.
+    #[test]
+    fn a_vendor_call_id_outside_the_plans_namespace_is_unchanged() {
+        for id in ["call_1", "toolu_01ABC", "Acp:plan", "plan", "acp"] {
+            let started = started_ids(&reduce(vec![announced(id)]));
+            assert_eq!(
+                started.first().map(|(id, _)| id.as_str()),
+                Some(id),
+                "expected the agent's id {id:?} unchanged | received {started:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_of_plan_prefixes_only_ids_in_the_minted_namespace() {
+        for (sent, expected) in [
+            ("call_1", "call_1"),
+            ("plan", "plan"),
+            ("acp", "acp"),
+            ("acp:plan", "acp:vendor:acp:plan"),
+            ("acp:", "acp:vendor:acp:"),
+            ("acp:vendor:x", "acp:vendor:acp:vendor:x"),
+        ] {
+            let received = super::clear_of_plan(super::ToolCallId::new(sent)).to_string();
+            assert_eq!(
+                received, expected,
+                "expected the agent id {sent:?} to be published as {expected:?} | received {received:?}"
+            );
+        }
+    }
+
+    /// The rewritten id is the same one for the whole bracket: start, update and completion.
+    #[test]
+    fn a_rewritten_vendor_call_id_is_stable_across_its_bracket() {
+        let events = reduce(vec![
+            announced(PLAN_CALL_ID),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": PLAN_CALL_ID,
+                "title": "Renamed"
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": PLAN_CALL_ID,
+                "status": "completed"
+            }),
+        ]);
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::ActivityStarted { call_id, .. }
+                | EventKind::ActivityUpdated { call_id, .. }
+                | EventKind::ActivityCompleted { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ids.len() == 3 && ids.iter().all(|id| *id == ids[0]) && ids[0] != PLAN_CALL_ID,
+            "expected one id, not the plan's, on all three events | received {ids:?}"
+        );
+    }
+
+    /// Later frames for a refused id are one dropped bracket, not a fresh `ActivityStarted` each.
+    #[test]
+    fn later_frames_for_a_refused_call_id_are_dropped() {
+        let long = "c".repeat(129);
+        let mut reducer = Reducer::new();
+        let _ = reducer.update_at(update(announced(&long)), Instant::now());
+        for frame in [
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": long, "title": "again" }),
+            announced(&long),
+        ] {
+            let (events, _) = reducer.update_at(update(frame.clone()), Instant::now());
+            assert!(
+                events.is_empty(),
+                "expected a repeat frame for a refused id to be dropped | received: {events:?} for {frame}"
+            );
+        }
+        assert!(
+            reducer.finish().is_empty(),
+            "expected nothing owed for a call the host never saw"
+        );
+    }
+
+    /// An id at the limit is still a running call.
+    #[test]
+    fn a_call_id_at_the_limit_is_tracked() {
+        let exact = "c".repeat(128);
+        let mut reducer = Reducer::new();
+        let _ = reducer.update_at(update(announced(&exact)), Instant::now());
+        assert_eq!(
+            reducer.open_calls_len(),
+            1,
+            "expected a 128-code-point id to be tracked | received: {}",
+            reducer.open_calls_len()
+        );
     }
 }
