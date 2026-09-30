@@ -350,8 +350,18 @@ pub trait ProcessLauncher: Send + Sync {
 /// never leave this type.
 #[derive(Clone)]
 pub struct StderrTail {
-    buffer: Arc<Mutex<Vec<u8>>>,
+    state: Arc<Mutex<TailState>>,
     max_bytes: usize,
+}
+
+/// What the tail holds, and whether the next bytes still belong to a line it already discarded.
+#[derive(Default)]
+struct TailState {
+    buffer: Vec<u8>,
+    /// Set when an overflow left nothing that starts a line: the rest of that line is dropped up
+    /// to its terminator, because a continuation kept on its own has lost the name that lets
+    /// [`redact::stderr_text`] recognise the value.
+    discarding: bool,
 }
 
 /// How much stderr is kept for diagnostics.
@@ -367,7 +377,7 @@ impl StderrTail {
     /// A tail that keeps at most `max_bytes` of the most recent output.
     pub fn with_capacity(max_bytes: usize) -> Self {
         Self {
-            buffer: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(Mutex::new(TailState::default())),
             max_bytes,
         }
     }
@@ -379,8 +389,33 @@ impl StderrTail {
     /// [`read`](Self::read) cannot redact: the scanner needs the name in front of the `=` to know
     /// the value after it is a secret. Losing a partial first line costs a diagnostic nobody could
     /// read anyway.
+    ///
+    /// A line longer than the cap is dropped whole: once an overflow leaves only the middle of a
+    /// line, every following byte up to the next CR or LF is dropped too, however many reads it
+    /// spans. Keeping that continuation would return text whose credential name was discarded.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::StderrTail;
+    ///
+    /// let tail = StderrTail::with_capacity(16);
+    /// tail.push(b"API_KEY=0123456789abcdef");
+    /// tail.push(b"-continued-secret\nnext line\n");
+    /// assert_eq!(tail.read(), "next line\n");
+    /// ```
     pub fn push(&self, chunk: &[u8]) {
-        let mut buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let chunk = if state.discarding {
+            let Some(end) = chunk.iter().position(|byte| matches!(byte, b'\n' | b'\r')) else {
+                return;
+            };
+            state.discarding = false;
+            &chunk[end + 1..]
+        } else {
+            chunk
+        };
+        let buffer = &mut state.buffer;
         buffer.extend_from_slice(chunk);
         if buffer.len() <= self.max_bytes {
             return;
@@ -393,8 +428,11 @@ impl StderrTail {
             }
             // Nothing retained starts a line, so the whole window is the middle of one — a single
             // line longer than the cap. The middle of a line is exactly what cannot be redacted,
-            // and a diagnostic is not worth a token.
-            None => buffer.clear(),
+            // and a diagnostic is not worth a token. The line goes on until its terminator.
+            None => {
+                buffer.clear();
+                state.discarding = true;
+            }
         }
     }
 
@@ -410,19 +448,19 @@ impl StderrTail {
     /// assert_eq!(tail.read(), "Authorization: Bearer [REDACTED]");
     /// ```
     pub fn read(&self) -> String {
-        let buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
-        redact::stderr_text(&String::from_utf8_lossy(&buffer))
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        redact::stderr_text(&String::from_utf8_lossy(&state.buffer))
     }
 }
 
 impl std::fmt::Debug for StderrTail {
     /// Reports capacity and occupancy without turning retained stderr into a byte-array dump.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         formatter
             .debug_struct("StderrTail")
             .field("max_bytes", &self.max_bytes)
-            .field("buffered_bytes", &buffer.len())
+            .field("buffered_bytes", &state.buffer.len())
             .finish()
     }
 }
@@ -606,7 +644,10 @@ impl LineStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{ByteSource, Error, LaunchSpec, LineLimits, LineStream, Result, StderrTail};
+    use super::{
+        ByteSource, DEFAULT_STDERR_TAIL_BYTES, Error, LaunchSpec, LineLimits, LineStream, Result,
+        StderrTail,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -1264,6 +1305,157 @@ mod tests {
             tail.read(),
             "",
             "expected no fragment of an unredactable line"
+        );
+    }
+
+    /// The credential name sits in the read that overflowed the cap and the value arrives in later
+    /// reads. The tail is read between every read, so a fragment of the overlong line fails by name.
+    #[test]
+    fn an_overflowed_line_stays_discarded_across_later_reads() {
+        let tail = StderrTail::with_capacity(16);
+        tail.push(b"OPENAI_API_KEY=sk-proj-0123456789abcdef");
+        assert_eq!(tail.read(), "", "expected nothing after the overflow");
+
+        for (index, piece) in [&b"secret-suffix"[..], b"-more-secret", b"-and-more"]
+            .into_iter()
+            .enumerate()
+        {
+            tail.push(piece);
+            let read = tail.read();
+            assert_eq!(
+                read, "",
+                "expected no fragment of the overflowed line after continuation read {index} | received {read:?}"
+            );
+        }
+    }
+
+    /// The defaults: a 16 KiB cap fed the launcher's 16 KiB reads. The name lands in the second
+    /// read, which is the window the overflow keeps, and the value arrives in the third.
+    #[test]
+    fn a_line_past_twice_the_default_cap_never_returns_its_credential_suffix() {
+        let tail = StderrTail::default();
+        let chunk = DEFAULT_STDERR_TAIL_BYTES;
+        let mut line = vec![b'x'; 2 * chunk - 8];
+        line.extend_from_slice(b"API_KEY=TOPSECRETVALUE0123456789 more text\n");
+        for piece in line.chunks(chunk) {
+            tail.push(piece);
+        }
+
+        let read = tail.read();
+        assert!(
+            !read.contains("TOPSECRET") && !read.contains("more text"),
+            "expected no credential suffix from the overflowed line | received {read:?}"
+        );
+    }
+
+    /// Only the rest of the overflowed line is lost: the next line, even in the same read as the
+    /// terminator, is kept whole.
+    #[test]
+    fn the_line_after_an_overflowed_one_is_kept_intact() {
+        let tail = StderrTail::with_capacity(48);
+        tail.push(b"API_KEY=0123456789012345678901234567890123456789012345678901234567890");
+        tail.push(b"still-the-same-secret-line");
+        tail.push(b"end-of-secret\nnext: ordinary diagnostic\n");
+
+        let read = tail.read();
+        assert_eq!(
+            read, "next: ordinary diagnostic\n",
+            "expected the following line intact and no overflowed suffix | received {read:?}"
+        );
+    }
+
+    #[test]
+    fn a_crlf_split_across_reads_ends_the_discard_at_the_carriage_return() {
+        let tail = StderrTail::with_capacity(32);
+        tail.push(b"API_KEY=0123456789012345678901234567890");
+        tail.push(b"trailing-secret");
+        let read = tail.read();
+        assert_eq!(
+            read, "",
+            "expected no suffix before the terminator arrives | received {read:?}"
+        );
+        tail.push(b"-more\r");
+        tail.push(b"\nnext: ordinary diagnostic\n");
+
+        let read = tail.read();
+        assert!(
+            !read.contains("trailing-secret"),
+            "expected no suffix of the overflowed line | received {read:?}"
+        );
+        assert!(
+            read.ends_with("next: ordinary diagnostic\n"),
+            "expected the line after the CRLF intact | received {read:?}"
+        );
+    }
+
+    #[test]
+    fn a_lone_line_feed_or_carriage_return_ends_the_discard() {
+        for terminator in ["\n", "\r"] {
+            let tail = StderrTail::with_capacity(16);
+            tail.push(b"API_KEY=0123456789012345678901234567890");
+            tail.push(format!("secret{terminator}ok\n").as_bytes());
+
+            let read = tail.read();
+            assert!(
+                !read.contains("secret") && read.contains("ok\n"),
+                "expected only the overflowed remainder dropped for {terminator:?} | received {read:?}"
+            );
+        }
+    }
+
+    /// The discard belongs to the shared buffer, not to one handle: the launcher fills one clone
+    /// while the control handle reads another.
+    #[test]
+    fn a_clone_shares_the_discard_of_an_overflowed_line() {
+        let writer = StderrTail::with_capacity(16);
+        let reader = writer.clone();
+        writer.push(b"API_KEY=0123456789012345678901234567890");
+        reader.push(b"secret-suffix");
+        let read = writer.read();
+        assert_eq!(
+            read, "",
+            "expected the writer clone to drop the continuation pushed through the reader clone | received {read:?}"
+        );
+
+        writer.push(b"secret-tail\nok\n");
+        for (name, tail) in [("writer", &writer), ("reader", &reader)] {
+            let read = tail.read();
+            assert!(
+                !read.contains("secret") && read.contains("ok\n"),
+                "expected the {name} clone to drop the overflowed remainder only | received {read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_cap_retains_nothing_and_never_leaks() {
+        let tail = StderrTail::with_capacity(0);
+        tail.push(b"");
+        tail.push(b"API_KEY=zero-cap-secret");
+        tail.push(b"more-secret\nnext line\n");
+        tail.push(b"another API_KEY=second-secret");
+
+        let read = tail.read();
+        assert_eq!(
+            read, "",
+            "expected an empty tail at zero cap | received {read:?}"
+        );
+    }
+
+    /// A credential whose value is cut by the overflow boundary itself.
+    #[test]
+    fn a_credential_split_by_the_overflow_boundary_is_never_returned() {
+        let tail = StderrTail::with_capacity(24);
+        tail.push(b"noise\nAuthorization: Bearer sk-live-");
+        tail.push(b"0123456789abcdef");
+        tail.push(b"ghijklmnop\nok\n");
+
+        let read = tail.read();
+        assert!(
+            !read.contains("sk-live")
+                && !read.contains("0123456789abcdef")
+                && !read.contains("ghijklmnop"),
+            "expected no credential fragment | received {read:?}"
         );
     }
 
