@@ -19,6 +19,7 @@ bench = false
 [dependencies]
 async-trait = "0.1.92"
 mango-external-agents.workspace = true
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]

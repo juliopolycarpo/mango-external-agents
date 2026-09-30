@@ -6,10 +6,12 @@
 //! supervisor keeps the stream and hands every watcher one of these instead. Dropping the last one
 //! is an ordinary state of the world, not an error.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use mango_external_agents::AgentEvent;
-use tokio::sync::broadcast;
+use mango_external_agents::content::{ActivityContent, FileChange, PlanStep};
+use mango_external_agents::{AgentEvent, EventKind};
+use tokio::sync::Notify;
 
 /// One thing a subscriber reads: an event, or the news that events were lost before it.
 ///
@@ -89,18 +91,126 @@ pub enum Delivery {
     },
 }
 
+/// The default for how many bytes of events a fan-out retains for a watcher that has fallen behind.
+///
+/// The same 8 MiB as [`Limits::turn_buffer_bytes`](mango_external_agents::Limits): once the
+/// supervisor has drained the library's own queue, the host keeps no more than the library itself
+/// would have been willing to buffer.
+pub const DEFAULT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+
+/// What an activity's fixed fields (name, title, ids) are counted as, on top of its text.
+const ACTIVITY_OVERHEAD_BYTES: usize = 512;
+
+/// What one event costs against the byte budget.
+///
+/// The event's own size plus its payload. What can be large is text, so the payload is measured
+/// by its text and never by serializing it: a text or reasoning delta is its text, and an activity
+/// update or result is its detail plus its content (a diff of up to
+/// [`DIFF_MAX_CONTENT_LENGTH`](mango_external_agents::content::DIFF_MAX_CONTENT_LENGTH) code
+/// points, or output). Every other kind is small, bounded by the library's field limits, and is
+/// counted by its encoded JSON length instead.
+fn event_bytes(event: &AgentEvent) -> usize {
+    let payload = match &event.kind {
+        EventKind::TextDelta { text } | EventKind::ReasoningDelta { text } => text.len(),
+        EventKind::ActivityUpdated { update, .. } => activity_bytes(
+            [update.title.as_deref(), update.detail.as_deref()],
+            update.content.as_ref(),
+        ),
+        EventKind::ActivityCompleted { result, .. } => {
+            activity_bytes([result.detail.as_deref(), None], result.content.as_ref())
+        }
+        other => json_len(other),
+    };
+    size_of::<AgentEvent>().saturating_add(payload)
+}
+
+/// An activity's text fields and structured content, counted by length.
+fn activity_bytes(texts: [Option<&str>; 2], content: Option<&ActivityContent>) -> usize {
+    let text: usize = texts.into_iter().flatten().map(str::len).sum();
+    let content = match content {
+        Some(ActivityContent::Output { text }) => text.len(),
+        Some(ActivityContent::Diff { files }) => files.iter().map(file_change_bytes).sum(),
+        Some(ActivityContent::Plan { steps }) => steps.iter().map(plan_step_bytes).sum(),
+        Some(_) | None => 0,
+    };
+    ACTIVITY_OVERHEAD_BYTES
+        .saturating_add(text)
+        .saturating_add(content)
+}
+
+/// One changed file: its paths and every body it carries, plus a row's worth of fixed fields.
+fn file_change_bytes(file: &FileChange) -> usize {
+    [
+        Some(file.path.as_str()),
+        file.previous_path.as_deref(),
+        file.unified_diff.as_deref(),
+        file.old_text.as_deref(),
+        file.new_text.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::len)
+    .fold(size_of::<FileChange>(), usize::saturating_add)
+}
+
+/// One plan step: its title and id, plus a row's worth of fixed fields.
+fn plan_step_bytes(step: &PlanStep) -> usize {
+    let id = step.id.as_deref().map_or(0, str::len);
+    size_of::<PlanStep>()
+        .saturating_add(step.title.len())
+        .saturating_add(id)
+}
+
+/// The encoded length of `kind`, counted without building the string.
+fn json_len(kind: &EventKind) -> usize {
+    #[derive(Default)]
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter::default();
+    // A kind that cannot be serialized is counted as empty: the budget is an approximation
+    // and `publish` must not fail.
+    let _ = serde_json::to_writer(&mut counter, kind);
+    counter.0
+}
+
 /// The supervisor's side of the fan-out.
 ///
-/// Publishing to nobody succeeds. `broadcast::Sender::send` reports "no receivers" as an `Err`,
-/// and a supervisor that propagated it with `?` would abandon an operation the moment a browser
-/// tab closed — which is the exact failure this type exists to make impossible.
+/// Each watcher has its own queue of the events it has not read yet, bounded by a count and by a
+/// number of bytes. When either bound is exceeded the *oldest* event is dropped and the watcher
+/// is told through [`Delivery::Gap`]. Events are shared through [`Arc`], so a few stalled
+/// watchers cost about as much as one: their queues are all suffixes of the same stream.
+///
+/// Publishing never blocks on a watcher and cannot fail. With nobody watching it stores nothing,
+/// and an event every watcher has read is not kept. A supervisor that propagated a "no receivers"
+/// error with `?` would abandon an operation the moment a browser tab closed, which is the exact
+/// failure this type exists to make impossible.
+///
+/// # Retention
+///
+/// The bound is on the size of a watcher's queue *after* dropping, with one exception: the newest
+/// event is always kept, even when it alone exceeds the byte budget, because dropping it could
+/// drop the operation's terminal. A queue therefore holds at most `capacity` events and at most
+/// the byte budget plus the newest event.
 #[derive(Debug)]
 pub struct TurnBroadcast {
-    sender: broadcast::Sender<Arc<AgentEvent>>,
+    slots: Mutex<Vec<Weak<Slot>>>,
+    capacity: usize,
+    max_retained_bytes: usize,
 }
 
 impl TurnBroadcast {
-    /// A fan-out holding at most `capacity` events for a subscriber that has fallen behind.
+    /// A fan-out holding at most `capacity` events, and [`DEFAULT_RETAINED_BYTES`] of them, for
+    /// a subscriber that has fallen behind.
+    ///
+    /// `capacity` is exact, and a capacity of zero holds one event.
     ///
     /// # Example
     ///
@@ -111,12 +221,36 @@ impl TurnBroadcast {
     /// assert_eq!(events.subscriber_count(), 0);
     /// ```
     pub fn new(capacity: usize) -> Self {
+        Self::with_byte_budget(capacity, DEFAULT_RETAINED_BYTES)
+    }
+
+    /// A fan-out holding at most `capacity` events and about `max_retained_bytes` of them for a
+    /// subscriber that has fallen behind, whichever is reached first.
+    ///
+    /// A byte is counted as the event's in-memory size plus its text, so the budget bounds the
+    /// heap a stalled watcher pins rather than the size of the JSON a browser would receive. The
+    /// newest event is kept even when it alone is larger than the budget.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::TurnBroadcast;
+    ///
+    /// // Room for 256 events, but never more than 1 MiB of them.
+    /// let events = TurnBroadcast::with_byte_budget(256, 1024 * 1024);
+    /// assert_eq!(events.subscriber_count(), 0);
+    /// ```
+    pub fn with_byte_budget(capacity: usize, max_retained_bytes: usize) -> Self {
         Self {
-            sender: broadcast::Sender::new(capacity),
+            slots: Mutex::new(Vec::new()),
+            capacity: capacity.max(1),
+            max_retained_bytes,
         }
     }
 
     /// One watcher's handle, which it may drop at any time.
+    ///
+    /// The watcher sees what is published from now on, never what came before.
     ///
     /// # Example
     ///
@@ -130,9 +264,11 @@ impl TurnBroadcast {
     /// assert_eq!(events.subscriber_count(), 0);
     /// ```
     pub fn subscribe(&self) -> TurnSubscriber {
-        TurnSubscriber {
-            receiver: self.sender.subscribe(),
-        }
+        let slot = Arc::new(Slot::default());
+        let mut slots = lock(&self.slots);
+        slots.retain(|other| other.strong_count() > 0);
+        slots.push(Arc::downgrade(&slot));
+        TurnSubscriber { slot }
     }
 
     /// How many watchers are attached right now.
@@ -145,10 +281,16 @@ impl TurnBroadcast {
     /// assert_eq!(TurnBroadcast::new(4).subscriber_count(), 0);
     /// ```
     pub fn subscriber_count(&self) -> usize {
-        self.sender.receiver_count()
+        lock(&self.slots)
+            .iter()
+            .filter(|slot| slot.strong_count() > 0)
+            .count()
     }
 
     /// Offers one event to every watcher, ignoring the fact that there may be none.
+    ///
+    /// Never waits for a watcher: each one's queue is updated under a lock held for a few
+    /// instructions, and whatever it cannot fit is dropped from the front and counted.
     ///
     /// # Example
     ///
@@ -180,17 +322,122 @@ impl TurnBroadcast {
     /// });
     /// ```
     pub fn publish(&self, event: AgentEvent) {
-        let _ = self.sender.send(Arc::new(event));
+        // Snapshot the watchers and let go of the list before sizing the event, so measuring a
+        // large one never holds up `subscribe`.
+        let watchers: Vec<Arc<Slot>> = {
+            let mut slots = lock(&self.slots);
+            slots.retain(|slot| slot.strong_count() > 0);
+            slots.iter().filter_map(Weak::upgrade).collect()
+        };
+        if watchers.is_empty() {
+            return;
+        }
+        let held = Held {
+            bytes: event_bytes(&event),
+            event: Arc::new(event),
+        };
+        for slot in watchers {
+            slot.push(held.clone(), self.capacity, self.max_retained_bytes);
+        }
     }
+}
+
+impl Drop for TurnBroadcast {
+    /// Tells every watcher that nothing more is coming, once it has read what is still held.
+    fn drop(&mut self) {
+        for slot in lock(&self.slots).iter().filter_map(Weak::upgrade) {
+            slot.close();
+        }
+    }
+}
+
+/// One published event and what it cost, shared by every queue that holds it.
+#[derive(Clone, Debug)]
+struct Held {
+    event: Arc<AgentEvent>,
+    bytes: usize,
+}
+
+/// One watcher's queue and the way to wake it.
+#[derive(Debug, Default)]
+struct Slot {
+    state: Mutex<Queue>,
+    woken: Notify,
+}
+
+#[derive(Debug, Default)]
+struct Queue {
+    held: VecDeque<Held>,
+    bytes: usize,
+    /// Events dropped since the watcher last read, delivered as one gap before `held`.
+    missed: u64,
+    closed: bool,
+}
+
+/// What a watcher finds when it looks at its queue.
+enum Next {
+    Ready(Delivery),
+    Closed,
+    Empty,
+}
+
+impl Slot {
+    /// Appends `held`, then drops from the front until both bounds hold again.
+    ///
+    /// The newest event is never dropped, so a queue can hold one event over the byte budget.
+    fn push(&self, held: Held, capacity: usize, max_bytes: usize) {
+        {
+            let mut queue = lock(&self.state);
+            queue.bytes = queue.bytes.saturating_add(held.bytes);
+            queue.held.push_back(held);
+            while queue.held.len() > capacity || (queue.bytes > max_bytes && queue.held.len() > 1) {
+                let Some(oldest) = queue.held.pop_front() else {
+                    break;
+                };
+                queue.bytes = queue.bytes.saturating_sub(oldest.bytes);
+                queue.missed = queue.missed.saturating_add(1);
+            }
+        }
+        self.woken.notify_one();
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.woken.notify_one();
+    }
+
+    /// The next thing to hand the watcher: a pending gap first, then the oldest held event.
+    fn next(&self) -> Next {
+        let mut queue = lock(&self.state);
+        if queue.missed > 0 {
+            let missed = std::mem::take(&mut queue.missed);
+            return Next::Ready(Delivery::Gap { missed });
+        }
+        if let Some(held) = queue.held.pop_front() {
+            queue.bytes = queue.bytes.saturating_sub(held.bytes);
+            return Next::Ready(Delivery::Event(held.event));
+        }
+        if queue.closed {
+            return Next::Closed;
+        }
+        Next::Empty
+    }
+}
+
+/// Locks `mutex`, carrying on with the data if a panic poisoned it: a queue of events is still a
+/// queue of events, and `publish` must not fail.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One watcher's handle on a running operation.
 ///
-/// Dropping it detaches that watcher. It does not cancel, abandon or even slow the operation: a
-/// lagged subscriber is told it lagged, through [`Delivery::Gap`], and carries on.
+/// Dropping it detaches that watcher and releases every event it had not read. It does not
+/// cancel, abandon or even slow the operation: a lagged subscriber is told it lagged, through
+/// [`Delivery::Gap`], and carries on.
 #[derive(Debug)]
 pub struct TurnSubscriber {
-    receiver: broadcast::Receiver<Arc<AgentEvent>>,
+    slot: Arc<Slot>,
 }
 
 impl TurnSubscriber {
@@ -199,6 +446,8 @@ impl TurnSubscriber {
     /// A watcher that fell too far behind is not disconnected, because a UI that missed three
     /// deltas still wants the fourth. It receives one [`Delivery::Gap`] counting what it missed,
     /// then continues from the oldest event still held.
+    ///
+    /// Cancel-safe: dropping the future loses nothing, and the next call reads the same queue.
     ///
     /// # Example
     ///
@@ -216,10 +465,14 @@ impl TurnSubscriber {
     /// });
     /// ```
     pub async fn recv(&mut self) -> Option<Delivery> {
-        match self.receiver.recv().await {
-            Ok(event) => Some(Delivery::Event(event)),
-            Err(broadcast::error::RecvError::Lagged(missed)) => Some(Delivery::Gap { missed }),
-            Err(broadcast::error::RecvError::Closed) => None,
+        loop {
+            // `notify_one` keeps a permit when nobody is waiting yet, so an event published
+            // between the check and the wait below is not missed.
+            match self.slot.next() {
+                Next::Ready(delivery) => return Some(delivery),
+                Next::Closed => return None,
+                Next::Empty => self.slot.woken.notified().await,
+            }
         }
     }
 
@@ -237,12 +490,150 @@ impl TurnSubscriber {
     /// assert!(watcher.try_recv().is_none());
     /// ```
     pub fn try_recv(&mut self) -> Option<Delivery> {
-        match self.receiver.try_recv() {
-            Ok(event) => Some(Delivery::Event(event)),
-            Err(broadcast::error::TryRecvError::Lagged(missed)) => Some(Delivery::Gap { missed }),
-            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
-                None
-            }
+        match self.slot.next() {
+            Next::Ready(delivery) => Some(delivery),
+            Next::Closed | Next::Empty => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_RETAINED_BYTES, event_bytes, json_len};
+    use mango_external_agents::content::{ActivityContent, FileChange, PlanStep};
+    use mango_external_agents::{
+        ActivityResult, ActivityStatus, ActivityUpdate, AgentEvent, AttemptId, EventKind,
+        EventSink, Limits, SessionId, SystemClock, TurnId,
+    };
+    use std::sync::Arc;
+
+    /// The event the library would stamp around `kind`.
+    async fn event(kind: EventKind) -> AgentEvent {
+        let (sink, mut source) = EventSink::new(
+            SessionId::new("chat-1"),
+            TurnId::new("turn-1"),
+            AttemptId::FIRST,
+            Arc::new(SystemClock),
+            1,
+        );
+        sink.emit(kind)
+            .await
+            .expect("expected the sink to take the event");
+        source.try_recv().expect("expected the event back")
+    }
+
+    #[tokio::test]
+    async fn a_text_delta_costs_its_event_plus_its_text() {
+        let text = "x".repeat(1_000);
+        let cost = event_bytes(&event(EventKind::TextDelta { text }).await);
+        assert_eq!(
+            cost,
+            size_of::<AgentEvent>() + 1_000,
+            "expected the event size plus 1000 bytes of text | received {cost}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reasoning_delta_costs_its_text_too() {
+        let text = "y".repeat(500);
+        let cost = event_bytes(&event(EventKind::ReasoningDelta { text }).await);
+        assert_eq!(
+            cost,
+            size_of::<AgentEvent>() + 500,
+            "expected the event size plus 500 bytes of text | received {cost}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kind_without_text_costs_its_event_plus_its_encoded_length() {
+        let kind = EventKind::Completed;
+        let encoded = json_len(&kind);
+        assert_eq!(
+            encoded,
+            r#"{"type":"completed"}"#.len(),
+            "expected the length of the encoded kind | received {encoded}"
+        );
+        let cost = event_bytes(&event(kind).await);
+        assert_eq!(
+            cost,
+            size_of::<AgentEvent>() + encoded,
+            "expected the event size plus the encoded kind | received {cost}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activity_carrying_a_diff_costs_at_least_the_diff() {
+        // The library bounds each file's diff body, so a large diff is many files.
+        let body = "+".repeat(4_000);
+        let files: Vec<FileChange> = (0..30)
+            .map(|index| {
+                FileChange::new(format!("src/file{index}.rs")).with_unified_diff(body.clone())
+            })
+            .collect();
+        let result = ActivityResult::new(ActivityStatus::Completed)
+            .with_content(ActivityContent::Diff { files });
+        let carried = 30 * body.len();
+        let cost = event_bytes(
+            &event(EventKind::ActivityCompleted {
+                call_id: String::from("call-1"),
+                result,
+            })
+            .await,
+        );
+        assert!(
+            cost >= carried,
+            "expected an event carrying {carried} bytes of diff to cost at least that | \
+             received {cost}"
+        );
+    }
+
+    #[test]
+    fn the_default_budget_is_the_librarys_own_turn_buffer() {
+        assert_eq!(
+            DEFAULT_RETAINED_BYTES,
+            Limits::default().turn_buffer_bytes,
+            "expected the default retained bytes to equal the library's turn buffer budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activity_update_costs_its_output_and_its_detail() {
+        let update = ActivityUpdate::new()
+            .with_detail("d".repeat(300))
+            .with_content(ActivityContent::Output {
+                text: "o".repeat(3_000),
+            });
+        let cost = event_bytes(
+            &event(EventKind::ActivityUpdated {
+                call_id: String::from("call-1"),
+                update,
+            })
+            .await,
+        );
+        assert!(
+            cost >= 3_300,
+            "expected an update with 3000 bytes of output and 300 of detail to cost at least \
+             3300 | received {cost}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activity_result_costs_its_detail_and_its_plan() {
+        let steps = vec![PlanStep::new("t".repeat(100)); 10];
+        let result = ActivityResult::new(ActivityStatus::Completed)
+            .with_detail("d".repeat(200))
+            .with_content(ActivityContent::Plan { steps });
+        let cost = event_bytes(
+            &event(EventKind::ActivityCompleted {
+                call_id: String::from("call-1"),
+                result,
+            })
+            .await,
+        );
+        assert!(
+            cost >= 1_200,
+            "expected a result with 200 bytes of detail and ten 100 byte plan steps to cost at \
+             least 1200 | received {cost}"
+        );
     }
 }

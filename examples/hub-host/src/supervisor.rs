@@ -20,7 +20,11 @@ use crate::retry::{RetryPolicy, WaitOutcome};
 use crate::stop::Stop;
 use crate::subscriber::{TurnBroadcast, TurnSubscriber};
 
-/// How many events one operation's fan-out holds for a watcher that has fallen behind.
+/// How many events the supervisor's fan-out holds for a watcher that has fallen behind.
+///
+/// The fan-out is the supervisor's, not one operation's: a single broadcast carries every turn
+/// the supervisor runs, so this is a count across turns. The bytes are bounded too, by
+/// [`DEFAULT_RETAINED_BYTES`](crate::subscriber::DEFAULT_RETAINED_BYTES).
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 
 /// How one logical operation ended.
