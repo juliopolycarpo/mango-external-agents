@@ -141,7 +141,7 @@ jobs:
           tool: git-cliff
       - name: Release notes for this tag
         run: git-cliff --config cliff.toml --current --strip header --output release-notes.md
-      # A full rerun after the release exists skips this step instead of failing on it.
+      # The step still runs on a full rerun; only creating the release is skipped when it exists.
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
