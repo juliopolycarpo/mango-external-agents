@@ -39,7 +39,7 @@ use mango_external_agents::{
     PlanStepStatus, VendorError,
     content::{DIFF_MAX_CONTENT_LENGTH, DIFF_MAX_FILES},
     normalize,
-    normalize::TextLimit,
+    normalize::{MAX_PATH_LENGTH, TextLimit},
 };
 
 /// The call id every plan update shares.
@@ -308,7 +308,8 @@ impl Held {
 /// Sized from bytes, which are never fewer than code points, so a body whose byte length fits is
 /// certain to fit, and one that only looks long in bytes is bounded early to no effect. Every text
 /// the core bounds is bounded to [`TextLimit::Detail`], and a diff also to
-/// [`DIFF_MAX_FILES`] rows and [`DIFF_MAX_CONTENT_LENGTH`] code points of bodies together.
+/// [`DIFF_MAX_FILES`] rows and [`DIFF_MAX_CONTENT_LENGTH`] code points of bodies together. A path is
+/// published only up to [`MAX_PATH_LENGTH`] bytes; a longer one is dropped, with its row for a diff's own path.
 fn exceeds_bound(content: &ActivityContent) -> bool {
     let body = TextLimit::Detail.max_code_points();
     match content {
@@ -316,6 +317,15 @@ fn exceeds_bound(content: &ActivityContent) -> bool {
         ActivityContent::Diff { files } => {
             let mut total = 0usize;
             files.len() > DIFF_MAX_FILES
+                || files.iter().any(|file| {
+                    // A path over the length the core publishes is dropped with its row, so one
+                    // that long is not worth holding either.
+                    file.path.len() > MAX_PATH_LENGTH
+                        || file
+                            .previous_path
+                            .as_ref()
+                            .is_some_and(|path| path.len() > MAX_PATH_LENGTH)
+                })
                 || files.iter().any(|file| {
                     [&file.unified_diff, &file.old_text, &file.new_text]
                         .into_iter()
@@ -3172,6 +3182,66 @@ mod tests {
                 "expected delivery identical to bounding at delivery only for {name}"
             );
         }
+    }
+
+    fn file_with_path(path: &str, previous_path: Option<&str>) -> super::FileChange {
+        let mut file = super::FileChange::new(path);
+        file.previous_path = previous_path.map(str::to_owned);
+        file.new_text = Some(String::from("small"));
+        file
+    }
+
+    /// A diff whose bodies fit still exceeds the bound when a path is longer than the core
+    /// publishes: held as it arrived, it would keep that path until delivery.
+    #[test]
+    fn a_diff_path_over_the_published_length_exceeds_the_bound() {
+        let long = "p".repeat(super::MAX_PATH_LENGTH + 1);
+        let at_limit = "p".repeat(super::MAX_PATH_LENGTH);
+        for (name, files, expected) in [
+            (
+                "ordinary paths",
+                vec![file_with_path("/repo/a.rs", None)],
+                false,
+            ),
+            (
+                "paths at the limit",
+                vec![file_with_path(&at_limit, Some(&at_limit))],
+                false,
+            ),
+            ("an oversized path", vec![file_with_path(&long, None)], true),
+            (
+                "an oversized previous path",
+                vec![file_with_path("/repo/a.rs", Some(&long))],
+                true,
+            ),
+        ] {
+            let received = super::exceeds_bound(&ActivityContent::Diff { files });
+            assert_eq!(
+                received, expected,
+                "expected exceeds_bound for {name}: {expected} | received: {received}"
+            );
+        }
+    }
+
+    /// An oversized path reaches the host as it would have without holding: its row is dropped and
+    /// the update reports a cut.
+    #[test]
+    fn delivery_with_an_oversized_diff_path_is_identical_to_bounding_only_at_delivery() {
+        let frame = |path: &str| {
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call",
+                "content": [{ "type": "diff", "path": path, "oldText": "a", "newText": "b" }]
+            })
+        };
+        let frames = [frame("/repo/a.rs"), frame(&"p".repeat(10_000))];
+        let expected = published_once(&frames[1..]);
+        let received = delivered_last(&frames);
+        assert_eq!(
+            (&received, received.truncated),
+            (&expected, expected.truncated),
+            "expected delivery identical to bounding at delivery only for an oversized diff path"
+        );
     }
 
     /// Bounding is idempotent: the sink applies it again to what the reducer already bounded.
