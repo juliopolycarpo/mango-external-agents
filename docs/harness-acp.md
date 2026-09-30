@@ -587,6 +587,14 @@ weakly, so the token does not keep a dropped session's child alive. After the to
 start gets, including a patch that touches no wire request. That guard is keyed on the token, so it
 does not cover a session that ended because the agent vanished.
 
+Dropping the last session handle while a turn is running does the same for that turn. The prompt
+task owns the connection while the turn runs, so the drop itself records `CancelReason::Shutdown`,
+withdraws the parked questions and starts the connection's shutdown on the runtime it was driven
+on, which also works from a thread with no runtime. The held `TurnStream` ends as
+`Cancelled { reason: Shutdown }` then `Completed`, and the watcher publishes `Closed` after it. A
+drop with no turn running keeps its earlier behaviour: the watcher reaps once the connection is
+released.
+
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
 that absence or the pinned profiles return a stale-session reply (`session/load` code `-32002`),
