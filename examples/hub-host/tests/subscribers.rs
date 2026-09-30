@@ -382,10 +382,13 @@ async fn a_stalled_subscriber_is_told_when_the_byte_budget_drops_events() {
         })
         .sum();
     let (held_bytes, held_events) = held_text(&seen);
+    // The queue bills each event its own size as well as its text, so the same sum with the
+    // per-event size added is what must fit; text alone would pass even if that drifted.
+    let billed = held_bytes + held_events * size_of::<AgentEvent>();
     assert!(
-        held_bytes <= 3 * KIB,
-        "expected at most {} bytes of retained text | received {held_bytes} bytes in \
-         {held_events} events",
+        billed <= 3 * KIB,
+        "expected at most {} bytes retained, counting each event's own size | received {billed} \
+         bytes ({held_bytes} of text in {held_events} events)",
         3 * KIB
     );
     assert_eq!(
