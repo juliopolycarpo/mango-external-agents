@@ -71,6 +71,7 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### 📚 Documentation
 
+- **(release)** Update the README install snippets when bumping the version (#108)
 - Fix the adopt guide's example and the Codex WebSocket quote (#102)
 - **(examples)** Describe what a lagged subscriber can recover (#76)
 - **(release)** State that packaged crates do not carry test fixtures (#74)
@@ -88,6 +89,7 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ### 👷 CI
 
+- **(release)** Check the README install requirement against the release rule (#109)
 - **(release)** Skip an existing GitHub release on rerun (#72)
 - **(ci)** Test against freshly resolved dependencies (#70)
 - **(release)** Verify the release tag signature (#75)
