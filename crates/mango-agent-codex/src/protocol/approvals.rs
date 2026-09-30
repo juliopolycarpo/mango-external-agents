@@ -7,9 +7,12 @@
 //! refusal is the library's central invariant rather than a gap.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::redacted;
 
 /// The requests the app-server initiates, in the families this harness recognises.
 pub mod method {
@@ -70,7 +73,7 @@ impl Refusal {
 }
 
 /// One question the app-server asked and is waiting on.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum ServerRequest {
     /// May the agent run this command?
     CommandExecution(CommandExecutionApprovalParams),
@@ -178,7 +181,7 @@ impl ServerRequest {
 /// the option set a person chooses from out of an undeclared field would make every prompt depend
 /// on a member that can change without a schema change. The options are derived from the declared
 /// [`ApprovalDecisionValue`] and the two declared amendment fields instead.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandExecutionApprovalParams {
     /// Which conversation.
@@ -216,7 +219,7 @@ pub struct CommandExecutionApprovalParams {
 }
 
 /// May the agent write these files?
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileChangeApprovalParams {
     /// Which conversation.
@@ -236,7 +239,7 @@ pub struct FileChangeApprovalParams {
 }
 
 /// Would the client grant this permission profile?
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionsRequestApprovalParams {
     /// Which conversation.
@@ -282,7 +285,7 @@ pub enum PermissionGrantScope {
 /// Never carries `strictAutoReview`: that field asks the vendor to change how *it* reviews later
 /// requests, which is a standing instruction this library has no basis to give — the only thing it
 /// ever grants is exactly the profile that was asked for, or nothing.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionsRequestApprovalResponse {
     /// The profile granted, echoed back verbatim from the request — or `{}` for none.
@@ -344,7 +347,7 @@ impl PermissionsRequestApprovalResponse {
 /// Upstream's own schema marks this surface EXPERIMENTAL. `autoResolutionMs` is declared but
 /// deliberately not read: it is documented as deprecated, and a deadline this harness already owns
 /// (the same one every approval carries) is what governs an unanswered round instead.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolRequestUserInputParams {
     /// Which conversation.
@@ -363,7 +366,7 @@ pub struct ToolRequestUserInputParams {
 }
 
 /// One question inside a `item/tool/requestUserInput` round.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolRequestUserInputQuestion {
     /// The vendor's own id for this question.
@@ -393,7 +396,7 @@ pub struct ToolRequestUserInputQuestion {
 ///
 /// Carries no id of its own: the vendor's schema gives a choice only a label, so the label is what
 /// this harness offers as the option's native identity and what the answer echoes back.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolRequestUserInputOption {
     /// The vendor's own label. Doubles as this option's id: nothing else names it.
@@ -404,7 +407,7 @@ pub struct ToolRequestUserInputOption {
 }
 
 /// One question's answer, as `item/tool/requestUserInput` takes it.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Default, PartialEq, Serialize)]
 pub struct ToolRequestUserInputAnswer {
     /// The chosen labels, the written text as one string, or nothing for a declined question.
     pub answers: Vec<String>,
@@ -414,7 +417,7 @@ pub struct ToolRequestUserInputAnswer {
 ///
 /// A [`BTreeMap`] rather than the vendor's own arrival order, so two harness builds never write the
 /// same round in a different byte order on the wire.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Default, PartialEq, Serialize)]
 pub struct ToolRequestUserInputResponse {
     /// Which question each entry answers, and what it was answered with.
     pub answers: BTreeMap<String, ToolRequestUserInputAnswer>,
@@ -448,7 +451,7 @@ impl ToolRequestUserInputResponse {
 /// cannot leak into a host-visible event or a log. See
 /// `crate::interaction::UnsupportedQuestion::ArbitraryForm`, the only answer this harness ever gives
 /// one.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerElicitationRequestParams {
     /// Which conversation.
@@ -506,7 +509,7 @@ impl McpServerElicitationRequestResponse {
 /// with its own `{"permissions": ..., "scope": ...}` shape entirely. This is what lets a session
 /// hand any settled approval back to the app-server without a caller matching on which family it
 /// belongs to.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum ServerAnswer {
     /// The command- and file-change families: a bare decision string or a tagged amendment.
     Approval(ApprovalDecisionValue),
@@ -556,7 +559,7 @@ impl ServerAnswer {
 /// command approval offers. Serialised by hand rather than derived: the amendment arms are tagged
 /// objects whose inner keys are snake_case inside an otherwise camelCase dialect, and the payload
 /// is whatever JSON the request carried rather than a shape this harness models.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum ApprovalDecisionValue {
     /// Allow this one thing.
     Accept,
@@ -613,11 +616,255 @@ impl Serialize for ApprovalDecisionValue {
 }
 
 /// The answer frame both approval families take.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalResponse {
     /// What was decided.
     pub decision: ApprovalDecisionValue,
+}
+
+// Metadata-only `Debug` for every carrier below: a kind, which optional members are present, and
+// sizes, never the command, reason, prefix, host, profile or answer they hold. Vendor-minted ids
+// are reported by length, the same as core reports an `InteractionId` or a `PermissionRequest`'s
+// opaque identifiers. `docs/compliance.md` names the policy; `crate::redacted` is the helper.
+
+impl fmt::Debug for ServerRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommandExecution(params) => formatter
+                .debug_tuple("CommandExecution")
+                .field(params)
+                .finish(),
+            Self::FileChange(params) => formatter.debug_tuple("FileChange").field(params).finish(),
+            Self::Permissions(params) => {
+                formatter.debug_tuple("Permissions").field(params).finish()
+            }
+            Self::RequestUserInput(params) => formatter
+                .debug_tuple("RequestUserInput")
+                .field(params)
+                .finish(),
+            Self::McpElicitation(params) => formatter
+                .debug_tuple("McpElicitation")
+                .field(params)
+                .finish(),
+            // A method this harness names is a library constant and reads as one. Any other is
+            // the server's own text, so only its length is reported.
+            Self::Refused { method, refusal } => {
+                let known = KNOWN_METHODS.contains(&method.as_str());
+                let mut refused = formatter.debug_struct("Refused");
+                if known {
+                    refused.field("method", method);
+                } else {
+                    refused.field("method", &redacted::text(method));
+                }
+                refused.field("refusal", refusal).finish()
+            }
+        }
+    }
+}
+
+/// Every method this module names, which is what a refusal may print verbatim.
+const KNOWN_METHODS: [&str; 10] = [
+    method::COMMAND_EXECUTION_APPROVAL,
+    method::FILE_CHANGE_APPROVAL,
+    method::TOOL_CALL,
+    method::TOOL_REQUEST_USER_INPUT,
+    method::MCP_ELICITATION,
+    method::PERMISSIONS_APPROVAL,
+    method::CHATGPT_AUTH_TOKENS_REFRESH,
+    method::ATTESTATION_GENERATE,
+    method::LEGACY_EXEC_COMMAND_APPROVAL,
+    method::LEGACY_APPLY_PATCH_APPROVAL,
+];
+
+impl fmt::Debug for CommandExecutionApprovalParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommandExecutionApprovalParams")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field(
+                "approval_id",
+                &redacted::opt_text(self.approval_id.as_deref()),
+            )
+            .field("command", &redacted::opt_text(self.command.as_deref()))
+            .field("cwd", &redacted::opt_text(self.cwd.as_deref()))
+            .field("reason", &redacted::opt_text(self.reason.as_deref()))
+            .field(
+                "proposed_execpolicy_amendment",
+                &redacted::opt_json(self.proposed_execpolicy_amendment.as_ref()),
+            )
+            .field(
+                "proposed_network_policy_amendments",
+                &self
+                    .proposed_network_policy_amendments
+                    .as_ref()
+                    .map(Vec::len),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for FileChangeApprovalParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileChangeApprovalParams")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field("reason", &redacted::opt_text(self.reason.as_deref()))
+            .field(
+                "grant_root",
+                &redacted::opt_text(self.grant_root.as_deref()),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for PermissionsRequestApprovalParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionsRequestApprovalParams")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field("cwd", &redacted::opt_text(self.cwd.as_deref()))
+            .field("permissions", &redacted::json(&self.permissions))
+            .field("reason", &redacted::opt_text(self.reason.as_deref()))
+            .finish()
+    }
+}
+
+impl fmt::Debug for PermissionsRequestApprovalResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionsRequestApprovalResponse")
+            .field("permissions", &redacted::json(&self.permissions))
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ToolRequestUserInputParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRequestUserInputParams")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field("is_blocking", &self.is_blocking)
+            .field("question_count", &self.questions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for ToolRequestUserInputQuestion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRequestUserInputQuestion")
+            .field("id", &redacted::text(&self.id))
+            .field("header", &redacted::text(&self.header))
+            .field("question", &redacted::text(&self.question))
+            .field("option_count", &self.options.as_ref().map(Vec::len))
+            .field("is_other", &self.is_other)
+            .field("is_secret", &self.is_secret)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ToolRequestUserInputOption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRequestUserInputOption")
+            .field("label", &redacted::text(&self.label))
+            .field(
+                "description",
+                &redacted::opt_text(self.description.as_deref()),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for ToolRequestUserInputAnswer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRequestUserInputAnswer")
+            .field("answer_count", &self.answers.len())
+            .field(
+                "answer_bytes",
+                &redacted::Redacted::sum(self.answers.iter().map(String::len)),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for ToolRequestUserInputResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRequestUserInputResponse")
+            .field("answered_questions", &self.answers.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for McpServerElicitationRequestParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpServerElicitationRequestParams")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::opt_text(self.turn_id.as_deref()))
+            .field(
+                "elicitation_id",
+                &redacted::opt_text(self.elicitation_id.as_deref()),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for ServerAnswer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Approval(decision) => formatter.debug_tuple("Approval").field(decision).finish(),
+            // The option id is one this library offers (`grant:turn`, `deny`), not vendor text.
+            Self::Permissions {
+                option_id,
+                response,
+            } => formatter
+                .debug_struct("Permissions")
+                .field("option_id", option_id)
+                .field("response", response)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for ApprovalDecisionValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accept => formatter.write_str("Accept"),
+            Self::AcceptForSession => formatter.write_str("AcceptForSession"),
+            Self::Decline => formatter.write_str("Decline"),
+            Self::Cancel => formatter.write_str("Cancel"),
+            Self::AcceptWithExecpolicyAmendment(amendment) => formatter
+                .debug_tuple("AcceptWithExecpolicyAmendment")
+                .field(&redacted::json(amendment))
+                .finish(),
+            Self::ApplyNetworkPolicyAmendment(amendment) => formatter
+                .debug_tuple("ApplyNetworkPolicyAmendment")
+                .field(&redacted::json(amendment))
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for ApprovalResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalResponse")
+            .field("decision", &self.decision)
+            .finish()
+    }
 }
 
 #[cfg(test)]
