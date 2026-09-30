@@ -20,21 +20,26 @@ use tokio::sync::Notify;
 /// [`Delivery::Gap`] is that notice, delivered in order: it arrives where the missing events
 /// would have been, before the oldest event that is still held.
 ///
-/// # Resync contract
+/// # After a gap
 ///
 /// On a [`Delivery::Gap`] the subscriber must stop treating what it accumulated for the current
 /// operation as complete. Text deltas are not idempotent, so it cannot patch the hole. It should
 /// mark the view as incomplete and keep reading: the remaining events, including the terminal,
-/// are still delivered after the gap, so the operation's end is never lost. It then replaces the
-/// incomplete view with the authoritative outcome from whatever durable record the host keeps
-/// for the operation, because the stream itself cannot be replayed. A subscriber that only
-/// renders a live view may instead show the answer as truncated.
+/// are still delivered after the gap, so the operation's end is never lost.
+///
+/// That is all a gap leaves recoverable: the terminal event that follows it, and `missed`, how many
+/// events were dropped. The lost deltas cannot be rebuilt. The stream cannot be replayed, and this
+/// crate keeps no transcript to rebuild them from: [`HubApi`](crate::HubApi) records only an
+/// operation's committed terminal outcome, never its events, and this fan-out retains only a
+/// bounded window of them. A subscriber's own copy has the same hole, so it cannot fill it either.
+/// A host that must be able to show the whole text of an operation has to record the events where
+/// the supervisor drains the stream, before the fan-out, and own that storage. A subscriber that
+/// only renders a live view may instead show the answer as truncated.
 ///
 /// A gap names no operation. One broadcast serves every turn a supervisor runs, so the dropped
 /// events may include an earlier turn's terminal, and the next retained event may already belong
 /// to a later turn. Treat a gap as invalidating *every* in-flight view the subscriber holds, and
-/// resync each operation it cares about from the durable record, unless it has already seen that
-/// operation's terminal.
+/// mark each one incomplete, unless it has already seen that operation's terminal.
 ///
 /// `missed` counts events dropped for *any* reason, such as a history that has to forget its
 /// oldest events, so a subscriber handles every cause the same way.
