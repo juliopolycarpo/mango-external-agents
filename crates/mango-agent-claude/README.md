@@ -5,8 +5,8 @@ Claude Code harness for
 
 ```toml
 [dependencies]
-mango-external-agents = "0.1"
-mango-agent-claude = "0.1"
+mango-external-agents = "0.3"
+mango-agent-claude = "0.3"
 ```
 
 The harness drives only the vendor's official CLI through its documented programmatic surface —
