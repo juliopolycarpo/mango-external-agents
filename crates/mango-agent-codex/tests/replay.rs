@@ -1607,6 +1607,71 @@ async fn a_second_turn_started_while_one_is_running_is_refused_rather_than_steer
     );
 }
 
+/// The requested host of a managed-network approval reaches the host's prompt through the whole
+/// session, not only through the unit that builds it: the context is read from the raw frame, so a
+/// session that stopped passing it on would show a person nothing about where the command goes.
+#[tokio::test]
+async fn a_managed_network_approval_reaches_the_host_naming_the_requested_host() {
+    let transcript = Transcript::load("turn");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the turn recording to name its thread");
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/start") => Some(vec![
+                serde_json::json!({"id": id, "result": {"turn": {"id": "net-turn"}}}).to_string(),
+                serde_json::json!({
+                    "id": 88_001,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": thread_id, "turnId": "net-turn", "itemId": "cmd-1",
+                        "startedAtMs": 1_u64, "command": "curl https://api.example.com",
+                        "networkApprovalContext": {"host": "api.example.com", "protocol": "https"},
+                    },
+                })
+                .to_string(),
+            ]),
+            _ => None,
+        }
+    }));
+    let (host, launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "fetch"))
+        .await
+        .expect("expected a turn");
+
+    let request = await_approval(&mut turn).await;
+    let detail = request.detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("https to api.example.com"),
+        "expected the requested host in the detail the host sees | received: {detail:?}"
+    );
+
+    session
+        .respond(PermissionResponse::from_user(
+            request.id().clone(),
+            "decline",
+        ))
+        .await
+        .expect("expected the refusal to be accepted");
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected a clean close");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the app-server reaped"
+    );
+}
+
 /// A cancel cannot name a turn until `turn/start` answers. The unnamed vendor turn still occupies
 /// the app-server, so another start in that interval would be treated as a steer of it.
 #[tokio::test]
