@@ -98,12 +98,12 @@ struct LineSink {
 
 #[async_trait::async_trait]
 impl LinkSender for LineSink {
-    async fn send(&mut self, message: String) -> Result<()> {
+    async fn send(&mut self, mut message: String) -> Result<()> {
         // One write rather than two: a second write could interleave with another task's message
-        // and split a frame across two lines.
-        self.stdin
-            .write_all(format!("{message}\n").as_bytes())
-            .await
+        // and split a frame across two lines. The newline joins the message the caller handed
+        // over, which it no longer needs, instead of a second copy of it.
+        message.push('\n');
+        self.stdin.write_all(message.as_bytes()).await
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -465,6 +465,90 @@ mod tests {
         assert_eq!(
             launcher.written(),
             vec![String::from(r#"{"method":"ping"}"#)]
+        );
+    }
+
+    /// Records each `write_all` call separately, so a frame split across two writes is visible.
+    struct WriteLog(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    #[async_trait::async_trait]
+    impl crate::process::ByteSink for WriteLog {
+        async fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
+            self.0
+                .lock()
+                .expect("expected an unpoisoned write log")
+                .push(bytes.to_vec());
+            Ok(())
+        }
+
+        async fn close(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A launcher whose children write their stdin to a shared log.
+    struct LoggedStdinLauncher {
+        inner: Arc<FakeLauncher>,
+        log: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for LoggedStdinLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> crate::Result<ManagedProcess> {
+            let mut child = self.inner.spawn(spec).await?;
+            child.stdin = Some(Box::new(WriteLog(Arc::clone(&self.log))));
+            Ok(child)
+        }
+    }
+
+    #[tokio::test]
+    async fn each_message_is_one_write_ending_in_one_newline() {
+        let inner = Arc::new(FakeLauncher::new());
+        inner.push(FakeProcess::responding(|_| Vec::new()));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = HostContext::builder()
+            .launcher(Arc::new(LoggedStdinLauncher {
+                inner,
+                log: Arc::clone(&log),
+            }))
+            .cwd("/workspace")
+            .client_info("test-host", "0.0.0")
+            .build()
+            .expect("expected a host");
+        let transport = open(
+            &host,
+            &StdioSpec::new(["codex"]),
+            &ExecutablePath::default(),
+            &[],
+        )
+        .await
+        .expect("expected a transport");
+        let (mut sender, _receiver) = transport.link.split();
+
+        // Exactly full, roomy and empty buffers: appending the newline must not depend on spare
+        // capacity, and must not turn into a second write when it has to grow the buffer.
+        let full = String::from(r#"{"method":"ping","params":{"n":"é日本"}}"#);
+        let mut roomy = String::with_capacity(4_096);
+        roomy.push_str(r#"{"method":"roomy"}"#);
+        for message in [full.clone(), roomy, String::new()] {
+            sender
+                .send(message)
+                .await
+                .expect("expected the send to land");
+        }
+
+        let writes = log
+            .lock()
+            .expect("expected an unpoisoned write log")
+            .clone();
+        let expected: Vec<Vec<u8>> = vec![
+            format!("{full}\n").into_bytes(),
+            b"{\"method\":\"roomy\"}\n".to_vec(),
+            b"\n".to_vec(),
+        ];
+        assert_eq!(
+            writes, expected,
+            "expected one write per message, each ending in a single newline | received {writes:?}"
         );
     }
 

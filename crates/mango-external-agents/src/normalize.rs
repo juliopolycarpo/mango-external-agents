@@ -147,16 +147,28 @@ impl BoundedText {
 /// assert!(clean.truncated);
 /// ```
 pub fn sanitize_field(raw: &str) -> BoundedText {
-    let mut text = String::with_capacity(raw.len());
-    let mut truncated = false;
-    for character in raw.chars() {
-        if is_strippable(character) {
-            truncated = true;
-            continue;
-        }
-        text.push(character);
+    sanitize_owned(raw.to_owned())
+}
+
+/// [`sanitize_field`] for text the caller already owns: nothing is copied.
+///
+/// Clean text comes back as it arrived. Dirty text is stripped in place, so the buffer that held
+/// it is the buffer that keeps the survivors. The result is byte-identical to
+/// `sanitize_field(&raw)`.
+pub(crate) fn sanitize_owned(mut raw: String) -> BoundedText {
+    if !may_need_stripping(&raw) {
+        return BoundedText {
+            text: raw,
+            truncated: false,
+        };
     }
-    BoundedText { text, truncated }
+    // One pass: a removal always shortens the text, so the length says whether anything went.
+    let before = raw.len();
+    raw.retain(|character| !is_strippable(character));
+    BoundedText {
+        truncated: raw.len() != before,
+        text: raw,
+    }
 }
 
 /// Applies one field's bound to vendor-supplied text.
@@ -272,6 +284,29 @@ pub fn is_argv_value_with_max(raw: &str, max_code_points: usize) -> bool {
             .all(|character| !character.is_control() && !is_strippable(character))
 }
 
+/// A byte scan that never misses text [`is_strippable`] would strip, and is much cheaper than
+/// decoding every character to find out that ordinary text has nothing to strip.
+///
+/// It looks for the UTF-8 bytes a stripped character must contain: a C0 control or DEL as itself,
+/// and the lead byte of each multi-byte sequence that holds a stripped character (`C2` for the C1
+/// controls, `D8` for U+061C, `E2` for the marks, embeddings and isolates). Text without any of
+/// them is clean; text with one may still be clean (an em dash leads with `E2`), so the caller
+/// confirms with the exact per-character test.
+fn may_need_stripping(text: &str) -> bool {
+    // Sixteen bytes at a time with no early exit inside a block, so the compiler can test a block
+    // with vector instructions instead of branching on every byte.
+    text.as_bytes().chunks(16).any(|block| {
+        block
+            .iter()
+            .fold(false, |found, byte| found | is_flagged_byte(*byte))
+    })
+}
+
+/// Whether a byte can belong to a stripped character.
+const fn is_flagged_byte(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x08 | 0x0b..=0x1f | 0x7f | 0xc2 | 0xd8 | 0xe2)
+}
+
 /// C0 and C1 controls except tab and newline, and every bidirectional formatting character.
 ///
 /// Expressed as code-point tests rather than as a character class: a regular expression made of
@@ -297,7 +332,7 @@ fn is_strippable(character: char) -> bool {
 mod tests {
     use super::{
         ARGV_VALUE_MAX_CODE_POINTS, MAX_PATH_LENGTH, TextLimit, bound_text, is_argv_value,
-        is_argv_value_with_max, opaque_id, sanitize_field, vendor_path,
+        is_argv_value_with_max, opaque_id, sanitize_field, sanitize_owned, vendor_path,
     };
     use crate::error::Error;
 
@@ -319,6 +354,102 @@ mod tests {
                 clean.text
             );
             assert!(clean.truncated);
+        }
+    }
+
+    /// The original character-by-character loop, kept as the reference the fast paths must match.
+    fn reference_sanitize(raw: &str) -> (String, bool) {
+        let mut text = String::with_capacity(raw.len());
+        let mut truncated = false;
+        for character in raw.chars() {
+            if super::is_strippable(character) {
+                truncated = true;
+                continue;
+            }
+            text.push(character);
+        }
+        (text, truncated)
+    }
+
+    /// Inputs on both sides of every boundary `is_strippable` draws, alone and embedded.
+    fn boundary_inputs() -> Vec<String> {
+        let edges = [
+            0x00, 0x08, 0x09, 0x0a, 0x0b, 0x1f, 0x20, 0x7e, 0x7f, 0x80, 0x9f, 0xa0, 0x061b, 0x061c,
+            0x061d, 0x200d, 0x200e, 0x200f, 0x2010, 0x2029, 0x202a, 0x202e, 0x202f, 0x2065, 0x2066,
+            0x2069, 0x206a, 0x1f34b,
+        ];
+        let mut inputs = vec![
+            String::new(),
+            String::from("the quick brown fox"),
+            String::from("héllo wörld 日本語 🍋 — done\n"),
+            String::from("\u{1b}[0m"),
+            String::from("\u{0}\u{7f}\u{9f}\u{202e}"),
+        ];
+        // A stripped character at every offset around the prefilter's 16-byte blocks.
+        for offset in 0..40 {
+            for dirty in ['\u{1b}', '\u{202e}', '\u{85}'] {
+                let mut text = "a".repeat(40);
+                text.insert(offset, dirty);
+                inputs.push(text);
+            }
+        }
+        for code in edges {
+            let character = char::from_u32(code).expect("expected a scalar value");
+            inputs.push(character.to_string());
+            inputs.push(format!("{character}tail"));
+            inputs.push(format!("head{character}"));
+            inputs.push(format!("héad {character} 日本 {character}"));
+        }
+        inputs
+    }
+
+    #[test]
+    fn owned_and_borrowed_sanitising_match_the_reference_byte_for_byte() {
+        for input in boundary_inputs() {
+            let (expected_text, expected_truncated) = reference_sanitize(&input);
+            let borrowed = sanitize_field(&input);
+            let owned = sanitize_owned(input.clone());
+            assert_eq!(
+                (borrowed.text.as_bytes(), borrowed.truncated),
+                (expected_text.as_bytes(), expected_truncated),
+                "expected sanitize_field to match the reference | input: {input:?}"
+            );
+            assert_eq!(
+                (owned.text.as_bytes(), owned.truncated),
+                (expected_text.as_bytes(), expected_truncated),
+                "expected sanitize_owned to match the reference | input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_byte_prefilter_flags_every_character_that_is_stripped() {
+        let mut buffer = [0_u8; 4];
+        for character in ('\0'..=char::MAX).filter(|character| super::is_strippable(*character)) {
+            let encoded: &str = character.encode_utf8(&mut buffer);
+            assert!(
+                super::may_need_stripping(encoded),
+                "expected the prefilter to flag U+{:04X} | received clean",
+                u32::from(character)
+            );
+        }
+    }
+
+    #[test]
+    fn owned_sanitising_reuses_the_callers_buffer_for_clean_and_dirty_text() {
+        for input in [
+            "clean ascii text",
+            "héllo 日本語",
+            "dirty\u{1b}[0m\u{202e}text",
+        ] {
+            let owned = input.to_owned();
+            let (pointer, capacity) = (owned.as_ptr(), owned.capacity());
+            let cleaned = sanitize_owned(owned);
+            assert_eq!(
+                (cleaned.text.as_ptr(), cleaned.text.capacity()),
+                (pointer, capacity),
+                "expected {input:?} sanitised in the buffer it arrived in | received a new buffer"
+            );
         }
     }
 

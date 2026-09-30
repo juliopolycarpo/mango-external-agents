@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -1002,18 +1002,15 @@ async fn dispatch(
 ) -> std::result::Result<(), PeerTermination> {
     // Not every line on a peer's output is a frame. Dropping an unparseable one keeps a stray
     // diagnostic from killing a live turn.
-    let Ok(Value::Object(frame)) = serde_json::from_str::<Value>(&message) else {
+    let Ok(Value::Object(mut frame)) = serde_json::from_str::<Value>(&message) else {
         return Ok(());
     };
 
-    let id = frame.get("id").cloned();
-    let method = frame
-        .get("method")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let params = frame.get("params").cloned().unwrap_or(Value::Null);
-
-    if let Some(method) = method {
+    // The frame is owned and read once, so every member is taken out of it rather than cloned: a
+    // large diff notification would otherwise exist twice until the clone is dropped.
+    let id = frame.remove("id");
+    if let Some(Value::String(method)) = frame.remove("method") {
+        let params = frame.remove("params").unwrap_or(Value::Null);
         let bytes = u32::try_from(message.len()).map_err(|_| {
             PeerTermination::NotificationByteBackpressure {
                 limit: state.options.max_pending_bytes,
@@ -1039,15 +1036,19 @@ async fn dispatch(
     }
 
     if let Some(id) = id {
-        let outcome = match frame.get("error") {
-            Some(error) => Err(
-                serde_json::from_value(error.clone()).unwrap_or(JsonRpcError {
-                    code: -32603,
-                    message: error.to_string(),
-                    data: None,
-                }),
-            ),
-            None => Ok(frame.get("result").cloned().unwrap_or(Value::Null)),
+        let outcome = match frame.remove("error") {
+            // Deserialised from a reference so the raw value survives for the fallback, which is
+            // only rendered when the body is malformed.
+            Some(error) => {
+                Err(
+                    JsonRpcError::deserialize(&error).unwrap_or_else(|_| JsonRpcError {
+                        code: -32603,
+                        message: error.to_string(),
+                        data: None,
+                    }),
+                )
+            }
+            None => Ok(frame.remove("result").unwrap_or(Value::Null)),
         };
         state.settle(&RequestId::new(id).key(), outcome).await;
     }
@@ -1544,6 +1545,98 @@ mod tests {
         assert!(
             !vendor.retryable,
             "expected a reserved code to be non-retryable"
+        );
+    }
+
+    /// Sends one request and answers it with the given frame, whatever shape the frame has.
+    async fn outcome_of(frame: &str) -> crate::error::Result<Value> {
+        let link = ScriptedLink::new();
+        link.push_line(frame);
+        let client = client(link, RecordingHandler::arc(None));
+        client.request::<_, Value>("thread/start", json!({})).await
+    }
+
+    #[tokio::test]
+    async fn a_null_or_malformed_error_member_still_takes_the_error_path() {
+        let cases = [
+            (r#"{"id":"1","error":null}"#, "null"),
+            (r#"{"id":"1","error":"boom"}"#, r#""boom""#),
+            (
+                r#"{"id":"1","error":{"code":"x"},"result":1}"#,
+                r#"{"code":"x"}"#,
+            ),
+        ];
+        for (frame, message) in cases {
+            let error = outcome_of(frame).await.expect_err(&format!(
+                "expected a failure for {frame}, received an answer"
+            ));
+            let Error::Vendor(vendor) = error else {
+                panic!("expected a vendor failure for {frame}, received {error:?}");
+            };
+            assert_eq!(vendor.message, message, "frame: {frame}");
+            assert_eq!(
+                vendor.vendor_code.as_deref(),
+                Some("-32603"),
+                "expected the internal-error code for {frame}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_member_wins_over_a_result_member() {
+        let error = outcome_of(
+            r#"{"id":"1","result":{"ok":true},"error":{"code":-32000,"message":"refused"}}"#,
+        )
+        .await
+        .expect_err("expected the error member to win, received an answer");
+        assert!(
+            matches!(&error, Error::Vendor(vendor) if vendor.message == "refused"),
+            "expected the peer's refusal, received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_whose_method_is_not_a_string_is_a_response() {
+        let answer = outcome_of(r#"{"id":"1","method":7,"params":{"a":1},"result":{"b":2}}"#)
+            .await
+            .expect("expected the frame to settle the call");
+        assert_eq!(answer, json!({ "b": 2 }));
+    }
+
+    #[tokio::test]
+    async fn a_response_without_a_result_settles_with_null() {
+        let answer = outcome_of(r#"{"id":"1"}"#)
+            .await
+            .expect("expected the frame to settle the call");
+        assert_eq!(answer, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_notification_reaches_the_handler_with_its_params_intact() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = client(link.clone(), Arc::clone(&handler));
+
+        link.push_line(
+            r#"{"method":"item/patch","params":{"changes":[{"path":"a.rs","kind":null}],"n":1.5}}"#,
+        );
+        link.push_line(r#"{"method":"item/bare"}"#);
+        link.push_line(r#"{"id":"1","result":null}"#);
+        client
+            .request::<_, Value>("ping", json!({}))
+            .await
+            .expect("expected an answer");
+
+        let seen = handler.notifications.lock().await;
+        assert_eq!(
+            *seen,
+            vec![
+                (
+                    String::from("item/patch"),
+                    json!({ "changes": [{ "path": "a.rs", "kind": null }], "n": 1.5 })
+                ),
+                (String::from("item/bare"), Value::Null),
+            ]
         );
     }
 
