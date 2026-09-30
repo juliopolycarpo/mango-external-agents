@@ -11,7 +11,9 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 1. This repository is Rust only. Use `cargo`; there is no Bun, npm or Node toolchain here.
 2. Lint and format: `cargo fmt`, `cargo clippy`, and `dprint` for markdown, TOML and YAML.
 3. Run root scripts from the repository root: `scripts/check.sh`, `scripts/fix.sh`,
-   `scripts/changelog.sh`. Read `scripts/` before inventing a command.
+   `scripts/changelog.sh`. Read `scripts/` before inventing a command. `scripts/bench.sh` runs the
+   non-gating benchmarks; `docs/benchmarks.md` explains how to record a Base / Variant / Delta
+   receipt for a performance claim.
 4. Tools the scripts expect on `PATH`: `cargo-nextest`, `cargo-deny`, `cargo-hack`, `dprint`,
    `git-cliff`. CI installs the same set through `taiki-e/install-action`.
 

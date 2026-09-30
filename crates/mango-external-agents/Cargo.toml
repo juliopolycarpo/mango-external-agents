@@ -15,6 +15,10 @@ description = "Drive local coding-agent CLIs from Rust behind one abstraction: t
 [lints]
 workspace = true
 
+[lib]
+# The library has no benchmarks of its own, so `cargo bench` skips its unit tests.
+bench = false
+
 [features]
 default = ["stdio"]
 # Line-framed child processes spawned through the host's ProcessLauncher.
@@ -61,6 +65,16 @@ windows = { version = "0.62.2", default-features = false, features = ["Win32_Sys
 
 [dev-dependencies]
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+
+# Non-gating benchmarks: plain `harness = false` binaries with no extra dependencies. Run them with
+# `cargo bench -p mango-external-agents`; see docs/benchmarks.md.
+[[bench]]
+name = "framing"
+harness = false
+
+[[bench]]
+name = "events"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true
