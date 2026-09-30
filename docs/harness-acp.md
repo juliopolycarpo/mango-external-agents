@@ -351,8 +351,10 @@ outstanding.
 time. Answers at or after the deadline cannot allow work, even before the timer task runs.
 Expiry selects the agent's `reject_once` option and records `DecisionSource::Expired`. If the agent
 offers no one-time refusal, the harness cancels the turn with `CancelReason::Timeout` and
-withdraws the question with ACP's `Cancelled` outcome;
-there is no `ApprovalResolved` selection event because no vendor option was selected. It never
+withdraws the question with ACP's `Cancelled` outcome and closes the host's dialog with an
+`ApprovalResolved` whose option id is `withdrawn`, `DecisionSource::Cancelled` and no effect,
+because no vendor option was selected. The cancel starts the same kill-grace fallback a host
+`cancel` does, so an agent that ignores `session/cancel` is still reaped. It never
 chooses `reject_always` for a timeout. These outcomes follow the
 [ACP v1 permission specification](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission).
 The timer answers the agent even if the bounded event channel is full. Approval events remain
