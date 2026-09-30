@@ -257,6 +257,22 @@ final output. `Reducer::with_update_interval` changes the interval; `Duration::Z
 update. This bounds how often one call reaches a host, not how large one update is: each is still
 bounded by the core's `TextLimit::Detail`.
 
+A [tool call's](https://agentclientprotocol.com/protocol/v1/tool-calls) `toolCallId` is an opaque
+string the agent chooses, and the core publishes an id only when it is not blank and is at most 128
+code points; it refuses rather than shortens one, because a cut id would name a different call. Such
+an id is refused on every event that names it, so the reducer does not track it as a running call
+(it is remembered as ended, at the fixed size of a digest, so a repeat frame is dropped rather than
+announced again), and the turn ends with an `EventKind::Error` whose code is `acp-refused-event`, for
+example `the ACP agent sent an event the core refused to publish: expected a usable activity call id,
+received invalid vendor data`. The turn is failed rather than left running with the call missing
+from the host's transcript. What the turn still owes is settled first, in the order a normal ending
+uses: waiting questions are withdrawn and their resolutions sent, then the calls the agent left
+running are closed as failed, an open thought is ended and the plan is completed, and only then
+does the failure commit, so the transcript never ends with an activity still running. Only a value
+the core cannot make safe is reported this way; a stream
+that is already closed or terminal, and an overflow (which the sink already turns into its own
+failure), are not. The longest id seen from a live agent is Cursor's, 85 code points.
+
 A `session/update` that arrives while no turn exists is not transcript. ACP's
 [`session/load`](https://agentclientprotocol.com/protocol/v1/session-setup) has the agent replay the
 whole conversation through `session/update` before it answers, and a frame between two turns is the

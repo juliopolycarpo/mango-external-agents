@@ -337,45 +337,50 @@ fn main() {
         },
     );
 
-    // Command output: every delta beyond the first lands inside the throttle window.
+    // Command output: every delta beyond the first lands inside the throttle window. The chunk
+    // size is what varies: 1 KiB is an ordinary delta and stays under the tail limit, 8 KiB and
+    // 64 KiB are chunks that alone exceed it, which take the path of their own.
     let command_item = json!({"type": "commandExecution", "id": "cmd-1",
                               "command": "cargo build", "status": "inProgress"});
-    let output_text = "   Compiling mango-external-agents v0.3.0 (/work/crates)\n".repeat(19);
-    let output_frames = |count: usize| -> Vec<Frame> {
-        (0..count)
-            .map(|_| {
-                Frame::new(
-                    "item/commandExecution/outputDelta",
-                    &json!({"threadId": THREAD, "turnId": TURN, "itemId": "cmd-1", "delta": output_text}),
-                )
-            })
-            .collect()
-    };
-    bench.run(
-        "codex/stage/reduce/command-output-1KiB/throttled",
-        per_frame,
-        || {
-            let notifications: Vec<Notification> = output_frames(SMALL_FRAMES)
-                .iter()
-                .map(Frame::notification)
-                .collect();
-            (reducer_with_item(&command_item, start), notifications)
-        },
-        |(mut reducer, notifications)| {
-            // The first delta opens the window; the rest land inside it and are suppressed.
-            let mut emitted = 0;
-            for notification in &notifications {
-                if matches!(reduce(&mut reducer, notification, start), Outcome::Emit(_)) {
-                    emitted += 1;
+    let output_line = "   Compiling mango-external-agents v0.3.0 (/work/crates)\n";
+    for (name, lines, frames) in [
+        ("command-output-1KiB", 19, SMALL_FRAMES),
+        ("command-output-8KiB", 152, SMALL_FRAMES),
+        ("command-output-64KiB", 1216, SMALL_FRAMES / 10),
+    ] {
+        let output_text = output_line.repeat(lines);
+        let per_frame = Unit::new(frames as u64, "frame");
+        bench.run(
+            &format!("codex/stage/reduce/{name}/throttled"),
+            per_frame,
+            || {
+                let notifications: Vec<Notification> = (0..frames)
+                    .map(|_| {
+                        Frame::new(
+                            "item/commandExecution/outputDelta",
+                            &json!({"threadId": THREAD, "turnId": TURN, "itemId": "cmd-1", "delta": output_text}),
+                        )
+                        .notification()
+                    })
+                    .collect();
+                (reducer_with_item(&command_item, start), notifications)
+            },
+            |(mut reducer, notifications)| {
+                // The first delta opens the window; the rest land inside it and are suppressed.
+                let mut emitted = 0;
+                for notification in &notifications {
+                    if matches!(reduce(&mut reducer, notification, start), Outcome::Emit(_)) {
+                        emitted += 1;
+                    }
                 }
-            }
-            assert_eq!(
-                emitted, 1,
-                "expected 1 emitted command update inside one window, received {emitted}"
-            );
-            reducer
-        },
-    );
+                assert_eq!(
+                    emitted, 1,
+                    "expected 1 emitted command update inside one window, received {emitted}"
+                );
+                reducer
+            },
+        );
+    }
 
     replay_fixtures(&bench, &rt);
 }
