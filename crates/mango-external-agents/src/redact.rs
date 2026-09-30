@@ -9,6 +9,11 @@
 //! with the same shapes as the patterns they replace, so each rule can be read on its own:
 //! a bearer header, a `key = value` assignment, and the password in a URL's userinfo.
 
+mod strip;
+
+pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
+use strip::{remove_boundaries, strip_control_characters};
+
 /// Redacts a stderr tail and strips terminal-unsafe control characters.
 ///
 /// # Example
@@ -26,7 +31,7 @@ pub fn stderr_text(raw: &str) -> String {
     let plain = strip_control_characters(raw);
     let bearer = redact_bearer(&plain);
     let assignments = redact_assignments(&bearer);
-    redact_url_passwords(&assignments)
+    remove_boundaries(redact_url_passwords(&assignments))
 }
 
 /// Whether `dropped`, the text a cut removed from the end of what came before, stops where a
@@ -134,7 +139,10 @@ fn redact_bearer(raw: &str) -> String {
         let scheme_start = skip_spaces(bytes, after_colon);
         let after_scheme = match_word(bytes, scheme_start, b"bearer")
             .or_else(|| match_word(bytes, scheme_start, b"basic"))?;
-        let token_start = skip_spaces(bytes, after_scheme);
+        // A boundary marker stands where a byte was removed between the scheme and its token.
+        let token_start = take_while(bytes, after_scheme, |byte| {
+            is_space_byte(byte) || byte == strip::BOUNDARY_BYTE
+        });
         if token_start == after_scheme {
             return None;
         }
@@ -318,44 +326,6 @@ fn is_value_byte(byte: u8) -> bool {
 
 fn as_text(bytes: &[u8], from: usize, to: usize) -> String {
     String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default()).into_owned()
-}
-
-/// Keeps tab and newline, drops every other C0 control, DEL, the C1 block and every bidirectional
-/// formatting character, and takes a CSI sequence out whole rather than leaving its parameters
-/// behind as text.
-///
-/// A lone `\r` or an escape sequence in a vendor's diagnostic is a terminal-rendering problem the
-/// moment anyone tails a log. Dropping only the `ESC` would leave `[31m` sitting in the middle of
-/// a header, which reads as noise and hides a token from the rules that run after this.
-///
-/// The bidirectional set goes for the reason it goes everywhere else in this crate — see
-/// [`normalize::is_strippable`](crate::normalize) — and this tail is rendered in a host's
-/// diagnostics like any other vendor-written string, so the answer has to be the same one.
-fn strip_control_characters(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut characters = raw.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\u{1b}' {
-            if characters.peek() == Some(&'[') {
-                characters.next();
-                // Parameter and intermediate bytes, up to and including the final byte.
-                for character in characters.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&character) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if character == '\t' || character == '\n' {
-            out.push(character);
-            continue;
-        }
-        if !is_unsafe_to_render(character) {
-            out.push(character);
-        }
-    }
-    out
 }
 
 /// Every code point a diagnostic must not carry across a boundary, tab and newline excepted.
