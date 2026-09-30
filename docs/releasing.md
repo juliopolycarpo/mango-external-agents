@@ -73,8 +73,9 @@ Observed on the four 0.3.0 tarballs, each unpacked from `cargo package` and run 
   `tests/support/mod.rs` and `tests/reducer_replay.rs`, and the build stops with
   `couldn't read src/../../../fixtures/claude/contract/cli-surface.json`.
 - `mango-agent-codex`: the tests compile. The unit and doc tests pass, but the three integration
-  test binaries open `fixtures/codex` at run time through `CARGO_MANIFEST_DIR` and 147 of their
-  tests fail (`cancel_deadlines`, `notification_decode`, `replay`).
+  test binaries open `fixtures/codex` at run time through `CARGO_MANIFEST_DIR`, and 147 of the
+  tests in them fail: 14 in `cancel_deadlines`, 1 in `notification_decode` and 132 in `replay`, so
+  the rest of those binaries still pass.
 - `mango-agent-acp`: `tests/session.rs` and `tests/smoke.rs` do not compile
   (`cannot find TokioLauncher in launcher`), because the dev-dependency on the sibling crate that
   turns on its `launcher-tokio` feature is a path entry Cargo leaves out of the published manifest.
