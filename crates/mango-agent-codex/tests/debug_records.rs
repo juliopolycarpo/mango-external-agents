@@ -324,3 +324,60 @@ fn a_harness_does_not_print_the_executable_it_was_pointed_at() {
     );
     assert_omits("CodexHarness", &harness, &[("executable", "CANARY-user")]);
 }
+
+/// A patch is reported by how many files it touches and how many bytes of path and diff it holds,
+/// so a host can spot a huge patch in a log without seeing a path or a diff.
+#[test]
+fn a_patch_reports_its_total_size_but_not_its_files() {
+    let changes = json!([
+        {"path": "CANARY-path-a", "diff": "CANARY-diff-a"},
+        {"path": "CANARY-path-b", "diff": "CANARY-diff-b"},
+    ]);
+    let total = "CANARY-path-a".len() * 4;
+    let expected = format!("<{total} bytes redacted>");
+
+    let completed = item(json!({"type": "fileChange", "id": "i", "changes": changes}));
+    assert_names(
+        "Notification(FileChange item)",
+        &completed,
+        "change_count: 2",
+    );
+    assert_names("Notification(FileChange item)", &completed, &expected);
+
+    let updated = Notification::parse(
+        "item/fileChange/patchUpdated",
+        json!({"threadId": "t", "turnId": "u", "itemId": "i", "changes": changes}),
+    );
+    assert_names(
+        "Notification(FileChangePatchUpdated)",
+        &updated,
+        "change_count: 2",
+    );
+    assert_names("Notification(FileChangePatchUpdated)", &updated, &expected);
+}
+
+/// Turn notifications hold ids, a status and a `TurnError` (already metadata-only), never text the
+/// agent wrote, so they keep the derive and print their ids. Item and delta notifications carry
+/// content and report ids by length. The split is deliberate; this locks it in.
+#[test]
+fn a_turn_notification_prints_its_ids_and_status_but_never_the_error_text() {
+    let started = Notification::parse(
+        "turn/started",
+        json!({"threadId": "thread-7", "turn": {"id": "turn-9", "status": "inProgress"}}),
+    );
+    assert_names("Notification(TurnStarted)", &started, "thread-7");
+    assert_names("Notification(TurnStarted)", &started, "turn-9");
+    assert_names("Notification(TurnStarted)", &started, "InProgress");
+
+    let completed = Notification::parse(
+        "turn/completed",
+        json!({"threadId": "thread-7", "turn": {"id": "turn-9", "status": "failed",
+               "error": {"message": "CANARY-message"}}}),
+    );
+    assert_names("Notification(TurnCompleted)", &completed, "thread-7");
+    assert_omits(
+        "Notification(TurnCompleted)",
+        &completed,
+        &[("error.message", "CANARY-message")],
+    );
+}

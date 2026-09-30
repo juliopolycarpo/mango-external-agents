@@ -443,6 +443,7 @@ impl fmt::Debug for FileChangePatchUpdated {
             .field("turn_id", &redacted::text(&self.turn_id))
             .field("item_id", &redacted::text(&self.item_id))
             .field("change_count", &self.changes.len())
+            .field("changes", &super::items::changes_size(&self.changes))
             .finish()
     }
 }

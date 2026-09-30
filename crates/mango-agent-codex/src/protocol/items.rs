@@ -238,6 +238,16 @@ impl fmt::Debug for FileUpdateChange {
     }
 }
 
+/// The combined size of every path and diff in a patch, so a log can show a huge one without
+/// showing a file.
+pub(crate) fn changes_size(changes: &[FileUpdateChange]) -> redacted::Redacted {
+    redacted::Redacted::sum(
+        changes
+            .iter()
+            .map(|change| change.path.len() + change.diff.len()),
+    )
+}
+
 impl fmt::Debug for ThreadItem {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -291,6 +301,7 @@ impl fmt::Debug for ThreadItem {
                 .debug_struct("FileChange")
                 .field("id", &redacted::text(id))
                 .field("change_count", &changes.len())
+                .field("changes", &changes_size(changes))
                 .field("status", status)
                 .finish(),
             Self::McpToolCall {
