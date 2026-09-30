@@ -418,6 +418,10 @@ struct ClientState {
     /// owns termination.
     write_failure: StdMutex<Option<String>>,
     write_failed: Notify,
+    /// Set synchronously, before the sender is released, by the write that abandoned a frame
+    /// mid-send, so a writer already queued for the sender refuses instead of appending a whole
+    /// frame behind the half one. The pump ends the connection later, on its own task.
+    link_poisoned: AtomicBool,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
     notifications: StdMutex<Option<JoinHandle<()>>>,
@@ -453,6 +457,8 @@ impl Drop for MidSend<'_> {
         if self.finished {
             return;
         }
+        // Before the sender is released (this guard drops ahead of it): the next writer sees it.
+        self.state.link_poisoned.store(true, Ordering::Release);
         self.state.signal_write_failure(&Error::Link {
             peer: self.state.options.peer_name.clone(),
             message: String::from("a JSON-RPC frame write was abandoned mid-send"),
@@ -506,6 +512,7 @@ impl Client {
             shutdown: CancelToken::new(),
             write_failure: StdMutex::new(None),
             write_failed: Notify::new(),
+            link_poisoned: AtomicBool::new(false),
             in_flight: StdMutex::new(JoinSet::new()),
             notifications: StdMutex::new(None),
             peer_bytes,
@@ -945,6 +952,18 @@ impl ClientState {
     async fn write_marking(&self, frame: String, started: Option<&AtomicBool>) -> Result<()> {
         tokio::time::timeout(self.options.request_timeout, async {
             let mut sender = self.sender.lock().await;
+            // Read again holding the sender: the write that held it before may have been
+            // abandoned mid-frame while this one waited, and the pump has not necessarily ended
+            // the connection yet. `closed` is deliberately not the test, because a connection
+            // that is closing still writes the refusals its in-flight questions are owed.
+            if self.link_poisoned.load(Ordering::Acquire) {
+                return Err(Error::Link {
+                    peer: self.options.peer_name.clone(),
+                    message: String::from(
+                        "the link was abandoned mid-frame by an earlier JSON-RPC frame write",
+                    ),
+                });
+            }
             if let Some(started) = started {
                 started.store(true, Ordering::Release);
             }
@@ -2814,6 +2833,58 @@ mod tests {
         assert!(
             !client.is_closed(),
             "expected closed: false for sends that returned | received: true"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+
+    /// A write already waiting for the sender when another is abandoned mid-frame must not send: it
+    /// would append a whole frame behind the half one, and the pump ends the connection later than
+    /// the sender is released.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_queued_behind_an_abandoned_send_never_reaches_the_link() {
+        let link = ScriptedLink::new();
+        let (sender, receiver) = link.clone().into_link().split();
+        let handler = RecordingHandler::arc(None);
+        let client = Arc::new(Client::connect(
+            crate::link::Link::new(
+                Box::new(StalledMethod {
+                    inner: sender,
+                    method: "thread/start",
+                }),
+                receiver,
+            ),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_request_timeout(Duration::from_secs(5)),
+        ));
+        let stalled = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("thread/start", json!({})).await })
+        };
+        // The stalled send holds the sender before the second write is issued, and the second
+        // write's own deadline is later than the stall's, so it is waiting for the sender when the
+        // stall is abandoned.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let queued = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.notify("ping", json!({})).await })
+        };
+
+        let stalled = stalled
+            .await
+            .expect("expected the stalled request to finish");
+        assert!(
+            matches!(stalled, Err(Error::Timeout { .. })),
+            "expected the stalled request to time out | received {stalled:?}"
+        );
+        let queued = queued.await.expect("expected the queued write to finish");
+        assert!(
+            queued.is_err(),
+            "expected the queued write to be refused | received {queued:?}"
+        );
+        assert!(
+            link.sent().is_empty(),
+            "expected sent: [] behind an abandoned send | received {:?}",
+            link.sent()
         );
         client.close().await.expect("expected a clean close");
     }
