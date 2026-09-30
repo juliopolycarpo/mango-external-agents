@@ -866,6 +866,8 @@ fn file_change_content(name: &str, input: Option<&Value>) -> Option<ActivityCont
             .and_then(Value::as_str)
             .map(|text| head(text, DETAIL_CARRY_MAX_CHARS).to_owned())
     };
+    // Presence only: the strings an `Edit` states are not carried, so they are not copied.
+    let is_text = |key: &str| fields.get(key).is_some_and(Value::is_string);
     let path = fields.get("file_path")?.as_str()?;
     let change = match name {
         "Write" => FileChange::new(path).with_new_text(bounded("content")?),
@@ -873,7 +875,9 @@ fn file_change_content(name: &str, input: Option<&Value>) -> Option<ActivityCont
         // call states a before, and a call missing either is one whose shape this mapping does
         // not recognise.
         "Edit" => {
-            let (_before, _after) = (bounded("old_string")?, bounded("new_string")?);
+            if !(is_text("old_string") && is_text("new_string")) {
+                return None;
+            }
             FileChange::new(path).with_kind(FileChangeKind::Modified)
         }
         _ => return None,
@@ -1645,5 +1649,52 @@ mod tests {
             "expected truncated: true for a result of {} chars, received {normalized:?}",
             DETAIL_CARRY_MAX_CHARS + 51
         );
+    }
+
+    /// The activity content an `Edit` call with `input` starts with, or `None` when it has none.
+    fn edit_content(input: &serde_json::Value) -> Option<ActivityContent> {
+        let line = json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Edit", "input": input}
+        ]}})
+        .to_string();
+        let events = reduce(&mut TurnReducer::new(), &line);
+        let [EventKind::ActivityStarted { activity, .. }] = events.as_slice() else {
+            panic!("expected one started activity, received {events:?}");
+        };
+        activity.content.clone()
+    }
+
+    /// An `Edit` states a before and an after; it carries neither, only that it modifies a file.
+    /// A call missing either string, or carrying one that is not text, is not a shape this mapping
+    /// recognises.
+    #[test]
+    fn an_edit_needs_both_strings_as_text_and_carries_neither() {
+        let long = "e".repeat(2 * DETAIL_CARRY_MAX_CHARS);
+        let both = json!({"file_path": "/work/a.rs", "old_string": long, "new_string": "n"});
+        let Some(ActivityContent::Diff { files }) = edit_content(&both) else {
+            panic!("expected a diff for an Edit stating both strings");
+        };
+        assert_eq!(
+            (files.len(), files[0].path.as_str(), files[0].kind),
+            (1, "/work/a.rs", Some(FileChangeKind::Modified)),
+            "expected one modified file, received {files:?}"
+        );
+        assert_eq!(
+            (&files[0].old_text, &files[0].new_text),
+            (&None, &None),
+            "expected neither string to be carried, received {files:?}"
+        );
+        for missing in [
+            json!({"file_path": "/work/a.rs", "new_string": "n"}),
+            json!({"file_path": "/work/a.rs", "old_string": "o"}),
+            json!({"file_path": "/work/a.rs", "old_string": 5, "new_string": "n"}),
+            json!({"file_path": "/work/a.rs", "old_string": "o", "new_string": null}),
+        ] {
+            assert_eq!(
+                edit_content(&missing),
+                None,
+                "expected no content for an Edit of {missing}"
+            );
+        }
     }
 }
