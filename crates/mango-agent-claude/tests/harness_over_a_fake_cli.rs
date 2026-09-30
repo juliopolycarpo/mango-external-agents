@@ -5033,6 +5033,15 @@ mod ending_mid_thinking {
                 EventKind::Error { error } if error.code.as_str() == "stream-overflow")),
             "expected no stream-overflow terminal in place of the {path} | received: {events:?}"
         );
+        // The other half of the contract: the queue had no room, so the close and the usage are
+        // dropped and the host reads the terminal as ending the reasoning. A close that shows up
+        // here went through plain `emit`, or was squeezed in behind the terminal's back.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventKind::ReasoningEnded | EventKind::Usage { .. })),
+            "expected the close and the usage to be dropped on a full queue in the {path} | received: {events:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
