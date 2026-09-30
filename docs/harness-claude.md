@@ -438,7 +438,10 @@ The reducer holds three properties, each with a fixture case behind it:
   deltas and again as a completed block — so deltas are the source and a completed block
   contributes only the remainder nothing streamed for it. Buffers are matched by delivery channel,
   because Claude restates in text the plan it just reasoned through, and letting the wrong buffer
-  claim the other's delivery silently truncates the reply.
+  claim the other's delivery silently truncates the reply. What a block delivered is kept only up
+  to what one line can carry (`Limits::line`'s larger of `max_line_bytes` and
+  `max_buffered_bytes`): a completed block cannot begin with more than that, so past it the text is
+  dropped and the completed block is emitted whole, never refused.
 - **Subagents stay the vendor's.** `--forward-subagent-text` tags a subagent's messages with
   `parent_tool_use_id`; those nest under the `Task` activity as accumulating detail, never
   promoted into the transcript, which would tell a user the host made a hand-off it did not make.
