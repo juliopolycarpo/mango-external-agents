@@ -556,6 +556,14 @@ impl HubApi for FakeHubApi {
         match answer {
             CommitAnswer::Fail(error) => return Err(error),
             CommitAnswer::AlreadyRecorded { terminal } => {
+                // What an earlier call left behind is still true after this answer is spent, so
+                // the ledger takes it: a later commit or reconciliation must see the same
+                // terminal, as it would from a Hub that really held one.
+                self.ledger
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .committed
+                    .insert(logical(operation), terminal.clone());
                 return Ok(Commit::AlreadyRecorded { terminal });
             }
             CommitAnswer::Record => {}
