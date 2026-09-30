@@ -58,6 +58,39 @@ crates.io — and adds the two questions a dry run does not answer:
 Run it on a clean tree: `cargo package --list` refuses to describe a package whose sources have
 uncommitted changes, and the script surfaces that refusal rather than reporting an empty package.
 
+**The three harness crates' tarballs are not standalone test packages.** The library build from any
+tarball is unaffected, but the tests of `mango-agent-claude`, `mango-agent-codex` and
+`mango-agent-acp` are not self-contained: they read the repository's `fixtures/` directory, which
+sits outside every crate and so cannot be packaged. The fixtures come from `mea capture`, and the capture
+directories that carry a `manifest.json` are held to the digests in it; a copy inside a crate would
+be a second, unguarded record, so none is bundled.
+
+Observed on the four crates as `cargo package` produced them from `main` after 0.3.0 (the 0.3.0
+sources plus unreleased changes, so counts differ from the published 0.3.0 tarballs; the
+published `mango-agent-claude` 0.3.0 fails in the same way), each unpacked and run with
+`cargo test --all-features`. Re-check after a version bump:
+
+- `mango-external-agents`: every unit, integration and doc test passes, so its packaged tests can
+  be run. Only its `framing` bench reads `fixtures/`, at run time.
+- `mango-agent-claude`: the tests do not compile. `src/cli_surface.rs`, `src/models.rs`,
+  `src/probe.rs` and `src/auth.rs` use `include_str!` on `../../../fixtures/...` in test code, as do
+  `tests/support/mod.rs` and `tests/reducer_replay.rs` (with `../` counts that fit their own
+  directories), and the build stops with
+  `couldn't read src/../../../fixtures/claude/contract/cli-surface.json`.
+- `mango-agent-codex`: the tests compile. The unit and doc tests pass, but the three integration
+  test binaries open `fixtures/codex` at run time through `CARGO_MANIFEST_DIR`, and 147 of the
+  tests in them fail: 14 in `cancel_deadlines`, 1 in `notification_decode` and 132 in `replay`, so
+  the rest of those binaries still pass.
+- `mango-agent-acp`: the tests compile, because the dev-dependency on the core crate is declared
+  with `workspace = true` and so keeps its `launcher-tokio` and `testing` features in the published
+  manifest (`scripts/check-dev-dependencies.sh` guards that; a path-only entry would be dropped).
+  `tests/discovery.rs` and `tests/session.rs` pass, and of the unit tests one profile test fails at
+  run time because it reads the repository root.
+
+Whoever needs to run the harness crates' tests, such as a distribution packager, should use a
+checkout of the release tag, not the `.crate`. Excluding `tests/` and `benches/` from the packages would not change
+this, because the test-only includes in `src/` would remain.
+
 Run `mea doctor` and a harmless `mea turn` against Claude, Codex and Cursor on the maintainer's
 Linux and Windows installations. Pinned CI covers Linux, macOS and Windows public contracts;
 authenticated turns require the maintainer's existing vendor login and are not a PR CI job.
