@@ -14,9 +14,9 @@ use std::time::SystemTime;
 
 use mango_external_agents::{
     AttemptId, CancelReason, CloseReason, Dispatch, Error, EventKind, EventSink, HarnessIdentity,
-    OperationRef, PermissionResponse, RequestFingerprint, Result, Session, SessionId, SessionIds,
-    SessionSnapshot, SessionState, SystemClock, TerminalStatus, TransportKind, TransportSelection,
-    TurnId, TurnRequest, TurnStream,
+    OperationRef, PermissionResponse, ProcessControl, RequestFingerprint, Result, Session,
+    SessionId, SessionIds, SessionSnapshot, SessionState, SystemClock, TerminalStatus,
+    TransportKind, TransportSelection, TurnId, TurnRequest, TurnStream,
 };
 use tokio::sync::Notify;
 
@@ -942,5 +942,118 @@ impl Session for FakeVendorSession {
     async fn close(&self, _reason: CloseReason) -> Result<()> {
         self.inner.open_gate();
         Ok(())
+    }
+}
+
+/// How a [`FailingCancelSession`] fails its `cancel`.
+enum CancelFailure {
+    /// The vendor did not confirm the stop in time.
+    TimedOut,
+    /// The stop could not reap the child, so its handle is handed back.
+    CleanupRequired(Arc<dyn ProcessControl>),
+}
+
+/// A [`Session`] that runs turns like the [`FakeVendorSession`] it wraps and fails every `cancel`.
+///
+/// It is the shape a shipped harness has: Claude's `cancel` returns
+/// [`Error::CleanupRequired`] intact when the child could not be reaped. The wrapped session still
+/// records the turn, so a test can assert the vendor's work started before the cancel failed.
+pub struct FailingCancelSession {
+    inner: FakeVendorSession,
+    failure: CancelFailure,
+}
+
+impl FailingCancelSession {
+    /// A session whose `cancel` answers [`Error::Timeout`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::{FailingCancelSession, FakeVendorSession};
+    ///
+    /// let _session = FailingCancelSession::timing_out(FakeVendorSession::new());
+    /// ```
+    pub fn timing_out(inner: FakeVendorSession) -> Self {
+        Self {
+            inner,
+            failure: CancelFailure::TimedOut,
+        }
+    }
+
+    /// A session whose `cancel` answers [`Error::CleanupRequired`] carrying `control`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::{FailingCancelSession, FakeVendorSession};
+    /// use mango_external_agents::{CancelReason, Error, ExitStatus, ProcessControl};
+    /// use std::sync::Arc;
+    ///
+    /// struct Unreaped;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl ProcessControl for Unreaped {
+    ///     fn pid(&self) -> Option<u32> {
+    ///         None
+    ///     }
+    ///
+    ///     fn stderr_tail(&self) -> String {
+    ///         String::new()
+    ///     }
+    ///
+    ///     async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+    ///         Err(Error::Closed { subject: "example" })
+    ///     }
+    ///
+    ///     async fn kill(&self, _reason: CancelReason) -> mango_external_agents::Result<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let _session =
+    ///     FailingCancelSession::requiring_cleanup(FakeVendorSession::new(), Arc::new(Unreaped));
+    /// ```
+    pub fn requiring_cleanup(inner: FakeVendorSession, control: Arc<dyn ProcessControl>) -> Self {
+        Self {
+            inner,
+            failure: CancelFailure::CleanupRequired(control),
+        }
+    }
+
+    fn timeout() -> Error {
+        Error::Timeout {
+            operation: String::from("hub vendor session process reaping"),
+            after: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Session for FailingCancelSession {
+    fn state(&self) -> &SessionState {
+        self.inner.state()
+    }
+
+    async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        self.inner.start_turn(request).await
+    }
+
+    async fn respond(&self, response: PermissionResponse) -> Result<()> {
+        self.inner.respond(response).await
+    }
+
+    /// Fails without opening the wrapped session's gate: a cancel that failed has not ended the turn.
+    async fn cancel(&self, _reason: CancelReason) -> Result<()> {
+        Err(match &self.failure {
+            CancelFailure::TimedOut => Self::timeout(),
+            CancelFailure::CleanupRequired(control) => Error::CleanupRequired {
+                control: Arc::clone(control),
+                source: Box::new(Self::timeout()),
+            },
+        })
+    }
+
+    async fn close(&self, reason: CloseReason) -> Result<()> {
+        self.inner.close(reason).await
     }
 }

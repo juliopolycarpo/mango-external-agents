@@ -71,7 +71,10 @@ pub enum Settled {
         /// What the Hub gave as its reason.
         reason: String,
     },
-    /// The host stopped the operation.
+    /// The host stopped the operation, and the vendor confirmed it ended its own work.
+    ///
+    /// Only reported once [`Session::cancel`] succeeded, or when there was no live turn to
+    /// cancel. A cancel that fails is an `Err` from [`Supervisor::run`] instead; see there.
     Stopped {
         /// Which of the three stops it was.
         reason: CancelReason,
@@ -430,6 +433,15 @@ impl Supervisor {
     /// request reuses a logical turn id with different content, or when the Hub answered something
     /// that contradicts what it had already said.
     ///
+    /// The session's own error when a stop reached a live turn and [`Session::cancel`] failed. The
+    /// stop still stands: the turn's stream has been dropped, the abort or shutdown signal stays
+    /// pulled, and running the same turn id again answers [`Settled::Stopped`] without dispatching
+    /// anything. What the error says is that the vendor's work may not have ended. It is returned
+    /// unchanged, so [`Error::cleanup_control`] hands back the process handle of an
+    /// [`Error::CleanupRequired`] for the host to retry the kill or escalate. It is an `Err`
+    /// rather than a `Settled` variant because `Settled` is `Clone + Eq` and an [`Error`] holding
+    /// a live process handle is neither.
+    ///
     /// # Example
     ///
     /// ```
@@ -530,7 +542,7 @@ impl SupervisorInner {
             // is visible as the full attempt deadline elapsing. Delete this one and `back_off`'s
             // and the suite fails; that is what the coverage is actually proving.
             if let Some(reason) = progress.stop.reason() {
-                self.abandon(&mut progress, reason).await;
+                self.abandon(&mut progress, reason).await?;
                 return Ok(Settled::Stopped { reason });
             }
             let LogicalTurn {
@@ -566,7 +578,7 @@ impl SupervisorInner {
                 Step::Backoff(hint) => {
                     // The second of the three described at the top of this loop.
                     if let Some(reason) = self.back_off(&mut progress, hint).await {
-                        self.abandon(&mut progress, reason).await;
+                        self.abandon(&mut progress, reason).await?;
                         return Ok(Settled::Stopped { reason });
                     }
                 }
@@ -829,12 +841,20 @@ impl SupervisorInner {
     /// (`dropping_a_start_future_reaps_an_unacknowledged_attempt`,
     /// `dropping_start_during_spawn_reaps_the_child_returned_after_abort`). Calling `cancel` here
     /// instead would name a turn this host was never given a handle for.
-    async fn abandon(&self, progress: &mut Progress, reason: CancelReason) {
+    ///
+    /// # Errors
+    ///
+    /// The session's own error when `cancel` fails, unchanged, so a
+    /// [`CleanupRequired`](Error::CleanupRequired) still carries the handle the host needs. The
+    /// stream is dropped either way, because dropping it is the library's own cleanup attempt and
+    /// a failed `cancel` is no reason to skip it.
+    async fn abandon(&self, progress: &mut Progress, reason: CancelReason) -> Result<()> {
         let Some(stream) = progress.stream.take() else {
-            return;
+            return Ok(());
         };
-        let _ = self.session.cancel(reason).await;
+        let cancelled = self.session.cancel(reason).await;
         drop(stream);
+        cancelled
     }
 
     /// Bounds one Hub call by the policy's per-attempt deadline.
