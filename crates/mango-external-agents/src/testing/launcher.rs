@@ -41,6 +41,15 @@ struct StdinFailure {
     message: String,
 }
 
+impl StdinFailure {
+    fn error(&self) -> Error {
+        Error::Link {
+            peer: String::from("fake child stdin"),
+            message: self.message.clone(),
+        }
+    }
+}
+
 /// A handle that makes a fake child speak without being written to first.
 ///
 /// A responder only answers: it says something because the library asked. The peers this library
@@ -411,6 +420,7 @@ impl ProcessLauncher for FakeLauncher {
                     partial: Vec::new(),
                     failure: stdin_failure,
                     lines_landed: 0,
+                    broken: false,
                 })
             }),
             control: child,
@@ -521,11 +531,18 @@ struct FakeStdin {
     partial: Vec<u8>,
     failure: Option<StdinFailure>,
     lines_landed: usize,
+    /// Set once a write was refused: every later write is refused too, even one with no newline.
+    broken: bool,
 }
 
 #[async_trait::async_trait]
 impl ByteSink for FakeStdin {
     async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.broken
+            && let Some(failure) = &self.failure
+        {
+            return Err(failure.error());
+        }
         // Each byte is scanned once, from where the last write stopped, and the consumed lines are
         // removed in one pass at the end rather than one drain per line.
         let mut line_start = 0;
@@ -538,10 +555,10 @@ impl ByteSink for FakeStdin {
             if let Some(failure) = &self.failure
                 && self.lines_landed >= failure.after_lines
             {
-                return Err(Error::Link {
-                    peer: String::from("fake child stdin"),
-                    message: failure.message.clone(),
-                });
+                // A broken pipe stays broken, and the bytes of the refused line are gone with it.
+                self.broken = true;
+                self.partial.clear();
+                return Err(failure.error());
             }
             self.lines_landed += 1;
             let line_end = scan_from + offset + 1;
@@ -687,7 +704,8 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| panic!("expected {line:?} to land | received {error}"));
         }
-        for line in ["three\n", "four\n"] {
+        // The last one has no newline: a broken pipe refuses that too, rather than buffering it.
+        for line in ["three\n", "four\n", "five"] {
             let refused = stdin.write_all(line.as_bytes()).await;
             assert!(
                 matches!(&refused, Err(Error::Link { message, .. }) if message == "EPIPE"),
