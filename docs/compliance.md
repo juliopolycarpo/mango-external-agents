@@ -187,6 +187,12 @@ public and unresolved. `interactive_approvals` is reported false instead.
 **Nominative use.** "Claude Code" and "Anthropic" name the tool being launched and the company
 whose terms apply. No logos, no wordmarks, nothing implying an official or endorsed integration.
 
+**Debug output.** The raw `stream-json` records and the reducer that holds them are carriers under
+the `Debug` policy above, because a `tool_result` body arrives in them and a `Read` of a `.env` is
+that body. `StreamRecord`, its borrowed views (`InitRecord`, `PermissionDenied`, `ContentBlock`,
+`StreamEvent`, `Delta`, `ResultRecord`) and `TurnReducer` report a record's kind, its member counts
+and byte sizes, never a value, a call id or a denial's message.
+
 ## OpenAI Codex (`mango-agent-codex`)
 
 **Surface used:** `codex app-server`, the interface OpenAI documents for rich clients and ships its

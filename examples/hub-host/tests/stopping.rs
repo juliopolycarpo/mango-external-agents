@@ -9,9 +9,13 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hub_host::testing::{FakeHubApi, FakeVendorSession, HubCallKind, TurnAnswer};
-use hub_host::{Commit, Settled, Stop};
-use mango_external_agents::{CancelReason, TurnId, TurnRequest};
+use hub_host::testing::{
+    FailingCancelSession, FakeHubApi, FakeVendorSession, HubCallKind, TurnAnswer,
+};
+use hub_host::{Commit, HubApi, Settled, Stop, Supervisor};
+use mango_external_agents::{
+    CancelReason, Error, ExitStatus, ProcessControl, SystemClock, TurnId, TurnRequest,
+};
 
 /// More recoverable failures than any run will get through, so the supervisor is always backing
 /// off when the stop lands.
@@ -304,5 +308,190 @@ fn a_stop_keeps_the_reason_it_was_first_given() {
         stop.reason(),
         Some(CancelReason::ConsentRevoked),
         "expected the first reason to stand"
+    );
+}
+
+/// A child the vendor could not reap, retained so a test can prove the host gets the same one back.
+struct UnreapedControl;
+
+#[async_trait::async_trait]
+impl ProcessControl for UnreapedControl {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+
+    fn stderr_tail(&self) -> String {
+        String::new()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+        Err(Error::Closed {
+            subject: "unreaped test process",
+        })
+    }
+
+    async fn kill(&self, _reason: CancelReason) -> mango_external_agents::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs one turn on `session`, stops it mid-turn, and returns the supervisor with the outcome.
+async fn stop_a_live_turn_on(
+    session: FailingCancelSession,
+    stopping: &FakeVendorSession,
+) -> (Supervisor, mango_external_agents::Result<Settled>) {
+    let hub = Arc::new(FakeHubApi::new());
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = Supervisor::new(
+        Box::new(session),
+        Arc::clone(&hub) as Arc<dyn HubApi>,
+        common::policy(),
+        Arc::clone(&stop),
+        Arc::new(SystemClock),
+    );
+    let request = TurnRequest::new("turn-1", "ship it");
+    let abort = supervisor.abort_signal(&TurnId::new("turn-1"));
+    let stopper = tokio::spawn({
+        let stopping = stopping.clone();
+        async move {
+            common::until("the turn to start", || stopping.start_count() == 1).await;
+            abort.stop(CancelReason::Requested);
+        }
+    });
+    let settled = supervisor.run(request).await;
+    stopper.await.expect("expected the stopper task to finish");
+    (supervisor, settled)
+}
+
+/// A stop the vendor could not confirm is not reported as a completed stop.
+///
+/// The host only learns the work may still be running from the answer to `run`, so a plain
+/// `Stopped` would tell it there is nothing left to clean up.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_that_times_out_is_not_reported_as_a_completed_stop() {
+    let inner = FakeVendorSession::new().by_default(TurnAnswer::CompleteWhenReleased);
+    let session = FailingCancelSession::timing_out(inner.clone());
+
+    let (mut supervisor, settled) = stop_a_live_turn_on(session, &inner).await;
+
+    assert!(
+        matches!(settled, Err(Error::Timeout { .. })),
+        "expected Err(Timeout) from the failed cancel, received {settled:?}"
+    );
+    // Running the turn again is how a host retries the stop. The first run dropped the stream, so
+    // an answer of `Stopped` here would turn a stop nobody confirmed into one that looks confirmed.
+    let again = supervisor.run(TurnRequest::new("turn-1", "ship it")).await;
+    assert!(
+        matches!(again, Err(Error::Timeout { .. })),
+        "expected the rerun to retry the cancel and surface Err(Timeout) again, received {again:?}"
+    );
+    assert_eq!(
+        inner.start_count(),
+        1,
+        "expected the stopped turn not to be dispatched again"
+    );
+}
+
+/// The handle to the unreaped child reaches the host, so it can retry the kill or escalate.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_that_needs_cleanup_hands_the_host_the_same_process_handle() {
+    let control: Arc<dyn ProcessControl> = Arc::new(UnreapedControl);
+    let inner = FakeVendorSession::new().by_default(TurnAnswer::CompleteWhenReleased);
+    let session = FailingCancelSession::requiring_cleanup(inner.clone(), Arc::clone(&control));
+
+    let (_supervisor, settled) = stop_a_live_turn_on(session, &inner).await;
+
+    let error = settled.expect_err("expected the failed cancel to surface as an error");
+    let received = error
+        .cleanup_control()
+        .unwrap_or_else(|| panic!("expected a cleanup handle on the error, received {error:?}"));
+    assert!(
+        Arc::ptr_eq(&received, &control),
+        "expected the host to receive the very handle the session returned, received a different one"
+    );
+}
+
+/// Retrying a stop is running the turn again, and it confirms the stop once the vendor can.
+///
+/// The first run's stream is gone, so the retry has nothing to drain: the cancel it sends is the
+/// only thing that can turn the unconfirmed stop into a confirmed one.
+#[tokio::test(start_paused = true)]
+async fn running_a_turn_again_retries_the_cancel_and_confirms_the_stop() {
+    let inner = FakeVendorSession::new().by_default(TurnAnswer::CompleteWhenReleased);
+    let session = FailingCancelSession::timing_out(inner.clone()).recovering_after(1);
+
+    let (mut supervisor, settled) = stop_a_live_turn_on(session, &inner).await;
+    assert!(
+        matches!(settled, Err(Error::Timeout { .. })),
+        "expected Err(Timeout) from the failed cancel, received {settled:?}"
+    );
+    let again = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the retried stop to settle");
+
+    assert_eq!(
+        again,
+        Settled::Stopped {
+            reason: CancelReason::Requested
+        },
+        "expected Stopped once the retried cancel succeeded"
+    );
+    assert_eq!(
+        inner.cancels(),
+        vec![CancelReason::Requested],
+        "expected the vendor to receive the stop exactly once, from the retry"
+    );
+    let third = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the confirmed stop to settle");
+    assert_eq!(
+        third,
+        Settled::Stopped {
+            reason: CancelReason::Requested
+        }
+    );
+    assert_eq!(
+        inner.cancels().len(),
+        1,
+        "expected a confirmed stop not to be cancelled a third time"
+    );
+    assert_eq!(
+        inner.start_count(),
+        1,
+        "expected the stopped turn not to be dispatched again"
+    );
+}
+
+/// The retry after a cleanup failure still hands the host the handle, not a bare `Stopped`.
+///
+/// The host that retries a stop is the host that needs the process handle to retry the kill, so
+/// it has to come back on every attempt and not only the first.
+#[tokio::test(start_paused = true)]
+async fn a_rerun_after_a_cleanup_failure_hands_the_host_the_same_process_handle_again() {
+    let control: Arc<dyn ProcessControl> = Arc::new(UnreapedControl);
+    let inner = FakeVendorSession::new().by_default(TurnAnswer::CompleteWhenReleased);
+    let session = FailingCancelSession::requiring_cleanup(inner.clone(), Arc::clone(&control));
+
+    let (mut supervisor, first) = stop_a_live_turn_on(session, &inner).await;
+    assert!(
+        first.is_err(),
+        "expected the first run to surface the failed cancel, received {first:?}"
+    );
+    let again = supervisor.run(TurnRequest::new("turn-1", "ship it")).await;
+
+    let error = again.expect_err("expected the rerun to surface the still-failing cancel");
+    let received = error.cleanup_control().unwrap_or_else(|| {
+        panic!("expected a cleanup handle on the rerun's error, received {error:?}")
+    });
+    assert!(
+        Arc::ptr_eq(&received, &control),
+        "expected the rerun to hand back the very handle the session returned, received a different one"
+    );
+    assert_eq!(
+        inner.start_count(),
+        1,
+        "expected the stopped turn not to be dispatched again"
     );
 }

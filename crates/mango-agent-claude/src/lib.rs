@@ -12,6 +12,7 @@ pub mod permissions;
 pub mod pinned;
 pub mod probe;
 pub mod protocol;
+mod redacted;
 pub mod reducer;
 pub mod session;
 pub mod version;
