@@ -57,7 +57,9 @@ ahead of the SDK actor is not request concurrency. Notifications and turn events
 not one to one (a first thought chunk opens reasoning and adds a delta; a completed tool call
 starts and completes an activity), so the message count is a coarse guard and the byte budget is
 what bounds memory. A host may set a very large count to rely on bytes alone; the outgoing writer
-queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking.
+queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking, and so is the request
+admission semaphore that `max_pending_requests` sizes (a `usize::MAX` there means no cap in
+practice, and opens, runs turns and closes like any other value).
 
 Output bytes remain charged through the physical write. A single frame larger than the byte
 budget, or a queue that would exceed either bound, fails the connection with an error naming the

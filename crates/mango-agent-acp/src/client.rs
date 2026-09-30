@@ -1283,7 +1283,10 @@ struct RequestAdmissionState {
 impl RequestAdmission {
     fn new(limit: usize) -> Self {
         Self {
-            permits: tokio::sync::Semaphore::new(limit),
+            // A host may set a huge count to mean "no cap"; a semaphore panics above
+            // `MAX_PERMITS`, and this runs after the child is launched. `limit` itself stays as
+            // the host set it, for the refusal message.
+            permits: tokio::sync::Semaphore::new(limit.min(tokio::sync::Semaphore::MAX_PERMITS)),
             limit,
             state: Mutex::new(RequestAdmissionState::default()),
         }
