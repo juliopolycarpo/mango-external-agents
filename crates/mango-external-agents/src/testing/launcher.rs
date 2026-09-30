@@ -30,6 +30,15 @@ pub struct FakeProcess {
     responder: Option<Responder>,
     end_stdout_when: Option<CancelToken>,
     announcer: Option<Announcer>,
+    stdin_failure: Option<StdinFailure>,
+}
+
+/// When and how a fake child's stdin starts refusing writes.
+#[derive(Clone, Debug)]
+struct StdinFailure {
+    /// How many complete lines land before the pipe breaks.
+    after_lines: usize,
+    message: String,
 }
 
 /// A handle that makes a fake child speak without being written to first.
@@ -201,6 +210,32 @@ impl FakeProcess {
         self
     }
 
+    /// Makes stdin refuse writes once `lines` complete lines have landed, like a peer whose pipe
+    /// broke: the next line is not recorded, no responder answers it, and the write returns
+    /// [`Error::Link`] carrying `message`, as does every later one.
+    ///
+    /// Every other fake stdin answers `Ok`, so nothing else can reach the path where a harness's
+    /// write to its vendor fails. That includes a reply to a request the vendor made, which has to
+    /// end the link rather than leave the vendor waiting for an answer that will never come.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::testing::FakeProcess;
+    ///
+    /// // The handshake's first two lines land; the third write hits a broken pipe.
+    /// let process = FakeProcess::responding(|_| Vec::new()).failing_stdin_after(2, "EPIPE");
+    /// # let _ = process;
+    /// ```
+    #[must_use]
+    pub fn failing_stdin_after(mut self, lines: usize, message: impl Into<String>) -> Self {
+        self.stdin_failure = Some(StdinFailure {
+            after_lines: lines,
+            message: message.into(),
+        });
+        self
+    }
+
     /// Exits with this status.
     #[must_use]
     pub fn with_exit(mut self, exit: ExitStatus) -> Self {
@@ -364,6 +399,7 @@ impl ProcessLauncher for FakeLauncher {
         if let Some(announcer) = &process.announcer {
             announcer.attach(&child);
         }
+        let stdin_failure = process.stdin_failure;
 
         Ok(ManagedProcess {
             stdout: Box::new(FakeStdout {
@@ -373,6 +409,8 @@ impl ProcessLauncher for FakeLauncher {
                 Box::new(FakeStdin {
                     state: Arc::clone(&child),
                     partial: Vec::new(),
+                    failure: stdin_failure,
+                    lines_landed: 0,
                 })
             }),
             control: child,
@@ -481,6 +519,8 @@ impl ByteSource for FakeStdout {
 struct FakeStdin {
     state: Arc<ChildState>,
     partial: Vec<u8>,
+    failure: Option<StdinFailure>,
+    lines_landed: usize,
 }
 
 #[async_trait::async_trait]
@@ -495,6 +535,15 @@ impl ByteSink for FakeStdin {
             .iter()
             .position(|byte| *byte == b'\n')
         {
+            if let Some(failure) = &self.failure
+                && self.lines_landed >= failure.after_lines
+            {
+                return Err(Error::Link {
+                    peer: String::from("fake child stdin"),
+                    message: failure.message.clone(),
+                });
+            }
+            self.lines_landed += 1;
             let line_end = scan_from + offset + 1;
             let line = String::from_utf8_lossy(&self.partial[line_start..line_end])
                 .trim_end()
@@ -610,6 +659,52 @@ mod tests {
         assert_eq!(launch.argv[0], "claude");
         assert_eq!(launch.cwd.to_string_lossy(), "/workspace");
         assert_eq!(launch.env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    /// A pipe that breaks lets the lines before the break land, refuses the one at the break and
+    /// every one after it, records none of them and never asks the responder about them.
+    #[tokio::test]
+    async fn a_failing_stdin_lets_the_first_lines_land_and_refuses_the_rest() {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responder_asked = std::sync::Arc::clone(&asked);
+        let launcher = FakeLauncher::new();
+        launcher.push(
+            FakeProcess::responding(move |_| {
+                responder_asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            })
+            .failing_stdin_after(2, "EPIPE"),
+        );
+        let mut child = launcher
+            .spawn(spec(&["codex", "app-server"]))
+            .await
+            .expect("expected a child");
+        let mut stdin = child.stdin.take().expect("expected a stdin");
+
+        for line in ["one\n", "two\n"] {
+            stdin
+                .write_all(line.as_bytes())
+                .await
+                .unwrap_or_else(|error| panic!("expected {line:?} to land | received {error}"));
+        }
+        for line in ["three\n", "four\n"] {
+            let refused = stdin.write_all(line.as_bytes()).await;
+            assert!(
+                matches!(&refused, Err(Error::Link { message, .. }) if message == "EPIPE"),
+                "expected {line:?} refused with Link(EPIPE) | received {refused:?}"
+            );
+        }
+
+        assert_eq!(
+            launcher.written(),
+            vec![String::from("one"), String::from("two")],
+            "expected only the lines before the break recorded"
+        );
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "expected the responder asked about the two lines that landed only"
+        );
     }
 
     /// Feeds `input` to a fresh child's stdin in `sizes`-long writes (cycled) and returns the
