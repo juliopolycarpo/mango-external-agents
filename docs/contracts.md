@@ -89,6 +89,15 @@ Every snapshot carries a `SessionRevision` that only increases. Updates coalesce
 right semantics for a picture of the present; the revision is what lets a consumer tell coalescing
 from stillness, and a persisted revision is what lets it tell a stale read from a current one.
 
+### A terminal ends whatever is still open
+
+`Completed`, `Cancelled` and `Error` each end the turn, and with it every activity and reasoning
+phase the turn left open. A harness closes them with `ActivityCompleted` and `ReasoningEnded`
+before the terminal, but under a full transcript budget a close can be refused so that the
+terminal keeps its own cause (`EventSink::emit_close`, see [turn ownership and recovery](lifecycle.md)).
+A host must not keep an activity or a reasoning block running past the terminal because its close
+never arrived.
+
 ### Ordering and stale work
 
 `AgentEvent` names the session, the logical turn **and** the attempt. A host compares
