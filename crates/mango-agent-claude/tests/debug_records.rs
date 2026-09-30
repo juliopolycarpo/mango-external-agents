@@ -148,9 +148,26 @@ fn the_init_record_and_a_permission_denial_do_not_print_their_members() {
 
 #[test]
 fn an_unknown_discriminator_is_reported_by_size_not_by_text() {
-    let record = record(r#"{"type":"CANARY type with spaces and secrets","subtype":"ok"}"#);
+    let record = record(r#"{"type":"CANARY type with spaces and secrets","subtype":"success"}"#);
     assert_omits("StreamRecord", &record, &[("type", "CANARY")]);
-    assert_names("StreamRecord", &record, "ok");
+    assert_names("StreamRecord", &record, "success");
+}
+
+/// A credential or an id can have a label's shape, so a value that is not a discriminator this
+/// harness knows is sized even when it looks like one.
+#[test]
+fn a_credential_shaped_discriminator_is_not_printed() {
+    let record = record(
+        r#"{"type":"AKIAIOSFODNN7EXAMPLE","subtype":"3f2b8c1e-0d4a-4c7e-9a55-1b2c3d4e5f60"}"#,
+    );
+    assert_omits(
+        "StreamRecord",
+        &record,
+        &[
+            ("type", "AKIAIOSFODNN7EXAMPLE"),
+            ("subtype", "3f2b8c1e-0d4a-4c7e-9a55-1b2c3d4e5f60"),
+        ],
+    );
 }
 
 /// The reducer holds the streamed text of each open block until its `assistant` record lands, the

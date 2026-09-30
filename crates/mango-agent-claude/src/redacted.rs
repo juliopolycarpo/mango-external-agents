@@ -17,6 +17,7 @@
 //! ```
 
 use std::fmt;
+use std::io;
 
 use serde_json::{Map, Value};
 
@@ -45,39 +46,86 @@ impl Redacted {
 }
 
 /// A JSON object member, reported by the length of its compact serialization.
+///
+/// Counted while serializing the borrowed map into a writer that keeps only the length, so a large
+/// record is never cloned or materialised to be measured.
 pub(crate) fn object(fields: &Map<String, Value>) -> Redacted {
-    // `Value`'s `Display` is its compact serialization and cannot fail, so an unserializable value
-    // never reads as an empty one. The clone is only paid when a record is debug-formatted.
-    Redacted {
-        bytes: Value::Object(fields.clone()).to_string().len(),
+    struct Counter(usize);
+
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
+
+    // Serializing a `Map<String, Value>` cannot fail, and the counter never refuses a write, so
+    // the count is always the whole length.
+    let mut counter = Counter(0);
+    let _ = serde_json::to_writer(&mut counter, fields);
+    Redacted { bytes: counter.0 }
 }
 
-/// A protocol discriminator such as a record's `type`: printed when it has a label's shape, so a
-/// log names the record, and reported by size when it does not, because a value the vendor
-/// composed can carry anything.
+/// A protocol discriminator such as a record's `type`: printed only when it is one this harness
+/// knows by name, so a log names the record, and reported by size otherwise. A value the vendor
+/// composed can carry anything, and a credential or an id can have a label's shape, so the shape
+/// of a value is not a reason to print it.
 pub(crate) struct Label<'a>(pub(crate) Option<&'a str>);
 
-/// The longest discriminator printed as itself.
-const LABEL_MAX_BYTES: usize = 48;
+/// Every discriminator the pinned Claude Code build writes for a record, a content block, a stream
+/// event or a delta, plus the result subtypes it documents.
+const KNOWN_DISCRIMINATORS: &[&str] = &[
+    // Records.
+    "system",
+    "assistant",
+    "user",
+    "result",
+    "stream_event",
+    "rate_limit_event",
+    // System and result subtypes.
+    "init",
+    "status",
+    "thinking_tokens",
+    "api_retry",
+    "permission_denied",
+    "success",
+    "error_max_turns",
+    "error_during_execution",
+    // Content blocks.
+    "text",
+    "thinking",
+    "redacted_thinking",
+    "tool_use",
+    "tool_result",
+    // Stream events.
+    "message_start",
+    "message_delta",
+    "message_stop",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "ping",
+    // Deltas.
+    "text_delta",
+    "thinking_delta",
+    "input_json_delta",
+    "signature_delta",
+];
 
 impl fmt::Debug for Label<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             None => formatter.write_str("None"),
-            Some(value) if is_label(value) => write!(formatter, "Some({value:?})"),
+            Some(value) if KNOWN_DISCRIMINATORS.contains(&value) => {
+                write!(formatter, "Some({value:?})")
+            }
             Some(value) => write!(formatter, "Some({:?})", text(value)),
         }
     }
-}
-
-/// Whether a value has a label's shape: short, and only `a-z`, `A-Z`, `0-9`, `-`, `_`, `.` and `:`.
-fn is_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= LABEL_MAX_BYTES
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 /// An optional discriminator; see [`Label`].
@@ -121,19 +169,38 @@ mod tests {
     }
 
     #[test]
-    fn a_discriminator_with_a_labels_shape_prints_and_anything_else_is_sized() {
+    fn a_known_discriminator_prints_and_anything_else_is_sized() {
         assert_eq!(
             format!("{:?}", label(Some("tool_result"))),
             "Some(\"tool_result\")"
         );
         assert_eq!(format!("{:?}", label(None)), "None");
-        for unlabelled in ["has a space", "", &"x".repeat(49), "café"] {
-            let printed = format!("{:?}", label(Some(unlabelled)));
+        // Credential- and id-shaped values have a label's shape and must still be sized.
+        for unknown in [
+            "AKIAIOSFODNN7EXAMPLE",
+            "3f2b8c1e-0d4a-4c7e-9a55-1b2c3d4e5f60",
+            "has a space",
+            "",
+            "café",
+        ] {
+            let printed = format!("{:?}", label(Some(unknown)));
             assert_eq!(
                 printed,
-                format!("Some({:?})", text(unlabelled)),
-                "expected {unlabelled:?} to be reported by size | received: {printed}"
+                format!("Some({:?})", text(unknown)),
+                "expected {unknown:?} to be reported by size | received: {printed}"
             );
         }
+    }
+
+    #[test]
+    fn a_large_object_is_measured_without_being_cloned() {
+        let Value::Object(fields) = json!({"body": "x".repeat(1_000_000)}) else {
+            panic!("expected an object");
+        };
+        assert_eq!(
+            format!("{:?}", object(&fields)),
+            format!("<{} bytes redacted>", 1_000_000 + 11),
+            "expected the compact length of a million-byte body plus its framing"
+        );
     }
 }

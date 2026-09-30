@@ -500,7 +500,7 @@ The raw `stream-json` records are carriers under the `Debug` policy in `docs/com
 `tool_result` body arrives in them, and a `Read` of a `.env` is that body. `StreamRecord` keeps the
 whole line's JSON and `InitRecord`, `PermissionDenied`, `ContentBlock`, `StreamEvent`, `Delta` and
 `ResultRecord` borrow from it, so each has a hand-written `Debug` that reports the record's `type`
-and `subtype` (when they have a label's shape, otherwise their size), how many members it has and
+and `subtype` (when they are a discriminator this harness knows by name, otherwise their size), how many members it has and
 how many bytes they take, never a value. A debug-logged tool result reads
 `ContentBlock { kind: Some("tool_result"), is_error: false, members: 3, size: <96 bytes redacted> }`.
 
