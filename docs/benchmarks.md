@@ -119,22 +119,25 @@ produce, is closed or dropped with these numbers, not merged on an assumed gain.
 
 ## Noise on the reference machine
 
-Measured on a WSL2 Xeon E5-2699 v3 (32 threads) that other builds were using at the same time
-(load average 3 to 10), with `scripts/bench.sh` run 10 times in a row at 15 samples per case:
+Measured on a WSL2 Xeon E5-2699 v3 (32 threads) shared with other builds, running
+`scripts/bench.sh` 10 times in a row at 15 samples per case, twice:
 
-- **Within a run**, the CV of a case's 15 samples had a median of 6.5%, a 90th percentile of 13%
-  and a worst case of 35%.
-- **Between runs**, the per-run medians of a case had a CV between 4% and 39%, with a median of
-  9%. The drift is real machine load, not sampling error, so more samples in one run do not fix
-  it.
+| Batch                                   | Load average | Within a run: CV of the 15 samples | Between runs: CV of a case's medians |
+| --------------------------------------- | ------------ | ---------------------------------- | ------------------------------------ |
+| Busy (other builds running)             | 3.5 to 10    | median 6.5%, p90 13%, worst 35%    | median 9%, range 4% to 39%           |
+| Quieter (the batch in the pull request) | 2.3 to 6.3   | median 2.2%, p90 8.7%, worst 41%   | median 3.5%, range 0.9% to 41%       |
+
+The drift between runs is machine load, not sampling error, so more samples inside one run do not
+fix it. A single slow run also drags a case's spread wide (the two 40% ranges are one outlier run
+each) while the median of the run medians stays put.
 
 What that means for a claim:
 
-- Large effects are safe to claim: the 1 MiB line at 4 KiB chunks, which is about 118 ms, varies by
-  6% run to run, so a 2x change is unmistakable.
-- An effect under about 15% is not, on this class of machine, from one run per side. Copy removals
-  in the 1 KiB paths, each a few percent of a microsecond-scale case, fall here. Interleave Base
-  and Variant runs on a quiet machine, take at least 5 runs per side, and report the spread. If
-  the Delta is still inside it, say so.
-- The minimum of a run is not steadier than its median here (12% against 9% run to run), so do
-  not switch to the minimum to make a result look cleaner.
+- Large effects are safe to claim on either batch: the 1 MiB line at 4 KiB chunks, about 118 to
+  123 ms, moved 1.4% to 6% run to run, so a 2x change is unmistakable.
+- An effect under about 10% needs care. Copy removals in the 1 KiB paths, each a few percent of a
+  microsecond-scale case, fall here. Interleave Base and Variant runs, take at least 5 runs per
+  side, compare the medians of the run medians, and report the spread. If the Delta is inside the
+  spread, say so.
+- A run's minimum is not steadier than its median (4.9% against 3.5% run to run on the quieter
+  batch), so do not switch to the minimum to make a result look cleaner.
