@@ -257,23 +257,110 @@ impl<'a> ContentBlock<'a> {
                     .iter()
                     .filter_map(block_text)
                     .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
             _ => Cow::Borrowed(""),
         }
     }
+
+    /// The start of [`Self::result_text`]: its first `max_chars` characters, without building the
+    /// rest of an array payload.
+    ///
+    /// The characters are byte-identical to flattening and then cutting: the same `\n` between
+    /// the non-empty parts, the same skipped elements, and a cut that never splits a character. An
+    /// array is read only until it has `max_chars`, so a multi-megabyte result costs a few
+    /// thousand characters instead of two full copies, and an array with one text part is
+    /// borrowed rather than copied. A separator that fits inside the bound is kept even when
+    /// nothing follows it, as the flatten-then-cut path keeps it.
+    ///
+    /// A string payload is returned whole, as [`Self::result_text`] does: it is borrowed, so
+    /// cutting it here would only scan it a second time before the caller cuts it.
+    pub(crate) fn result_text_head(&self, max_chars: usize) -> Cow<'a, str> {
+        match self.fields.get("content") {
+            Some(Value::String(content)) => Cow::Borrowed(content.as_str()),
+            Some(Value::Array(blocks)) => join_head(blocks, max_chars),
+            _ => Cow::Borrowed(""),
+        }
+    }
 }
 
-fn block_text(block: &Value) -> Option<String> {
+/// The array case of [`ContentBlock::result_text_head`].
+fn join_head(blocks: &[Value], max_chars: usize) -> Cow<'_, str> {
+    let mut parts = blocks
+        .iter()
+        .filter_map(block_text)
+        .filter(|text| !text.is_empty());
+    let Some(first) = parts.next() else {
+        return Cow::Borrowed("");
+    };
+    // A first part that fills the bound is the whole head: no later part, however many the array
+    // holds, is read.
+    let (head, count) = take_chars(first, max_chars);
+    if count == max_chars {
+        return Cow::Borrowed(head);
+    }
+    let Some(second) = parts.next() else {
+        return Cow::Borrowed(head);
+    };
+    let mut joined = String::with_capacity(capacity_hint(blocks, max_chars));
+    let mut remaining = max_chars;
+    for (index, part) in [first, second].into_iter().chain(parts).enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        if index > 0 {
+            joined.push('\n');
+            remaining -= 1;
+            if remaining == 0 {
+                break;
+            }
+        }
+        let (kept, count) = take_chars(part, remaining);
+        remaining -= count;
+        joined.push_str(kept);
+    }
+    Cow::Owned(joined)
+}
+
+/// Bytes to reserve for the joined head: the payload's own size, walked no further than the bound
+/// needs. Only a hint, since a bound in characters can span more bytes than it counts.
+fn capacity_hint(blocks: &[Value], max_chars: usize) -> usize {
+    let mut bytes = 0;
+    for part in blocks.iter().filter_map(block_text) {
+        bytes += part.len() + 1;
+        if bytes >= max_chars {
+            break;
+        }
+    }
+    bytes.min(max_chars)
+}
+
+/// The text of one element of a `tool_result` array: a bare string, or an object's `text`.
+fn block_text(block: &Value) -> Option<&str> {
     match block {
-        Value::String(text) => Some(text.clone()),
-        Value::Object(fields) => fields
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        Value::String(text) => Some(text),
+        Value::Object(fields) => fields.get("text").and_then(Value::as_str),
         _ => None,
     }
+}
+
+/// The first `max` characters of `text` and how many that is, never cutting one in half.
+///
+/// A prefix of `max` ASCII bytes is `max` characters, and the next byte then starts a character,
+/// so text that opens with one is cut without decoding it.
+fn take_chars(text: &str, max: usize) -> (&str, usize) {
+    let prefix = text.len().min(max);
+    if text.as_bytes()[..prefix].is_ascii() {
+        return (&text[..prefix], prefix);
+    }
+    for (count, (boundary, _)) in text.char_indices().enumerate() {
+        if count == max {
+            return (&text[..boundary], max);
+        }
+    }
+    (text, text.chars().count())
 }
 
 /// `stream_event` — a raw Anthropic streaming event, forwarded verbatim.
@@ -428,7 +515,7 @@ fn count(fields: &Map<String, Value>, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::StreamRecord;
+    use super::{StreamRecord, capacity_hint, take_chars};
 
     fn record(line: &str) -> StreamRecord {
         StreamRecord::parse(line).expect("expected a parseable record")
@@ -581,6 +668,164 @@ mod tests {
                 .init()
                 .slash_commands(),
             Some(Vec::new())
+        );
+    }
+
+    /// A record whose one `tool_result` carries `content`.
+    fn tool_result(content: &serde_json::Value) -> StreamRecord {
+        record(
+            &serde_json::json!({"message": {"content": [
+                {"type": "tool_result", "tool_use_id": "call", "content": content}
+            ]}})
+            .to_string(),
+        )
+    }
+
+    /// The path the reducer used before `result_text_head`: flatten everything, then cut.
+    fn flatten_then_cut(record: &StreamRecord, max_chars: usize) -> String {
+        record.content_blocks()[0]
+            .result_text()
+            .chars()
+            .take(max_chars)
+            .collect()
+    }
+
+    /// Payloads that exercise separators, empty and non-text elements, and characters of one to
+    /// four bytes, so a cut can land on each kind of boundary.
+    fn payloads() -> Vec<serde_json::Value> {
+        use serde_json::json;
+        let long = "x".repeat(40);
+        vec![
+            json!("plain string \u{e9}\u{65e5}"),
+            json!(""),
+            json!(null),
+            json!(7),
+            json!([]),
+            json!([""]),
+            json!(["one"]),
+            json!(["one", "two"]),
+            json!([{"text": "one"}, {"text": ""}, "two", 5, {"type": "image"}, {"text": 5}]),
+            json!(["", "", "a", "", "b", ""]),
+            json!([
+                "h\u{e9}llo",
+                "\u{65e5}\u{672c}\u{8a9e}",
+                "\u{1f600}\u{1f600}",
+                "z"
+            ]),
+            json!(["\u{1f600}", "\u{1f600}", "\u{1f600}"]),
+            json!(["ab", "cd", "ef"]),
+            json!([long, long, {"text": long}, null, long]),
+            json!([null, {"text": null}, {"nested": {"text": "hidden"}}, "seen"]),
+        ]
+    }
+
+    #[test]
+    fn a_bounded_tool_result_matches_flattening_then_cutting_at_every_bound() {
+        for payload in payloads() {
+            let record = tool_result(&payload);
+            for max_chars in 0..=140 {
+                let expected = flatten_then_cut(&record, max_chars);
+                let head = record.content_blocks()[0].result_text_head(max_chars);
+                // A string payload comes back whole; an array payload must stop at the bound.
+                if payload.is_array() {
+                    assert!(
+                        head.chars().count() <= max_chars,
+                        "expected at most {max_chars} chars of {payload}, received {} chars",
+                        head.chars().count()
+                    );
+                }
+                let received: String = head.chars().take(max_chars).collect();
+                assert_eq!(
+                    received, expected,
+                    "expected the head of {payload} at {max_chars} chars to be {expected:?}, received {received:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_that_lands_exactly_on_a_separator_keeps_the_separator_only_when_it_fits() {
+        let record = tool_result(&serde_json::json!(["abc", "def"]));
+        let block = &record.content_blocks()[0];
+        assert_eq!(block.result_text_head(3), "abc");
+        assert_eq!(block.result_text_head(4), "abc\n");
+        assert_eq!(block.result_text_head(5), "abc\nd");
+    }
+
+    #[test]
+    fn a_bound_never_splits_a_multi_byte_character() {
+        let record = tool_result(&serde_json::json!(["\u{1f600}\u{1f600}", "\u{65e5}"]));
+        let block = &record.content_blocks()[0];
+        assert_eq!(block.result_text_head(1), "\u{1f600}");
+        assert_eq!(block.result_text_head(3), "\u{1f600}\u{1f600}\n");
+        assert_eq!(block.result_text_head(4), "\u{1f600}\u{1f600}\n\u{65e5}");
+    }
+
+    #[test]
+    fn a_large_array_result_is_cut_at_the_bound() {
+        let part = "y".repeat(1000);
+        let parts: Vec<&str> = std::iter::repeat_n(part.as_str(), 2000).collect();
+        let record = tool_result(&serde_json::json!(parts));
+        let head = record.content_blocks()[0].result_text_head(4096);
+        assert_eq!(
+            head.chars().count(),
+            4096,
+            "expected exactly the bound in characters, received {}",
+            head.chars().count()
+        );
+        assert_eq!(head, flatten_then_cut(&record, 4096));
+    }
+
+    #[test]
+    fn taking_characters_agrees_with_counting_them_for_ascii_and_multi_byte_text() {
+        for text in [
+            "",
+            "abc",
+            "h\u{e9}llo",
+            "\u{1f600}ab",
+            "ab\u{1f600}",
+            "\u{65e5}\u{672c}",
+        ] {
+            for max in 0..=8 {
+                let expected: String = text.chars().take(max).collect();
+                let (kept, count) = take_chars(text, max);
+                assert_eq!(
+                    (kept, count),
+                    (expected.as_str(), expected.chars().count()),
+                    "expected the first {max} characters of {text:?}, received {kept:?} ({count})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_capacity_hint_is_the_payload_size_capped_at_the_bound() {
+        let blocks = [
+            serde_json::json!("abcd"),
+            serde_json::json!({"text": "ef"}),
+            serde_json::json!(5),
+        ];
+        // "abcd" and "ef" plus a separator's byte after each: 5 + 3.
+        assert_eq!(capacity_hint(&blocks, 100), 8);
+        assert_eq!(capacity_hint(&blocks, 6), 6);
+        assert_eq!(capacity_hint(&blocks, 0), 0);
+        assert_eq!(capacity_hint(&[], 10), 0);
+    }
+
+    #[test]
+    fn a_first_part_that_fills_the_bound_is_borrowed_without_reading_further_parts() {
+        let record = tool_result(&serde_json::json!(["abcdef", "", 5, "later part"]));
+        let head = record.content_blocks()[0].result_text_head(4);
+        assert_eq!(head, "abcd");
+        assert!(
+            matches!(head, std::borrow::Cow::Borrowed(_)),
+            "expected a borrowed head once the first part fills the bound, received {head:?}"
+        );
+        let exact = tool_result(&serde_json::json!(["abcd", "later part"]));
+        let head = exact.content_blocks()[0].result_text_head(4);
+        assert!(
+            matches!(head, std::borrow::Cow::Borrowed("abcd")),
+            "expected the first part alone at a bound equal to its length, received {head:?}"
         );
     }
 }

@@ -15,6 +15,10 @@ description = "Claude Code harness for mango-external-agents: the stream-json di
 [lints]
 workspace = true
 
+[lib]
+# The library has no benchmarks of its own, so `cargo bench` skips its unit tests.
+bench = false
+
 [dependencies]
 # `stdio` because this dialect is a child process per turn and per probe; the
 # core's other transport kinds are not reachable from it.
@@ -35,6 +39,12 @@ nix = { version = "0.31.3", default-features = false, features = ["user"] }
 [dev-dependencies]
 mango-external-agents = { workspace = true, features = ["stdio", "testing"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
+
+# Non-gating benchmarks: a plain `harness = false` binary with no extra dependencies. Run it with
+# `cargo bench -p mango-agent-claude`; see docs/benchmarks.md.
+[[bench]]
+name = "tool_results"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true
