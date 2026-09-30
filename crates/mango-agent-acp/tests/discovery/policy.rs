@@ -88,10 +88,65 @@ async fn advertised_http_mcp_preserves_endpoint_and_headers() {
         .expect("expected close");
 }
 
+/// A stdio server's arguments are its own argv, so its flags reach `session/new` byte for byte.
+#[tokio::test]
+async fn flag_shaped_mcp_arguments_are_sent_unchanged() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(FakeAcpAgent::new().process());
+    let command = std::env::current_exe()
+        .expect("expected an absolute test executable path")
+        .to_string_lossy()
+        .into_owned();
+    let arguments = ["--stdio", "-y", "--port=1", "@scope/server"];
+    let mut request = mango_external_agents::OpenSession::new("mcp");
+    request.mcp_servers.push(mango_external_agents::McpServer {
+        name: String::from("docs"),
+        transport: mango_external_agents::McpTransport::Stdio {
+            command,
+            args: arguments.iter().map(ToString::to_string).collect(),
+            env: std::collections::BTreeMap::new(),
+        },
+    });
+    let session = AcpHarness::builtin("cursor")
+        .expect("expected Cursor profile")
+        .open_session(&host(launcher.clone()), request)
+        .await
+        .expect("expected dash-led MCP arguments to be accepted");
+    let sent = launcher
+        .written()
+        .into_iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(&line).expect("expected JSON-RPC"))
+        .find(|message| message.get("method") == Some(&serde_json::json!("session/new")))
+        .expect("expected session/new");
+    assert_eq!(
+        sent["params"]["mcpServers"][0]["args"],
+        serde_json::json!(arguments),
+        "expected the MCP arguments unchanged on session/new"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected close");
+}
+
 /// Bad MCP entries are a host configuration error, before an ACP child can receive one.
 #[tokio::test]
 async fn malformed_mcp_servers_are_not_submitted_or_spawned() {
+    let stdio_with_argument = |argument: String| {
+        vec![mango_external_agents::McpServer {
+            name: String::from("docs"),
+            transport: mango_external_agents::McpTransport::Stdio {
+                command: String::from("/usr/bin/docs-mcp"),
+                args: vec![argument],
+                env: std::collections::BTreeMap::new(),
+            },
+        }]
+    };
     let cases = [
+        stdio_with_argument(String::new()),
+        stdio_with_argument(String::from("--std\u{0}io")),
+        stdio_with_argument(String::from("-\u{1b}[31m")),
+        stdio_with_argument(format!("--{}", "a".repeat(127))),
         vec![mango_external_agents::McpServer::stdio(
             "",
             "/usr/bin/docs-mcp",

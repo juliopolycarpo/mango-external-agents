@@ -1867,6 +1867,7 @@ impl PeerHandler for CodexHandler {
         params: Value,
         id: RequestId,
     ) -> ServerRequestOutcome {
+        let network_context = approvals::network_context(&method, &params);
         let request = ServerRequest::parse(&method, params);
 
         if let Some(refusal) = request.refusal() {
@@ -1986,6 +1987,7 @@ impl PeerHandler for CodexHandler {
 
         let Some(pending) = approvals::to_request(
             &request,
+            network_context.as_ref(),
             route.operation(self.shared.session_id.clone()),
             expires_at,
         ) else {
@@ -5534,6 +5536,73 @@ mod tests {
             ),
             "expected completion after the accepted answer resolution"
         );
+    }
+
+    /// The host sees the resolution before the answer is written, so an answer the link refuses
+    /// has to be followed by the failure that says the vendor never received it, not by silence
+    /// that the idle watchdog later reports as a timeout.
+    #[tokio::test]
+    async fn an_approval_answer_the_link_refuses_is_followed_by_the_connection_failure() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+        let link = ScriptedLink::new();
+        link.fail_sends("EPIPE");
+        let client = Client::connect(
+            link.clone().into_link(),
+            super::CodexSession::handler(Arc::clone(&shared)),
+            ClientOptions::new("Codex app-server"),
+        );
+        link.push_line(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1", "turnId": "vendor-turn-1", "itemId": "item-1",
+                    "command": "pwd"
+                }
+            })
+            .to_string(),
+        );
+
+        let mut seen = Vec::new();
+        let terminal = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "expected a terminal event after the refused answer | received: {seen:?}"
+                    )
+                })
+                .expect("expected the stream to stay open until its terminal");
+            match event.kind {
+                EventKind::ApprovalRequested { .. } => {
+                    seen.push("ApprovalRequested");
+                    answer_waiting_approval(&shared).await;
+                }
+                EventKind::ApprovalResolved { .. } => seen.push("ApprovalResolved"),
+                EventKind::Error { error } => break error,
+                other => panic!("expected an approval event or the failure | received {other:?}"),
+            }
+        };
+        assert_eq!(
+            seen,
+            ["ApprovalRequested", "ApprovalResolved"],
+            "expected the resolution before the failure terminal | received {seen:?}"
+        );
+        assert!(
+            terminal
+                .message
+                .contains("connection ended while the turn was active"),
+            "expected the connection-failure terminal, not a timeout | received {}",
+            terminal.message
+        );
+        assert!(
+            client.is_closed(),
+            "expected closed: true after the refused answer | received: false"
+        );
+        let _ = client.close().await;
     }
 
     /// Cancellation cleanup owns the approval resolution it already published.

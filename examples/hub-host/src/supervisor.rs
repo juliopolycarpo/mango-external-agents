@@ -327,7 +327,7 @@ impl Supervisor {
     ///
     /// The watcher sees every turn this supervisor runs from now on, not one operation. If it
     /// falls behind it receives a [`Delivery::Gap`](crate::Delivery::Gap), which names no turn:
-    /// resync every operation it is showing, as that type's documentation describes.
+    /// mark every operation it is showing as incomplete, as that type's documentation describes.
     ///
     /// # Example
     ///

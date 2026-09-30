@@ -3,8 +3,8 @@
 # cannot package a file from another crate. A drifted copy would make two crates' numbers
 # incomparable, so the copies must stay byte-identical.
 # Usage: scripts/check-bench-runner.sh [reference-runner other-runner...]
-#   with no arguments, the core runner is the reference and the Codex, ACP and Claude copies are
-#   compared to it.
+#   with no arguments, the core runner is the reference and the Codex, ACP, Claude and hub-host
+#   copies are compared to it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,7 +13,8 @@ if [ "$#" -eq 0 ]; then
     crates/mango-external-agents/benches/support/mod.rs \
     crates/mango-agent-codex/benches/support/mod.rs \
     crates/mango-agent-acp/benches/support/mod.rs \
-    crates/mango-agent-claude/benches/support/mod.rs
+    crates/mango-agent-claude/benches/support/mod.rs \
+    examples/hub-host/benches/support/mod.rs
 elif [ "$#" -lt 2 ]; then
   echo "expected a reference runner and at least one copy to compare, received $# path(s): $*" >&2
   exit 1
