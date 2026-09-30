@@ -566,7 +566,7 @@ impl SupervisorInner {
         request: &TurnRequest,
         progress: &mut Progress,
     ) -> Result<Step> {
-        let operation = self.next_operation(record, request, progress.dispatched)?;
+        let (operation, retried) = self.next_dispatch(record, request, progress.dispatched)?;
         // Before the Hub reservation, not after it: reserving *is* the side-effecting submission
         // in a Hub-owned model, so a reservation whose acknowledgement is lost must leave this
         // record on `Reconcile` rather than on "nothing happened".
@@ -584,7 +584,9 @@ impl SupervisorInner {
             Err(error) => return Ok(Step::Backoff(error.retry_hint())),
         }
 
-        let dispatched = request.clone().as_attempt(operation.attempt);
+        // The first attempt copies the request only now that the Hub has taken the reservation; a
+        // retry already built its copy for the record and hands that same one over.
+        let dispatched = retried.unwrap_or_else(|| request.clone().as_attempt(operation.attempt));
         // The third of the set described at the top of `drive`. Without it the attempt deadline is
         // the only other future in this race, so a stop landing while the vendor is acknowledging
         // is not seen until the deadline expires — the whole of it, for an abort, a revoked
@@ -742,17 +744,24 @@ impl SupervisorInner {
     }
 
     /// The operation this dispatch belongs to, taking a strictly newer attempt on every re-send.
-    fn next_operation(
+    ///
+    /// A re-send also returns the request it built for that attempt, so the caller can hand it to
+    /// the vendor instead of copying the input and its attachments a second time. The first
+    /// attempt returns `None`: it copies only once the Hub has accepted the reservation.
+    fn next_dispatch(
         &self,
         record: &mut RecoveryRecord,
         request: &TurnRequest,
         dispatched: bool,
-    ) -> Result<OperationRef> {
+    ) -> Result<(OperationRef, Option<TurnRequest>)> {
         if !dispatched {
-            return Ok(record.operation().clone());
+            return Ok((record.operation().clone(), None));
         }
-        let next = record.operation().attempt.next();
-        record.retry(&request.clone().as_attempt(next))
+        let attempt = request
+            .clone()
+            .as_attempt(record.operation().attempt.next());
+        let operation = record.retry(&attempt)?;
+        Ok((operation, Some(attempt)))
     }
 
     /// Waits out the backoff, answering with the stop reason when one landed instead.
