@@ -677,7 +677,7 @@ impl ConfigurationValue {
     pub fn normalized(self) -> Option<Self> {
         match self {
             Self::Text(value) => {
-                let bounded = normalize::sanitize_field(&value);
+                let bounded = normalize::sanitize_owned(value);
                 (!bounded.truncated
                     && !bounded.text.is_empty()
                     && bounded.text.chars().count() <= CONFIGURATION_TEXT_MAX_LENGTH)

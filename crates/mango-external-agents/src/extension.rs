@@ -173,7 +173,7 @@ impl Extensions {
             if kept.len() >= EXTENSIONS_MAX_ENTRIES {
                 break;
             }
-            let key = normalize::sanitize_field(&key).text;
+            let key = normalize::sanitize_owned(key).text;
             if key.is_empty() || key.chars().count() > EXTENSION_KEY_MAX_LENGTH {
                 continue;
             }

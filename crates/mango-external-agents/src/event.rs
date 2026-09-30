@@ -349,10 +349,10 @@ impl EventKind {
                 native_turn_id: normalize::opaque_id(&native_turn_id, "native turn id")?,
             },
             Self::TextDelta { text } => Self::TextDelta {
-                text: normalize::sanitize_field(&text).text,
+                text: normalize::sanitize_owned(text).text,
             },
             Self::ReasoningDelta { text } => Self::ReasoningDelta {
-                text: normalize::sanitize_field(&text).text,
+                text: normalize::sanitize_owned(text).text,
             },
             Self::ActivityStarted { call_id, activity } => Self::ActivityStarted {
                 call_id: normalize::opaque_id(&call_id, "activity call id")?,
@@ -1707,6 +1707,41 @@ mod tests {
                 );
             }
             other => panic!("expected a text delta, received {other:?}"),
+        }
+    }
+
+    /// The text a streaming event carries, whichever kind it is.
+    fn streamed_text(kind: EventKind) -> String {
+        match kind {
+            EventKind::TextDelta { text } | EventKind::ReasoningDelta { text } => text,
+            other => panic!("expected a text event, received {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_text_is_cleaned_in_the_buffer_it_arrived_in() {
+        let cases = [
+            ("clean ascii", "the quick brown fox ".repeat(52)),
+            ("clean non-ascii", "héllo wörld 日本語 🍋 —".repeat(40)),
+            ("dirty", "clean\u{1b}[0m\u{0}text \u{202e}".repeat(64)),
+        ];
+        for (label, text) in cases {
+            for reasoning in [false, true] {
+                let owned = text.clone();
+                let arrived_in = owned.as_ptr();
+                let kind = if reasoning {
+                    EventKind::ReasoningDelta { text: owned }
+                } else {
+                    EventKind::TextDelta { text: owned }
+                };
+                let cleaned = streamed_text(kind.normalized().expect("expected a delta"));
+                assert_eq!(
+                    cleaned.as_ptr(),
+                    arrived_in,
+                    "expected {label} text (reasoning: {reasoning}) cleaned in its own buffer | \
+                     received a new allocation"
+                );
+            }
         }
     }
 

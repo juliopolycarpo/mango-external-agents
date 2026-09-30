@@ -147,16 +147,26 @@ impl BoundedText {
 /// assert!(clean.truncated);
 /// ```
 pub fn sanitize_field(raw: &str) -> BoundedText {
-    let mut text = String::with_capacity(raw.len());
-    let mut truncated = false;
-    for character in raw.chars() {
-        if is_strippable(character) {
-            truncated = true;
-            continue;
-        }
-        text.push(character);
+    sanitize_owned(raw.to_owned())
+}
+
+/// [`sanitize_field`] for text the caller already owns: nothing is copied.
+///
+/// Clean text comes back as it arrived. Dirty text is stripped in place, so the buffer that held
+/// it is the buffer that keeps the survivors. The result is byte-identical to
+/// `sanitize_field(&raw)`.
+pub(crate) fn sanitize_owned(mut raw: String) -> BoundedText {
+    if !raw.chars().any(is_strippable) {
+        return BoundedText {
+            text: raw,
+            truncated: false,
+        };
     }
-    BoundedText { text, truncated }
+    raw.retain(|character| !is_strippable(character));
+    BoundedText {
+        text: raw,
+        truncated: true,
+    }
 }
 
 /// Applies one field's bound to vendor-supplied text.
@@ -297,7 +307,7 @@ fn is_strippable(character: char) -> bool {
 mod tests {
     use super::{
         ARGV_VALUE_MAX_CODE_POINTS, MAX_PATH_LENGTH, TextLimit, bound_text, is_argv_value,
-        is_argv_value_with_max, opaque_id, sanitize_field, vendor_path,
+        is_argv_value_with_max, opaque_id, sanitize_field, sanitize_owned, vendor_path,
     };
     use crate::error::Error;
 
@@ -319,6 +329,81 @@ mod tests {
                 clean.text
             );
             assert!(clean.truncated);
+        }
+    }
+
+    /// The original character-by-character loop, kept as the reference the fast paths must match.
+    fn reference_sanitize(raw: &str) -> (String, bool) {
+        let mut text = String::with_capacity(raw.len());
+        let mut truncated = false;
+        for character in raw.chars() {
+            if super::is_strippable(character) {
+                truncated = true;
+                continue;
+            }
+            text.push(character);
+        }
+        (text, truncated)
+    }
+
+    /// Inputs on both sides of every boundary `is_strippable` draws, alone and embedded.
+    fn boundary_inputs() -> Vec<String> {
+        let edges = [
+            0x00, 0x08, 0x09, 0x0a, 0x0b, 0x1f, 0x20, 0x7e, 0x7f, 0x80, 0x9f, 0xa0, 0x061b, 0x061c,
+            0x061d, 0x200d, 0x200e, 0x200f, 0x2010, 0x2029, 0x202a, 0x202e, 0x202f, 0x2065, 0x2066,
+            0x2069, 0x206a, 0x1f34b,
+        ];
+        let mut inputs = vec![
+            String::new(),
+            String::from("the quick brown fox"),
+            String::from("héllo wörld 日本語 🍋 — done\n"),
+            String::from("\u{1b}[0m"),
+            String::from("\u{0}\u{7f}\u{9f}\u{202e}"),
+        ];
+        for code in edges {
+            let character = char::from_u32(code).expect("expected a scalar value");
+            inputs.push(character.to_string());
+            inputs.push(format!("{character}tail"));
+            inputs.push(format!("head{character}"));
+            inputs.push(format!("héad {character} 日本 {character}"));
+        }
+        inputs
+    }
+
+    #[test]
+    fn owned_and_borrowed_sanitising_match_the_reference_byte_for_byte() {
+        for input in boundary_inputs() {
+            let (expected_text, expected_truncated) = reference_sanitize(&input);
+            let borrowed = sanitize_field(&input);
+            let owned = sanitize_owned(input.clone());
+            assert_eq!(
+                (borrowed.text.as_bytes(), borrowed.truncated),
+                (expected_text.as_bytes(), expected_truncated),
+                "expected sanitize_field to match the reference | input: {input:?}"
+            );
+            assert_eq!(
+                (owned.text.as_bytes(), owned.truncated),
+                (expected_text.as_bytes(), expected_truncated),
+                "expected sanitize_owned to match the reference | input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_sanitising_reuses_the_callers_buffer_for_clean_and_dirty_text() {
+        for input in [
+            "clean ascii text",
+            "héllo 日本語",
+            "dirty\u{1b}[0m\u{202e}text",
+        ] {
+            let owned = input.to_owned();
+            let (pointer, capacity) = (owned.as_ptr(), owned.capacity());
+            let cleaned = sanitize_owned(owned);
+            assert_eq!(
+                (cleaned.text.as_ptr(), cleaned.text.capacity()),
+                (pointer, capacity),
+                "expected {input:?} sanitised in the buffer it arrived in | received a new buffer"
+            );
         }
     }
 
