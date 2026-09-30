@@ -36,7 +36,10 @@ use mango_external_agents::event::{
 };
 use mango_external_agents::{
     ActivityContent, ErrorCode, ExtensionValue, Extensions, FileChange, PlanStep, PlanStepPriority,
-    PlanStepStatus, VendorError, normalize,
+    PlanStepStatus, VendorError,
+    content::{DIFF_MAX_CONTENT_LENGTH, DIFF_MAX_FILES},
+    normalize,
+    normalize::{MAX_PATH_LENGTH, TextLimit},
 };
 
 /// The call id every plan update shares.
@@ -181,7 +184,161 @@ struct OpenCall {
     /// When the host last received an update for it, if it has.
     last_update: Option<Instant>,
     /// What arrived since then and has not been sent, merged latest-wins.
-    held: Option<ActivityUpdate>,
+    held: Option<Held>,
+}
+
+/// The merge of a call's coalesced updates, with any field too large to publish already bounded.
+///
+/// A running call re-sends its whole body with every update, so an agent with many calls open at
+/// once would otherwise leave each call's latest body here, twice for a text one (the detail line
+/// and the output). A field over the size the core publishes is therefore run through the core's
+/// own [`ActivityUpdate::normalized`] when it is held, which redacts before it cuts, and delivery
+/// bounds it again to the same result. A field that already fits is kept exactly as it arrived, so
+/// the ordinary update costs nothing extra, and the core bounds it once at delivery as before.
+///
+/// Bounding sets [`ActivityUpdate::truncated`], and that flag cannot be kept on the merge itself:
+/// a later update that replaces a cut field with one that fits must not leave the merge reporting a
+/// cut, and one that leaves it alone must keep reporting it, because bounding the merged update
+/// again at delivery finds nothing more to cut. So the cut is remembered per field, and the flag is
+/// derived from the fields still held.
+#[derive(Debug, Default)]
+struct Held {
+    update: ActivityUpdate,
+    title_cut: bool,
+    detail_cut: bool,
+    content_cut: bool,
+}
+
+impl Held {
+    /// An update as it arrived, to be bounded by the core when it is delivered.
+    ///
+    /// The reducer never sets [`ActivityUpdate::truncated`] itself, so nothing is lost by dropping it.
+    fn unbounded(update: ActivityUpdate) -> Self {
+        Self {
+            update,
+            ..Self::default()
+        }
+    }
+
+    /// An update to hold: each field over the published size bounded now, the rest left as it is.
+    ///
+    /// A field is bounded on its own so its cut is known on its own.
+    fn bounded(update: ActivityUpdate) -> Self {
+        let mut held = Self::default();
+        if let Some(title) = update.title {
+            if title.len() > TextLimit::Title.max_code_points() {
+                let bounded = ActivityUpdate::new().with_title(title).normalized();
+                held.update.title = bounded.title;
+                held.title_cut = bounded.truncated;
+            } else {
+                held.update.title = Some(title);
+            }
+        }
+        if let Some(detail) = update.detail {
+            if detail.len() > TextLimit::Detail.max_code_points() {
+                let bounded = ActivityUpdate::new().with_detail(detail).normalized();
+                held.update.detail = bounded.detail;
+                held.detail_cut = bounded.truncated;
+            } else {
+                held.update.detail = Some(detail);
+            }
+        }
+        if let Some(content) = update.content {
+            if exceeds_bound(&content) {
+                let bounded = ActivityUpdate::new().with_content(content).normalized();
+                held.update.content = bounded.content;
+                held.content_cut = bounded.truncated;
+            } else {
+                held.update.content = Some(content);
+            }
+        }
+        held
+    }
+
+    /// `self` and a later update as one, the later one's fields winning.
+    ///
+    /// Every [`ActivityUpdate`] field is a replacement, so a field the later update carries makes the
+    /// earlier value unobservable, and a field it leaves out keeps the earlier one.
+    fn merged_with(mut self, later: Self) -> Self {
+        if later.update.title.is_some() {
+            self.update.title = later.update.title;
+            self.title_cut = later.title_cut;
+        }
+        if later.update.detail.is_some() {
+            self.update.detail = later.update.detail;
+            self.detail_cut = later.detail_cut;
+        }
+        if later.update.content.is_some() {
+            self.update.content = later.update.content;
+            self.content_cut = later.content_cut;
+        }
+        self
+    }
+
+    /// What of `self` a call's completion does not already replace.
+    ///
+    /// A completion that carries content or detail replaces those, so the held copies would only be
+    /// overwritten; a title has no slot on [`ActivityResult`] and survives.
+    fn superseded_by(mut self, result: &ActivityResult) -> Self {
+        if result.content.is_some() {
+            self.update.content = None;
+            self.content_cut = false;
+        }
+        if result.detail.is_some() {
+            self.update.detail = None;
+            self.detail_cut = false;
+        }
+        self
+    }
+
+    /// The update to deliver, reporting a cut for any field still in it that was cut.
+    fn into_update(self) -> ActivityUpdate {
+        let mut update = self.update;
+        update.truncated = self.title_cut || self.detail_cut || self.content_cut;
+        update
+    }
+
+    fn is_empty(&self) -> bool {
+        self.update.is_empty()
+    }
+}
+
+/// Whether the core would shorten `content` (or drop rows of it) when publishing it.
+///
+/// Sized from bytes, which are never fewer than code points, so a body whose byte length fits is
+/// certain to fit, and one that only looks long in bytes is bounded early to no effect. Every text
+/// the core bounds is bounded to [`TextLimit::Detail`], and a diff also to
+/// [`DIFF_MAX_FILES`] rows and [`DIFF_MAX_CONTENT_LENGTH`] code points of bodies together. A path is
+/// published only up to [`MAX_PATH_LENGTH`] bytes; a longer one is dropped, with its row for a diff's own path.
+fn exceeds_bound(content: &ActivityContent) -> bool {
+    let body = TextLimit::Detail.max_code_points();
+    match content {
+        ActivityContent::Output { text } => text.len() > body,
+        ActivityContent::Diff { files } => {
+            let mut total = 0usize;
+            files.len() > DIFF_MAX_FILES
+                || files.iter().any(|file| {
+                    // A path over the length the core publishes is dropped with its row, so one
+                    // that long is not worth holding either.
+                    file.path.len() > MAX_PATH_LENGTH
+                        || file
+                            .previous_path
+                            .as_ref()
+                            .is_some_and(|path| path.len() > MAX_PATH_LENGTH)
+                })
+                || files.iter().any(|file| {
+                    [&file.unified_diff, &file.old_text, &file.new_text]
+                        .into_iter()
+                        .flatten()
+                        .any(|text| {
+                            total = total.saturating_add(text.len());
+                            text.len() > body
+                        })
+                })
+                || total > DIFF_MAX_CONTENT_LENGTH
+        }
+        _ => false,
+    }
 }
 
 impl Reducer {
@@ -375,10 +532,10 @@ impl Reducer {
         open.sort_by_key(|(_, call)| call.opened);
         for (call_id, call) in open {
             self.mark_finished(&call_id);
-            if let Some(update) = call.held.filter(|update| !update.is_empty()) {
+            if let Some(held) = call.held.filter(|held| !held.is_empty()) {
                 events.push(EventKind::ActivityUpdated {
                     call_id: call_id.clone(),
-                    update,
+                    update: held.into_update(),
                 });
             }
             events.push(EventKind::ActivityCompleted {
@@ -393,6 +550,23 @@ impl Reducer {
             });
         }
         events
+    }
+
+    /// Bytes of detail and output text the open calls hold back, for the tests that bound them.
+    #[cfg(test)]
+    pub(crate) fn held_text_bytes(&self) -> usize {
+        self.open_calls
+            .values()
+            .filter_map(|call| call.held.as_ref())
+            .map(|held| &held.update)
+            .map(|held| {
+                let output = match &held.content {
+                    Some(ActivityContent::Output { text }) => text.len(),
+                    _ => 0,
+                };
+                held.detail.as_ref().map_or(0, String::len) + output
+            })
+            .sum()
     }
 
     /// How many tool calls the reducer is holding open, for the tests that prove a frame did not
@@ -534,13 +708,19 @@ impl Reducer {
         };
         match tool_call_update(update).pop() {
             Some(EventKind::ActivityUpdated { call_id, update }) => {
-                let merged = match open.held.take() {
-                    Some(held) => merged_update(held, update),
-                    None => update,
-                };
                 let recent = open
                     .last_update
                     .is_some_and(|last| now.saturating_duration_since(last) < interval);
+                // Only an update that will be held is bounded here: one delivered now is bounded
+                // once, by the sink.
+                let later = match recent {
+                    true => Held::bounded(update),
+                    false => Held::unbounded(update),
+                };
+                let merged = match open.held.take() {
+                    Some(held) => held.merged_with(later),
+                    None => later,
+                };
                 if recent {
                     open.held = Some(merged);
                     return Vec::new();
@@ -548,17 +728,17 @@ impl Reducer {
                 open.last_update = Some(now);
                 vec![EventKind::ActivityUpdated {
                     call_id,
-                    update: merged,
+                    update: merged.into_update(),
                 }]
             }
             Some(EventKind::ActivityCompleted { call_id, result }) => {
                 let mut events = Vec::with_capacity(2);
                 if let Some(held) = open.held.take() {
-                    let held = superseded_by(held, &result);
+                    let held = held.superseded_by(&result);
                     if !held.is_empty() {
                         events.push(EventKind::ActivityUpdated {
                             call_id: call_id.clone(),
-                            update: held,
+                            update: held.into_update(),
                         });
                     }
                 }
@@ -777,39 +957,6 @@ fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
         return Vec::new();
     }
     vec![EventKind::ActivityUpdated { call_id, update }]
-}
-
-/// Two updates to one call as one, the later one's fields winning.
-///
-/// Every [`ActivityUpdate`] field is a replacement, so a field the later update carries makes the
-/// earlier value unobservable, and a field it leaves out keeps the earlier one.
-fn merged_update(earlier: ActivityUpdate, later: ActivityUpdate) -> ActivityUpdate {
-    let mut merged = earlier;
-    if later.title.is_some() {
-        merged.title = later.title;
-    }
-    if later.detail.is_some() {
-        merged.detail = later.detail;
-    }
-    if later.content.is_some() {
-        merged.content = later.content;
-    }
-    merged.truncated |= later.truncated;
-    merged
-}
-
-/// What of a held update a call's completion does not already replace.
-///
-/// A completion that carries content or detail replaces those, so the held copies would only be
-/// overwritten; a title has no slot on [`ActivityResult`] and survives.
-fn superseded_by(mut held: ActivityUpdate, result: &ActivityResult) -> ActivityUpdate {
-    if result.content.is_some() {
-        held.content = None;
-    }
-    if result.detail.is_some() {
-        held.detail = None;
-    }
-    held
 }
 
 /// The outcome of a terminal tool-call status, or nothing while it is still running.
@@ -2859,6 +3006,300 @@ mod tests {
             1,
             "expected a 128-code-point id to be tracked | received: {}",
             reducer.open_calls_len()
+        );
+    }
+
+    fn text_update(call_id: &str, text: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call_id,
+            "content": [{ "type": "content", "content": { "type": "text", "text": text } }]
+        })
+    }
+
+    fn diff_update(call_id: &str, body: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call_id,
+            "title": "Edit",
+            "content": [{ "type": "diff", "path": "/repo/a.rs", "oldText": "old", "newText": body }]
+        })
+    }
+
+    fn title_update(call_id: &str, title: &str) -> serde_json::Value {
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": call_id, "title": title })
+    }
+
+    /// Bytes of detail and output text one update carries once the core has bounded it.
+    fn normalized_text_bytes(text: &str) -> usize {
+        let update = ActivityUpdate::new()
+            .with_detail(text)
+            .with_content(ActivityContent::Output {
+                text: text.to_owned(),
+            })
+            .normalized();
+        let output = match update.content {
+            Some(ActivityContent::Output { text }) => text.len(),
+            _ => 0,
+        };
+        update.detail.map_or(0, |detail| detail.len()) + output
+    }
+
+    /// Calls open at once, each holding the second of two updates sent inside the interval.
+    fn reducer_holding(calls: usize, body: &str) -> Reducer {
+        let now = Instant::now();
+        let mut reducer = Reducer::new();
+        for index in 0..calls {
+            let id = format!("call-{index}");
+            let _ = reducer.update_at(update(announced(&id)), now);
+            // The first update after opening is delivered; the next, inside the interval, is held.
+            let _ = reducer.update_at(update(text_update(&id, body)), now);
+            let _ = reducer.update_at(update(text_update(&id, body)), now);
+        }
+        reducer
+    }
+
+    /// Open calls each holding a body over the bound hold what the core publishes of it.
+    #[test]
+    fn a_held_update_over_the_bound_is_kept_at_its_normalized_size() {
+        const CALLS: usize = 20;
+        let body = "x".repeat(64 * 1024);
+        let expected = CALLS * normalized_text_bytes(&body);
+        let held = reducer_holding(CALLS, &body).held_text_bytes();
+        assert_eq!(
+            held, expected,
+            "expected held text bytes for {CALLS} open calls: {expected} | received: {held}"
+        );
+    }
+
+    /// A body within the bound is held exactly as it arrived: no copy is bounded, none is changed.
+    #[test]
+    fn a_held_update_within_the_bound_is_kept_as_it_arrived() {
+        const CALLS: usize = 5;
+        let body = "y".repeat(4_096);
+        let held = reducer_holding(CALLS, &body).held_text_bytes();
+        // Detail and output both carry the body, so the raw hold is twice the body per call.
+        let expected = CALLS * 2 * body.len();
+        assert_eq!(
+            held, expected,
+            "expected held text bytes for {CALLS} bodies at the bound: {expected} | received: {held}"
+        );
+    }
+
+    /// The update a host is finally sent: the last one delivered when the turn ends.
+    fn delivered_last(frames: &[serde_json::Value]) -> ActivityUpdate {
+        let now = Instant::now();
+        let mut reducer = Reducer::new();
+        let _ = reducer.update_at(update(announced("call")), now);
+        for frame in frames {
+            let _ = reducer.update_at(update(frame.clone()), now);
+        }
+        let closing = reducer.finish();
+        let Some(EventKind::ActivityUpdated { update, .. }) = closing.into_iter().next() else {
+            panic!("expected the held update delivered at the turn's end");
+        };
+        update.normalized()
+    }
+
+    /// What the core publishes of the frames sent after the first, merged latest-field-wins with
+    /// nothing bounded early.
+    fn published_once(frames: &[serde_json::Value]) -> ActivityUpdate {
+        let mut reducer = Reducer::new().with_update_interval(Duration::ZERO);
+        let now = Instant::now();
+        let _ = reducer.update_at(update(announced("call")), now);
+        let mut merged = ActivityUpdate::new();
+        for frame in frames {
+            let (events, _) = reducer.update_at(update(frame.clone()), now);
+            for event in events {
+                let EventKind::ActivityUpdated { update, .. } = event else {
+                    continue;
+                };
+                merged.title = update.title.or(merged.title);
+                merged.detail = update.detail.or(merged.detail);
+                merged.content = update.content.or(merged.content);
+            }
+        }
+        merged.normalized()
+    }
+
+    /// Bounding early never changes what a host is sent, cut flag included.
+    #[test]
+    fn delivery_is_identical_to_bounding_only_at_delivery() {
+        let big = "z".repeat(64 * 1024);
+        // A credential straddling the cut: redaction has to see it whole before the text is cut.
+        let straddling = format!("{}sk-{}", "a".repeat(4_090), "b".repeat(80));
+        let sequences: Vec<(&str, Vec<serde_json::Value>)> = vec![
+            (
+                "one big body",
+                vec![text_update("call", "first"), text_update("call", &big)],
+            ),
+            (
+                "a credential across the cut",
+                vec![
+                    text_update("call", "first"),
+                    text_update("call", &straddling),
+                ],
+            ),
+            (
+                "a big body then a small one",
+                vec![
+                    text_update("call", "first"),
+                    text_update("call", &big),
+                    text_update("call", "short again"),
+                ],
+            ),
+            (
+                "a small body then a big one",
+                vec![
+                    text_update("call", "first"),
+                    text_update("call", "small"),
+                    text_update("call", &big),
+                ],
+            ),
+            (
+                "a big diff with a long title",
+                vec![
+                    title_update("call", "first"),
+                    diff_update("call", &big),
+                    title_update("call", &"t".repeat(600)),
+                ],
+            ),
+            (
+                "a big diff then a title only",
+                vec![
+                    title_update("call", "first"),
+                    diff_update("call", &big),
+                    title_update("call", "short"),
+                ],
+            ),
+        ];
+        for (name, frames) in sequences {
+            let expected = published_once(&frames[1..]);
+            let received = delivered_last(&frames);
+            assert_eq!(
+                (&received, received.truncated),
+                (&expected, expected.truncated),
+                "expected delivery identical to bounding at delivery only for {name}"
+            );
+        }
+    }
+
+    fn file_with_path(path: &str, previous_path: Option<&str>) -> super::FileChange {
+        let mut file = super::FileChange::new(path);
+        file.previous_path = previous_path.map(str::to_owned);
+        file.new_text = Some(String::from("small"));
+        file
+    }
+
+    /// A diff whose bodies fit still exceeds the bound when a path is longer than the core
+    /// publishes: held as it arrived, it would keep that path until delivery.
+    #[test]
+    fn a_diff_path_over_the_published_length_exceeds_the_bound() {
+        let long = "p".repeat(super::MAX_PATH_LENGTH + 1);
+        let at_limit = "p".repeat(super::MAX_PATH_LENGTH);
+        for (name, files, expected) in [
+            (
+                "ordinary paths",
+                vec![file_with_path("/repo/a.rs", None)],
+                false,
+            ),
+            (
+                "paths at the limit",
+                vec![file_with_path(&at_limit, Some(&at_limit))],
+                false,
+            ),
+            ("an oversized path", vec![file_with_path(&long, None)], true),
+            (
+                "an oversized previous path",
+                vec![file_with_path("/repo/a.rs", Some(&long))],
+                true,
+            ),
+        ] {
+            let received = super::exceeds_bound(&ActivityContent::Diff { files });
+            assert_eq!(
+                received, expected,
+                "expected exceeds_bound for {name}: {expected} | received: {received}"
+            );
+        }
+    }
+
+    /// An oversized path reaches the host as it would have without holding: its row is dropped and
+    /// the update reports a cut.
+    #[test]
+    fn delivery_with_an_oversized_diff_path_is_identical_to_bounding_only_at_delivery() {
+        let frame = |path: &str| {
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call",
+                "content": [{ "type": "diff", "path": path, "oldText": "a", "newText": "b" }]
+            })
+        };
+        let frames = [frame("/repo/a.rs"), frame(&"p".repeat(10_000))];
+        let expected = published_once(&frames[1..]);
+        let received = delivered_last(&frames);
+        assert_eq!(
+            (&received, received.truncated),
+            (&expected, expected.truncated),
+            "expected delivery identical to bounding at delivery only for an oversized diff path"
+        );
+    }
+
+    /// Bounding is idempotent: the sink applies it again to what the reducer already bounded.
+    #[test]
+    fn normalizing_an_update_twice_gives_the_same_update_and_flag() {
+        let long = "y".repeat(10_000);
+        let straddling = format!("{}sk-{}", "a".repeat(4_090), "b".repeat(80));
+        let frames = [
+            ActivityUpdate::new().with_title("t".repeat(600)),
+            ActivityUpdate::new().with_detail(long.clone()),
+            ActivityUpdate::new().with_detail(straddling.clone()),
+            ActivityUpdate::new().with_content(ActivityContent::Output { text: long }),
+            ActivityUpdate::new().with_content(ActivityContent::Output { text: straddling }),
+            ActivityUpdate::new()
+                .with_title("short")
+                .with_detail("short")
+                .with_content(ActivityContent::Output {
+                    text: String::from("short"),
+                }),
+            ActivityUpdate::new().with_content(ActivityContent::Empty),
+        ];
+        for frame in frames {
+            let once = frame.clone().normalized();
+            let twice = once.clone().normalized();
+            assert_eq!(
+                (&twice, twice.truncated),
+                (&once, once.truncated),
+                "expected normalizing twice to equal normalizing once for {frame:?}"
+            );
+        }
+    }
+
+    /// The cut a held field already took is still reported when it is finally delivered.
+    #[test]
+    fn a_held_cut_is_still_reported_truncated_when_delivered() {
+        let delivered = delivered_last(&[
+            text_update("call", "first"),
+            text_update("call", &"z".repeat(64 * 1024)),
+        ]);
+        assert!(
+            delivered.truncated,
+            "expected truncated: true for a 64 KiB body | received: {:?}",
+            delivered.truncated
+        );
+    }
+
+    /// A later update that replaces a cut field with one that fits leaves nothing cut.
+    #[test]
+    fn a_replaced_cut_field_does_not_leave_the_update_truncated() {
+        let delivered = delivered_last(&[
+            text_update("call", "first"),
+            text_update("call", &"z".repeat(64 * 1024)),
+            text_update("call", "short again"),
+        ]);
+        assert!(
+            !delivered.truncated,
+            "expected truncated: false once the cut body was replaced | received: {:?}",
+            delivered.truncated
         );
     }
 }

@@ -257,6 +257,16 @@ final output. `Reducer::with_update_interval` changes the interval; `Duration::Z
 update. This bounds how often one call reaches a host, not how large one update is: each is still
 bounded by the core's `TextLimit::Detail`.
 
+A held field that is over the size the core publishes (a text body or a diff body over
+`TextLimit::Detail`, a title over `TextLimit::Title`, or a diff past the core's row or total-size
+limits) is bounded when it is held, through the core's own bounding, which redacts before it cuts;
+delivery bounds it again to the same result. An agent with many calls open at once therefore leaves
+each holding what a host would be sent rather than its latest whole body. A field that already fits
+is held exactly as it arrived and bounded once, at delivery, as before. Whether a held field was cut
+is remembered per field, so a later update that replaces a cut field does not leave the delivered
+update reporting a cut, and one that leaves it alone still does. The number of calls open at once
+is not capped: that would refuse a legitimate turn.
+
 A [tool call's](https://agentclientprotocol.com/protocol/v1/tool-calls) `toolCallId` is an opaque
 string the agent chooses, and the core publishes an id only when it is not blank and is at most 128
 code points; it refuses rather than shortens one, because a cut id would name a different call. Such
