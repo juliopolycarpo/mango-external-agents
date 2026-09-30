@@ -70,7 +70,8 @@ Observed on the four 0.3.0 tarballs, each unpacked from `cargo package` and run 
   be run. Only its `framing` bench reads `fixtures/`, at run time.
 - `mango-agent-claude`: the tests do not compile. `src/cli_surface.rs`, `src/models.rs`,
   `src/probe.rs` and `src/auth.rs` use `include_str!` on `../../../fixtures/...` in test code, as do
-  `tests/support/mod.rs` and `tests/reducer_replay.rs`, and the build stops with
+  `tests/support/mod.rs` and `tests/reducer_replay.rs` (with `../` counts that fit their own
+  directories), and the build stops with
   `couldn't read src/../../../fixtures/claude/contract/cli-surface.json`.
 - `mango-agent-codex`: the tests compile. The unit and doc tests pass, but the three integration
   test binaries open `fixtures/codex` at run time through `CARGO_MANIFEST_DIR`, and 147 of the
