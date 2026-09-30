@@ -27,6 +27,9 @@ use mango_external_agents::{Attachment, AttachmentKind, Error, Result};
 /// attachment over [`ATTACHMENT_MAX_BYTES`] — both caps are the library's own, and both numbers
 /// are named — and [`Error::Protocol`] for a kind this agent's `promptCapabilities` did not
 /// advertise.
+///
+/// The encoded size of the whole request is not checked here: the frame budget belongs to the
+/// transport, and [`AcpSession`](crate::AcpSession) measures it before submitting the turn.
 pub fn prompt(
     input: &str,
     attachments: &[Attachment],

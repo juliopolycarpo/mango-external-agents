@@ -36,7 +36,7 @@ use mango_external_agents::{
 
 use crate::client::{self, ConnectionHandle, link_failure, overflow_failure, with_stderr};
 use crate::profile::AcpProfile;
-use crate::{content, reducer};
+use crate::{content, prompt_size, reducer};
 
 /// One conversation with one ACP agent.
 pub struct AcpSession {
@@ -1030,6 +1030,12 @@ impl Session for AcpSession {
             &self.agent_capabilities.prompt_capabilities,
         )
         .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        // Each attachment is capped alone, but the frame the SDK writes for all of them is not. The
+        // transport refuses an outgoing frame over `Limits::turn_buffer_bytes` only once the turn
+        // has started, which fails the connection and leaves the host with `AcceptanceUnknown`.
+        // Refused here, nothing has been submitted and the session stays usable.
+        prompt_size::refuse_oversized_prompt(&self.native_session_id, &prompt, self.host.limits())
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let _configuration = self.configuration_gate.lock().await;
 
         let (sink, events) = EventSink::with_limits(

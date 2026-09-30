@@ -4509,6 +4509,9 @@ mod burst;
 #[path = "session/edges.rs"]
 mod edges;
 
+#[path = "session/prompt_frame.rs"]
+mod prompt_frame;
+
 /// The `tool_call` frame for a call the agent reports as running and never ends.
 fn running_call(call_id: &str) -> serde_json::Value {
     serde_json::json!({

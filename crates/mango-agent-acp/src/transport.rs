@@ -19,7 +19,7 @@ use std::pin::Pin;
 
 mod bounded;
 pub use bounded::BoundedTransport;
-pub(crate) use bounded::{Overflow, OverflowSlot};
+pub(crate) use bounded::{Overflow, OverflowSlot, outgoing_frame_limit};
 use futures::stream::BoxStream;
 use mango_external_agents::process::{ByteSink, LineStream};
 use mango_external_agents::{AcpSpec, Error, HostContext, LaunchSpec, ManagedProcess, Result};

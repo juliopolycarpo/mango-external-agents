@@ -61,7 +61,9 @@ queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking.
 
 Output bytes remain charged through the physical write. A single frame larger than the byte
 budget, or a queue that would exceed either bound, fails the connection with an error naming the
-received count or size and the limit; the session then closes and its child is released.
+received count or size and the limit; the session then closes and its child is released. A prompt
+too large for one frame does not reach that path: `start_turn` measures it first and refuses it
+before submission (see [Attachments](#attachments)).
 
 What the host observes: the turn in flight ends with one `EventKind::Error` whose code is
 `acp-transport-overflow` and whose message is the core `Error::LimitExceeded` text, for example
@@ -582,6 +584,24 @@ machine that the agent might then try to read.
 An attachment whose kind the agent never advertised in `promptCapabilities` is refused **before** the
 turn starts. Rejected mid-turn it reads to a user as the agent breaking rather than as a file that was
 never going to work.
+
+The whole prompt is checked too, not only each attachment. The transport refuses any outgoing frame
+over `Limits::turn_buffer_bytes` (8 MiB by default), and the encoding grows what it carries: base64
+adds a third, and a control character in a text attachment becomes a six-byte `\u00XX` escape. Three
+2 MiB images or one 2 MiB text of control characters pass the per-attachment cap and still exceed the
+frame. Refused there, the turn has already started: the connection fails, the session closes and the
+host is left with `AcceptanceUnknown`. So `start_turn` measures the exact `session/prompt` frame the
+official crate will write, before it submits anything, and answers `LimitExceeded` ("bytes in one
+frame to the ACP agent") with `Dispatch::NotSubmitted`. The session stays usable for the next turn.
+The count is exact, not a bound: the check accepts a frame of exactly `turn_buffer_bytes` bytes,
+refuses one byte more, and refuses nothing that fits the frame budget today. It guarantees only that
+the frame fits alone. The outgoing byte budget is shared by every frame queued for the agent until it
+is written, so a near-budget prompt can still fail the connection after submission when another
+outgoing frame is queued at the same moment (a `session/cancel`, a permission or file response).
+That is the transport's queue cap described above, not a prompt-size refusal. It serialises into a counting sink, so no second
+copy of an attachment is built. It is one extra serialisation pass per turn, cheaper than the
+official crate's own encoding of the same request. A host that wants larger prompts raises
+`Limits::turn_buffer_bytes` itself.
 
 ## Known caveats
 

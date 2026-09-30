@@ -7,6 +7,7 @@ pub mod error;
 pub mod harness;
 pub mod permission;
 pub mod profile;
+mod prompt_size;
 pub mod reducer;
 pub mod session;
 #[cfg(any(test, feature = "testing"))]
