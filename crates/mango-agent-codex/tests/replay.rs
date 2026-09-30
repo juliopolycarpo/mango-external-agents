@@ -1361,6 +1361,180 @@ async fn a_recorded_turn_replays_as_a_turn_that_ends_exactly_once() {
     );
 }
 
+/// The native turn id the oversized-message server answers `turn/start` with.
+const OVERSIZED_MESSAGE_TURN_ID: &str = "vendor-turn-oversized";
+
+/// A server that answers `turn/start` with one agent message streamed whole and then completed with
+/// the identical text, and ends the turn.
+///
+/// The message is larger than the default line limit's reducer bound, which no recording holds, so
+/// this only shapes the wire the way the `turn` fixture already does: the answer rides the
+/// `turn/start` response, followed by the item's deltas, its completion and the turn's.
+struct OversizedMessage {
+    thread_id: String,
+    text: String,
+}
+
+impl OversizedMessage {
+    fn respond(&self, frame: &serde_json::Value) -> Option<Vec<String>> {
+        if frame.get("method").and_then(serde_json::Value::as_str) != Some("turn/start") {
+            return None;
+        }
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let notification = |method: &str, params: serde_json::Value| {
+            serde_json::json!({"method": method, "params": params}).to_string()
+        };
+        Some(vec![
+            serde_json::json!({"id": id, "result": {"turn": {"id": OVERSIZED_MESSAGE_TURN_ID}}})
+                .to_string(),
+            notification(
+                "item/agentMessage/delta",
+                serde_json::json!({"threadId": self.thread_id, "turnId": OVERSIZED_MESSAGE_TURN_ID,
+                                   "itemId": "msg-1", "delta": self.text}),
+            ),
+            notification(
+                "item/completed",
+                serde_json::json!({"threadId": self.thread_id, "turnId": OVERSIZED_MESSAGE_TURN_ID,
+                                   "item": {"type": "agentMessage", "id": "msg-1",
+                                            "text": self.text}}),
+            ),
+            notification(
+                "turn/completed",
+                serde_json::json!({"threadId": self.thread_id,
+                                   "turn": {"id": OVERSIZED_MESSAGE_TURN_ID,
+                                            "status": "completed"}}),
+            ),
+        ])
+    }
+}
+
+/// What the turn keeps of a streamed message follows the host's limits, not the defaults.
+///
+/// A host that raised `Limits::line` reads frames the default limits would refuse, so a message it
+/// streamed in full and then completed with the same text is one delivery. A session that built
+/// its reducer from the default limits would drop the streamed text at 2 MiB and emit the
+/// completion a second time.
+#[tokio::test]
+async fn a_message_larger_than_the_default_bound_is_delivered_once_under_raised_line_limits() {
+    let transcript = Transcript::load("turn");
+    let server = OversizedMessage {
+        thread_id: transcript
+            .thread_id()
+            .expect("expected the turn recording to name its thread"),
+        text: "x".repeat(3 * 1024 * 1024),
+    };
+    let message_bytes = server.text.len();
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| server.respond(frame)));
+    let (host, _launcher) = with_launcher_limits(
+        launcher,
+        None,
+        mango_external_agents::Limits {
+            line: mango_external_agents::LineLimits {
+                max_line_bytes: 4 * 1024 * 1024,
+                max_buffered_bytes: 16 * 1024 * 1024,
+            },
+            ..replay_limits()
+        },
+    );
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "say a lot"))
+        .await
+        .expect("expected a turn");
+
+    let events = drain(&mut turn).await;
+
+    let text_events: Vec<usize> = events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::TextDelta { text } => Some(text.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text_events,
+        vec![message_bytes],
+        "expected the message delivered once | received text events of these lengths: {text_events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the turn to complete | received {:?}",
+        events.last()
+    );
+}
+
+/// The bound only drops text no completion could have repeated, so every recorded turn reduces to
+/// the same outcomes with it as without it.
+#[test]
+fn leaves_every_recorded_turn_byte_identical() {
+    use mango_agent_codex::protocol::Notification;
+    use mango_agent_codex::reducer::Outcome;
+    use mango_agent_codex::turn_reducer::TurnReducer;
+
+    let default_bound = 2 * 1024 * 1024;
+    let now = tokio::time::Instant::now();
+    let mut emitted_text = 0;
+    for name in [
+        "turn",
+        "approval",
+        "interrupt",
+        "permission-transitions",
+        "review",
+        "review-base-branch",
+        "review-commit",
+        "review-custom",
+        "user-defaults",
+    ] {
+        let transcript = Transcript::load(name);
+        let mut unbounded = TurnReducer::new();
+        let mut bounded = TurnReducer::builder()
+            .max_message_bytes(default_bound)
+            .build();
+        for frame in transcript.every_received() {
+            let (Some(method), Some(params), None) = (
+                frame.get("method").and_then(serde_json::Value::as_str),
+                frame.get("params"),
+                frame.get("id"),
+            ) else {
+                continue;
+            };
+            let thread = params.get("threadId").and_then(serde_json::Value::as_str);
+            let native_turn = params.get("turnId").and_then(serde_json::Value::as_str);
+            let (Some(thread), Some(native_turn)) = (thread, native_turn) else {
+                continue;
+            };
+            let notification = Notification::parse(method, params.clone());
+            let reduce = |reducer: &mut TurnReducer| {
+                reducer.reduce(
+                    &notification,
+                    thread,
+                    Some(native_turn),
+                    SystemTime::UNIX_EPOCH,
+                    now,
+                )
+            };
+            let (expected, received) = (reduce(&mut unbounded), reduce(&mut bounded));
+            assert_eq!(
+                received, expected,
+                "expected {name} to reduce {method} the same under a bound of {default_bound} bytes"
+            );
+            if matches!(&expected, Outcome::Emit(events)
+                if events.iter().any(|event| matches!(event, EventKind::TextDelta { .. })))
+            {
+                emitted_text += 1;
+            }
+        }
+    }
+    assert!(
+        emitted_text > 0,
+        "expected the recorded turns to emit answer text | received {emitted_text} outcomes with text"
+    );
+}
+
 /// The turn-scoped counterpart to opening a session: the vendor accepted this attempt and named
 /// its own handle for it, first on every turn's stream — not just the first, since it says
 /// something about this attempt rather than about the session.

@@ -1419,7 +1419,7 @@ async fn pump(
     stop: CancelToken,
     input: String,
 ) {
-    let mut reducer = TurnReducer::new();
+    let mut reducer = TurnReducer::for_limits(shared.host.limits());
     // The host's own patience for a child that should be exiting; it owns the process, so it owns
     // how long the turn waits on one that is not.
     let exit_grace = shared.host.limits().kill_grace;

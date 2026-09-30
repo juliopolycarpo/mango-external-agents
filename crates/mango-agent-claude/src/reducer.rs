@@ -110,7 +110,35 @@ enum Channel {
 #[derive(Clone, Debug)]
 struct Delivered {
     channel: Channel,
+    /// Every byte delivered so far; empty once `overflowed`.
     text: String,
+    /// More was delivered than [`TurnReducerBuilder::max_message_bytes`] allows, so the text was
+    /// dropped: no completed block the transport can deliver begins with that much text.
+    overflowed: bool,
+}
+
+impl Delivered {
+    fn new(channel: Channel) -> Self {
+        Self {
+            channel,
+            text: String::new(),
+            overflowed: false,
+        }
+    }
+
+    /// Appends one delta, dropping the text once it passes `bound`.
+    fn push(&mut self, text: &str, bound: Option<usize>) {
+        if self.overflowed {
+            return;
+        }
+        if bound.is_some_and(|bound| self.text.len().saturating_add(text.len()) > bound) {
+            // Replaced rather than cleared: clearing would keep the buffer's capacity.
+            self.text = String::new();
+            self.overflowed = true;
+            return;
+        }
+        self.text.push_str(text);
+    }
 }
 
 /// One run's records, reduced to neutral events.
@@ -139,6 +167,55 @@ pub struct TurnReducer {
     /// `content_block_stop` states an index and nothing else — not the type of the block it closes
     /// — so the type has to be remembered from the `content_block_start` that opened it.
     open_reasoning_blocks: BTreeSet<u64>,
+    /// The most delivered text kept for one block; `None` keeps all of it.
+    max_message_bytes: Option<usize>,
+}
+
+/// Configures a [`TurnReducer`].
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_claude::reducer::TurnReducer;
+///
+/// let reducer = TurnReducer::builder()
+///     .max_message_bytes(2 * 1024 * 1024)
+///     .build();
+/// # let _ = reducer;
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+#[must_use]
+pub struct TurnReducerBuilder {
+    max_message_bytes: Option<usize>,
+}
+
+impl TurnReducerBuilder {
+    /// The most decoded bytes one completed block can arrive in, and so the most delivered text
+    /// worth keeping for it.
+    ///
+    /// A completed block is delivered inside one inbound line, and the transport refuses a line
+    /// past its limit, so a block whose deltas already passed that limit can never be the prefix
+    /// of a completed block. Its text is dropped rather than held until the message ends, and the
+    /// completed block is emitted whole. A bound below what the transport delivers would emit a
+    /// fully streamed block twice.
+    ///
+    /// A session passes the most a decoded stdio line can hold under its `Limits::line`: the raw
+    /// line is at most `max_line_bytes`, repairing invalid UTF-8 can triple it, and the repaired
+    /// line still has to fit in `max_buffered_bytes`. Without a bound, which is what
+    /// [`TurnReducer::new`] builds, a block's delivered text is kept whole until its message ends.
+    pub fn max_message_bytes(mut self, bytes: usize) -> Self {
+        self.max_message_bytes = Some(bytes);
+        self
+    }
+
+    /// A reducer for one run.
+    #[must_use]
+    pub fn build(self) -> TurnReducer {
+        TurnReducer {
+            max_message_bytes: self.max_message_bytes,
+            ..TurnReducer::new()
+        }
+    }
 }
 
 impl TurnReducer {
@@ -169,7 +246,34 @@ impl TurnReducer {
             denied_activities: BTreeMap::new(),
             delivered_by_block: BTreeMap::new(),
             open_reasoning_blocks: BTreeSet::new(),
+            max_message_bytes: None,
         }
+    }
+
+    /// Configures a reducer; see [`TurnReducerBuilder`].
+    pub fn builder() -> TurnReducerBuilder {
+        TurnReducerBuilder::default()
+    }
+
+    /// The reducer for a run whose output is read under `limits`.
+    ///
+    /// A block reaches the reducer decoded, in one stdio line: at most `max_line_bytes` as the
+    /// vendor wrote it, at most three times that once each invalid byte is repaired to a 3-byte
+    /// U+FFFD, and never more than `max_buffered_bytes`, which the repaired line is counted against.
+    ///
+    /// The bound equals the largest decoded stdio line only because this harness is stdio-only. On
+    /// a websocket the limit applies to the decoded message against `max_line_bytes` alone (see
+    /// `SocketReceiver::bounded` in the websocket transport), so a websocket transport would need
+    /// its own bound rather than this one.
+    pub(crate) fn for_limits(limits: &mango_external_agents::Limits) -> Self {
+        let line = &limits.line;
+        Self::builder()
+            .max_message_bytes(
+                line.max_line_bytes
+                    .saturating_mul(3)
+                    .min(line.max_buffered_bytes),
+            )
+            .build()
     }
 
     /// Whether a `result` record, or an [`abort`](Self::abort), has already ended this run.
@@ -338,13 +442,8 @@ impl TurnReducer {
         index: Option<u64>,
     ) -> Vec<EventKind> {
         if let (Some(index), Some(channel)) = (index, opening_channel(block_type)) {
-            self.delivered_by_block.insert(
-                index,
-                Delivered {
-                    channel,
-                    text: String::new(),
-                },
-            );
+            self.delivered_by_block
+                .insert(index, Delivered::new(channel));
         }
         if !is_reasoning_block(block_type) {
             return Vec::new();
@@ -397,12 +496,22 @@ impl TurnReducer {
         let Some(index) = index else {
             return;
         };
-        let entry = self.delivered_by_block.entry(index).or_insert(Delivered {
-            channel,
-            text: String::new(),
-        });
+        let bound = self.max_message_bytes;
+        let entry = self
+            .delivered_by_block
+            .entry(index)
+            .or_insert_with(|| Delivered::new(channel));
         entry.channel = channel;
-        entry.text.push_str(text);
+        entry.push(text, bound);
+    }
+
+    /// The capacity of every delivered text still kept, for tests of what is retained.
+    #[cfg(test)]
+    fn retained_text_capacity(&self) -> usize {
+        self.delivered_by_block
+            .values()
+            .map(|entry| entry.text.capacity())
+            .sum()
     }
 
     /// The part of a completed block that reached nobody.
@@ -422,7 +531,7 @@ impl TurnReducer {
         let mut matched = None;
         let mut delivered = 0;
         for (index, entry) in &self.delivered_by_block {
-            if entry.channel != channel {
+            if entry.channel != channel || entry.overflowed {
                 continue;
             }
             if entry.text.len() > delivered && text.starts_with(&entry.text) {
@@ -903,6 +1012,216 @@ mod tests {
     fn reduce(reducer: &mut TurnReducer, line: &str) -> Vec<EventKind> {
         let record = StreamRecord::parse(line).expect("expected a parseable record");
         reducer.reduce(&record).events
+    }
+
+    fn open_block_line(index: u64, block_type: &str) -> String {
+        json!({"type": "stream_event", "event": {"type": "content_block_start", "index": index,
+               "content_block": {"type": block_type}}})
+        .to_string()
+    }
+
+    fn delta_line(index: u64, kind: &str, text: &str) -> String {
+        let delta = match kind {
+            "thinking_delta" => json!({"type": kind, "thinking": text}),
+            _ => json!({"type": kind, "text": text}),
+        };
+        json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": index,
+               "delta": delta}})
+        .to_string()
+    }
+
+    fn completed_line(block_type: &str, text: &str) -> String {
+        let key = if block_type == "thinking" {
+            "thinking"
+        } else {
+            "text"
+        };
+        json!({"type": "assistant", "message": {"role": "assistant",
+               "content": [{"type": block_type, key: text}]}})
+        .to_string()
+    }
+
+    fn text_of(events: &[EventKind]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Streams `deltas` into block 0 of a text message, returning what reached the host.
+    fn stream_text(reducer: &mut TurnReducer, deltas: &[&str]) -> String {
+        let mut delivered = reduce(reducer, &open_block_line(0, "text"));
+        for delta in deltas {
+            delivered.extend(reduce(reducer, &delta_line(0, "text_delta", delta)));
+        }
+        text_of(&delivered)
+    }
+
+    fn bounded(bound: usize) -> TurnReducer {
+        TurnReducer::builder().max_message_bytes(bound).build()
+    }
+
+    #[test]
+    fn delivered_text_past_the_bound_is_not_kept_for_the_completed_block() {
+        let mut reducer = bounded(8);
+        stream_text(&mut reducer, &["1234", "5678"]);
+        assert!(
+            reducer.retained_text_capacity() >= 8,
+            "expected the text within the bound to be kept, received {} bytes of capacity",
+            reducer.retained_text_capacity()
+        );
+        stream_text(
+            &mut reducer,
+            &["9", "more text the completed block can never repeat"],
+        );
+        assert_eq!(
+            reducer.retained_text_capacity(),
+            0,
+            "expected no text kept past the bound of 8 bytes, received {} bytes of capacity",
+            reducer.retained_text_capacity()
+        );
+    }
+
+    #[test]
+    fn delivered_reasoning_past_the_bound_is_not_kept_either() {
+        let mut reducer = bounded(8);
+        reduce(&mut reducer, &open_block_line(0, "thinking"));
+        reduce(
+            &mut reducer,
+            &delta_line(0, "thinking_delta", "a long plan, thought through"),
+        );
+        assert_eq!(
+            reducer.retained_text_capacity(),
+            0,
+            "expected no reasoning kept past the bound of 8 bytes, received {} bytes of capacity",
+            reducer.retained_text_capacity()
+        );
+    }
+
+    #[test]
+    fn a_block_of_exactly_the_bound_is_still_deduplicated() {
+        let mut reducer = bounded(8);
+        let streamed = stream_text(&mut reducer, &["1234", "5678"]);
+        let completed = reduce(&mut reducer, &completed_line("text", "12345678"));
+        assert_eq!(
+            (streamed.as_str(), completed.as_slice()),
+            ("12345678", [].as_slice()),
+            "expected a block of exactly the bound to add nothing on completion"
+        );
+
+        let mut reducer = bounded(8);
+        stream_text(&mut reducer, &["1234", "5678"]);
+        let completed = reduce(&mut reducer, &completed_line("text", "12345678 tail"));
+        assert_eq!(
+            text_of(&completed),
+            " tail",
+            "expected only the text the deltas left out"
+        );
+    }
+
+    /// The completed block can be shorter than what streamed, or a rewrite of it. It is the whole
+    /// block either way, with or without a bound.
+    #[test]
+    fn a_completed_block_not_extending_what_streamed_is_emitted_whole_past_the_bound() {
+        for bound in [4, 4096] {
+            let mut reducer = bounded(bound);
+            stream_text(
+                &mut reducer,
+                &["a long first draft, ", "that is then rewritten"],
+            );
+            let completed = reduce(&mut reducer, &completed_line("text", "rewritten"));
+            assert_eq!(
+                text_of(&completed),
+                "rewritten",
+                "expected the completed block whole with a bound of {bound}"
+            );
+        }
+    }
+
+    /// One block passing the bound must not cost another block its deduplication.
+    #[test]
+    fn every_block_has_its_own_bound() {
+        let mut reducer = bounded(8);
+        stream_text(&mut reducer, &["0123456789"]);
+        reduce(&mut reducer, &open_block_line(1, "text"));
+        reduce(&mut reducer, &delta_line(1, "text_delta", "1234"));
+        let completed = reduce(&mut reducer, &completed_line("text", "1234"));
+        assert!(
+            completed.is_empty(),
+            "expected the short block to be deduplicated beside an overflowed one, received {completed:?}"
+        );
+    }
+
+    /// A transport that delivers larger lines has to be able to deduplicate larger blocks, so the
+    /// bound is what the builder was given rather than a constant.
+    #[test]
+    fn a_block_larger_than_the_default_line_limit_is_deduplicated_under_a_larger_bound() {
+        let two_mib = "x".repeat(2 * 1024 * 1024);
+        let mut reducer = bounded(4 * 1024 * 1024);
+        stream_text(&mut reducer, &[two_mib.as_str()]);
+        let completed = reduce(&mut reducer, &completed_line("text", &two_mib));
+        assert!(
+            completed.is_empty(),
+            "expected a fully delivered block under a 4 MiB bound to add nothing, received {} events",
+            completed.len()
+        );
+    }
+
+    #[test]
+    fn a_reducer_without_a_bound_keeps_every_block_whole() {
+        let mut reducer = TurnReducer::new();
+        stream_text(&mut reducer, &["a block ", "of any length"]);
+        let completed = reduce(
+            &mut reducer,
+            &completed_line("text", "a block of any length"),
+        );
+        assert!(completed.is_empty(), "received {completed:?}");
+    }
+
+    /// What a run keeps is what its output can be read under, not a constant: a block that fits
+    /// the host's limits and was fully delivered must not be emitted a second time.
+    #[test]
+    fn a_run_reducer_keeps_what_its_limits_can_deliver() {
+        use mango_external_agents::{Limits, LineLimits};
+
+        let line = |max_line_bytes, max_buffered_bytes| Limits {
+            line: LineLimits {
+                max_line_bytes,
+                max_buffered_bytes,
+            },
+            ..Limits::default()
+        };
+        for (limits, block_bytes) in [
+            (Limits::default(), 2 * 1024 * 1024),
+            // Repairing invalid UTF-8 triples a raw line, within the buffered budget.
+            (line(1024 * 1024, 8 * 1024 * 1024), 3 * 1024 * 1024),
+            (line(4 * 1024 * 1024, 3 * 1024 * 1024), 3 * 1024 * 1024),
+            (line(1024, 3 * 1024 * 1024), 3 * 1024),
+        ] {
+            let block = "x".repeat(block_bytes);
+            let mut reducer = TurnReducer::for_limits(&limits);
+            stream_text(&mut reducer, &[block.as_str()]);
+            let completed = reduce(&mut reducer, &completed_line("text", &block));
+            assert!(
+                completed.is_empty(),
+                "expected a {block_bytes}-byte block to be deduplicated under {limits:?}, received {} events",
+                completed.len()
+            );
+        }
+
+        // Nothing longer than the buffered budget can be read, whatever the line limit says.
+        for limits in [line(16, 16), line(4 * 1024 * 1024, 16)] {
+            let mut reducer = TurnReducer::for_limits(&limits);
+            stream_text(&mut reducer, &["seventeen bytes!!"]);
+            assert_eq!(
+                reducer.retained_text_capacity(),
+                0,
+                "expected no text kept past the 16 bytes {limits:?} can deliver"
+            );
+        }
     }
 
     #[test]

@@ -15,7 +15,8 @@
 //!   `item/agentMessage/delta` frames and again, whole, on `item/completed`. Rendering both would
 //!   double the answer, and rendering only the deltas drops a message that was never streamed —
 //!   which a resumed conversation can deliver. The completion therefore adds exactly the text its
-//!   deltas did not.
+//!   deltas did not. The streamed text is kept only while a completion could still begin with it;
+//!   see [`TurnReducerBuilder::max_message_bytes`].
 //!
 //! - **The vendor's error code.** The documented failure order is an `error` notification carrying
 //!   `codexErrorInfo`, then `turn/completed` with status `failed`. A completion that names no code
@@ -26,6 +27,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+use mango_external_agents::Limits;
 use mango_external_agents::event::{ActivityUpdate, EventKind};
 
 use crate::activity;
@@ -71,9 +73,83 @@ pub const ACTIVITY_UPDATE_DETAIL_MAX_CHARS: usize = 2_000;
 pub struct TurnReducer {
     activities: HashMap<String, OpenActivity>,
     /// The answer text already emitted per message item, until that item completes.
-    streamed: HashMap<String, String>,
+    streamed: HashMap<String, Streamed>,
+    /// The most streamed text kept for one message; `None` keeps all of it.
+    max_message_bytes: Option<usize>,
     /// The vendor code of the last error report the server did not mean to retry.
     reported_code: Option<String>,
+}
+
+/// What the deltas of one message item delivered, for the completion to be compared against.
+#[derive(Debug)]
+enum Streamed {
+    /// Every byte delivered so far.
+    Text(String),
+    /// More was delivered than [`TurnReducerBuilder::max_message_bytes`] allows, so the text was
+    /// dropped: no completion the transport can deliver begins with that much text.
+    Overflowed,
+}
+
+impl Streamed {
+    /// Appends one delta, dropping the text once it passes `bound`.
+    fn push(&mut self, delta: &str, bound: Option<usize>) {
+        let Self::Text(text) = self else {
+            return;
+        };
+        if bound.is_some_and(|bound| text.len().saturating_add(delta.len()) > bound) {
+            // Assigning drops the buffer, capacity included; clearing it would keep the memory.
+            *self = Self::Overflowed;
+            return;
+        }
+        text.push_str(delta);
+    }
+}
+
+/// Configures a [`TurnReducer`].
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_codex::turn_reducer::TurnReducer;
+///
+/// let turn = TurnReducer::builder()
+///     .max_message_bytes(2 * 1024 * 1024)
+///     .build();
+/// # let _ = turn;
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+#[must_use]
+pub struct TurnReducerBuilder {
+    max_message_bytes: Option<usize>,
+}
+
+impl TurnReducerBuilder {
+    /// The most decoded bytes one completed message can arrive in, and so the most streamed text
+    /// worth keeping for it.
+    ///
+    /// A completed message is delivered inside one inbound frame, and the transport refuses a
+    /// frame past its limit, so a message whose deltas already passed that limit can never be the
+    /// prefix of a completion. Its text is dropped rather than held until the item completes, and
+    /// the completion of such a message is emitted whole, which is what a rewrite does anyway. A
+    /// bound below what the transport delivers would emit a fully streamed message twice.
+    ///
+    /// A session passes the most a decoded stdio line can hold under its `Limits::line`: the raw
+    /// line is at most `max_line_bytes`, repairing invalid UTF-8 can triple it, and the repaired
+    /// line still has to fit in `max_buffered_bytes`. Without a bound, which is what
+    /// [`TurnReducer::new`] builds, a message's streamed text is kept whole until it completes.
+    pub fn max_message_bytes(mut self, bytes: usize) -> Self {
+        self.max_message_bytes = Some(bytes);
+        self
+    }
+
+    /// A turn nothing has been announced for yet.
+    #[must_use]
+    pub fn build(self) -> TurnReducer {
+        TurnReducer {
+            max_message_bytes: self.max_message_bytes,
+            ..TurnReducer::default()
+        }
+    }
 }
 
 /// One activity the host was told about and has not seen complete.
@@ -100,6 +176,33 @@ impl TurnReducer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configures a reducer; see [`TurnReducerBuilder`].
+    pub fn builder() -> TurnReducerBuilder {
+        TurnReducerBuilder::default()
+    }
+
+    /// The reducer for a session that reads its connection under `limits`.
+    ///
+    /// This harness reads its app-server over stdio, where a message reaches the reducer decoded,
+    /// in one line: at most `max_line_bytes` as the vendor wrote it, at most three times that once
+    /// each invalid byte is repaired to a 3-byte U+FFFD, and never more than `max_buffered_bytes`,
+    /// which the repaired line is counted against.
+    ///
+    /// The bound equals the largest decoded stdio line only because this harness is stdio-only. On
+    /// a websocket the limit applies to the decoded message against `max_line_bytes` alone (see
+    /// `SocketReceiver::bounded` in the websocket transport), so a websocket transport would need
+    /// its own bound rather than this one.
+    pub(crate) fn for_limits(limits: &Limits) -> Self {
+        let line = &limits.line;
+        Self::builder()
+            .max_message_bytes(
+                line.max_line_bytes
+                    .saturating_mul(3)
+                    .min(line.max_buffered_bytes),
+            )
+            .build()
     }
 
     /// Reduces one announcement for the active turn, remembering what later ones depend on.
@@ -171,10 +274,7 @@ impl TurnReducer {
         }
         if let (Notification::AgentMessageDelta(delta), Outcome::Emit(_)) = (notification, &outcome)
         {
-            self.streamed
-                .entry(delta.item_id.clone())
-                .or_default()
-                .push_str(&delta.delta);
+            self.remember_streamed(&delta.item_id, &delta.delta);
         }
         self.observe(&outcome);
         outcome
@@ -186,14 +286,40 @@ impl TurnReducer {
     /// message and the whole of it is emitted, as the TypeScript adapter did: a correction is
     /// worth more than avoiding a repeat.
     fn completed_message(&mut self, item_id: &str, text: &str) -> Outcome {
-        let streamed = self.streamed.remove(item_id).unwrap_or_default();
-        let remainder = text.strip_prefix(streamed.as_str()).unwrap_or(text);
+        let remainder = match self.streamed.remove(item_id) {
+            Some(Streamed::Text(streamed)) => text.strip_prefix(streamed.as_str()).unwrap_or(text),
+            Some(Streamed::Overflowed) | None => text,
+        };
         if remainder.is_empty() {
             return Outcome::Ignore;
         }
         Outcome::Emit(vec![EventKind::TextDelta {
             text: remainder.to_owned(),
         }])
+    }
+
+    /// Adds one emitted delta to the text its message item has delivered.
+    fn remember_streamed(&mut self, item_id: &str, delta: &str) {
+        let bound = self.max_message_bytes;
+        if let Some(streamed) = self.streamed.get_mut(item_id) {
+            streamed.push(delta, bound);
+            return;
+        }
+        let mut streamed = Streamed::Text(String::new());
+        streamed.push(delta, bound);
+        self.streamed.insert(item_id.to_owned(), streamed);
+    }
+
+    /// The capacity of every streamed text still kept, for tests of what is retained.
+    #[cfg(test)]
+    fn retained_text_capacity(&self) -> usize {
+        self.streamed
+            .values()
+            .map(|streamed| match streamed {
+                Streamed::Text(text) => text.capacity(),
+                Streamed::Overflowed => 0,
+            })
+            .sum()
     }
 
     /// Tracks which activities are open, from what the pure reducer decided to emit.
@@ -557,6 +683,172 @@ mod tests {
         assert_eq!(
             reduce_at(&mut turn, &message_completed("m", "done"), at),
             Outcome::Ignore
+        );
+    }
+
+    /// A turn whose messages keep at most `bound` streamed bytes each.
+    fn bounded(bound: usize) -> TurnReducer {
+        TurnReducer::builder().max_message_bytes(bound).build()
+    }
+
+    fn stream(turn: &mut TurnReducer, item_id: &str, deltas: &[&str]) {
+        let at = tokio::time::Instant::now();
+        for delta in deltas {
+            let outcome = reduce_at(turn, &message_delta(item_id, delta), at);
+            assert_eq!(
+                text_of(&outcome),
+                *delta,
+                "expected the delta to reach the host whatever is kept for the completion"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_text_past_the_bound_is_not_kept_for_the_completion() {
+        let mut turn = bounded(8);
+        stream(&mut turn, "m", &["1234", "5678"]);
+        assert!(
+            turn.retained_text_capacity() >= 8,
+            "expected the text within the bound to be kept, received {} bytes of capacity",
+            turn.retained_text_capacity()
+        );
+        stream(
+            &mut turn,
+            "m",
+            &["9", "more text the completion can never repeat"],
+        );
+        assert_eq!(
+            turn.retained_text_capacity(),
+            0,
+            "expected no text kept past the bound of 8 bytes, received {} bytes of capacity",
+            turn.retained_text_capacity()
+        );
+    }
+
+    #[test]
+    fn a_message_of_exactly_the_bound_is_still_deduplicated() {
+        let at = tokio::time::Instant::now();
+        let mut turn = bounded(8);
+        stream(&mut turn, "m", &["1234", "5678"]);
+        assert_eq!(
+            reduce_at(&mut turn, &message_completed("m", "12345678"), at),
+            Outcome::Ignore,
+            "expected a message of exactly the bound to add nothing on completion"
+        );
+
+        stream(&mut turn, "n", &["1234", "5678"]);
+        let completed = reduce_at(&mut turn, &message_completed("n", "12345678 tail"), at);
+        assert_eq!(
+            text_of(&completed),
+            " tail",
+            "expected only the text the deltas left out"
+        );
+    }
+
+    /// The vendor may correct a message it already streamed, and the correction can be shorter
+    /// than what the deltas delivered. The completion is the whole message either way.
+    #[test]
+    fn a_rewrite_shorter_than_what_streamed_is_emitted_whole_past_the_bound() {
+        let at = tokio::time::Instant::now();
+        for bound in [4, 4096] {
+            let mut turn = bounded(bound);
+            stream(
+                &mut turn,
+                "m",
+                &["a long first draft, ", "that is then rewritten"],
+            );
+            let completed = reduce_at(&mut turn, &message_completed("m", "rewritten"), at);
+            assert_eq!(
+                text_of(&completed),
+                "rewritten",
+                "expected the rewrite whole with a bound of {bound}"
+            );
+        }
+    }
+
+    /// A transport that delivers larger frames has to be able to deduplicate larger messages, so
+    /// the bound is what the builder was given rather than a constant.
+    #[test]
+    fn a_message_larger_than_the_default_line_limit_is_deduplicated_under_a_larger_bound() {
+        let at = tokio::time::Instant::now();
+        let two_mib = "x".repeat(2 * 1024 * 1024);
+        let mut turn = bounded(4 * 1024 * 1024);
+        stream(&mut turn, "m", &[two_mib.as_str()]);
+        assert_eq!(
+            reduce_at(&mut turn, &message_completed("m", &two_mib), at),
+            Outcome::Ignore,
+            "expected a fully streamed message under a 4 MiB bound to add nothing"
+        );
+    }
+
+    /// What a session keeps is what its connection can deliver, not a constant: a message that
+    /// fits the host's limits and fully streamed must not be emitted a second time.
+    #[test]
+    fn a_session_reducer_keeps_what_its_limits_can_deliver() {
+        use mango_external_agents::{Limits, LineLimits};
+
+        let at = tokio::time::Instant::now();
+        let line = |max_line_bytes, max_buffered_bytes| Limits {
+            line: LineLimits {
+                max_line_bytes,
+                max_buffered_bytes,
+            },
+            ..Limits::default()
+        };
+        for (limits, message_bytes) in [
+            (Limits::default(), 2 * 1024 * 1024),
+            // Repairing invalid UTF-8 triples a raw line, within the buffered budget.
+            (line(1024 * 1024, 8 * 1024 * 1024), 3 * 1024 * 1024),
+            (line(4 * 1024 * 1024, 3 * 1024 * 1024), 3 * 1024 * 1024),
+            (line(1024, 3 * 1024 * 1024), 3 * 1024),
+        ] {
+            let message = "x".repeat(message_bytes);
+            let mut turn = TurnReducer::for_limits(&limits);
+            stream(&mut turn, "m", &[message.as_str()]);
+            assert_eq!(
+                reduce_at(&mut turn, &message_completed("m", &message), at),
+                Outcome::Ignore,
+                "expected a {message_bytes}-byte message to be deduplicated under {limits:?}"
+            );
+        }
+
+        // Nothing longer than the buffered budget can be read, whatever the line limit says.
+        for limits in [line(16, 16), line(4 * 1024 * 1024, 16)] {
+            let mut turn = TurnReducer::for_limits(&limits);
+            stream(&mut turn, "m", &["seventeen bytes!!"]);
+            assert_eq!(
+                turn.retained_text_capacity(),
+                0,
+                "expected no text kept past the 16 bytes {limits:?} can deliver"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reducer_without_a_bound_keeps_every_message_whole() {
+        let at = tokio::time::Instant::now();
+        let mut turn = TurnReducer::new();
+        stream(&mut turn, "m", &["a message ", "of any length"]);
+        assert_eq!(
+            reduce_at(
+                &mut turn,
+                &message_completed("m", "a message of any length"),
+                at
+            ),
+            Outcome::Ignore
+        );
+    }
+
+    #[test]
+    fn every_message_item_has_its_own_bound() {
+        let at = tokio::time::Instant::now();
+        let mut turn = bounded(8);
+        stream(&mut turn, "long", &["0123456789"]);
+        stream(&mut turn, "short", &["12", "34"]);
+        assert_eq!(
+            reduce_at(&mut turn, &message_completed("short", "1234"), at),
+            Outcome::Ignore,
+            "expected the short message to be deduplicated beside an overflowed one"
         );
     }
 

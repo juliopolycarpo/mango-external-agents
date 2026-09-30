@@ -124,6 +124,46 @@ fn names(commands: &[Command]) -> Vec<&str> {
         .collect()
 }
 
+mod bounding_what_a_block_delivered {
+    use super::*;
+
+    /// Every record of a transcript through `reducer`, as the turn loop feeds it.
+    fn events_of(transcript: &str, mut reducer: TurnReducer) -> Vec<EventKind> {
+        transcript
+            .lines()
+            .filter_map(StreamRecord::parse)
+            .flat_map(|record| reducer.reduce(&record).events)
+            .collect()
+    }
+
+    /// The bound only drops text no completed block could have repeated, so a recorded turn reads
+    /// the same with it as without it.
+    #[test]
+    fn leaves_every_recorded_turn_byte_identical() {
+        let default_bound = 2 * 1024 * 1024;
+        for (name, transcript) in [
+            ("read-turn", READ_TURN),
+            ("denied-write-turn", DENIED_WRITE),
+        ] {
+            let unbounded = events_of(transcript, TurnReducer::new());
+            let bounded = events_of(
+                transcript,
+                TurnReducer::builder()
+                    .max_message_bytes(default_bound)
+                    .build(),
+            );
+            assert!(
+                !unbounded.is_empty(),
+                "expected {name} to produce events, received none"
+            );
+            assert_eq!(
+                bounded, unbounded,
+                "expected {name} to read the same under a bound of {default_bound} bytes"
+            );
+        }
+    }
+}
+
 mod on_a_recorded_read_a_file_turn {
     use super::*;
 

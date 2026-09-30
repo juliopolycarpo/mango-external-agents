@@ -2601,6 +2601,61 @@ mod a_turn {
         );
     }
 
+    /// What the turn keeps of a streamed block follows the host's limits, not the defaults.
+    ///
+    /// A host that raised `Limits::line` reads lines the default limits would refuse, so a block it
+    /// streamed in full and then completed with the same text is one delivery. A session that
+    /// built its reducer from the default limits would drop the streamed text at 2 MiB and emit
+    /// the completed block a second time.
+    #[tokio::test]
+    async fn delivers_a_block_larger_than_the_default_bound_once_under_raised_line_limits() {
+        let block = "x".repeat(3 * 1024 * 1024);
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(&format!(
+            r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{block}"}}}}}}
+{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{block}"}}]}}}}
+{{"type":"result","is_error":false}}
+"#
+        ))));
+        let host = host_under(
+            launcher,
+            Limits {
+                line: LineLimits {
+                    max_line_bytes: 4 * 1024 * 1024,
+                    max_buffered_bytes: 16 * 1024 * 1024,
+                },
+                ..Limits::default()
+            },
+        );
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "say a lot"))
+            .await
+            .expect("expected a turn");
+
+        let events = drain(&mut turn).await;
+
+        let text_events: Vec<usize> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventKind::TextDelta { text } => Some(text.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_events,
+            vec![block.len()],
+            "expected the block delivered once | received text events of these lengths: {text_events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(EventKind::Completed)),
+            "expected the turn to complete | received {:?}",
+            events.last()
+        );
+    }
+
     /// `close` while a turn's process is still being spawned waits for the late child to stop.
     #[tokio::test]
     async fn refuses_a_turn_whose_session_closed_while_its_process_was_starting() {
