@@ -1616,6 +1616,38 @@ pub(crate) async fn wait_for_turn_release(
         })
 }
 
+impl Drop for AcpSession {
+    /// Ends a running turn's child when the last session handle disappears.
+    ///
+    /// The prompt task owns the connection while a turn runs, so releasing the handle does not wind
+    /// the connection down: a host that keeps the stream and drops the session would leave the agent
+    /// running, with nobody left to answer its questions. This records `Shutdown` as the turn's
+    /// reason, withdraws its parked questions and starts the connection's single-flight shutdown,
+    /// which `begin_shutdown` spawns on the runtime the connection was driven on, so a drop from a
+    /// thread with no runtime still ends the child. The prompt task then writes the terminal and the
+    /// connection watcher publishes `Closed` after it.
+    ///
+    /// An idle session keeps its existing teardown (its watcher reaps once the connection is
+    /// released), and an explicit `close` owns everything when one has started.
+    ///
+    /// ```ignore
+    /// drop(session); // the held `TurnStream` now ends as `Cancelled { reason: Shutdown }`
+    /// ```
+    fn drop(&mut self) {
+        if self.close.is_started() {
+            return;
+        }
+        let cancelling = {
+            let _starting = self.connection_state.lock_turn_start();
+            self.connection_state
+                .begin_cancellation(CancelReason::Shutdown)
+        };
+        if cancelling {
+            self.connection.begin_shutdown(CancelReason::Shutdown);
+        }
+    }
+}
+
 impl AcpSession {
     /// The two ids, for a caller holding a concrete session.
     #[must_use]
