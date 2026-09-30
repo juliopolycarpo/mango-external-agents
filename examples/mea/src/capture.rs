@@ -95,6 +95,17 @@ const SCENARIOS: &[Scenario] = &[
 /// Whatever the launcher or the vendor reported. A scenario that fails leaves the fixtures written
 /// so far in place: a partial capture is a diff to read, not a reason to lose the rest.
 pub async fn codex(out_dir: &Path, workspace: &Path) -> Result<()> {
+    let host = HostContext::builder()
+        .launcher(Arc::new(TokioLauncher::new()))
+        .cwd(workspace.to_path_buf())
+        .client_info("mea", env!("CARGO_PKG_VERSION"))
+        .environment(mango_external_agents::EnvSource::from_process())
+        .build()?;
+    codex_with(&host, out_dir, workspace).await
+}
+
+/// [`codex`] on a host the caller built, so a test can inject its own launcher.
+async fn codex_with(host: &HostContext, out_dir: &Path, workspace: &Path) -> Result<()> {
     std::fs::create_dir_all(out_dir).map_err(|error| Error::HostConfiguration {
         expected: "a writable fixture directory",
         received: error.to_string(),
@@ -102,7 +113,7 @@ pub async fn codex(out_dir: &Path, workspace: &Path) -> Result<()> {
 
     for scenario in SCENARIOS {
         println!("capturing codex/{}: {}", scenario.name, scenario.purpose);
-        let recorded = record(scenario, workspace).await?;
+        let recorded = record(host, scenario, workspace).await?;
         let path = out_dir.join(format!("{}.jsonl", scenario.name));
         std::fs::write(&path, recorded).map_err(|error| Error::HostConfiguration {
             expected: "a writable fixture file",
@@ -114,16 +125,14 @@ pub async fn codex(out_dir: &Path, workspace: &Path) -> Result<()> {
 }
 
 /// One scenario, as the lines both sides wrote.
-async fn record(scenario: &Scenario, workspace: &Path) -> Result<String> {
-    let host = HostContext::builder()
-        .launcher(Arc::new(TokioLauncher::new()))
-        .cwd(workspace.to_path_buf())
-        .client_info("mea", env!("CARGO_PKG_VERSION"))
-        .environment(mango_external_agents::EnvSource::from_process())
-        .build()?;
-
+///
+/// A child that cannot be reaped fails the capture even when the conversation succeeded: the
+/// fixture is not affected, but a `codex app-server` left running on the maintainer's machine is
+/// not something to report as a clean run. When the conversation failed too, that error is the one
+/// returned and the cleanup failure is printed beside it.
+async fn record(host: &HostContext, scenario: &Scenario, workspace: &Path) -> Result<String> {
     let transport = stdio::open(
-        &host,
+        host,
         &StdioSpec::new(["codex", "app-server"]),
         &ExecutablePath::default(),
         &["CODEX_HOME"],
@@ -140,12 +149,25 @@ async fn record(scenario: &Scenario, workspace: &Path) -> Result<String> {
     };
 
     let outcome = recorder.run(scenario).await;
-    let _ = transport
+    let stopped = transport
         .control
         .kill(mango_external_agents::CancelReason::Shutdown)
         .await;
-    outcome?;
-    Ok(recorder.lines.join("\n") + "\n")
+    match outcome {
+        Ok(()) => {
+            stopped?;
+            Ok(recorder.lines.join("\n") + "\n")
+        }
+        Err(error) => {
+            if let Err(cleanup) = stopped {
+                eprintln!(
+                    "codex/{}: the app-server was not reaped: {cleanup}",
+                    scenario.name
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 /// A conversation being written down as it happens.
@@ -479,8 +501,186 @@ fn review_target(scenario: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{review_target, thread_start_params, unconfigured_turn_params};
-    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{
+        SCENARIOS, Scenario, codex_with, record, review_target, thread_start_params,
+        unconfigured_turn_params,
+    };
+    use mango_external_agents::process::{
+        LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
+    };
+    use mango_external_agents::testing::{FakeLauncher, FakeProcess};
+    use mango_external_agents::{CancelReason, EnvSource, Error, ExitStatus, HostContext, Result};
+    use serde_json::{Value, json};
+
+    /// A Codex app-server that answers every request, and names a thread for `thread/start`.
+    fn app_server() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            let Ok(frame) = serde_json::from_str::<Value>(line) else {
+                return Vec::new();
+            };
+            let (Some(_), Some(id)) = (frame.get("method"), frame.get("id")) else {
+                return Vec::new();
+            };
+            vec![json!({"id": id, "result": {"thread": {"id": "thread-1"}}}).to_string()]
+        })
+    }
+
+    /// A launcher whose children end on a kill but report that they could not be reaped.
+    struct UnreapableLauncher {
+        inner: Arc<FakeLauncher>,
+    }
+
+    struct UnreapableControl {
+        inner: Arc<dyn ProcessControl>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for UnreapableLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+            let process = self.inner.spawn(spec).await?;
+            Ok(ManagedProcess {
+                stdout: process.stdout,
+                stdin: process.stdin,
+                control: Arc::new(UnreapableControl {
+                    inner: process.control,
+                }),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for UnreapableControl {
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.inner.stderr_tail()
+        }
+
+        async fn wait(&self) -> Result<ExitStatus> {
+            self.inner.wait().await
+        }
+
+        async fn kill(&self, reason: CancelReason) -> Result<()> {
+            self.inner.kill(reason).await?;
+            Err(Error::Timeout {
+                operation: String::from("reaping the fake app-server"),
+                after: Duration::from_secs(2),
+            })
+        }
+    }
+
+    fn host(launcher: Arc<dyn ProcessLauncher>) -> HostContext {
+        HostContext::builder()
+            .launcher(launcher)
+            .cwd(std::env::temp_dir())
+            .environment(EnvSource::from_pairs([("PATH", "/fake/bin")]))
+            .client_info("mea-test", "0.0.0")
+            .build()
+            .expect("expected a fake capture host")
+    }
+
+    fn handshake() -> &'static Scenario {
+        SCENARIOS
+            .iter()
+            .find(|scenario| scenario.name == "handshake")
+            .expect("expected a handshake scenario")
+    }
+
+    fn unreapable(launcher: &Arc<FakeLauncher>) -> Arc<UnreapableLauncher> {
+        Arc::new(UnreapableLauncher {
+            inner: Arc::clone(launcher),
+        })
+    }
+
+    #[tokio::test]
+    async fn record_returns_the_transcript_when_the_child_is_reaped() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(app_server());
+
+        let recorded = record(&host(launcher.clone()), handshake(), &std::env::temp_dir())
+            .await
+            .expect("expected a reaped capture to succeed");
+
+        assert!(
+            recorded.contains("account/read"),
+            "expected a transcript that reads the account | received {recorded}"
+        );
+        assert_eq!(launcher.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn record_fails_when_the_child_cannot_be_reaped() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(app_server());
+
+        let result = record(
+            &host(unreapable(&launcher)),
+            handshake(),
+            &std::env::temp_dir(),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(Error::Timeout { operation, .. }) if operation.contains("reaping")),
+            "expected a capture error naming the reap failure | received {result:?}"
+        );
+        assert_eq!(
+            launcher.live_children(),
+            0,
+            "expected the child to be ended before the reap failure is reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_conversation_keeps_its_own_error_when_the_reap_fails_too() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(app_server());
+        let scenario = Scenario {
+            name: "unknown",
+            purpose: "a scenario this command does not know",
+        };
+
+        let result = record(
+            &host(unreapable(&launcher)),
+            &scenario,
+            &std::env::temp_dir(),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(Error::HostConfiguration { received, .. }) if received == "unknown"),
+            "expected the conversation's own error | received {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_capture_writes_no_fixture_when_the_child_cannot_be_reaped() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(app_server());
+        let out = std::env::temp_dir().join(format!("mea-capture-unreaped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+
+        let result = codex_with(&host(unreapable(&launcher)), &out, &std::env::temp_dir()).await;
+
+        let written: Vec<_> = std::fs::read_dir(&out)
+            .expect("expected the fixture directory to exist")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .collect();
+        std::fs::remove_dir_all(&out).expect("expected temporary capture cleanup");
+        assert!(
+            result.is_err(),
+            "expected the capture to fail | received {result:?}"
+        );
+        assert!(
+            written.is_empty(),
+            "expected no fixture after an unreaped child | received {written:?}"
+        );
+    }
 
     #[test]
     fn review_scenarios_use_the_documented_targets() {

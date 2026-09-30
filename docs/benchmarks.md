@@ -29,6 +29,7 @@ with `-` filter cases by substring; flags such as `--bench` are ignored.
 | `mango-external-agents` / `copies`    | `Client` dispatch of prebuilt frames through a scripted link (1 KiB notification, 500 KB diff notification, 500 KB and error responses); `stdio::open` link sends of 1 KiB and 1 MiB messages into a counting sink                                                                                                                                                                                                                                                                                     |
 | `mango-agent-acp` / `reducer`         | `Reducer::update_at` on tool-call frames: ten 100 KiB diffs as a new call, as an update and as a completion; a 1 MiB image ahead of a text block; a 1 MiB text body; and the frames most agents send (two 2 KiB diffs, a short text)                                                                                                                                                                                                                                                                   |
 | `mango-agent-codex` / `pipeline`      | Per stage and end to end: raw line to JSON, `Notification::parse`, `TurnReducer::reduce`, emit, drain, serialize. 1 KiB text deltas; 500 KB patch updates (throttled and emitted); a file change started and completed; command output inside the throttle window; every captured Codex transcript                                                                                                                                                                                                     |
+| `hub-host` / `retry`                  | `Supervisor::run` re-sending an 8 MiB, 2 MiB, 1 MiB or attachment-free request after `NotSubmitted` answers (1 or 3 re-sends), on a paused clock so backoff costs nothing; the process's peak resident set is printed after the cases                                                                                                                                                                                                                                                                  |
 | `mango-agent-claude` / `tool_results` | `TurnReducer::reduce` closing a call: a `tool_result` record with a string payload (1 MiB, 32 KiB) or an array of text blocks (1 MiB in one block and in 100 blocks, 12 KiB and 32 KiB in one block, 6 KiB and 600 bytes in three); starting a `Write` (16 KiB, 200 KiB) or an `Edit` (two 2 KiB or two 100-byte strings) call; 1000 subagent text blocks of 1 KiB forwarded under one `Task`                                                                                                          |
 
 Reading the output: one line per case with the median, minimum, maximum, coefficient of variation
@@ -54,10 +55,14 @@ instead of criterion or divan:
 - No dependency enters the lockfile, so `cargo deny`, the TLS check and the MSRV lane are
   untouched, and nothing enters the published dependency graph.
 - It prints raw samples, which a review can recompute from; it makes no statistical claim.
-- The library crates set `bench = false` on their `[lib]` target so `cargo bench` skips their unit
-  tests. The Codex, ACP and Claude copies of the runner are byte-identical to the core one because a
-  published crate cannot package a file from another crate; change all four together. `scripts/check-bench-runner.sh` fails
-  `scripts/check.sh` and CI's Policy lane when they differ, and `scripts/bench.sh` runs it first.
+- The library crates, and the `hub-host` reference host, set `bench = false` on their `[lib]` target
+  so `cargo bench` skips their unit tests. The Codex, ACP, Claude and `hub-host` copies of the
+  runner are byte-identical to the core one because a published crate cannot package a file from
+  another crate; change every copy together. `scripts/check-bench-runner.sh` lists them and fails
+  `scripts/check.sh` and CI's Policy lane when they differ, `scripts/test-bench-runner.sh` fails if
+  a tracked copy is missing from that list, and `scripts/bench.sh` runs the check first. The
+  runner's own tests, such as the `BENCH_SAMPLES` validation, run under `cargo nextest` through
+  `examples/hub-host/tests/bench_runner.rs`, since a bench target cannot run `#[test]`s.
 
 Allocation counts are not measured. A counting global allocator needs `unsafe`, which the
 workspace forbids. To find allocations, use a profiler on the bench binary
@@ -114,8 +119,8 @@ produce, is closed or dropped with these numbers, not merged on an assumed gain.
   times the `Ignore` path measures nothing.
 - Build a fresh reducer or sink per sample. Reducers keep per-message state and a sink refuses
   events once it hits its budget, so a shared one changes the workload as it runs.
-- A crate without benches yet (`examples/hub-host`) gets
-  its own `benches/` directory with a copy of `support/mod.rs` (listed in `scripts/check-bench-runner.sh`), a `[[bench]]` entry with
+- A crate without benches yet gets its own `benches/` directory with a copy of `support/mod.rs`
+  (listed in `scripts/check-bench-runner.sh`; `examples/hub-host` is the unpublished example), a `[[bench]]` entry with
   `harness = false` and `required-features` for anything feature-gated, and no new dependency that
   is not already in `Cargo.lock`. Run `cargo clippy --workspace --all-targets --all-features -- -D
   warnings` afterwards, since that command compiles bench targets.

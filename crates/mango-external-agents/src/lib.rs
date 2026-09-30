@@ -49,7 +49,7 @@ pub use error::{Error, ErrorCode, Result, VendorError};
 pub use event::{
     AccountLimits, Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
     AgentEvent, Command, Credits, EventKind, RESET_CREDIT_MAX_ITEMS, RateLimitWindow, ResetCredit,
-    ResetCredits, SessionId, SpendControl, ThreadUsage, TurnId, Usage,
+    ResetCredits, SessionId, SpendControl, StructureClose, ThreadUsage, TurnId, Usage,
 };
 pub use extension::{ExtensionValue, Extensions};
 pub use harness::{
