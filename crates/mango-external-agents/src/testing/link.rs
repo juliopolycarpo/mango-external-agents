@@ -1,5 +1,6 @@
 //! A link driven from a script, with no process and no socket behind it.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Notify;
@@ -33,6 +34,7 @@ struct ScriptState {
     sent: Mutex<Vec<String>>,
     ended: Mutex<bool>,
     send_failure: Mutex<Option<String>>,
+    refused: AtomicUsize,
     changed: Notify,
 }
 
@@ -80,6 +82,25 @@ impl ScriptedLink {
             .clone()
     }
 
+    /// How many sends the link refused, because it was closed or because [`ScriptedLink::fail_sends`]
+    /// was set.
+    ///
+    /// [`ScriptedLink::sent`] counts only the writes that landed, so a test that needs to know a
+    /// write was attempted and refused reads this instead.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::testing::ScriptedLink;
+    ///
+    /// let link = ScriptedLink::new();
+    /// link.fail_sends("EPIPE");
+    /// assert_eq!(link.refused_sends(), 0);
+    /// ```
+    pub fn refused_sends(&self) -> usize {
+        self.state.refused.load(Ordering::Acquire)
+    }
+
     /// Waits until at least `count` messages have been sent.
     ///
     /// For the ordinary shape of a protocol test: queue an answer only once the question is
@@ -121,6 +142,7 @@ impl LinkSender for ScriptedSender {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
         {
+            self.state.refused.fetch_add(1, Ordering::AcqRel);
             return Err(Error::Closed {
                 subject: "scripted link",
             });
@@ -132,6 +154,7 @@ impl LinkSender for ScriptedSender {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
         {
+            self.state.refused.fetch_add(1, Ordering::AcqRel);
             return Err(Error::Link {
                 peer: String::from("scripted link"),
                 message: failure,
@@ -261,6 +284,33 @@ mod tests {
             "received {error:?}"
         );
         assert_eq!(link.sent(), vec![String::from("one")]);
+    }
+
+    #[tokio::test]
+    async fn counts_the_sends_it_refused_apart_from_the_ones_it_recorded() {
+        let link = ScriptedLink::new();
+        let (mut sender, _) = link.clone().into_link().split();
+        sender
+            .send(String::from("lands"))
+            .await
+            .expect("expected the send to land");
+        assert_eq!(
+            (link.sent().len(), link.refused_sends()),
+            (1, 0),
+            "expected 1 recorded and 0 refused before any refusal"
+        );
+
+        link.fail_sends("EPIPE");
+        let _ = sender.send(String::from("failed")).await;
+        sender.close().await.expect("expected a clean close");
+        let _ = sender.send(String::from("closed")).await;
+        assert_eq!(
+            (link.sent().len(), link.refused_sends()),
+            (1, 2),
+            "expected 1 recorded and 2 refused (one failing, one closed) | received sent {} refused {}",
+            link.sent().len(),
+            link.refused_sends()
+        );
     }
 
     #[tokio::test]

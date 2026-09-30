@@ -2439,17 +2439,69 @@ mod tests {
         );
     }
 
-    /// Two replies failing together, and a close racing them, still end in one clean shutdown:
-    /// the reply path only signals, so nothing waits on the task that is waiting on it.
+    /// A handler whose answers are held until the test lets them go, the way an approval waits on
+    /// a person. `asked` counts the questions that reached it.
+    struct GatedAnswers {
+        asked: std::sync::atomic::AtomicUsize,
+        terminated: std::sync::atomic::AtomicUsize,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for GatedAnswers {
+        async fn on_notification(&self, _method: String, _params: Value) {}
+
+        async fn on_request(
+            &self,
+            _method: String,
+            _params: Value,
+            _id: RequestId,
+        ) -> ServerRequestOutcome {
+            self.asked.fetch_add(1, Ordering::AcqRel);
+            self.release.notified().await;
+            ServerRequestOutcome::Answer(json!({}))
+        }
+
+        async fn on_terminated(&self, _termination: PeerTermination) {
+            self.terminated.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Two replies failing together while a close races them still end in one clean shutdown: the
+    /// reply path only signals, so nothing waits on the task that is waiting on it.
+    ///
+    /// Both questions are held inside the handler until the replies are about to fail, so the
+    /// close arrives while answers are in flight and the reply writes are reached, not skipped.
     #[tokio::test]
     async fn failed_replies_racing_a_close_neither_deadlock_nor_terminate_twice() {
         let link = ScriptedLink::new();
-        let handler = RecordingHandler::arc(None);
-        let client = client(link.clone(), Arc::clone(&handler));
+        let gated = Arc::new(GatedAnswers {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+            terminated: std::sync::atomic::AtomicUsize::new(0),
+            release: Notify::new(),
+        });
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&gated) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_request_timeout(Duration::from_secs(5)),
+        );
         link.fail_sends("EPIPE");
         link.push_line(r#"{"jsonrpc":"2.0","id":1,"method":"item/requestApproval"}"#);
         link.push_line(r#"{"jsonrpc":"2.0","id":2,"method":"item/requestApproval"}"#);
+        let mut asked = 0;
+        for _ in 0..400 {
+            asked = gated.asked.load(Ordering::Acquire);
+            if asked == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            asked, 2,
+            "expected both questions held in the handler | received: {asked}"
+        );
 
+        gated.release.notify_waiters();
         let closed = tokio::time::timeout(Duration::from_secs(5), client.close())
             .await
             .expect("expected close to return while replies were failing");
@@ -2457,11 +2509,17 @@ mod tests {
             closed.is_ok(),
             "expected a clean close | received {closed:?}"
         );
+        assert_eq!(
+            link.refused_sends(),
+            2,
+            "expected both replies to reach the writer and be refused | received: {}",
+            link.refused_sends()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let total = handler.terminations.lock().await.len();
+        let terminated = gated.terminated.load(Ordering::Acquire);
         assert!(
-            total <= 1,
-            "expected at most one termination for a racing close | received: {total}"
+            terminated <= 1,
+            "expected at most one termination for a racing close | received: {terminated}"
         );
     }
 
