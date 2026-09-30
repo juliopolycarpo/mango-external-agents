@@ -528,9 +528,14 @@ impl Harness for AcpHarness {
         let opened = match handshake.await {
             Ok(opened) => opened,
             Err(error) => {
-                connection
-                    .shutdown(mango_external_agents::CancelReason::Requested)
-                    .await?;
+                // The reason the host's cleanup hook sees is the host's own token when that is
+                // what ended the open.
+                let reason = if host.cancel().is_cancelled() {
+                    mango_external_agents::CancelReason::Shutdown
+                } else {
+                    mango_external_agents::CancelReason::Requested
+                };
+                connection.shutdown(reason).await?;
                 return Err(error);
             }
         };
@@ -591,47 +596,30 @@ impl Harness for AcpHarness {
         );
         let close = session.close_state();
 
-        // Set only when the profile knows the agent's own id for the level *and* the agent
-        // advertised it. A mode this agent never offered is a refusal rather than a request it would
-        // reject mid-session.
-        if let Err(error) = self
-            .apply_mode(&session, &configuration, opened.modes.as_ref())
-            .await
-        {
-            // Closing the session rather than the connection alone: a session that exists on the
-            // agent's side and is about to be dropped on ours is a session to end, and `close` is
-            // what withdraws its pending questions and ends the child.
-            session
-                .close(mango_external_agents::CloseReason::Requested)
-                .await?;
-            return Err(error);
-        }
-
-        // `apply_mode` already established the profile-owned permission pair. Sending it through
-        // the option path again performs a second `session/set_mode` for no new state, so only
-        // negotiate catalog-backed settings here.
-        let mut options = request.configuration.clone();
-        options.level = mango_external_agents::ConfigurationChange::Keep;
-        options.routing = mango_external_agents::ConfigurationChange::Keep;
-        if !options.is_empty() {
-            let outcome = match session.configure_session(options).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    session
-                        .close(mango_external_agents::CloseReason::Requested)
-                        .await?;
-                    return Err(error);
-                }
-            };
-            if !outcome.is_complete() {
+        // The host's token ends the setup requests too: an agent that leaves `session/set_mode` or
+        // `session/set_config_option` unanswered would otherwise keep the child until the request
+        // timeout, because the watcher below is not running yet.
+        let setup = tokio::select! {
+            biased;
+            () = host.cancel().cancelled() => None,
+            setup = self.configure_opened_session(
+                &session,
+                &configuration,
+                opened.modes.as_ref(),
+                &request,
+            ) => Some(setup),
+        };
+        match setup {
+            None => {
                 session
-                    .close(mango_external_agents::CloseReason::Requested)
+                    .close(mango_external_agents::CloseReason::Shutdown)
                     .await?;
-                return Err(Error::HostConfiguration {
-                    expected: "every requested ACP session configuration option to be supported",
-                    received: String::from("a configuration option the agent did not accept"),
+                return Err(Error::Cancelled {
+                    reason: mango_external_agents::CancelReason::Shutdown,
                 });
             }
+            Some(Err(error)) => return Err(error),
+            Some(Ok(())) => {}
         }
 
         // An agent can die without anyone calling `close`: it exits, or its transport fails.
@@ -809,6 +797,58 @@ impl AcpHarness {
             )
             .await?;
         Ok((handshake, opened))
+    }
+
+    /// Applies the profile-owned mode and the requested catalog settings to a freshly opened session.
+    ///
+    /// Every refusal closes the session first, so the child never outlives a failed open.
+    async fn configure_opened_session(
+        &self,
+        session: &AcpSession,
+        configuration: &Configuration,
+        modes: Option<&SessionModeState>,
+        request: &OpenSession,
+    ) -> Result<()> {
+        // Set only when the profile knows the agent's own id for the level *and* the agent
+        // advertised it. A mode this agent never offered is a refusal rather than a request it would
+        // reject mid-session.
+        if let Err(error) = self.apply_mode(session, configuration, modes).await {
+            // Closing the session rather than the connection alone: a session that exists on the
+            // agent's side and is about to be dropped on ours is a session to end, and `close` is
+            // what withdraws its pending questions and ends the child.
+            session
+                .close(mango_external_agents::CloseReason::Requested)
+                .await?;
+            return Err(error);
+        }
+
+        // `apply_mode` already established the profile-owned permission pair. Sending it through
+        // the option path again performs a second `session/set_mode` for no new state, so only
+        // negotiate catalog-backed settings here.
+        let mut options = request.configuration.clone();
+        options.level = mango_external_agents::ConfigurationChange::Keep;
+        options.routing = mango_external_agents::ConfigurationChange::Keep;
+        if !options.is_empty() {
+            let outcome = match session.configure_session(options).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    session
+                        .close(mango_external_agents::CloseReason::Requested)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            if !outcome.is_complete() {
+                session
+                    .close(mango_external_agents::CloseReason::Requested)
+                    .await?;
+                return Err(Error::HostConfiguration {
+                    expected: "every requested ACP session configuration option to be supported",
+                    received: String::from("a configuration option the agent did not accept"),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Tells the agent which of its own modes to run in, when the profile knows one.

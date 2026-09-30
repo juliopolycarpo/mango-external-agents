@@ -350,3 +350,175 @@ async fn cancelling_with_an_approval_pending_settles_it_and_reaps_the_child() {
     assert_settles_closed(session.as_ref()).await;
     assert_children_reaped(&launcher).await;
 }
+
+/// A launcher whose children remember the reason every kill request carried, so a host's
+/// reason-sensitive cleanup hook can be shown the reason that actually ended the open.
+#[derive(Clone)]
+struct ReasonRecordingLauncher {
+    inner: FakeLauncher,
+    reasons: Arc<Mutex<Vec<CancelReason>>>,
+}
+
+impl ReasonRecordingLauncher {
+    fn new(inner: FakeLauncher) -> Self {
+        Self {
+            inner,
+            reasons: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn kill_reasons(&self) -> Vec<CancelReason> {
+        self.reasons
+            .lock()
+            .expect("expected recorded kill reasons")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for ReasonRecordingLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<ManagedProcess> {
+        let process = self.inner.spawn(spec).await?;
+        Ok(ManagedProcess {
+            control: Arc::new(ReasonRecordingControl {
+                inner: process.control,
+                reasons: Arc::clone(&self.reasons),
+            }),
+            ..process
+        })
+    }
+}
+
+struct ReasonRecordingControl {
+    inner: Arc<dyn ProcessControl>,
+    reasons: Arc<Mutex<Vec<CancelReason>>>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for ReasonRecordingControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.reasons
+            .lock()
+            .expect("expected recorded kill reasons")
+            .push(reason);
+        self.inner.kill(reason).await
+    }
+}
+
+/// The host's cleanup hook is told the host's own reason, not an ordinary request.
+#[tokio::test]
+async fn a_handshake_cancel_reaches_the_launcher_as_a_shutdown() {
+    let inner = FakeLauncher::new();
+    inner.push(FakeProcess::responding(|_| Vec::new()));
+    let launcher = ReasonRecordingLauncher::new(inner.clone());
+    let cancel = CancelToken::new();
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .cancel(cancel.clone())
+        .build()
+        .expect("expected a host");
+
+    let harness = AcpHarness::new(profile());
+    let opening = harness.open_session(&host, OpenSession::new("handshake-reason"));
+    let canceller = async {
+        while inner.launches().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel.cancel();
+    };
+    let (opened, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(opening, canceller)
+    })
+    .await
+    .expect("expected the open to end after the host cancelled, received a pending open");
+
+    let _ = refusal(opened);
+    assert_children_reaped(&inner).await;
+    assert_eq!(
+        launcher.kill_reasons(),
+        vec![CancelReason::Shutdown],
+        "expected kill reasons: [Shutdown] | received: {:?}",
+        launcher.kill_reasons()
+    );
+}
+
+/// Cancels an open while the agent holds one setup request, then expects the open to end and the
+/// child to go, without waiting out the request timeout.
+async fn assert_cancel_ends_a_held_setup_request(
+    method: &'static str,
+    profile: Arc<AcpProfile>,
+    request: OpenSession,
+) {
+    let agent = HeldRequestAgent::new(method);
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process());
+    let cancel = CancelToken::new();
+    let host = cancellable_host(&launcher, &cancel);
+
+    let harness = AcpHarness::new(profile);
+    let opening = harness.open_session(&host, request);
+    let canceller = async {
+        agent.wait_until_entered().await;
+        cancel.cancel();
+    };
+    let (opened, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(opening, canceller)
+    })
+    .await
+    .expect("expected the open to end after the host cancelled, received a pending open");
+
+    let error = refusal(opened);
+    assert!(
+        matches!(error.cause(), Error::Cancelled { .. }),
+        "expected error: Cancelled | received: {error:?}"
+    );
+    assert_children_reaped(&launcher).await;
+}
+
+/// The watcher is not running while the profile's mode is being set, so the open observes the
+/// token itself.
+#[tokio::test]
+async fn cancelling_while_the_profile_mode_is_pending_refuses_the_open_and_reaps() {
+    let profile = Arc::new(
+        AcpProfile::custom("fake", ["fake-acp", "acp"], VENDOR).with_modes(SessionModeIds {
+            read_only: Some("plan"),
+            ..SessionModeIds::UNKNOWN
+        }),
+    );
+    assert_cancel_ends_a_held_setup_request(
+        "session/set_mode",
+        profile,
+        OpenSession::new("mode").with_configuration(at_level(PermissionLevel::ReadOnly)),
+    )
+    .await;
+}
+
+/// The same for a catalog-backed setting, which goes through `session/set_config_option`.
+#[tokio::test]
+async fn cancelling_while_a_setting_is_pending_refuses_the_open_and_reaps() {
+    assert_cancel_ends_a_held_setup_request(
+        "session/set_config_option",
+        profile(),
+        OpenSession::new("setting").with_configuration(
+            ConfigurationPatch::new().model(ConfigurationChange::Set(String::from("large"))),
+        ),
+    )
+    .await;
+}
