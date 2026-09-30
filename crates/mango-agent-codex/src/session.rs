@@ -2053,7 +2053,19 @@ impl CodexHandler {
         let Some(mut active_route) = active_route else {
             return;
         };
+        // Only this session's own thread can name the turn it is waiting for. The connection also
+        // carries a subagent's thread and a detached review's, whose frames name turns of their
+        // own, and until the start answer arrives there is no native id to tell them apart by.
+        // A frame with no thread is nobody's here: the malformed-terminal path that has to poison
+        // on one is the reducer's, below, and does not go through the claim.
+        let own_thread = notification.thread_id() == Some(self.shared.thread_id());
+        // The drop of a frame for a turn that already ended keeps applying to a frame with no
+        // thread too: a duplicate malformed terminal of a finished turn must not reach the reducer,
+        // where an unroutable terminal shuts the session down. Only another thread's frame is left
+        // to the reducer's routing.
+        let own_or_threadless = own_thread || notification.thread_id().is_none();
         if active_route.native_turn_id.is_empty()
+            && own_or_threadless
             && notification.requires_native_turn_match()
             && let Some(turn_id) = notification.turn_id()
             && self.shared.recently_completed(turn_id).await
@@ -2071,6 +2083,7 @@ impl CodexHandler {
         // response and from every later item and completion for the same review; claiming from
         // it here would announce a review under an id nothing else on its stream agrees with.
         if active_route.native_turn_id.is_empty()
+            && own_thread
             && notification.requires_native_turn_match()
             && let Some(turn_id) = notification.turn_id()
         {
@@ -4972,6 +4985,36 @@ mod tests {
         assert!(
             shared.turn.lock().await.is_some(),
             "expected the delayed terminal not to clear the pending start"
+        );
+    }
+
+    /// A duplicate of a finished turn's malformed terminal, with no thread, is dropped while a
+    /// start is pending, as it was before claims were scoped to the session's own thread. If it
+    /// reached the reducer it would be an unroutable terminal and shut the session down.
+    #[tokio::test]
+    async fn a_threadless_duplicate_of_a_completed_turns_terminal_is_dropped_not_poisoned() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        shared.remember_completed("vendor-turn-1").await;
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let (_turn_id, _pending_start) = running(&shared, "").await;
+
+        handler
+            .on_notification(
+                String::from("turn/completed"),
+                serde_json::json!({"turn": {"id": "vendor-turn-1", "status": 7}}),
+            )
+            .await;
+
+        assert!(
+            !shared.is_shutting_down(),
+            "expected a threadless duplicate for a completed turn to be dropped | received a poisoned session"
+        );
+        assert!(
+            shared.turn.lock().await.is_some(),
+            "expected the pending start to stay admitted"
         );
     }
 
