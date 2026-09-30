@@ -25,7 +25,7 @@ use mango_external_agents::{
     CancelReason, CancelToken, CloseReason, Configuration, ConfigurationState, Dispatch, Error,
     ErrorCode, EventKind, EventSink, ExecutablePath, HostContext, PermissionResponse, Result,
     SessionLifecycle, SessionState as CoreSessionState, SessionStatus, StdioSpec, StopOutcome,
-    TurnRequest, TurnStream, VendorError, event, transports::stdio,
+    StructureClose, TurnRequest, TurnStream, VendorError, event, transports::stdio,
 };
 use serde_json::json;
 
@@ -1561,8 +1561,14 @@ async fn pump(
             // teardown without discarding the confirmed resumable continuation.
             let _ = start_terminal_teardown(&shared, &end, &control, true);
         }
+        let mut room_for_closes = true;
         for event in reduction.events {
-            match sink.emit(event).await {
+            let emitted = if native_finished {
+                emit_run_end(&sink, event, &mut room_for_closes).await
+            } else {
+                sink.emit(event).await
+            };
+            match emitted {
                 Ok(()) => {}
                 // The host dropped the stream. There is nobody to tell, and a turn nobody is
                 // reading is a turn to stop feeding.
@@ -1608,6 +1614,40 @@ async fn pump(
     settle_owner(&shared, &end);
 }
 
+/// Emits one event of a run's end: the closes the reducer owes for what the run left open, the
+/// usage the vendor reported, then the terminal.
+///
+/// A close goes through [`EventSink::emit_close`], because a plain `emit` that finds the queue full
+/// commits a `stream-overflow` failure, and that failure would replace the cancellation, the
+/// completion or the vendor's own error the turn is about to end with. When the queue has no room
+/// the close is dropped and `room` remembers it: the refusal is sticky, so every later close and
+/// every later payload (the usage) is dropped too rather than left to overflow behind the hole.
+/// The terminal itself never needs room. A run that ends on a full queue therefore loses its
+/// closes and its usage, never its terminal.
+async fn emit_run_end(sink: &EventSink, event: EventKind, room: &mut bool) -> Result<()> {
+    let close = match event {
+        EventKind::ReasoningEnded => StructureClose::reasoning(),
+        EventKind::ActivityCompleted { call_id, result } => {
+            StructureClose::activity(call_id, result)
+        }
+        terminal @ (EventKind::Completed | EventKind::Error { .. }) => {
+            return sink.emit(terminal).await;
+        }
+        payload if *room => return sink.emit(payload).await,
+        _ => return Ok(()),
+    };
+    if !*room {
+        return Ok(());
+    }
+    match sink.emit_close(close).await {
+        Err(Error::LimitExceeded { .. }) => {
+            *room = false;
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// Writes the turn's terminal event, whichever way it ended, and reaps the child.
 async fn finish(
     shared: &Arc<Shared>,
@@ -1623,8 +1663,9 @@ async fn finish(
         // The vendor's own `result` already ended the turn. A cancel that arrived after it changes
         // nothing: the turn did finish.
     } else if let Some(&reason) = end.get() {
+        let mut room_for_closes = true;
         for event in reducer.cancel() {
-            let _ = sink.emit(event).await;
+            let _ = emit_run_end(sink, event, &mut room_for_closes).await;
         }
         let _ = sink.cancel(reason).await;
     } else {
@@ -1638,8 +1679,9 @@ async fn finish(
             .await
             .ok()
             .and_then(std::result::Result::ok);
+        let mut room_for_closes = true;
         for event in reducer.abort(no_result_error(failure, exit, control.stderr_tail())) {
-            let _ = sink.emit(event).await;
+            let _ = emit_run_end(sink, event, &mut room_for_closes).await;
         }
     }
     // What can still be running here is a background *Bash* task the run started — a dev server, a

@@ -4986,4 +4986,117 @@ mod ending_mid_thinking {
         events.extend(drain(&mut turn).await);
         assert_ended_once_before_terminal("cancel", &events);
     }
+
+    /// A turn whose queue is exactly full of what the model thought before the run ended: the
+    /// turn's start, the reasoning's start and one delta, under a capacity of three, read by
+    /// nobody until the run is over.
+    async fn events_of_a_full_queue(run: Run, cancel: bool) -> Vec<EventKind> {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(run));
+        let limits = Limits {
+            turn_channel_capacity: 3,
+            ..Limits::default()
+        };
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host_under(Arc::clone(&launcher) as Arc<dyn ProcessLauncher>, limits),
+                OpenSession::new("chat-1"),
+            )
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "think about it"))
+            .await
+            .expect("expected a turn");
+        // Paused time only advances once every task is idle, so this returns once the pump has
+        // read every scripted line and is waiting on the child.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if cancel {
+            session
+                .cancel(CancelReason::Requested)
+                .await
+                .expect("expected the cancel to land");
+        }
+        drain(&mut turn).await
+    }
+
+    /// What a host must be able to rely on when the queue has no room for the close: the turn's
+    /// own terminal still ends it, and the refused close never becomes the failure.
+    fn assert_terminal_survives_a_full_queue(path: &str, events: &[EventKind], terminal: &str) {
+        let last = events.last().map(|event| format!("{event:?}"));
+        assert!(
+            last.as_deref()
+                .is_some_and(|last| last.starts_with(terminal)),
+            "expected the {path} to end with {terminal} on a full queue | received: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(event,
+                EventKind::Error { error } if error.code.as_str() == "stream-overflow")),
+            "expected no stream-overflow terminal in place of the {path} | received: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_on_a_full_queue_still_ends_cancelled() {
+        let run = Run::stalling(thinking_lines());
+        let events = events_of_a_full_queue(run, true).await;
+        assert!(
+            events.contains(&EventKind::Cancelled {
+                reason: CancelReason::Requested
+            }),
+            "expected the cancel to end Cancelled on a full queue | received: {events:?}"
+        );
+        assert_terminal_survives_a_full_queue("cancel", &events, "Completed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_process_death_on_a_full_queue_still_ends_with_its_own_error() {
+        let run = Run::Transcript {
+            lines: thinking_lines(),
+            exit: ExitStatus {
+                code: Some(1),
+                signal: None,
+            },
+        };
+        let events = events_of_a_full_queue(run, false).await;
+        assert_terminal_survives_a_full_queue("abort", &events, "Error");
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { error })
+                if error.code.as_str() == "claude-no-result"),
+            "expected the vendor's own no-result error to end the turn | received: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_result_on_a_full_queue_still_completes() {
+        let mut lines = thinking_lines();
+        lines.push(String::from(r#"{"type":"result","is_error":false}"#));
+        let run = Run::Transcript {
+            lines,
+            exit: ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        };
+        let events = events_of_a_full_queue(run, false).await;
+        assert_terminal_survives_a_full_queue("result", &events, "Completed");
+    }
+
+    /// A refused close is sticky, so the usage that rides between the closes and the completion
+    /// would overflow behind it and take the completion's place; it goes the way of the closes.
+    #[tokio::test(start_paused = true)]
+    async fn a_result_carrying_usage_on_a_full_queue_still_completes() {
+        let mut lines = thinking_lines();
+        lines.push(String::from(
+            r#"{"type":"result","is_error":false,"usage":{"input_tokens":4,"output_tokens":9}}"#,
+        ));
+        let run = Run::Transcript {
+            lines,
+            exit: ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        };
+        let events = events_of_a_full_queue(run, false).await;
+        assert_terminal_survives_a_full_queue("result", &events, "Completed");
+    }
 }
