@@ -8,7 +8,7 @@ use mango_external_agents::testing::Announcer;
 
 /// A host whose shutdown token the test owns, with an idle bound no test could reach: a turn that
 /// ends inside it ended because the host cancelled, not because the agent went quiet.
-fn cancellable_host(launcher: &FakeLauncher, cancel: &CancelToken) -> HostContext {
+pub(super) fn cancellable_host(launcher: &FakeLauncher, cancel: &CancelToken) -> HostContext {
     HostContext::builder()
         .launcher(Arc::new(launcher.clone()))
         .cwd(std::env::temp_dir())
@@ -26,20 +26,20 @@ fn cancellable_host(launcher: &FakeLauncher, cancel: &CancelToken) -> HostContex
 
 /// An agent that never answers `session/prompt`, ignores `session/cancel`, and keeps streaming
 /// updates until the test stops it: the shape that idle expiry can never end.
-struct ChatteringAgent {
+pub(super) struct ChatteringAgent {
     announcer: Announcer,
     stop: Arc<AtomicBool>,
 }
 
 impl ChatteringAgent {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             announcer: Announcer::new(),
             stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn process(&self) -> FakeProcess {
+    pub(super) fn process(&self) -> FakeProcess {
         FakeAcpAgent::new()
             .with_updates(Vec::new())
             .staying_silent()
@@ -48,7 +48,7 @@ impl ChatteringAgent {
     }
 
     /// Streams one update every 5 ms until [`ChatteringAgent::hang_up`] is called.
-    fn start_chattering(&self) -> tokio::task::JoinHandle<()> {
+    pub(super) fn start_chattering(&self) -> tokio::task::JoinHandle<()> {
         let announcer = self.announcer.clone();
         let stop = Arc::clone(&self.stop);
         tokio::spawn(async move {
@@ -72,13 +72,13 @@ impl ChatteringAgent {
         })
     }
 
-    fn hang_up(&self) {
+    pub(super) fn hang_up(&self) {
         self.stop.store(true, Ordering::Release);
     }
 }
 
 /// Reads a turn to its terminal, reporting what arrived rather than hanging when there is none.
-async fn events_to_terminal(turn: &mut TurnStream) -> Vec<EventKind> {
+pub(super) async fn events_to_terminal(turn: &mut TurnStream) -> Vec<EventKind> {
     let mut seen = Vec::new();
     let ended = tokio::time::timeout(Duration::from_secs(8), async {
         while let Some(event) = turn.recv().await {
@@ -93,13 +93,13 @@ async fn events_to_terminal(turn: &mut TurnStream) -> Vec<EventKind> {
     .await;
     assert!(
         matches!(ended, Ok(true)),
-        "expected a terminal event after the host cancelled | received: {seen:?}"
+        "expected a terminal event | received: {seen:?}"
     );
     seen
 }
 
 /// Polls until every child is gone, naming the last count seen when they are not.
-async fn assert_children_reaped(launcher: &FakeLauncher) {
+pub(super) async fn assert_children_reaped(launcher: &FakeLauncher) {
     let mut last = launcher.live_children();
     let reaped = tokio::time::timeout(Duration::from_secs(5), async {
         while last != 0 {
@@ -114,7 +114,7 @@ async fn assert_children_reaped(launcher: &FakeLauncher) {
     );
 }
 
-async fn assert_settles_closed(session: &dyn Session) {
+pub(super) async fn assert_settles_closed(session: &dyn Session) {
     let mut lifecycle = session.subscribe();
     let status = status_once_settled(&mut lifecycle).await;
     assert_eq!(
@@ -125,7 +125,7 @@ async fn assert_settles_closed(session: &dyn Session) {
 }
 
 /// The turn ended as a host shutdown: the cancel marker, then the terminal.
-fn assert_shutdown_terminal(events: &[EventKind]) {
+pub(super) fn assert_shutdown_terminal(events: &[EventKind]) {
     let marked = events.iter().any(|kind| {
         matches!(
             kind,
@@ -357,20 +357,20 @@ async fn cancelling_with_an_approval_pending_settles_it_and_reaps_the_child() {
 /// A launcher whose children remember the reason every kill request carried, so a host's
 /// reason-sensitive cleanup hook can be shown the reason that actually ended the open.
 #[derive(Clone)]
-struct ReasonRecordingLauncher {
+pub(super) struct ReasonRecordingLauncher {
     inner: FakeLauncher,
     reasons: Arc<Mutex<Vec<CancelReason>>>,
 }
 
 impl ReasonRecordingLauncher {
-    fn new(inner: FakeLauncher) -> Self {
+    pub(super) fn new(inner: FakeLauncher) -> Self {
         Self {
             inner,
             reasons: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn kill_reasons(&self) -> Vec<CancelReason> {
+    pub(super) fn kill_reasons(&self) -> Vec<CancelReason> {
         self.reasons
             .lock()
             .expect("expected recorded kill reasons")
