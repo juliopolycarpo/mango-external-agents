@@ -23,6 +23,9 @@ use crate::session::CancelReason;
 
 #[cfg(test)]
 mod shutdown_tests;
+mod stderr_discard;
+
+use stderr_discard::Discard;
 
 /// What the library asks a host's launcher for.
 ///
@@ -354,14 +357,14 @@ pub struct StderrTail {
     max_bytes: usize,
 }
 
-/// What the tail holds, and whether the next bytes still belong to a line it already discarded.
+/// What the tail holds, and whether the next bytes still belong to text it already discarded.
 #[derive(Default)]
 struct TailState {
     buffer: Vec<u8>,
-    /// Set when an overflow left nothing that starts a line: the rest of that line is dropped up
-    /// to its terminator, because a continuation kept on its own has lost the name that lets
-    /// [`redact::stderr_text`] recognise the value.
-    discarding: bool,
+    /// Set while a cut is unfinished: the bytes that follow are the rest of a line, or the value
+    /// of a credential whose name was dropped, and a continuation kept on its own has lost the
+    /// name that lets [`redact::stderr_text`] recognise it.
+    discard: Option<Discard>,
 }
 
 /// How much stderr is kept for diagnostics.
@@ -390,9 +393,13 @@ impl StderrTail {
     /// the value after it is a secret. Losing a partial first line costs a diagnostic nobody could
     /// read anyway.
     ///
-    /// A line longer than the cap is dropped whole: once an overflow leaves only the middle of a
-    /// line, every following byte up to the next CR or LF is dropped too, however many reads it
-    /// spans. Keeping that continuation would return text whose credential name was discarded.
+    /// A cut goes on until nothing kept can have lost its name. A line longer than the cap is
+    /// dropped whole: once an overflow leaves only the middle of a line, every following byte up
+    /// to the next CR or LF is dropped too, however many reads it spans. And a cut that ends where
+    /// a credential's value is still awaited (`API_KEY=`, `Authorization:` or a trailing
+    /// `Bearer`) also drops the blank lines and the next non-empty line, because the redaction
+    /// rules read a value across a line break. Bytes are only ever dropped, never cut before
+    /// they are redacted.
     ///
     /// # Example
     ///
@@ -405,33 +412,46 @@ impl StderrTail {
     /// assert_eq!(tail.read(), "next line\n");
     /// ```
     pub fn push(&self, chunk: &[u8]) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let chunk = if state.discarding {
-            let Some(end) = chunk.iter().position(|byte| matches!(byte, b'\n' | b'\r')) else {
-                return;
-            };
-            state.discarding = false;
-            &chunk[end + 1..]
-        } else {
-            chunk
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let TailState { buffer, discard } = &mut *guard;
+        let chunk = match discard.as_mut().map(|open| open.consume(chunk)) {
+            Some(None) => return,
+            Some(Some(kept_from)) => {
+                *discard = None;
+                &chunk[kept_from..]
+            }
+            None => chunk,
         };
-        let buffer = &mut state.buffer;
         buffer.extend_from_slice(chunk);
         if buffer.len() <= self.max_bytes {
             return;
         }
         let overflow = buffer.len() - self.max_bytes;
-        buffer.drain(..overflow);
-        match buffer.iter().position(|byte| matches!(byte, b'\n' | b'\r')) {
-            Some(boundary) => {
-                buffer.drain(..=boundary);
-            }
+        let boundary = buffer[overflow..]
+            .iter()
+            .position(|byte| matches!(byte, b'\n' | b'\r'))
+            .map(|offset| overflow + offset);
+        let Some(boundary) = boundary else {
             // Nothing retained starts a line, so the whole window is the middle of one — a single
             // line longer than the cap. The middle of a line is exactly what cannot be redacted,
             // and a diagnostic is not worth a token. The line goes on until its terminator.
+            *discard = Some(Discard::mid_line(buffer));
+            buffer.clear();
+            return;
+        };
+        let awaiting = Discard::after_line(&buffer[..boundary]);
+        buffer.drain(..=boundary);
+        let Some(mut open) = awaiting else {
+            return;
+        };
+        // The dropped line ended awaiting a value, and what is kept begins with it.
+        match open.consume(buffer) {
+            Some(kept_from) => {
+                buffer.drain(..kept_from);
+            }
             None => {
                 buffer.clear();
-                state.discarding = true;
+                *discard = Some(open);
             }
         }
     }
@@ -1456,6 +1476,49 @@ mod tests {
                 && !read.contains("0123456789abcdef")
                 && !read.contains("ghijklmnop"),
             "expected no credential fragment | received {read:?}"
+        );
+    }
+
+    /// The redaction rules read a value across a line break, so a discarded line that ends on the
+    /// name or the separator takes the value line with it.
+    #[test]
+    fn an_overflowed_line_ending_on_a_separator_drops_the_value_on_the_next_line() {
+        let tail = StderrTail::with_capacity(16);
+        tail.push(b"xxxxxxxxxxxxxxxxxxxxxxxx API_KEY=");
+        tail.push(b"\nsk-secret-value\n");
+
+        let read = tail.read();
+        assert!(
+            !read.contains("sk-secret-value"),
+            "expected no value from the line after an overflowed assignment | received {read:?}"
+        );
+    }
+
+    /// The same shape at the line rounding cut, where the overflow lands inside an earlier line.
+    #[test]
+    fn a_rounded_cut_ending_on_a_header_drops_the_bearer_line() {
+        let tail = StderrTail::with_capacity(30);
+        tail.push(b"noise noise Authorization:\n  Bearer sk-live-secret\n");
+
+        let read = tail.read();
+        assert!(
+            !read.contains("sk-live-secret"),
+            "expected no token from the line after a cut header | received {read:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_line_dropped_after_a_cut_is_followed_by_an_intact_diagnostic() {
+        let tail = StderrTail::with_capacity(32);
+        tail.push(b"noise noise noise noise Authorization:\n");
+        tail.push(b"\n  Bearer sk-live-");
+        assert_eq!(tail.read(), "", "expected the split token line dropped");
+        tail.push(b"secret\nnext: ordinary diagnostic\n");
+
+        let read = tail.read();
+        assert_eq!(
+            read, "next: ordinary diagnostic\n",
+            "expected only the value line dropped | received {read:?}"
         );
     }
 

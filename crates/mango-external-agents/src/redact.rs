@@ -29,6 +29,36 @@ pub fn stderr_text(raw: &str) -> String {
     redact_url_passwords(&assignments)
 }
 
+/// Whether `dropped`, the text a cut removed from the end of what came before, stops where a
+/// rule here is still waiting for a credential's value.
+///
+/// The rules skip line breaks between a name, its separator and its value, so `Authorization:`
+/// can end one line and `  Bearer x` be the credential on the next. A caller that discards the
+/// first line and keeps the second returns a value whose name is gone. This is that check: it
+/// appends each shape a continuation can take and asks the rules whether the appended value was
+/// redacted, so the answer follows the rules and not a second list of names and separators.
+/// It errs toward `true`: a trailing `password` counts as awaiting even when nothing follows.
+pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
+    // Each probe finishes one waiting state: a name that wants its separator, a separator that
+    // wants its value, `Authorization` that wants `:`, `Authorization:` that wants a scheme and a
+    // scheme that wants its token. `Z` is the value; it survives only when nothing claimed it.
+    const PROBES: [&str; 4] = ["\n=Z", "\n:bearer Z", "\nbearer Z", "\nZ"];
+    // Only the two rules that read across a line break: a URL password cannot span one.
+    let plain = strip_control_characters(dropped);
+    // Nothing is awaited without a keyword in the text, and most tails have none.
+    let names_a_credential = (0..plain.len()).any(|at| {
+        match_credential_keyword(plain.as_bytes(), at).is_some()
+            || match_word(plain.as_bytes(), at, b"authorization").is_some()
+    });
+    if !names_a_credential {
+        return false;
+    }
+    PROBES.iter().any(|probe| {
+        let probed = redact_assignments(&redact_bearer(&format!("{plain}{probe}")));
+        !probed.ends_with('Z')
+    })
+}
+
 /// A safe executable summary from a host-owned path.
 ///
 /// A diagnostic can name known vendor programs, but an arbitrary executable basename is
@@ -86,6 +116,13 @@ fn is_known_program(name: &str) -> bool {
     KNOWN_PROGRAMS.contains(&bare)
 }
 
+/// The keyword that makes a variable name a credential's: `api_key` or one of a short list.
+fn match_credential_keyword(bytes: &[u8], at: usize) -> Option<usize> {
+    const KEYWORDS: &[&[u8]] = &[b"secret", b"token", b"password", b"passwd", b"credential"];
+    match_api_key(bytes, at)
+        .or_else(|| KEYWORDS.iter().find_map(|word| match_word(bytes, at, word)))
+}
+
 /// `authorization : bearer <token>`, however it was spaced and cased.
 ///
 /// `basic` counts as well as `bearer`: it is the same header carrying the same credential, and a
@@ -114,10 +151,8 @@ fn redact_bearer(raw: &str) -> String {
 
 /// `api_key=`, `secret:`, `token = `, … and whatever value follows.
 fn redact_assignments(raw: &str) -> String {
-    const KEYWORDS: &[&[u8]] = &[b"secret", b"token", b"password", b"passwd", b"credential"];
     rewrite(raw, |bytes, at| {
-        let after_keyword = match_api_key(bytes, at)
-            .or_else(|| KEYWORDS.iter().find_map(|word| match_word(bytes, at, word)))?;
+        let after_keyword = match_credential_keyword(bytes, at)?;
         // `AWS_SECRET_ACCESS_KEY=` is a keyword with the rest of a name after it. Requiring the
         // separator to follow the keyword itself would redact only the spellings that happen to
         // end on one, which is a minority of the names credentials actually have.
@@ -240,10 +275,14 @@ fn match_byte(bytes: &[u8], at: usize, expected: u8) -> Option<usize> {
     (bytes.get(at) == Some(&expected)).then_some(at + 1)
 }
 
+/// The whitespace every rule here skips between a name, its separator and its value, line
+/// breaks included.
+pub(crate) fn is_space_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
 fn skip_spaces(bytes: &[u8], at: usize) -> usize {
-    take_while(bytes, at, |byte| {
-        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
-    })
+    take_while(bytes, at, is_space_byte)
 }
 
 fn take_while(bytes: &[u8], at: usize, keep: impl Fn(u8) -> bool) -> usize {
@@ -264,10 +303,7 @@ fn is_name_byte(byte: u8) -> bool {
 
 /// The `[^\s,;]+` every value in these patterns is.
 fn is_value_byte(byte: u8) -> bool {
-    !matches!(
-        byte,
-        b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c | b',' | b';'
-    )
+    !is_space_byte(byte) && !matches!(byte, b',' | b';')
 }
 
 fn as_text(bytes: &[u8], from: usize, to: usize) -> String {
@@ -326,7 +362,7 @@ fn is_unsafe_to_render(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{program_name, stderr_text};
+    use super::{ends_awaiting_value, program_name, stderr_text};
 
     /// The fixture a vendor child writes in the port's own process test.
     const FIXTURE: &str =
@@ -531,5 +567,41 @@ mod tests {
             stderr_text("não encontrado: token=café"),
             "não encontrado: token=[REDACTED]"
         );
+    }
+
+    #[test]
+    fn text_ending_where_a_value_is_awaited_is_recognised() {
+        for dropped in [
+            "noise API_KEY=",
+            "noise API_KEY = ",
+            "noise OPENAI_API_KEY",
+            "noise secret:",
+            "noise Authorization",
+            "noise Authorization:",
+            "noise authorization: Bearer",
+            "noise Authorization: basic ",
+        ] {
+            assert!(
+                ends_awaiting_value(dropped),
+                "expected {dropped:?} to await a value | received false"
+            );
+        }
+    }
+
+    #[test]
+    fn text_that_leaves_no_value_awaited_is_not() {
+        for dropped in [
+            "",
+            "error: the vendor exited with status 1",
+            "noise API_KEY=value",
+            "Authorization: Bearer sk-live-42",
+            "retry at https://user:url-secret@agent.internal",
+            "an ordinary line ending in a colon:",
+        ] {
+            assert!(
+                !ends_awaiting_value(dropped),
+                "expected {dropped:?} to await nothing | received true"
+            );
+        }
     }
 }
