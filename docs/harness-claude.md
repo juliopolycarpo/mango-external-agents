@@ -37,6 +37,30 @@ wrapper banner can include its own semver, so discovery reads the semver from th
 identifies Claude Code rather than accepting the first semver in all stdout. A single bare version
 remains accepted for the documented compact form.
 
+Probe output that may be incomplete is never read as a verdict. A read error before the CLI closed
+stdout, a line over the host's line cap, more than 1 MiB of stdout (the largest captured help is
+21,401 bytes, about 2% of that cap) or the 15 s timeout cut a probe short, and what each probe
+concludes from the lines that did arrive differs:
+
+- `--help` is strict: a cut-off listing is unestablished, so discovery reports
+  `GateVerdict::Unknown` rather than `MissingRequiredSurface`. Missing lines cannot show that a flag
+  is absent.
+- `--version` uses the complete lines it read, because an incomplete read proves the binary ran. A
+  banner line that names Claude Code and arrived whole still supplies the version, as if the read
+  had finished. A cut-off read is read strictly: a lone line that lacks the "Claude Code" banner,
+  including the bare compact form `2.1.270`, is not trusted, because the banner line behind a
+  wrapper's own preamble may be the one that was lost. Otherwise, and when no line arrived, the CLI
+  is installed with an unreadable version and the gate comes from `--help`, as for an unparseable
+  banner. Discovery then reports no `version` at all rather than the lines that arrived, so a
+  receipt never hands a wrapper's number back to opening as if it were Claude Code's. Only a spawn that failed or a child that printed nothing
+  reports the CLI as not installed, and opening is never refused as "a CLI that reported no
+  version" for a read that failed part way.
+- `auth status` gives the lines that arrived to the same parser as a complete read, which trusts
+  only a whole JSON object. A status document that arrived complete keeps its answer, so a
+  signed-in account keeps `auto` even if later output failed. A document cut off inside the object
+  is not parsed and the answer is unknown authentication, which leaves `auto` unavailable, as for
+  any unknown account.
+
 Anthropic's [CLI reference](https://code.claude.com/docs/en/cli-reference.md#cli-flags) cautions
 that `claude --help` does not list every supported flag. This harness deliberately applies the
 runtime gate only to the fixed argv it drives, each measured in the pinned 2.1.270 capture and
