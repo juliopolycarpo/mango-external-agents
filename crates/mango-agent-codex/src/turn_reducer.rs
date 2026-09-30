@@ -28,7 +28,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use mango_external_agents::Limits;
-use mango_external_agents::event::{ActivityUpdate, EventKind};
+use mango_external_agents::event::{
+    ActivityResult, ActivityStatus, ActivityUpdate, EventKind, StructureClose,
+};
 
 use crate::activity;
 use crate::protocol::items::{FileUpdateChange, ThreadItem};
@@ -149,6 +151,89 @@ impl TurnReducerBuilder {
             max_message_bytes: self.max_message_bytes,
             ..TurnReducer::default()
         }
+    }
+}
+
+/// What the host was told this turn opened and has not seen closed.
+///
+/// A [`TurnReducer`] answers "was this announcement one to emit"; this answers "what does the host
+/// still hold open", which is a different fact. It is fed from what was **published**, not from
+/// what was reduced: an event the stream refused because a terminal won the race was never seen by
+/// the host, so a close for it would be a completion of a call nobody started.
+///
+/// At the terminal, [`Self::close_all`] turns whatever is left into the closes a host owes its
+/// transcript: one [`EventKind::ActivityCompleted`] per open call, in the order they started, and
+/// one [`EventKind::ReasoningEnded`] per open phase. It empties the set as it does, so a second
+/// terminal has nothing left to close.
+#[derive(Debug, Default)]
+pub(crate) struct OpenStructures {
+    /// Call ids, oldest first, so the closes come out in a stable order.
+    activities: Vec<String>,
+    /// Reasoning phases opened and not yet ended.
+    reasoning: usize,
+}
+
+/// One change to [`OpenStructures`], read off an event before it is handed to the stream.
+///
+/// Read first because publishing consumes the event, and applied only once the stream accepted it:
+/// an event the sink refused, for a payload that fails normalisation for instance, was never seen
+/// by the host and opens nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Mark {
+    ActivityOpened(String),
+    ActivityClosed(String),
+    ReasoningOpened,
+    ReasoningClosed,
+}
+
+impl Mark {
+    /// What `event` does to the open set, when it does anything.
+    ///
+    /// Allocates only for an activity event; text and usage, the bulk of a turn, cost a match.
+    pub(crate) fn of(event: &EventKind) -> Option<Self> {
+        match event {
+            EventKind::ActivityStarted { call_id, .. } => {
+                Some(Self::ActivityOpened(call_id.clone()))
+            }
+            EventKind::ActivityCompleted { call_id, .. } => {
+                Some(Self::ActivityClosed(call_id.clone()))
+            }
+            EventKind::ReasoningStarted => Some(Self::ReasoningOpened),
+            EventKind::ReasoningEnded => Some(Self::ReasoningClosed),
+            _ => None,
+        }
+    }
+}
+
+impl OpenStructures {
+    /// Records one change the host has now been given.
+    pub(crate) fn apply(&mut self, mark: Mark) {
+        match mark {
+            Mark::ActivityOpened(call_id) => {
+                if !self.activities.contains(&call_id) {
+                    self.activities.push(call_id);
+                }
+            }
+            Mark::ActivityClosed(call_id) => self.activities.retain(|open| *open != call_id),
+            Mark::ReasoningOpened => self.reasoning += 1,
+            Mark::ReasoningClosed => self.reasoning = self.reasoning.saturating_sub(1),
+        }
+    }
+
+    /// The closes for everything still open, ending each as `status`; leaves nothing open.
+    ///
+    /// Empty on the ordinary path, where every activity completed before the turn did.
+    pub(crate) fn close_all(&mut self, status: ActivityStatus) -> Vec<StructureClose> {
+        let activities = std::mem::take(&mut self.activities);
+        let reasoning = std::mem::take(&mut self.reasoning);
+        let mut closes = Vec::with_capacity(activities.len() + reasoning);
+        closes.extend(
+            activities
+                .into_iter()
+                .map(|call_id| StructureClose::activity(call_id, ActivityResult::new(status))),
+        );
+        closes.extend(std::iter::repeat_n(StructureClose::reasoning(), reasoning));
+        closes
     }
 }
 
@@ -422,11 +507,16 @@ impl OpenActivity {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTIVITY_UPDATE_DETAIL_MAX_CHARS, ACTIVITY_UPDATE_INTERVAL, TurnReducer};
+    use super::{
+        ACTIVITY_UPDATE_DETAIL_MAX_CHARS, ACTIVITY_UPDATE_INTERVAL, Mark, OpenStructures,
+        TurnReducer,
+    };
     use crate::protocol::notifications::{Notification, method};
     use crate::reducer::Outcome;
     use mango_external_agents::content::ActivityContent;
-    use mango_external_agents::event::{ActivityUpdate, EventKind};
+    use mango_external_agents::event::{
+        ActivityResult, ActivityStatus, ActivityUpdate, EventKind, StructureClose,
+    };
     use serde_json::json;
     use std::time::{Duration, SystemTime};
 
@@ -998,6 +1088,102 @@ mod tests {
         assert_eq!(
             reduce_at(&mut turn, &output("cmd-1", ""), start),
             Outcome::Ignore
+        );
+    }
+
+    fn activity_started(call_id: &str) -> EventKind {
+        EventKind::ActivityStarted {
+            call_id: call_id.to_owned(),
+            activity: mango_external_agents::event::Activity::new(
+                "command",
+                mango_external_agents::event::ActivityKind::Command,
+                "cargo build",
+            ),
+        }
+    }
+
+    fn open_after(events: &[EventKind]) -> OpenStructures {
+        let mut open = OpenStructures::default();
+        for event in events {
+            if let Some(mark) = Mark::of(event) {
+                open.apply(mark);
+            }
+        }
+        open
+    }
+
+    #[test]
+    fn a_mark_is_read_only_from_activity_and_reasoning_events() {
+        assert_eq!(
+            Mark::of(&activity_started("c1")),
+            Some(Mark::ActivityOpened(String::from("c1")))
+        );
+        assert_eq!(
+            Mark::of(&EventKind::ReasoningEnded),
+            Some(Mark::ReasoningClosed)
+        );
+        assert_eq!(
+            Mark::of(&EventKind::TextDelta {
+                text: String::from("hi")
+            }),
+            None,
+            "expected text to open nothing"
+        );
+    }
+
+    #[test]
+    fn close_all_closes_activities_oldest_first_then_reasoning_and_only_once() {
+        let mut open = open_after(&[
+            EventKind::ReasoningStarted,
+            activity_started("b"),
+            activity_started("a"),
+        ]);
+        let closes = open.close_all(ActivityStatus::Failed);
+        let names: Vec<String> = closes
+            .iter()
+            .map(|close| match close {
+                StructureClose::Activity { call_id, result } => {
+                    format!("{call_id}:{:?}", result.status)
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["b:Failed", "a:Failed", "Reasoning"],
+            "expected closes in start order, reasoning last | received {names:?}"
+        );
+        assert_eq!(
+            open.close_all(ActivityStatus::Failed),
+            Vec::<StructureClose>::new(),
+            "expected a second settle to find nothing open"
+        );
+    }
+
+    #[test]
+    fn close_all_skips_what_the_vendor_already_closed() {
+        let mut open = open_after(&[
+            EventKind::ReasoningStarted,
+            activity_started("a"),
+            EventKind::ReasoningEnded,
+            EventKind::ActivityCompleted {
+                call_id: String::from("a"),
+                result: ActivityResult::new(ActivityStatus::Completed),
+            },
+        ]);
+        assert_eq!(
+            open.close_all(ActivityStatus::Cancelled),
+            Vec::<StructureClose>::new()
+        );
+    }
+
+    #[test]
+    fn a_reasoning_end_without_a_start_does_not_go_below_zero() {
+        let mut open = open_after(&[EventKind::ReasoningEnded, EventKind::ReasoningStarted]);
+        assert_eq!(
+            open.close_all(ActivityStatus::Cancelled),
+            vec![StructureClose::reasoning()],
+            "expected the one real start to be closed once"
         );
     }
 }
