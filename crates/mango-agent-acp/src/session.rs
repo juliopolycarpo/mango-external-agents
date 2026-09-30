@@ -232,6 +232,7 @@ impl AcpSession {
         if self.lifecycle.is_closed() {
             return Err(Error::Closed { subject: "session" });
         }
+        self.refuse_after_host_shutdown()?;
         if self.connection_state.turn().is_some() {
             return Err(Error::Protocol {
                 expected: String::from(
@@ -515,6 +516,26 @@ impl AcpSession {
         })
     }
 
+    /// Refuses work once the host's shutdown token has fired.
+    ///
+    /// The connection watcher ends the session on that token without claiming its close, so a patch
+    /// that touches no wire request would otherwise still succeed against a session that has
+    /// already been wound down. Shaped like the refusal `start_turn` gives.
+    ///
+    /// ```ignore
+    /// host.cancel().cancel();
+    /// assert!(session.refuse_after_host_shutdown().is_err());
+    /// ```
+    fn refuse_after_host_shutdown(&self) -> Result<()> {
+        if !self.host.cancel().is_cancelled() {
+            return Ok(());
+        }
+        Err(Error::Cancelled {
+            reason: CancelReason::Shutdown,
+        }
+        .with_dispatch(Dispatch::NotSubmitted))
+    }
+
     /// Publishes the configuration state confirmed before a later option request can fail.
     fn publish_catalog_configuration(
         &self,
@@ -526,6 +547,7 @@ impl AcpSession {
         let Some(_lifecycle) = self.lifecycle.begin_start() else {
             return Err(Error::Closed { subject: "session" });
         };
+        self.refuse_after_host_shutdown()?;
         self.connection_state.accept_configuration(accepted.clone());
         Ok(self.connection_state.publish_response_configuration(
             catalog_revision,
