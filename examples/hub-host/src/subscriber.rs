@@ -106,13 +106,17 @@ const ACTIVITY_OVERHEAD_BYTES: usize = 512;
 /// The event's own size plus its payload. What can be large is text, so the payload is measured
 /// by its text and never by serializing it: a text or reasoning delta is the buffer holding its text
 /// (its capacity, because sanitizing can leave a short string in a large buffer), and an activity
-/// update or result is its detail plus its content (a diff of up to
+/// (started, updated or completed) is its detail plus its content (a diff of up to
 /// [`DIFF_MAX_CONTENT_LENGTH`](mango_external_agents::content::DIFF_MAX_CONTENT_LENGTH) code
 /// points, or output). Every other kind is small, bounded by the library's field limits, and is
 /// counted by its encoded JSON length instead.
 fn event_bytes(event: &AgentEvent) -> usize {
     let payload = match &event.kind {
         EventKind::TextDelta { text } | EventKind::ReasoningDelta { text } => text.capacity(),
+        EventKind::ActivityStarted { activity, .. } => activity_bytes(
+            [Some(activity.title.as_str()), activity.detail.as_deref()],
+            activity.content.as_ref(),
+        ),
         EventKind::ActivityUpdated { update, .. } => activity_bytes(
             [update.title.as_deref(), update.detail.as_deref()],
             update.content.as_ref(),
@@ -445,8 +449,10 @@ impl TurnSubscriber {
     /// The next delivery, or `None` once the supervisor has finished publishing.
     ///
     /// A watcher that fell too far behind is not disconnected, because a UI that missed three
-    /// deltas still wants the fourth. It receives one [`Delivery::Gap`] counting what it missed,
-    /// then continues from the oldest event still held.
+    /// deltas still wants the fourth. It receives a [`Delivery::Gap`] counting what it missed,
+    /// then continues from the oldest event still held. Events dropped between two reads are
+    /// counted into a single gap, but more drops after one was read produce another, so gaps
+    /// can arrive back to back.
     ///
     /// Cancel-safe: dropping the future loses nothing, and the next call reads the same queue.
     ///
@@ -503,8 +509,8 @@ mod tests {
     use super::{DEFAULT_RETAINED_BYTES, event_bytes, json_len};
     use mango_external_agents::content::{ActivityContent, FileChange, PlanStep};
     use mango_external_agents::{
-        ActivityResult, ActivityStatus, ActivityUpdate, AgentEvent, AttemptId, EventKind,
-        EventSink, Limits, SessionId, SystemClock, TurnId,
+        Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, AgentEvent,
+        AttemptId, EventKind, EventSink, Limits, SessionId, SystemClock, TurnId,
     };
     use std::sync::Arc;
 
@@ -606,6 +612,35 @@ mod tests {
             cost >= carried,
             "expected an event carrying {carried} bytes of diff to cost at least that | \
              received {cost}"
+        );
+    }
+
+    /// A diff arrives at the start of an edit as well as at its end, and must be sized by its
+    /// bodies: encoding it would cost roughly twice as much here, because every newline in a
+    /// diff is escaped in JSON.
+    #[tokio::test]
+    async fn an_activity_started_with_a_diff_is_sized_by_its_bodies_not_encoded() {
+        let body = "+\n".repeat(2_000);
+        let files: Vec<FileChange> = (0..30)
+            .map(|index| {
+                FileChange::new(format!("src/file{index}.rs")).with_unified_diff(body.clone())
+            })
+            .collect();
+        let mut activity = Activity::new("Edit", ActivityKind::FileChange, "Edit files");
+        activity.content = Some(ActivityContent::Diff { files });
+        let carried = 30 * body.len();
+        let cost = event_bytes(
+            &event(EventKind::ActivityStarted {
+                call_id: String::from("call-1"),
+                activity,
+            })
+            .await,
+        );
+        let ceiling = carried + 30 * (size_of::<FileChange>() + 32) + 2_048;
+        assert!(
+            (carried..=ceiling).contains(&cost),
+            "expected an ActivityStarted carrying {carried} bytes of diff to cost between \
+             {carried} and {ceiling} | received {cost}"
         );
     }
 
