@@ -28,7 +28,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use mango_external_agents::Limits;
-use mango_external_agents::event::{ActivityUpdate, EventKind};
+use mango_external_agents::event::{
+    ActivityResult, ActivityStatus, ActivityUpdate, EventKind, StructureClose,
+};
 
 use crate::activity;
 use crate::protocol::items::{FileUpdateChange, ThreadItem};
@@ -149,6 +151,89 @@ impl TurnReducerBuilder {
             max_message_bytes: self.max_message_bytes,
             ..TurnReducer::default()
         }
+    }
+}
+
+/// What the host was told this turn opened and has not seen closed.
+///
+/// A [`TurnReducer`] answers "was this announcement one to emit"; this answers "what does the host
+/// still hold open", which is a different fact. It is fed from what was **published**, not from
+/// what was reduced: an event the stream refused because a terminal won the race was never seen by
+/// the host, so a close for it would be a completion of a call nobody started.
+///
+/// At the terminal, [`Self::close_all`] turns whatever is left into the closes a host owes its
+/// transcript: one [`EventKind::ActivityCompleted`] per open call, in the order they started, and
+/// one [`EventKind::ReasoningEnded`] per open phase. It empties the set as it does, so a second
+/// terminal has nothing left to close.
+#[derive(Debug, Default)]
+pub(crate) struct OpenStructures {
+    /// Call ids, oldest first, so the closes come out in a stable order.
+    activities: Vec<String>,
+    /// Reasoning phases opened and not yet ended.
+    reasoning: usize,
+}
+
+/// One change to [`OpenStructures`], read off an event before it is handed to the stream.
+///
+/// Read first because publishing consumes the event, and applied only once the stream accepted it:
+/// an event the sink refused, for a payload that fails normalisation for instance, was never seen
+/// by the host and opens nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Mark {
+    ActivityOpened(String),
+    ActivityClosed(String),
+    ReasoningOpened,
+    ReasoningClosed,
+}
+
+impl Mark {
+    /// What `event` does to the open set, when it does anything.
+    ///
+    /// Allocates only for an activity event; text and usage, the bulk of a turn, cost a match.
+    pub(crate) fn of(event: &EventKind) -> Option<Self> {
+        match event {
+            EventKind::ActivityStarted { call_id, .. } => {
+                Some(Self::ActivityOpened(call_id.clone()))
+            }
+            EventKind::ActivityCompleted { call_id, .. } => {
+                Some(Self::ActivityClosed(call_id.clone()))
+            }
+            EventKind::ReasoningStarted => Some(Self::ReasoningOpened),
+            EventKind::ReasoningEnded => Some(Self::ReasoningClosed),
+            _ => None,
+        }
+    }
+}
+
+impl OpenStructures {
+    /// Records one change the host has now been given.
+    pub(crate) fn apply(&mut self, mark: Mark) {
+        match mark {
+            Mark::ActivityOpened(call_id) => {
+                if !self.activities.contains(&call_id) {
+                    self.activities.push(call_id);
+                }
+            }
+            Mark::ActivityClosed(call_id) => self.activities.retain(|open| *open != call_id),
+            Mark::ReasoningOpened => self.reasoning += 1,
+            Mark::ReasoningClosed => self.reasoning = self.reasoning.saturating_sub(1),
+        }
+    }
+
+    /// The closes for everything still open, ending each as `status`; leaves nothing open.
+    ///
+    /// Empty on the ordinary path, where every activity completed before the turn did.
+    pub(crate) fn close_all(&mut self, status: ActivityStatus) -> Vec<StructureClose> {
+        let activities = std::mem::take(&mut self.activities);
+        let reasoning = std::mem::take(&mut self.reasoning);
+        let mut closes = Vec::with_capacity(activities.len() + reasoning);
+        closes.extend(
+            activities
+                .into_iter()
+                .map(|call_id| StructureClose::activity(call_id, ActivityResult::new(status))),
+        );
+        closes.extend(std::iter::repeat_n(StructureClose::reasoning(), reasoning));
+        closes
     }
 }
 
@@ -393,6 +478,18 @@ impl TurnReducer {
     }
 }
 
+/// Where the last [`ACTIVITY_UPDATE_DETAIL_MAX_CHARS`] characters of `text` begin, or `None` when
+/// it holds fewer.
+///
+/// Walks back from the end and stops after that many characters, so a long chunk costs the tail's
+/// length rather than its own.
+fn last_window_start(text: &str) -> Option<usize> {
+    text.char_indices()
+        .rev()
+        .nth(ACTIVITY_UPDATE_DETAIL_MAX_CHARS - 1)
+        .map(|(index, _)| index)
+}
+
 impl OpenActivity {
     /// Whether an update at `instant` falls inside the window of the one last emitted.
     ///
@@ -404,7 +501,26 @@ impl OpenActivity {
     }
 
     /// Appends output, keeping only the most recent characters.
+    ///
+    /// A chunk that is at most [`ACTIVITY_UPDATE_DETAIL_MAX_CHARS`] bytes cannot alone fill the
+    /// tail, so it takes the ordinary path: append, count, cut what overflows. Only a longer chunk
+    /// looks for its own last characters, and keeps just those. Without that, one large delta left
+    /// its whole size behind as the tail's capacity until the activity completed.
+    ///
+    /// The chunk is cut here only to bound what one activity retains, and the result is the same
+    /// tail and flag either path produces. The tail is never credential-redacted on its way out,
+    /// so nothing is cut ahead of a redaction.
     fn append(&mut self, chunk: &str) {
+        if chunk.len() > ACTIVITY_UPDATE_DETAIL_MAX_CHARS
+            && let Some(start) = last_window_start(chunk)
+        {
+            // The chunk alone holds a whole tail. What came before it, and what this chunk drops
+            // of its own front, are both gone.
+            self.truncated |= start > 0 || !self.tail.is_empty();
+            // Assigned, not cleared, so the old buffer's capacity goes with it.
+            self.tail = chunk[start..].to_owned();
+            return;
+        }
         self.tail.push_str(chunk);
         let length = self.tail.chars().count();
         if length <= ACTIVITY_UPDATE_DETAIL_MAX_CHARS {
@@ -422,11 +538,16 @@ impl OpenActivity {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTIVITY_UPDATE_DETAIL_MAX_CHARS, ACTIVITY_UPDATE_INTERVAL, TurnReducer};
+    use super::{
+        ACTIVITY_UPDATE_DETAIL_MAX_CHARS, ACTIVITY_UPDATE_INTERVAL, Mark, OpenActivity,
+        OpenStructures, TurnReducer,
+    };
     use crate::protocol::notifications::{Notification, method};
     use crate::reducer::Outcome;
     use mango_external_agents::content::ActivityContent;
-    use mango_external_agents::event::{ActivityUpdate, EventKind};
+    use mango_external_agents::event::{
+        ActivityResult, ActivityStatus, ActivityUpdate, EventKind, StructureClose,
+    };
     use serde_json::json;
     use std::time::{Duration, SystemTime};
 
@@ -998,6 +1119,303 @@ mod tests {
         assert_eq!(
             reduce_at(&mut turn, &output("cmd-1", ""), start),
             Outcome::Ignore
+        );
+    }
+
+    fn activity_started(call_id: &str) -> EventKind {
+        EventKind::ActivityStarted {
+            call_id: call_id.to_owned(),
+            activity: mango_external_agents::event::Activity::new(
+                "command",
+                mango_external_agents::event::ActivityKind::Command,
+                "cargo build",
+            ),
+        }
+    }
+
+    fn open_after(events: &[EventKind]) -> OpenStructures {
+        let mut open = OpenStructures::default();
+        for event in events {
+            if let Some(mark) = Mark::of(event) {
+                open.apply(mark);
+            }
+        }
+        open
+    }
+
+    #[test]
+    fn a_mark_is_read_only_from_activity_and_reasoning_events() {
+        assert_eq!(
+            Mark::of(&activity_started("c1")),
+            Some(Mark::ActivityOpened(String::from("c1")))
+        );
+        assert_eq!(
+            Mark::of(&EventKind::ReasoningEnded),
+            Some(Mark::ReasoningClosed)
+        );
+        assert_eq!(
+            Mark::of(&EventKind::TextDelta {
+                text: String::from("hi")
+            }),
+            None,
+            "expected text to open nothing"
+        );
+    }
+
+    #[test]
+    fn close_all_closes_activities_oldest_first_then_reasoning_and_only_once() {
+        let mut open = open_after(&[
+            EventKind::ReasoningStarted,
+            activity_started("b"),
+            activity_started("a"),
+        ]);
+        let closes = open.close_all(ActivityStatus::Failed);
+        let names: Vec<String> = closes
+            .iter()
+            .map(|close| match close {
+                StructureClose::Activity { call_id, result } => {
+                    format!("{call_id}:{:?}", result.status)
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["b:Failed", "a:Failed", "Reasoning"],
+            "expected closes in start order, reasoning last | received {names:?}"
+        );
+        assert_eq!(
+            open.close_all(ActivityStatus::Failed),
+            Vec::<StructureClose>::new(),
+            "expected a second settle to find nothing open"
+        );
+    }
+
+    #[test]
+    fn close_all_skips_what_the_vendor_already_closed() {
+        let mut open = open_after(&[
+            EventKind::ReasoningStarted,
+            activity_started("a"),
+            EventKind::ReasoningEnded,
+            EventKind::ActivityCompleted {
+                call_id: String::from("a"),
+                result: ActivityResult::new(ActivityStatus::Completed),
+            },
+        ]);
+        assert_eq!(
+            open.close_all(ActivityStatus::Cancelled),
+            Vec::<StructureClose>::new()
+        );
+    }
+
+    #[test]
+    fn a_reasoning_end_without_a_start_does_not_go_below_zero() {
+        let mut open = open_after(&[EventKind::ReasoningEnded, EventKind::ReasoningStarted]);
+        assert_eq!(
+            open.close_all(ActivityStatus::Cancelled),
+            vec![StructureClose::reasoning()],
+            "expected the one real start to be closed once"
+        );
+    }
+
+    /// The tail exactly as it was kept before an oversized chunk got a path of its own, so the
+    /// tests can hold the new code to the same output rather than to a description of it.
+    #[derive(Default)]
+    struct ReferenceTail {
+        tail: String,
+        truncated: bool,
+    }
+
+    impl ReferenceTail {
+        fn append(&mut self, chunk: &str) {
+            self.tail.push_str(chunk);
+            let length = self.tail.chars().count();
+            if length <= ACTIVITY_UPDATE_DETAIL_MAX_CHARS {
+                return;
+            }
+            let cut = self
+                .tail
+                .char_indices()
+                .nth(length - ACTIVITY_UPDATE_DETAIL_MAX_CHARS)
+                .map_or(0, |(index, _)| index);
+            self.tail.drain(..cut);
+            self.truncated = true;
+        }
+    }
+
+    /// Feeds both tails the same chunks and fails at the first chunk where they differ.
+    fn assert_same_tail(label: &str, chunks: &[String]) {
+        let mut open = OpenActivity::default();
+        let mut reference = ReferenceTail::default();
+        for (index, chunk) in chunks.iter().enumerate() {
+            open.append(chunk);
+            reference.append(chunk);
+            assert_eq!(
+                (open.tail.as_str(), open.truncated),
+                (reference.tail.as_str(), reference.truncated),
+                "expected the reference tail after chunk {index} of {label} ({} bytes, {} chars) | received a different tail or flag",
+                chunk.len(),
+                chunk.chars().count()
+            );
+        }
+    }
+
+    /// `count` characters of `unit`, so a chunk's length is exact in characters, not bytes.
+    fn of(unit: char, count: usize) -> String {
+        std::iter::repeat_n(unit, count).collect()
+    }
+
+    /// Distinct characters, so a tail cut in the wrong place cannot match by accident.
+    fn numbered(start: usize, count: usize) -> String {
+        (start..start + count)
+            .map(|n| char::from_u32(0x4E00 + (n % 2000) as u32).unwrap_or('?'))
+            .collect()
+    }
+
+    const UNITS: [char; 4] = ['a', 'é', '€', '😀'];
+    const LIMIT: usize = ACTIVITY_UPDATE_DETAIL_MAX_CHARS;
+
+    #[test]
+    fn a_chunk_straddling_the_tail_limit_gives_the_reference_tail_for_every_width() {
+        for unit in UNITS {
+            for chars in [
+                0,
+                1,
+                LIMIT - 1,
+                LIMIT,
+                LIMIT + 1,
+                2 * LIMIT - 1,
+                2 * LIMIT,
+                2 * LIMIT + 1,
+            ] {
+                assert_same_tail(
+                    &format!("a lone {chars}-char chunk of {unit:?}"),
+                    &[of(unit, chars)],
+                );
+                assert_same_tail(
+                    &format!("a short chunk then a {chars}-char chunk of {unit:?}"),
+                    &[of('x', 7), of(unit, chars)],
+                );
+                assert_same_tail(
+                    &format!("a full tail then a {chars}-char chunk of {unit:?}"),
+                    &[of('y', LIMIT), of(unit, chars)],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_chunk_of_exactly_the_limit_only_truncates_when_something_came_before() {
+        let mut fresh = OpenActivity::default();
+        fresh.append(&of('a', LIMIT));
+        assert!(
+            !fresh.truncated && fresh.tail.chars().count() == LIMIT,
+            "expected a lone {LIMIT}-char chunk kept whole and not truncated | received truncated={} chars={}",
+            fresh.truncated,
+            fresh.tail.chars().count()
+        );
+
+        let mut after = OpenActivity::default();
+        after.append("x");
+        after.append(&of('a', LIMIT));
+        assert!(
+            after.truncated && after.tail == of('a', LIMIT),
+            "expected the earlier byte dropped and the tail flagged truncated | received truncated={}",
+            after.truncated
+        );
+    }
+
+    #[test]
+    fn a_chunk_longer_in_bytes_than_in_characters_is_not_taken_for_an_oversized_one() {
+        // 1500 characters of 3 bytes: over the limit in bytes, under it in characters.
+        let wide = of('€', 1500);
+        assert!(wide.len() > LIMIT && wide.chars().count() < LIMIT);
+        assert_same_tail("a wide chunk under the limit", std::slice::from_ref(&wide));
+        assert_same_tail("two wide chunks", &[wide.clone(), wide]);
+    }
+
+    #[test]
+    fn many_small_chunks_followed_by_one_huge_one_give_the_reference_tail() {
+        for unit in UNITS {
+            let mut chunks: Vec<String> = (0..300).map(|n| numbered(n * 7, 1 + n % 40)).collect();
+            chunks.push(of(unit, 100_000));
+            chunks.extend((0..20).map(|n| numbered(n * 11, 30)));
+            assert_same_tail(&format!("small chunks then a huge {unit:?} chunk"), &chunks);
+        }
+    }
+
+    #[test]
+    fn a_seeded_mix_of_widths_and_sizes_gives_the_reference_tail() {
+        // xorshift64: a fixed seed, so a failure names a chunk that reproduces.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let sizes = [
+            0,
+            1,
+            17,
+            LIMIT - 1,
+            LIMIT,
+            LIMIT + 1,
+            2 * LIMIT,
+            5 * LIMIT + 3,
+        ];
+        let chunks: Vec<String> = (0..2_000)
+            .map(|_| {
+                let unit = UNITS[(next() % 4) as usize];
+                let chars = sizes[(next() % sizes.len() as u64) as usize];
+                if next() % 3 == 0 {
+                    numbered((next() % 1000) as usize, chars)
+                } else {
+                    of(unit, chars)
+                }
+            })
+            .collect();
+        assert_same_tail("a seeded mix", &chunks);
+    }
+
+    #[test]
+    fn one_large_delta_does_not_leave_its_size_behind_as_capacity() {
+        for (unit, chars) in [('a', 1_000_000), ('😀', 250_000)] {
+            let mut open = OpenActivity::default();
+            open.append(&of(unit, chars));
+            assert!(
+                open.tail.capacity() <= 8 * 1024,
+                "expected a tail capacity of at most 8192 bytes after one {chars}-char delta of {unit:?} | received {}",
+                open.tail.capacity()
+            );
+            assert_eq!(open.tail.chars().count(), LIMIT);
+        }
+    }
+
+    #[test]
+    fn a_huge_chunk_after_small_ones_releases_what_they_held() {
+        let mut open = OpenActivity::default();
+        for _ in 0..50 {
+            open.append(&of('a', 1_500));
+        }
+        open.append(&of('b', 1_000_000));
+        assert!(
+            open.tail.capacity() <= 8 * 1024,
+            "expected a tail capacity of at most 8192 bytes after a huge chunk | received {}",
+            open.tail.capacity()
+        );
+    }
+
+    #[test]
+    fn last_window_start_finds_the_start_of_the_last_limit_characters() {
+        assert_eq!(super::last_window_start(&of('a', LIMIT - 1)), None);
+        assert_eq!(super::last_window_start(&of('a', LIMIT)), Some(0));
+        assert_eq!(super::last_window_start(&of('a', LIMIT + 5)), Some(5));
+        let wide = format!("{}{}", of('x', 3), of('😀', LIMIT));
+        assert_eq!(
+            super::last_window_start(&wide),
+            Some(3),
+            "expected the window to start after the three narrow characters, counted in bytes"
         );
     }
 }

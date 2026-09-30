@@ -104,6 +104,17 @@ Already queued events remain readable, followed by that failure. The driver stop
 An overflow means the transcript is incomplete; it never means execution succeeded. Hosts should
 drain streams in their supervisor even when no browser is connected.
 
+A harness that ends a turn with an activity or a reasoning phase still open closes it with
+`EventSink::emit_close`, before it commits the terminal. Unlike `emit`, a close the budget has no
+room for is refused with `LimitExceeded` and commits nothing, so the terminal that follows keeps
+its own cause: a cancellation stays `Cancelled` and a completion stays `Completed`. The refusal is
+sticky: after it no later close is queued and later payload is refused as overflow, so the host
+never sees new events behind a close that is missing, and a stream whose last sender is dropped
+after a refusal, with no terminal, ends with `stream-overflow` rather than silently. Under a full
+queue the closes are best-effort and the terminal wins. A host therefore reads any terminal
+(`Completed`, `Cancelled` or `Error`) as ending every activity and reasoning phase still open,
+whether or not a close event arrived.
+
 JSON-RPC separately caps outbound requests and in-flight incoming requests at
 `max_pending_requests`, 64 by default. Queued and in-flight incoming callback payloads share an
 8 MiB budget by default. Callback queue pressure fails the connection explicitly; response

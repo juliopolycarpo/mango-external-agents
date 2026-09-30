@@ -279,11 +279,11 @@ The `testing` feature ships fakes that spawn nothing:
 - `RecordingBroker` and `FrozenClock` turn a policy decision and an event's timestamp into values
   a test can assert on.
 
-```rust,ignore
-let launcher = FakeLauncher::scripted(include_str!("../fixtures/claude/transcripts/hello.ndjson"));
-// … build the host, open a session, assert on the events your mapping produced.
-assert_eq!(launcher.last_launch().unwrap().env.get("CONNECTOR_SECRET"), None);
-```
+Two complete examples are compiled by the test suite, so neither can drift from the API. The core
+crate's README (`crates/mango-external-agents/README.md`) is a whole host against `FakeLauncher`
+and `FakeHarness`, run as a doctest. The Claude crate's README (`crates/mango-agent-claude/README.md`)
+is the same shape against the real `ClaudeHarness`, compiled and not run because it needs the
+vendor CLI. Start from those rather than from a snippet in this guide, which nothing would compile.
 
 ## Writing a harness
 

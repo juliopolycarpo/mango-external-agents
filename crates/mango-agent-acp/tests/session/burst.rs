@@ -332,3 +332,67 @@ async fn streaming_tool_output_reaches_the_host_coalesced() {
         last_output.map(|text| text.chars().take(8).collect::<String>())
     );
 }
+
+/// A host may set an absurdly large request cap to mean "no cap". That must not panic the open
+/// after the child has launched and leak the child: the admission semaphore cannot hold more than
+/// `Semaphore::MAX_PERMITS`, so the cap is clamped to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_cap_of_usize_max_opens_runs_a_turn_and_reaps_the_child() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().process());
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            max_pending_requests: usize::MAX,
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host");
+    let opened = tokio::spawn(async move {
+        AcpHarness::new(profile())
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+    })
+    .await;
+    let session = match opened {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => panic!(
+            "expected open to succeed | received {error:?} (live children {})",
+            launcher.live_children()
+        ),
+        Err(error) => panic!(
+            "expected open to succeed | received {} (live children {})",
+            if error.is_panic() {
+                "panic"
+            } else {
+                "cancellation"
+            },
+            launcher.live_children()
+        ),
+    };
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "say hello"))
+        .await
+        .expect("expected a turn under usize::MAX");
+    let events = drain(&mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the turn to complete under usize::MAX | received {:?}",
+        events.last()
+    );
+    session.close(CloseReason::Requested).await.expect("close");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "expected live children: 0 after close | received {}",
+            launcher.live_children()
+        )
+    });
+}

@@ -150,6 +150,9 @@ pub enum CommitAnswer {
     /// The case a host cannot produce on its own, because the outcome the Hub kept may differ
     /// from the one this run has in hand: an earlier attempt that ended `Failed` beats a later
     /// one that ended `Completed`, and the host has to report what the Hub holds.
+    ///
+    /// If the fake already recorded a terminal for the operation, that one is what it answers: a
+    /// Hub keeps one terminal per logical operation.
     AlreadyRecorded {
         /// The outcome the Hub is holding.
         terminal: TerminalStatus,
@@ -556,7 +559,18 @@ impl HubApi for FakeHubApi {
         match answer {
             CommitAnswer::Fail(error) => return Err(error),
             CommitAnswer::AlreadyRecorded { terminal } => {
-                return Ok(Commit::AlreadyRecorded { terminal });
+                // What an earlier call left behind is still true after this answer is spent, so
+                // the ledger takes it: a later commit or reconciliation must see the same
+                // terminal, as it would from a Hub that really held one. A Hub keeps one terminal
+                // per logical operation, so one it already holds wins over a script that
+                // contradicts it, and is what this answers.
+                let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
+                let held = ledger
+                    .committed
+                    .entry(logical(operation))
+                    .or_insert(terminal)
+                    .clone();
+                return Ok(Commit::AlreadyRecorded { terminal: held });
             }
             CommitAnswer::Record => {}
         }
@@ -569,6 +583,57 @@ impl HubApi for FakeHubApi {
         }
         ledger.committed.insert(id, terminal.clone());
         Ok(Commit::Recorded)
+    }
+}
+
+/// A [`Session`] whose streams say the vendor never acknowledged the turn.
+///
+/// The shape ACP and Codex return: the stream carries [`Dispatch::AcceptanceUnknown`] until its
+/// terminal proves the turn ran. Everything else, including the turn's script, is the wrapped
+/// [`FakeVendorSession`]'s.
+///
+/// # Example
+///
+/// ```
+/// use hub_host::testing::{FakeVendorSession, UnconfirmedAcceptanceSession};
+///
+/// let _session = UnconfirmedAcceptanceSession::new(FakeVendorSession::new());
+/// ```
+pub struct UnconfirmedAcceptanceSession {
+    inner: FakeVendorSession,
+}
+
+impl UnconfirmedAcceptanceSession {
+    /// Wraps `inner`, whose turns keep their script but come back unacknowledged.
+    pub fn new(inner: FakeVendorSession) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl Session for UnconfirmedAcceptanceSession {
+    fn state(&self) -> &SessionState {
+        self.inner.state()
+    }
+
+    async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        Ok(self
+            .inner
+            .start_turn(request)
+            .await?
+            .with_dispatch(Dispatch::AcceptanceUnknown))
+    }
+
+    async fn respond(&self, response: PermissionResponse) -> Result<()> {
+        self.inner.respond(response).await
+    }
+
+    async fn cancel(&self, reason: CancelReason) -> Result<()> {
+        self.inner.cancel(reason).await
+    }
+
+    async fn close(&self, reason: CloseReason) -> Result<()> {
+        self.inner.close(reason).await
     }
 }
 
