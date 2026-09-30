@@ -7,14 +7,21 @@
 //! rules read on the next line, because they skip line breaks between a name, its separator and
 //! its value. Bytes are only ever dropped here; nothing is cut before redaction.
 
-use crate::redact::{self, is_space_byte, is_stripped_byte};
+use crate::redact::{
+    self, MAX_ESCAPE_BYTES, holds_string_terminator, is_space_byte, is_stripped_byte,
+};
 
 /// How much of what was dropped is remembered to decide whether a value is still awaited.
 ///
 /// A credential name longer than this, or one padded with escape sequences that the redactor
 /// strips but the collapse does not, is outside what the check can see, and the line after it is
-/// kept. A credential name is a few dozen bytes.
+/// kept. A credential name is a few dozen bytes. The exception is a string escape (an OSC, say)
+/// ending inside the window: the redactor takes the whole string out, so a name can sit that far
+/// behind, and the look-back reaches [`REACH_BYTES`] to cover it.
 const TAIL_BYTES: usize = 512;
+
+/// The look-back when a string escape ends inside the last [`TAIL_BYTES`].
+const REACH_BYTES: usize = TAIL_BYTES + MAX_ESCAPE_BYTES;
 
 /// Where the discard is inside the text it is dropping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +91,13 @@ impl Discard {
     }
 
     fn awaits_value(&self) -> bool {
-        redact::ends_awaiting_value(&String::from_utf8_lossy(&self.tail))
+        let window = &self.tail[self.tail.len().saturating_sub(TAIL_BYTES)..];
+        let seen = if holds_string_terminator(window) {
+            &self.tail[..]
+        } else {
+            window
+        };
+        redact::ends_awaiting_value(&String::from_utf8_lossy(seen))
     }
 
     fn push_blank(&mut self) {
@@ -97,13 +110,14 @@ impl Discard {
         let piece = tail_of(text);
         let skip = usize::from(self.tail.last() == Some(&b' ') && piece.first() == Some(&b' '));
         self.tail.extend_from_slice(&piece[skip..]);
-        if self.tail.len() > TAIL_BYTES {
-            self.tail.drain(..self.tail.len() - TAIL_BYTES);
+        if self.tail.len() > REACH_BYTES {
+            self.tail.drain(..self.tail.len() - REACH_BYTES);
         }
     }
 }
 
-/// The last [`TAIL_BYTES`] of `bytes`, with every run of spaces, tabs and line feeds collapsed to
+/// The last [`TAIL_BYTES`] of `bytes` (or [`REACH_BYTES`] when a string escape ends in them), with
+/// every run of spaces, tabs and line feeds collapsed to
 /// a single space and every run of bytes the redactor removes (a bare CR among them) to one of
 /// them.
 ///
@@ -114,9 +128,18 @@ impl Discard {
 /// Scans back from the end and stops once it has enough, so a long dropped line costs the tail
 /// and not the line.
 fn tail_of(bytes: &[u8]) -> Vec<u8> {
-    let mut tail = Vec::with_capacity(TAIL_BYTES.min(bytes.len()));
+    let tail = collapsed_tail(bytes, TAIL_BYTES);
+    if holds_string_terminator(&tail) {
+        return collapsed_tail(bytes, REACH_BYTES);
+    }
+    tail
+}
+
+/// The last `limit` bytes of `bytes` after the collapse [`tail_of`] describes.
+fn collapsed_tail(bytes: &[u8], limit: usize) -> Vec<u8> {
+    let mut tail = Vec::with_capacity(limit.min(bytes.len()));
     for byte in bytes.iter().rev() {
-        if tail.len() == TAIL_BYTES {
+        if tail.len() == limit {
             break;
         }
         if is_stripped_byte(*byte) {
@@ -151,6 +174,30 @@ mod tests {
             "expected the last {TAIL_BYTES} bytes of a longer line"
         );
         assert_eq!(tail_of(b""), b"", "expected an empty tail for no bytes");
+    }
+
+    #[test]
+    fn the_look_back_reaches_over_a_string_escape_that_ends_in_the_window() {
+        let mut text = b"API_KEY \x1b]0;".to_vec();
+        text.extend(std::iter::repeat_n(b'x', 2 * TAIL_BYTES));
+        let plain = tail_of(&text);
+        assert_eq!(
+            plain.len(),
+            TAIL_BYTES,
+            "expected the ordinary window when no string escape ends in it"
+        );
+
+        text.push(0x07);
+        let reached = tail_of(&text);
+        assert!(
+            reached.len() > TAIL_BYTES && reached.starts_with(b"API_KEY"),
+            "expected the look-back to reach the name behind the OSC | received {} bytes",
+            reached.len()
+        );
+        assert!(
+            Discard::after_line(&text).is_some(),
+            "expected a name behind a long OSC to await its separator"
+        );
     }
 
     #[test]

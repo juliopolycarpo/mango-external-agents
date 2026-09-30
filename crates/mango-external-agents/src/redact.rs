@@ -11,6 +11,7 @@
 
 mod strip;
 
+pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
 use strip::{remove_boundaries, strip_control_characters};
 
 /// Redacts a stderr tail and strips terminal-unsafe control characters.

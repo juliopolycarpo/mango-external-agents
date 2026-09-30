@@ -33,6 +33,22 @@ pub(super) fn remove_boundaries(text: String) -> String {
 /// like any other.
 const OSC_PAYLOAD_LIMIT: usize = 4096;
 
+/// The most raw bytes one string escape can take out: the longest payload, its introducer and its
+/// terminator. A caller that looks back over text the redactor will strip needs this much reach
+/// to see a name on the far side of one.
+pub(crate) const MAX_ESCAPE_BYTES: usize = OSC_PAYLOAD_LIMIT + 8;
+
+/// Whether `bytes` holds something that ends a string escape: a BEL, `ESC \` or the 8-bit ST.
+/// Text with none of them has no string escape ending in it, however long the escape was.
+pub(crate) fn holds_string_terminator(bytes: &[u8]) -> bool {
+    bytes.iter().enumerate().any(|(at, byte)| match byte {
+        0x07 => true,
+        0x1b => bytes.get(at + 1) == Some(&b'\\'),
+        0xc2 => bytes.get(at + 1) == Some(&0x9c),
+        _ => false,
+    })
+}
+
 /// The byte after `ESC` that opens a DCS, SOS, PM or APC string: `ESC P`, `ESC X`, `ESC ^` and
 /// `ESC _`. Each runs to an ST.
 const STRING_INTRODUCERS: &[u8] = b"PX^_";
@@ -463,6 +479,25 @@ mod tests {
             "\nERROR: real failure\n",
             "expected a line break to end the scan as it does for an OSC"
         );
+    }
+
+    #[test]
+    fn a_string_terminator_is_found_wherever_it_ends_a_string_escape() {
+        for (bytes, expected) in [
+            (&b"title\x07"[..], true),
+            (b"title\x1b\\", true),
+            ("title\u{9c}".as_bytes(), true),
+            (b"plain text", false),
+            (b"colour \x1b[31m", false),
+            (b"\x1b", false),
+            (b"", false),
+        ] {
+            assert_eq!(
+                super::holds_string_terminator(bytes),
+                expected,
+                "expected a terminator verdict of {expected} | input {bytes:?}"
+            );
+        }
     }
 
     #[test]

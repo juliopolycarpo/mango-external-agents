@@ -1556,6 +1556,29 @@ mod tests {
         );
     }
 
+    /// The redactor takes a whole OSC out, up to 4 KiB of it, so a name and its separator can sit
+    /// far apart in the raw bytes and still be adjacent to it. The tail's lookback has to reach
+    /// back over the string, or the cut loses the name and keeps the value line.
+    #[test]
+    fn a_cut_that_drops_a_name_behind_a_long_osc_drops_its_value_line_too() {
+        let mut text = b"API_KEY \x1b]0;".to_vec();
+        text.extend(std::iter::repeat_n(b'x', 600));
+        text.extend_from_slice(b"\x07 =\nVALUE\nok\n");
+        let whole = crate::redact::stderr_text(&String::from_utf8_lossy(&text));
+        assert!(
+            !whole.contains("VALUE"),
+            "expected whole-text redaction to hide the value | received {whole:?}"
+        );
+
+        let tail = StderrTail::with_capacity(20);
+        tail.push(&text);
+        let read = tail.read();
+        assert_eq!(
+            read, "ok\n",
+            "expected the value line dropped as whole-text redaction hides it | received {read:?}"
+        );
+    }
+
     #[test]
     fn a_value_line_dropped_after_a_cut_is_followed_by_an_intact_diagnostic() {
         let tail = StderrTail::with_capacity(32);
