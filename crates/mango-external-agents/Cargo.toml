@@ -76,5 +76,10 @@ harness = false
 name = "events"
 harness = false
 
+[[bench]]
+name = "copies"
+harness = false
+required-features = ["stdio"]
+
 [package.metadata.docs.rs]
 all-features = true
