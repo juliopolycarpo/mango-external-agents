@@ -50,7 +50,7 @@ tokio = { version = "1.53.1", default-features = false, features = ["macros", "r
 
 [dev-dependencies]
 async-trait = "0.1.92"
-mango-external-agents = { features = ["launcher-tokio", "testing"], path = "../mango-external-agents" }
+mango-external-agents = { workspace = true, features = ["launcher-tokio", "testing"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 
 # Non-gating benchmarks: a plain `harness = false` binary with no extra dependencies. Run it with
