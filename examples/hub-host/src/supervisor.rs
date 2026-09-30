@@ -197,6 +197,15 @@ struct LogicalTurn {
     record: RecoveryRecord,
     refusal: Option<String>,
     settlement: Option<TerminalStatus>,
+    /// What the vendor's own stream said about whether it acknowledged the turn.
+    ///
+    /// Kept apart from the record's certainty on purpose. The record is monotonic and is what
+    /// steers recovery: `Accepted` sends a run to observe, which never dispatches again, while
+    /// `AcceptanceUnknown` sends it to reconcile, where a Hub answering `NeverArrived` unlocks a
+    /// newer attempt. A stream that has come back is a turn this host holds, so the record says
+    /// `Accepted` and this says what the stream itself claimed. Recording the stream's doubt on
+    /// the record instead would let that answer replay a turn whose first stream is still live.
+    stream_dispatch: Option<Dispatch>,
     reserved: bool,
 }
 
@@ -206,6 +215,7 @@ impl LogicalTurn {
             record,
             refusal: None,
             settlement: None,
+            stream_dispatch: None,
             reserved: false,
         }
     }
@@ -398,6 +408,10 @@ impl Supervisor {
 
     /// What the record for this logical turn currently says, for a host persisting alongside it.
     ///
+    /// The record's dispatch certainty says whether the operation is in the vendor's hands, and is
+    /// `Accepted` once a stream came back. What the stream itself claimed is
+    /// [`Supervisor::stream_dispatch`].
+    ///
     /// # Example
     ///
     /// ```
@@ -461,6 +475,47 @@ impl Supervisor {
         self.records
             .get(turn_id)
             .and_then(|turn| turn.settlement.as_ref())
+    }
+
+    /// What the vendor's own stream said about whether it acknowledged this turn, when one came
+    /// back.
+    ///
+    /// [`Supervisor::record`]'s dispatch is `Accepted` as soon as the vendor returned a stream: the
+    /// operation is in the vendor's hands and this host observes it and never replays it. That is
+    /// the state recovery needs, and it is deliberately not the stream's own claim. ACP and Codex
+    /// return streams that carry [`Dispatch::AcceptanceUnknown`] until the terminal proves the turn
+    /// ran, and this is where a host that saves the record reads that. It cannot be recorded on
+    /// the record itself without sending a resumed run to reconcile, where a Hub's `NeverArrived`
+    /// would unlock a newer attempt for a turn that may still be running. `None` until a stream has
+    /// been returned.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use hub_host::testing::{FakeHubApi, FakeVendorSession, ScriptedJitter};
+    /// # use hub_host::{RetryPolicy, Stop, Supervisor};
+    /// # use mango_external_agents::{SystemClock, TurnId};
+    /// # use std::sync::Arc;
+    /// # use std::time::Duration;
+    /// # let policy = RetryPolicy::new(
+    /// #     Duration::from_millis(10),
+    /// #     Duration::from_secs(1),
+    /// #     Duration::from_secs(5),
+    /// #     Arc::new(ScriptedJitter::maximum()),
+    /// # );
+    /// # let supervisor = Supervisor::new(
+    /// #     Box::new(FakeVendorSession::new()),
+    /// #     Arc::new(FakeHubApi::new()),
+    /// #     policy,
+    /// #     Arc::new(Stop::new()),
+    /// #     Arc::new(SystemClock),
+    /// # );
+    /// assert!(supervisor.stream_dispatch(&TurnId::new("never-run")).is_none());
+    /// ```
+    pub fn stream_dispatch(&self, turn_id: &TurnId) -> Option<Dispatch> {
+        self.records
+            .get(turn_id)
+            .and_then(|turn| turn.stream_dispatch)
     }
 
     /// Drives one logical operation until it is committed, refused, stopped or uncertain.
@@ -582,6 +637,11 @@ impl SupervisorInner {
             // one on the evidence of a passing suite. The exception is `submit`'s, whose absence
             // is visible as the full attempt deadline elapsing. Delete this one and `back_off`'s
             // and the suite fails; that is what the coverage is actually proving.
+            // Before the stop check, so a stop that lands right after the vendor answered still
+            // leaves what the stream said. Nothing awaits between `submit` and here.
+            if let Some(stream) = &progress.stream {
+                turn.stream_dispatch = Some(stream.dispatch());
+            }
             if let Some(reason) = progress.stop.reason() {
                 self.abandon(&mut progress, reason).await;
                 return Ok(Settled::Stopped { reason });
@@ -677,6 +737,9 @@ impl SupervisorInner {
         };
         match started {
             Ok(Ok(stream)) => {
+                // `Accepted` whatever the stream claims: this host now holds the turn and observes
+                // it. The stream's own certainty is kept on the logical turn, see
+                // `LogicalTurn::stream_dispatch` for why it must not reach the record.
                 record.record_dispatch(&operation, Dispatch::Accepted)?;
                 progress.stream = Some(stream);
                 Ok(Step::Continue)
