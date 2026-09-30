@@ -142,25 +142,38 @@ fn start_all(mut reducer: TurnReducer, records: Vec<StreamRecord>) -> Drained {
     (reducer, records, output)
 }
 
-/// One open `Task` call and `blocks` text blocks of `bytes` each forwarded under it.
-fn forwarded_blocks(blocks: usize, bytes: usize) -> (TurnReducer, Vec<StreamRecord>) {
+/// `parents` open `Task` calls, each with `blocks` text blocks of `bytes` each forwarded under it,
+/// interleaved the way a run with several subagents at once delivers them.
+fn forwarded_blocks(
+    parents: usize,
+    blocks: usize,
+    bytes: usize,
+) -> (TurnReducer, Vec<StreamRecord>) {
     let mut reducer = TurnReducer::new();
-    let started = json!({"type": "assistant", "message": {"role": "assistant", "content": [
-        {"type": "tool_use", "id": "toolu_parent", "name": "Task", "input": {"prompt": "go"}}
-    ]}})
-    .to_string();
-    let started = StreamRecord::parse(&started).expect("expected the bench record to parse");
-    assert!(
-        !reducer.reduce(&started).events.is_empty(),
-        "expected the Task call to open an activity"
-    );
+    for parent in 0..parents {
+        let started = json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": format!("toolu_parent_{parent}"), "name": "Task",
+             "input": {"prompt": "go"}}
+        ]}})
+        .to_string();
+        let started = StreamRecord::parse(&started).expect("expected the bench record to parse");
+        assert!(
+            !reducer.reduce(&started).events.is_empty(),
+            "expected the Task call to open an activity"
+        );
+    }
     let text = text_of(bytes);
-    let forwarded = json!({"type": "assistant", "parent_tool_use_id": "toolu_parent",
-        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
-    .to_string();
-    let records = (0..blocks)
-        .map(|_| StreamRecord::parse(&forwarded).expect("expected the bench record to parse"))
-        .collect();
+    let mut records = Vec::with_capacity(parents * blocks);
+    for _ in 0..blocks {
+        for parent in 0..parents {
+            let forwarded = json!({"type": "assistant",
+                "parent_tool_use_id": format!("toolu_parent_{parent}"),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+            .to_string();
+            records
+                .push(StreamRecord::parse(&forwarded).expect("expected the bench record to parse"));
+        }
+    }
     (reducer, records)
 }
 
@@ -230,7 +243,15 @@ fn main() {
     bench.run(
         "claude/forward/1000x1KiB",
         Unit::new(1000, "block"),
-        || forwarded_blocks(1000, 1 << 10),
+        || forwarded_blocks(1, 1000, 1 << 10),
+        |(reducer, records)| forward_all(reducer, records),
+    );
+    // Below the cap: six 1 KiB blocks stay under the 8192-character buffer, so every append is
+    // kept. The control for the case above, which spends nearly all of its blocks past the cap.
+    bench.run(
+        "claude/forward/100x6x1KiB",
+        Unit::new(600, "block"),
+        || forwarded_blocks(100, 6, 1 << 10),
         |(reducer, records)| forward_all(reducer, records),
     );
 }

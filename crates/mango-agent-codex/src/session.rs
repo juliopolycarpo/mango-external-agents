@@ -63,6 +63,14 @@ use crate::reducer::{self, Outcome};
 /// call is made.
 pub const CALL_FAILED: ErrorCode = ErrorCode::from_static("codex-call-failed");
 
+/// The code a turn fails with when the core refuses to publish one of its events.
+///
+/// Only a value the core cannot make safe is reported, such as a vendor id that is blank, longer
+/// than the bound, or containing characters the core refuses (control and bidirectional formatting
+/// characters), because dropping it in silence would leave the host rendering a turn that is
+/// missing part of what happened.
+pub const REFUSED_EVENT: ErrorCode = ErrorCode::from_static("codex-refused-event");
+
 /// Native ids retained after terminal frames so a delayed old frame cannot attach while the next
 /// start still waits for its response.
 const RECENT_COMPLETED_TURNS: usize = 16;
@@ -1346,6 +1354,54 @@ impl Shared {
         active.publish(kind).await
     }
 
+    /// Fails the turn because the core refused to publish one of its events.
+    ///
+    /// Only a value the core cannot make safe is reported: a vendor id that is blank, longer than
+    /// the bound, or containing characters the core refuses. It means part of the turn can never
+    /// reach the host, and dropping it in
+    /// silence leaves a host rendering a turn that is missing something. Any other refusal is an
+    /// ordinary end of the stream, a closed or already terminal sink, or was already turned into
+    /// a failure by the sink itself, an overflow, so it stays silent. A terminal commits once, so
+    /// a turn that already ended keeps its outcome.
+    ///
+    /// What the host still holds open is closed first, as failed, and the failure is committed on
+    /// the sink like an overflow. Admission is not released here: the committed terminal is what
+    /// wakes the abandonment watcher, which interrupts the native turn and releases the slot once
+    /// Codex reports it over, so a new turn cannot start on top of one that is still running.
+    async fn fail_refused_event(&self, route: &ActiveTurnRoute, error: &Error) {
+        // What the turn was still asking is settled first, as it is ahead of an ordinary terminal:
+        // once the sink holds the failure it refuses the resolutions, and the host would keep a
+        // prompt nobody can answer. Held through the failure, so a request that routed to this
+        // turn cannot register a new round after the drain.
+        let _settlement = self.question_settlements.lock().await;
+        self.release_pending_approvals_for(Some(&route.owner), DecisionSource::Cancelled)
+            .await;
+        self.release_pending_questions_for_locked(Some(&route.owner))
+            .await;
+        let mut turn = self.turn.lock().await;
+        let Some(active) = turn
+            .as_mut()
+            .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
+        else {
+            return;
+        };
+        if active.sink.is_terminal() {
+            return;
+        }
+        for close in active.open.close_all(ActivityStatus::Failed) {
+            if active.sink.emit_close(close).await.is_err() {
+                break;
+            }
+        }
+        let _ = active
+            .sink
+            .fail(VendorError::new(
+                REFUSED_EVENT,
+                format!("expected an app-server event the core can publish, received one it refused: {error}"),
+            ))
+            .await;
+    }
+
     /// Claims a turn's terminal while retaining admission until it is committed.
     async fn claim_terminal(&self, owner: Option<&Arc<()>>) -> Option<TerminalClaim> {
         let mut turn = self.turn.lock().await;
@@ -1867,6 +1923,7 @@ impl PeerHandler for CodexHandler {
         params: Value,
         id: RequestId,
     ) -> ServerRequestOutcome {
+        let network_context = approvals::network_context(&method, &params);
         let request = ServerRequest::parse(&method, params);
 
         if let Some(refusal) = request.refusal() {
@@ -1986,6 +2043,7 @@ impl PeerHandler for CodexHandler {
 
         let Some(pending) = approvals::to_request(
             &request,
+            network_context.as_ref(),
             route.operation(self.shared.session_id.clone()),
             expires_at,
         ) else {
@@ -2053,7 +2111,19 @@ impl CodexHandler {
         let Some(mut active_route) = active_route else {
             return;
         };
+        // Only this session's own thread can name the turn it is waiting for. The connection also
+        // carries a subagent's thread and a detached review's, whose frames name turns of their
+        // own, and until the start answer arrives there is no native id to tell them apart by.
+        // A frame with no thread is nobody's here: the malformed-terminal path that has to poison
+        // on one is the reducer's, below, and does not go through the claim.
+        let own_thread = notification.thread_id() == Some(self.shared.thread_id());
+        // The drop of a frame for a turn that already ended keeps applying to a frame with no
+        // thread too: a duplicate malformed terminal of a finished turn must not reach the reducer,
+        // where an unroutable terminal shuts the session down. Only another thread's frame is left
+        // to the reducer's routing.
+        let own_or_threadless = own_thread || notification.thread_id().is_none();
         if active_route.native_turn_id.is_empty()
+            && own_or_threadless
             && notification.requires_native_turn_match()
             && let Some(turn_id) = notification.turn_id()
             && self.shared.recently_completed(turn_id).await
@@ -2071,6 +2141,7 @@ impl CodexHandler {
         // response and from every later item and completion for the same review; claiming from
         // it here would announce a review under an id nothing else on its stream agrees with.
         if active_route.native_turn_id.is_empty()
+            && own_thread
             && notification.requires_native_turn_match()
             && let Some(turn_id) = notification.turn_id()
         {
@@ -2131,14 +2202,21 @@ impl CodexHandler {
                     } else {
                         self.shared.emit(event).await
                     };
-                    if matches!(emitted, Err(Error::LimitExceeded { .. })) {
-                        self.shared
-                            .poison(VendorError::new(
-                                CALL_FAILED,
-                                "expected bounded Codex transcript publication, received overflow",
-                            ))
-                            .await;
-                        return;
+                    match emitted {
+                        Err(Error::LimitExceeded { .. }) => {
+                            self.shared
+                                .poison(VendorError::new(
+                                    CALL_FAILED,
+                                    "expected bounded Codex transcript publication, received overflow",
+                                ))
+                                .await;
+                            return;
+                        }
+                        Err(error @ Error::InvalidVendorValue { .. }) => {
+                            self.shared.fail_refused_event(&active_route, &error).await;
+                            return;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3942,8 +4020,11 @@ impl Session for CodexSession {
         let _steering = self.shared.steering.lock().await;
         let running = {
             let turn = self.shared.turn.lock().await;
+            // A turn whose stream already ended is not one the host can steer, even while Codex
+            // has not yet reported it over: input sent now would reach a turn the host was told
+            // is finished, and race the interrupt that is stopping it.
             turn.as_ref()
-                .filter(|active| !active.finishing)
+                .filter(|active| !active.finishing && !active.sink.is_terminal())
                 .map(|active| {
                     (
                         Arc::clone(&active.owner),
@@ -4975,6 +5056,36 @@ mod tests {
         );
     }
 
+    /// A duplicate of a finished turn's malformed terminal, with no thread, is dropped while a
+    /// start is pending, as it was before claims were scoped to the session's own thread. If it
+    /// reached the reducer it would be an unroutable terminal and shut the session down.
+    #[tokio::test]
+    async fn a_threadless_duplicate_of_a_completed_turns_terminal_is_dropped_not_poisoned() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        shared.remember_completed("vendor-turn-1").await;
+        let handler = CodexHandler {
+            shared: Arc::clone(&shared),
+        };
+        let (_turn_id, _pending_start) = running(&shared, "").await;
+
+        handler
+            .on_notification(
+                String::from("turn/completed"),
+                serde_json::json!({"turn": {"id": "vendor-turn-1", "status": 7}}),
+            )
+            .await;
+
+        assert!(
+            !shared.is_shutting_down(),
+            "expected a threadless duplicate for a completed turn to be dropped | received a poisoned session"
+        );
+        assert!(
+            shared.turn.lock().await.is_some(),
+            "expected the pending start to stay admitted"
+        );
+    }
+
     /// An approval from a completed turn on this same thread must never wait for the new turn's
     /// host, even while the server still has its request task alive.
     #[tokio::test]
@@ -5491,6 +5602,73 @@ mod tests {
             ),
             "expected completion after the accepted answer resolution"
         );
+    }
+
+    /// The host sees the resolution before the answer is written, so an answer the link refuses
+    /// has to be followed by the failure that says the vendor never received it, not by silence
+    /// that the idle watchdog later reports as a timeout.
+    #[tokio::test]
+    async fn an_approval_answer_the_link_refuses_is_followed_by_the_connection_failure() {
+        let shared = shared();
+        shared.adopt_thread(String::from("thread-1"));
+        let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+        let link = ScriptedLink::new();
+        link.fail_sends("EPIPE");
+        let client = Client::connect(
+            link.clone().into_link(),
+            super::CodexSession::handler(Arc::clone(&shared)),
+            ClientOptions::new("Codex app-server"),
+        );
+        link.push_line(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1", "turnId": "vendor-turn-1", "itemId": "item-1",
+                    "command": "pwd"
+                }
+            })
+            .to_string(),
+        );
+
+        let mut seen = Vec::new();
+        let terminal = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "expected a terminal event after the refused answer | received: {seen:?}"
+                    )
+                })
+                .expect("expected the stream to stay open until its terminal");
+            match event.kind {
+                EventKind::ApprovalRequested { .. } => {
+                    seen.push("ApprovalRequested");
+                    answer_waiting_approval(&shared).await;
+                }
+                EventKind::ApprovalResolved { .. } => seen.push("ApprovalResolved"),
+                EventKind::Error { error } => break error,
+                other => panic!("expected an approval event or the failure | received {other:?}"),
+            }
+        };
+        assert_eq!(
+            seen,
+            ["ApprovalRequested", "ApprovalResolved"],
+            "expected the resolution before the failure terminal | received {seen:?}"
+        );
+        assert!(
+            terminal
+                .message
+                .contains("connection ended while the turn was active"),
+            "expected the connection-failure terminal, not a timeout | received {}",
+            terminal.message
+        );
+        assert!(
+            client.is_closed(),
+            "expected closed: true after the refused answer | received: false"
+        );
+        let _ = client.close().await;
     }
 
     /// Cancellation cleanup owns the approval resolution it already published.
