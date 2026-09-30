@@ -930,3 +930,50 @@ async fn a_terminal_the_hub_recorded_as_offered_leaves_no_separate_settlement() 
         "expected no separate settlement when the hub took the vendor's terminal"
     );
 }
+
+/// The settlement a reconciliation found is kept too, not only the one a commit answered.
+///
+/// Both end as `AlreadyCommitted`, and both used to be forgotten with the run: the flag that says
+/// the terminal came from the Hub was the run's, so a repeated run committed a terminal the Hub
+/// had already handed over.
+#[tokio::test(start_paused = true)]
+async fn a_repeated_run_after_a_reconciled_terminal_does_not_commit_it_back() {
+    let hub = Arc::new(FakeHubApi::new().reconciling([ReconcileAnswer::Answer(
+        Reconciliation::Answered(HubStatus::Committed {
+            terminal: hub_failure(),
+        }),
+    )]));
+    let session = FakeVendorSession::new().answering([TurnAnswer::AcknowledgementLost]);
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    let first = supervisor
+        .run(request.clone())
+        .await
+        .expect("expected the first run to settle");
+    let again = supervisor
+        .run(request)
+        .await
+        .expect("expected the repeated run to settle");
+
+    let settled = Settled::AlreadyCommitted {
+        terminal: hub_failure(),
+    };
+    assert_eq!(first, settled);
+    assert_eq!(
+        again, settled,
+        "expected the repeated run to agree with the terminal the hub reported"
+    );
+    assert_eq!(
+        hub.count(HubCallKind::Commit),
+        0,
+        "expected no commit of an outcome the hub reported, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        supervisor.settlement(&TurnId::new("turn-1")),
+        Some(&hub_failure()),
+        "expected the reconciled terminal to be kept as the hub's settlement"
+    );
+}
