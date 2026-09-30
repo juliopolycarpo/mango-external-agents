@@ -61,7 +61,8 @@ jobs:
             echo '### Protocol crates in this run'
             echo
             echo '```'
-            cargo tree -p mango-agent-acp --depth 1 | grep -E 'agent-client-protocol'
+            cargo tree -i agent-client-protocol -e normal --depth 0
+            cargo tree -i agent-client-protocol-schema -e normal --depth 0
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
