@@ -1,4 +1,6 @@
-//! The Claude reducer closing a call: a `tool_result` record in, the completion out.
+//! The Claude reducer closing a call (a `tool_result` record in, the completion out) and starting
+//! a file-change call (a `Write` or `Edit` `tool_use` in, the activity with its diff out), plus a
+//! subagent's forwarded text blocks accumulating under the call that spawned it.
 //!
 //! The reducer keeps only the start of a result's text, so the cost of a call is what it takes to
 //! find that start. A string payload is borrowed; an array payload is a list of text blocks that
@@ -82,7 +84,11 @@ fn open_calls(calls: usize, payload: &Payload) -> (TurnReducer, Vec<StreamRecord
     (reducer, results)
 }
 
-fn close_all(mut reducer: TurnReducer, results: Vec<StreamRecord>) -> (TurnReducer, usize) {
+/// What a routine hands back: the reducer, the records it reduced and the event count. The runner
+/// drops it after the timer stops, so freeing the parsed records is not charged to the reducer.
+type Drained = (TurnReducer, Vec<StreamRecord>, usize);
+
+fn close_all(mut reducer: TurnReducer, results: Vec<StreamRecord>) -> Drained {
     let mut output = 0;
     for record in &results {
         let events = reducer.reduce(record).events;
@@ -95,11 +101,84 @@ fn close_all(mut reducer: TurnReducer, results: Vec<StreamRecord>) -> (TurnReduc
         );
         output += events.len();
     }
-    (reducer, output)
+    (reducer, results, output)
+}
+
+/// The assistant record that starts `calls` file-change calls, and a fresh reducer to reduce it on.
+///
+/// `Write` carries one `content` string; `Edit` carries an `old_string` and a `new_string`. Each
+/// string is `bytes` of source-like text.
+fn file_change_records(calls: usize, tool: &str, bytes: usize) -> (TurnReducer, Vec<StreamRecord>) {
+    let text = text_of(bytes);
+    let input = match tool {
+        "Write" => json!({"file_path": "/work/src/lib.rs", "content": text}),
+        _ => json!({"file_path": "/work/src/lib.rs", "old_string": text, "new_string": text}),
+    };
+    let records = (0..calls)
+        .map(|call| {
+            let line = json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("toolu_{call}"), "name": tool, "input": input}
+            ]}})
+            .to_string();
+            StreamRecord::parse(&line).expect("expected the bench record to parse")
+        })
+        .collect();
+    (TurnReducer::new(), records)
+}
+
+fn start_all(mut reducer: TurnReducer, records: Vec<StreamRecord>) -> Drained {
+    let mut output = 0;
+    for record in &records {
+        let events = reducer.reduce(record).events;
+        assert!(
+            matches!(
+                events.as_slice(),
+                [EventKind::ActivityStarted { activity, .. }] if activity.content.is_some()
+            ),
+            "expected exactly one started activity carrying a diff, received {events:?}"
+        );
+        output += events.len();
+    }
+    (reducer, records, output)
+}
+
+/// One open `Task` call and `blocks` text blocks of `bytes` each forwarded under it.
+fn forwarded_blocks(blocks: usize, bytes: usize) -> (TurnReducer, Vec<StreamRecord>) {
+    let mut reducer = TurnReducer::new();
+    let started = json!({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_parent", "name": "Task", "input": {"prompt": "go"}}
+    ]}})
+    .to_string();
+    let started = StreamRecord::parse(&started).expect("expected the bench record to parse");
+    assert!(
+        !reducer.reduce(&started).events.is_empty(),
+        "expected the Task call to open an activity"
+    );
+    let text = text_of(bytes);
+    let forwarded = json!({"type": "assistant", "parent_tool_use_id": "toolu_parent",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+    .to_string();
+    let records = (0..blocks)
+        .map(|_| StreamRecord::parse(&forwarded).expect("expected the bench record to parse"))
+        .collect();
+    (reducer, records)
+}
+
+fn forward_all(mut reducer: TurnReducer, records: Vec<StreamRecord>) -> Drained {
+    let mut output = 0;
+    for record in &records {
+        let events = reducer.reduce(record).events;
+        assert!(
+            matches!(events.as_slice(), [EventKind::ActivityUpdated { .. }]),
+            "expected one activity update per forwarded block, received {events:?}"
+        );
+        output += events.len();
+    }
+    (reducer, records, output)
 }
 
 fn main() {
-    let bench = Bench::new("claude reducer (tool_result close)");
+    let bench = Bench::new("claude reducer (tool_result close, file-change start, forwarded text)");
     let cases: [(&str, usize, Payload); 8] = [
         ("claude/close/string/1MiB", 20, Payload::text(1 << 20)),
         ("claude/close/array-1x1MiB", 20, Payload::blocks(1 << 20, 1)),
@@ -134,4 +213,24 @@ fn main() {
             |(reducer, results)| close_all(reducer, results),
         );
     }
+    let file_changes: [(&str, usize, &str, usize); 4] = [
+        ("claude/start/write-16KiB", 1000, "Write", 16 << 10),
+        ("claude/start/write-200KiB", 100, "Write", 200 << 10),
+        ("claude/start/edit-2x2KiB", 1000, "Edit", 2 << 10),
+        ("claude/start/edit-2x100B", 1000, "Edit", 100),
+    ];
+    for (name, calls, tool, bytes) in file_changes {
+        bench.run(
+            name,
+            Unit::new(calls as u64, "call"),
+            || file_change_records(calls, tool, bytes),
+            |(reducer, records)| start_all(reducer, records),
+        );
+    }
+    bench.run(
+        "claude/forward/1000x1KiB",
+        Unit::new(1000, "block"),
+        || forwarded_blocks(1000, 1 << 10),
+        |(reducer, records)| forward_all(reducer, records),
+    );
 }
