@@ -586,6 +586,57 @@ impl HubApi for FakeHubApi {
     }
 }
 
+/// A [`Session`] whose streams say the vendor never acknowledged the turn.
+///
+/// The shape ACP and Codex return: the stream carries [`Dispatch::AcceptanceUnknown`] until its
+/// terminal proves the turn ran. Everything else, including the turn's script, is the wrapped
+/// [`FakeVendorSession`]'s.
+///
+/// # Example
+///
+/// ```
+/// use hub_host::testing::{FakeVendorSession, UnconfirmedAcceptanceSession};
+///
+/// let _session = UnconfirmedAcceptanceSession::new(FakeVendorSession::new());
+/// ```
+pub struct UnconfirmedAcceptanceSession {
+    inner: FakeVendorSession,
+}
+
+impl UnconfirmedAcceptanceSession {
+    /// Wraps `inner`, whose turns keep their script but come back unacknowledged.
+    pub fn new(inner: FakeVendorSession) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl Session for UnconfirmedAcceptanceSession {
+    fn state(&self) -> &SessionState {
+        self.inner.state()
+    }
+
+    async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        Ok(self
+            .inner
+            .start_turn(request)
+            .await?
+            .with_dispatch(Dispatch::AcceptanceUnknown))
+    }
+
+    async fn respond(&self, response: PermissionResponse) -> Result<()> {
+        self.inner.respond(response).await
+    }
+
+    async fn cancel(&self, reason: CancelReason) -> Result<()> {
+        self.inner.cancel(reason).await
+    }
+
+    async fn close(&self, reason: CloseReason) -> Result<()> {
+        self.inner.close(reason).await
+    }
+}
+
 /// One scripted answer to [`Session::start_turn`].
 #[derive(Clone, Copy, Debug)]
 pub enum TurnAnswer {
