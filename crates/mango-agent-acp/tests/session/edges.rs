@@ -327,3 +327,104 @@ async fn a_parameterized_model_id_survives_the_catalog_verbatim() {
     );
     session.close(CloseReason::Shutdown).await.expect("close");
 }
+
+/// A host launcher that ignores `LaunchSpec::stdin: true`: the child is live and its stdout is
+/// readable, but it was never given a writable stdin.
+struct StdinlessLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for StdinlessLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<ManagedProcess> {
+        let mut process = self.inner.spawn(spec).await?;
+        process.stdin = None;
+        Ok(process)
+    }
+}
+
+fn stdinless_host(inner: Arc<dyn ProcessLauncher>) -> HostContext {
+    HostContext::builder()
+        .launcher(Arc::new(StdinlessLauncher { inner }))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .limits(Limits {
+            kill_grace: Duration::from_millis(10),
+            shutdown_timeout: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host")
+}
+
+/// Waits, bounded, for the launcher to report no live child, naming the last count it saw.
+async fn wait_for_no_live_children(launcher: &FakeLauncher) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while launcher.live_children() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "expected live children: 0 | received {}",
+            launcher.live_children()
+        )
+    });
+}
+
+/// A child launched without stdin cannot be a peer, and it must not be left running: the open
+/// fails with the link error and the child is reaped.
+#[tokio::test]
+async fn a_child_launched_without_stdin_is_reaped_when_the_open_fails() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().process());
+    let error = AcpHarness::new(profile())
+        .open_session(
+            &stdinless_host(Arc::new(launcher.clone())),
+            OpenSession::new("no-stdin"),
+        )
+        .await
+        .err()
+        .expect("expected the open to fail for a child with no stdin");
+    assert!(
+        matches!(error.cause(), Error::Link { .. }),
+        "expected Error::Link for a child without a writable stdin | received {error:?}"
+    );
+    wait_for_no_live_children(&launcher).await;
+}
+
+/// When the bounded kill of that child fails, the host is handed the control, as
+/// `docs/lifecycle.md` promises, and can still reap the child through it.
+#[tokio::test]
+async fn a_failed_kill_of_a_child_without_stdin_hands_the_host_its_control() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().process());
+    let failing_once = RecoverableCleanupLauncher::new(launcher.clone());
+    let error = AcpHarness::new(profile())
+        .open_session(
+            &stdinless_host(Arc::new(failing_once)),
+            OpenSession::new("no-stdin"),
+        )
+        .await
+        .err()
+        .expect("expected the open to fail for a child with no stdin");
+    // `cause()` looks through `CleanupRequired`, so the control is what proves that variant.
+    let control = error.cleanup_control().unwrap_or_else(|| {
+        panic!("expected Error::CleanupRequired carrying the child's control | received {error:?}")
+    });
+    assert_eq!(
+        launcher.live_children(),
+        1,
+        "expected the child still live until the host retries | received {}",
+        launcher.live_children()
+    );
+    control
+        .kill(CancelReason::Shutdown)
+        .await
+        .expect("expected the host's retry to reap the child");
+    wait_for_no_live_children(&launcher).await;
+}

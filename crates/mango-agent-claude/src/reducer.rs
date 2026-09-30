@@ -151,7 +151,10 @@ pub struct TurnReducer {
     /// closed in a stable order.
     open_activities: Vec<String>,
     /// Forwarded subagent text per parent call, so updates accumulate rather than replace.
-    nested_text: BTreeMap<String, String>,
+    ///
+    /// The flag is set once a cut has happened: the buffer then holds the bound's worth of
+    /// characters, and appending more can only be cut off again.
+    nested_text: BTreeMap<String, (String, bool)>,
     /// A held `system/permission_denied` reason, keyed by the call it refused, until the
     /// `tool_result` that closes the call arrives.
     denied_activities: BTreeMap<String, String>,
@@ -787,13 +790,23 @@ impl TurnReducer {
     /// Hands back the accumulated buffer itself. A copy would be made per forwarded block, of a
     /// string that is allowed to grow to twice a detail's bound, only for the caller to bound and
     /// copy it again on the way into the event.
+    ///
+    /// Once a cut has happened the buffer holds exactly the bound's worth of characters, and
+    /// `head(buffer + '\n' + text)` is that buffer again for any `text`. So a full buffer is handed
+    /// back as it is: the block is not copied in only to be cut off, and the buffer's capacity stops
+    /// growing with the blocks it discards. Nothing here is redacted, so nothing is cut earlier
+    /// than it was.
     fn append_nested(&mut self, parent: &str, text: &str) -> &str {
-        let entry = self.nested_text.entry(parent.to_owned()).or_default();
+        let (entry, full) = self.nested_text.entry(parent.to_owned()).or_default();
+        if *full {
+            return entry;
+        }
         if !entry.is_empty() {
             entry.push('\n');
         }
         entry.push_str(text);
         let kept = head(entry, DETAIL_CARRY_MAX_CHARS).len();
+        *full = kept < entry.len();
         entry.truncate(kept);
         entry
     }
@@ -1870,6 +1883,118 @@ mod tests {
             0,
             "expected no delivered text kept once the run ended, received {} bytes of capacity",
             reducer.retained_text_capacity()
+        );
+    }
+
+    /// The reference for a subagent's accumulated detail: append the block, then cut to the bound,
+    /// every time. What the reducer must keep producing, byte for byte, however it gets there.
+    fn accumulated_by_cutting_every_time(kept: &mut String, block: &str) -> String {
+        if !kept.is_empty() {
+            kept.push('\n');
+        }
+        kept.push_str(block);
+        let cut = crate::protocol::char_head(kept, DETAIL_CARRY_MAX_CHARS).len();
+        kept.truncate(cut);
+        kept.clone()
+    }
+
+    fn forwarded_line(parent: &str, text: &str) -> String {
+        json!({"type": "assistant", "parent_tool_use_id": parent,
+               "message": {"content": [{"type": "text", "text": text}]}})
+        .to_string()
+    }
+
+    /// The detail a `Task` call shows after one more forwarded block.
+    fn nested_detail(reducer: &mut TurnReducer, parent: &str, block: &str) -> Option<String> {
+        let events = reduce(reducer, &forwarded_line(parent, block));
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.first() else {
+            panic!("expected one activity update for a forwarded block | received: {events:?}");
+        };
+        update.detail.clone()
+    }
+
+    fn open_task(reducer: &mut TurnReducer, id: &str) {
+        let line = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": id, "name": "Task", "input": {"prompt": "go"}}]}})
+        .to_string();
+        assert!(
+            !reduce(reducer, &line).is_empty(),
+            "expected the Task call {id} to open an activity"
+        );
+    }
+
+    #[test]
+    fn a_subagents_detail_is_byte_identical_to_cutting_after_every_block() {
+        let bound = DETAIL_CARRY_MAX_CHARS;
+        let shapes = [
+            ("ascii", "a".repeat(1000)),
+            ("two-byte", "\u{e9}".repeat(700)),
+            ("four-byte", "ab\u{1f600}".repeat(333)),
+            ("exactly the bound", "x".repeat(bound)),
+            ("one under the bound", "y".repeat(bound - 1)),
+            ("one character", String::from("z")),
+            ("bidi control", "\u{202e}sk-live-CANARY".repeat(50)),
+        ];
+        for (name, shape) in &shapes {
+            for mixed in [false, true] {
+                let mut reducer = TurnReducer::new();
+                open_task(&mut reducer, "p");
+                let mut reference = String::new();
+                for block in 0..40 {
+                    let text = if mixed && block % 3 == 0 {
+                        "\u{e9}\u{77ed}"
+                    } else {
+                        shape.as_str()
+                    };
+                    let expected = accumulated_by_cutting_every_time(&mut reference, text);
+                    let received = nested_detail(&mut reducer, "p", text);
+                    assert_eq!(
+                        received.as_deref(),
+                        (!expected.is_empty()).then_some(expected.as_str()),
+                        "expected the detail to match cutting after every block | shape: {name}, \
+                         mixed: {mixed}, block: {block}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_subagent_buffer_does_not_swallow_another_subagents_text() {
+        let mut reducer = TurnReducer::new();
+        open_task(&mut reducer, "big");
+        open_task(&mut reducer, "small");
+        let overlong = "w".repeat(DETAIL_CARRY_MAX_CHARS + 10);
+        nested_detail(&mut reducer, "big", &overlong);
+        nested_detail(&mut reducer, "big", "ignored, the buffer is full");
+
+        assert_eq!(
+            nested_detail(&mut reducer, "small", "first").as_deref(),
+            Some("first"),
+            "expected another parent to accumulate from its own empty buffer"
+        );
+        assert_eq!(
+            nested_detail(&mut reducer, "small", "second").as_deref(),
+            Some("first\nsecond"),
+            "expected the other parent to keep accumulating below the bound"
+        );
+    }
+
+    #[test]
+    fn a_reused_call_id_starts_a_new_buffer_once_the_call_closed() {
+        let mut reducer = TurnReducer::new();
+        open_task(&mut reducer, "p");
+        nested_detail(&mut reducer, "p", &"w".repeat(DETAIL_CARRY_MAX_CHARS + 10));
+        let closed = json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "p", "content": "done"}]}})
+        .to_string();
+        reduce(&mut reducer, &closed);
+
+        open_task(&mut reducer, "p");
+        assert_eq!(
+            nested_detail(&mut reducer, "p", "fresh").as_deref(),
+            Some("fresh"),
+            "expected a closed call's full buffer not to carry into a new call of the same id"
         );
     }
 }

@@ -290,6 +290,9 @@ pub(crate) struct SessionState {
     turn_released: tokio::sync::Notify,
     /// Set by the connection-loss watcher: no further turn may take the slot on a dead connection.
     admission_closed: AtomicBool,
+    /// Set by the lifecycle watcher on every wake: the connection is being wound down without a
+    /// `close`, so configuration is refused even when it touches no wire request.
+    peer_ended: AtomicBool,
     /// The explicit settings the next turn inherits.
     ///
     /// `None` on either permission axis leaves the vendor's own setting in force. Turning that
@@ -367,6 +370,7 @@ impl SessionState {
             turn: Mutex::new(None),
             turn_released: tokio::sync::Notify::new(),
             admission_closed: AtomicBool::new(false),
+            peer_ended: AtomicBool::new(false),
             configuration: Mutex::new(configuration),
             catalog_revision: Mutex::new(0),
             turn_start: Mutex::new(()),
@@ -712,6 +716,24 @@ impl SessionState {
         self.admission_closed.store(true, Ordering::Release);
     }
 
+    /// Records that the lifecycle watcher is ending this session without a `close`.
+    ///
+    /// A separate mark from the close state on purpose: `close` keeps sole ownership of the shared
+    /// close result, and this only lets configuration refuse work on a session that has ended.
+    ///
+    /// ```ignore
+    /// state.mark_peer_ended();
+    /// assert!(state.has_peer_ended());
+    /// ```
+    pub(crate) fn mark_peer_ended(&self) {
+        self.peer_ended.store(true, Ordering::Release);
+    }
+
+    /// Whether the lifecycle watcher has begun ending this session.
+    pub(crate) fn has_peer_ended(&self) -> bool {
+        self.peer_ended.load(Ordering::Acquire)
+    }
+
     /// Waits until no turn holds the prompt slot.
     ///
     /// A turn leaves the slot only after its terminal is committed, so a watcher that awaits this
@@ -738,6 +760,13 @@ impl SessionState {
         // and a runtime with paused time has to see that spacing move with it.
         self.lock_reducer()
             .update_at(notification.update, tokio::time::Instant::now().into_std())
+    }
+
+    /// How many tool calls the turn reducer holds open, for the tests that prove a turnless frame
+    /// did not reach it.
+    #[cfg(test)]
+    fn open_call_count(&self) -> usize {
+        self.lock_reducer().open_calls_len()
     }
 
     /// Publishes a session-scoped fact the reducer surfaced.
@@ -1040,19 +1069,25 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     if !state.serves(&notification.session_id) {
         return;
     }
-    // Capture the current owner before reducing session facts. Facts may arrive between turns;
-    // their publication must not attach turn events to a newly admitted generation.
+    // Capture the current owner before anything is reduced. Facts may arrive between turns; their
+    // publication must not attach turn events to a newly admitted generation.
     let turn = state.turn();
     state.touch();
+    // No turn owns this frame (a `session/load` replay, or a frame between turns): its events would
+    // be dropped, so only its session facts are read and the turn reducer is not fed, which keeps a
+    // long history from leaving open calls behind for the next turn to reset.
+    let Some(turn) = turn else {
+        for fact in Reducer::session_facts(notification.update) {
+            state.apply_fact(fact);
+        }
+        return;
+    };
     let (events, facts) = state.reduce(notification);
     // Published before the turn events: a session fact is true the moment the agent announced it,
     // not only once a host has read every event that preceded it on this turn's own stream.
     for fact in facts {
         state.apply_fact(fact);
     }
-    let Some(turn) = turn else {
-        return;
-    };
     for kind in events {
         // Re-checked each time round: close can commit the terminal after reduction, and no later
         // event may follow it.
@@ -1296,7 +1331,10 @@ struct RequestAdmissionState {
 impl RequestAdmission {
     fn new(limit: usize) -> Self {
         Self {
-            permits: tokio::sync::Semaphore::new(limit),
+            // A host may set a huge count to mean "no cap"; a semaphore panics above
+            // `MAX_PERMITS`, and this runs after the child is launched. `limit` itself stays as
+            // the host set it, for the refusal message.
+            permits: tokio::sync::Semaphore::new(limit.min(tokio::sync::Semaphore::MAX_PERMITS)),
             limit,
             state: Mutex::new(RequestAdmissionState::default()),
         }
@@ -2700,5 +2738,148 @@ mod tests {
                 if operation.contains("turn slot release") && *after == bound),
             "expected Timeout naming the turn slot release after {bound:?} | received: {error:?}"
         );
+    }
+
+    /// Frames delivered while no turn exists: a `session/load` replay, or a frame between turns.
+    mod replay {
+        use std::sync::Arc;
+
+        use mango_external_agents::{AttemptId, EventSink, TurnId};
+
+        use super::{SessionId, state};
+
+        /// One `session/update` notification for `session-1`, composed as the agent's JSON.
+        fn notification(
+            update: serde_json::Value,
+        ) -> agent_client_protocol::schema::v1::SessionNotification {
+            serde_json::from_value(serde_json::json!({
+                "sessionId": "session-1",
+                "update": update,
+            }))
+            .expect("expected the test frame to be a v1 session notification")
+        }
+
+        fn running_call(index: usize) -> agent_client_protocol::schema::v1::SessionNotification {
+            notification(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": format!("call-{index}"),
+                "title": "Run tests",
+                "kind": "execute",
+                "status": "in_progress",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "output" } }],
+            }))
+        }
+
+        /// `session/load` replays a whole history while no turn exists. Those frames build events that
+        /// are dropped, so they must not also leave a call open in the reducer until the next turn.
+        #[tokio::test]
+        async fn replayed_tool_calls_leave_no_open_call_when_no_turn_exists() {
+            const REPLAYED: usize = 50;
+            let (state, _) = state();
+            let state = Arc::new(state);
+            for index in 0..REPLAYED {
+                crate::client::on_session_update(&state, running_call(index)).await;
+            }
+            let open = state.open_call_count();
+            assert_eq!(
+                open, 0,
+                "expected open calls after turnless replay: 0 | received: {open}"
+            );
+        }
+
+        /// Skipping the transcript must not skip what the replay says about the session itself.
+        #[tokio::test]
+        async fn replayed_session_facts_are_still_applied_when_no_turn_exists() {
+            let (state, _) = state();
+            let state = Arc::new(state);
+            crate::client::on_session_update(&state, running_call(0)).await;
+            crate::client::on_session_update(
+                &state,
+                notification(serde_json::json!({
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{ "name": "review", "description": "Review the diff" }],
+                })),
+            )
+            .await;
+            crate::client::on_session_update(
+                &state,
+                notification(serde_json::json!({
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": [{
+                        "id": "model",
+                        "name": "Model",
+                        "type": "select",
+                        "currentValue": "fast",
+                        "options": [
+                            { "value": "fast", "name": "Fast" },
+                            { "value": "deep", "name": "Deep" }
+                        ],
+                    }],
+                })),
+            )
+            .await;
+            let snapshot = state.core_state.snapshot();
+            let commands: Vec<&str> = snapshot.commands.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(
+                commands,
+                ["review"],
+                "expected replayed commands: [review] | received: {commands:?}"
+            );
+            let options = snapshot.catalog.options().len();
+            assert_eq!(
+                options, 1,
+                "expected replayed configuration options: 1 | received: {options}"
+            );
+        }
+
+        /// The turn events one session emits for a repeat of call 0 after `replayed` turnless frames.
+        async fn events_after_replay(replayed: usize) -> Vec<String> {
+            use mango_external_agents::event::EventKind;
+
+            let (state, host) = state();
+            let state = Arc::new(state);
+            for index in 0..replayed {
+                crate::client::on_session_update(&state, running_call(index)).await;
+            }
+            let (sink, mut events) = EventSink::new(
+                SessionId::new("session-1"),
+                TurnId::new("turn-1"),
+                AttemptId::default(),
+                Arc::clone(host.clock()),
+                16,
+            );
+            let turn = state
+                .begin_turn(sink, None)
+                .expect("expected the turn to be admitted");
+            crate::client::on_session_update(&state, running_call(0)).await;
+            let closing = state.prepare_terminal_matching(&turn);
+            let closed = closing.map_or(0, |(_, _, mut reducer)| reducer.finish().len());
+            let mut kinds = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                kinds.push(match event.kind {
+                    EventKind::ActivityStarted { .. } => String::from("started"),
+                    other => format!("{other:?}"),
+                });
+            }
+            kinds.push(format!("owed-closings:{closed}"));
+            kinds
+        }
+
+        /// A turn that starts after a replay reduces its own frames exactly as it would have on a
+        /// session that never replayed anything: the replay's calls are neither open nor finished in it.
+        #[tokio::test]
+        async fn a_turn_after_replay_reduces_as_on_a_fresh_session() {
+            let fresh = events_after_replay(0).await;
+            let replayed = events_after_replay(50).await;
+            assert_eq!(
+                fresh,
+                ["started", "owed-closings:1"],
+                "expected a fresh turn to start one call and owe its close | received: {fresh:?}"
+            );
+            assert_eq!(
+                replayed, fresh,
+                "expected a turn after replay to match a fresh session: {fresh:?} | received: {replayed:?}"
+            );
+        }
     }
 }

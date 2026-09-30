@@ -120,6 +120,46 @@ fn reduce(frames: Vec<SessionUpdate>, mut reducer: Reducer) -> usize {
     carried
 }
 
+/// One replayed call as `session/load` sends it: the announcement, a running update that repeats
+/// the body, and the completion, with a line of assistant commentary between calls.
+fn replayed_history(calls: usize, body: &str) -> Vec<SessionUpdate> {
+    let content = [text_block(body)];
+    let mut frames = Vec::with_capacity(calls * 4);
+    for index in 0..calls {
+        frames.push(update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "running the next step" },
+        })));
+        frames.push(tool_call(index, &content));
+        frames.push(tool_call_update(index, "in_progress", &content));
+        frames.push(tool_call_update(index, "completed", &content));
+    }
+    frames
+}
+
+/// The replay as the turn reducer saw it before: every frame reduced and its events dropped.
+fn replay_through_reducer(frames: Vec<SessionUpdate>) -> usize {
+    let start = Instant::now();
+    let mut reducer = Reducer::new();
+    let mut facts = 0;
+    for (index, frame) in frames.into_iter().enumerate() {
+        let spacing = FRAME_SPACING * u32::try_from(index).unwrap_or(u32::MAX);
+        let (events, frame_facts) = reducer.update_at(frame, start + spacing);
+        facts += frame_facts.len();
+        std::hint::black_box(events);
+    }
+    facts
+}
+
+/// The replay as a session with no turn reads it: only the frames' session facts.
+fn replay_facts_only(frames: Vec<SessionUpdate>) -> usize {
+    let mut facts = 0;
+    for frame in frames {
+        facts += std::hint::black_box(Reducer::session_facts(frame)).len();
+    }
+    facts
+}
+
 /// A reducer already tracking `count` running calls, for the update cases.
 fn reducer_with_open_calls(count: usize) -> Reducer {
     let mut reducer = Reducer::new();
@@ -208,4 +248,24 @@ fn main() {
         || started(SMALL_FRAMES, &[text_block(commentary)]),
         |frames| reduce(frames, Reducer::new()),
     );
+
+    // A `session/load` replay reaches a session with no turn, so its events are dropped. `full` is
+    // what that cost when every frame went through the turn reducer; `facts-only` is what a
+    // turnless session reads now. Four frames per call, so the unit is the frame.
+    let replay_body = "output line of a finished build step\n".repeat(55);
+    for calls in [1_000, 10_000] {
+        let frames = Unit::new(4 * calls as u64, "frame");
+        bench.run(
+            &format!("acp/reduce/replay/{calls}-calls/full"),
+            frames,
+            || replayed_history(calls, &replay_body),
+            replay_through_reducer,
+        );
+        bench.run(
+            &format!("acp/reduce/replay/{calls}-calls/facts-only"),
+            frames,
+            || replayed_history(calls, &replay_body),
+            replay_facts_only,
+        );
+    }
 }
