@@ -95,6 +95,12 @@ Under "Authentication and credential use":
 > users. Moreover, developers may not collect, store, or intermediate Claude.ai credentials or
 > session tokens — sign-in to a Claude account must complete through Anthropic’s own flow.
 
+> This does not restrict how customers provision and manage their own API keys or third-party
+> inference provider credentials — for example, configuring an API key in a development
+> environment, secrets manager, or machine image for use by the customer’s own authorized users —
+> provided the resulting usage is billed to the key owner under their agreement with Anthropic (or
+> the applicable provider) and is not resold or intermediated as described above.
+
 > Nor does it prevent an end user from signing in to the unmodified Claude Code binary with their own
 > Claude subscription, including where a platform hosts Claude Code as described under Can customers
 > offer Claude Code in their products? above.
@@ -123,8 +129,10 @@ page claims no permission the vendor did not write down.
   for example in a hosted sandbox, is the party the conditions address: it needs the Commercial
   Terms and must meet the conditions. A host that only drives the `claude` a user installed and
   signed into on their own machine should still read them.
-- **The binary is not modified.** The library launches the executable the host names, as published,
-  and patches, wraps or replaces nothing in it.
+- **The library does not modify the binary.** It launches the executable that the host's
+  `ExecutablePath`, or the bare `claude` name its launcher resolves, points at, and patches, wraps
+  or replaces nothing in it. It does not check that the executable is Anthropic's own build:
+  supplying and verifying the official, unmodified binary is the host's job.
 - **No built-in authentication method is removed, disabled or restricted by a flag.** The argv adds
   no option that selects or drops a sign-in method. `--bare`, which would skip OAuth and the keychain
   and authenticate only from `ANTHROPIC_API_KEY` or an `apiKeyHelper`, is deliberately not passed
@@ -140,12 +148,17 @@ page claims no permission the vendor did not write down.
   not remove, disable, or restrict any authentication method built into it (including methods that
   permit signing in with a Claude account or the user’s own API key)". This page draws no
   conclusion: the sentence is addressed to customers running Claude Code in their products, and
-  whether an environment allowlist counts is Anthropic's to say.
+  whether an environment allowlist counts is Anthropic's to say. The written allowance for
+  customer-managed API keys, quoted above, concerns how customers provision keys for their own
+  authorized users; a host that relies on it configures the key in `claude` itself, because the
+  library will not carry it.
 - **No credential or session token is collected, stored or intermediated.** Sign-in completes
   through Anthropic's own flow: a signed-out CLI fails a turn with `AuthRequired`, which carries
   `claude auth login` as text for a person to run.
-- **No resale or intermediation.** The library routes no request and pays for none; the user's own
-  account is what the binary authenticates with.
+- **No resale or intermediation by the library.** It routes no request and pays for none. It does
+  not establish whose account the binary authenticates with: discovery reports the account mode
+  only, and a host can point `CLAUDE_CONFIG_DIR` at shared configuration. Ensuring that every end
+  user authenticates with their own account is the host's job.
 
 Discovery reports `AuthState` — including whether the account is a subscription rather than an API
 key — so a host can show its own disclosure and make its own call. `mango-external-agents` makes
@@ -184,8 +197,8 @@ is here and the decision is the host's. OpenAI has also publicly welcomed third-
 subscriptions (press coverage, 2026-02); that is cited as reported, not as a licence term, and it
 does not displace the published sentence.
 
-**Quotes** (read 2026-09-30, from <https://learn.chatgpt.com/docs/app-server>, section "Auth
-endpoints"):
+**Auth policy quotes** (read 2026-09-30, from <https://learn.chatgpt.com/docs/app-server>,
+section "Auth endpoints"):
 
 > If you’ve built a local or open-source application using Codex app-server authentication, you can
 > continue using it, though we recommend migrating to Sign in with ChatGPT so users have greater
@@ -204,7 +217,7 @@ is the library's own allowlist, and the only vendor variable on it is `CODEX_HOM
 in a host's environment is not forwarded. The sentence quoted above does not address that, and this
 page draws no conclusion.
 
-**Quotes**, read against `rust-v0.154.0`, from
+**Interface quotes**, read against `rust-v0.154.0`, from
 [`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md)
 at that tag:
 
