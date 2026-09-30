@@ -63,8 +63,10 @@ published manifest does not declare. The fixtures come from `mea capture`, and t
 directories that carry a `manifest.json` are held to the digests in it; a copy inside a crate would
 be a second, unguarded record, so none is bundled.
 
-Observed on the four 0.3.0 tarballs, each unpacked from `cargo package` and run with
-`cargo test --all-features`:
+Observed on the four crates as `cargo package` produced them from `main` after 0.3.0 (the 0.3.0
+sources plus unreleased changes, so counts differ from the published 0.3.0 tarballs; the
+published `mango-agent-claude` 0.3.0 fails in the same way), each unpacked and run with
+`cargo test --all-features`. Re-check after a version bump:
 
 - `mango-external-agents`: every unit, integration and doc test passes, so its packaged tests can
   be run. Only its `framing` bench reads `fixtures/`, at run time.
