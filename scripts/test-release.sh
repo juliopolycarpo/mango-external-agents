@@ -228,3 +228,117 @@ rm -rf "$dev_fixture"
 trap - EXIT
 scripts/check-dev-dependencies.sh >/dev/null
 echo 'dev-dependency packaging checks passed'
+
+# A crate README's install requirement follows the release rule: `major.minor` for a release, the
+# full version for a pre-release. 0.3.0 shipped "0.1", which no 0.3 release satisfies. Every
+# refusal has to name the README, the value it carries and the value it should carry.
+readme_fixture=$(mktemp -d)
+trap 'rm -rf "$readme_fixture"' EXIT
+write_readme() {
+  printf '# crate\n\n```toml\n[dependencies]\nmango-external-agents = "%s"\nmango-agent-acp = "%s"\n```\n' "$2" "$3" > "$readme_fixture/$1.md"
+}
+expect_readme_refusal() {
+  local version=$1
+  local expected=$2
+  shift 2
+  local output
+  if output=$(scripts/check-readme-requirements.sh "$version" "$@" 2>&1); then
+    echo "expected the README check to refuse, received success for $version: $*" >&2
+    exit 1
+  fi
+  case "$output" in
+    *"$expected"*) ;;
+    *)
+      echo "expected the README check to say '$expected', received: $output" >&2
+      exit 1
+      ;;
+  esac
+}
+write_readme current 0.3 0.3
+write_readme stale 0.3 0.1
+write_readme patch 0.3.1 0.3
+write_readme prerelease 0.4.0-rc.1 0.4.0-rc.1
+write_readme caret 0.4 0.4
+printf '# crate\n\nNo install snippet here.\n' > "$readme_fixture/none.md"
+scripts/check-readme-requirements.sh 0.3.1 "$readme_fixture/current.md" >/dev/null || {
+  echo 'expected "0.3" to satisfy workspace version 0.3.1, received a refusal' >&2
+  exit 1
+}
+scripts/check-readme-requirements.sh 0.4.0-rc.1 "$readme_fixture/prerelease.md" >/dev/null || {
+  echo 'expected the full version to satisfy pre-release 0.4.0-rc.1, received a refusal' >&2
+  exit 1
+}
+expect_readme_refusal 0.3.1 "$readme_fixture/stale.md:6: expected mango-agent-acp = \"0.3\" for workspace version 0.3.1, received \"0.1\"" \
+  "$readme_fixture/stale.md"
+expect_readme_refusal 0.3.1 "$readme_fixture/patch.md:5: expected mango-external-agents = \"0.3\" for workspace version 0.3.1, received \"0.3.1\"" \
+  "$readme_fixture/patch.md"
+expect_readme_refusal 0.4.0-rc.1 "$readme_fixture/caret.md:5: expected mango-external-agents = \"0.4.0-rc.1\" for workspace version 0.4.0-rc.1, received \"0.4\"" \
+  "$readme_fixture/caret.md"
+# Inline tables and trailing comments are valid TOML, so a stale one must not hide behind the simple
+# line that sits beside it; a form the check cannot read is refused rather than skipped.
+printf 'mango-external-agents = "0.3"\nmango-agent-acp = { version = "0.1", features = ["testing"] }\n' > "$readme_fixture/table-stale.md"
+printf 'mango-external-agents = "0.3" # core\nmango-agent-acp = { features = ["testing"], version = "0.3" } # harness\n' > "$readme_fixture/table-current.md"
+printf 'mango-external-agents = "0.3"\nmango-agent-acp = "0.1" # stale\n' > "$readme_fixture/comment-stale.md"
+printf 'mango-external-agents = "0.3"\nmango-agent-acp = { path = "../acp" }\n' > "$readme_fixture/table-path.md"
+scripts/check-readme-requirements.sh 0.3.1 "$readme_fixture/table-current.md" >/dev/null || {
+  echo 'expected an inline table and a trailing comment at "0.3" to pass, received a refusal' >&2
+  exit 1
+}
+expect_readme_refusal 0.3.1 "$readme_fixture/table-stale.md:2: expected mango-agent-acp = \"0.3\" for workspace version 0.3.1, received \"0.1\"" \
+  "$readme_fixture/table-stale.md"
+expect_readme_refusal 0.3.1 "$readme_fixture/comment-stale.md:2: expected mango-agent-acp = \"0.3\" for workspace version 0.3.1, received \"0.1\"" \
+  "$readme_fixture/comment-stale.md"
+expect_readme_refusal 0.3.1 "$readme_fixture/table-path.md:2: expected mango-agent-acp = \"0.3\" or an inline table with version = \"0.3\", received unsupported form: { path = \"../acp\" }" \
+  "$readme_fixture/table-path.md"
+expect_readme_refusal 0.3.1 "$readme_fixture/none.md: expected a 'mango-… = \"0.3\"' install requirement, received none" \
+  "$readme_fixture/none.md"
+expect_readme_refusal 0.3.1 "$readme_fixture/missing.md: expected a README file, received none" \
+  "$readme_fixture/missing.md"
+expect_readme_refusal not-a-version "expected a version like 0.3.1 or 0.4.0-rc.1, received 'not-a-version'" \
+  "$readme_fixture/current.md"
+
+# `check-versions.sh` is what `check.sh`, CI and the release workflow run, so the README rule has to
+# be wired into it: a workspace in lockstep at 0.3.1 whose README says "0.1" must not pass.
+mkdir -p "$readme_fixture/tree/scripts" "$readme_fixture/tree/crates/demo" "$readme_fixture/tree/examples/demo-host"
+cp scripts/check-versions.sh scripts/check-readme-requirements.sh "$readme_fixture/tree/scripts/"
+printf '[workspace.package]\nversion = "0.3.1"\n\n[workspace.dependencies]\nmango-demo = { path = "crates/demo", version = "0.3.1" }\n' > "$readme_fixture/tree/Cargo.toml"
+printf '[package]\nname = "mango-demo"\nversion.workspace = true\n' > "$readme_fixture/tree/crates/demo/Cargo.toml"
+printf '[package]\nname = "demo-host"\nversion.workspace = true\n' > "$readme_fixture/tree/examples/demo-host/Cargo.toml"
+write_readme tree/crates/demo/README 0.3 0.3
+if ! "$readme_fixture/tree/scripts/check-versions.sh" >/dev/null 2>&1; then
+  echo 'expected a lockstep workspace with current README snippets to pass, received a refusal' >&2
+  exit 1
+fi
+write_readme tree/crates/demo/README 0.3 0.1
+if output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
+  echo 'expected check-versions.sh to refuse a stale README snippet, received success' >&2
+  exit 1
+fi
+case "$output" in
+  *'crates/demo/README.md:6: expected mango-agent-acp = "0.3" for workspace version 0.3.1, received "0.1"'*) ;;
+  *)
+    echo 'expected check-versions.sh to name the stale README requirement, received:' >&2
+    echo "$output" >&2
+    exit 1
+    ;;
+esac
+# A deleted README must fail, not vanish: a glob over READMEs would drop it from the arguments.
+write_readme tree/crates/demo/README 0.3 0.3
+mkdir -p "$readme_fixture/tree/crates/other"
+printf '[package]\nname = "mango-other"\nversion.workspace = true\n' > "$readme_fixture/tree/crates/other/Cargo.toml"
+sed -i 's|^\[workspace.dependencies\]|&\nmango-other = { path = "crates/other", version = "0.3.1" }|' "$readme_fixture/tree/Cargo.toml"
+if output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
+  echo 'expected check-versions.sh to refuse a crate without a README, received success' >&2
+  exit 1
+fi
+case "$output" in
+  *'crates/other/README.md: expected a README file, received none'*) ;;
+  *)
+    echo 'expected check-versions.sh to name the missing README, received:' >&2
+    echo "$output" >&2
+    exit 1
+    ;;
+esac
+rm -rf "$readme_fixture"
+trap - EXIT
+echo 'README install requirement checks passed'

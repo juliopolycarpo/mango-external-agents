@@ -19,7 +19,7 @@ stored in the repository or in CI.
    0.3.x): a published README is immutable, and 0.3.0 shipped `"0.1"`, which a caret requirement
    never resolves to 0.3. For a pre-release, write the full version with its suffix instead
    (`"0.4.0-rc.1"`), because no caret requirement resolves to one. Then refresh the lockfile and
-   prove the lockstep:
+   prove the lockstep; the same script refuses a README snippet that breaks this rule:
 
    ```sh
    cargo update --workspace
