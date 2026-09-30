@@ -684,3 +684,130 @@ async fn a_cancelled_run_still_refuses_a_reused_turn_id_with_changed_content() {
         "expected the refusal not to reach the vendor"
     );
 }
+
+/// A hub that never acknowledged the reservation, and the answer that proves it.
+fn never_arrived() -> ReconcileAnswer {
+    ReconcileAnswer::Answer(Reconciliation::Answered(HubStatus::NeverArrived))
+}
+
+/// Shorter than the first backoff, so a run is dropped while it sleeps between attempts.
+const MID_BACKOFF: Duration = Duration::from_millis(5);
+
+/// A dropped run must not let the next one reuse the attempt it may already have reserved.
+///
+/// The Hub cannot tell two reservations under the same attempt apart, so a resumed run that
+/// followed a `NeverArrived` answer with the same attempt would ask for the same reservation
+/// twice. The "already reserved" fact has to live with the logical turn, not with the run.
+#[tokio::test(start_paused = true)]
+async fn a_resumed_run_takes_a_newer_attempt_after_an_uncertain_reservation() {
+    let hub = Arc::new(
+        FakeHubApi::new()
+            .reserving([ReserveAnswer::Fail(HubError::recoverable(
+                "connection reset",
+            ))])
+            .reconciling([never_arrived()]),
+    );
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    let abandoned = tokio::time::timeout(MID_BACKOFF, supervisor.run(request.clone())).await;
+    assert!(
+        abandoned.is_err(),
+        "expected the first run to be dropped while backing off, received {abandoned:?}"
+    );
+    let settled = supervisor
+        .run(request)
+        .await
+        .expect("expected the resumed operation to settle");
+
+    assert_eq!(
+        settled,
+        Settled::Committed {
+            terminal: common::COMPLETED,
+            commit: Commit::Recorded,
+        }
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Reserve),
+        vec![AttemptId::new(1), AttemptId::new(2)],
+        "expected strictly increasing reserve attempts across the dropped run, received the call sequence {:?}",
+        hub.sequence()
+    );
+}
+
+/// The same guarantee across several dropped runs in a row, not just the first.
+#[tokio::test(start_paused = true)]
+async fn every_resumed_run_takes_a_newer_attempt_than_the_one_it_replaces() {
+    let hub = Arc::new(
+        FakeHubApi::new()
+            .reserving([
+                ReserveAnswer::Fail(HubError::recoverable("connection reset")),
+                ReserveAnswer::Fail(HubError::recoverable("connection reset")),
+            ])
+            .reconciling([never_arrived(), never_arrived()]),
+    );
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    for run in 1..=2 {
+        let abandoned = tokio::time::timeout(MID_BACKOFF, supervisor.run(request.clone())).await;
+        assert!(
+            abandoned.is_err(),
+            "expected run {run} to be dropped while backing off, received {abandoned:?}"
+        );
+    }
+    let settled = supervisor
+        .run(request)
+        .await
+        .expect("expected the third run to settle");
+
+    assert!(
+        matches!(settled, Settled::Committed { .. }),
+        "expected the third run to commit, received {settled:?}"
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Reserve),
+        vec![AttemptId::new(1), AttemptId::new(2), AttemptId::new(3)],
+        "expected strictly increasing reserve attempts across three runs, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        session.start_count(),
+        1,
+        "expected the vendor to start the turn once, on the attempt the hub finally took"
+    );
+}
+
+/// A run dropped before it ever reserved has nothing to advance past.
+///
+/// The counterpart of the two tests above: the history is what says an attempt is spent, so a
+/// turn whose first run never reached the Hub still starts on the first attempt.
+#[tokio::test(start_paused = true)]
+async fn a_run_dropped_before_any_reservation_leaves_the_first_attempt_unspent() {
+    let hub = Arc::new(FakeHubApi::new());
+    let session = FakeVendorSession::new();
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    drop(supervisor.run(request.clone()));
+    let settled = supervisor
+        .run(request)
+        .await
+        .expect("expected the run after the dropped one to settle");
+
+    assert!(
+        matches!(settled, Settled::Committed { .. }),
+        "expected the run to commit, received {settled:?}"
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Reserve),
+        vec![AttemptId::FIRST],
+        "expected the first reservation to use the first attempt, received the call sequence {:?}",
+        hub.sequence()
+    );
+}
