@@ -484,6 +484,9 @@ impl LineStream {
     /// # Errors
     ///
     /// [`Error::LimitExceeded`] when one line, or the unread output as a whole, passes its cap.
+    /// The stream is over after that: later calls return `None` rather than lines that skip the
+    /// refused one. Lines from the same read that came before the refused one are not delivered
+    /// either; the error is what the call returns, as it always was.
     pub async fn next_line(&mut self) -> Result<Option<String>> {
         loop {
             if let Some(line) = self.pending.pop_front() {
@@ -493,15 +496,29 @@ impl LineStream {
             if self.ended {
                 return Ok(None);
             }
-            match self.source.next_chunk().await? {
-                Some(chunk) => self.absorb(&chunk)?,
-                None => self.finish()?,
+            let outcome = match self.source.next_chunk().await? {
+                Some(chunk) => self.absorb(chunk),
+                None => self.finish(),
+            };
+            if let Err(error) = outcome {
+                self.abandon();
+                return Err(error);
             }
         }
     }
 
-    fn absorb(&mut self, chunk: &[u8]) -> Result<()> {
-        self.buffer.extend_from_slice(chunk);
+    /// Splits `chunk` and everything held so far into complete lines.
+    ///
+    /// The held tail never contains a newline, so the scan resumes where the new bytes begin
+    /// instead of at the start of a long partial line, and the buffer is compacted once for the
+    /// whole chunk rather than once per line.
+    fn absorb(&mut self, chunk: Vec<u8>) -> Result<()> {
+        let tail = self.buffer.len();
+        if tail == 0 {
+            self.buffer = chunk;
+        } else {
+            self.buffer.extend_from_slice(&chunk);
+        }
         let buffered = self.buffer.len() + self.queued_bytes;
         if buffered > self.limits.max_buffered_bytes {
             return Err(Error::LimitExceeded {
@@ -511,14 +528,17 @@ impl LineStream {
             });
         }
 
-        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut record: Vec<u8> = self.buffer.drain(..=newline).collect();
-            record.pop();
-            if record.last() == Some(&b'\r') {
-                record.pop();
+        let mut consumed = 0;
+        while let Some(newline) = self.next_newline(consumed.max(tail)) {
+            let mut record = &self.buffer[consumed..newline];
+            if let Some(without_return) = record.strip_suffix(b"\r") {
+                record = without_return;
             }
-            self.queue(record)?;
+            let record = record.to_vec();
+            consumed = newline + 1;
+            self.queue(record, self.buffer.len() - consumed)?;
         }
+        self.buffer.drain(..consumed);
 
         if self.buffer.len() > self.limits.max_line_bytes {
             return Err(Error::LimitExceeded {
@@ -530,6 +550,12 @@ impl LineStream {
         Ok(())
     }
 
+    /// The index of the first newline at or after `from`.
+    fn next_newline(&self, from: usize) -> Option<usize> {
+        let found = self.buffer[from..].iter().position(|byte| *byte == b'\n');
+        found.map(|offset| from + offset)
+    }
+
     /// A vendor that exits without a final newline still said something.
     fn finish(&mut self) -> Result<()> {
         self.ended = true;
@@ -537,10 +563,11 @@ impl LineStream {
             return Ok(());
         }
         let record = std::mem::take(&mut self.buffer);
-        self.queue(record)
+        self.queue(record, 0)
     }
 
-    fn queue(&mut self, record: Vec<u8>) -> Result<()> {
+    /// Queues one raw line; `remaining` is how many raw bytes are still buffered behind it.
+    fn queue(&mut self, record: Vec<u8>, remaining: usize) -> Result<()> {
         if record.len() > self.limits.max_line_bytes {
             return Err(Error::LimitExceeded {
                 subject: "bytes of one vendor output line",
@@ -549,10 +576,12 @@ impl LineStream {
             });
         }
         // Repair can triple a line: each invalid sequence becomes a 3-byte U+FFFD. The raw checks
-        // above cannot see that, so the decoded size is counted against the unread-output budget too.
-        let repaired = String::from_utf8_lossy(&record);
+        // above cannot see that, so the decoded size is counted against the unread-output budget
+        // too. A valid line keeps its own allocation.
+        let line = String::from_utf8(record)
+            .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned());
         // What is still buffered behind this record (later lines, an unterminated tail) is held too.
-        let unread = self.queued_bytes + repaired.len() + self.buffer.len();
+        let unread = self.queued_bytes + line.len() + remaining;
         if unread > self.limits.max_buffered_bytes {
             return Err(Error::LimitExceeded {
                 subject: "bytes of unread vendor output",
@@ -560,10 +589,18 @@ impl LineStream {
                 received: unread,
             });
         }
-        let line = repaired.into_owned();
         self.queued_bytes += line.len();
         self.pending.push_back(line);
         Ok(())
+    }
+
+    /// Ends the stream after a limit error, so a caller that asks again reaches the end instead of
+    /// lines that skip the one that was refused, and the refused bytes are released.
+    fn abandon(&mut self) {
+        self.ended = true;
+        self.buffer = Vec::new();
+        self.pending.clear();
+        self.queued_bytes = 0;
     }
 }
 
@@ -933,6 +970,230 @@ mod tests {
             ),
             "expected a buffer-limit refusal at 130 held bytes, received {error:?}"
         );
+    }
+
+    /// Reads every remaining line, or the first error.
+    async fn drain(lines: &mut LineStream) -> Result<Vec<String>> {
+        let mut all = Vec::new();
+        while let Some(line) = lines.next_line().await? {
+            all.push(line);
+        }
+        Ok(all)
+    }
+
+    fn strings<const N: usize>(lines: [&str; N]) -> Vec<String> {
+        lines.into_iter().map(String::from).collect()
+    }
+
+    /// A stream over `chunks` exactly as cut.
+    fn cut(chunks: &[&str], limits: LineLimits) -> LineStream {
+        let chunks = chunks
+            .iter()
+            .map(|chunk| chunk.as_bytes().to_vec())
+            .collect();
+        RawChunkSource::stream(chunks, limits)
+    }
+
+    #[tokio::test]
+    async fn joins_a_crlf_that_is_split_across_chunks() {
+        for chunks in [
+            vec!["a\r", "\nb\r\n"],
+            vec!["a", "\r", "\n", "b", "\r", "\n"],
+            vec!["a\r\nb\r", "\n"],
+        ] {
+            let mut lines = cut(&chunks, LineLimits::default());
+            assert_eq!(
+                drain(&mut lines).await.expect("expected lines"),
+                strings(["a", "b"]),
+                "expected CRLF to end each line however {chunks:?} is cut"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_newline_may_be_the_first_or_last_byte_of_a_chunk() {
+        for (chunks, expected) in [
+            (vec!["abc", "\ndef\n"], strings(["abc", "def"])),
+            (vec!["abc\n", "def\n"], strings(["abc", "def"])),
+            (vec!["abc\n", "\n", "def"], strings(["abc", "", "def"])),
+            (vec!["\n", "\n\n"], strings(["", "", ""])),
+            (vec!["ab", "\n", "cd", "\n"], strings(["ab", "cd"])),
+        ] {
+            let mut lines = cut(&chunks, LineLimits::default());
+            assert_eq!(
+                drain(&mut lines).await.expect("expected lines"),
+                expected,
+                "expected these lines from chunks {chunks:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strips_one_carriage_return_and_keeps_an_unterminated_one() {
+        // Only the `\r` directly before a `\n` is a terminator; a `\r` at the end of the stream
+        // has no newline after it and is data.
+        let mut lines = stream(["a\r\r\nb\r"], LineLimits::default());
+
+        assert_eq!(
+            drain(&mut lines).await.expect("expected lines"),
+            strings(["a\r", "b\r"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_exactly_at_the_cap_is_delivered_however_the_chunks_fall() {
+        let limits = LineLimits {
+            max_line_bytes: 8,
+            max_buffered_bytes: 64,
+        };
+        for chunks in [
+            vec!["12345678\n"],
+            vec!["1234", "5678\n"],
+            vec!["12345678", "\n"],
+            vec!["1", "2", "3", "4", "5", "6", "7", "8", "\n"],
+            vec!["12345678\n", "12345678\n"],
+            vec!["1234", "5678\n1234", "5678\n"],
+            vec!["12345678"],
+        ] {
+            let mut lines = cut(&chunks, limits);
+            let all = drain(&mut lines).await.unwrap_or_else(|error| {
+                panic!("expected 8-byte lines from {chunks:?}, received {error:?}")
+            });
+            assert!(
+                !all.is_empty() && all.iter().all(|line| line == "12345678"),
+                "expected only 8-byte lines from {chunks:?}, received {all:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_one_past_the_cap_is_refused_with_its_length_however_the_chunks_fall() {
+        let limits = LineLimits {
+            max_line_bytes: 8,
+            max_buffered_bytes: 64,
+        };
+        // Terminated in the same chunk, terminated in a later chunk, and never terminated: the
+        // refusal names the same limit and the same received length.
+        for chunks in [
+            vec!["123456789\n"],
+            vec!["1234", "56789\n"],
+            vec!["123456789", "\n"],
+            vec!["12345678", "9\n"],
+            vec!["123456789"],
+            vec!["1234", "56789"],
+        ] {
+            let mut lines = cut(&chunks, limits);
+            let error = drain(&mut lines)
+                .await
+                .expect_err("expected a refusal, received lines");
+            assert!(
+                matches!(
+                    error,
+                    Error::LimitExceeded {
+                        subject: "bytes of one vendor output line",
+                        limit: 8,
+                        received: 9,
+                    }
+                ),
+                "expected a 9-byte line refusal from {chunks:?}, received {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_carriage_return_held_at_a_chunk_edge_counts_toward_the_line_cap() {
+        // Characterises today's behaviour so it cannot drift: a full line whose `\r` ends one chunk
+        // and whose `\n` starts the next is held as 9 bytes, one past the cap, when the first chunk
+        // is checked. Cut anywhere else, the same line is delivered.
+        let limits = LineLimits {
+            max_line_bytes: 8,
+            max_buffered_bytes: 64,
+        };
+        let mut split = cut(&["12345678\r", "\n"], limits);
+        let error = drain(&mut split)
+            .await
+            .expect_err("expected a refusal, received lines");
+        assert!(
+            matches!(
+                error,
+                Error::LimitExceeded {
+                    subject: "bytes of one vendor output line",
+                    limit: 8,
+                    received: 9,
+                }
+            ),
+            "expected a 9-byte line refusal, received {error:?}"
+        );
+
+        let mut whole = cut(&["12345678\r\n"], limits);
+        assert_eq!(
+            drain(&mut whole).await.expect("expected the line"),
+            strings(["12345678"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_ends_the_stream_instead_of_skipping_a_line() {
+        // The second line is over the cap. Once `next_line` has said so, a caller that asks again
+        // must not be handed the lines around it as if nothing had been lost.
+        let mut lines = stream(
+            ["ok\n0123456789\nafter\n"],
+            LineLimits {
+                max_line_bytes: 8,
+                max_buffered_bytes: 64,
+            },
+        );
+
+        let error = lines
+            .next_line()
+            .await
+            .expect_err("expected a refusal, received a line");
+        assert!(
+            matches!(
+                error,
+                Error::LimitExceeded {
+                    limit: 8,
+                    received: 10,
+                    ..
+                }
+            ),
+            "expected a line-limit refusal, received {error:?}"
+        );
+        let after = drain(&mut lines).await;
+        assert!(
+            matches!(after.as_deref(), Ok([])),
+            "expected the end of the stream after a refusal, received {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn framing_does_not_depend_on_where_the_chunks_are_cut() {
+        // Empty lines, CRLF, invalid UTF-8, multi-byte characters and an unterminated tail.
+        let input =
+            b"first\r\n\nsec\xffond\n\xe2\x82\xac euro\r\n\r\n{\"k\":1}\nlast \xc3".to_vec();
+        let mut whole = RawChunkSource::stream(vec![input.clone()], LineLimits::default());
+        let whole = drain(&mut whole).await.expect("expected lines");
+        assert_eq!(
+            whole,
+            strings([
+                "first",
+                "",
+                "sec\u{fffd}ond",
+                "\u{20ac} euro",
+                "",
+                "{\"k\":1}",
+                "last \u{fffd}"
+            ])
+        );
+        for size in 1..=input.len() {
+            let chunks = input.chunks(size).map(<[u8]>::to_vec).collect();
+            let mut lines = RawChunkSource::stream(chunks, LineLimits::default());
+            assert_eq!(
+                drain(&mut lines).await.expect("expected lines"),
+                whole,
+                "expected the same lines cut every {size} bytes"
+            );
+        }
     }
 
     #[tokio::test]

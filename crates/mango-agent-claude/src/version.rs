@@ -52,6 +52,16 @@ pub fn parse(raw: &str) -> Option<Version> {
         .find_map(parse_claude_line)
 }
 
+/// Pulls the version out of a `--version` read that may have been cut short.
+///
+/// Only a line that identifies Claude Code counts. [`parse`] also accepts a single bare version as
+/// the documented compact form, but that is only safe when the read finished: a lone line that
+/// arrived before a read error may be a wrapper's own preamble, and the Claude Code line after it
+/// was never read.
+pub(crate) fn parse_incomplete(raw: &str) -> Option<Version> {
+    raw.lines().map(str::trim).find_map(parse_claude_line)
+}
+
 /// Parses a banner line that identifies Claude Code.
 fn parse_claude_line(line: &str) -> Option<Version> {
     if !line.to_ascii_lowercase().contains("claude code") {
@@ -92,7 +102,7 @@ pub fn is_supported(observed: Option<&Version>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_supported, minimum, parse};
+    use super::{is_supported, minimum, parse, parse_incomplete};
     use crate::pinned::MINIMUM_VERSION;
 
     #[test]
@@ -106,6 +116,29 @@ mod tests {
             parse("2.1.226 (Claude Code)").expect("expected a version"),
             semver::Version::new(2, 1, 226)
         );
+    }
+
+    #[test]
+    fn an_incomplete_read_trusts_only_a_line_that_names_claude_code() {
+        assert_eq!(
+            parse_incomplete("2.1.270 (Claude Code)"),
+            Some(semver::Version::new(2, 1, 270))
+        );
+        assert_eq!(
+            parse_incomplete("wrapper 1.0.0\nClaude Code v2.1.270"),
+            Some(semver::Version::new(2, 1, 270))
+        );
+        assert_eq!(
+            parse_incomplete("wrapper 1.0.0"),
+            None,
+            "expected a lone wrapper line not to be taken for Claude Code's version"
+        );
+        assert_eq!(
+            parse_incomplete("2.1.270"),
+            None,
+            "expected the bare compact form to need a finished read"
+        );
+        assert_eq!(parse_incomplete(""), None);
     }
 
     #[test]

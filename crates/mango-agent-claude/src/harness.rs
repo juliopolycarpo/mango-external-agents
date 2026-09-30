@@ -21,7 +21,7 @@ use crate::cli_surface::CliSurface;
 use crate::mcp::ConfigFile;
 use crate::permissions::{self, ModeAvailability};
 use crate::pinned::{self, MINIMUM_VERSION, VENDOR, VENDOR_ENVIRONMENT_KEYS};
-use crate::probe;
+use crate::probe::{self, Probed};
 use crate::session::ClaudeSession;
 use crate::{argv, models, version};
 
@@ -124,10 +124,26 @@ impl ClaudeHarness {
 
     /// Everything the three probes established, in one pass.
     async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Result<Survey> {
-        let Some(banner) = probe::output(host, executable, &["--version"]).await? else {
-            return Ok(Survey::default());
+        // An incomplete banner still proves the binary ran, so its complete lines are used and an
+        // empty one leaves an installed CLI whose version is unreadable; only a probe that
+        // established nothing reads as "not installed". A cut-off read may have lost the Claude
+        // Code line behind a wrapper's own, so it is read strictly: only a line that names Claude
+        // Code counts, never the single bare-version form.
+        let (banner, version) = match probe::read(host, executable, &["--version"]).await? {
+            Probed::Nothing => return Ok(Survey::default()),
+            Probed::Whole(banner) => {
+                let version = version::parse(&banner);
+                (banner, version)
+            }
+            Probed::Incomplete(banner) => match version::parse_incomplete(&banner) {
+                Some(version) => (banner, Some(version)),
+                // Lines that never named Claude Code are not a version, and they must not be
+                // shown as one either: a receipt carries `Discovery::version` and opening parses
+                // it again, so a wrapper's "1.0.0" would come back as a too-old CLI. An empty
+                // banner keeps the CLI installed without offering anything to show or re-parse.
+                None => (String::new(), None),
+            },
         };
-        let version = version::parse(&banner);
         let surface = probe::output(host, executable, &["--help"])
             .await?
             .map(|help| CliSurface::parse(&help))
@@ -147,7 +163,12 @@ impl ClaudeHarness {
         // Neither read depends on the other's result: one is a process boot, the other a file read.
         let (authentication, auto_mode_disabled_by_policy) = tokio::join!(
             async {
-                let stdout = probe::output(host, executable, &["auth", "status"]).await?;
+                // `parse_status` trusts only a complete JSON object, so the lines that arrived
+                // before a cut-off are safe to give it: a whole document keeps its answer and a
+                // truncated one stays unknown.
+                let stdout = probe::read(host, executable, &["auth", "status"])
+                    .await?
+                    .lines();
                 Ok::<Authentication, Error>(stdout.map_or_else(Authentication::unknown, |stdout| {
                     auth::parse_status(&stdout)
                 }))

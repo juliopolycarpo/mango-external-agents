@@ -402,6 +402,277 @@ mod discovery {
         );
     }
 
+    /// The regression behind the probe's own contract: a help listing cut off by a read error is
+    /// not a listing that lacks flags, so it must not be read as one.
+    #[tokio::test]
+    async fn a_help_listing_cut_off_by_a_read_error_is_unknown_rather_than_missing_a_surface() {
+        // The cut lands after the permission modes and before a required flag, so the printed prefix
+        // lacks it while the whole listing does not.
+        let cut_at = HELP_2_1_270
+            .lines()
+            .position(|line| line.trim_start().starts_with("--permission-prompts"))
+            .expect("expected the captured help to declare --permission-prompts");
+        let mut lines: Vec<String> = HELP_2_1_270.lines().map(String::from).collect();
+        lines.insert(cut_at, "x".repeat(8192));
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(&lines.join("\n")));
+        let narrow = Limits {
+            line: LineLimits {
+                max_line_bytes: 4096,
+                max_buffered_bytes: 8192,
+            },
+            ..Limits::default()
+        };
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected a help listing that could not be read whole to be unknown | received {:?}",
+            discovery.gate
+        );
+    }
+
+    /// Narrow caps under which an 8 KiB line is a read error, as the cut-off tests use.
+    fn narrow_lines() -> Limits {
+        Limits {
+            line: LineLimits {
+                max_line_bytes: 4096,
+                max_buffered_bytes: 8192,
+            },
+            ..Limits::default()
+        }
+    }
+
+    /// An incomplete `--version` proves the binary ran, so it must never read as "not installed":
+    /// the banner's complete first line still carries the version, exactly as it did before the
+    /// probe learned to refuse partial output.
+    #[tokio::test]
+    async fn a_version_banner_followed_by_a_read_error_is_still_an_installed_cli() {
+        let banner = format!("2.1.270 (Claude Code)\n{}", "x".repeat(8192));
+        let launcher = Arc::new(FakeClaudeCli::new().with_version(&banner));
+        let host = host_under(launcher, narrow_lines());
+
+        let discovery = ClaudeHarness::new()
+            .discover(&host)
+            .await
+            .expect("expected a discovery");
+        assert_ne!(
+            discovery.gate,
+            GateVerdict::NotInstalled,
+            "expected a CLI that printed its version before the read failed to be installed | \
+             received {:?}",
+            discovery.gate
+        );
+        assert_eq!(
+            discovery.version.as_deref(),
+            Some("2.1.270 (Claude Code)"),
+            "expected the complete first line to keep supplying the version"
+        );
+
+        let opened = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await;
+        assert!(
+            opened.is_ok(),
+            "expected opening not to be refused for an incomplete --version | received {:?}",
+            opened.err()
+        );
+    }
+
+    /// With no complete line at all there is no version to read, but a child that started and then
+    /// failed to speak is still not "a CLI that is not there".
+    #[tokio::test]
+    async fn a_version_probe_that_failed_before_any_line_is_installed_with_no_version() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_version(&"x".repeat(8192)));
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_ne!(
+            discovery.gate,
+            GateVerdict::NotInstalled,
+            "expected a --version that failed mid-read not to report a missing CLI | received {:?}",
+            discovery.gate
+        );
+        assert_eq!(discovery.version, None);
+    }
+
+    /// `--help` cut off after its first line, so that only the version could gate the CLI.
+    fn cut_off_help() -> String {
+        let mut lines: Vec<String> = HELP_2_1_270.lines().map(String::from).collect();
+        lines.insert(1, "x".repeat(8192));
+        lines.join("\n")
+    }
+
+    /// A wrapper's own version is not Claude Code's: with the read cut off before the banner line
+    /// and `--help` cut off too, that version must not gate the CLI as too old.
+    #[tokio::test]
+    async fn a_wrappers_version_before_a_read_error_is_not_taken_for_claudes() {
+        let banner = format!("wrapper 1.0.0\n{}\n2.1.270 (Claude Code)", "x".repeat(8192));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version(&banner)
+                .with_help(&cut_off_help()),
+        );
+
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected the wrapper's 1.0.0 not to gate the CLI as too old | received {:?}",
+            discovery.gate
+        );
+    }
+
+    /// The receipt of an unreadable `--version` must not carry the wrapper's line as a version:
+    /// opening re-parses the receipt's version, and with `--help` still cut off that would turn
+    /// `Unknown` into a false `VersionTooOld`.
+    #[tokio::test]
+    async fn a_receipt_of_an_unreadable_version_does_not_reopen_as_too_old() {
+        let banner = format!("wrapper 1.0.0\n{}\n2.1.270 (Claude Code)", "x".repeat(8192));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version(&banner)
+                .with_help(&cut_off_help()),
+        );
+        let harness = ClaudeHarness::new();
+        let host = host_under(launcher, narrow_lines());
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        assert_eq!(discovery.gate, GateVerdict::Unknown);
+        assert_eq!(
+            discovery.version, None,
+            "expected no version to be reported for a banner that never named Claude Code | \
+             received {:?}",
+            discovery.version
+        );
+
+        let mut request = OpenSession::new("chat-1");
+        if let Some(executable) = &discovery.executable {
+            request = request.with_executable(ExecutablePath::resolved(executable.clone()));
+        }
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+
+        let opened = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await;
+        let error = match opened {
+            Ok(_) => panic!("expected an unreadable help surface to refuse opening"),
+            Err(error) => error,
+        };
+        assert!(
+            !matches!(error, Error::VersionGate { .. }),
+            "expected an unreadable version not to refuse opening as too old | received {error:?}"
+        );
+    }
+
+    /// The compact form (a bare version) is only trusted when the read finished: a bare number
+    /// followed by a read error could be a wrapper's own.
+    #[tokio::test]
+    async fn a_bare_version_before_a_read_error_is_not_trusted() {
+        let banner = format!("1.0.0\n{}", "x".repeat(8192));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version(&banner)
+                .with_help(&cut_off_help()),
+        );
+
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected an incomplete bare 1.0.0 not to gate the CLI as too old | received {:?}",
+            discovery.gate
+        );
+    }
+
+    /// A status document read whole is trusted even when more output follows and fails: narrowing
+    /// the permission matrix over an answer that was complete would lose `auto` for a signed-in
+    /// account.
+    #[tokio::test]
+    async fn a_complete_auth_status_line_survives_a_read_error_after_it() {
+        let status = format!("{}\n{}", support::SIGNED_IN, "x".repeat(8192));
+        let launcher = Arc::new(FakeClaudeCli::new().with_auth(&status));
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.auth,
+            mango_external_agents::AuthState::LoggedIn {
+                mode: mango_external_agents::AuthMode::Subscription
+            },
+            "expected the complete status line to keep its answer | received {:?}",
+            discovery.auth
+        );
+    }
+
+    /// A status document cut off part way is not a document: the answer stays unknown.
+    #[tokio::test]
+    async fn an_auth_status_cut_off_inside_its_document_is_unknown() {
+        let status = format!("{{\n  \"loggedIn\": true,\n{}", "x".repeat(8192));
+        let launcher = Arc::new(FakeClaudeCli::new().with_auth(&status));
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.auth,
+            mango_external_agents::AuthState::Unknown,
+            "expected a truncated status document not to be trusted | received {:?}",
+            discovery.auth
+        );
+    }
+
+    /// The same rule for the total cap: a runaway listing made of legal lines is not a listing that
+    /// lacks flags either, and discovery stops holding it once it passes the cap.
+    #[tokio::test]
+    async fn a_help_listing_over_the_total_cap_is_unknown_rather_than_missing_a_surface() {
+        // The whole captured listing, then legal filler past the cap. Parsing everything that
+        // arrived would report `Usable`; a listing that was not read whole must report `Unknown`.
+        let filler = "y".repeat(999);
+        let runaway = format!("{HELP_2_1_270}\n{}", vec![filler; 1200].join("\n"));
+        let launcher = Arc::new(FakeClaudeCli::new().with_help(&runaway));
+        let discovery = ClaudeHarness::new()
+            .discover(&host(launcher))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected {} bytes of help, over the probe's total cap, to be unknown | received {:?}",
+            runaway.len(),
+            discovery.gate
+        );
+    }
+
     #[tokio::test]
     async fn a_cli_that_is_not_there_is_not_installed_rather_than_an_error() {
         // The fake answers nothing, because a launcher that cannot spawn returns no output.

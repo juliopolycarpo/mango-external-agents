@@ -625,6 +625,8 @@ struct VendorInner {
     state: SessionState,
     script: Mutex<SessionScript>,
     starts: AtomicU64,
+    recording: AtomicBool,
+    requests: Mutex<Vec<TurnRequest>>,
     cancels: Mutex<Vec<CancelReason>>,
     gate: Notify,
     released: AtomicBool,
@@ -696,6 +698,8 @@ impl FakeVendorSession {
                     default: TurnAnswer::Complete,
                 }),
                 starts: AtomicU64::new(0),
+                recording: AtomicBool::new(false),
+                requests: Mutex::new(Vec::new()),
                 cancels: Mutex::new(Vec::new()),
                 gate: Notify::new(),
                 released: AtomicBool::new(false),
@@ -758,6 +762,44 @@ impl FakeVendorSession {
     /// ```
     pub fn start_count(&self) -> usize {
         self.inner.starts.load(Ordering::Acquire) as usize
+    }
+
+    /// Keeps a copy of every request `start_turn` receives, for [`requests`](Self::requests).
+    ///
+    /// Off by default: the copy holds the whole input and its attachments, which a test about
+    /// something else, or a benchmark, should not pay for.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::FakeVendorSession;
+    ///
+    /// let session = FakeVendorSession::new().recording_requests();
+    /// assert!(session.requests().is_empty());
+    /// ```
+    #[must_use]
+    pub fn recording_requests(self) -> Self {
+        self.inner.recording.store(true, Ordering::Release);
+        self
+    }
+
+    /// Every request `start_turn` received, in order, whether or not the fake started it.
+    ///
+    /// Empty unless [`recording_requests`](Self::recording_requests) was asked for.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::FakeVendorSession;
+    ///
+    /// assert!(FakeVendorSession::new().requests().is_empty());
+    /// ```
+    pub fn requests(&self) -> Vec<TurnRequest> {
+        self.inner
+            .requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Every reason this session was cancelled with, in order.
@@ -824,6 +866,13 @@ impl Session for FakeVendorSession {
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+        if self.inner.recording.load(Ordering::Acquire) {
+            self.inner
+                .requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.clone());
+        }
         let answer = self.next_answer();
         match answer {
             TurnAnswer::NotSubmitted => return Err(never_left()),
