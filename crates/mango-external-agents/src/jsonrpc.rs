@@ -2916,6 +2916,13 @@ mod tests {
             "expected sent: [] behind an abandoned send | received {:?}",
             link.sent()
         );
+        assert_write_timeout_ended_the_connection(&handler, &client).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let terminations = handler.terminations.lock().await.len();
+        assert_eq!(
+            terminations, 1,
+            "expected exactly one termination | received: {terminations}"
+        );
         client.close().await.expect("expected a clean close");
     }
 }
