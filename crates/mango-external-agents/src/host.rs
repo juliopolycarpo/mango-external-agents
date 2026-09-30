@@ -161,9 +161,12 @@ pub struct Limits {
     /// ACP also uses it, or [`Self::max_pending_requests`] when larger, as the message cap at its
     /// SDK boundary: at most that many JSON-RPC messages (batch members counted individually)
     /// queue per direction of the connection. Messages and turn events are related but not one to
-    /// one; [`Self::turn_buffer_bytes`] is what bounds memory there.
+    /// one; [`Self::turn_buffer_bytes`] is what bounds the queued bytes there.
     pub turn_channel_capacity: usize,
     /// Maximum serialized bytes queued per turn, excluding its reserved terminal.
+    ///
+    /// This counts encoded (wire) bytes, not the heap a parsed message occupies, which can be many
+    /// times larger; a host that needs a hard memory cap must enforce it itself.
     ///
     /// Payload and interaction events are budgeted apart within this one number. Interactions
     /// hold a reserve of their count reserve times 8 KiB, clamped to half of this value — 1 MiB of
