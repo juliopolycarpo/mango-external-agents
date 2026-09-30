@@ -257,6 +257,27 @@ fn map_mcp_servers(
         .collect()
 }
 
+/// Whether text can be one argument of an MCP stdio server's own command line.
+///
+/// It is the vendor-argv value rule (non-empty, at most 128 code points, no control or bidi
+/// characters) with one difference: a leading `-` is allowed. These arguments reach the ACP agent
+/// as JSON in `session/new.mcpServers` and are the MCP server's own argv, never an option the agent
+/// parses, so `--stdio` or `-y` is the server's flag, not an injected one. The core rule keeps
+/// refusing a leading `-` for the values that do enter a vendor's argv.
+///
+/// ```ignore
+/// assert!(is_mcp_stdio_argument("--stdio"));
+/// assert!(!is_mcp_stdio_argument(""));
+/// ```
+fn is_mcp_stdio_argument(argument: &str) -> bool {
+    match argument.strip_prefix('-') {
+        // A stand-in letter keeps the dash counted by the length check while the rest of the rule
+        // still applies to every other character.
+        Some(rest) => mango_external_agents::normalize::is_argv_value(&format!("x{rest}")),
+        None => mango_external_agents::normalize::is_argv_value(argument),
+    }
+}
+
 /// Checks host-supplied MCP entries before a vendor process can observe them.
 fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
     let mut names = BTreeSet::new();
@@ -286,12 +307,9 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<()> {
                         received: String::from("a relative MCP stdio command"),
                     });
                 }
-                if args
-                    .iter()
-                    .any(|argument| !mango_external_agents::normalize::is_argv_value(argument))
-                {
+                if args.iter().any(|argument| !is_mcp_stdio_argument(argument)) {
                     return Err(Error::HostConfiguration {
-                        expected: "MCP stdio arguments with a value shape",
+                        expected: "non-empty MCP stdio arguments of at most 128 code points without control characters",
                         received: String::from("an invalid MCP stdio argument"),
                     });
                 }
@@ -1124,7 +1142,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AcpHarness, VERSION_PROBE_MAX_BYTES, ceiling, first_version, gate, probe_line_limits,
+        AcpHarness, VERSION_PROBE_MAX_BYTES, ceiling, first_version, gate, is_mcp_stdio_argument,
+        probe_line_limits,
     };
     use mango_external_agents::{
         ByteSource, Capabilities, CapabilityCeiling, GateVerdict, Harness, LineLimits, LineStream,
@@ -1142,6 +1161,62 @@ mod tests {
             self.chunks_served
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Some(vec![b'x'; 8 * 1024]))
+        }
+    }
+
+    /// MCP arguments are the server's own argv, so its flags are legitimate there.
+    #[test]
+    fn an_mcp_argument_may_start_with_a_dash() {
+        for argument in [
+            "--stdio",
+            "-y",
+            "--port=1",
+            "-",
+            "--",
+            "plain",
+            "@scope/pkg",
+        ] {
+            assert!(
+                is_mcp_stdio_argument(argument),
+                "expected MCP argument {argument:?} accepted | received refused"
+            );
+        }
+    }
+
+    /// Only the leading dash is relaxed; every other refusal of the argv rule still applies.
+    #[test]
+    fn an_mcp_argument_keeps_the_length_and_character_rules() {
+        let over_by_one = format!("-{}", "a".repeat(128));
+        let exactly_full = format!("-{}", "a".repeat(127));
+        let refused = [
+            String::new(),
+            String::from("--std\u{0}io"),
+            String::from("--bad\nline"),
+            String::from("-\u{202e}rtl"),
+            String::from("--\u{1b}[31m"),
+            over_by_one,
+        ];
+        for argument in &refused {
+            assert!(
+                !is_mcp_stdio_argument(argument),
+                "expected MCP argument {argument:?} refused | received accepted"
+            );
+        }
+        assert!(
+            is_mcp_stdio_argument(&exactly_full),
+            "expected a 128 code point dash-led MCP argument accepted | received refused"
+        );
+    }
+
+    /// The relaxation is local to MCP: the values that enter a vendor's argv still cannot look
+    /// like an option.
+    #[test]
+    fn the_core_argv_rule_still_refuses_a_leading_dash() {
+        for value in ["--x", "-y", "--stdio"] {
+            assert!(
+                !mango_external_agents::normalize::is_argv_value(value),
+                "expected core argv value {value:?} refused | received accepted"
+            );
         }
     }
 
