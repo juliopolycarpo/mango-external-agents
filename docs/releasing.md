@@ -22,7 +22,10 @@ stored in the repository or in CI.
    scripts/check-versions.sh 0.2.0
    ```
 
-3. Review the diff, commit, tag and push. The tag must be signed.
+3. Review the diff, commit, tag and push. The tag must be an annotated, signed tag: the `Release`
+   workflow refuses one that GitHub does not report as verified, so add your signing key to your
+   GitHub account as a signing key first. This checks that GitHub verified the signature, not which
+   maintainer made it.
 
    ```sh
    git add Cargo.toml Cargo.lock CHANGELOG.md

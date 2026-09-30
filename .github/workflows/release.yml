@@ -1,7 +1,7 @@
 name: Release
 
-# Cut a release from a signed v* tag: verify the manifests agree with the tag,
-# run the check lane, publish the four crates to crates.io in dependency order
+# Cut a release from a signed v* tag: verify GitHub reports the tag as signed,
+# verify the manifests agree with the tag, run the check lane, publish the four crates to crates.io in dependency order
 # through crates.io trusted publishing (OIDC, no stored token), and create a
 # GitHub release with git-cliff notes. The publish job runs in the `release`
 # environment, whose deployment rule admits only v* tags.
@@ -54,6 +54,15 @@ jobs:
         run: |
           version=$(scripts/release-version.sh "$RELEASE_REF" "$INPUT_VERSION")
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # An unsigned, lightweight or unverifiable tag stops here, before anything is published. This
+      # proves GitHub verified the tag's signature, not who signed it: pushing a v* tag stays a
+      # matter of repository write access and the `release` environment.
+      - name: Tag is signed and verified by GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: scripts/check-release-tag-signature.sh "$REPOSITORY" "$VERSION"
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11

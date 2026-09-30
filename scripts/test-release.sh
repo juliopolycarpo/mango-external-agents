@@ -63,6 +63,57 @@ if scripts/check-pr-title.sh >/dev/null 2>&1; then
 fi
 echo 'pull request title checks passed'
 
+# The release tag must be an annotated tag GitHub verified. The fake `gh` answers for one tag; every
+# refusal has to name the tag and what GitHub reported, so a maintainer can act on the log alone.
+tag_bin=$(mktemp -d)
+tag_log=$tag_bin/gh.log
+ln -s "$PWD/scripts/test-fixtures/fake-tag-verification-cli.sh" "$tag_bin/gh"
+check_tag() {
+  env PATH="$tag_bin:$PATH" FAKE_GH_LOG=$tag_log FAKE_TAG_NAME=v0.4.0 "$@" \
+    scripts/check-release-tag-signature.sh owner/repository "$TAG_VERSION"
+}
+expect_tag_refusal() {
+  local status=$1
+  local expected=$2
+  shift 2
+  local output
+  local received
+  set +e
+  output=$(check_tag "$@" 2>&1)
+  received=$?
+  set -e
+  if [ "$received" != "$status" ]; then
+    echo "expected exit $status from the tag check, received $received: $output" >&2
+    exit 1
+  fi
+  case "$output" in
+    *"$expected"*) ;;
+    *)
+      echo "expected the tag check to say '$expected', received: $output" >&2
+      exit 1
+      ;;
+  esac
+}
+TAG_VERSION=0.4.0
+check_tag FAKE_TAG_VERIFIED=true FAKE_TAG_REASON=valid >/dev/null || {
+  echo 'expected a verified annotated tag to pass, received a refusal' >&2
+  exit 1
+}
+expect_tag_refusal 1 'expected tag v0.4.0 to be signed and verified by GitHub, received verified=false reason=unsigned' \
+  FAKE_TAG_VERIFIED=false FAKE_TAG_REASON=unsigned
+expect_tag_refusal 1 'received verified=false reason=unknown_key' \
+  FAKE_TAG_VERIFIED=false FAKE_TAG_REASON=unknown_key
+expect_tag_refusal 1 'expected v0.4.0 to be an annotated signed tag, received a commit object' \
+  FAKE_TAG_OBJECT=commit
+TAG_VERSION=0.9.0
+expect_tag_refusal 2 'expected tag v0.9.0 to exist in owner/repository' FAKE_TAG_VERIFIED=true
+if scripts/check-release-tag-signature.sh owner/repository >/dev/null 2>&1; then
+  echo 'expected the tag check to refuse a missing version, received success' >&2
+  exit 1
+fi
+rm -rf "$tag_bin"
+echo 'release tag signature checks passed'
+
 # What the title gate protects: git-cliff has to keep a squash subject that carries no Conventional
 # Commit type, show only its first line, and mark a breaking change. `filter_unconventional = true`
 # — the setting that kept #18 out of v0.1.0's notes — fails the first assertion, dropping the
