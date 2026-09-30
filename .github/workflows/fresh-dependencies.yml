@@ -1,0 +1,72 @@
+name: Fresh dependencies
+
+# Every lane in ci.yml builds against the committed Cargo.lock with `--locked`, so nothing there
+# ever sees a newer semver-compatible release. A host that embeds the library resolves its own
+# tree: this lane does the same, weekly, and reports what would break. It is not part of the CI
+# `Gate` and is not a required check, so a red run here is a signal for the maintainers, never a
+# reason a pull request cannot merge. The committed lock is only ever changed by a reviewed commit.
+
+on:
+  schedule:
+    - cron: "43 6 * * 2"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/fresh-dependencies.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fresh-dependencies-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fresh:
+    name: Fresh resolution (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fresh
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cargo-nextest
+      - name: Resolve every dependency to its newest compatible release
+        run: |
+          cargo update 2>&1 | tee "$RUNNER_TEMP/cargo-update.log"
+          {
+            echo '### Packages that moved from the committed lock'
+            echo
+            echo '```'
+            grep -E '^\s*(Updating|Adding|Removing) ' "$RUNNER_TEMP/cargo-update.log" | grep -v 'crates.io index' || echo 'none'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Record the protocol crates this run resolved
+        run: |
+          {
+            echo '### Protocol crates in this run'
+            echo
+            echo '```'
+            cargo tree -p mango-agent-acp --depth 1 | grep -E 'agent-client-protocol'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --workspace --all-features
+      - run: cargo test --doc --workspace --all-features
+      - run: cargo doc --no-deps --workspace --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
