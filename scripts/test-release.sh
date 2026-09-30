@@ -104,3 +104,23 @@ else
   trap - EXIT
   echo 'changelog rendering checks passed'
 fi
+
+# A path-only dev-dependency vanishes from the packaged manifest, taking its features with it.
+# `workspace = true` and a version beside the path both survive; a bare path does not.
+dev_fixture=$(mktemp -d)
+trap 'rm -rf "$dev_fixture"' EXIT
+printf '[dev-dependencies]\nsibling = { workspace = true, features = ["testing"] }\nother = { path = "../other", version = "0.3.0" }\n' > "$dev_fixture/kept.toml"
+printf '[dev-dependencies]\nsibling = { features = ["testing"], path = "../sibling" }\n' > "$dev_fixture/dropped.toml"
+scripts/check-dev-dependencies.sh "$dev_fixture/kept.toml" >/dev/null
+if scripts/check-dev-dependencies.sh "$dev_fixture/dropped.toml" >/dev/null 2>"$dev_fixture/dropped.err"; then
+  echo 'expected rejection of a path-only dev-dependency, received success' >&2
+  exit 1
+fi
+grep -q 'dropped.toml:2: sibling = ' "$dev_fixture/dropped.err" || {
+  echo "expected the rejection to name the manifest line, received: $(cat "$dev_fixture/dropped.err")" >&2
+  exit 1
+}
+rm -rf "$dev_fixture"
+trap - EXIT
+scripts/check-dev-dependencies.sh >/dev/null
+echo 'dev-dependency packaging checks passed'
