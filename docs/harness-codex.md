@@ -313,20 +313,92 @@ Two of the server's questions are approvals a person can answer:
 `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`. Options come from
 the declared `CommandExecutionApprovalDecision` / `FileChangeApprovalDecision` enums:
 
-| Vendor decision                 | Effect  | Scope     | Risk        | Writes a rule | Note                                         |
-| ------------------------------- | ------- | --------- | ----------- | ------------- | -------------------------------------------- |
-| `accept`                        | Allow   | `Once`    | unspecified | no            |                                              |
-| `acceptForSession`              | Allow   | `Session` | unspecified | no            | Codex forgets it when the thread ends        |
-| `decline`                       | Reject  | `Once`    | unspecified | no            | The turn goes on                             |
-| `cancel`                        | `Other` | —         | destructive | no            | Stops the turn, which a reject must not mean |
-| `acceptWithExecpolicyAmendment` | `Other` | —         | destructive | **yes**       | Only when the request proposed one           |
-| `applyNetworkPolicyAmendment`   | `Other` | —         | destructive | **yes**       | Only when the request proposed one           |
+| Vendor decision                 | Effect  | Scope     | Risk        | Writes a rule | Note                                                     |
+| ------------------------------- | ------- | --------- | ----------- | ------------- | -------------------------------------------------------- |
+| `accept`                        | Allow   | `Once`    | unspecified | no            |                                                          |
+| `acceptForSession`              | Allow   | `Session` | unspecified | no            | Codex forgets it when the thread ends                    |
+| `decline`                       | Reject  | `Once`    | unspecified | no            | The turn goes on                                         |
+| `cancel`                        | `Other` | —         | destructive | no            | Stops the turn, which a reject must not mean             |
+| `acceptWithExecpolicyAmendment` | `Other` | —         | destructive | **yes**       | Only when the request proposed one and it displays whole |
+| `applyNetworkPolicyAmendment`   | `Other` | —         | destructive | **yes**       | Only when the request proposed one and it displays whole |
 
 Four facts rather than one word. The two amendments are the reason: each one writes a policy Codex
 applies to later requests on its own, and the old vocabulary had no way to say that — `Other` said
 "only a person can weigh this" and nothing about what agreeing would leave behind. Their scope is
 left **unstated**, because Codex does not say how far an amendment reaches, and an unstated reach is
 never read as the narrow one.
+
+### Standing rules an amendment writes
+
+An amendment option writes a rule Codex applies on its own from then on, so the option's label
+carries the rule itself and never a generic description of it. The pinned digest in
+`vendor/schema.json` lists property names only, with no field types. The types come from
+`codex app-server generate-json-schema` run at the pinned 0.154.0:
+`CommandExecutionRequestApprovalParams.proposedExecpolicyAmendment` is `string[]` (a command
+prefix), `proposedNetworkPolicyAmendments` is `NetworkPolicyAmendment[]` where
+`NetworkPolicyAmendment` is `{host: string, action: "allow" | "deny"}`, and
+`networkApprovalContext` is `{host: string, protocol: "http" | "https" | "socks5Tcp" |
+"socks5Udp"}`. The reply shapes are the `acceptWithExecpolicyAmendment` and
+`applyNetworkPolicyAmendment` arms of `CommandExecutionApprovalDecision`.
+
+| Proposal                             | Label                                                             |
+| ------------------------------------ | ----------------------------------------------------------------- |
+| `["git","status"]`                   | `Allow, and always allow commands starting with ["git","status"]` |
+| `{host: "a.example", action: allow}` | `Apply standing network rule: allow "a.example"`                  |
+| `{host: "a.example", action: deny}`  | `Apply standing network rule: deny "a.example"`                   |
+
+- **The prefix is compact JSON**, because a space-joined prefix reads the same for `["rm -rf","x"]`
+  and `["rm","-rf","x"]`.
+- **An option is offered only when its label survives the core's option-label bound**
+  (`TextLimit::ApprovalOptionLabel`, 128 code points, with control and bidirectional characters
+  stripped) unchanged, checked with `normalize::bound_text` on the final string. Cutting a label
+  would show a person less than the rule they are writing, which is the concealment the label
+  exists to prevent, so the option is dropped instead. The four plain options remain, and the
+  dropped rule is spelled out in the detail (up to 256 code points; a longer one is described as
+  too long to show) as a standing rule "proposed but not offered".
+- **A proposal outside the declared shape is not offered**: an execpolicy amendment that is not a
+  nonempty array of strings, or a network amendment without a nonempty `host` and an `action` of
+  exactly `allow` or `deny`. A rule that cannot be labelled exactly cannot be consented to.
+- **The action is what the wire proposes.** A `deny` proposal is labelled `deny`, never "Allow".
+  What Codex does with the current request when a `deny` amendment is applied is **unverified**:
+  the pinned description says only "User chose a persistent network policy rule (allow/deny) for
+  this host", so the label says nothing about the request in front of the person. The reply
+  carries exactly the `{action, host}` that was labelled.
+- **`networkApprovalContext` leads the detail**, ahead of the agent's own `reason`, as
+  `Network access requested: <protocol> to <host>`. A context of a shape the pin does not declare
+  is shown as it arrived rather than dropped.
+- **The refusal is unchanged**: `decline`. Options stay `Other`, destructive and
+  `policy_changing`, so a broker's `allow()` never selects one, and nothing is auto-selected.
+
+**Only the first network proposal is a candidate.** The choice was made deliberately:
+
+- Every network amendment answers with the same option id, `applyNetworkPolicyAmendment`, because
+  `ApprovalDecisionValue::option_id` is a public `&'static str`. Offering several would need
+  indexed ids, and the broker path resolves the chosen option by reading that id back off the
+  decision, so a broker choosing the second would be audited as an unresolved option, losing its
+  `policy_changing` and destructive flags.
+- The core refuses a request of more than `APPROVAL_MAX_OPTIONS` (16) options, and the pin
+  declares no bound on the number of proposals, so offering all of them lets a long proposal list
+  stop a prompt from reaching the host at all.
+- Nothing is lost silently: every later proposal is listed in the detail (four at most, then a
+  count). A person who wants one of those rules can decline and write it in their own Codex
+  configuration.
+
+Offering every proposal remains possible once options can carry ids other than the vendor
+decision's own.
+
+**How often a prefix survives.** The label wording leaves 81 code points for the compact JSON of a
+prefix, and 91 for a network host. A host name is short enough that a network option is dropped
+only for a host longer than that. A prefix keeps its option when the JSON of the whole argv fits:
+`["git","status"]` (16), `["cargo","test","--workspace"]` (32) and
+`["curl","-s","https://api.example.com/v1/status"]` (48) all do. It loses it for a long argv, such
+as a shell wrapper around a whole script or a `curl` with an inline payload, whose JSON exceeds 81.
+There is no captured corpus of real proposals to count against: the archival capture in
+`fixtures/codex/approval.jsonl` records one three-word prefix with its text redacted, and the
+sample of commands available locally is too small to state a rate. What is asserted is the
+boundary itself, by
+`approvals::tests::realistic_prefixes_mostly_keep_their_option`. A prefix that loses its option is
+not silently gone: the detail carries the rule and the four plain options still work.
 
 The running server also writes an `availableDecisions` member that **its own generated schema does
 not declare**. It is deliberately not read: building the option set a person chooses from out of an

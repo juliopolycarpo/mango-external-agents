@@ -213,6 +213,12 @@ pub struct CommandExecutionApprovalParams {
     /// Network-policy changes it proposes, on the same terms.
     #[serde(default)]
     pub proposed_network_policy_amendments: Option<Vec<Value>>,
+    /// The host and protocol a managed-network approval asks about.
+    ///
+    /// Declared by the pinned protocol as `{host, protocol}`; kept as raw JSON so a shape this
+    /// harness does not model is still shown to the person rather than dropped.
+    #[serde(default)]
+    pub network_approval_context: Option<Value>,
 }
 
 /// May the agent write these files?
