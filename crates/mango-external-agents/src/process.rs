@@ -432,7 +432,9 @@ impl std::fmt::Debug for StderrTail {
 pub struct LineLimits {
     /// The longest single line the library will assemble.
     pub max_line_bytes: usize,
-    /// The most unread output the library will hold at once.
+    /// The most unread output the library will hold at once, counted after invalid UTF-8 is
+    /// replaced (each invalid sequence becomes a 3-byte U+FFFD, so repair can at most triple a
+    /// line).
     pub max_buffered_bytes: usize,
 }
 
@@ -475,7 +477,9 @@ impl LineStream {
     ///
     /// A trailing `\r` is dropped, so a vendor writing CRLF on Windows reads the same as one
     /// writing LF. Invalid UTF-8 is replaced rather than refused: a vendor's stray byte should not
-    /// end a turn that is otherwise going fine.
+    /// end a turn that is otherwise going fine. The replacement can be longer than the bytes it
+    /// stands for, so the repaired line is what counts against `max_buffered_bytes`; `max_line_bytes`
+    /// stays a limit on the raw line.
     ///
     /// # Errors
     ///
@@ -544,7 +548,19 @@ impl LineStream {
                 received: record.len(),
             });
         }
-        let line = String::from_utf8_lossy(&record).into_owned();
+        // Repair can triple a line: each invalid sequence becomes a 3-byte U+FFFD. The raw checks
+        // above cannot see that, so the decoded size is counted against the unread-output budget too.
+        let repaired = String::from_utf8_lossy(&record);
+        // What is still buffered behind this record (later lines, an unterminated tail) is held too.
+        let unread = self.queued_bytes + repaired.len() + self.buffer.len();
+        if unread > self.limits.max_buffered_bytes {
+            return Err(Error::LimitExceeded {
+                subject: "bytes of unread vendor output",
+                limit: self.limits.max_buffered_bytes,
+                received: unread,
+            });
+        }
+        let line = repaired.into_owned();
         self.queued_bytes += line.len();
         self.pending.push_back(line);
         Ok(())
@@ -801,6 +817,161 @@ mod tests {
             lines.next_line().await.expect("expected a line"),
             Some(String::from("a\u{fffd}b"))
         );
+    }
+
+    /// Hands out exactly the raw chunks a test scripted, so a test can put invalid UTF-8 on the
+    /// wire, which the `&str`-taking [`ScriptedSource`] cannot.
+    struct RawChunkSource {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl RawChunkSource {
+        fn stream(chunks: Vec<Vec<u8>>, limits: LineLimits) -> LineStream {
+            let chunks = chunks.into_iter().rev().collect();
+            LineStream::new(Box::new(Self { chunks }), limits)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for RawChunkSource {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            Ok(self.chunks.pop())
+        }
+    }
+
+    /// `count` invalid bytes and a newline: each byte repairs to a 3-byte U+FFFD.
+    fn invalid_line(count: usize) -> Vec<u8> {
+        let mut line = vec![0xff; count];
+        line.push(b'\n');
+        line
+    }
+
+    #[tokio::test]
+    async fn refuses_a_line_that_only_passes_the_buffer_cap_before_repair() {
+        // 60 raw bytes fit both caps (100); repaired they are 180 bytes.
+        let mut lines = RawChunkSource::stream(
+            vec![invalid_line(60)],
+            LineLimits {
+                max_line_bytes: 100,
+                max_buffered_bytes: 100,
+            },
+        );
+
+        let error = lines
+            .next_line()
+            .await
+            .expect_err("expected a refusal, received a line");
+        assert!(
+            matches!(
+                error,
+                Error::LimitExceeded {
+                    subject: "bytes of unread vendor output",
+                    limit: 100,
+                    received: 180,
+                }
+            ),
+            "expected a buffer-limit refusal at 180 repaired bytes, received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_several_repaired_lines_from_one_chunk_past_the_buffer_cap() {
+        // Four lines of 21 raw bytes are 84 in one chunk, under the cap of 100. The first repairs
+        // to 60 bytes with 63 raw bytes of the other three still buffered: 123 held.
+        let chunk = (0..4).flat_map(|_| invalid_line(20)).collect();
+        let mut lines = RawChunkSource::stream(
+            vec![chunk],
+            LineLimits {
+                max_line_bytes: 100,
+                max_buffered_bytes: 100,
+            },
+        );
+
+        let error = lines
+            .next_line()
+            .await
+            .expect_err("expected a refusal, received a line");
+        assert!(
+            matches!(
+                error,
+                Error::LimitExceeded {
+                    subject: "bytes of unread vendor output",
+                    limit: 100,
+                    received: 123,
+                }
+            ),
+            "expected a buffer-limit refusal at 123 held bytes, received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn counts_the_unterminated_tail_beside_a_repaired_line() {
+        // One 21-byte line and a 70-byte tail are 91 raw bytes in the chunk, under the cap of 100.
+        // The line repairs to 60 bytes and the tail stays buffered: 130 bytes held in all.
+        let mut chunk = invalid_line(20);
+        chunk.extend(std::iter::repeat_n(b'a', 70));
+        let mut lines = RawChunkSource::stream(
+            vec![chunk],
+            LineLimits {
+                max_line_bytes: 100,
+                max_buffered_bytes: 100,
+            },
+        );
+
+        let error = lines
+            .next_line()
+            .await
+            .expect_err("expected a refusal, received a line");
+        assert!(
+            matches!(
+                error,
+                Error::LimitExceeded {
+                    subject: "bytes of unread vendor output",
+                    limit: 100,
+                    received: 130,
+                }
+            ),
+            "expected a buffer-limit refusal at 130 held bytes, received {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivers_repaired_lines_that_fit_the_buffer_cap_exactly() {
+        // Two lines of 10 invalid bytes repair to 30 bytes each: 60, exactly the cap.
+        let chunk = (0..2).flat_map(|_| invalid_line(10)).collect();
+        let mut lines = RawChunkSource::stream(
+            vec![chunk],
+            LineLimits {
+                max_line_bytes: 100,
+                max_buffered_bytes: 60,
+            },
+        );
+
+        let repaired = "\u{fffd}".repeat(10);
+        for _ in 0..2 {
+            assert_eq!(
+                lines.next_line().await.expect("expected a line"),
+                Some(repaired.clone())
+            );
+        }
+        assert_eq!(lines.next_line().await.expect("expected the end"), None);
+    }
+
+    #[tokio::test]
+    async fn valid_utf8_at_exactly_both_caps_is_delivered() {
+        let mut lines = stream(
+            ["0123456789abcde\n"],
+            LineLimits {
+                max_line_bytes: 15,
+                max_buffered_bytes: 16,
+            },
+        );
+
+        assert_eq!(
+            lines.next_line().await.expect("expected a line"),
+            Some(String::from("0123456789abcde"))
+        );
+        assert_eq!(lines.next_line().await.expect("expected the end"), None);
     }
 
     /// A tail cut at an arbitrary byte starts mid-name, and a scanner that cannot see the name
