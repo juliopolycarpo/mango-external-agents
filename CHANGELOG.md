@@ -4,6 +4,98 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.3.1] - 2026-09-30
+
+### 🚀 Features
+
+- **(core)** Let a harness close open structures without replacing its terminal (#71)
+
+### 🐛 Bug Fixes
+
+- **(acp)** Keep a stale turn's frame out of the next turn's reducer (#82)
+- **(acp)** Keep agent tool call ids out of the plan's id namespace (#94)
+- **(core)** End the connection when any write times out mid-frame (#99)
+- **(codex)** Keep raw protocol records out of Debug output (#105)
+- **(examples)** Report an unconfirmed stop when cancel fails (#78)
+- **(core)** Stop a malformed escape sequence from hiding a credential name (#95)
+- **(claude)** Keep raw stream records out of Debug output (#106)
+- **(acp)** Report events the core refuses to publish (#81)
+- **(examples)** Track stream acceptance certainty separately (#101)
+- **(core)** Clamp the JSON-RPC notification queue to what a channel can hold (#90)
+- **(codex)** Fail the turn when the core refuses to publish an event (#88)
+- **(acp)** Stop a child launched without stdin before failing the open (#91)
+- **(acp)** Clamp the pending-request limit to what a semaphore can hold (#89)
+- **(codex)** Keep approval payloads out of Debug output (#98)
+- **(acp)** Refuse configuration once the watcher has ended a session (#100)
+- **(acp)** Shut down an active session on drop (#92)
+- **(examples)** Keep the Hub's settlement separate from the local terminal (#80)
+- **(codex)** Ignore other threads when claiming a pending turn (#85)
+- **(claude)** End reasoning when a run stops mid-thinking (#63)
+- **(core)** Terminate the link when a reply cannot be written (#87)
+- **(ci)** Match vendor-drift issues by label and marker (#65)
+- **(acp)** Stop approval callbacks when their turn ends (#86)
+- **(acp)** Accept MCP server arguments that start with a dash (#96)
+- **(codex)** Show the rule an approval amendment grants (#77)
+- **(codex)** Close open activities and reasoning before the terminal (#68)
+- **(acp)** Stop a running session when the host cancels (#73)
+- **(core)** Discard an overflowed stderr line until its end (#60)
+- **(acp)** Settle an expired approval that has no refusal option (#57)
+- **(mea)** Report a capture whose child was not reaped (#58)
+- **(examples)** Keep the reservation history on the logical turn (#59)
+- Stop buffering streamed answer text no completion can repeat (#47)
+- **(acp)** Store fixed-size keys for finished tool calls (#45)
+- **(claude)** Refuse partial discovery output instead of misreporting it (#41)
+- **(acp)** Refuse prompts that exceed the outbound frame before submission (#42)
+- **(acp)** Bound the version probe's output (#40)
+- **(core)** Count repaired UTF-8 against the unread-output budget (#38)
+- **(examples)** Report lagged hub-host subscribers instead of skipping silently (#39)
+
+### ⚡ Performance
+
+- **(acp)** Bound oversized held tool-call updates when they are held (#84)
+- **(core)** Copy clean prefixes in bound_text (#66)
+- **(codex)** Keep only the tail of a command-output chunk that alone exceeds it (#93)
+- **(claude)** Skip forwarded subagent text once the buffer is full (#97)
+- **(acp)** Skip turn reduction for replayed history (#62)
+- **(core)** Use a VecDeque in the scripted test link (#69)
+- **(claude)** Check an Edit's strings without copying them (#56)
+- **(claude)** Cut long text at an ASCII boundary without decoding it (#55)
+- **(claude)** Bound tool-result text before joining it (#52)
+- **(codex)** Avoid discarded copies in the notification path (#54)
+- **(examples)** Bound hub-host broadcast retention by bytes (#46)
+- **(core)** Record fake stdin lines in one scan (#53)
+- **(acp)** Read tool-call details without cloning content (#51)
+- **(core)** Stop copying owned JSON-RPC fields, text deltas and stdio messages (#50)
+- **(core)** Avoid rescanning and copying lines in LineStream (#48)
+- **(examples)** Build the hub-host retry request once (#49)
+
+### 📚 Documentation
+
+- Fix the adopt guide's example and the Codex WebSocket quote (#102)
+- **(examples)** Describe what a lagged subscriber can recover (#76)
+- **(release)** State that packaged crates do not carry test fixtures (#74)
+- **(codex)** Note the reachability of requestUserInput questions (#67)
+- Point the README example at the tested fake-driven doctest (#64)
+- **(acp)** Document the standing refusal an expired approval selects (#83)
+- Cite current Anthropic, OpenAI and SpaceXAI terms in the compliance page (#61)
+- **(core)** State that byte budgets are wire limits, not memory limits (#44)
+
+### 🧪 Testing
+
+- **(core)** Cancel with an open activity and reasoning; failing stdin fake (#104)
+- **(examples)** Run the hub-host retry bench through scripts/bench.sh (#79)
+- **(core)** Add non-gating performance benchmarks (#43)
+
+### 👷 CI
+
+- **(release)** Skip an existing GitHub release on rerun (#72)
+- **(ci)** Test against freshly resolved dependencies (#70)
+- **(release)** Verify the release tag signature (#75)
+
+### 🏗️ Build
+
+- **(acp)** Keep the testing dev-dependency in the published manifest (#103)
+
 ## [0.3.0] - 2026-09-25
 
 ### 🚀 Features

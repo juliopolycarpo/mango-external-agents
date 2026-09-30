@@ -7,7 +7,7 @@ client over a line link, and the `testing` fakes every harness crate is proven a
 
 ```toml
 [dependencies]
-mango-external-agents = "0.1"
+mango-external-agents = "0.3"
 ```
 
 Harness crates plug in on top: `mango-agent-claude`, `mango-agent-codex`, `mango-agent-acp`.
