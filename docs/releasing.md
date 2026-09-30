@@ -55,17 +55,19 @@ crates.io — and adds the two questions a dry run does not answer:
 Run it on a clean tree: `cargo package --list` refuses to describe a package whose sources have
 uncommitted changes, and the script surfaces that refusal rather than reporting an empty package.
 
-**A crate tarball is not a standalone test package.** The library build from a tarball is
-unaffected, but its tests are not self-contained: they read the repository's `fixtures/` directory,
-which sits outside every crate and so cannot be packaged, and some need a sibling crate's features
-that a published manifest does not declare. The fixtures are captured by `mea capture` and held to
-a digest manifest; a copy inside a crate would be a second, unguarded record, so none is bundled.
+**The three harness crates' tarballs are not standalone test packages.** The library build from any
+tarball is unaffected, but the tests of `mango-agent-claude`, `mango-agent-codex` and
+`mango-agent-acp` are not self-contained: they read the repository's `fixtures/` directory, which
+sits outside every crate and so cannot be packaged, and some need a sibling crate's feature that a
+published manifest does not declare. The fixtures come from `mea capture`, and the capture
+directories that carry a `manifest.json` are held to the digests in it; a copy inside a crate would
+be a second, unguarded record, so none is bundled.
 
 Observed on the four 0.3.0 tarballs, each unpacked from `cargo package` and run with
 `cargo test --all-features`:
 
-- `mango-external-agents`: every unit, integration and doc test passes. Only its `framing` bench
-  reads `fixtures/`, at run time.
+- `mango-external-agents`: every unit, integration and doc test passes, so its packaged tests can
+  be run. Only its `framing` bench reads `fixtures/`, at run time.
 - `mango-agent-claude`: the tests do not compile. `src/cli_surface.rs`, `src/models.rs`,
   `src/probe.rs` and `src/auth.rs` use `include_str!` on `../../../fixtures/...` in test code, as do
   `tests/support/mod.rs` and `tests/reducer_replay.rs`, and the build stops with
@@ -74,13 +76,13 @@ Observed on the four 0.3.0 tarballs, each unpacked from `cargo package` and run 
   test binaries open `fixtures/codex` at run time through `CARGO_MANIFEST_DIR` and 147 of their
   tests fail (`cancel_deadlines`, `notification_decode`, `replay`).
 - `mango-agent-acp`: `tests/session.rs` and `tests/smoke.rs` do not compile
-  (`cannot find TokioLauncher in launcher`), because the dev-dependency on the sibling crate that turns on its
-  `launcher-tokio` and `testing` features is a path entry Cargo leaves out of the published
-  manifest. `tests/discovery.rs` passes, and of the unit tests one profile test fails at run time
-  because it reads the repository root.
+  (`cannot find TokioLauncher in launcher`), because the dev-dependency on the sibling crate that
+  turns on its `launcher-tokio` feature is a path entry Cargo leaves out of the published manifest.
+  The crate's own `testing` feature still resolves, so `tests/discovery.rs` passes. Of the unit
+  tests one profile test fails at run time because it reads the repository root.
 
-Whoever needs to run the tests, such as a distribution packager, should use a checkout of the
-release tag, not the `.crate`. Excluding `tests/` and `benches/` from the packages would not change
+Whoever needs to run the harness crates' tests, such as a distribution packager, should use a
+checkout of the release tag, not the `.crate`. Excluding `tests/` and `benches/` from the packages would not change
 this, because the test-only includes in `src/` would remain.
 
 Run `mea doctor` and a harmless `mea turn` against Claude, Codex and Cursor on the maintainer's
