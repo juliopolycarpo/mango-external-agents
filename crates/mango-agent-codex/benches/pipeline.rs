@@ -312,7 +312,8 @@ fn main() {
     );
     bench.run(
         "codex/stage/reduce/file-change-started+completed-500KB",
-        per_patch,
+        // Two notifications per iteration: the item starting and the item completing.
+        Unit::new(2 * PATCH_FRAMES as u64, "frame"),
         || {
             let pairs: Vec<(Notification, Notification)> = (0..PATCH_FRAMES)
                 .map(|_| (started.notification(), completed.notification()))
@@ -361,9 +362,17 @@ fn main() {
             (reducer_with_item(&command_item, start), notifications)
         },
         |(mut reducer, notifications)| {
+            // The first delta opens the window; the rest land inside it and are suppressed.
+            let mut emitted = 0;
             for notification in &notifications {
-                std::hint::black_box(reduce(&mut reducer, notification, start));
+                if matches!(reduce(&mut reducer, notification, start), Outcome::Emit(_)) {
+                    emitted += 1;
+                }
             }
+            assert_eq!(
+                emitted, 1,
+                "expected 1 emitted command update inside one window, received {emitted}"
+            );
             reducer
         },
     );
@@ -447,13 +456,14 @@ fn replay_fixtures(bench: &Bench, rt: &tokio::runtime::Runtime) {
         println!("# skipped codex/pipeline/fixtures: no fixtures/codex directory beside the crate");
         return;
     }
-    let total: usize = transcripts
+    let per_pass: usize = transcripts
         .iter()
         .map(|transcript| transcript.frames.len())
         .sum();
+    let total = per_pass * FIXTURE_REPLAYS;
     let names: Vec<&str> = transcripts.iter().map(|t| t.name.as_str()).collect();
     println!(
-        "# fixture corpus: {} transcripts ({}), {total} notification frames ({FIXTURE_REPLAYS} replays)",
+        "# fixture corpus: {} transcripts ({}), {per_pass} notification frames, replayed {FIXTURE_REPLAYS}x per sample",
         transcripts.len(),
         names.join(", ")
     );
@@ -509,13 +519,18 @@ async fn replay(transcript: &Transcript) -> usize {
         match outcome {
             Outcome::Emit(kinds) => {
                 for kind in kinds {
-                    if sink.emit(kind).await.is_err() {
-                        continue;
-                    }
-                    if let Ok(event) = events.try_recv() {
-                        emitted += 1;
-                        std::hint::black_box(serde_json::to_string(&event).ok());
-                    }
+                    let name = &transcript.name;
+                    sink.emit(kind).await.unwrap_or_else(|error| {
+                        panic!("expected transcript {name} to emit within the turn budget, received {error}")
+                    });
+                    let event = events.try_recv().unwrap_or_else(|error| {
+                        panic!("expected transcript {name} to queue the emitted event, received {error}")
+                    });
+                    emitted += 1;
+                    std::hint::black_box(
+                        serde_json::to_string(&event)
+                            .expect("expected a normalized event to serialize"),
+                    );
                 }
             }
             Outcome::Finish { .. } | Outcome::Poison { .. } => {
