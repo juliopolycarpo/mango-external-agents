@@ -8,15 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# The Codex crate packages its own copy of the runner; a drifted copy would make the two crates'
-# numbers incomparable.
-core_runner=crates/mango-external-agents/benches/support/mod.rs
-codex_runner=crates/mango-agent-codex/benches/support/mod.rs
-if ! cmp -s "$core_runner" "$codex_runner"; then
-  echo "expected $core_runner and $codex_runner to be identical, received a difference:" >&2
-  diff -u "$core_runner" "$codex_runner" >&2 || true
-  exit 1
-fi
+# A drifted copy of the runner would make the two crates' numbers incomparable.
+scripts/check-bench-runner.sh >/dev/null
 
 # sha256sum is GNU coreutils; macOS ships shasum instead. Neither present is a hard failure, so a
 # receipt never silently omits the lockfile digest.

@@ -53,8 +53,8 @@ instead of criterion or divan:
 - It prints raw samples, which a review can recompute from; it makes no statistical claim.
 - The library crates set `bench = false` on their `[lib]` target so `cargo bench` skips their unit
   tests. The Codex copy of the runner is byte-identical to the core one because a published crate
-  cannot package a file from another crate; change both together. `scripts/bench.sh` refuses to run
-  when they differ.
+  cannot package a file from another crate; change both together. `scripts/check-bench-runner.sh` fails
+  `scripts/check.sh` and CI's Policy lane when they differ, and `scripts/bench.sh` runs it first.
 
 Allocation counts are not measured. A counting global allocator needs `unsafe`, which the
 workspace forbids. To find allocations, use a profiler on the bench binary
