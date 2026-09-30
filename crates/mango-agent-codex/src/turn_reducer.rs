@@ -189,6 +189,11 @@ impl TurnReducer {
     /// in one line: at most `max_line_bytes` as the vendor wrote it, at most three times that once
     /// each invalid byte is repaired to a 3-byte U+FFFD, and never more than `max_buffered_bytes`,
     /// which the repaired line is counted against.
+    ///
+    /// The bound equals the largest decoded stdio line only because this harness is stdio-only. On
+    /// a websocket the limit applies to the decoded message against `max_line_bytes` alone (see
+    /// `SocketReceiver::bounded` in the websocket transport), so a websocket transport would need
+    /// its own bound rather than this one.
     pub(crate) fn for_limits(limits: &Limits) -> Self {
         let line = &limits.line;
         Self::builder()
