@@ -44,8 +44,12 @@ jobs:
           key: fresh
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,cargo-deny
       - name: Resolve every dependency to its newest compatible release
+        # No colour: the workflow-wide `always` puts escape codes in front of the status words the
+        # summary greps for.
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           cargo update 2>&1 | tee "$RUNNER_TEMP/cargo-update.log"
           {
@@ -65,7 +69,13 @@ jobs:
             cargo tree -i agent-client-protocol-schema -e normal --depth 0
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      # The repository's own rules, applied to the tree this run resolved: a new compatible release
+      # must not bring in aws-lc-rs or OpenSSL, or a licence or source the policy refuses. Advisories
+      # are left out; they change with the database, not with the lock.
+      - run: scripts/check-tls.sh
+      - run: cargo deny check bans licenses sources
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - run: cargo nextest run --workspace --all-features
       - run: cargo test --doc --workspace --all-features
       - run: cargo doc --no-deps --workspace --all-features
