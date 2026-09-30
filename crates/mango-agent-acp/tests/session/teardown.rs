@@ -644,3 +644,57 @@ async fn acp_teardown_close_after_a_failed_cleanup_returns_promptly() {
         "expected close result: Err(cleanup failed) | received: {result:?}"
     );
 }
+
+/// A routing-only patch is local: it touches no wire request, so nothing but the watcher's own
+/// mark that the peer ended can refuse it once the agent has vanished and the session is `Closed`.
+#[tokio::test]
+async fn acp_teardown_watcher_close_refuses_later_configuration() {
+    let watched = open_watched(false).await;
+    watched.launcher.release();
+    watched.agent_gone.cancel();
+    wait_for_closed(&watched.session).await;
+
+    let refused = watched
+        .session
+        .configure(
+            ConfigurationPatch::new().routing(ConfigurationChange::Set(ApprovalRouting::User)),
+        )
+        .await;
+
+    let error = match refused {
+        Err(error) => error,
+        Ok(outcome) => panic!(
+            "expected configure after the peer ended: Closed(ACP connection) | received: Ok({outcome:?})"
+        ),
+    };
+    assert!(
+        matches!(
+            error.cause(),
+            Error::Closed {
+                subject: "ACP connection"
+            }
+        ),
+        "expected error: Closed(ACP connection) | received: {error:?}"
+    );
+    // Nothing reached the agent, so a host may replay it without reconciling.
+    assert_eq!(
+        error.dispatch(),
+        Dispatch::NotSubmitted,
+        "expected dispatch: NotSubmitted | received: {:?}",
+        error.dispatch()
+    );
+    let accepted = watched.session.snapshot().configuration.accepted.routing;
+    assert_eq!(
+        accepted, None,
+        "expected accepted routing: None | received: {accepted:?}"
+    );
+    // Close ownership is untouched: a later close still returns the shared result.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        watched.session.close(CloseReason::Requested),
+    )
+    .await
+    .expect("expected close after the watcher to return, not hang")
+    .expect("expected close to observe the watcher's successful cleanup");
+    assert_one_teardown(&watched);
+}
