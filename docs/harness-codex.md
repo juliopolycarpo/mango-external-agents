@@ -93,6 +93,25 @@ when that names none, from the last report the server did not mean to retry. The
 not one — it carries `willRetry`, and the turn's own completion still follows. Ending a turn there
 would end the host's turn twice.
 
+**Every terminal closes what it leaves open.** The app-server documents `item/started` and
+`item/completed` as the lifecycle of a thread item and `turn/interrupt` as ending the turn with
+status `interrupted` ([app-server][app-server]); it does not promise a completion for an item that
+was still running when the turn was interrupted, failed or torn down. A host that only saw the
+opening would keep an activity spinning and a reasoning block open, so the session tracks what it
+has published and, in the same step that claims the terminal, emits one `ActivityCompleted` per
+open call, in start order, and one `ReasoningEnded` per open phase, and then the terminal. The
+status is `cancelled` for an interrupt, a host shutdown, and a turn the vendor reported complete
+with items unreported, and `failed` for a failed turn, a malformed terminal, a lost connection
+and a poisoned session. The claim is taken once, so a late second terminal closes nothing. A turn
+with nothing open emits nothing extra.
+
+The closes go through `EventSink::emit_close`. They are payload, so a turn whose payload budget
+is spent has no room for them; the sink refuses such a close without committing anything, the
+first refusal stops the closes, and the terminal the turn was ending with is committed as usual. A
+full queue therefore costs the host the closes it had no room for and never the cancellation,
+completion or failure. A stream that already committed a terminal, an overflow for instance,
+refuses every close, so nothing follows it. Nothing waits for room.
+
 **Conversation events and approvals retain thread and native-turn ownership.** Delayed events
 cannot finish a replacement turn. Reviews explicitly account for the early `turn/started` id
 differing from the review response. Child-thread events remain excluded until the shared API
