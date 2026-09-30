@@ -4,11 +4,12 @@
 //! the runner prints every raw sample beside the median, minimum, maximum and coefficient of
 //! variation, so a Base / Variant / Delta receipt can quote the numbers it computed from.
 //!
-//! The Codex, ACP and Claude crates carry byte-identical copies of this file at
-//! `crates/mango-agent-codex/benches/support/mod.rs`,
-//! `crates/mango-agent-acp/benches/support/mod.rs` and
-//! `crates/mango-agent-claude/benches/support/mod.rs`; a crate cannot package a file that lives in
-//! another crate. Change all four together.
+//! The Codex, ACP and Claude crates and the `hub-host` example carry byte-identical copies of this
+//! file at `crates/mango-agent-codex/benches/support/mod.rs`,
+//! `crates/mango-agent-acp/benches/support/mod.rs`,
+//! `crates/mango-agent-claude/benches/support/mod.rs` and
+//! `examples/hub-host/benches/support/mod.rs`; a crate cannot package a file that lives in another
+//! crate. Change all five together.
 //!
 //! Usage from a bench binary:
 //!
