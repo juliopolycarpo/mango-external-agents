@@ -1719,6 +1719,36 @@ mod tests {
         client.close().await.ok();
     }
 
+    /// Only a reply the peer is waiting on ends the connection. A request the host sends that
+    /// fails to write reports to its own caller, who decides what to do, and leaves the link open.
+    #[tokio::test]
+    async fn a_failed_outbound_write_reports_to_its_caller_and_leaves_the_connection_open() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = client(link.clone(), Arc::clone(&handler));
+        link.fail_sends("EPIPE");
+
+        let error = client
+            .request::<_, Value>("thread/start", json!({}))
+            .await
+            .expect_err("expected a failure, received an answer");
+        assert!(
+            error.to_string().contains("EPIPE"),
+            "expected the write failure to reach the caller | received {error}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let terminations = handler.terminations.lock().await.len();
+        assert_eq!(
+            terminations, 0,
+            "expected terminations: 0 after a failed outbound write | received: {terminations}"
+        );
+        assert!(
+            !client.is_closed(),
+            "expected closed: false after a failed outbound write | received: true"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+
     #[tokio::test]
     async fn a_peer_that_exits_fails_every_call_still_waiting() {
         let link = ScriptedLink::new();
