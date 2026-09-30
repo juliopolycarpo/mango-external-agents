@@ -496,7 +496,11 @@ impl Client {
     /// client is dropped.
     pub fn connect(link: Link, handler: Arc<dyn PeerHandler>, options: ClientOptions) -> Self {
         let (sender, receiver) = link.split();
-        let notification_capacity = options.max_pending_notifications.max(1);
+        // `mpsc::channel` panics above `Semaphore::MAX_PERMITS`, and a host may set a huge count
+        // to mean "no cap".
+        let notification_capacity = options
+            .max_pending_notifications
+            .clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
         let peer_bytes = Arc::new(tokio::sync::Semaphore::new(
             options
                 .max_pending_bytes
@@ -1456,6 +1460,32 @@ mod tests {
         assert_eq!(link.sent().len(), 1);
         first.abort();
         let _ = first.await;
+    }
+
+    /// A host may set a huge count to mean "no cap". The queues behind these limits are semaphore
+    /// backed and panic above `Semaphore::MAX_PERMITS`, so they are clamped, not passed through.
+    #[tokio::test]
+    async fn connecting_under_limits_of_usize_max_does_not_panic() {
+        let limits = crate::Limits {
+            turn_channel_capacity: usize::MAX,
+            turn_buffer_bytes: usize::MAX,
+            max_pending_requests: usize::MAX,
+            ..crate::Limits::default()
+        };
+        let link = ScriptedLink::new();
+        let connected = tokio::spawn(async move {
+            let client = Client::connect(
+                link.into_link(),
+                RecordingHandler::arc(None),
+                ClientOptions::new("peer").with_limits(&limits),
+            );
+            drop(client);
+        })
+        .await;
+        assert!(
+            connected.is_ok(),
+            "expected connect under usize::MAX limits: no panic | received {connected:?}"
+        );
     }
 
     #[tokio::test]
