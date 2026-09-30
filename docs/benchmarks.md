@@ -27,6 +27,7 @@ with `-` filter cases by substring; flags such as `--bench` are ignored.
 | `mango-external-agents` / `framing` | `LineStream`: a 128 KiB line at 16 KiB chunks; a 1 MiB line at 4 KiB, 16 KiB and 1 MiB chunks; 15-byte records; an invalid-UTF-8 line (the lossy repair path); the captured fixture transcripts replayed at 4 KiB and 16 KiB chunks                                                                |
 | `mango-external-agents` / `events`  | `EventSink::emit` plus drain for 1 KiB deltas (ASCII, JSON escapes, non-ASCII, characters the sanitiser strips) and a rich activity; the same events serialized to a counting writer and to a string; `normalize::sanitize_field` alone                                                            |
 | `mango-external-agents` / `copies`  | `Client` dispatch of prebuilt frames through a scripted link (1 KiB notification, 500 KB diff notification, 500 KB and error responses); `stdio::open` link sends of 1 KiB and 1 MiB messages into a counting sink                                                                                 |
+| `mango-agent-acp` / `reducer`       | `Reducer::update_at` on tool-call frames: ten 100 KiB diffs as a new call, as an update and as a completion; a 1 MiB image ahead of a text block; a 1 MiB text body; and the frames most agents send (two 2 KiB diffs, a short text)                                                               |
 | `mango-agent-codex` / `pipeline`    | Per stage and end to end: raw line to JSON, `Notification::parse`, `TurnReducer::reduce`, emit, drain, serialize. 1 KiB text deltas; 500 KB patch updates (throttled and emitted); a file change started and completed; command output inside the throttle window; every captured Codex transcript |
 
 Reading the output: one line per case with the median, minimum, maximum, coefficient of variation
@@ -53,8 +54,8 @@ instead of criterion or divan:
   untouched, and nothing enters the published dependency graph.
 - It prints raw samples, which a review can recompute from; it makes no statistical claim.
 - The library crates set `bench = false` on their `[lib]` target so `cargo bench` skips their unit
-  tests. The Codex copy of the runner is byte-identical to the core one because a published crate
-  cannot package a file from another crate; change both together. `scripts/check-bench-runner.sh` fails
+  tests. The Codex and ACP copies of the runner are byte-identical to the core one because a published
+  crate cannot package a file from another crate; change all three together. `scripts/check-bench-runner.sh` fails
   `scripts/check.sh` and CI's Policy lane when they differ, and `scripts/bench.sh` runs it first.
 
 Allocation counts are not measured. A counting global allocator needs `unsafe`, which the
@@ -112,8 +113,8 @@ produce, is closed or dropped with these numbers, not merged on an assumed gain.
   times the `Ignore` path measures nothing.
 - Build a fresh reducer or sink per sample. Reducers keep per-message state and a sink refuses
   events once it hits its budget, so a shared one changes the workload as it runs.
-- A crate without benches yet (`mango-agent-claude`, `mango-agent-acp`, `examples/hub-host`) gets
-  its own `benches/` directory with a copy of `support/mod.rs`, a `[[bench]]` entry with
+- A crate without benches yet (`mango-agent-claude`, `examples/hub-host`) gets
+  its own `benches/` directory with a copy of `support/mod.rs` (listed in `scripts/check-bench-runner.sh`), a `[[bench]]` entry with
   `harness = false` and `required-features` for anything feature-gated, and no new dependency that
   is not already in `Cargo.lock`. Run `cargo clippy --workspace --all-targets --all-features -- -D
   warnings` afterwards, since that command compiles bench targets.

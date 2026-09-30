@@ -15,6 +15,10 @@ description = "Generic Agent Client Protocol harness for mango-external-agents w
 [lints]
 workspace = true
 
+[lib]
+# The library has no benchmarks of its own, so `cargo bench` skips its unit tests.
+bench = false
+
 [features]
 default = []
 # The named fake ACP agent this crate's own tests replay, for a host writing tests of its own.
@@ -48,6 +52,12 @@ tokio = { version = "1.53.1", default-features = false, features = ["macros", "r
 async-trait = "0.1.92"
 mango-external-agents = { features = ["launcher-tokio", "testing"], path = "../mango-external-agents" }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
+
+# Non-gating benchmarks: a plain `harness = false` binary with no extra dependencies. Run it with
+# `cargo bench -p mango-agent-acp`; see docs/benchmarks.md.
+[[bench]]
+name = "reducer"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true
