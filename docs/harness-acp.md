@@ -567,7 +567,10 @@ cancelled token takes the watcher's path: admission closes, the running turn is 
 [the prompt-turn cancellation rules](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation)
 require, then the same bounded cleanup runs
 and the turn writes its terminal before `Closed` is published. The watcher holds the connection only
-weakly, so the token does not keep a dropped session's child alive.
+weakly, so the token does not keep a dropped session's child alive. After the token fires,
+`configure` is refused as `Cancelled { reason: Shutdown }` (`NotSubmitted`), the same shape a turn
+start gets, including a patch that touches no wire request. That guard is keyed on the token, so it
+does not cover a session that ended because the agent vanished.
 
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports

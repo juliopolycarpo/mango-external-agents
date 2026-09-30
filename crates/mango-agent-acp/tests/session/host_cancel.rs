@@ -347,6 +347,9 @@ async fn cancelling_with_an_approval_pending_settles_it_and_reaps_the_child() {
         resolved, 1,
         "expected approval resolutions: 1 | received: {events:?}"
     );
+    // The reason the watcher records is what turns the withdrawn question's teardown into a
+    // `Cancelled(Shutdown)` terminal rather than a link failure.
+    assert_shutdown_terminal(&events);
     assert_settles_closed(session.as_ref()).await;
     assert_children_reaped(&launcher).await;
 }
@@ -521,4 +524,109 @@ async fn cancelling_while_a_setting_is_pending_refuses_the_open_and_reaps() {
         ),
     )
     .await;
+}
+
+/// A routing-only patch is local: it touches no wire request, so only the token can refuse it once
+/// the watcher has ended the session on the host's shutdown.
+#[tokio::test]
+async fn configuring_after_a_host_shutdown_is_refused_and_close_still_returns() {
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeAcpAgent::new().process());
+    let cancel = CancelToken::new();
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &cancellable_host(&launcher, &cancel),
+            OpenSession::new("configure"),
+        )
+        .await
+        .expect("expected a session");
+    cancel.cancel();
+    assert_settles_closed(session.as_ref()).await;
+
+    let refused = session
+        .configure(
+            ConfigurationPatch::new().routing(ConfigurationChange::Set(ApprovalRouting::User)),
+        )
+        .await;
+
+    let error = match refused {
+        Err(error) => error,
+        Ok(outcome) => panic!(
+            "expected configure after a host shutdown: Cancelled(Shutdown) | received: Ok({outcome:?})"
+        ),
+    };
+    assert!(
+        matches!(
+            error.cause(),
+            Error::Cancelled {
+                reason: CancelReason::Shutdown
+            }
+        ),
+        "expected error: Cancelled(Shutdown) | received: {error:?}"
+    );
+    assert_eq!(
+        error.dispatch(),
+        Dispatch::NotSubmitted,
+        "expected dispatch: NotSubmitted | received: {:?}",
+        error.dispatch()
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        session.close(CloseReason::Requested),
+    )
+    .await
+    .expect("expected close after the shutdown to return, not hang")
+    .expect("expected close to observe the watcher's successful cleanup");
+    assert_children_reaped(&launcher).await;
+}
+
+/// A catalog request that the shutdown fails part-way must not publish a partial configuration
+/// as if the session were still live.
+#[tokio::test]
+async fn a_setting_failed_by_a_host_shutdown_is_not_published() {
+    let agent = HeldRequestAgent::new("session/set_config_option");
+    let launcher = FakeLauncher::new();
+    launcher.push(agent.process());
+    let cancel = CancelToken::new();
+    let opened = AcpHarness::new(profile())
+        .open_session(
+            &cancellable_host(&launcher, &cancel),
+            OpenSession::new("held-setting"),
+        )
+        .await
+        .expect("expected a session");
+    let session: Arc<dyn Session> = Arc::from(opened);
+    let configuring = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .configure(
+                    ConfigurationPatch::new()
+                        .model(ConfigurationChange::Set(String::from("large"))),
+                )
+                .await
+        }
+    });
+    agent.wait_until_entered().await;
+
+    cancel.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(8), configuring)
+        .await
+        .expect("expected the held setting to end after the shutdown, received a pending call")
+        .expect("expected the configure task not to panic");
+    let error = match result {
+        Err(error) => error,
+        Ok(outcome) => panic!(
+            "expected configure ended by a host shutdown: an error | received: Ok({outcome:?})"
+        ),
+    };
+    assert!(
+        matches!(
+            error.cause(),
+            Error::Cancelled { .. } | Error::Closed { .. }
+        ),
+        "expected error: Cancelled or Closed | received: {error:?}"
+    );
+    assert_children_reaped(&launcher).await;
 }
