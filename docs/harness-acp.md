@@ -349,12 +349,11 @@ outstanding.
 `PermissionRequest::expires_at` comes from `Limits::approval_timeout`. The core's
 `ApprovalDeadline` starts when the question arrives and covers broker deliberation and host response
 time. Answers at or after the deadline cannot allow work, even before the timer task runs.
-Expiry selects the agent's `reject_once` option and records `DecisionSource::Expired`. If the agent
-offers `reject_always` and no one-time refusal, expiry selects that standing refusal, because it is
-the only refusal the agent left and the alternative is to end the whole turn; the resolution is
-still `DecisionSource::Expired`. Only when the agent offers no refusal at all does the harness
-cancel the turn with `CancelReason::Timeout` and withdraw the question with ACP's `Cancelled`
-outcome;
+Expiry answers with the agent's refusal, preferring the one-time one: `reject_once` when offered,
+otherwise `reject_always`, which is then the only refusal the agent left and the alternative is to
+end the whole turn. Either way the resolution is `DecisionSource::Expired`. Only when the agent
+offers no refusal at all does the harness cancel the turn with `CancelReason::Timeout` and withdraw
+the question with ACP's `Cancelled` outcome;
 there is no `ApprovalResolved` selection event because no vendor option was selected. Expiry never
 selects an allow option. These outcomes follow the
 [ACP v1 permission specification](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission).
