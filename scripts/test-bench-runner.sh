@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Regression coverage for scripts/check-bench-runner.sh: identical copies pass; a differing copy or
-# a missing file is rejected with the expected/received message.
+# a missing file is rejected with the expected/received message, and every tracked runner copy is
+# one the default check lists.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -50,4 +51,12 @@ grep -q 'received no such file' "$scratch/missing.err" || {
   echo "expected the missing-file message, received: $(cat "$scratch/missing.err")" >&2
   exit 1
 }
+# Every runner copy in the tree is one the default check compares. A crate that grows benches and a
+# copy of the runner, but is never added to the default list, would drift without a failure.
+for runner in $(git ls-files ':(glob)**/benches/support/mod.rs'); do
+  grep -qF "$runner" scripts/check-bench-runner.sh || {
+    echo "expected scripts/check-bench-runner.sh to compare $runner, received a runner copy it never lists" >&2
+    exit 1
+  }
+done
 echo "bench runner checks passed"

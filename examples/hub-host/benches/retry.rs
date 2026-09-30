@@ -5,25 +5,36 @@
 //! costs nothing and the samples are the CPU cost of the retries. Run with:
 //!
 //! ```sh
-//! cargo bench -p hub-host --bench retry -- <mib> <retries> <samples>
+//! cargo bench -p hub-host --bench retry
+//! BENCH_SAMPLES=25 cargo bench -p hub-host --bench retry -- 8MiB/3retries
 //! ```
 //!
-//! Prints one line: median and range in milliseconds and the process's peak resident set from
-//! `/proc/self/status` (Linux only, `n/a` elsewhere), then every sample.
+//! The cases are named `retry/<attachments>/<retries>retries`, where `<attachments>` is the total
+//! size of the request's two attachments or `none`. Timing, the sample count, the case filter and
+//! the printed environment header come from the shared runner in `support/mod.rs`, the same as
+//! every other crate's benches. After the cases this bench prints the process's peak resident set
+//! from `/proc/self/status` (Linux only, `n/a` elsewhere), which the runner does not measure.
+
+mod support;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hub_host::testing::{FakeHubApi, FakeVendorSession, HubCallKind, ScriptedJitter, TurnAnswer};
 use hub_host::{HubApi, RetryPolicy, Settled, Stop, Supervisor};
 use mango_external_agents::{Attachment, AttachmentKind, SystemClock, TerminalStatus, TurnRequest};
+use support::{Bench, Unit};
 
 const MIB: usize = 1024 * 1024;
+
+/// The cases: total attachment MiB (`0` is a request with none) and the re-sends each one needs.
+const CASES: [(usize, usize); 5] = [(8, 3), (8, 1), (2, 3), (1, 3), (0, 3)];
 
 fn request(mib: usize) -> TurnRequest {
     // Two attachments so the copy is not one allocation; the input is a realistic prompt.
     let each = mib * MIB / 2;
     let attachments = (0..2u8)
+        .filter(|_| mib > 0)
         .map(|index| Attachment {
             id: format!("file-{index}"),
             name: format!("file-{index}.bin"),
@@ -94,35 +105,33 @@ fn peak_resident_kib() -> String {
         .unwrap_or_else(|| String::from("n/a"))
 }
 
+fn case_name(mib: usize, retries: usize) -> String {
+    let size = if mib == 0 {
+        String::from("none")
+    } else {
+        format!("{mib}MiB")
+    };
+    format!("retry/{size}/{retries}retries")
+}
+
 fn main() {
-    let numbers: Vec<usize> = std::env::args()
-        .filter_map(|argument| argument.parse().ok())
-        .collect();
-    let mib = numbers.first().copied().unwrap_or(8);
-    let retries = numbers.get(1).copied().unwrap_or(3);
-    let samples = numbers.get(2).copied().unwrap_or(15);
+    // A paused clock makes every backoff free, so a sample is the retries' CPU cost alone.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
         .build()
         .expect("expected a current-thread runtime with a paused clock");
-
-    let mut millis = Vec::with_capacity(samples);
-    for _ in 0..samples {
-        let request = request(mib);
-        let started = Instant::now();
-        runtime.block_on(run_once(request, retries));
-        millis.push(started.elapsed().as_secs_f64() * 1000.0);
+    let bench = Bench::new("retry");
+    for (mib, retries) in CASES {
+        bench.run(
+            &case_name(mib, retries),
+            Unit::new(retries as u64, "retry"),
+            || request(mib),
+            |request| runtime.block_on(run_once(request, retries)),
+        );
     }
-    let mut sorted = millis.clone();
-    sorted.sort_by(f64::total_cmp);
     println!(
-        "retry/{mib}MiB/{retries}retries median_ms={:.2} min_ms={:.2} max_ms={:.2} peak_rss={}",
-        sorted[sorted.len() / 2],
-        sorted[0],
-        sorted[sorted.len() - 1],
+        "# peak resident set (process high-water mark): {}",
         peak_resident_kib()
     );
-    let listed: Vec<String> = millis.iter().map(|value| format!("{value:.2}")).collect();
-    println!("samples_ms: {}", listed.join(" "));
 }
