@@ -8,7 +8,7 @@
 //! work — is a host-side failure, not a vendor dialect.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
@@ -961,6 +961,8 @@ enum CancelFailure {
 pub struct FailingCancelSession {
     inner: FakeVendorSession,
     failure: CancelFailure,
+    /// How many more `cancel` calls fail before the wrapped session's own answer is used.
+    failures_left: AtomicUsize,
 }
 
 impl FailingCancelSession {
@@ -977,6 +979,7 @@ impl FailingCancelSession {
         Self {
             inner,
             failure: CancelFailure::TimedOut,
+            failures_left: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -1017,7 +1020,25 @@ impl FailingCancelSession {
         Self {
             inner,
             failure: CancelFailure::CleanupRequired(control),
+            failures_left: AtomicUsize::new(usize::MAX),
         }
+    }
+
+    /// Fails only the first `failures` calls to `cancel`; later ones reach the wrapped session.
+    ///
+    /// A host retrying a stop is retrying against a vendor whose teardown eventually finishes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hub_host::testing::{FailingCancelSession, FakeVendorSession};
+    ///
+    /// let _session = FailingCancelSession::timing_out(FakeVendorSession::new()).recovering_after(1);
+    /// ```
+    #[must_use]
+    pub fn recovering_after(self, failures: usize) -> Self {
+        self.failures_left.store(failures, Ordering::Release);
+        self
     }
 
     fn timeout() -> Error {
@@ -1043,7 +1064,16 @@ impl Session for FailingCancelSession {
     }
 
     /// Fails without opening the wrapped session's gate: a cancel that failed has not ended the turn.
-    async fn cancel(&self, _reason: CancelReason) -> Result<()> {
+    async fn cancel(&self, reason: CancelReason) -> Result<()> {
+        let failing = self
+            .failures_left
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if !failing {
+            return self.inner.cancel(reason).await;
+        }
         Err(match &self.failure {
             CancelFailure::TimedOut => Self::timeout(),
             CancelFailure::CleanupRequired(control) => Error::CleanupRequired {

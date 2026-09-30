@@ -71,10 +71,13 @@ pub enum Settled {
         /// What the Hub gave as its reason.
         reason: String,
     },
-    /// The host stopped the operation, and the vendor confirmed it ended its own work.
+    /// The host stopped the operation and the vendor accepted the stop.
     ///
     /// Only reported once [`Session::cancel`] succeeded, or when there was no live turn to
-    /// cancel. A cancel that fails is an `Err` from [`Supervisor::run`] instead; see there.
+    /// cancel. That is the vendor accepting the request, not proof that its work has ended: a
+    /// harness may return from `cancel` while the turn is still winding down, and what its success
+    /// covers is that harness's own contract. A cancel that fails is an `Err` from
+    /// [`Supervisor::run`] instead; see there.
     Stopped {
         /// Which of the three stops it was.
         reason: CancelReason,
@@ -193,6 +196,13 @@ pub struct Supervisor {
 struct LogicalTurn {
     record: RecoveryRecord,
     refusal: Option<String>,
+    /// The stop this turn was asked to apply and no `cancel` has confirmed yet.
+    ///
+    /// Set before `Session::cancel` is awaited and cleared only when it succeeds, so a failed
+    /// cancel, or a run dropped while waiting for one, leaves it set. The stream is gone by then,
+    /// so without this the next run finds nothing to cancel and answers `Stopped` for a stop
+    /// nobody confirmed.
+    unconfirmed_stop: bool,
     reserved: bool,
 }
 
@@ -201,6 +211,7 @@ impl LogicalTurn {
         Self {
             record,
             refusal: None,
+            unconfirmed_stop: false,
             reserved: false,
         }
     }
@@ -434,9 +445,11 @@ impl Supervisor {
     /// that contradicts what it had already said.
     ///
     /// The session's own error when a stop reached a live turn and [`Session::cancel`] failed. The
-    /// stop still stands: the turn's stream has been dropped, the abort or shutdown signal stays
-    /// pulled, and running the same turn id again answers [`Settled::Stopped`] without dispatching
-    /// anything. What the error says is that the vendor's work may not have ended. It is returned
+    /// stop still stands: the turn's stream has been dropped and the abort or shutdown signal stays
+    /// pulled, so nothing is dispatched again. Running the same turn id again retries the
+    /// `cancel`, and answers [`Settled::Stopped`] only once one succeeds; until then it returns
+    /// the error again rather than a stop nobody confirmed. What the error says is that the
+    /// vendor's work may not have ended. It is returned
     /// unchanged, so [`Error::cleanup_control`] hands back the process handle of an
     /// [`Error::CleanupRequired`] for the host to retry the kill or escalate. It is an `Err`
     /// rather than a `Settled` variant because `Settled` is `Clone + Eq` and an [`Error`] holding
@@ -542,7 +555,8 @@ impl SupervisorInner {
             // is visible as the full attempt deadline elapsing. Delete this one and `back_off`'s
             // and the suite fails; that is what the coverage is actually proving.
             if let Some(reason) = progress.stop.reason() {
-                self.abandon(&mut progress, reason).await?;
+                self.abandon(&mut progress, &mut turn.unconfirmed_stop, reason)
+                    .await?;
                 return Ok(Settled::Stopped { reason });
             }
             let LogicalTurn {
@@ -578,7 +592,8 @@ impl SupervisorInner {
                 Step::Backoff(hint) => {
                     // The second of the three described at the top of this loop.
                     if let Some(reason) = self.back_off(&mut progress, hint).await {
-                        self.abandon(&mut progress, reason).await?;
+                        self.abandon(&mut progress, &mut turn.unconfirmed_stop, reason)
+                            .await?;
                         return Ok(Settled::Stopped { reason });
                     }
                 }
@@ -831,7 +846,7 @@ impl SupervisorInner {
             .map_or(Drained::Ended, Drained::Terminal)
     }
 
-    /// Ends the vendor's own work when the host stops, rather than leaving it running.
+    /// Asks the vendor to end its own work when the host stops, rather than leaving it running.
     ///
     /// Returning early with no stream is **not** a hole, though it reads like one: it means the
     /// stop won a `select!` against `Session::start_turn`, so what this host holds is a dropped
@@ -846,14 +861,25 @@ impl SupervisorInner {
     ///
     /// The session's own error when `cancel` fails, unchanged, so a
     /// [`CleanupRequired`](Error::CleanupRequired) still carries the handle the host needs. The
+    /// turn remembers the stop as unconfirmed, so a later run cancels again. The
     /// stream is dropped either way, because dropping it is the library's own cleanup attempt and
     /// a failed `cancel` is no reason to skip it.
-    async fn abandon(&self, progress: &mut Progress, reason: CancelReason) -> Result<()> {
-        let Some(stream) = progress.stream.take() else {
+    async fn abandon(
+        &self,
+        progress: &mut Progress,
+        unconfirmed_stop: &mut bool,
+        reason: CancelReason,
+    ) -> Result<()> {
+        let stream = progress.stream.take();
+        // A turn whose earlier cancel failed has no stream left but still owes a confirmed stop,
+        // so running it again retries the cancel.
+        if stream.is_none() && !*unconfirmed_stop {
             return Ok(());
-        };
+        }
+        *unconfirmed_stop = true;
         let cancelled = self.session.cancel(reason).await;
         drop(stream);
+        *unconfirmed_stop = cancelled.is_err();
         cancelled
     }
 

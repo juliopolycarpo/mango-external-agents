@@ -378,16 +378,12 @@ async fn a_cancel_that_times_out_is_not_reported_as_a_completed_stop() {
         matches!(settled, Err(Error::Timeout { .. })),
         "expected Err(Timeout) from the failed cancel, received {settled:?}"
     );
-    let again = supervisor
-        .run(TurnRequest::new("turn-1", "ship it"))
-        .await
-        .expect("expected the stopped turn to answer without an error the second time");
-    assert_eq!(
-        again,
-        Settled::Stopped {
-            reason: CancelReason::Requested
-        },
-        "expected the stop to stand after the failed cancel"
+    // Running the turn again is how a host retries the stop. The first run dropped the stream, so
+    // an answer of `Stopped` here would turn a stop nobody confirmed into one that looks confirmed.
+    let again = supervisor.run(TurnRequest::new("turn-1", "ship it")).await;
+    assert!(
+        matches!(again, Err(Error::Timeout { .. })),
+        "expected the rerun to retry the cancel and surface Err(Timeout) again, received {again:?}"
     );
     assert_eq!(
         inner.start_count(),
@@ -412,5 +408,58 @@ async fn a_cancel_that_needs_cleanup_hands_the_host_the_same_process_handle() {
     assert!(
         Arc::ptr_eq(&received, &control),
         "expected the host to receive the very handle the session returned, received a different one"
+    );
+}
+
+/// Retrying a stop is running the turn again, and it confirms the stop once the vendor can.
+///
+/// The first run's stream is gone, so the retry has nothing to drain: the cancel it sends is the
+/// only thing that can turn the unconfirmed stop into a confirmed one.
+#[tokio::test(start_paused = true)]
+async fn running_a_turn_again_retries_the_cancel_and_confirms_the_stop() {
+    let inner = FakeVendorSession::new().by_default(TurnAnswer::CompleteWhenReleased);
+    let session = FailingCancelSession::timing_out(inner.clone()).recovering_after(1);
+
+    let (mut supervisor, settled) = stop_a_live_turn_on(session, &inner).await;
+    assert!(
+        matches!(settled, Err(Error::Timeout { .. })),
+        "expected Err(Timeout) from the failed cancel, received {settled:?}"
+    );
+    let again = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the retried stop to settle");
+
+    assert_eq!(
+        again,
+        Settled::Stopped {
+            reason: CancelReason::Requested
+        },
+        "expected Stopped once the retried cancel succeeded"
+    );
+    assert_eq!(
+        inner.cancels(),
+        vec![CancelReason::Requested],
+        "expected the vendor to receive the stop exactly once, from the retry"
+    );
+    let third = supervisor
+        .run(TurnRequest::new("turn-1", "ship it"))
+        .await
+        .expect("expected the confirmed stop to settle");
+    assert_eq!(
+        third,
+        Settled::Stopped {
+            reason: CancelReason::Requested
+        }
+    );
+    assert_eq!(
+        inner.cancels().len(),
+        1,
+        "expected a confirmed stop not to be cancelled a third time"
+    );
+    assert_eq!(
+        inner.start_count(),
+        1,
+        "expected the stopped turn not to be dispatched again"
     );
 }
