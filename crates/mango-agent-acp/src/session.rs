@@ -233,6 +233,7 @@ impl AcpSession {
             return Err(Error::Closed { subject: "session" });
         }
         self.refuse_after_host_shutdown()?;
+        self.refuse_after_peer_ended()?;
         if self.connection_state.turn().is_some() {
             return Err(Error::Protocol {
                 expected: String::from(
@@ -536,6 +537,25 @@ impl AcpSession {
         .with_dispatch(Dispatch::NotSubmitted))
     }
 
+    /// Refuses work once the lifecycle watcher has begun ending the session without a `close`.
+    ///
+    /// The watcher does not claim the close state, so a patch that touches no wire request would
+    /// otherwise still succeed after the agent vanished. The refusal is the one a request on the
+    /// sealed connection gives, so an abandoned request and a vanished agent read the same.
+    ///
+    /// ```ignore
+    /// // once the agent's output has ended and the watcher has woken
+    /// assert!(session.refuse_after_peer_ended().is_err());
+    /// ```
+    fn refuse_after_peer_ended(&self) -> Result<()> {
+        if !self.connection_state.has_peer_ended() {
+            return Ok(());
+        }
+        Err(Error::Closed {
+            subject: "ACP connection",
+        })
+    }
+
     /// Publishes the configuration state confirmed before a later option request can fail.
     fn publish_catalog_configuration(
         &self,
@@ -548,6 +568,7 @@ impl AcpSession {
             return Err(Error::Closed { subject: "session" });
         };
         self.refuse_after_host_shutdown()?;
+        self.refuse_after_peer_ended()?;
         self.connection_state.accept_configuration(accepted.clone());
         Ok(self.connection_state.publish_response_configuration(
             catalog_revision,

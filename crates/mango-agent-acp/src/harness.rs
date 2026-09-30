@@ -655,6 +655,9 @@ impl Harness for AcpHarness {
             // connection and could still be writing its terminal after `Closed`.
             if let Some(state) = turn_state.upgrade() {
                 state.close_turn_admission();
+                // Every wake reason, so configuration stops being accepted on a session that has
+                // ended; `close` still owns the shared close result.
+                state.mark_peer_ended();
                 // A host shutdown is the reason the turn ends, and its parked questions are
                 // withdrawn the way `close` withdraws them. A vanished peer is not a host request,
                 // so that path keeps its own reporting.
