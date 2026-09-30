@@ -52,9 +52,11 @@ grep -q 'received no such file' "$scratch/missing.err" || {
   exit 1
 }
 # Every runner copy in the tree is one the default check compares. A crate that grows benches and a
-# copy of the runner, but is never added to the default list, would drift without a failure.
+# copy of the runner, but is never added to the default list, would drift without a failure. Only a
+# line of the list itself counts: the path on its own, optionally continued with a backslash, so a
+# comment or a message that mentions the path does not.
 for runner in $(git ls-files ':(glob)**/benches/support/mod.rs'); do
-  grep -qF "$runner" scripts/check-bench-runner.sh || {
+  grep -qE "^[[:space:]]+${runner//./\\.}( \\\\)?\$" scripts/check-bench-runner.sh || {
     echo "expected scripts/check-bench-runner.sh to compare $runner, received a runner copy it never lists" >&2
     exit 1
   }

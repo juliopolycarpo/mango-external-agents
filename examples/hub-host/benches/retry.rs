@@ -27,8 +27,14 @@ use support::{Bench, Unit};
 
 const MIB: usize = 1024 * 1024;
 
-/// The cases: total attachment MiB (`0` is a request with none) and the re-sends each one needs.
-const CASES: [(usize, usize); 5] = [(8, 3), (8, 1), (2, 3), (1, 3), (0, 3)];
+/// The cases: name, total attachment MiB (`0` is a request with none) and the re-sends each needs.
+const CASES: [(&str, usize, usize); 5] = [
+    ("retry/8MiB/3retries", 8, 3),
+    ("retry/8MiB/1retries", 8, 1),
+    ("retry/2MiB/3retries", 2, 3),
+    ("retry/1MiB/3retries", 1, 3),
+    ("retry/none/3retries", 0, 3),
+];
 
 fn request(mib: usize) -> TurnRequest {
     // Two attachments so the copy is not one allocation; the input is a realistic prompt.
@@ -105,15 +111,6 @@ fn peak_resident_kib() -> String {
         .unwrap_or_else(|| String::from("n/a"))
 }
 
-fn case_name(mib: usize, retries: usize) -> String {
-    let size = if mib == 0 {
-        String::from("none")
-    } else {
-        format!("{mib}MiB")
-    };
-    format!("retry/{size}/{retries}retries")
-}
-
 fn main() {
     // A paused clock makes every backoff free, so a sample is the retries' CPU cost alone.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -122,9 +119,9 @@ fn main() {
         .build()
         .expect("expected a current-thread runtime with a paused clock");
     let bench = Bench::new("retry");
-    for (mib, retries) in CASES {
+    for (name, mib, retries) in CASES {
         bench.run(
-            &case_name(mib, retries),
+            name,
             Unit::new(retries as u64, "retry"),
             || request(mib),
             |request| runtime.block_on(run_once(request, retries)),

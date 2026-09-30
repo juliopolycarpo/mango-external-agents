@@ -60,7 +60,9 @@ instead of criterion or divan:
   runner are byte-identical to the core one because a published crate cannot package a file from
   another crate; change every copy together. `scripts/check-bench-runner.sh` lists them and fails
   `scripts/check.sh` and CI's Policy lane when they differ, `scripts/test-bench-runner.sh` fails if
-  a tracked copy is missing from that list, and `scripts/bench.sh` runs the check first.
+  a tracked copy is missing from that list, and `scripts/bench.sh` runs the check first. The
+  runner's own tests, such as the `BENCH_SAMPLES` validation, run under `cargo nextest` through
+  `examples/hub-host/tests/bench_runner.rs`, since a bench target cannot run `#[test]`s.
 
 Allocation counts are not measured. A counting global allocator needs `unsafe`, which the
 workspace forbids. To find allocations, use a profiler on the bench binary
