@@ -126,9 +126,10 @@ impl Default for Reducer {
 
 /// A fixed-size stand-in for a finished tool call's id, for remembering that it ended.
 ///
-/// 128 bits: two 64-bit outputs of std's keyed default hasher (SipHash-1-3 today) over the id, the
-/// second over a domain-separated copy of the input, so the two halves collide independently. The
-/// key is drawn per reducer and the agent never sees it, so it cannot aim two ids at one digest. What
+/// 128 bits: two 64-bit outputs of std's keyed default hasher (SipHash-1-3 today), one over the id
+/// and one over the id followed by a marker byte. Both come from one pass over the id: the hasher is
+/// cloned after the id, and only the clone is finished, so the two halves are outputs of the same
+/// keyed function on two different messages and collide independently. The key is drawn per reducer and the agent never sees it, so it cannot aim two ids at one digest. What
 /// is left is an accident: about `n^2 / 2^129` for `n` distinct ids in one turn, roughly `1.5e-29`
 /// at a hundred thousand calls. A collision would make the reducer take a new call for one that had
 /// already ended and drop its frames; 64 bits would put that near `3e-10` at the same count, which
@@ -138,10 +139,10 @@ struct CallDigest(u128);
 
 impl CallDigest {
     fn of(key: &RandomState, call_id: &str) -> Self {
-        let high = key.hash_one(call_id);
         let mut hasher = key.build_hasher();
-        hasher.write_u8(1);
         call_id.hash(&mut hasher);
+        let high = hasher.clone().finish();
+        hasher.write_u8(1);
         Self((u128::from(high) << 64) | u128::from(hasher.finish()))
     }
 }
@@ -1818,6 +1819,15 @@ mod tests {
                     ids[other].len()
                 );
             }
+        }
+        for (id, digest) in ids.iter().zip(&digests) {
+            let (high, low) = ((digest.0 >> 64) as u64, digest.0 as u64);
+            assert_ne!(
+                high,
+                low,
+                "expected two different 64-bit halves for an id of {} bytes",
+                id.len()
+            );
         }
         let other_key = RandomState::new();
         assert_ne!(
