@@ -35,7 +35,7 @@ use mango_external_agents::{
 use serde_json::Value;
 
 use crate::commands;
-use crate::protocol::{ContentBlock, PermissionDenied, StreamRecord};
+use crate::protocol::{ContentBlock, PermissionDenied, StreamRecord, char_head as head};
 
 /// How much text any detail carries on its way to the sink.
 ///
@@ -748,9 +748,8 @@ impl TurnReducer {
             entry.push('\n');
         }
         entry.push_str(text);
-        if let Some((boundary, _)) = entry.char_indices().nth(DETAIL_CARRY_MAX_CHARS) {
-            entry.truncate(boundary);
-        }
+        let kept = head(entry, DETAIL_CARRY_MAX_CHARS).len();
+        entry.truncate(kept);
         entry
     }
 }
@@ -888,13 +887,6 @@ fn file_change_content(name: &str, input: Option<&Value>) -> Option<ActivityCont
 fn detail_for(detail: &str) -> Option<String> {
     let bounded = head(detail, DETAIL_CARRY_MAX_CHARS);
     (!bounded.is_empty()).then(|| bounded.to_owned())
-}
-
-/// The first `max` characters, never cutting one in half.
-fn head(text: &str, max: usize) -> &str {
-    text.char_indices()
-        .nth(max)
-        .map_or(text, |(boundary, _)| &text[..boundary])
 }
 
 /// Whether a `result` record is a failure, and what to call it.

@@ -346,6 +346,21 @@ fn block_text(block: &Value) -> Option<&str> {
     }
 }
 
+/// The first `max` characters of `text`, never cutting one in half.
+///
+/// Text that opens with `max` ASCII bytes is cut at byte `max` without decoding it, which is the
+/// common case for the source and command output this is applied to. Anything else falls back to
+/// finding the boundary character by character.
+pub(crate) fn char_head(text: &str, max: usize) -> &str {
+    let prefix = text.len().min(max);
+    if text.as_bytes()[..prefix].is_ascii() {
+        return &text[..prefix];
+    }
+    text.char_indices()
+        .nth(max)
+        .map_or(text, |(boundary, _)| &text[..boundary])
+}
+
 /// The first `max` characters of `text` and how many that is, never cutting one in half.
 ///
 /// A prefix of `max` ASCII bytes is `max` characters, and the next byte then starts a character,
@@ -515,7 +530,7 @@ fn count(fields: &Map<String, Value>, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamRecord, capacity_hint, take_chars};
+    use super::{StreamRecord, capacity_hint, char_head, take_chars};
 
     fn record(line: &str) -> StreamRecord {
         StreamRecord::parse(line).expect("expected a parseable record")
@@ -827,5 +842,41 @@ mod tests {
             matches!(head, std::borrow::Cow::Borrowed("abcd")),
             "expected the first part alone at a bound equal to its length, received {head:?}"
         );
+    }
+
+    /// What the reducer's `head` did before the ASCII fast path: decode until the boundary.
+    fn decoding_head(text: &str, max: usize) -> &str {
+        text.char_indices()
+            .nth(max)
+            .map_or(text, |(boundary, _)| &text[..boundary])
+    }
+
+    #[test]
+    fn the_character_head_matches_decoding_for_ascii_and_multi_byte_text_at_every_cut() {
+        let long_ascii = "a".repeat(40);
+        let mixed_tail = format!("{}\u{e9}{}", "a".repeat(20), "b".repeat(20));
+        let mixed_head = format!("\u{1f600}{}", "a".repeat(20));
+        let texts = [
+            "",
+            "abc",
+            "h\u{e9}llo",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{1f600}\u{1f600}\u{1f600}",
+            "ab\u{1f600}cd",
+            "\u{e9}",
+            long_ascii.as_str(),
+            mixed_tail.as_str(),
+            mixed_head.as_str(),
+        ];
+        for text in texts {
+            for max in 0..=45 {
+                let expected = decoding_head(text, max);
+                let received = char_head(text, max);
+                assert_eq!(
+                    received, expected,
+                    "expected the first {max} chars of {text:?} to be {expected:?}, received {received:?}"
+                );
+            }
+        }
     }
 }
