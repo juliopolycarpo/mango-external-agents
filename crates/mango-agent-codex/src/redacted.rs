@@ -52,8 +52,10 @@ pub(crate) fn opt_text(value: Option<&str>) -> Option<Redacted> {
 
 /// A JSON member, reported by the length of its compact serialization.
 pub(crate) fn json(value: &Value) -> Redacted {
+    // `Value`'s `Display` is its compact serialization and cannot fail, so an unserializable value
+    // never reads as an empty one.
     Redacted {
-        bytes: serde_json::to_string(value).map_or(0, |compact| compact.len()),
+        bytes: value.to_string().len(),
     }
 }
 
