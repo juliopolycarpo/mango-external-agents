@@ -184,10 +184,15 @@ pub(crate) fn sanitize_owned(mut raw: String) -> BoundedText {
 /// ```
 pub fn bound_text(raw: &str, limit: TextLimit) -> BoundedText {
     let max = limit.max_code_points();
-    let mut text = String::new();
-    let mut kept = 0;
+    // Plain ASCII is one byte and one code point per character and nothing in it is strippable, so
+    // the clean prefix (up to the bound) is copied whole. The per-character loop then resumes at
+    // the first byte the prefix scan refused, so it never re-reads what was already copied.
+    let prefix = clean_ascii_prefix_len(&raw.as_bytes()[..raw.len().min(max)]);
+    let mut text = String::with_capacity(raw.len().min(max));
+    text.push_str(&raw[..prefix]);
+    let mut kept = prefix;
     let mut truncated = false;
-    for character in raw.chars() {
+    for character in raw[prefix..].chars() {
         if is_strippable(character) {
             truncated = true;
             continue;
@@ -200,6 +205,39 @@ pub fn bound_text(raw: &str, limit: TextLimit) -> BoundedText {
         kept += 1;
     }
     BoundedText { text, truncated }
+}
+
+/// How many leading bytes are printable ASCII, tab or newline: one code point each, none strippable.
+///
+/// Sixteen bytes at a time with no early exit inside a block, so the compiler can test a block
+/// with vector instructions; the offending byte inside the first dirty block is then located
+/// byte by byte. The result always ends on a character boundary because every byte it counts is
+/// below 0x80.
+fn clean_ascii_prefix_len(bytes: &[u8]) -> usize {
+    let (blocks, remainder) = bytes.as_chunks::<16>();
+    let mut clean = 0;
+    for block in blocks {
+        if block
+            .iter()
+            .fold(false, |dirty, byte| dirty | !is_clean_ascii_byte(*byte))
+        {
+            return clean + leading_clean_bytes(block);
+        }
+        clean += block.len();
+    }
+    clean + leading_clean_bytes(remainder)
+}
+
+fn leading_clean_bytes(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|byte| is_clean_ascii_byte(**byte))
+        .count()
+}
+
+/// Whether a byte is a whole character that [`is_strippable`] keeps: printable ASCII, tab or newline.
+const fn is_clean_ascii_byte(byte: u8) -> bool {
+    matches!(byte, 0x20..=0x7e | b'\t' | b'\n')
 }
 
 /// An opaque vendor identifier, refused rather than repaired.
@@ -331,8 +369,9 @@ fn is_strippable(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARGV_VALUE_MAX_CODE_POINTS, MAX_PATH_LENGTH, TextLimit, bound_text, is_argv_value,
-        is_argv_value_with_max, opaque_id, sanitize_field, sanitize_owned, vendor_path,
+        ARGV_VALUE_MAX_CODE_POINTS, BoundedText, MAX_PATH_LENGTH, TextLimit, bound_text,
+        clean_ascii_prefix_len, is_argv_value, is_argv_value_with_max, opaque_id, sanitize_field,
+        sanitize_owned, vendor_path,
     };
     use crate::error::Error;
 
@@ -468,6 +507,185 @@ mod tests {
         assert_eq!(bounded.text.chars().count(), 128);
         assert_eq!(bounded.text, "🍋".repeat(128));
         assert!(bounded.truncated);
+    }
+
+    /// The character-by-character loop `bound_text` ran before the clean-prefix fast path, kept as
+    /// the reference the fast path must match byte for byte.
+    fn reference_bound(raw: &str, max: usize) -> BoundedText {
+        let mut text = String::new();
+        let mut kept = 0;
+        let mut truncated = false;
+        for character in raw.chars() {
+            if super::is_strippable(character) {
+                truncated = true;
+                continue;
+            }
+            if kept == max {
+                truncated = true;
+                break;
+            }
+            text.push(character);
+            kept += 1;
+        }
+        BoundedText { text, truncated }
+    }
+
+    const LIMITS: [TextLimit; 10] = [
+        TextLimit::ActivityName,
+        TextLimit::Title,
+        TextLimit::Detail,
+        TextLimit::ApprovalOptionLabel,
+        TextLimit::SessionTitle,
+        TextLimit::ErrorMessage,
+        TextLimit::VendorId,
+        TextLimit::AccountLabel,
+        TextLimit::CommandName,
+        TextLimit::CommandDescription,
+    ];
+
+    fn assert_bound_matches_reference(input: &str, limit: TextLimit) {
+        let expected = reference_bound(input, limit.max_code_points());
+        let received = bound_text(input, limit);
+        assert_eq!(
+            (received.text.as_bytes(), received.truncated),
+            (expected.text.as_bytes(), expected.truncated),
+            "expected bound_text to match the reference | limit: {limit:?} | input length: {} | \
+             input head: {:?}",
+            input.len(),
+            input.chars().take(24).collect::<String>()
+        );
+    }
+
+    /// Shapes around a bound of `max` code points: clean ASCII, a late or early non-ASCII
+    /// character, escape sequences before, at and after the bound, and multi-byte text that
+    /// straddles it.
+    fn bound_shapes(max: usize) -> Vec<String> {
+        let mut shapes = vec![
+            String::new(),
+            "x".repeat(max / 2),
+            "x".repeat(max - 1),
+            "x".repeat(max),
+            "x".repeat(max + 1),
+            "x".repeat(max * 3),
+            "line one\n\tline two\n".repeat(max),
+            "é".repeat(max - 1),
+            "é".repeat(max),
+            "é".repeat(max + 1),
+            "🍋".repeat(max + 1),
+            "\u{1b}[0m".repeat(max),
+            "\u{202e}".repeat(max + 1),
+        ];
+        // The first unclean byte at every offset around the bound and the 16-byte blocks.
+        let offsets = (0..40)
+            .chain(max.saturating_sub(20)..max + 20)
+            .collect::<Vec<_>>();
+        for offset in offsets {
+            for unclean in ['é', '\u{1b}', '\u{7f}', '\u{85}', '\u{202e}', '🍋', '\0'] {
+                for tail in ["", "y", "yyyy\u{1b}[0m", "🍋🍋"] {
+                    let mut text = "a".repeat(offset);
+                    text.push(unclean);
+                    text.push_str(tail);
+                    shapes.push(text);
+                }
+            }
+        }
+        // Colour codes through otherwise clean output, and a straddling run of multi-byte text.
+        shapes.push("\u{1b}[32mok\u{1b}[0m done\n".repeat(max / 8));
+        shapes.push(format!("{}{}", "a".repeat(max - 2), "日本語日本語"));
+        shapes.push(format!("{}{}", "a".repeat(max - 1), "🍋🍋🍋"));
+        shapes.push(format!("{}\u{1b}[0m{}", "a".repeat(max), "b".repeat(8)));
+        shapes.push(format!("{}\u{1b}[0m", "a".repeat(max)));
+        shapes
+    }
+
+    #[test]
+    fn bound_text_matches_the_reference_for_every_shape_and_limit() {
+        for limit in LIMITS {
+            for shape in bound_shapes(limit.max_code_points()) {
+                assert_bound_matches_reference(&shape, limit);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_text_matches_the_reference_for_scalar_values_inside_and_at_the_bound() {
+        let max = TextLimit::VendorId.max_code_points();
+        // Every scalar through the range that holds every stripped character, then a stride over
+        // the rest (none of it is stripped) that still reaches each UTF-8 width and the last scalar.
+        let scalars = ('\0'..='\u{2100}')
+            .chain(('\u{2101}'..=char::MAX).step_by(997))
+            .chain([char::MAX]);
+        for character in scalars {
+            for head in [0, 15, 16, max - 1, max] {
+                let input = format!("{}{character}zz", "a".repeat(head));
+                assert_bound_matches_reference(&input, TextLimit::VendorId);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_text_matches_the_reference_for_generated_mixed_text() {
+        let alphabet: Vec<char> = [
+            "\t", "\n", "\u{1b}", "\u{7f}", "\u{9f}", "é", "日", "🍋", "\u{202e}", "\u{61c}",
+        ]
+        .iter()
+        .flat_map(|piece| piece.chars())
+        .collect();
+        // xorshift64: deterministic, so a failure names an input that reproduces.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..3_000 {
+            let length = usize::try_from(next() % 400).expect("expected a small length");
+            // About one character in `rarity` is not plain ASCII, so a long clean prefix is the
+            // common case and a late unclean character is too.
+            let rarity = 1 + next() % 200;
+            let input: String = (0..length)
+                .map(|_| {
+                    if next() % rarity != 0 {
+                        return 'a';
+                    }
+                    let pick = usize::try_from(next()).unwrap_or(0) % alphabet.len();
+                    alphabet[pick]
+                })
+                .collect();
+            for limit in [TextLimit::VendorId, TextLimit::Title] {
+                assert_bound_matches_reference(&input, limit);
+            }
+        }
+    }
+
+    #[test]
+    fn the_clean_ascii_prefix_stops_at_the_first_byte_that_is_not_kept_whole() {
+        for (input, expected) in [
+            ("", 0),
+            ("plain text\twith\nwhitespace", 26),
+            ("abc\u{1b}[0m", 3),
+            ("abcé", 3),
+            ("abc\u{7f}", 3),
+            ("\u{0}abc", 0),
+            ("🍋", 0),
+        ] {
+            assert_eq!(
+                clean_ascii_prefix_len(input.as_bytes()),
+                expected,
+                "expected the clean prefix of {input:?} to be {expected} bytes"
+            );
+        }
+        // The unclean byte at every offset across several 16-byte blocks.
+        for offset in 0..70 {
+            let mut bytes = vec![b'a'; 70];
+            bytes[offset] = 0x1b;
+            assert_eq!(
+                clean_ascii_prefix_len(&bytes),
+                offset,
+                "expected an ESC at byte {offset} to end the clean prefix there"
+            );
+        }
     }
 
     #[test]

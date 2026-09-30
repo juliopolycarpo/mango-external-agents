@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use mango_external_agents::content::ActivityContent;
 use mango_external_agents::host::SystemClock;
-use mango_external_agents::normalize::sanitize_field;
+use mango_external_agents::normalize::{TextLimit, bound_text, sanitize_field};
 use mango_external_agents::{
     Activity, ActivityKind, AgentEvent, AttemptId, EventKind, EventReceiver, EventSink, Limits,
     SessionId, TurnId,
@@ -76,6 +76,52 @@ fn rich_activities() -> Vec<EventKind> {
             activity.content = Some(ActivityContent::Output {
                 text: "test result: ok. 42 passed; 0 failed\n".repeat(64),
             });
+            EventKind::ActivityStarted {
+                call_id: format!("call-{index}"),
+                activity,
+            }
+        })
+        .collect()
+}
+
+/// Inputs for `normalize::bound_text` at the detail limit (4,096 code points), covering where the
+/// first byte that is not plain ASCII sits: nowhere, near the start, late in the text, just before
+/// the bound and after it.
+fn bound_inputs() -> [(&'static str, String); 8] {
+    let ansi = "\u{1b}[32mok\u{1b}[0m test result: 42 passed\n";
+    [
+        ("clean-ascii", "the quick brown fox ".repeat(210)),
+        ("early-utf8", format!("é{}", "a".repeat(4_200))),
+        (
+            "late-utf8",
+            format!("{}é{}", "a".repeat(4_000), "b".repeat(200)),
+        ),
+        (
+            "late-esc",
+            format!("{}\u{1b}[0m{}", "a".repeat(4_000), "b".repeat(200)),
+        ),
+        (
+            "esc-at-4095",
+            format!("{}\u{1b}[0m{}", "a".repeat(4_095), "b".repeat(200)),
+        ),
+        ("esc-after-bound", format!("{}\u{1b}[0m", "a".repeat(4_200))),
+        (
+            "short-title",
+            String::from("cargo nextest run -p mango-external-agents"),
+        ),
+        ("ansi-command-output", ansi.repeat(4_200 / ansi.len() + 1)),
+    ]
+}
+
+/// `EVENTS` started activities whose detail is `detail`, so the bound reaches `normalize`.
+fn detail_activities(detail: &str) -> Vec<EventKind> {
+    (0..EVENTS)
+        .map(|index| {
+            let mut activity = Activity::default();
+            activity.name = String::from("Bash");
+            activity.kind = ActivityKind::Command;
+            activity.title = format!("cargo nextest run --filter {index}");
+            activity.detail = Some(detail.to_owned());
             EventKind::ActivityStarted {
                 call_id: format!("call-{index}"),
                 activity,
@@ -151,6 +197,27 @@ fn main() {
         );
     }
 
+    // The same emit and drain with a detail whose first byte that is not plain ASCII sits late:
+    // `bound_text` must not cost more here than it did before the clean-prefix copy.
+    let details: Vec<(&str, String)> = bound_inputs()
+        .into_iter()
+        .filter(|(label, _)| matches!(*label, "late-utf8" | "late-esc" | "esc-at-4095"))
+        .collect();
+    for (label, detail) in &details {
+        bench.run(
+            &format!("events/emit+drain/activity-detail-{label}"),
+            per_event,
+            || detail_activities(detail),
+            |kinds| {
+                let drained = emit_and_drain(&rt, kinds);
+                assert_eq!(
+                    drained, EVENTS,
+                    "expected {EVENTS} events drained, received {drained}"
+                );
+            },
+        );
+    }
+
     // The stand-in for the private `payload_bytes`: count the serialized size of events that are
     // already normalized and queued, and, for comparison, serialize them to a string as a host
     // would.
@@ -210,6 +277,25 @@ fn main() {
             |()| {
                 (0..EVENTS)
                     .map(|_| sanitize_field(std::hint::black_box(input)).text.len())
+                    .sum::<usize>()
+            },
+        );
+    }
+
+    // `normalize::bound_text` on its own at the detail limit, over every place the first byte that
+    // is not plain ASCII can sit.
+    for (label, input) in bound_inputs() {
+        bench.run(
+            &format!("normalize/bound_text-4KiB/{label}"),
+            per_event,
+            || (),
+            |()| {
+                (0..EVENTS)
+                    .map(|_| {
+                        bound_text(std::hint::black_box(&input), TextLimit::Detail)
+                            .text
+                            .len()
+                    })
                     .sum::<usize>()
             },
         );
