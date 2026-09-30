@@ -1,5 +1,7 @@
 //! A link driven from a script, with no process and no socket behind it.
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Notify;
@@ -29,10 +31,11 @@ pub struct ScriptedLink {
 
 #[derive(Debug, Default)]
 struct ScriptState {
-    incoming: Mutex<Vec<String>>,
+    incoming: Mutex<VecDeque<String>>,
     sent: Mutex<Vec<String>>,
     ended: Mutex<bool>,
     send_failure: Mutex<Option<String>>,
+    refused: AtomicUsize,
     changed: Notify,
 }
 
@@ -48,7 +51,7 @@ impl ScriptedLink {
             .incoming
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(message.into());
+            .push_back(message.into());
         self.state.changed.notify_waiters();
     }
 
@@ -78,6 +81,25 @@ impl ScriptedLink {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// How many sends the link refused, because it was closed or because [`ScriptedLink::fail_sends`]
+    /// was set.
+    ///
+    /// [`ScriptedLink::sent`] counts only the writes that landed, so a test that needs to know a
+    /// write was attempted and refused reads this instead.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::testing::ScriptedLink;
+    ///
+    /// let link = ScriptedLink::new();
+    /// link.fail_sends("EPIPE");
+    /// assert_eq!(link.refused_sends(), 0);
+    /// ```
+    pub fn refused_sends(&self) -> usize {
+        self.state.refused.load(Ordering::Acquire)
     }
 
     /// Waits until at least `count` messages have been sent.
@@ -121,6 +143,7 @@ impl LinkSender for ScriptedSender {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
         {
+            self.state.refused.fetch_add(1, Ordering::AcqRel);
             return Err(Error::Closed {
                 subject: "scripted link",
             });
@@ -132,6 +155,7 @@ impl LinkSender for ScriptedSender {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
         {
+            self.state.refused.fetch_add(1, Ordering::AcqRel);
             return Err(Error::Link {
                 peer: String::from("scripted link"),
                 message: failure,
@@ -172,8 +196,8 @@ impl LinkReceiver for ScriptedReceiver {
                     .incoming
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                if !incoming.is_empty() {
-                    return Ok(Some(incoming.remove(0)));
+                if let Some(message) = incoming.pop_front() {
+                    return Ok(Some(message));
                 }
                 if *self
                     .state
@@ -209,6 +233,53 @@ mod tests {
             receiver.recv().await.expect("expected a message"),
             Some(String::from("second"))
         );
+        assert_eq!(receiver.recv().await.expect("expected the end"), None);
+    }
+
+    /// Draining used to shift the whole queue on every receive, so a large replay took quadratic
+    /// time (100,000 messages took several seconds in a debug build).
+    #[tokio::test]
+    async fn a_large_queue_is_replayed_in_order_and_then_ends() {
+        const MESSAGES: usize = 100_000;
+        let link = ScriptedLink::new();
+        for index in 0..MESSAGES {
+            link.push_line(index.to_string());
+        }
+        link.end();
+        let (_, mut receiver) = link.into_link().split();
+
+        for expected in 0..MESSAGES {
+            let received = receiver.recv().await.expect("expected a message");
+            assert_eq!(
+                received.as_deref(),
+                Some(expected.to_string().as_str()),
+                "expected message {expected} in order | received {received:?}"
+            );
+        }
+        assert_eq!(receiver.recv().await.expect("expected the end"), None);
+    }
+
+    /// A clone shares the script, so lines a clone queues after the receiver has started draining
+    /// still arrive after the earlier ones.
+    #[tokio::test]
+    async fn a_clone_queues_behind_what_is_already_waiting() {
+        let link = ScriptedLink::new();
+        link.push_line("first");
+        let (_, mut receiver) = link.clone().into_link().split();
+        assert_eq!(
+            receiver.recv().await.expect("expected a message"),
+            Some(String::from("first"))
+        );
+
+        link.clone().push_line("second");
+        link.push_line("third");
+        link.end();
+        for expected in ["second", "third"] {
+            assert_eq!(
+                receiver.recv().await.expect("expected a message"),
+                Some(String::from(expected))
+            );
+        }
         assert_eq!(receiver.recv().await.expect("expected the end"), None);
     }
 
@@ -261,6 +332,33 @@ mod tests {
             "received {error:?}"
         );
         assert_eq!(link.sent(), vec![String::from("one")]);
+    }
+
+    #[tokio::test]
+    async fn counts_the_sends_it_refused_apart_from_the_ones_it_recorded() {
+        let link = ScriptedLink::new();
+        let (mut sender, _) = link.clone().into_link().split();
+        sender
+            .send(String::from("lands"))
+            .await
+            .expect("expected the send to land");
+        assert_eq!(
+            (link.sent().len(), link.refused_sends()),
+            (1, 0),
+            "expected 1 recorded and 0 refused before any refusal"
+        );
+
+        link.fail_sends("EPIPE");
+        let _ = sender.send(String::from("failed")).await;
+        sender.close().await.expect("expected a clean close");
+        let _ = sender.send(String::from("closed")).await;
+        assert_eq!(
+            (link.sent().len(), link.refused_sends()),
+            (1, 2),
+            "expected 1 recorded and 2 refused (one failing, one closed) | received sent {} refused {}",
+            link.sent().len(),
+            link.refused_sends()
+        );
     }
 
     #[tokio::test]

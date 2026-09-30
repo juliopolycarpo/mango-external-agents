@@ -42,6 +42,15 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local path="$1"
+  local unexpected="$2"
+  local message="$3"
+  if grep -Fq -- "$unexpected" "$path"; then
+    fail "$message; unexpected $unexpected in $path: $(tr '\n' '|' < "$path")"
+  fi
+}
+
 expect_status() {
   local expected="$1"
   shift
@@ -236,7 +245,11 @@ test_issue_deduplication() {
   export FAKE_GH_ISSUE_BODY='<!-- vendor-drift:claude -->'
 
   upsert_issue owner/repository claude "$report" >/dev/null
-  assert_contains "$log" 'issue edit 42' 'existing drift issue update'
+  assert_contains "$log" 'issue edit 42 ' 'existing drift issue update'
+  assert_contains "$log" 'labels=type:+drift' 'drift issues are read by label'
+  assert_contains "$log" '--paginate' 'every page of drift issues is read'
+  assert_not_contains "$log" 'issue create' 'a second run must not open a duplicate'
+  assert_not_contains "$log" 'issue edit 1042' 'a pull request carrying the label is not a drift issue'
 
   : > "$log"
   export FAKE_GH_ISSUE_BODY='manual issue without the drift marker'
