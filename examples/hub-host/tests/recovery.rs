@@ -15,7 +15,8 @@ use hub_host::testing::{
 };
 use hub_host::{Commit, HubError, HubStatus, Reconciliation, Settled, Stop};
 use mango_external_agents::{
-    AttemptId, Dispatch, Error, ErrorCode, TerminalStatus, TurnId, TurnRequest,
+    Attachment, AttachmentKind, AttemptId, Dispatch, Error, ErrorCode, TerminalStatus, TurnId,
+    TurnRequest,
 };
 
 /// Long enough for the supervisor to reach the held turn, short enough to stay a test.
@@ -223,6 +224,59 @@ async fn a_failure_that_never_left_the_host_needs_no_hub_query_to_retry() {
         session.start_count(),
         1,
         "expected the refused dispatch not to count as vendor work"
+    );
+}
+
+/// A re-send carries the same content under a newer attempt, and the Hub sees the same fingerprint.
+///
+/// The retry path builds the request for the newer attempt once and uses it both to advance the
+/// record and to start the turn, so what the vendor receives must still be exactly what the record
+/// validated: same logical id, input and attachment bytes, only the attempt moved.
+#[tokio::test(start_paused = true)]
+async fn a_re_send_starts_the_same_content_under_a_newer_attempt() {
+    let hub = Arc::new(FakeHubApi::new());
+    let session = FakeVendorSession::new()
+        .recording_requests()
+        .answering([TurnAnswer::NotSubmitted]);
+    let stop = Arc::new(Stop::new());
+    let mut supervisor = common::supervisor(&session, &hub, &stop);
+    let attachment = Attachment {
+        id: String::from("file-1"),
+        name: String::from("notes.txt"),
+        mime_type: String::from("text/plain"),
+        kind: AttachmentKind::Text,
+        bytes: b"attached bytes".to_vec(),
+    };
+    let request = TurnRequest::new("turn-1", "ship it").with_attachments(vec![attachment]);
+
+    supervisor
+        .run(request.clone())
+        .await
+        .expect("expected the operation to settle");
+
+    let started = session.requests();
+    let attempts: Vec<AttemptId> = started.iter().map(|sent| sent.attempt).collect();
+    assert_eq!(
+        attempts,
+        vec![AttemptId::new(1), AttemptId::new(2)],
+        "expected the vendor to be asked under attempts 1 then 2, received {attempts:?}"
+    );
+    for sent in &started {
+        assert_eq!(
+            sent.clone().as_attempt(request.attempt),
+            request,
+            "expected every start to carry the original content, received {sent:?}"
+        );
+    }
+    let fingerprints = hub.fingerprints(HubCallKind::Reserve);
+    assert_eq!(
+        fingerprints.len(),
+        2,
+        "expected two reservations, received {fingerprints:?}"
+    );
+    assert_eq!(
+        fingerprints[0], fingerprints[1],
+        "expected the same fingerprint on both reservations"
     );
 }
 
