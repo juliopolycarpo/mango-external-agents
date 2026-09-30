@@ -43,7 +43,7 @@ use mango_external_agents::transport::TransportKind;
 use mango_external_agents::{
     AcpSpec, AuthState, Capabilities, CapabilityCeiling, DiscoveredCapabilities, Discovery, Error,
     ExecutablePath, GateVerdict, Harness, HarnessDescriptor, HarnessIdentity, HostContext,
-    LaunchSpec, LineStream, Result, SessionId, StdioSpec,
+    LaunchSpec, LineLimits, LineStream, Result, SessionId, StdioSpec,
 };
 
 use crate::client::{self, SessionState};
@@ -375,15 +375,14 @@ impl Harness for AcpHarness {
         if argv.is_empty() {
             return Ok(Discovery::not_installed());
         }
-        let printed = match run_version(host, &self.descriptor, argv).await {
-            Ok(printed) => printed,
+        let version = match run_version(host, &self.descriptor, argv).await {
+            Ok(version) => version,
             // A launcher that could not start it is the definition of not installed here: the
             // library does not search `PATH`, so "no such program" is what it learns instead.
             Err(Error::Launch { .. }) => return Ok(Discovery::not_installed()),
             Err(error) => return Err(error),
         };
 
-        let version = version::parse(&printed);
         Ok(Discovery {
             executable: self.executable.get().cloned(),
             version: version.clone(),
@@ -1014,12 +1013,19 @@ fn resume_failure_is_conclusive(error: &Error) -> bool {
     )
 }
 
-/// Runs the profile's version argv and returns what it printed.
+/// The most output a version probe reads before it stops looking for a version.
+///
+/// A real `--version` prints one line; 64 KiB leaves room for a banner far longer than any agent
+/// prints. Past it the probe reports no version rather than reading for the whole request timeout.
+const VERSION_PROBE_MAX_BYTES: usize = 64 * 1024;
+
+/// Runs the profile's version argv and returns the version it printed, if it printed one within
+/// [`VERSION_PROBE_MAX_BYTES`].
 async fn run_version(
     host: &HostContext,
     descriptor: &HarnessDescriptor,
     argv: Vec<String>,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let process = host
         .launcher()
         .spawn(LaunchSpec {
@@ -1033,20 +1039,13 @@ async fn run_version(
         })
         .await?;
 
-    let mut lines = LineStream::new(process.stdout, host.limits().line);
-    let mut printed = String::new();
+    let mut lines = LineStream::new(process.stdout, probe_line_limits(host.limits().line));
     // Bounded by the host's own request timeout: an agent that prints nothing and does not exit must
     // not hold a discovery open.
-    let read = tokio::time::timeout(host.limits().request_timeout, async {
-        while let Some(line) = lines.next_line().await? {
-            printed.push_str(&line);
-            printed.push('\n');
-            if version::parse(&printed).is_some() {
-                break;
-            }
-        }
-        Ok::<(), Error>(())
-    })
+    let read = tokio::time::timeout(
+        host.limits().request_timeout,
+        first_version(&mut lines, VERSION_PROBE_MAX_BYTES),
+    )
     .await;
 
     // The child is ended either way: a probe that left one running would leak a process per probe.
@@ -1055,8 +1054,48 @@ async fn run_version(
         .kill(mango_external_agents::CancelReason::Requested)
         .await;
     match read {
-        Ok(Ok(())) | Err(_) => Ok(printed),
-        Ok(Err(error)) => Err(error),
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
+}
+
+/// The host's line limits, with one line held to the probe's cap.
+///
+/// The byte count in [`first_version`] only sees complete lines. Capping a line here stops an agent
+/// that never prints a newline from being buffered up to the host's own (larger) line limit.
+fn probe_line_limits(limits: LineLimits) -> LineLimits {
+    LineLimits {
+        max_line_bytes: limits.max_line_bytes.min(VERSION_PROBE_MAX_BYTES),
+        ..limits
+    }
+}
+
+/// The first version found in `lines`, or `None` when the stream ends, passes `max_bytes`
+/// (terminators counted) or overruns the stream's line limit without one.
+///
+/// Each line is parsed once. [`version::parse`] takes the first version-shaped token of whitespace
+/// separated text and a line break is whitespace, so the first line that holds one yields the same
+/// answer as parsing everything read so far, at a cost linear in the output.
+async fn first_version(lines: &mut LineStream, max_bytes: usize) -> Result<Option<String>> {
+    let mut read = 0_usize;
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return Ok(None),
+            // A line past the stream's limit is more output than the probe reads, which is the
+            // same answer as passing `max_bytes`.
+            Err(Error::LimitExceeded { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        // Parsed before the cap is checked: a line that starts inside the first `max_bytes` and
+        // ends past them is read whole (a line is itself held to the cap by `probe_line_limits`).
+        if let Some(found) = version::parse(&line) {
+            return Ok(Some(found));
+        }
+        read = read.saturating_add(line.len() + 1);
+        if read > max_bytes {
+            return Ok(None);
+        }
     }
 }
 
@@ -1084,8 +1123,89 @@ fn gate(version: Option<&str>, minimum: Option<&str>) -> GateVerdict {
 mod tests {
     use serde_json::Value;
 
-    use super::{AcpHarness, ceiling, gate};
-    use mango_external_agents::{Capabilities, CapabilityCeiling, GateVerdict, Harness};
+    use super::{
+        AcpHarness, VERSION_PROBE_MAX_BYTES, ceiling, first_version, gate, probe_line_limits,
+    };
+    use mango_external_agents::{
+        ByteSource, Capabilities, CapabilityCeiling, GateVerdict, Harness, LineLimits, LineStream,
+        Result,
+    };
+
+    /// An agent that writes chunks forever and never prints a newline.
+    struct UnterminatedOutput {
+        chunks_served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for UnterminatedOutput {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            self.chunks_served
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(vec![b'x'; 8 * 1024]))
+        }
+    }
+
+    #[test]
+    fn the_probe_holds_one_line_to_its_cap_without_loosening_the_hosts_limits() {
+        let limits = probe_line_limits(LineLimits::default());
+        assert_eq!(limits.max_line_bytes, VERSION_PROBE_MAX_BYTES);
+        assert_eq!(
+            limits.max_buffered_bytes,
+            LineLimits::default().max_buffered_bytes
+        );
+        let tight = LineLimits {
+            max_line_bytes: 100,
+            max_buffered_bytes: 200,
+        };
+        assert_eq!(probe_line_limits(tight), tight);
+    }
+
+    /// An agent that writes these chunks, in order, then ends its output.
+    struct ScriptedOutput {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ByteSource for ScriptedOutput {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            Ok(self.chunks.pop_front())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_that_starts_a_line_crossing_the_cap_is_still_read() {
+        let filler = "banner line\n".repeat((VERSION_PROBE_MAX_BYTES - 1_000) / 12);
+        let crossing = format!("cursor-agent 2026.09.10 {}\n", "y".repeat(2_000));
+        let source = ScriptedOutput {
+            chunks: [filler.into_bytes(), crossing.into_bytes()].into(),
+        };
+        let mut lines = LineStream::new(Box::new(source), probe_line_limits(LineLimits::default()));
+        let found = first_version(&mut lines, VERSION_PROBE_MAX_BYTES).await;
+        assert!(
+            matches!(&found, Ok(Some(version)) if version == "2026.09.10"),
+            "expected Ok(Some(\"2026.09.10\")) from a version inside the first {VERSION_PROBE_MAX_BYTES} bytes | received {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_line_stops_the_probe_at_its_cap_with_no_version() {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = UnterminatedOutput {
+            chunks_served: served.clone(),
+        };
+        let mut lines = LineStream::new(Box::new(source), probe_line_limits(LineLimits::default()));
+        let found = first_version(&mut lines, VERSION_PROBE_MAX_BYTES).await;
+        let chunks = served.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            matches!(found, Ok(None)),
+            "expected Ok(None) for output that never ends a line | received {found:?}"
+        );
+        assert!(
+            chunks * 8 * 1024 <= VERSION_PROBE_MAX_BYTES + 8 * 1024,
+            "expected at most {VERSION_PROBE_MAX_BYTES} bytes plus one chunk read | received {} bytes",
+            chunks * 8 * 1024
+        );
+    }
 
     #[test]
     fn a_harness_is_named_by_its_profile() {

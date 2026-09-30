@@ -3,6 +3,8 @@
 
 #[path = "discovery/policy.rs"]
 mod policy;
+#[path = "discovery/version_probe.rs"]
+mod version_probe;
 
 use std::sync::Arc;
 
