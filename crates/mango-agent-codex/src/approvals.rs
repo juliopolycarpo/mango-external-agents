@@ -7,6 +7,8 @@
 
 use std::time::SystemTime;
 
+use serde_json::Value;
+
 use mango_external_agents::event::ActivityKind;
 use mango_external_agents::interaction::{Interaction, InteractionId, InteractionKind};
 use mango_external_agents::normalize::{self, TextLimit};
@@ -73,18 +75,37 @@ impl PendingApproval {
     }
 }
 
+/// The `networkApprovalContext` member of a raw command-approval frame.
+///
+/// Read from the raw params, beside the public [`CommandExecutionApprovalParams`], so that type
+/// keeps the fields it has: adding a public field to it would break a struct literal built outside
+/// the crate. `None` for another method, an absent member and an explicit `null`.
+pub(crate) fn network_context(method: &str, params: &Value) -> Option<Value> {
+    if method != crate::protocol::approvals::method::COMMAND_EXECUTION_APPROVAL {
+        return None;
+    }
+    params
+        .get("networkApprovalContext")
+        .filter(|context| !context.is_null())
+        .cloned()
+}
+
 /// One of the server's approvals, as a question with options.
+///
+/// `network_context` is [`network_context`] of the frame the request was parsed from; only a
+/// command approval uses it.
 ///
 /// `None` for a request this harness refuses; the caller answers those with a protocol error.
 #[must_use]
 pub(crate) fn to_request(
     request: &ServerRequest,
+    network_context: Option<&Value>,
     operation: OperationRef,
     expires_at: SystemTime,
 ) -> Option<PendingApproval> {
     match request {
         ServerRequest::CommandExecution(params) => {
-            Some(from_command(params, operation, expires_at))
+            Some(from_command(params, network_context, operation, expires_at))
         }
         ServerRequest::FileChange(params) => Some(from_file_change(params, operation, expires_at)),
         ServerRequest::Permissions(params) => Some(from_permissions(params, operation, expires_at)),
@@ -95,36 +116,60 @@ pub(crate) fn to_request(
 
 fn from_command(
     params: &CommandExecutionApprovalParams,
+    network_context: Option<&Value>,
     operation: OperationRef,
     expires_at: SystemTime,
 ) -> PendingApproval {
     let command = params.command.as_deref().unwrap_or("a command");
     let title = format!("Run {command}");
-    let detail = match (params.reason.as_deref(), params.cwd.as_deref()) {
-        (Some(reason), Some(cwd)) => Some(format!("{reason}\n\nin {cwd}")),
-        (Some(reason), None) => Some(reason.to_owned()),
-        (None, Some(cwd)) => Some(format!("in {cwd}")),
-        (None, None) => None,
-    };
 
-    let mut decisions = base_decisions();
+    let mut choices = base_choices();
+    let mut unoffered: Vec<String> = Vec::new();
     // Offered only when the request carries the proposal, because the answer echoes the payload
-    // back: an amendment option with nothing to send is an option that cannot be chosen.
-    if let Some(amendment) = params.proposed_execpolicy_amendment.clone() {
-        decisions.push(ApprovalDecisionValue::AcceptWithExecpolicyAmendment(
-            amendment,
-        ));
-    }
-    if let Some(amendment) = params
-        .proposed_network_policy_amendments
+    // back: an amendment option with nothing to send is an option that cannot be chosen. And only
+    // when a person can read the whole rule: an option that writes a standing rule the host cannot
+    // display in full is not one a person can consent to.
+    if let Some(rule) = params
+        .proposed_execpolicy_amendment
         .as_ref()
-        .and_then(|amendments| amendments.first())
-        .cloned()
+        .and_then(ExecRule::decode)
     {
-        decisions.push(ApprovalDecisionValue::ApplyNetworkPolicyAmendment(
-            amendment,
-        ));
+        match rule.choice() {
+            Some(choice) => choices.push(choice),
+            None => unoffered.push(rule.text()),
+        }
     }
+    // Only the first network proposal the request lists is a candidate. See `docs/harness-codex.md`, Approvals: every
+    // later one is named in the detail instead, so nothing is dropped without a trace.
+    let proposals = params
+        .proposed_network_policy_amendments
+        .as_deref()
+        .unwrap_or_default();
+    for (index, rule) in proposals
+        .iter()
+        .enumerate()
+        .filter_map(|(index, proposal)| Some((index, NetworkRule::decode(proposal)?)))
+    {
+        match rule.choice().filter(|_| index == 0) {
+            Some(choice) => choices.push(choice),
+            None => unoffered.push(rule.text()),
+        }
+    }
+
+    // The requested host leads the detail, ahead of anything the agent wrote, so a long `reason`
+    // cannot push it past the display bound.
+    let mut lines: Vec<String> = Vec::with_capacity(4);
+    if let Some(context) = network_context {
+        lines.push(network_context_line(context));
+    }
+    lines.extend(unoffered_line(&unoffered));
+    if let Some(reason) = params.reason.as_deref() {
+        lines.push(reason.to_owned());
+    }
+    if let Some(cwd) = params.cwd.as_deref() {
+        lines.push(format!("in {cwd}"));
+    }
+    let detail = (!lines.is_empty()).then(|| lines.join("\n\n"));
 
     build(
         params.approval_id.as_deref().unwrap_or(&params.item_id),
@@ -132,9 +177,155 @@ fn from_command(
         ActivityKind::Command,
         title,
         detail,
-        decisions,
+        choices,
         expires_at,
     )
+}
+
+/// The most proposals the detail names, so a long list cannot crowd out the agent's reason.
+const UNOFFERED_LISTED: usize = 4;
+/// The longest rule the detail spells out; a longer one is described, not quoted.
+const UNOFFERED_RULE_CODE_POINTS: usize = 256;
+
+/// The detail line naming proposals this prompt did not turn into an option.
+fn unoffered_line(rules: &[String]) -> Option<String> {
+    if rules.is_empty() {
+        return None;
+    }
+    let mut line = String::from("Standing rules proposed but not offered as options:");
+    for rule in rules.iter().take(UNOFFERED_LISTED) {
+        if rule.chars().count() > UNOFFERED_RULE_CODE_POINTS {
+            line.push_str("\n- a rule too long to show");
+        } else {
+            line.push_str("\n- ");
+            line.push_str(rule);
+        }
+    }
+    if rules.len() > UNOFFERED_LISTED {
+        line.push_str(&format!("\n- and {} more", rules.len() - UNOFFERED_LISTED));
+    }
+    Some(line)
+}
+
+/// The values the pinned `NetworkApprovalProtocol` declares.
+const NETWORK_PROTOCOLS: [&str; 4] = ["http", "https", "socks5Tcp", "socks5Udp"];
+
+/// The host and protocol a managed-network approval asks about.
+fn network_context_line(context: &Value) -> String {
+    let field = |name: &str| context.get(name).and_then(Value::as_str);
+    // The abbreviated form is for exactly the declared shape: `{host, protocol}` with a protocol
+    // from the pinned enum. Anything wider is shown whole, so no member is hidden behind it.
+    let declared = context
+        .as_object()
+        .is_some_and(|members| members.len() == 2);
+    match (field("protocol"), field("host")) {
+        (Some(protocol), Some(host)) if declared && NETWORK_PROTOCOLS.contains(&protocol) => {
+            format!("Network access requested: {protocol} to {host}")
+        }
+        _ => format!("Network access requested: {context}"),
+    }
+}
+
+/// One option of a question: the vendor decision, and the label that says what it grants.
+///
+/// The label is `None` for the four plain decisions, whose wording is fixed here, and carries the
+/// exact rule for an amendment.
+struct Choice {
+    decision: ApprovalDecisionValue,
+    label: Option<String>,
+}
+
+/// Whether the core would show this label whole. `normalized()` cuts a label at
+/// [`TextLimit::ApprovalOptionLabel`] and strips control and bidirectional characters, so a label
+/// that changes under the same bounding would tell a person less than the rule it names.
+fn label_survives(label: &str) -> bool {
+    !normalize::bound_text(label, TextLimit::ApprovalOptionLabel).truncated
+}
+
+/// An exec-policy proposal: the command prefix the vendor would stop asking about.
+///
+/// The pinned protocol declares `proposedExecpolicyAmendment` as an array of strings.
+struct ExecRule(Vec<String>);
+
+impl ExecRule {
+    /// `None` for anything that is not a nonempty array of strings, which cannot be shown exactly.
+    fn decode(value: &Value) -> Option<Self> {
+        let words: Vec<String> = value
+            .as_array()?
+            .iter()
+            .map(|word| word.as_str().map(str::to_owned))
+            .collect::<Option<_>>()?;
+        (!words.is_empty()).then_some(Self(words))
+    }
+
+    /// The prefix as compact JSON, because a space-joined prefix reads the same for `["a b"]` and
+    /// `["a","b"]`.
+    fn text(&self) -> String {
+        Value::from(self.0.clone()).to_string()
+    }
+
+    fn choice(&self) -> Option<Choice> {
+        let label = format!(
+            "Allow, and always allow commands starting with {}",
+            self.text()
+        );
+        label_survives(&label).then(|| Choice {
+            decision: ApprovalDecisionValue::AcceptWithExecpolicyAmendment(Value::from(
+                self.0.clone(),
+            )),
+            label: Some(label),
+        })
+    }
+}
+
+/// A network-policy proposal: allow or deny one host, from now on.
+///
+/// The pinned protocol declares `{host: string, action: "allow" | "deny"}`.
+struct NetworkRule {
+    host: String,
+    action: &'static str,
+}
+
+impl NetworkRule {
+    /// `None` for a shape the pin does not declare, which cannot be shown exactly.
+    fn decode(value: &Value) -> Option<Self> {
+        // Exactly the two declared members: the label names `{host, action}`, so a proposal that
+        // carries more is one the label would misdescribe.
+        if value.as_object()?.len() != 2 {
+            return None;
+        }
+        let host = value
+            .get("host")?
+            .as_str()
+            .filter(|host| !host.is_empty())?;
+        let action = match value.get("action")?.as_str()? {
+            "allow" => "allow",
+            "deny" => "deny",
+            _ => return None,
+        };
+        Some(Self {
+            host: host.to_owned(),
+            action,
+        })
+    }
+
+    /// What the vendor proposes, in its own words: never "Allow" for a `deny`.
+    fn text(&self) -> String {
+        format!("{} {}", self.action, Value::from(self.host.as_str()))
+    }
+
+    fn choice(&self) -> Option<Choice> {
+        // Deliberately silent on what an applied `deny` does to the request in front of the
+        // person: the pinned protocol says only that the user "chose a persistent network policy
+        // rule (allow/deny) for this host".
+        let label = format!("Apply standing network rule: {}", self.text());
+        label_survives(&label).then(|| Choice {
+            decision: ApprovalDecisionValue::ApplyNetworkPolicyAmendment(
+                serde_json::json!({"action": self.action, "host": self.host}),
+            ),
+            label: Some(label),
+        })
+    }
 }
 
 fn from_file_change(
@@ -152,19 +343,25 @@ fn from_file_change(
         ActivityKind::FileChange,
         title,
         params.reason.clone(),
-        base_decisions(),
+        base_choices(),
         expires_at,
     )
 }
 
 /// The four decisions both approval families declare, in the order a prompt reads best.
-fn base_decisions() -> Vec<ApprovalDecisionValue> {
-    vec![
+fn base_choices() -> Vec<Choice> {
+    [
         ApprovalDecisionValue::Accept,
         ApprovalDecisionValue::AcceptForSession,
         ApprovalDecisionValue::Decline,
         ApprovalDecisionValue::Cancel,
     ]
+    .into_iter()
+    .map(|decision| Choice {
+        decision,
+        label: None,
+    })
+    .collect()
 }
 
 fn build(
@@ -173,16 +370,19 @@ fn build(
     kind: ActivityKind,
     title: String,
     detail: Option<String>,
-    decisions: Vec<ApprovalDecisionValue>,
+    choices: Vec<Choice>,
     expires_at: SystemTime,
 ) -> PendingApproval {
-    let options: Vec<PermissionOption> = decisions.iter().map(option_for).collect();
-    let decisions: Vec<(String, ServerAnswer)> = decisions
+    let options: Vec<PermissionOption> = choices
+        .iter()
+        .map(|choice| option_for(&choice.decision, choice.label.as_deref()))
+        .collect();
+    let decisions: Vec<(String, ServerAnswer)> = choices
         .into_iter()
-        .map(|decision| {
+        .map(|choice| {
             (
-                decision.option_id().to_owned(),
-                ServerAnswer::Approval(decision),
+                choice.decision.option_id().to_owned(),
+                ServerAnswer::Approval(choice.decision),
             )
         })
         .collect();
@@ -313,7 +513,10 @@ fn from_permissions(
 }
 
 /// What one vendor decision means, in the neutral vocabulary a policy can answer in.
-fn option_for(decision: &ApprovalDecisionValue) -> PermissionOption {
+///
+/// `rule` is the exact standing rule an amendment writes, already worded; the plain decisions
+/// ignore it.
+fn option_for(decision: &ApprovalDecisionValue, rule: Option<&str>) -> PermissionOption {
     match decision {
         ApprovalDecisionValue::Accept => {
             PermissionOption::new(decision.option_id(), PermissionEffect::Allow)
@@ -344,13 +547,13 @@ fn option_for(decision: &ApprovalDecisionValue) -> PermissionOption {
         // marked `policy_changing` rather than left to guess at a scope Codex never states.
         ApprovalDecisionValue::AcceptWithExecpolicyAmendment(_) => {
             PermissionOption::new(decision.option_id(), PermissionEffect::Other)
-                .with_label("Allow, and stop asking for commands like this")
+                .with_label(rule.unwrap_or("Allow, and always allow commands like this"))
                 .with_risk(PermissionRisk::Destructive)
                 .policy_changing()
         }
         ApprovalDecisionValue::ApplyNetworkPolicyAmendment(_) => {
             PermissionOption::new(decision.option_id(), PermissionEffect::Other)
-                .with_label("Allow, and apply the proposed network rule")
+                .with_label(rule.unwrap_or("Apply the proposed standing network rule"))
                 .with_risk(PermissionRisk::Destructive)
                 .policy_changing()
         }
@@ -375,6 +578,7 @@ mod tests {
         );
         super::to_request(
             &request,
+            None,
             operation(),
             mango_external_agents::Limits::default()
                 .approval_expires_at(std::time::SystemTime::UNIX_EPOCH)
@@ -403,11 +607,35 @@ mod tests {
     fn to_request(request: &ServerRequest, now: SystemTime) -> Option<super::PendingApproval> {
         build_request(
             request,
+            None,
             operation(),
             mango_external_agents::Limits::default()
                 .approval_expires_at(now)
                 .ok()?,
         )
+    }
+
+    /// A command approval built the way the session builds it: the raw frame supplies the network
+    /// context, and the parsed request supplies everything else.
+    fn command_pending(extra: serde_json::Value) -> super::PendingApproval {
+        let mut params = json!({
+            "threadId": "thread-1", "turnId": "turn-1", "itemId": "exec-1",
+            "startedAtMs": 1_u64, "command": "curl example.com", "cwd": "/workspace",
+        });
+        if let (Some(base), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            base.extend(extra.clone());
+        }
+        let context = super::network_context(method::COMMAND_EXECUTION_APPROVAL, &params);
+        let request = ServerRequest::parse(method::COMMAND_EXECUTION_APPROVAL, params);
+        build_request(
+            &request,
+            context.as_ref(),
+            operation(),
+            mango_external_agents::Limits::default()
+                .approval_expires_at(now())
+                .expect("default approval deadline"),
+        )
+        .expect("expected a question")
     }
 
     fn now() -> SystemTime {
@@ -583,7 +811,7 @@ mod tests {
     fn a_network_amendment_carries_the_first_proposal_the_request_made() {
         let with = to_request(
             &command_request(json!({
-                "proposedNetworkPolicyAmendments": [{"host": "example.com", "allow": true}]
+                "proposedNetworkPolicyAmendments": [{"host": "example.com", "action": "allow"}]
             })),
             now(),
         )
@@ -593,7 +821,7 @@ mod tests {
             with.decision_for("applyNetworkPolicyAmendment"),
             Some(super::ServerAnswer::Approval(
                 ApprovalDecisionValue::ApplyNetworkPolicyAmendment(
-                    json!({"host": "example.com", "allow": true})
+                    json!({"host": "example.com", "action": "allow"})
                 )
             ))
         );
@@ -664,7 +892,7 @@ mod tests {
         let pending = to_request(
             &command_request(json!({
                 "proposedExecpolicyAmendment": amendment,
-                "proposedNetworkPolicyAmendments": [{"host": "example.com"}]
+                "proposedNetworkPolicyAmendments": [{"host": "example.com", "action": "allow"}]
             })),
             now(),
         )
@@ -880,5 +1108,492 @@ mod tests {
             .option("deny")
             .expect("expected a deny option among the three offered");
         assert_eq!(deny.effect, PermissionEffect::Reject);
+    }
+
+    /// The label of one offered option, or a failure naming what was offered instead.
+    fn label_of(pending: &super::PendingApproval, id: &str) -> String {
+        pending
+            .request
+            .options
+            .iter()
+            .find(|option| option.id == id)
+            .and_then(|option| option.label.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an offered option {id:?} with a label | received: {:?}",
+                    pending.request.options
+                )
+            })
+    }
+
+    fn offers(pending: &super::PendingApproval, id: &str) -> bool {
+        pending.request.options.iter().any(|option| option.id == id)
+    }
+
+    fn detail_of(pending: &super::PendingApproval) -> String {
+        pending.request.detail.clone().unwrap_or_default()
+    }
+
+    /// The host cannot consent to a standing rule it cannot read: the label carries the exact
+    /// prefix, and survives the core's own bounding unchanged.
+    #[test]
+    fn an_exec_amendment_option_names_the_exact_prefix_it_writes() {
+        let pending = to_request(
+            &command_request(json!({"proposedExecpolicyAmendment": ["git", "status"]})),
+            now(),
+        )
+        .expect("expected a question");
+
+        let label = label_of(&pending, "acceptWithExecpolicyAmendment");
+        assert!(
+            label.contains(r#"["git","status"]"#),
+            "expected the exact command prefix in the label | received: {label:?}"
+        );
+        let bounded = pending.request.normalized().expect("expected bounding");
+        assert!(
+            !bounded.truncated,
+            "expected the label to survive core bounding whole | received: {:?}",
+            bounded.options
+        );
+    }
+
+    /// A space-joined prefix would read the same for one argument and for two.
+    #[test]
+    fn two_prefixes_that_differ_only_in_argument_boundaries_are_labelled_differently() {
+        let one = to_request(
+            &command_request(json!({"proposedExecpolicyAmendment": ["rm -rf", "x"]})),
+            now(),
+        )
+        .expect("expected a question");
+        let two = to_request(
+            &command_request(json!({"proposedExecpolicyAmendment": ["rm", "-rf", "x"]})),
+            now(),
+        )
+        .expect("expected a question");
+        assert_ne!(
+            label_of(&one, "acceptWithExecpolicyAmendment"),
+            label_of(&two, "acceptWithExecpolicyAmendment"),
+            "expected the argument boundaries to be visible in the label"
+        );
+    }
+
+    #[test]
+    fn a_network_amendment_option_names_the_host_and_the_action() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [
+                    {"host": "hidden-policy-domain.example", "action": "allow"}
+                ]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+
+        let label = label_of(&pending, "applyNetworkPolicyAmendment");
+        assert!(
+            label.contains("hidden-policy-domain.example") && label.contains("allow"),
+            "expected the host and the action in the label | received: {label:?}"
+        );
+        assert_eq!(
+            pending.decision_for("applyNetworkPolicyAmendment"),
+            Some(super::ServerAnswer::Approval(
+                ApprovalDecisionValue::ApplyNetworkPolicyAmendment(
+                    json!({"action": "allow", "host": "hidden-policy-domain.example"})
+                )
+            )),
+            "expected the labelled rule to be the one sent back"
+        );
+    }
+
+    #[test]
+    fn a_deny_amendment_is_never_labelled_as_an_allow() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [{"host": "blocked.example", "action": "deny"}]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+
+        let label = label_of(&pending, "applyNetworkPolicyAmendment");
+        assert!(
+            label.contains("deny") && label.contains("blocked.example"),
+            "expected the deny action and the host in the label | received: {label:?}"
+        );
+        assert!(
+            !label.to_lowercase().contains("allow"),
+            "expected no allow wording on a deny rule | received: {label:?}"
+        );
+    }
+
+    /// An option whose rule the host cannot see whole is an option nobody can consent to.
+    #[test]
+    fn an_amendment_too_long_to_display_whole_is_not_offered() {
+        let long_prefix = json!(["curl", "a".repeat(200)]);
+        let long_host = "h".repeat(200);
+        let pending = to_request(
+            &command_request(json!({
+                "proposedExecpolicyAmendment": long_prefix,
+                "proposedNetworkPolicyAmendments": [{"host": long_host, "action": "allow"}]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+
+        assert!(
+            !offers(&pending, "acceptWithExecpolicyAmendment")
+                && !offers(&pending, "applyNetworkPolicyAmendment"),
+            "expected neither oversized amendment to be offered | received: {:?}",
+            pending.request.options
+        );
+        assert!(
+            pending
+                .decision_for("acceptWithExecpolicyAmendment")
+                .is_none()
+                && pending
+                    .decision_for("applyNetworkPolicyAmendment")
+                    .is_none(),
+            "expected no wire answer for an option that was not offered"
+        );
+        // The four plain choices remain, and the request still bounds.
+        assert_eq!(pending.request.options.len(), 4);
+        pending.request.normalized().expect("expected bounding");
+    }
+
+    #[test]
+    fn an_amendment_whose_text_the_core_would_strip_is_not_offered() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [
+                    {"host": "safe.example\u{202e}evil", "action": "allow"}
+                ]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+        assert!(
+            !offers(&pending, "applyNetworkPolicyAmendment"),
+            "expected a bidirectional control in the host to refuse the option | received: {:?}",
+            pending.request.options
+        );
+    }
+
+    /// The pin declares these shapes; anything else cannot be labelled exactly.
+    #[test]
+    fn a_proposal_outside_the_declared_shape_is_not_offered() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedExecpolicyAmendment": ["git", 1],
+                "proposedNetworkPolicyAmendments": [{"host": "example.com", "allow": true}]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+        assert_eq!(
+            pending.request.options.len(),
+            4,
+            "expected only the four plain options | received: {:?}",
+            pending.request.options
+        );
+
+        for bad in [json!("git status"), json!([]), json!({"prefix": ["git"]})] {
+            let pending = to_request(
+                &command_request(json!({"proposedExecpolicyAmendment": bad})),
+                now(),
+            )
+            .expect("expected a question");
+            assert!(
+                !offers(&pending, "acceptWithExecpolicyAmendment"),
+                "expected {bad} not to be offered as a prefix"
+            );
+        }
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [{"host": "example.com", "action": "maybe"}]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+        assert!(
+            !offers(&pending, "applyNetworkPolicyAmendment"),
+            "expected an action outside allow|deny not to be offered"
+        );
+    }
+
+    /// Deliberate: only the first network proposal is an option, because every network option
+    /// shares one id and the broker audit path resolves an option by that id. Later proposals are
+    /// named in the detail, not dropped without a trace.
+    #[test]
+    fn later_network_proposals_are_named_in_the_detail_not_offered() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [
+                    {"host": "first.example", "action": "allow"},
+                    {"host": "second.example", "action": "deny"}
+                ]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+
+        let label = label_of(&pending, "applyNetworkPolicyAmendment");
+        assert!(
+            label.contains("first.example"),
+            "expected the first proposal to be the option | received: {label:?}"
+        );
+        assert_eq!(
+            pending
+                .request
+                .options
+                .iter()
+                .filter(|option| option.id == "applyNetworkPolicyAmendment")
+                .count(),
+            1,
+            "expected exactly one network amendment option"
+        );
+        let detail = detail_of(&pending);
+        assert!(
+            detail.contains("not offered") && detail.contains(r#"deny "second.example""#),
+            "expected the later proposal to be named in the detail | received: {detail:?}"
+        );
+        assert!(
+            !detail.contains("first.example"),
+            "expected the offered proposal not to be repeated as unoffered | received: {detail:?}"
+        );
+    }
+
+    /// "First" is the request's own first entry: a malformed lead proposal does not promote the one
+    /// behind it, whose place in the vendor's ordering says it is not the preferred rule.
+    #[test]
+    fn a_malformed_first_proposal_does_not_promote_the_one_behind_it() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [
+                    {"host": "first.example", "action": "maybe"},
+                    {"host": "second.example", "action": "allow"}
+                ]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+        assert!(
+            !offers(&pending, "applyNetworkPolicyAmendment"),
+            "expected no network option when the first listed proposal is malformed | received: {:?}",
+            pending.request.options
+        );
+        assert!(
+            detail_of(&pending).contains(r#"allow "second.example""#),
+            "expected the well-formed later proposal to be named | received: {:?}",
+            detail_of(&pending)
+        );
+    }
+
+    #[test]
+    fn a_proposal_too_long_to_be_an_option_is_named_in_the_detail() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [{"host": "h".repeat(200), "action": "allow"}]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+        assert!(
+            !offers(&pending, "applyNetworkPolicyAmendment"),
+            "expected the oversized proposal not to be an option"
+        );
+        let detail = detail_of(&pending);
+        assert!(
+            detail.contains(&"h".repeat(200)),
+            "expected the whole rule in the detail | received: {detail:?}"
+        );
+    }
+
+    #[test]
+    fn a_managed_network_approval_shows_the_host_it_asks_about() {
+        let pending = command_pending(json!({
+            "networkApprovalContext": {"host": "api.example.com", "protocol": "https"},
+            "reason": "y".repeat(8_192),
+        }));
+
+        let bounded = pending.request.normalized().expect("expected bounding");
+        let detail = bounded.detail.unwrap_or_default();
+        assert!(
+            detail.starts_with("Network access requested: https to api.example.com"),
+            "expected the requested host at the head of the bounded detail | received: {:?}",
+            &detail[..detail.len().min(96)]
+        );
+    }
+
+    /// A rule with a member the pin does not declare cannot be shown as received: the label would
+    /// name `{host, action}` while the vendor holds more.
+    #[test]
+    fn a_network_proposal_with_an_undeclared_member_is_not_offered() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [
+                    {"host": "example.com", "action": "allow", "port": 8080}
+                ]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+        assert!(
+            !offers(&pending, "applyNetworkPolicyAmendment"),
+            "expected a member outside {{host, action}} to refuse the option | received: {:?}",
+            pending.request.options
+        );
+    }
+
+    /// The abbreviated rendering is for the declared shape only; anything wider is shown whole.
+    #[test]
+    fn a_network_context_wider_than_the_declared_shape_is_shown_as_it_arrived() {
+        for context in [
+            json!({"host": "example.com", "protocol": "https", "port": 8443}),
+            json!({"host": "example.com", "protocol": "ftp"}),
+        ] {
+            let pending = command_pending(json!({"networkApprovalContext": context}));
+            let detail = detail_of(&pending);
+            assert!(
+                detail.contains(&context.to_string()),
+                "expected the whole context in the detail | received: {detail:?}"
+            );
+        }
+    }
+
+    /// The context is read from the raw frame and only for a command approval; an absent member and
+    /// an explicit `null` are the same thing.
+    #[test]
+    fn the_network_context_is_read_from_a_command_frame_only() {
+        let with = json!({"networkApprovalContext": {"host": "a.example", "protocol": "http"}});
+        assert_eq!(
+            super::network_context(method::COMMAND_EXECUTION_APPROVAL, &with),
+            Some(json!({"host": "a.example", "protocol": "http"})),
+            "expected the declared member of a command frame to be read"
+        );
+        assert_eq!(
+            super::network_context(method::FILE_CHANGE_APPROVAL, &with),
+            None,
+            "expected no context from a file-change frame"
+        );
+        for absent in [json!({}), json!({"networkApprovalContext": null})] {
+            assert_eq!(
+                super::network_context(method::COMMAND_EXECUTION_APPROVAL, &absent),
+                None,
+                "expected {absent} to carry no context"
+            );
+        }
+    }
+
+    /// Whatever the network context looks like, a person is shown it rather than nothing.
+    #[test]
+    fn a_network_context_of_an_undeclared_shape_is_shown_as_it_arrived() {
+        let pending = command_pending(json!({
+            "networkApprovalContext": {"target": "api.example.com"}
+        }));
+        let detail = detail_of(&pending);
+        assert!(
+            detail.contains(r#"{"target":"api.example.com"}"#),
+            "expected the raw context in the detail | received: {detail:?}"
+        );
+    }
+
+    /// Naming the rule changes nothing about how a refusal, a broker or the audit reads the
+    /// options: the refusal stays `decline`, an amendment is a policy-changing `Other`, and nothing
+    /// selects one for a broker.
+    #[test]
+    fn labelling_an_amendment_leaves_the_refusal_and_the_option_classes_unchanged() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedExecpolicyAmendment": ["git", "status"],
+                "proposedNetworkPolicyAmendments": [{"host": "example.com", "action": "allow"}]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+
+        assert_eq!(
+            pending.refusal(),
+            super::ServerAnswer::Approval(ApprovalDecisionValue::Decline)
+        );
+        for id in [
+            "acceptWithExecpolicyAmendment",
+            "applyNetworkPolicyAmendment",
+        ] {
+            let option = pending.option(id).expect("expected an amendment option");
+            assert_eq!(option.effect, PermissionEffect::Other, "{id}");
+            assert!(option.is_destructive(), "{id} expected destructive");
+            assert!(option.policy_changing, "{id} expected policy_changing");
+        }
+        assert_eq!(
+            pending.request.allow().expect("expected a grant").option_id,
+            "accept",
+            "expected a broker's allow never to select a standing rule"
+        );
+        assert_eq!(
+            pending
+                .request
+                .deny()
+                .expect("expected a refusal")
+                .option_id,
+            "decline"
+        );
+    }
+
+    /// How often a realistic prefix keeps its option. The numbers in `docs/harness-codex.md` are
+    /// produced by this table; a change to the label wording that flips a row should be a
+    /// conscious edit to both.
+    #[test]
+    fn realistic_prefixes_mostly_keep_their_option() {
+        let survives = |prefix: serde_json::Value| {
+            let pending = to_request(
+                &command_request(json!({"proposedExecpolicyAmendment": prefix})),
+                now(),
+            )
+            .expect("expected a question");
+            offers(&pending, "acceptWithExecpolicyAmendment")
+        };
+        let kept = [
+            json!(["git", "status"]),
+            json!(["cargo", "test", "--workspace"]),
+            json!(["rm", "-rf", "/tmp/mango"]),
+            json!(["/usr/bin/python3", "-m", "pytest", "tests/unit"]),
+            json!(["curl", "-s", "https://api.example.com/v1/status"]),
+            json!([
+                "sed",
+                "-n",
+                "1,200p",
+                "crates/mango-agent-codex/src/approvals.rs"
+            ]),
+        ];
+        let dropped = [
+            json!([
+                "/bin/bash",
+                "-lc",
+                "cd /workspace && cargo test --workspace --all-features -- --nocapture 2>&1 | tail -n 80"
+            ]),
+            json!([
+                "curl",
+                "-sS",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                "{\"query\":\"select 1\"}",
+                "https://api.example.com/v1/query"
+            ]),
+        ];
+        for prefix in kept {
+            assert!(
+                survives(prefix.clone()),
+                "expected a short prefix to keep its option | prefix: {prefix}"
+            );
+        }
+        for prefix in dropped {
+            assert!(
+                !survives(prefix.clone()),
+                "expected a long prefix to lose its option | prefix: {prefix}"
+            );
+        }
     }
 }

@@ -1,5 +1,6 @@
 //! A link driven from a script, with no process and no socket behind it.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Notify;
@@ -29,7 +30,7 @@ pub struct ScriptedLink {
 
 #[derive(Debug, Default)]
 struct ScriptState {
-    incoming: Mutex<Vec<String>>,
+    incoming: Mutex<VecDeque<String>>,
     sent: Mutex<Vec<String>>,
     ended: Mutex<bool>,
     send_failure: Mutex<Option<String>>,
@@ -48,7 +49,7 @@ impl ScriptedLink {
             .incoming
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(message.into());
+            .push_back(message.into());
         self.state.changed.notify_waiters();
     }
 
@@ -172,8 +173,8 @@ impl LinkReceiver for ScriptedReceiver {
                     .incoming
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                if !incoming.is_empty() {
-                    return Ok(Some(incoming.remove(0)));
+                if let Some(message) = incoming.pop_front() {
+                    return Ok(Some(message));
                 }
                 if *self
                     .state
@@ -209,6 +210,53 @@ mod tests {
             receiver.recv().await.expect("expected a message"),
             Some(String::from("second"))
         );
+        assert_eq!(receiver.recv().await.expect("expected the end"), None);
+    }
+
+    /// Draining used to shift the whole queue on every receive, so a large replay took quadratic
+    /// time (100,000 messages took several seconds in a debug build).
+    #[tokio::test]
+    async fn a_large_queue_is_replayed_in_order_and_then_ends() {
+        const MESSAGES: usize = 100_000;
+        let link = ScriptedLink::new();
+        for index in 0..MESSAGES {
+            link.push_line(index.to_string());
+        }
+        link.end();
+        let (_, mut receiver) = link.into_link().split();
+
+        for expected in 0..MESSAGES {
+            let received = receiver.recv().await.expect("expected a message");
+            assert_eq!(
+                received.as_deref(),
+                Some(expected.to_string().as_str()),
+                "expected message {expected} in order | received {received:?}"
+            );
+        }
+        assert_eq!(receiver.recv().await.expect("expected the end"), None);
+    }
+
+    /// A clone shares the script, so lines a clone queues after the receiver has started draining
+    /// still arrive after the earlier ones.
+    #[tokio::test]
+    async fn a_clone_queues_behind_what_is_already_waiting() {
+        let link = ScriptedLink::new();
+        link.push_line("first");
+        let (_, mut receiver) = link.clone().into_link().split();
+        assert_eq!(
+            receiver.recv().await.expect("expected a message"),
+            Some(String::from("first"))
+        );
+
+        link.clone().push_line("second");
+        link.push_line("third");
+        link.end();
+        for expected in ["second", "third"] {
+            assert_eq!(
+                receiver.recv().await.expect("expected a message"),
+                Some(String::from(expected))
+            );
+        }
         assert_eq!(receiver.recv().await.expect("expected the end"), None);
     }
 
