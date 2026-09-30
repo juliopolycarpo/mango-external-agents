@@ -101,7 +101,10 @@ Handlers leave the dispatch loop promptly:
   dispatch never waits for a host to read.
 - A `session/request_permission` handler must not wait for an answer, because the answer arrives
   through `Session::respond` on another task. It parks the agent's responder and returns; broker
-  deliberation is a separately bounded callback, capped by `Limits::max_pending_requests`.
+  deliberation is a separate callback that lives only as long as its question stays parked, so
+  `Limits::max_pending_requests` caps it too. Once the question is answered, withdrawn, expired,
+  cancelled or swept by a close, the broker's `decide` future is dropped rather than left to run
+  out the approval deadline; a broker must tolerate that, as it already must at the deadline.
 
 The typed handlers are installed before connecting. A final SDK handler consumes unsupported
 notifications and answers unsupported requests with `Method not found`; it does not retain them
