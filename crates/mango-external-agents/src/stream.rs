@@ -11,7 +11,7 @@ pub use buffer::EventReceiver;
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result, VendorError};
-use crate::event::{AgentEvent, EventKind, SessionId, TurnId};
+use crate::event::{AgentEvent, EventKind, SessionId, StructureClose, TurnId};
 use crate::host::Clock;
 use crate::operation::{AttemptId, Dispatch, OperationRef};
 use crate::session::CancelReason;
@@ -198,6 +198,20 @@ impl Clone for EventSink {
 
 impl Drop for EventSink {
     fn drop(&mut self) {
+        // A close was dropped for room and nobody committed a terminal: the host would otherwise
+        // see the stream simply stop, with an activity still open and no reason.
+        if self.buffer.owes_overflow_terminal() {
+            let error = VendorError::new(
+                crate::ErrorCode::from_static("stream-overflow"),
+                "expected a terminal after a close was refused for room, received the last sender dropped",
+            );
+            let status = TerminalStatus::Failed {
+                code: error.code.clone(),
+            };
+            if let Ok(event) = self.event(EventKind::Error { error }) {
+                let _ = self.buffer.finish(vec![event], status);
+            }
+        }
         self.buffer.remove_sender();
     }
 }
@@ -285,6 +299,64 @@ impl EventSink {
                 .await;
         }
         result
+    }
+
+    /// Closes something the turn opened, without letting a full queue replace the turn's terminal.
+    ///
+    /// A harness that ends a turn with an activity or a reasoning phase still open owes the host
+    /// a close for it before the terminal, or the host keeps rendering something nobody will ever
+    /// stop. [`Self::emit`] is the wrong call for that: a refused event commits a
+    /// `stream-overflow` failure, so a close that finds the queue full would replace the
+    /// cancellation, completion or vendor failure the turn was about to end with.
+    ///
+    /// This pushes the close as ordinary payload and, when the budget has no room, returns the
+    /// [`Error::LimitExceeded`] **without** committing anything. The caller stops emitting closes
+    /// and commits its own terminal with [`Self::cancel`], [`Self::fail`] or [`Self::complete`],
+    /// which never wait for room. Under a full queue the closes are therefore best-effort and the
+    /// terminal's cause wins; a host must read any terminal as ending every activity and reasoning
+    /// phase still open, close event or not. Once the stream has already committed a terminal, the
+    /// close is refused as [`Error::Closed`] like any late event.
+    ///
+    /// The refusal is sticky. After a close was refused, a later close returns an error and queues
+    /// nothing, and a later [`Self::emit`] of payload commits `stream-overflow` as it would for any
+    /// full queue, so the host never sees new payload behind a close that is missing. If the last
+    /// sender is dropped without a terminal after a refusal, the stream ends with that
+    /// `stream-overflow` failure rather than silently.
+    ///
+    /// The argument is a [`StructureClose`], so only the two things a host holds open can be
+    /// passed: an activity and a reasoning phase. An approval or a question is closed by its own
+    /// resolution event, which has a separate reserve and goes through [`Self::emit`]. The close
+    /// carries the activity's result, so it is payload like any other event and is bounded and
+    /// sanitised the same way.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::event::{ActivityResult, ActivityStatus, SessionId, TurnId};
+    /// use mango_external_agents::host::SystemClock;
+    /// use mango_external_agents::operation::AttemptId;
+    /// use mango_external_agents::session::CancelReason;
+    /// use mango_external_agents::stream::EventSink;
+    /// use mango_external_agents::StructureClose;
+    /// use std::sync::Arc;
+    ///
+    /// # tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+    /// let (sink, _events) = EventSink::new(
+    ///     SessionId::new("session"),
+    ///     TurnId::new("turn"),
+    ///     AttemptId::FIRST,
+    ///     Arc::new(SystemClock),
+    ///     16,
+    /// );
+    /// let close = StructureClose::activity("call-1", ActivityResult::new(ActivityStatus::Cancelled));
+    /// if sink.emit_close(close).await.is_ok() {
+    ///     // Room for the next close; on `Err` stop closing and go straight to the terminal.
+    /// }
+    /// sink.cancel(CancelReason::Requested).await.unwrap();
+    /// # });
+    /// ```
+    pub async fn emit_close(&self, close: StructureClose) -> Result<()> {
+        self.buffer.push_close(self.event(EventKind::from(close))?)
     }
 
     /// Commits cancellation and its compatibility terminal together, even when the queue is full.
@@ -394,6 +466,7 @@ impl EventSink {
 mod tests {
     use super::{EventReceiver, EventSink, TurnStream};
     use crate::error::Error;
+    use crate::event::StructureClose;
     use crate::event::{EventKind, SessionId, TurnId};
     use crate::host::{Clock, SystemClock};
     use crate::operation::{AttemptId, Dispatch};
@@ -888,5 +961,243 @@ mod tests {
         let completed = turn.recv().await.expect("expected a completion");
         assert_eq!(completed.kind, EventKind::Completed);
         assert!(completed.is_terminal());
+    }
+
+    fn activity_close(call_id: &str) -> StructureClose {
+        StructureClose::activity(
+            call_id,
+            crate::event::ActivityResult::new(crate::event::ActivityStatus::Cancelled),
+        )
+    }
+
+    fn queued_text() -> EventKind {
+        EventKind::TextDelta {
+            text: "queued".into(),
+        }
+    }
+
+    async fn drained(events: &mut EventReceiver) -> Vec<EventKind> {
+        let mut kinds = Vec::new();
+        while let Some(event) = events.recv().await {
+            kinds.push(event.kind);
+        }
+        kinds
+    }
+
+    #[tokio::test]
+    async fn a_close_is_queued_in_order_ahead_of_the_terminal() {
+        let (sink, mut events) = sink(8);
+        sink.emit_close(activity_close("call-1"))
+            .await
+            .expect("expected room for the activity close");
+        sink.emit_close(StructureClose::reasoning())
+            .await
+            .expect("expected room for the reasoning close");
+        sink.cancel(CancelReason::Requested)
+            .await
+            .expect("expected the cancellation to commit");
+
+        let kinds = drained(&mut events).await;
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::from(activity_close("call-1")),
+                EventKind::ReasoningEnded,
+                EventKind::Cancelled {
+                    reason: CancelReason::Requested
+                },
+                EventKind::Completed,
+            ],
+            "expected the two closes then the cancellation | received {kinds:?}"
+        );
+    }
+
+    /// The reason this method exists: `emit` would have committed `stream-overflow` here, and the
+    /// cancellation that follows would then have been a no-op.
+    #[tokio::test]
+    async fn a_close_refused_for_room_leaves_the_real_terminal_to_commit() {
+        let (sink, mut events) = sink(1);
+        sink.emit(queued_text()).await.expect("first event");
+
+        let refused = sink.emit_close(activity_close("call-1")).await;
+        assert!(
+            matches!(refused, Err(Error::LimitExceeded { .. })),
+            "expected the close to be refused for room | received {refused:?}"
+        );
+        assert!(
+            !sink.is_terminal(),
+            "expected a refused close to commit nothing"
+        );
+
+        sink.cancel(CancelReason::Requested)
+            .await
+            .expect("expected the cancellation to commit");
+        let kinds = drained(&mut events).await;
+        assert_eq!(
+            kinds,
+            vec![
+                queued_text(),
+                EventKind::Cancelled {
+                    reason: CancelReason::Requested
+                },
+                EventKind::Completed,
+            ],
+            "expected Cancelled then Completed after the refused close | received {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_close_leaves_a_completion_intact() {
+        let (sink, mut events) = sink(1);
+        sink.emit(queued_text()).await.expect("first event");
+        let refused = sink.emit_close(StructureClose::reasoning()).await;
+        assert!(
+            matches!(refused, Err(Error::LimitExceeded { .. })),
+            "expected the close to be refused for room | received {refused:?}"
+        );
+        sink.complete().await.expect("expected the completion");
+
+        let kinds = drained(&mut events).await;
+        assert_eq!(
+            kinds.last(),
+            Some(&EventKind::Completed),
+            "expected the completion to survive the refused close | received {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_close_leaves_a_vendor_failure_intact() {
+        let (sink, mut events) = sink(1);
+        sink.emit(queued_text()).await.expect("first event");
+        let refused = sink.emit_close(StructureClose::reasoning()).await;
+        assert!(
+            matches!(refused, Err(Error::LimitExceeded { .. })),
+            "expected the close to be refused for room | received {refused:?}"
+        );
+        sink.fail(
+            crate::error::VendorError::new(
+                crate::ErrorCode::from_static("vendor-failed"),
+                "expected a turn, received a refusal",
+            )
+            .with_vendor_code("usageLimitExceeded", false),
+        )
+        .await
+        .expect("expected the failure to commit");
+
+        let kinds = drained(&mut events).await;
+        let Some(EventKind::Error { error }) = kinds.last() else {
+            panic!("expected the vendor failure as the terminal | received {kinds:?}");
+        };
+        assert_eq!(
+            (error.code.as_str(), error.vendor_code.as_deref()),
+            ("vendor-failed", Some("usageLimitExceeded")),
+            "expected the vendor's own failure, not stream-overflow | received {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_sticky_for_later_closes_and_payload() {
+        let (sink, mut events) = sink(2);
+        sink.emit(queued_text()).await.expect("first event");
+        sink.emit(queued_text()).await.expect("second event");
+        let refused = sink.emit_close(activity_close("a")).await;
+        assert!(
+            matches!(refused, Err(Error::LimitExceeded { .. })),
+            "expected the first close to be refused for room | received {refused:?}"
+        );
+
+        // Room appears, as when the host reads; the refusal still holds.
+        let _ = events.recv().await;
+        let _ = events.recv().await;
+        let later = sink.emit_close(activity_close("b")).await;
+        assert!(
+            matches!(
+                later,
+                Err(Error::LimitExceeded {
+                    subject: "queued turn events after a refused close",
+                    ..
+                })
+            ),
+            "expected a later close to be refused after a refusal | received {later:?}"
+        );
+        let payload = sink.emit(queued_text()).await;
+        assert!(
+            matches!(payload, Err(Error::LimitExceeded { .. })),
+            "expected later payload to be refused after a refusal | received {payload:?}"
+        );
+        let kinds = drained(&mut events).await;
+        assert!(
+            matches!(kinds.as_slice(), [EventKind::Error { error }] if error.code.as_str() == "stream-overflow"),
+            "expected only the stream-overflow failure, with nothing queued behind the hole | received {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_still_lets_every_terminal_commit_its_own_cause() {
+        let (sink, mut events) = sink(1);
+        sink.emit(queued_text()).await.expect("first event");
+        let _ = sink.emit_close(activity_close("a")).await;
+        sink.cancel(CancelReason::Shutdown)
+            .await
+            .expect("expected the cancellation to commit after a refusal");
+        let kinds = drained(&mut events).await;
+        assert_eq!(
+            kinds.iter().rev().take(2).rev().collect::<Vec<_>>(),
+            [
+                &EventKind::Cancelled {
+                    reason: CancelReason::Shutdown
+                },
+                &EventKind::Completed
+            ],
+            "expected the cancellation after a sticky refusal | received {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_sender_after_a_refusal_ends_the_stream_with_overflow() {
+        let (sink, mut events) = sink(1);
+        sink.emit(queued_text()).await.expect("first event");
+        let _ = sink.emit_close(activity_close("a")).await;
+        drop(sink);
+
+        let kinds = drained(&mut events).await;
+        assert!(
+            matches!(kinds.last(), Some(EventKind::Error { error }) if error.code.as_str() == "stream-overflow"),
+            "expected a stream-overflow terminal instead of a silent end | received {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_sender_without_a_refusal_adds_no_terminal() {
+        let (sink, mut events) = sink(4);
+        sink.emit(queued_text()).await.expect("first event");
+        sink.emit_close(activity_close("a"))
+            .await
+            .expect("expected room for the close");
+        drop(sink);
+
+        let kinds = drained(&mut events).await;
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, EventKind::Error { .. })),
+            "expected no terminal invented for a stream nothing was refused on | received {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_after_the_terminal_is_refused_as_closed() {
+        let (sink, _events) = sink(8);
+        sink.complete().await.expect("expected the completion");
+        let late = sink.emit_close(StructureClose::reasoning()).await;
+        assert!(
+            matches!(
+                late,
+                Err(Error::Closed {
+                    subject: "turn stream"
+                })
+            ),
+            "expected a close after the terminal to be refused as closed | received {late:?}"
+        );
     }
 }

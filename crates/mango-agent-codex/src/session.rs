@@ -17,7 +17,7 @@ use mango_external_agents::configuration::{
     ConfigurationState, refuse_unsupported_native, refuse_unsupported_reset,
 };
 use mango_external_agents::error::{Error, ErrorCode, Result, VendorError};
-use mango_external_agents::event::{EventKind, SessionId, TurnId};
+use mango_external_agents::event::{ActivityStatus, EventKind, SessionId, TurnId};
 use mango_external_agents::interaction::{
     Interaction, InteractionId, InteractionKind, Question, QuestionForm, QuestionId,
     QuestionOption, QuestionOptionId, QuestionOutcome, QuestionRequest, QuestionResponse,
@@ -751,6 +751,12 @@ struct ActiveTurn {
     earlier_native_turn_ids: VecDeque<String>,
     /// What this turn already announced, for the announcements that depend on it.
     reducer: crate::turn_reducer::TurnReducer,
+    /// What the host was given and has not seen closed, kept for the terminal to settle.
+    ///
+    /// Fed by publication under this lock, and drained by [`Shared::claim_terminal`] under it,
+    /// which is what makes every close come out exactly once and never for an event the host was
+    /// not given.
+    open: crate::turn_reducer::OpenStructures,
     /// Native reviews have their own lifecycle and do not accept user steering.
     is_review: bool,
     /// The `turn/start` answer will never be read, so this turn can never be named or interrupted.
@@ -777,6 +783,45 @@ struct TerminalClaim {
     owner: Arc<()>,
     sink: EventSink,
     cancel_reason: Option<CancelReason>,
+    /// What the host still holds open, taken from the turn at the moment `finishing` was set.
+    open: crate::turn_reducer::OpenStructures,
+}
+
+impl TerminalClaim {
+    /// Closes whatever the host still holds open, ending each activity as `status`.
+    ///
+    /// Synchronous with the terminal: the sink never waits for a reader, so this delays nothing.
+    ///
+    /// The closes go through [`EventSink::emit_close`], which refuses one the payload budget has
+    /// no room for without committing anything. The first refusal stops the closes and the caller
+    /// commits the terminal it was going to commit anyway, so a full queue costs the host the
+    /// closes it had no room for and never the cancellation, completion or failure the turn ends
+    /// with. A sink that already committed a terminal, an overflow for instance, refuses every
+    /// close as closed, so nothing follows that terminal.
+    async fn close_open(&mut self, status: ActivityStatus) {
+        for close in self.open.close_all(status) {
+            if self.sink.emit_close(close).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl ActiveTurn {
+    /// Puts one event on this turn's stream and remembers what it leaves the host holding open.
+    ///
+    /// Callers hold the turn lock across this, which is what orders every publication against
+    /// [`Shared::claim_terminal`]: an event is either published before the claim and closed by it,
+    /// or refused after it. The sink never waits for a reader, so the lock is not held over a
+    /// suspension.
+    async fn publish(&mut self, kind: EventKind) -> Result<()> {
+        let mark = crate::turn_reducer::Mark::of(&kind);
+        let result = self.sink.emit(kind).await;
+        if let (Ok(()), Some(mark)) = (&result, mark) {
+            self.open.apply(mark);
+        }
+        result
+    }
 }
 
 /// How a stopped turn's settle stage ended.
@@ -1064,16 +1109,11 @@ impl Shared {
     /// The bounded sink never waits for a reader. Its receiver's drop is observed separately by
     /// the abandonment watcher, which stops the native turn instead of leaving it unowned.
     async fn emit(&self, kind: EventKind) -> Result<()> {
-        let sink = {
-            let turn = self.turn.lock().await;
-            turn.as_ref()
-                .filter(|active| !active.finishing)
-                .map(|active| active.sink.clone())
-        };
-        let Some(sink) = sink else {
+        let mut turn = self.turn.lock().await;
+        let Some(active) = turn.as_mut().filter(|active| !active.finishing) else {
             return Ok(());
         };
-        sink.emit(kind).await
+        active.publish(kind).await
     }
 
     /// Wins the race to announce one attempt's acceptance.
@@ -1296,16 +1336,14 @@ impl Shared {
 
     /// Puts one event on the stream that still belongs to this start attempt.
     async fn emit_for(&self, route: &ActiveTurnRoute, kind: EventKind) -> Result<()> {
-        let sink = {
-            let turn = self.turn.lock().await;
-            turn.as_ref()
-                .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
-                .map(|active| active.sink.clone())
-        };
-        let Some(sink) = sink else {
+        let mut turn = self.turn.lock().await;
+        let Some(active) = turn
+            .as_mut()
+            .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
+        else {
             return Ok(());
         };
-        sink.emit(kind).await
+        active.publish(kind).await
     }
 
     /// Claims a turn's terminal while retaining admission until it is committed.
@@ -1319,6 +1357,7 @@ impl Shared {
             owner: Arc::clone(&active.owner),
             sink: active.sink.clone(),
             cancel_reason: active.cancel_reason,
+            open: std::mem::take(&mut active.open),
         })
     }
 
@@ -1370,9 +1409,13 @@ impl Shared {
     }
 
     /// Commits the terminal before releasing the matching admission slot.
+    ///
+    /// Whatever the host still holds open is closed between the ending's own events and the
+    /// terminal: cancelled for a stop and for a turn that ended with items unreported, failed for a
+    /// failure.
     async fn commit_terminal(
         &self,
-        claim: TerminalClaim,
+        mut claim: TerminalClaim,
         events: Vec<EventKind>,
         cancelled: Option<CancelReason>,
         failure: Option<VendorError>,
@@ -1380,6 +1423,13 @@ impl Shared {
         for event in events {
             let _ = claim.sink.emit(event).await;
         }
+        claim
+            .close_open(if failure.is_some() {
+                ActivityStatus::Failed
+            } else {
+                ActivityStatus::Cancelled
+            })
+            .await;
         let _ = match (failure, cancelled) {
             (Some(failure), _) => claim.sink.fail(failure).await,
             // The reason this side recorded wins over the server's bare "interrupted": a shutdown
@@ -1425,9 +1475,10 @@ impl Shared {
 
     /// Ends a turn because the host is shutting the session down.
     async fn cancel_active(&self, reason: CancelReason) {
-        let Some(claim) = self.claim_terminal(None).await else {
+        let Some(mut claim) = self.claim_terminal(None).await else {
             return;
         };
+        claim.close_open(ActivityStatus::Cancelled).await;
         let _ = claim.sink.cancel_on_close(reason).await;
         self.release_terminal(&claim.owner).await;
     }
@@ -1439,7 +1490,7 @@ impl Shared {
         }
         self.release_pending_for(None, DecisionSource::Cancelled)
             .await;
-        let Some(claim) = self.claim_terminal(None).await else {
+        let Some(mut claim) = self.claim_terminal(None).await else {
             self.terminated.cancel();
             return;
         };
@@ -1471,6 +1522,7 @@ impl Shared {
         self.terminated.cancel();
         let failure =
             VendorError::new(CALL_FAILED, message).with_vendor_code("connection-terminated", true);
+        claim.close_open(ActivityStatus::Failed).await;
         let _ = claim.sink.fail(failure).await;
         self.release_terminal(&claim.owner).await;
     }
@@ -1490,7 +1542,8 @@ impl Shared {
         }
         self.release_pending_for(None, DecisionSource::Cancelled)
             .await;
-        if let Some(claim) = self.claim_terminal(None).await {
+        if let Some(mut claim) = self.claim_terminal(None).await {
+            claim.close_open(ActivityStatus::Failed).await;
             let _ = claim.sink.fail(failure).await;
             self.release_terminal(&claim.owner).await;
         }
@@ -1814,6 +1867,7 @@ impl PeerHandler for CodexHandler {
         params: Value,
         id: RequestId,
     ) -> ServerRequestOutcome {
+        let network_context = approvals::network_context(&method, &params);
         let request = ServerRequest::parse(&method, params);
 
         if let Some(refusal) = request.refusal() {
@@ -1933,6 +1987,7 @@ impl PeerHandler for CodexHandler {
 
         let Some(pending) = approvals::to_request(
             &request,
+            network_context.as_ref(),
             route.operation(self.shared.session_id.clone()),
             expires_at,
         ) else {
@@ -3409,6 +3464,7 @@ impl CodexSession {
                 announced: false,
                 earlier_native_turn_ids: VecDeque::new(),
                 reducer: crate::turn_reducer::TurnReducer::for_limits(self.shared.host.limits()),
+                open: crate::turn_reducer::OpenStructures::default(),
                 is_review: rpc_method == method::REVIEW_START,
                 start_unanswerable: false,
                 interrupt_dispatched: false,
@@ -4449,6 +4505,7 @@ mod tests {
             announced: true,
             earlier_native_turn_ids: std::collections::VecDeque::new(),
             reducer: crate::turn_reducer::TurnReducer::new(),
+            open: crate::turn_reducer::OpenStructures::default(),
             is_review: false,
             start_unanswerable: false,
             interrupt_dispatched: false,
@@ -6127,5 +6184,392 @@ mod tests {
             interrupts, 1,
             "expected turn/interrupt dispatches: 1 | received: {interrupts}"
         );
+    }
+
+    /// Every way a turn ends owes the host a close for what it left open.
+    ///
+    /// The terminal itself is not the defect: it is correct and last. What a host rendering the
+    /// transcript is left with when it sees only the terminal is an activity that spins forever and
+    /// a reasoning block that never ends, which is what the conformance suite's structure check
+    /// exists to catch.
+    mod terminal_closes {
+        use super::*;
+        use mango_external_agents::event::{Activity, ActivityKind, ActivityStatus};
+        use mango_external_agents::session::CancelReason;
+        use mango_external_agents::stream::TurnStream;
+
+        /// One way a turn can end, so every path is held to the same expectation.
+        #[derive(Clone, Copy, Debug)]
+        enum Ending {
+            NativeCompleted,
+            NativeInterrupted,
+            NativeFailed,
+            NativeMalformedAddressed,
+            LocalShutdown,
+            LocalConnectionLost,
+            LocalPoisoned,
+        }
+
+        const ENDINGS: [Ending; 7] = [
+            Ending::NativeCompleted,
+            Ending::NativeInterrupted,
+            Ending::NativeFailed,
+            Ending::NativeMalformedAddressed,
+            Ending::LocalShutdown,
+            Ending::LocalConnectionLost,
+            Ending::LocalPoisoned,
+        ];
+
+        impl Ending {
+            /// The status the host is told the open activity ended with.
+            fn expected_status(self) -> ActivityStatus {
+                match self {
+                    Self::NativeCompleted | Self::NativeInterrupted | Self::LocalShutdown => {
+                        ActivityStatus::Cancelled
+                    }
+                    Self::NativeFailed
+                    | Self::NativeMalformedAddressed
+                    | Self::LocalConnectionLost
+                    | Self::LocalPoisoned => ActivityStatus::Failed,
+                }
+            }
+
+            /// How many events the terminal itself is: a cancel is a marker and a completion.
+            fn terminal_events(self) -> usize {
+                match self {
+                    Self::NativeInterrupted | Self::LocalShutdown => 2,
+                    _ => 1,
+                }
+            }
+        }
+
+        fn is_terminal(kind: &EventKind) -> bool {
+            matches!(kind, EventKind::Completed | EventKind::Error { .. })
+        }
+
+        fn item_notification(item: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({"threadId": "thread-1", "turnId": "vendor-turn-1", "item": item})
+        }
+
+        fn reasoning_item() -> serde_json::Value {
+            serde_json::json!({"type": "reasoning", "id": "r1", "summary": [], "content": []})
+        }
+
+        fn command_item(status: &str) -> serde_json::Value {
+            serde_json::json!({"type": "commandExecution", "id": "c1",
+                "command": "sleep 1000", "status": status})
+        }
+
+        /// A running turn that has opened one reasoning phase and one command, the way the
+        /// app-server announces them.
+        async fn running_with_open_items() -> (Arc<Shared>, CodexHandler, TurnStream) {
+            let shared = shared();
+            shared.adopt_thread(String::from("thread-1"));
+            let handler = CodexHandler {
+                shared: Arc::clone(&shared),
+            };
+            let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
+            for item in [reasoning_item(), command_item("inProgress")] {
+                handler
+                    .on_notification(String::from("item/started"), item_notification(item))
+                    .await;
+            }
+            (shared, handler, stream)
+        }
+
+        async fn all_events(stream: &mut TurnStream) -> Vec<EventKind> {
+            let mut events = Vec::new();
+            while let Some(event) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+                    .await
+                    .expect("expected the stream to end within 5s of its terminal")
+            {
+                events.push(event.kind);
+            }
+            events
+        }
+
+        async fn end_with(shared: &Arc<Shared>, handler: &CodexHandler, ending: Ending) {
+            let native = |status: serde_json::Value| {
+                handler.on_notification(
+                    String::from("turn/completed"),
+                    serde_json::json!({"threadId": "thread-1",
+                        "turn": {"id": "vendor-turn-1", "status": status}}),
+                )
+            };
+            match ending {
+                Ending::NativeCompleted => native(serde_json::json!("completed")).await,
+                Ending::NativeInterrupted => native(serde_json::json!("interrupted")).await,
+                Ending::NativeFailed => native(serde_json::json!("failed")).await,
+                Ending::NativeMalformedAddressed => native(serde_json::json!(7)).await,
+                Ending::LocalShutdown => shared.cancel_active(CancelReason::Shutdown).await,
+                Ending::LocalConnectionLost => {
+                    shared.connection_terminated(PeerTermination::Exited).await;
+                }
+                Ending::LocalPoisoned => {
+                    shared
+                        .poison(VendorError::new(
+                            super::super::CALL_FAILED,
+                            "expected a routable frame, received one that named no thread",
+                        ))
+                        .await;
+                }
+            }
+        }
+
+        /// Events as compact names a failure message can print.
+        fn shape(events: &[EventKind]) -> Vec<String> {
+            events
+                .iter()
+                .map(|event| match event {
+                    EventKind::ActivityCompleted { call_id, result } => {
+                        format!("ActivityCompleted({call_id}, {:?})", result.status)
+                    }
+                    EventKind::ActivityStarted { call_id, .. } => {
+                        format!("ActivityStarted({call_id})")
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        }
+
+        fn close_count(shape: &[String]) -> usize {
+            shape
+                .iter()
+                .filter(|name| name.starts_with("ActivityCompleted") || *name == "ReasoningEnded")
+                .count()
+        }
+
+        #[tokio::test]
+        async fn every_ending_closes_an_open_activity_and_reasoning_once_before_its_terminal() {
+            for ending in ENDINGS {
+                let (shared, handler, mut stream) = running_with_open_items().await;
+                end_with(&shared, &handler, ending).await;
+                let events = all_events(&mut stream).await;
+                let shape = shape(&events);
+
+                let expected_prefix = [
+                    String::from("ReasoningStarted"),
+                    String::from("ActivityStarted(c1)"),
+                    format!("ActivityCompleted(c1, {:?})", ending.expected_status()),
+                    String::from("ReasoningEnded"),
+                ];
+                assert_eq!(
+                    shape.get(..4),
+                    Some(&expected_prefix[..]),
+                    "expected the open structures closed once before the terminal on {ending:?} | received {shape:?}"
+                );
+                let terminals = events.iter().filter(|kind| is_terminal(kind)).count();
+                assert!(
+                    terminals == 1 && events.last().is_some_and(is_terminal),
+                    "expected exactly one terminal, last, on {ending:?} | received {shape:?}"
+                );
+                assert_eq!(
+                    events.len(),
+                    4 + ending.terminal_events(),
+                    "expected nothing beyond the closes and the terminal on {ending:?} | received {shape:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_late_second_terminal_emits_nothing_more() {
+            let (shared, handler, mut stream) = running_with_open_items().await;
+            end_with(&shared, &handler, Ending::NativeInterrupted).await;
+            end_with(&shared, &handler, Ending::LocalShutdown).await;
+            end_with(&shared, &handler, Ending::NativeCompleted).await;
+
+            let shape = shape(&all_events(&mut stream).await);
+            assert_eq!(
+                close_count(&shape),
+                2,
+                "expected 1 activity close and 1 reasoning close in total | received {shape:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_turn_the_vendor_closed_itself_gets_no_synthetic_close() {
+            let (shared, handler, mut stream) = running_with_open_items().await;
+            let mut finished = command_item("completed");
+            finished["exitCode"] = serde_json::json!(0);
+            for item in [finished, reasoning_item()] {
+                handler
+                    .on_notification(String::from("item/completed"), item_notification(item))
+                    .await;
+            }
+            end_with(&shared, &handler, Ending::NativeCompleted).await;
+
+            let shape = shape(&all_events(&mut stream).await);
+            assert_eq!(
+                shape,
+                [
+                    "ReasoningStarted",
+                    "ActivityStarted(c1)",
+                    "ActivityCompleted(c1, Completed)",
+                    "ReasoningEnded",
+                    "Completed"
+                ],
+                "expected only the vendor's own closes | received {shape:?}"
+            );
+        }
+
+        /// An event refused while a terminal is being committed never reached the host, so it
+        /// opens nothing there to close. The terminal is held between its claim and its commit by
+        /// the completion log's lock, which is the window a racing publisher can land in.
+        #[tokio::test]
+        async fn an_event_published_while_the_terminal_commits_is_neither_shown_nor_closed() {
+            let (shared, _handler, mut stream) = running_with_open_items().await;
+            let route = shared
+                .active_turn_route()
+                .await
+                .expect("expected an active turn route");
+            let held_completion_log = shared.recent_completed_turns.lock().await;
+            let finishing = Arc::clone(&shared);
+            let finish_route = route.clone();
+            let completion = tokio::spawn(async move {
+                finishing
+                    .finish_for(
+                        &finish_route,
+                        Some("vendor-turn-1"),
+                        Outcome::Finish {
+                            events: Vec::new(),
+                            cancelled: None,
+                            failure: None,
+                        },
+                    )
+                    .await;
+            });
+            for _ in 0..100 {
+                if shared
+                    .turn
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|active| active.finishing)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let late = shared
+                .emit_for(
+                    &route,
+                    EventKind::ActivityStarted {
+                        call_id: String::from("late"),
+                        activity: Activity::new("late", ActivityKind::Command, "late"),
+                    },
+                )
+                .await;
+            assert!(
+                late.is_ok(),
+                "expected a publish during the commit to be dropped quietly | received {late:?}"
+            );
+            drop(held_completion_log);
+            completion.await.expect("expected the completion to finish");
+
+            let shape = shape(&all_events(&mut stream).await);
+            assert!(
+                !shape.iter().any(|name| name.contains("late")),
+                "expected no event for a call the host was never told about | received {shape:?}"
+            );
+            assert_eq!(
+                close_count(&shape),
+                2,
+                "expected only the two real structures closed | received {shape:?}"
+            );
+        }
+
+        /// A transcript whose budget is spent ends at the overflow error and adds nothing after it.
+        #[tokio::test]
+        async fn an_overflowed_turn_still_ends_with_its_terminal_and_no_closes() {
+            let (shared, handler, mut stream) = running_with_open_items().await;
+            // The stream `running` builds holds 8 payload events, and 2 are already queued.
+            for round in 0..16 {
+                handler
+                    .on_notification(
+                        String::from("item/agentMessage/delta"),
+                        serde_json::json!({"threadId": "thread-1", "turnId": "vendor-turn-1",
+                            "itemId": "m", "delta": format!("chunk {round}")}),
+                    )
+                    .await;
+            }
+            assert!(
+                shared.is_shutting_down(),
+                "expected an overflowed transcript to stop the session"
+            );
+
+            let events = all_events(&mut stream).await;
+            let shape = shape(&events);
+            let Some(EventKind::Error { error }) = events.last() else {
+                panic!("expected the stream to end at its overflow error | received {shape:?}");
+            };
+            assert_eq!(
+                error.code.as_str(),
+                "stream-overflow",
+                "expected the overflow terminal | received {shape:?}"
+            );
+            assert_eq!(
+                close_count(&shape),
+                0,
+                "expected no closes on the overflow terminal | received {shape:?}"
+            );
+        }
+
+        /// Closes are payload, so a queue that is full when the turn ends has no room for them.
+        /// The turn's own terminal must survive that: the closes are dropped, and the host gets
+        /// the cancellation, completion or failure the turn ended with, not an overflow failure.
+        #[tokio::test]
+        async fn a_full_queue_at_the_end_keeps_the_terminals_own_cause() {
+            for ending in [
+                Ending::LocalShutdown,
+                Ending::NativeCompleted,
+                Ending::NativeFailed,
+            ] {
+                let (shared, handler, mut stream) = running_with_open_items().await;
+                for round in 0..6 {
+                    handler
+                        .on_notification(
+                            String::from("item/agentMessage/delta"),
+                            serde_json::json!({"threadId": "thread-1", "turnId": "vendor-turn-1",
+                                "itemId": "m", "delta": format!("chunk {round}")}),
+                        )
+                        .await;
+                }
+                end_with(&shared, &handler, ending).await;
+
+                let events = all_events(&mut stream).await;
+                let shape = shape(&events);
+                let tail_starts_at = shape.len().saturating_sub(ending.terminal_events());
+                let tail: Vec<&str> = shape[tail_starts_at..].iter().map(String::as_str).collect();
+                match ending {
+                    Ending::LocalShutdown => assert_eq!(
+                        tail,
+                        ["Cancelled { reason: Shutdown }", "Completed"],
+                        "expected the shutdown cancellation to survive on {ending:?} | received {shape:?}"
+                    ),
+                    Ending::NativeCompleted => assert_eq!(
+                        tail,
+                        ["Completed"],
+                        "expected the completion to survive on {ending:?} | received {shape:?}"
+                    ),
+                    _ => {
+                        let Some(EventKind::Error { error }) = events.last() else {
+                            panic!(
+                                "expected the failure as the terminal on {ending:?} | received {shape:?}"
+                            );
+                        };
+                        assert_eq!(
+                            error.code.as_str(),
+                            "codex-turn-failed",
+                            "expected the vendor's failure, not an overflow, on {ending:?} | received {shape:?}"
+                        );
+                    }
+                }
+                assert!(
+                    shared.turn.lock().await.is_none(),
+                    "expected admission released after the terminal on {ending:?}"
+                );
+            }
+        }
     }
 }

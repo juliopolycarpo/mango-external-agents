@@ -563,6 +563,20 @@ expires, it leaves the session `Closing` without an error. A host that watches s
 call `close` on a session that stays `Closing`: the close either settles the turn and publishes
 `Closed`, or returns the `Error::Timeout` described above.
 
+The host's `CancelToken` is a shutdown signal the same watcher observes. `open_session` refuses an
+already-cancelled token before it launches anything (`Error::Cancelled`, `NotSubmitted`) and ends
+a handshake or a mode and setting request still in flight when the token fires, reaping the child
+and reporting `Shutdown` to the launcher. Once the session is open, a
+cancelled token takes the watcher's path: admission closes, the running turn is cancelled with
+`CancelReason::Shutdown` and its parked questions are withdrawn with ACP's `Cancelled` outcome, as
+[the prompt-turn cancellation rules](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation)
+require, then the same bounded cleanup runs
+and the turn writes its terminal before `Closed` is published. The watcher holds the connection only
+weakly, so the token does not keep a dropped session's child alive. After the token fires,
+`configure` is refused as `Cancelled { reason: Shutdown }` (`NotSubmitted`), the same shape a turn
+start gets, including a patch that touches no wire request. That guard is keyed on the token, so it
+does not cover a session that ended because the agent vanished.
+
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
 that absence or the pinned profiles return a stale-session reply (`session/load` code `-32002`),
@@ -615,8 +629,11 @@ official crate's own encoding of the same request. A host that wants larger prom
   environment. HTTP preserves name, endpoint, and headers only when `initialize` advertised
   `mcpCapabilities.http`; a request without that capability is refused before either lifecycle call.
   Before any ACP process starts, every entry must have a unique valid name; a stdio command must be
-  an absolute, control-free path; arguments and server-only environment entries must have valid
-  shapes; and an HTTP endpoint must parse as an absolute `http` or `https` URI with a host and valid
+  an absolute, control-free path; each argument must be non-empty, at most 128 code points and free
+  of control and bidi characters, and may start with `-` because it is the MCP server's own argv,
+  sent as JSON and never parsed as an agent option (the core argv rule that refuses a leading `-`
+  is unchanged, and Claude and Codex apply no MCP argument check at all); server-only environment
+  entries must have valid shapes; and an HTTP endpoint must parse as an absolute `http` or `https` URI with a host and valid
   port. Header names and values are checked before launch. The mapping follows
   [ACP v1 session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
   ACP-over-HTTP remains unrelated and unsupported.
