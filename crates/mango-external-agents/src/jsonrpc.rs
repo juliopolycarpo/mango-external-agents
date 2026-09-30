@@ -147,7 +147,7 @@ pub enum PeerTermination {
     Exited,
     /// The link failed: reading the peer failed, a reply to one of its questions could not be
     /// written (which leaves the peer waiting on an answer that will never arrive), or a write
-    /// timed out with its frame possibly half on the wire.
+    /// was abandoned mid-send (timed out or dropped) with its frame possibly half on the wire.
     LinkFailed(String),
     /// Peer work filled the bounded handoff queue before the handler could consume it.
     NotificationByteBackpressure {
@@ -410,7 +410,8 @@ struct ClientState {
     closed: AtomicBool,
     shutdown: CancelToken,
     /// Why a write to the peer left the link unusable, once one did: a reply that could not be
-    /// written, or any frame whose write timed out mid-send.
+    /// written, or any frame whose send was abandoned mid-frame (a timeout, a shorter caller
+    /// deadline, or a dropped request).
     ///
     /// A reply is written on a task the pump waits for when it tears the connection down, so that
     /// task must never run the teardown itself. It records the cause here and wakes the pump, which
@@ -421,6 +422,42 @@ struct ClientState {
     in_flight: StdMutex<JoinSet<()>>,
     notifications: StdMutex<Option<JoinHandle<()>>>,
     peer_bytes: Arc<tokio::sync::Semaphore>,
+}
+
+/// Reports a send that never finished.
+///
+/// A send dropped mid-frame, by its own write deadline, by a caller's shorter deadline or because
+/// the caller dropped the future, may have put half a frame on the wire, and every later frame
+/// would follow it. Whatever dropped it, this is the one place that notices, so the pump is
+/// told. A send that returns, even with an error, is finished and signals nothing.
+struct MidSend<'a> {
+    state: &'a ClientState,
+    finished: bool,
+}
+
+impl<'a> MidSend<'a> {
+    fn arm(state: &'a ClientState) -> Self {
+        Self {
+            state,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for MidSend<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.state.signal_write_failure(&Error::Link {
+            peer: self.state.options.peer_name.clone(),
+            message: String::from("a JSON-RPC frame write was abandoned mid-send"),
+        });
+    }
 }
 
 /// Removes correlation state when a request future is dropped at any await.
@@ -906,31 +943,23 @@ impl ClientState {
 
     /// Writes one frame, setting `started` once this write holds the sender and begins.
     async fn write_marking(&self, frame: String, started: Option<&AtomicBool>) -> Result<()> {
-        // Set once this write holds the sender: a timeout before that only waited behind another
-        // writer, and that writer's own deadline reports the stall.
-        let began = AtomicBool::new(false);
-        let written = tokio::time::timeout(self.options.request_timeout, async {
+        tokio::time::timeout(self.options.request_timeout, async {
             let mut sender = self.sender.lock().await;
-            began.store(true, Ordering::Release);
             if let Some(started) = started {
                 started.store(true, Ordering::Release);
             }
-            sender.send(frame).await
+            // Armed only once this write holds the sender: a caller that merely waited behind
+            // another writer has put nothing on the wire, and that writer's own guard reports it.
+            let mut midsend = MidSend::arm(self);
+            let sent = sender.send(frame).await;
+            midsend.finish();
+            sent
         })
-        .await;
-        written.unwrap_or_else(|_| {
-            let timeout = Error::Timeout {
-                operation: String::from("JSON-RPC frame write"),
-                after: self.options.request_timeout,
-            };
-            // A send abandoned mid-frame may have left half of it on the wire, and every later
-            // frame would follow it. That is a dead link whichever side asked for the write, so
-            // the pump is told. A write that fails outright reports only to its own caller.
-            if began.load(Ordering::Acquire) {
-                self.signal_write_failure(&timeout);
-            }
-            Err(timeout)
-        })
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("JSON-RPC frame write"),
+            after: self.options.request_timeout,
+        })?
     }
 
     async fn fail_pending(&self, failure: JsonRpcError) {
@@ -963,7 +992,7 @@ impl ClientState {
         self.write_failed.notify_one();
     }
 
-    /// The cause of the first reply that could not be written, if one was.
+    /// The cause of the first write that left the link unusable, if one did.
     fn take_write_failure(&self) -> Option<String> {
         self.write_failure
             .lock()
@@ -982,8 +1011,9 @@ async fn pump(
         let message = tokio::select! {
             biased;
             () = state.shutdown.cancelled() => break,
-            // A reply that could not be written is a dead link the read side has not noticed yet.
-            // It ends the connection here, on the one task that owns termination.
+            // A write that left the link unusable (a reply that could not be written, or a send
+            // abandoned mid-frame) is a dead link the read side has not noticed yet. It ends the
+            // connection here, on the one task that owns termination.
             () = state.write_failed.notified() => {
                 let cause = state
                     .take_write_failure()
@@ -2695,6 +2725,96 @@ mod tests {
             "expected the caller to receive the write timeout | received {error:?}"
         );
         assert_write_timeout_ended_the_connection(&handler, &client).await;
+        client.close().await.expect("expected a clean close");
+    }
+
+    /// A caller's own deadline shorter than the write deadline drops the request mid-send. The
+    /// frame may be half on the wire, so the connection ends whichever deadline wins.
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_deadline_shorter_than_the_write_deadline_still_ends_the_connection() {
+        let handler = RecordingHandler::arc(None);
+        let client = stalled_client(Arc::clone(&handler), "thread/start");
+
+        let error = client
+            .request_with_timeout::<_, Value>("thread/start", json!({}), Duration::from_secs(1))
+            .await
+            .expect_err("expected the caller's deadline to pass");
+        assert!(
+            matches!(error, Error::Timeout { .. }),
+            "expected the caller to receive its own timeout | received {error:?}"
+        );
+        let terminations = terminations_after(&handler, 1)
+            .await
+            .unwrap_or_else(|seen| {
+                panic!(
+                    "expected terminations: 1 after the caller's deadline dropped a send | received: {seen}"
+                )
+            });
+        assert!(
+            matches!(&terminations[..], [PeerTermination::LinkFailed(cause)] if cause.contains("JSON-RPC frame write")),
+            "expected one LinkFailed naming the abandoned frame write | received {terminations:?}"
+        );
+        assert!(
+            client.is_closed(),
+            "expected closed: true after an abandoned send | received: false"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+
+    /// A caller that drops its request future mid-send leaves the same half frame behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_dropped_mid_send_ends_the_connection() {
+        let handler = RecordingHandler::arc(None);
+        let client = stalled_client(Arc::clone(&handler), "thread/start");
+
+        tokio::select! {
+            _ = client.request::<_, Value>("thread/start", json!({})) => {
+                panic!("expected the stalled send to still be pending | received an outcome");
+            }
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        let terminations = terminations_after(&handler, 1)
+            .await
+            .unwrap_or_else(|seen| {
+                panic!("expected terminations: 1 after a request was dropped mid-send | received: {seen}")
+            });
+        assert!(
+            matches!(&terminations[..], [PeerTermination::LinkFailed(_)]),
+            "expected one LinkFailed | received {terminations:?}"
+        );
+        assert!(
+            client.is_closed(),
+            "expected closed: true after an abandoned send | received: false"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+
+    /// A send that completes, or fails outright, was not abandoned: nothing is signalled.
+    #[tokio::test]
+    async fn a_send_that_returns_leaves_the_connection_open() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = client(link.clone(), Arc::clone(&handler));
+
+        client
+            .notify("ping", json!({}))
+            .await
+            .expect("expected the send to land");
+        link.fail_sends("EPIPE");
+        client
+            .notify("ping", json!({}))
+            .await
+            .expect_err("expected the refused send to fail");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let terminations = handler.terminations.lock().await.len();
+        assert_eq!(
+            terminations, 0,
+            "expected terminations: 0 for sends that returned | received: {terminations}"
+        );
+        assert!(
+            !client.is_closed(),
+            "expected closed: false for sends that returned | received: true"
+        );
         client.close().await.expect("expected a clean close");
     }
 }
