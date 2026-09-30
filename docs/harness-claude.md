@@ -454,9 +454,11 @@ The reducer holds three properties, each with a fixture case behind it:
   the stop. A cancel, a process that dies, or a `result` that lands mid-thought never does, so the
   run's end emits the missing `ReasoningEnded` (and cancels open activities) ahead of the terminal;
   a stop that arrives afterwards produces nothing. Those closes go through `EventSink::emit_close`:
-  when the turn's queue is full they are dropped, together with the usage a `result` reports (the
-  refusal is sticky, so later payload would overflow behind it), and the turn still ends with its
-  own cancellation, completion or vendor error rather than a `stream-overflow` failure.
+  when the turn's queue has no room for one it is dropped, and a close never replaces the turn's
+  terminal: any terminal ends what is still open. The refusal is sticky, so the usage a `result`
+  reports is dropped with it. A usage that is sent but does not fit (the closes fit, the usage
+  does not) is ordinary payload overflow, and the turn ends as `stream-overflow`, exactly as it
+  would for a delta.
 
 **Structured content** is carried, not flattened, where a fixture evidences the shape. Every
 activity the reducer starts sets `item_id` from the `tool_use` block's own `id` — Claude's dialect

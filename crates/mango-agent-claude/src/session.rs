@@ -1622,8 +1622,11 @@ async fn pump(
 /// completion or the vendor's own error the turn is about to end with. When the queue has no room
 /// the close is dropped and `room` remembers it: the refusal is sticky, so every later close and
 /// every later payload (the usage) is dropped too rather than left to overflow behind the hole.
-/// The terminal itself never needs room. A run that ends on a full queue therefore loses its
-/// closes and its usage, never its terminal.
+/// A close never replaces the terminal, and losing one loses nothing, because any terminal ends
+/// whatever is still open. The usage is different: it is real data, and it is ordinary payload.
+/// When it is sent (no close was refused) but does not fit, the queue overflows and the turn ends
+/// as `stream-overflow`, exactly as it would for a delta, since dropping it silently would hide an
+/// incomplete transcript. The terminal itself needs no room.
 async fn emit_run_end(sink: &EventSink, event: EventKind, room: &mut bool) -> Result<()> {
     let close = match event {
         EventKind::ReasoningEnded => StructureClose::reasoning(),

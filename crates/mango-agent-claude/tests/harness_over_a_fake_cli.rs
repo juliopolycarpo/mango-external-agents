@@ -4991,9 +4991,14 @@ mod ending_mid_thinking {
     /// turn's start, the reasoning's start and one delta, under a capacity of three, read by
     /// nobody until the run is over.
     async fn events_of_a_full_queue(run: Run, cancel: bool) -> Vec<EventKind> {
+        events_under_capacity(3, run, cancel).await
+    }
+
+    /// The same turn under a queue of `capacity` payload events, read by nobody until it ends.
+    async fn events_under_capacity(capacity: usize, run: Run, cancel: bool) -> Vec<EventKind> {
         let launcher = Arc::new(FakeClaudeCli::new().with_turn(run));
         let limits = Limits {
-            turn_channel_capacity: 3,
+            turn_channel_capacity: capacity,
             ..Limits::default()
         };
         let session = ClaudeHarness::new()
@@ -5091,7 +5096,8 @@ mod ending_mid_thinking {
     }
 
     /// A refused close is sticky, so the usage that rides between the closes and the completion
-    /// would overflow behind it and take the completion's place; it goes the way of the closes.
+    /// would overflow behind it and take the completion's place. Nothing was lost by the close (a
+    /// terminal ends what is open), so the usage is dropped with it and the turn completes.
     #[tokio::test(start_paused = true)]
     async fn a_result_carrying_usage_on_a_full_queue_still_completes() {
         let mut lines = thinking_lines();
@@ -5107,5 +5113,45 @@ mod ending_mid_thinking {
         };
         let events = events_of_a_full_queue(run, false).await;
         assert_terminal_survives_a_full_queue("result", &events, "Completed");
+    }
+
+    /// The other side of the line: the close fits, the usage does not. Usage is data the host
+    /// asked for, so leaving it out silently would hide an incomplete transcript; it is ordinary
+    /// payload, and the turn ends as `stream-overflow` exactly as it would for a delta.
+    #[tokio::test(start_paused = true)]
+    async fn a_usage_that_does_not_fit_overflows_like_any_payload() {
+        let mut lines = thinking_lines();
+        lines.push(String::from(
+            r#"{"type":"result","is_error":false,"usage":{"input_tokens":4,"output_tokens":9}}"#,
+        ));
+        let run = Run::Transcript {
+            lines,
+            exit: ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        };
+        // Three payload events fill the queue's first three places; the close takes the fourth,
+        // and the usage has none left.
+        let events = events_under_capacity(4, run, false).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EventKind::ReasoningEnded))
+                .count(),
+            1,
+            "expected the close to be delivered when it fits | received: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventKind::Usage { .. })),
+            "expected the usage that did not fit to be absent | received: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { error })
+                if error.code.as_str() == "stream-overflow"),
+            "expected the turn to end as stream-overflow when the usage does not fit | received: {events:?}"
+        );
     }
 }
