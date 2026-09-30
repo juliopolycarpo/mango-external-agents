@@ -951,6 +951,67 @@ impl ActivityResult {
     }
 }
 
+/// Something a turn opened and now closes, for [`EventSink::emit_close`](crate::stream::EventSink::emit_close).
+///
+/// The two structures a host renders as open until told otherwise: an activity and a reasoning
+/// phase. Typed rather than an [`EventKind`] so a harness cannot hand the close call an event that
+/// closes nothing, and shaped like the fields of the events it becomes:
+/// [`EventKind::ActivityCompleted`] and [`EventKind::ReasoningEnded`].
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::{ActivityResult, ActivityStatus, EventKind, StructureClose};
+///
+/// let close = StructureClose::activity("call-1", ActivityResult::new(ActivityStatus::Cancelled));
+/// assert!(matches!(EventKind::from(close), EventKind::ActivityCompleted { .. }));
+/// assert_eq!(EventKind::from(StructureClose::reasoning()), EventKind::ReasoningEnded);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StructureClose {
+    /// An activity the turn started and never saw complete.
+    Activity {
+        /// Which activity, as [`EventKind::ActivityStarted`] named it.
+        call_id: String,
+        /// How it ended.
+        result: ActivityResult,
+    },
+    /// A reasoning phase the turn opened and never saw end.
+    Reasoning,
+}
+
+impl StructureClose {
+    /// The close of the activity `call_id`, ended as `result`.
+    ///
+    /// For example, `StructureClose::activity("call-1", ActivityResult::new(ActivityStatus::Failed))`.
+    pub fn activity(call_id: impl Into<String>, result: ActivityResult) -> Self {
+        Self::Activity {
+            call_id: call_id.into(),
+            result,
+        }
+    }
+
+    /// The close of one open reasoning phase.
+    ///
+    /// For example, `StructureClose::reasoning()`.
+    pub fn reasoning() -> Self {
+        Self::Reasoning
+    }
+}
+
+impl From<StructureClose> for EventKind {
+    /// The event a host reads for this close.
+    fn from(close: StructureClose) -> Self {
+        match close {
+            StructureClose::Activity { call_id, result } => {
+                Self::ActivityCompleted { call_id, result }
+            }
+            StructureClose::Reasoning => Self::ReasoningEnded,
+        }
+    }
+}
+
 /// Tokens, as reported.
 ///
 /// Every field optional: a harness reports only what its vendor reports, and absence is unknown
