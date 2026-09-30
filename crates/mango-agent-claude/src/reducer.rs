@@ -188,7 +188,7 @@ impl fmt::Debug for TurnReducer {
             .field("nested_texts", &self.nested_text.len())
             .field(
                 "nested_text_bytes",
-                &redacted::Redacted::sum(self.nested_text.values().map(String::len)),
+                &redacted::Redacted::sum(self.nested_text.values().map(|(text, _)| text.len())),
             )
             .field("denied_activities", &self.denied_activities.len())
             .field(
