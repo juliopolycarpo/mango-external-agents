@@ -19,7 +19,9 @@
 //!
 //! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/prompt-turn>
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
@@ -81,7 +83,13 @@ pub struct Reducer {
     /// Tool calls the host saw start and has not yet seen end, by the agent's own call id.
     open_calls: HashMap<String, OpenCall>,
     /// Tool calls that already ended this turn, so a late frame cannot open a second bracket.
-    finished_calls: HashSet<String>,
+    ///
+    /// Kept as [`CallDigest`]s, not ids: an id is agent-controlled text of up to one frame, and this
+    /// set lives for the whole turn, so its size has to depend on the number of calls, not on how
+    /// long the agent made their ids.
+    finished_calls: HashSet<CallDigest>,
+    /// The per-reducer key [`CallDigest`]s are made with.
+    digest_key: RandomState,
     /// Source of [`OpenCall::opened`], so the calls a turn ends owing are closed in the order the
     /// agent opened them rather than in a hash map's.
     next_call: u64,
@@ -109,9 +117,32 @@ impl Default for Reducer {
             plan_started: false,
             open_calls: HashMap::new(),
             finished_calls: HashSet::new(),
+            digest_key: RandomState::new(),
             next_call: 0,
             update_interval: TOOL_UPDATE_INTERVAL,
         }
+    }
+}
+
+/// A fixed-size stand-in for a finished tool call's id, for remembering that it ended.
+///
+/// 128 bits: two 64-bit outputs of std's keyed default hasher (SipHash-1-3 today) over the id, the
+/// second over a domain-separated copy of the input, so the two halves collide independently. The
+/// key is drawn per reducer and the agent never sees it, so it cannot aim two ids at one digest. What
+/// is left is an accident: about `n^2 / 2^129` for `n` distinct ids in one turn, roughly `1.5e-29`
+/// at a hundred thousand calls. A collision would make the reducer take a new call for one that had
+/// already ended and drop its frames; 64 bits would put that near `3e-10` at the same count, which
+/// is why the extra 8 bytes per call are spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CallDigest(u128);
+
+impl CallDigest {
+    fn of(key: &RandomState, call_id: &str) -> Self {
+        let high = key.hash_one(call_id);
+        let mut hasher = key.build_hasher();
+        hasher.write_u8(1);
+        call_id.hash(&mut hasher);
+        Self((u128::from(high) << 64) | u128::from(hasher.finish()))
     }
 }
 
@@ -274,7 +305,7 @@ impl Reducer {
         let mut open: Vec<(String, OpenCall)> = self.open_calls.drain().collect();
         open.sort_by_key(|(_, call)| call.opened);
         for (call_id, call) in open {
-            self.finished_calls.insert(call_id.clone());
+            self.mark_finished(&call_id);
             if let Some(update) = call.held.filter(|update| !update.is_empty()) {
                 events.push(EventKind::ActivityUpdated {
                     call_id: call_id.clone(),
@@ -365,7 +396,7 @@ impl Reducer {
     /// which leaves the host's copy alone. A call that already ended stays ended.
     fn tool_call(&mut self, call: ToolCall, now: Instant) -> Vec<EventKind> {
         let call_id = call.tool_call_id.to_string();
-        if self.finished_calls.contains(&call_id) {
+        if self.is_finished(&call_id) {
             return Vec::new();
         }
         if self.open_calls.contains_key(&call_id) {
@@ -401,7 +432,7 @@ impl Reducer {
     /// [`TOOL_UPDATE_INTERVAL`]), and a terminal one first delivers whatever is still held.
     fn tool_call_update(&mut self, update: ToolCallUpdate, now: Instant) -> Vec<EventKind> {
         let call_id = update.tool_call_id.to_string();
-        if self.finished_calls.contains(&call_id) {
+        if self.is_finished(&call_id) {
             return Vec::new();
         }
         if !self.open_calls.contains_key(&call_id) {
@@ -456,7 +487,7 @@ impl Reducer {
                     }
                 }
                 self.open_calls.remove(&call_id);
-                self.finished_calls.insert(call_id.clone());
+                self.mark_finished(&call_id);
                 events.push(EventKind::ActivityCompleted { call_id, result });
                 events
             }
@@ -464,10 +495,22 @@ impl Reducer {
         }
     }
 
+    /// Whether the host was already told this call ended.
+    fn is_finished(&self, call_id: &str) -> bool {
+        self.finished_calls
+            .contains(&CallDigest::of(&self.digest_key, call_id))
+    }
+
+    /// Remembers that the host was told this call ended, keeping only its digest.
+    fn mark_finished(&mut self, call_id: &str) {
+        self.finished_calls
+            .insert(CallDigest::of(&self.digest_key, call_id));
+    }
+
     /// Records a call the host has just been told about, as running or as already over.
     fn track(&mut self, call_id: String, finished: bool) {
         if finished {
-            self.finished_calls.insert(call_id);
+            self.mark_finished(&call_id);
             return;
         }
         let opened = self.next_call;
@@ -937,8 +980,8 @@ pub fn stop_failure(stop_reason: StopReason) -> Option<VendorError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PLAN_CALL_ID, Reducer, SessionFact, TURN_INCOMPLETE_CODE, activity_kind, stop_failure,
-        was_cancelled,
+        CallDigest, PLAN_CALL_ID, Reducer, SessionFact, TURN_INCOMPLETE_CODE, activity_kind,
+        stop_failure, was_cancelled,
     };
     use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolKind};
     use mango_external_agents::event::{
@@ -1660,6 +1703,151 @@ mod tests {
             2,
             "expected only the original bracket, received {events:?}"
         );
+    }
+
+    /// An id is agent-controlled text of up to one frame, and the finished set lives for the whole
+    /// turn, so what it keeps per call has to be a fixed size however long the id was.
+    #[test]
+    fn a_finished_call_costs_a_fixed_size_however_long_its_id() {
+        const CALLS: usize = 4;
+        const ID_LEN: usize = 1024 * 1024;
+        let mut reducer = Reducer::new();
+        for call in 0..CALLS {
+            let call_id = long_call_id(call, ID_LEN);
+            let (events, _) = reducer.update(update(finished_call(&call_id)));
+            assert_eq!(events.len(), 2, "expected a start and a completion");
+        }
+        let retained = retained_finished_bytes(&reducer);
+        let expected_max = CALLS * 16;
+        assert!(
+            retained <= expected_max,
+            "expected finished-call bytes <= {expected_max} for {CALLS} ids of {ID_LEN} bytes | received {retained}"
+        );
+    }
+
+    /// A late `tool_call` for a call with a long id is dropped just as one with a short id is.
+    #[test]
+    fn a_late_tool_call_for_a_finished_long_id_is_dropped() {
+        let call_id = long_call_id(0, 256 * 1024);
+        let mut reducer = Reducer::new();
+        let (first, _) = reducer.update(update(finished_call(&call_id)));
+        assert_eq!(first.len(), 2, "expected a start and a completion");
+        let (repeat, _) = reducer.update(update(finished_call(&call_id)));
+        assert!(
+            repeat.is_empty(),
+            "expected a repeated tool_call for a finished id to be dropped | received {repeat:?}"
+        );
+        assert!(
+            reducer.finish().is_empty(),
+            "expected nothing left to close"
+        );
+    }
+
+    /// A late `tool_call_update` for a call with a long id is dropped just as one with a short id is.
+    #[test]
+    fn a_late_update_for_a_finished_long_id_is_dropped() {
+        let call_id = long_call_id(0, 256 * 1024);
+        let mut reducer = Reducer::new();
+        let (first, _) = reducer.update(update(finished_call(&call_id)));
+        assert_eq!(first.len(), 2, "expected a start and a completion");
+        let late = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call_id,
+            "status": "completed"
+        });
+        let (repeat, _) = reducer.update(update(late));
+        assert!(
+            repeat.is_empty(),
+            "expected a late update for a finished id to be dropped | received {repeat:?}"
+        );
+    }
+
+    /// Remembering less than the id must not merge calls: every distinct id still gets its own
+    /// bracket, including ids that are prefixes of one another or differ only in the last byte.
+    #[test]
+    fn distinct_call_ids_each_get_their_own_bracket() {
+        let mut ids: Vec<String> = (0..10_000).map(|n| format!("call_{n}")).collect();
+        ids.extend(["", "call", "call_", "call_1x", "\0", "\0\0"].map(String::from));
+        let long = long_call_id(0, 64 * 1024);
+        ids.push(format!("{long}a"));
+        ids.push(format!("{long}b"));
+        ids.push(long);
+        let mut reducer = Reducer::new();
+        for call_id in &ids {
+            let (events, _) = reducer.update(update(finished_call(call_id)));
+            assert_eq!(
+                events.len(),
+                2,
+                "expected a start and a completion for a new id of {} bytes | received {events:?}",
+                call_id.len()
+            );
+        }
+        for call_id in &ids {
+            let (events, _) = reducer.update(update(finished_call(call_id)));
+            assert!(
+                events.is_empty(),
+                "expected a repeat of a finished id of {} bytes to be dropped | received {events:?}",
+                call_id.len()
+            );
+        }
+    }
+
+    /// A digest is stable under one key, tells apart ids that a lazy hash would merge, and is a
+    /// different value under a different key, so nothing outside the reducer can predict it.
+    #[test]
+    fn a_call_digest_depends_on_the_whole_id_and_on_the_key() {
+        use std::collections::hash_map::RandomState;
+
+        let key = RandomState::new();
+        let long = long_call_id(0, 64 * 1024);
+        let ids = ["", "a", "ab", "b", "\0", "\0\0", &long, &format!("{long}!")];
+        let digests: Vec<CallDigest> = ids.iter().map(|id| CallDigest::of(&key, id)).collect();
+        for (first, a) in digests.iter().enumerate() {
+            assert_eq!(
+                *a,
+                CallDigest::of(&key, ids[first]),
+                "expected a stable digest"
+            );
+            for (offset, b) in digests[first + 1..].iter().enumerate() {
+                let other = first + 1 + offset;
+                assert_ne!(
+                    a,
+                    b,
+                    "expected distinct digests for ids of {} and {} bytes",
+                    ids[first].len(),
+                    ids[other].len()
+                );
+            }
+        }
+        let other_key = RandomState::new();
+        assert_ne!(
+            CallDigest::of(&key, "call_1"),
+            CallDigest::of(&other_key, "call_1"),
+            "expected a digest under another key to differ"
+        );
+    }
+
+    /// A `tool_call` frame that arrives already completed.
+    fn finished_call(call_id: &str) -> serde_json::Value {
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": call_id,
+            "title": "Tool",
+            "kind": "other",
+            "status": "completed"
+        })
+    }
+
+    /// An id `len` bytes long that differs from every other `n`'s.
+    fn long_call_id(n: usize, len: usize) -> String {
+        let mut call_id = format!("call_{n}_");
+        call_id.push_str(&"x".repeat(len - call_id.len()));
+        call_id
+    }
+
+    /// What the reducer keeps in memory per finished call, summed.
+    fn retained_finished_bytes(reducer: &Reducer) -> usize {
+        reducer.finished_calls.len() * std::mem::size_of::<CallDigest>()
     }
 
     /// ACP ends a turn with the `session/prompt` response, not with a frame per call, so a call the
