@@ -3,9 +3,9 @@
 //! `docs/compliance.md` puts raw protocol records and reducers under a metadata-only `Debug`
 //! policy: a record prints what kind of thing it is, how many members it has and how large they
 //! are, never what they say. A derive prints everything, so a record writes its own `fmt` and hands
-//! each content member to one of these helpers. The Codex crate keeps a copy of the same pattern
-//! (`mango_agent_codex`'s private `redacted` module), so the two harnesses read alike in a log; it
-//! is a copy, not a shared item, so neither crate's public surface grows.
+//! each content member to one of these helpers. The Codex crate follows the same pattern for its
+//! own records, so the two harnesses read alike in a log; each keeps its own private helper, so
+//! neither crate's public surface grows.
 //!
 //! ```ignore
 //! formatter
