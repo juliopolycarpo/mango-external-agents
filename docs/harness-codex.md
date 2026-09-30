@@ -424,9 +424,11 @@ answer, not how often the vendor asks. What is known, read on 2026-09-30 against
 - `TurnStartParams.collaborationMode` is absent from the pinned inventory and, at `0.159.2`,
   appears only in the schema generated with `--experimental`, so the library has no supported way
   to select Plan mode, the other mode the vendor associates with questions.
-- The one setting found that changes this is that feature flag, and it is the user's to set. With
+- The one candidate setting found is that feature flag, and it is the user's to set. With
   `-c features.default_mode_request_user_input=true`, `codex features list` reports it `true`, and
-  `codex features enable` writes it to the user's `config.toml`. The library cannot set it. It
+  `codex features enable` writes it to the user's `config.toml`. That shows the flag can be turned
+  on, not that turning it on makes the vendor raise `requestUserInput`; no vendor source or capture
+  confirms that yet, which is what the capture task below is for. The library cannot set it. It
   starts `codex app-server` with no `-c` argument, edits no persistent Codex configuration, and its
   per-thread `config` override on `thread/start` and `thread/resume` carries only the host's MCP
   servers and the reasoning effort.
