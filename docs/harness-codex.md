@@ -590,8 +590,9 @@ item's `item/completed`. Deltas are emitted as they come; the completion adds on
 deltas did not deliver, so a message that was never streamed — as a resumed conversation can
 deliver one — still reaches the host exactly once. When the completed text does not start with what
 was streamed, the vendor rewrote the message and the whole text is emitted. The streamed text is
-kept per message only up to what one inbound frame can carry (`Limits::line`'s larger of
-`max_line_bytes` and `max_buffered_bytes`): a completion cannot begin with more than that, so past
+kept per message only up to what one stdio line can carry once decoded (three times
+`Limits::line.max_line_bytes`, since repairing invalid UTF-8 can triple a line, and never more than
+`max_buffered_bytes`): a completion cannot begin with more than that, so past
 it the text is dropped and the completion is emitted whole, never refused. The documented item
 shape is `agentMessage - {id, text, phase?} containing the accumulated agent reply`
 ([app-server][app-server]).
