@@ -274,6 +274,22 @@ expect_readme_refusal 0.3.1 "$readme_fixture/patch.md:5: expected mango-external
   "$readme_fixture/patch.md"
 expect_readme_refusal 0.4.0-rc.1 "$readme_fixture/caret.md:5: expected mango-external-agents = \"0.4.0-rc.1\" for workspace version 0.4.0-rc.1, received \"0.4\"" \
   "$readme_fixture/caret.md"
+# Inline tables and trailing comments are valid TOML, so a stale one must not hide behind the simple
+# line that sits beside it; a form the check cannot read is refused rather than skipped.
+printf 'mango-external-agents = "0.3"\nmango-agent-acp = { version = "0.1", features = ["testing"] }\n' > "$readme_fixture/table-stale.md"
+printf 'mango-external-agents = "0.3" # core\nmango-agent-acp = { features = ["testing"], version = "0.3" } # harness\n' > "$readme_fixture/table-current.md"
+printf 'mango-external-agents = "0.3"\nmango-agent-acp = "0.1" # stale\n' > "$readme_fixture/comment-stale.md"
+printf 'mango-external-agents = "0.3"\nmango-agent-acp = { path = "../acp" }\n' > "$readme_fixture/table-path.md"
+scripts/check-readme-requirements.sh 0.3.1 "$readme_fixture/table-current.md" >/dev/null || {
+  echo 'expected an inline table and a trailing comment at "0.3" to pass, received a refusal' >&2
+  exit 1
+}
+expect_readme_refusal 0.3.1 "$readme_fixture/table-stale.md:2: expected mango-agent-acp = \"0.3\" for workspace version 0.3.1, received \"0.1\"" \
+  "$readme_fixture/table-stale.md"
+expect_readme_refusal 0.3.1 "$readme_fixture/comment-stale.md:2: expected mango-agent-acp = \"0.3\" for workspace version 0.3.1, received \"0.1\"" \
+  "$readme_fixture/comment-stale.md"
+expect_readme_refusal 0.3.1 "$readme_fixture/table-path.md:2: expected mango-agent-acp = \"0.3\" or an inline table with version = \"0.3\", received unsupported form: { path = \"../acp\" }" \
+  "$readme_fixture/table-path.md"
 expect_readme_refusal 0.3.1 "$readme_fixture/none.md: expected a 'mango-… = \"0.3\"' install requirement, received none" \
   "$readme_fixture/none.md"
 expect_readme_refusal 0.3.1 "$readme_fixture/missing.md: expected a README file, received none" \
@@ -302,6 +318,23 @@ case "$output" in
   *'crates/demo/README.md:6: expected mango-agent-acp = "0.3" for workspace version 0.3.1, received "0.1"'*) ;;
   *)
     echo 'expected check-versions.sh to name the stale README requirement, received:' >&2
+    echo "$output" >&2
+    exit 1
+    ;;
+esac
+# A deleted README must fail, not vanish: a glob over READMEs would drop it from the arguments.
+write_readme tree/crates/demo/README 0.3 0.3
+mkdir -p "$readme_fixture/tree/crates/other"
+printf '[package]\nname = "mango-other"\nversion.workspace = true\n' > "$readme_fixture/tree/crates/other/Cargo.toml"
+sed -i 's|^\[workspace.dependencies\]|&\nmango-other = { path = "crates/other", version = "0.3.1" }|' "$readme_fixture/tree/Cargo.toml"
+if output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
+  echo 'expected check-versions.sh to refuse a crate without a README, received success' >&2
+  exit 1
+fi
+case "$output" in
+  *'crates/other/README.md: expected a README file, received none'*) ;;
+  *)
+    echo 'expected check-versions.sh to name the missing README, received:' >&2
     echo "$output" >&2
     exit 1
     ;;

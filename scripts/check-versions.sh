@@ -34,7 +34,13 @@ while IFS= read -r line; do
   fi
 done < <(sed -n '/^\[workspace\.dependencies\]/,/^\[/p' Cargo.toml | grep -E '^mango-' || true)
 
-scripts/check-readme-requirements.sh "$workspace_version" crates/*/README.md || status=1
+# One README path per crate manifest, not a glob over READMEs: a deleted README would vanish from a
+# glob and pass, where a named path is refused as missing.
+readmes=()
+for manifest in crates/*/Cargo.toml; do
+  readmes+=("${manifest%Cargo.toml}README.md")
+done
+scripts/check-readme-requirements.sh "$workspace_version" "${readmes[@]}" || status=1
 
 [ $status -eq 0 ] && echo "versions in lockstep: $workspace_version"
 exit $status

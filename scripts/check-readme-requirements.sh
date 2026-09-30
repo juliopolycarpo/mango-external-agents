@@ -5,8 +5,10 @@
 # resolves to 0.3. The rule: a release names `major.minor` (`"0.3"` for 0.3.1); a pre-release names
 # its full version (`"0.4.0-rc.1"`), because no caret requirement resolves to a pre-release.
 #
-# `scripts/check-versions.sh` runs this over `crates/*/README.md`. It takes the files as arguments
+# `scripts/check-versions.sh` runs this over each crate's README.md. It takes the files as arguments
 # so the regression test can point it at fixtures.
+# Understood forms: `mango-x = "0.3"` and `mango-x = { version = "0.3", … }`, with or without a
+# trailing comment. Any other form on a `mango-*` line is refused, not skipped.
 # Usage: scripts/check-readme-requirements.sh <workspace-version> <README.md>...
 set -euo pipefail
 
@@ -38,12 +40,24 @@ for readme in "$@"; do
   lineno=0
   while IFS= read -r line; do
     lineno=$((lineno + 1))
-    if [[ "$line" =~ ^(mango-[a-z-]+)[[:space:]]*=[[:space:]]*\"([^\"]*)\"[[:space:]]*$ ]]; then
-      found=$((found + 1))
-      if [ "${BASH_REMATCH[2]}" != "$required" ]; then
-        echo "$readme:$lineno: expected ${BASH_REMATCH[1]} = \"$required\" for workspace version $version, received \"${BASH_REMATCH[2]}\"" >&2
-        status=1
-      fi
+    [[ "$line" =~ ^(mango-[a-z-]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    name=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    found=$((found + 1))
+    # A plain string, or an inline table carrying `version`; a trailing comment is ignored. Any
+    # other form cannot be proved, so it is refused rather than skipped.
+    if [[ "$value" =~ ^\"([^\"]*)\" ]]; then
+      requirement=${BASH_REMATCH[1]}
+    elif [[ "$value" =~ ^\{.*[\{,[:space:]]version[[:space:]]*=[[:space:]]*\"([^\"]*)\" ]]; then
+      requirement=${BASH_REMATCH[1]}
+    else
+      echo "$readme:$lineno: expected $name = \"$required\" or an inline table with version = \"$required\", received unsupported form: $value" >&2
+      status=1
+      continue
+    fi
+    if [ "$requirement" != "$required" ]; then
+      echo "$readme:$lineno: expected $name = \"$required\" for workspace version $version, received \"$requirement\"" >&2
+      status=1
     fi
   done < "$readme"
   if [ "$found" -eq 0 ]; then
