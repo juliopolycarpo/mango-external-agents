@@ -55,6 +55,20 @@ own deployment.
   omits it.
   `examples/mea` is an unpublished smoke tool, not part of the guarantee either: its own refusals
   name the paths and OS messages its operator needs.
+- **Raw records and reducers.** The `Debug` boundary reaches the records decoded from a vendor's
+  wire and the reducers that hold them, not only the interaction and identity carriers above. A
+  record that can carry what the agent wrote or read — message and reasoning text, command text
+  and output, a diff or a path, an error message, a tool's name — has a hand-written `Debug` that
+  reports its kind, which members are present, counts and byte sizes, and never the text, because
+  a command's output can be the contents of a `.env`. A reducer that buffers such text reports
+  how much it holds, not what. A record that holds only numbers, statuses and enums keeps its
+  derive, as does one that reaches text only through a field that is itself metadata-only, so
+  a token-usage or rate-limit snapshot prints in full. The Codex records covered are
+  `ThreadItem`, `FileUpdateChange`, `TurnError`, the item, delta, progress and patch
+  notifications, and `TurnReducer`. Requests a host builds from its own input, such as a turn's
+  prompt, are not carriers: a host formatting text it wrote is not a boundary this library stands
+  on, the same as a `SessionId` or a `TurnId`. The exception this leaves is a host that
+  hand-parses a frame with `serde_json` and prints the `Value`; a library type cannot cover that.
 - **No telemetry, no listener, no downloaded binaries.**
 
 ## Claude Code (`mango-agent-claude`)
