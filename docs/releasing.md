@@ -58,8 +58,7 @@ uncommitted changes, and the script surfaces that refusal rather than reporting 
 **The three harness crates' tarballs are not standalone test packages.** The library build from any
 tarball is unaffected, but the tests of `mango-agent-claude`, `mango-agent-codex` and
 `mango-agent-acp` are not self-contained: they read the repository's `fixtures/` directory, which
-sits outside every crate and so cannot be packaged, and some need a sibling crate's feature that a
-published manifest does not declare. The fixtures come from `mea capture`, and the capture
+sits outside every crate and so cannot be packaged. The fixtures come from `mea capture`, and the capture
 directories that carry a `manifest.json` are held to the digests in it; a copy inside a crate would
 be a second, unguarded record, so none is bundled.
 
@@ -79,11 +78,11 @@ published `mango-agent-claude` 0.3.0 fails in the same way), each unpacked and r
   test binaries open `fixtures/codex` at run time through `CARGO_MANIFEST_DIR`, and 147 of the
   tests in them fail: 14 in `cancel_deadlines`, 1 in `notification_decode` and 132 in `replay`, so
   the rest of those binaries still pass.
-- `mango-agent-acp`: `tests/session.rs` and `tests/smoke.rs` do not compile
-  (`cannot find TokioLauncher in launcher`), because the dev-dependency on the sibling crate that
-  turns on its `launcher-tokio` feature is a path entry Cargo leaves out of the published manifest.
-  The crate's own `testing` feature still resolves, so `tests/discovery.rs` passes. Of the unit
-  tests one profile test fails at run time because it reads the repository root.
+- `mango-agent-acp`: the tests compile, because the dev-dependency on the core crate is declared
+  with `workspace = true` and so keeps its `launcher-tokio` and `testing` features in the published
+  manifest (`scripts/check-dev-dependencies.sh` guards that; a path-only entry would be dropped).
+  `tests/discovery.rs` and `tests/session.rs` pass, and of the unit tests one profile test fails at
+  run time because it reads the repository root.
 
 Whoever needs to run the harness crates' tests, such as a distribution packager, should use a
 checkout of the release tag, not the `.crate`. Excluding `tests/` and `benches/` from the packages would not change
