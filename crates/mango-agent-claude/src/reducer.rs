@@ -199,10 +199,10 @@ impl TurnReducerBuilder {
     /// completed block is emitted whole. A bound below what the transport delivers would emit a
     /// fully streamed block twice.
     ///
-    /// A session passes the larger of its `max_line_bytes` and `max_buffered_bytes`: repairing
-    /// invalid UTF-8 can make a decoded line longer than its raw bytes, but never longer than
-    /// `max_buffered_bytes`. Without a bound, which is what [`TurnReducer::new`] builds, a block's
-    /// delivered text is kept whole until its message ends.
+    /// A session passes the most a decoded stdio line can hold under its `Limits::line`: the raw
+    /// line is at most `max_line_bytes`, repairing invalid UTF-8 can triple it, and the repaired
+    /// line still has to fit in `max_buffered_bytes`. Without a bound, which is what
+    /// [`TurnReducer::new`] builds, a block's delivered text is kept whole until its message ends.
     pub fn max_message_bytes(mut self, bytes: usize) -> Self {
         self.max_message_bytes = Some(bytes);
         self
@@ -257,15 +257,16 @@ impl TurnReducer {
 
     /// The reducer for a run whose output is read under `limits`.
     ///
-    /// A block reaches the reducer decoded, in one line: at most `max_line_bytes` as the vendor
-    /// wrote it, and at most `max_buffered_bytes` once invalid UTF-8 is repaired.
+    /// A block reaches the reducer decoded, in one stdio line: at most `max_line_bytes` as the
+    /// vendor wrote it, at most three times that once each invalid byte is repaired to a 3-byte
+    /// U+FFFD, and never more than `max_buffered_bytes`, which the repaired line is counted against.
     pub(crate) fn for_limits(limits: &mango_external_agents::Limits) -> Self {
+        let line = &limits.line;
         Self::builder()
             .max_message_bytes(
-                limits
-                    .line
-                    .max_line_bytes
-                    .max(limits.line.max_buffered_bytes),
+                line.max_line_bytes
+                    .saturating_mul(3)
+                    .min(line.max_buffered_bytes),
             )
             .build()
     }
@@ -1190,8 +1191,10 @@ mod tests {
         };
         for (limits, block_bytes) in [
             (Limits::default(), 2 * 1024 * 1024),
-            (line(3 * 1024 * 1024, 1024), 3 * 1024 * 1024),
-            (line(1024, 3 * 1024 * 1024), 3 * 1024 * 1024),
+            // Repairing invalid UTF-8 triples a raw line, within the buffered budget.
+            (line(1024 * 1024, 8 * 1024 * 1024), 3 * 1024 * 1024),
+            (line(4 * 1024 * 1024, 3 * 1024 * 1024), 3 * 1024 * 1024),
+            (line(1024, 3 * 1024 * 1024), 3 * 1024),
         ] {
             let block = "x".repeat(block_bytes);
             let mut reducer = TurnReducer::for_limits(&limits);
@@ -1204,14 +1207,16 @@ mod tests {
             );
         }
 
-        let limits = line(16, 16);
-        let mut reducer = TurnReducer::for_limits(&limits);
-        stream_text(&mut reducer, &["seventeen bytes!!"]);
-        assert_eq!(
-            reducer.retained_text_capacity(),
-            0,
-            "expected no text kept past the 16 bytes {limits:?} can deliver"
-        );
+        // Nothing longer than the buffered budget can be read, whatever the line limit says.
+        for limits in [line(16, 16), line(4 * 1024 * 1024, 16)] {
+            let mut reducer = TurnReducer::for_limits(&limits);
+            stream_text(&mut reducer, &["seventeen bytes!!"]);
+            assert_eq!(
+                reducer.retained_text_capacity(),
+                0,
+                "expected no text kept past the 16 bytes {limits:?} can deliver"
+            );
+        }
     }
 
     #[test]
