@@ -21,7 +21,7 @@ use crate::cli_surface::CliSurface;
 use crate::mcp::ConfigFile;
 use crate::permissions::{self, ModeAvailability};
 use crate::pinned::{self, MINIMUM_VERSION, VENDOR, VENDOR_ENVIRONMENT_KEYS};
-use crate::probe;
+use crate::probe::{self, Probed};
 use crate::session::ClaudeSession;
 use crate::{argv, models, version};
 
@@ -126,11 +126,20 @@ impl ClaudeHarness {
     async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Result<Survey> {
         // An incomplete banner still proves the binary ran, so its complete lines are used and an
         // empty one leaves an installed CLI whose version is unreadable; only a probe that
-        // established nothing reads as "not installed".
-        let Some(banner) = probe::read(host, executable, &["--version"]).await?.lines() else {
-            return Ok(Survey::default());
+        // established nothing reads as "not installed". A cut-off read may have lost the Claude
+        // Code line behind a wrapper's own, so it is read strictly: only a line that names Claude
+        // Code counts, never the single bare-version form.
+        let (banner, version) = match probe::read(host, executable, &["--version"]).await? {
+            Probed::Nothing => return Ok(Survey::default()),
+            Probed::Whole(banner) => {
+                let version = version::parse(&banner);
+                (banner, version)
+            }
+            Probed::Incomplete(banner) => {
+                let version = version::parse_incomplete(&banner);
+                (banner, version)
+            }
         };
-        let version = version::parse(&banner);
         let surface = probe::output(host, executable, &["--help"])
             .await?
             .map(|help| CliSurface::parse(&help))

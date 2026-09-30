@@ -501,6 +501,61 @@ mod discovery {
         assert_eq!(discovery.version, None);
     }
 
+    /// `--help` cut off after its first line, so that only the version could gate the CLI.
+    fn cut_off_help() -> String {
+        let mut lines: Vec<String> = HELP_2_1_270.lines().map(String::from).collect();
+        lines.insert(1, "x".repeat(8192));
+        lines.join("\n")
+    }
+
+    /// A wrapper's own version is not Claude Code's: with the read cut off before the banner line
+    /// and `--help` cut off too, that version must not gate the CLI as too old.
+    #[tokio::test]
+    async fn a_wrappers_version_before_a_read_error_is_not_taken_for_claudes() {
+        let banner = format!("wrapper 1.0.0\n{}\n2.1.270 (Claude Code)", "x".repeat(8192));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version(&banner)
+                .with_help(&cut_off_help()),
+        );
+
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected the wrapper's 1.0.0 not to gate the CLI as too old | received {:?}",
+            discovery.gate
+        );
+    }
+
+    /// The compact form (a bare version) is only trusted when the read finished: a bare number
+    /// followed by a read error could be a wrapper's own.
+    #[tokio::test]
+    async fn a_bare_version_before_a_read_error_is_not_trusted() {
+        let banner = format!("1.0.0\n{}", "x".repeat(8192));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version(&banner)
+                .with_help(&cut_off_help()),
+        );
+
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.gate,
+            GateVerdict::Unknown,
+            "expected an incomplete bare 1.0.0 not to gate the CLI as too old | received {:?}",
+            discovery.gate
+        );
+    }
+
     /// A status document read whole is trusted even when more output follows and fails: narrowing
     /// the permission matrix over an answer that was complete would lose `auto` for a signed-in
     /// account.
