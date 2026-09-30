@@ -129,12 +129,18 @@ page claims no permission the vendor did not write down.
   no option that selects or drops a sign-in method. `--bare`, which would skip OAuth and the keychain
   and authenticate only from `ANTHROPIC_API_KEY` or an `apiKeyHelper`, is deliberately not passed
   (`docs/harness-claude.md`).
-- **The child environment is an allowlist.** The child receives only what the host's allowlist
-  carries plus `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`. `ANTHROPIC_API_KEY`,
-  `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN` are never forwarded by name, because the
-  library forwards no credential; a user who wants API-key mode configures it in `claude` itself.
-  That is a limit on what the library passes, not a change to the binary. Whether a host's own
-  environment policy counts as restricting a method is for that host to judge.
+- **The child environment is the library's own allowlist, and it excludes API-key variables.** A
+  vendor child receives a fixed set of location and locale variables plus the ones its harness
+  names, which for Claude are `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`. A host
+  cannot add a key. `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN` are
+  deliberately not on it, because the library forwards no credential. So an API key supplied
+  through the environment does not reach the child under this library, whatever the host's own
+  environment holds; a user who wants API-key mode configures it in `claude` itself. That is a limit
+  on how a credential can reach the binary, and it bears on the quoted sentence that customers "may
+  not remove, disable, or restrict any authentication method built into it (including methods that
+  permit signing in with a Claude account or the user’s own API key)". This page draws no
+  conclusion: the sentence is addressed to customers running Claude Code in their products, and
+  whether an environment allowlist counts is Anthropic's to say.
 - **No credential or session token is collected, stored or intermediated.** Sign-in completes
   through Anthropic's own flow: a signed-out CLI fails a turn with `AuthRequired`, which carries
   `claude auth login` as text for a person to run.
@@ -191,9 +197,12 @@ From the same page's transport notes:
 > The app-server command and WebSocket transport are experimental and aren’t supported for
 > production workloads.
 
-**Restricting the vendor's own authentication:** none. The harness starts `codex app-server` with
-no authentication option and passes only `CODEX_HOME` through by name; it never sends
-`account/login/*`, and the one server request that asks a client for credentials is refused.
+**Restricting the vendor's own authentication.** The harness starts `codex app-server` with no
+authentication option and sends no login request; the one server request that asks a client for
+credentials, `account/chatgptAuthTokens/refresh`, is refused. As with Claude, the child environment
+is the library's own allowlist, and the only vendor variable on it is `CODEX_HOME`, so a credential
+in a host's environment is not forwarded. The sentence quoted above does not address that, and this
+page draws no conclusion.
 
 **Quotes**, read against `rust-v0.154.0`, from
 [`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/README.md)
