@@ -644,11 +644,13 @@ reported only by a full read, so a sparse update leaves the last read's in place
 
 ## Transports
 
-`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket, and its README
-says of the first: "Websocket transport is currently experimental and unsupported. Do not rely on
-it for production workloads." Declaring it would invite hosts to build on a surface the vendor has
-already withdrawn once. The unix socket is the later opportunity; an undeclared transport is
-refused as `Error::UnsupportedTransport` before anything is spawned.
+`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket. OpenAI's
+[app-server documentation][app-server] (read 2026-09-30) lists the first as "websocket (--listen
+ws://IP:PORT, experimental and unsupported)" and says: "The app-server command and WebSocket
+transport are experimental and aren’t supported for production workloads." Declaring it would
+invite hosts to build on a surface the vendor does not support for production. The unix socket is
+the later opportunity; an undeclared transport is refused as `Error::UnsupportedTransport` before
+anything is spawned.
 
 ## MCP
 
