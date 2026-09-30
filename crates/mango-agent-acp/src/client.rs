@@ -290,6 +290,9 @@ pub(crate) struct SessionState {
     turn_released: tokio::sync::Notify,
     /// Set by the connection-loss watcher: no further turn may take the slot on a dead connection.
     admission_closed: AtomicBool,
+    /// Set by the lifecycle watcher on every wake: the connection is being wound down without a
+    /// `close`, so configuration is refused even when it touches no wire request.
+    peer_ended: AtomicBool,
     /// The explicit settings the next turn inherits.
     ///
     /// `None` on either permission axis leaves the vendor's own setting in force. Turning that
@@ -367,6 +370,7 @@ impl SessionState {
             turn: Mutex::new(None),
             turn_released: tokio::sync::Notify::new(),
             admission_closed: AtomicBool::new(false),
+            peer_ended: AtomicBool::new(false),
             configuration: Mutex::new(configuration),
             catalog_revision: Mutex::new(0),
             turn_start: Mutex::new(()),
@@ -710,6 +714,24 @@ impl SessionState {
     pub(crate) fn close_turn_admission(&self) {
         let _turn = self.lock_turn();
         self.admission_closed.store(true, Ordering::Release);
+    }
+
+    /// Records that the lifecycle watcher is ending this session without a `close`.
+    ///
+    /// A separate mark from the close state on purpose: `close` keeps sole ownership of the shared
+    /// close result, and this only lets configuration refuse work on a session that has ended.
+    ///
+    /// ```ignore
+    /// state.mark_peer_ended();
+    /// assert!(state.has_peer_ended());
+    /// ```
+    pub(crate) fn mark_peer_ended(&self) {
+        self.peer_ended.store(true, Ordering::Release);
+    }
+
+    /// Whether the lifecycle watcher has begun ending this session.
+    pub(crate) fn has_peer_ended(&self) -> bool {
+        self.peer_ended.load(Ordering::Acquire)
     }
 
     /// Waits until no turn holds the prompt slot.
@@ -1309,7 +1331,10 @@ struct RequestAdmissionState {
 impl RequestAdmission {
     fn new(limit: usize) -> Self {
         Self {
-            permits: tokio::sync::Semaphore::new(limit),
+            // A host may set a huge count to mean "no cap"; a semaphore panics above
+            // `MAX_PERMITS`, and this runs after the child is launched. `limit` itself stays as
+            // the host set it, for the refusal message.
+            permits: tokio::sync::Semaphore::new(limit.min(tokio::sync::Semaphore::MAX_PERMITS)),
             limit,
             state: Mutex::new(RequestAdmissionState::default()),
         }

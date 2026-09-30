@@ -10,6 +10,7 @@ mod mcp;
 pub mod permissions;
 pub mod protocol;
 pub mod rate_limits;
+mod redacted;
 pub mod reducer;
 pub mod session;
 pub mod turn_reducer;

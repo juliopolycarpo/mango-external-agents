@@ -57,7 +57,9 @@ ahead of the SDK actor is not request concurrency. Notifications and turn events
 not one to one (a first thought chunk opens reasoning and adds a delta; a completed tool call
 starts and completes an activity), so the message count is a coarse guard and the byte budget is
 what bounds memory. A host may set a very large count to rely on bytes alone; the outgoing writer
-queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking.
+queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking, and so is the request
+admission semaphore that `max_pending_requests` sizes (a `usize::MAX` there means no cap in
+practice, and opens, runs turns and closes like any other value).
 
 Output bytes remain charged through the physical write. A single frame larger than the byte
 budget, or a queue that would exceed either bound, fails the connection with an error naming the
@@ -584,8 +586,18 @@ require, then the same bounded cleanup runs
 and the turn writes its terminal before `Closed` is published. The watcher holds the connection only
 weakly, so the token does not keep a dropped session's child alive. After the token fires,
 `configure` is refused as `Cancelled { reason: Shutdown }` (`NotSubmitted`), the same shape a turn
-start gets, including a patch that touches no wire request. That guard is keyed on the token, so it
-does not cover a session that ended because the agent vanished.
+start gets, including a patch that touches no wire request. A session the watcher ends because the
+agent vanished refuses `configure` too, as `Closed` on the ACP connection: the watcher sets a mark
+of its own on every wake and never claims the close, so a later `close` still returns the shared
+result.
+
+Dropping the last session handle while a turn is running does the same for that turn. The prompt
+task owns the connection while the turn runs, so the drop itself records `CancelReason::Shutdown`,
+withdraws the parked questions and starts the connection's shutdown on the runtime it was driven
+on, which also works from a thread with no runtime. The held `TurnStream` ends as
+`Cancelled { reason: Shutdown }` then `Completed`, and the watcher publishes `Closed` after it. A
+drop with no turn running keeps its earlier behaviour: the watcher reaps once the connection is
+released.
 
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports

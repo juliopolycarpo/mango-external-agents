@@ -454,6 +454,20 @@ confirms that answer and consumes its bounded acknowledgement; it cannot become 
 that spends capacity for a later approval. This is client-side timing only: it adds no app-server
 method or wire field beyond the existing [documented surface][readme].
 
+### Debug output
+
+Every interaction carrier prints metadata only, following the `Debug` policy in
+`docs/compliance.md`: `PendingApproval`, `ServerRequest`, the approval, permissions, question and
+elicitation params, and every answer type (`ServerAnswer`, `ApprovalDecisionValue`,
+`ApprovalResponse`, `PermissionsRequestApprovalResponse` and the question-round answers). A
+debug-logged command approval reads, abridged,
+`CommandExecution(CommandExecutionApprovalParams { command: Some(<14 bytes redacted>), .. })`:
+which members are present and how large they are, never the command, reason, working directory,
+amendment prefix, host, permission profile or answer text. Vendor-minted ids are reported by
+length, as core does for an `InteractionId`; the option ids this harness offers (`accept`,
+`grant:turn`) and the method names it recognises print as themselves. Notifications, thread items
+and the reducers are raw protocol types outside this set.
+
 ### Permissions
 
 `item/permissions/requestApproval` is a third approval family: a permission profile the agent asks
@@ -639,11 +653,13 @@ reported only by a full read, so a sparse update leaves the last read's in place
 
 ## Transports
 
-`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket, and its README
-says of the first: "Websocket transport is currently experimental and unsupported. Do not rely on
-it for production workloads." Declaring it would invite hosts to build on a surface the vendor has
-already withdrawn once. The unix socket is the later opportunity; an undeclared transport is
-refused as `Error::UnsupportedTransport` before anything is spawned.
+`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket. OpenAI's
+[app-server documentation][app-server] (read 2026-09-30) lists the first as "websocket (--listen
+ws://IP:PORT, experimental and unsupported)" and says: "The app-server command and WebSocket
+transport are experimental and aren’t supported for production workloads." Declaring it would
+invite hosts to build on a surface the vendor does not support for production. The unix socket is
+the later opportunity; an undeclared transport is refused as `Error::UnsupportedTransport` before
+anything is spawned.
 
 ## MCP
 
