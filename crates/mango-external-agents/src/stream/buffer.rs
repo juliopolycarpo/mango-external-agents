@@ -49,6 +49,8 @@ struct State {
     control_bytes: usize,
     payloads: usize,
     controls: usize,
+    /// A close was refused for room, so the transcript has a hole a later payload must not paper over.
+    close_refused: bool,
 }
 
 impl State {
@@ -91,6 +93,28 @@ impl Buffer {
     }
 
     pub(super) fn push(&self, event: AgentEvent) -> Result<()> {
+        self.push_as(event, false)
+    }
+
+    /// Queues a close, remembering a refusal for room.
+    ///
+    /// The refusal is sticky: once a close was dropped, the host's transcript is missing an end,
+    /// so no later payload may be queued behind it and no later close is attempted. The turn's own
+    /// terminal is unaffected, because it never goes through the payload budget.
+    pub(super) fn push_close(&self, event: AgentEvent) -> Result<()> {
+        self.push_as(event, true)
+    }
+
+    /// Whether the sink dropping now would leave a refused close with no terminal after it.
+    pub(super) fn owes_overflow_terminal(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.close_refused
+            && state.status.is_none()
+            && self.senders.load(Ordering::Acquire) == 1
+            && !self.is_closed()
+    }
+
+    fn push_as(&self, event: AgentEvent, close: bool) -> Result<()> {
         let bytes = payload_bytes(&event)?;
         let control = matches!(
             event.kind,
@@ -105,11 +129,41 @@ impl Buffer {
                 subject: "turn stream",
             });
         }
+        if let Err(refusal) = self.admit(&state, control, bytes) {
+            state.close_refused |= close;
+            return Err(refusal);
+        }
+        if control {
+            state.control_bytes += bytes;
+            state.controls += 1;
+        } else {
+            state.payload_bytes += bytes;
+            state.payloads += 1;
+        }
+        state.events.push_back(Queued {
+            event,
+            bytes,
+            control,
+        });
+        drop(state);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Whether an event of this class and size fits the budgets right now.
+    fn admit(&self, state: &State, control: bool, bytes: usize) -> Result<()> {
         let (count, cap) = if control {
             (state.controls, control_event_cap(&self.limits))
         } else {
             (state.payloads, self.limits.turn_channel_capacity.max(1))
         };
+        if !control && state.close_refused {
+            return Err(Error::LimitExceeded {
+                subject: "queued turn events after a refused close",
+                limit: cap,
+                received: count.saturating_add(1),
+            });
+        }
         if count >= cap {
             return Err(Error::LimitExceeded {
                 subject: "queued turn events",
@@ -147,20 +201,6 @@ impl Buffer {
                 received: total,
             });
         }
-        if control {
-            state.control_bytes += bytes;
-            state.controls += 1;
-        } else {
-            state.payload_bytes += bytes;
-            state.payloads += 1;
-        }
-        state.events.push_back(Queued {
-            event,
-            bytes,
-            control,
-        });
-        drop(state);
-        self.changed.notify_one();
         Ok(())
     }
 
