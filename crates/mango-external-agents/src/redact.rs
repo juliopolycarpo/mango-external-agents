@@ -281,6 +281,16 @@ pub(crate) fn is_space_byte(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
+/// Whether [`stderr_text`] removes this byte outright, joining the text on either side of it.
+///
+/// The controls it strips one at a time, a bare carriage return among them. A caller that cuts
+/// text where the redactor sees no break can keep half of a credential whose name it dropped.
+pub(crate) fn is_stripped_byte(byte: u8) -> bool {
+    byte.is_ascii()
+        && !matches!(byte, b'\t' | b'\n' | 0x1b)
+        && is_unsafe_to_render(char::from(byte))
+}
+
 fn skip_spaces(bytes: &[u8], at: usize) -> usize {
     take_while(bytes, at, is_space_byte)
 }
@@ -362,7 +372,7 @@ fn is_unsafe_to_render(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ends_awaiting_value, program_name, stderr_text};
+    use super::{ends_awaiting_value, is_stripped_byte, program_name, stderr_text};
 
     /// The fixture a vendor child writes in the port's own process test.
     const FIXTURE: &str =
@@ -603,5 +613,26 @@ mod tests {
                 "expected {dropped:?} to await nothing | received true"
             );
         }
+    }
+
+    #[test]
+    fn a_byte_the_redactor_removes_is_reported_as_stripped() {
+        for byte in [0x00, b'\r', 0x0b, 0x0c, 0x7f] {
+            assert!(
+                is_stripped_byte(byte),
+                "expected {byte:#04x} to be reported as stripped | received false"
+            );
+        }
+        for byte in [b' ', b'\t', b'\n', 0x1b, b'a', b'=', 0xc3] {
+            assert!(
+                !is_stripped_byte(byte),
+                "expected {byte:#04x} to be kept | received true"
+            );
+        }
+        assert_eq!(
+            stderr_text("API_\rKEY=v"),
+            "API_KEY=[REDACTED]",
+            "expected the redactor to join the text around a carriage return"
+        );
     }
 }

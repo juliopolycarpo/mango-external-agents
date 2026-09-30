@@ -7,7 +7,7 @@
 //! rules read on the next line, because they skip line breaks between a name, its separator and
 //! its value. Bytes are only ever dropped here; nothing is cut before redaction.
 
-use crate::redact::{self, is_space_byte};
+use crate::redact::{self, is_space_byte, is_stripped_byte};
 
 /// How much of what was dropped is remembered to decide whether a value is still awaited.
 ///
@@ -19,7 +19,7 @@ const TAIL_BYTES: usize = 512;
 /// Where the discard is inside the text it is dropping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// In a line whose start is gone: drop to its CR or LF.
+    /// In a line whose start is gone: drop to its LF.
     Line,
     /// Past a line that ended awaiting a value: drop blank lines, then the next non-empty line.
     Blank,
@@ -69,10 +69,7 @@ impl Discard {
                 }
                 self.phase = Phase::Line;
             }
-            let Some(offset) = chunk[at..]
-                .iter()
-                .position(|byte| matches!(byte, b'\n' | b'\r'))
-            else {
+            let Some(offset) = chunk[at..].iter().position(|byte| *byte == b'\n') else {
                 self.push_text(&chunk[at..]);
                 return None;
             };
@@ -106,7 +103,11 @@ impl Discard {
     }
 }
 
-/// The last [`TAIL_BYTES`] of `bytes` with every blank run collapsed to a single space.
+/// The last [`TAIL_BYTES`] of `bytes` as the redactor reads it, with every blank run collapsed to
+/// a single space.
+///
+/// A byte the redactor removes (a bare CR among them) is left out, so the text on either side of
+/// it joins here as it does there.
 ///
 /// Scans back from the end and stops once it has enough, so a long dropped line costs the tail
 /// and not the line.
@@ -115,6 +116,9 @@ fn tail_of(bytes: &[u8]) -> Vec<u8> {
     for byte in bytes.iter().rev() {
         if tail.len() == TAIL_BYTES {
             break;
+        }
+        if is_stripped_byte(*byte) {
+            continue;
         }
         if !is_space_byte(*byte) {
             tail.push(*byte);
@@ -147,8 +151,8 @@ mod tests {
         let mut discard = Discard::mid_line(b"noise API_KEY=value");
         assert_eq!(
             discard.consume(b"more\r\nnext"),
-            Some(5),
-            "expected the discard to end right after the CR"
+            Some(6),
+            "expected the discard to end right after the LF, not the CR"
         );
     }
 
@@ -219,6 +223,19 @@ mod tests {
         assert!(
             Discard::after_line(&dropped).is_some(),
             "expected a name followed by a long blank run to stay awaited"
+        );
+    }
+
+    #[test]
+    fn a_bare_carriage_return_joins_a_name_as_the_redactor_reads_it() {
+        assert_eq!(
+            tail_of(b"noise API_\rKEY"),
+            b"noise API_KEY",
+            "expected the CR left out of the tail"
+        );
+        assert!(
+            Discard::after_line(b"noise API_\rKEY").is_some(),
+            "expected a name split by a CR to await its separator"
         );
     }
 }

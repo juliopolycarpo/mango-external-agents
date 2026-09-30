@@ -395,11 +395,15 @@ impl StderrTail {
     ///
     /// A cut goes on until nothing kept can have lost its name. A line longer than the cap is
     /// dropped whole: once an overflow leaves only the middle of a line, every following byte up
-    /// to the next CR or LF is dropped too, however many reads it spans. And a cut that ends where
+    /// to the next LF is dropped too, however many reads it spans. And a cut that ends where
     /// a credential's value is still awaited (`API_KEY=`, `Authorization:` or a trailing
     /// `Bearer`) also drops the blank lines and the next non-empty line, because the redaction
     /// rules read a value across a line break. Bytes are only ever dropped, never cut before
     /// they are redacted.
+    ///
+    /// Only LF ends a line. The redactor removes a bare CR and reads the text on both sides as one,
+    /// so cutting there could keep half of a credential whose name was dropped. A stream that
+    /// separates lines with a bare CR alone (a progress redraw) is one line to this tail.
     ///
     /// # Example
     ///
@@ -429,7 +433,7 @@ impl StderrTail {
         let overflow = buffer.len() - self.max_bytes;
         let boundary = buffer[overflow..]
             .iter()
-            .position(|byte| matches!(byte, b'\n' | b'\r'))
+            .position(|byte| *byte == b'\n')
             .map(|offset| overflow + offset);
         let Some(boundary) = boundary else {
             // Nothing retained starts a line, so the whole window is the middle of one — a single
@@ -1409,18 +1413,16 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_line_feed_or_carriage_return_ends_the_discard() {
-        for terminator in ["\n", "\r"] {
-            let tail = StderrTail::with_capacity(16);
-            tail.push(b"API_KEY=0123456789012345678901234567890");
-            tail.push(format!("secret{terminator}ok\n").as_bytes());
+    fn a_line_feed_ends_the_discard() {
+        let tail = StderrTail::with_capacity(16);
+        tail.push(b"API_KEY=0123456789012345678901234567890");
+        tail.push(b"secret\nok\n");
 
-            let read = tail.read();
-            assert!(
-                !read.contains("secret") && read.contains("ok\n"),
-                "expected only the overflowed remainder dropped for {terminator:?} | received {read:?}"
-            );
-        }
+        let read = tail.read();
+        assert!(
+            !read.contains("secret") && read.contains("ok\n"),
+            "expected only the overflowed remainder dropped | received {read:?}"
+        );
     }
 
     /// The discard belongs to the shared buffer, not to one handle: the launcher fills one clone
@@ -1504,6 +1506,32 @@ mod tests {
         assert!(
             !read.contains("sk-live-secret"),
             "expected no token from the line after a cut header | received {read:?}"
+        );
+    }
+
+    /// The redactor removes a bare carriage return and reads the text on both sides as one, so a
+    /// cut at that byte would keep the half of a credential whose name it dropped.
+    #[test]
+    fn a_bare_carriage_return_inside_an_overflowed_value_is_not_a_cut_point() {
+        let tail = StderrTail::with_capacity(24);
+        tail.push(b"OPENAI_API_KEY=sk-proj-AAAA\rBBBBsecretpart\nok\n");
+
+        let read = tail.read();
+        assert_eq!(
+            read, "ok\n",
+            "expected no part of the value after the carriage return | received {read:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_carriage_return_inside_a_dropped_name_is_not_a_cut_point() {
+        let tail = StderrTail::with_capacity(24);
+        tail.push(b"noise noise sec\rret=hunter2\nok\n");
+
+        let read = tail.read();
+        assert_eq!(
+            read, "ok\n",
+            "expected no part of the assignment after the carriage return | received {read:?}"
         );
     }
 
