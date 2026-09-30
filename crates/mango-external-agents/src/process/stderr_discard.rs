@@ -103,11 +103,13 @@ impl Discard {
     }
 }
 
-/// The last [`TAIL_BYTES`] of `bytes` as the redactor reads it, with every blank run collapsed to
-/// a single space.
+/// The last [`TAIL_BYTES`] of `bytes`, with every run of spaces, tabs and line feeds collapsed to
+/// a single space and every run of bytes the redactor removes (a bare CR among them) to one of
+/// them.
 ///
-/// A byte the redactor removes (a bare CR among them) is left out, so the text on either side of
-/// it joins here as it does there.
+/// Those bytes stay in the text raw. Whether the text on either side of one joins or is parted by
+/// a boundary is the redactor's call, made when `ends_awaiting_value` runs its own stripper over
+/// the tail, and a copy of that rule here would drift from it.
 ///
 /// Scans back from the end and stops once it has enough, so a long dropped line costs the tail
 /// and not the line.
@@ -118,9 +120,10 @@ fn tail_of(bytes: &[u8]) -> Vec<u8> {
             break;
         }
         if is_stripped_byte(*byte) {
-            continue;
-        }
-        if !is_space_byte(*byte) {
+            if !tail.last().is_some_and(|last| is_stripped_byte(*last)) {
+                tail.push(*byte);
+            }
+        } else if !is_space_byte(*byte) {
             tail.push(*byte);
         } else if tail.last() != Some(&b' ') {
             tail.push(b' ');
@@ -136,7 +139,11 @@ mod tests {
 
     #[test]
     fn a_tail_collapses_blank_runs_and_keeps_only_the_end() {
-        assert_eq!(tail_of(b"a \r\n\t b"), b"a b", "expected one space per run");
+        assert_eq!(
+            tail_of(b"a \n\t b\r\r\x0b"),
+            b"a b\x0b",
+            "expected one space per blank run and one byte per removed run"
+        );
         let long = vec![b'x'; TAIL_BYTES * 2];
         assert_eq!(
             tail_of(&long).len(),
@@ -230,12 +237,24 @@ mod tests {
     fn a_bare_carriage_return_joins_a_name_as_the_redactor_reads_it() {
         assert_eq!(
             tail_of(b"noise API_\rKEY"),
-            b"noise API_KEY",
-            "expected the CR left out of the tail"
+            b"noise API_\rKEY",
+            "expected the CR kept raw in the tail"
         );
         assert!(
             Discard::after_line(b"noise API_\rKEY").is_some(),
             "expected a name split by a CR to await its separator"
+        );
+    }
+
+    #[test]
+    fn a_removed_byte_before_a_name_is_left_to_the_redactor_to_read() {
+        assert!(
+            Discard::after_line(b"aaaaaaaa xyz\rtoken=").is_some(),
+            "expected xyz, a CR and token= to read as a name awaiting its value"
+        );
+        assert!(
+            Discard::after_line(b"aaaaaaaa xyz\rtoken=value").is_none(),
+            "expected a whole assignment to leave nothing awaited"
         );
     }
 }

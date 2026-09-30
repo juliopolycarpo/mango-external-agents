@@ -1535,6 +1535,27 @@ mod tests {
         );
     }
 
+    /// The redactor puts a boundary where it removes a byte in front of a credential name, so
+    /// `xyz`, a removed CR and `token=` read as a name. The tail has to see it the same way, or it
+    /// keeps the value line that whole-text redaction would have hidden.
+    #[test]
+    fn a_cut_that_drops_a_name_behind_a_removed_byte_drops_its_value_line_too() {
+        let text = b"aaaaaaaa xyz\rtoken=\nVALUE\nok\n";
+        let whole = crate::redact::stderr_text(&String::from_utf8_lossy(text));
+        assert!(
+            !whole.contains("VALUE"),
+            "expected whole-text redaction to hide the value | received {whole:?}"
+        );
+
+        let tail = StderrTail::with_capacity(20);
+        tail.push(text);
+        let read = tail.read();
+        assert_eq!(
+            read, "ok\n",
+            "expected the value line dropped as whole-text redaction hides it | received {read:?}"
+        );
+    }
+
     #[test]
     fn a_value_line_dropped_after_a_cut_is_followed_by_an_intact_diagnostic() {
         let tail = StderrTail::with_capacity(32);
