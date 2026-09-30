@@ -25,9 +25,10 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Diff, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    SessionConfigOption, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, ContentChunk, Diff, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, SessionConfigOption, SessionUpdate, StopReason, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use mango_external_agents::event::{
     Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, Command, EventKind,
@@ -274,6 +275,48 @@ impl Reducer {
         (events, facts)
     }
 
+    /// The session facts one `session/update` carries, and nothing else.
+    ///
+    /// For a frame no turn owns, such as one replayed by `session/load` or one that arrives between
+    /// turns: its events would be dropped, so building them, and remembering the tool calls they
+    /// open, would only hold memory until the next turn. This reads the two arms that say something
+    /// about the session itself (the command catalog and the configuration catalog) and leaves
+    /// every reducer untouched. It agrees with the facts [`Self::update`] returns for the same
+    /// frame.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use mango_agent_acp::reducer::{Reducer, SessionFact};
+    ///
+    /// let announced: SessionUpdate = serde_json::from_value(serde_json::json!({
+    ///     "sessionUpdate": "available_commands_update",
+    ///     "availableCommands": [{ "name": "review", "description": "Review the diff" }]
+    /// }))
+    /// .expect("a v1 command catalog");
+    /// assert!(matches!(
+    ///     Reducer::session_facts(announced).as_slice(),
+    ///     [SessionFact::Commands(commands)] if commands.len() == 1
+    /// ));
+    ///
+    /// let running: SessionUpdate = serde_json::from_value(serde_json::json!({
+    ///     "sessionUpdate": "tool_call",
+    ///     "toolCallId": "call_1",
+    ///     "title": "Run `cargo build`"
+    /// }))
+    /// .expect("a v1 tool call");
+    /// assert!(Reducer::session_facts(running).is_empty());
+    /// ```
+    #[must_use]
+    pub fn session_facts(update: SessionUpdate) -> Vec<SessionFact> {
+        match update {
+            SessionUpdate::AvailableCommandsUpdate(catalog) => vec![commands_fact(catalog)],
+            SessionUpdate::ConfigOptionUpdate(update) => vec![configuration_fact(update)],
+            _ => Vec::new(),
+        }
+    }
+
     /// The events that close out a turn that completed, before its terminal.
     ///
     /// [`Self::finish_with`] with [`ActivityStatus::Completed`]: see there for what a turn can end
@@ -352,6 +395,13 @@ impl Reducer {
         events
     }
 
+    /// How many tool calls the reducer is holding open, for the tests that prove a frame did not
+    /// reach it.
+    #[cfg(test)]
+    pub(crate) fn open_calls_len(&self) -> usize {
+        self.open_calls.len()
+    }
+
     fn close_reasoning(&mut self) -> Vec<EventKind> {
         if !std::mem::take(&mut self.reasoning_open) {
             return Vec::new();
@@ -376,19 +426,9 @@ impl Reducer {
                 (self.tool_call_update(update, now), Vec::new())
             }
             SessionUpdate::Plan(plan) => (self.plan(plan), Vec::new()),
-            SessionUpdate::AvailableCommandsUpdate(catalog) => (
-                Vec::new(),
-                vec![SessionFact::Commands(
-                    catalog
-                        .available_commands
-                        .into_iter()
-                        .map(|command| Command {
-                            name: command.name,
-                            description: Some(command.description),
-                        })
-                        .collect(),
-                )],
-            ),
+            SessionUpdate::AvailableCommandsUpdate(catalog) => {
+                (Vec::new(), vec![commands_fact(catalog)])
+            }
             SessionUpdate::UsageUpdate(usage) => (
                 vec![EventKind::ThreadUsage {
                     usage: ThreadUsage {
@@ -404,10 +444,9 @@ impl Reducer {
                 }],
                 Vec::new(),
             ),
-            SessionUpdate::ConfigOptionUpdate(update) => (
-                Vec::new(),
-                vec![SessionFact::ConfigurationOptions(update.config_options)],
-            ),
+            SessionUpdate::ConfigOptionUpdate(update) => {
+                (Vec::new(), vec![configuration_fact(update)])
+            }
             // Session state rather than transcript, and the `#[non_exhaustive]` tail: an agent that
             // sends an update from a draft feature this build did not opt into is not a failed turn.
             SessionUpdate::UserMessageChunk(_)
@@ -620,6 +659,23 @@ fn transcript(update: &SessionUpdate) -> bool {
         | SessionUpdate::Plan(_) => true,
         _ => false,
     }
+}
+
+fn commands_fact(catalog: AvailableCommandsUpdate) -> SessionFact {
+    SessionFact::Commands(
+        catalog
+            .available_commands
+            .into_iter()
+            .map(|command| Command {
+                name: command.name,
+                description: Some(command.description),
+            })
+            .collect(),
+    )
+}
+
+fn configuration_fact(update: ConfigOptionUpdate) -> SessionFact {
+    SessionFact::ConfigurationOptions(update.config_options)
 }
 
 fn text_delta(chunk: ContentChunk) -> Vec<EventKind> {
@@ -1071,6 +1127,47 @@ mod tests {
         }
         events.extend(reducer.finish());
         (events, facts)
+    }
+
+    /// The facts-only path answers with what the full reducer's facts are, for every frame kind
+    /// and without touching a reducer, so a replayed session says the same about itself.
+    #[test]
+    fn session_facts_agree_with_the_full_reducers_facts_for_every_frame() {
+        let frames = vec![
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } }),
+            json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "hm" } }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "q" } }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Run" }),
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed" }),
+            json!({ "sessionUpdate": "plan", "entries": [] }),
+            json!({ "sessionUpdate": "usage_update", "used": 1, "size": 10 }),
+            json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
+            json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [{ "name": "review", "description": "Review" }]
+            }),
+            json!({
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{
+                    "id": "model", "name": "Model", "type": "select", "currentValue": "a",
+                    "options": [{ "value": "a", "name": "A" }]
+                }]
+            }),
+        ];
+        let mut with_facts = 0;
+        for frame in frames {
+            let (_, expected) = Reducer::new().update(update(frame.clone()));
+            let received = Reducer::session_facts(update(frame.clone()));
+            assert_eq!(
+                received, expected,
+                "expected session facts identical to the reducer's for {frame} | received: {received:?}"
+            );
+            with_facts += usize::from(!received.is_empty());
+        }
+        assert_eq!(
+            with_facts, 2,
+            "expected exactly the command and configuration frames to carry facts | received: {with_facts}"
+        );
     }
 
     #[test]
