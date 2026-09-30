@@ -232,8 +232,7 @@ impl AcpSession {
         if self.lifecycle.is_closed() {
             return Err(Error::Closed { subject: "session" });
         }
-        self.refuse_after_host_shutdown()?;
-        self.refuse_after_peer_ended()?;
+        self.refuse_configuration_before_submission()?;
         if self.connection_state.turn().is_some() {
             return Err(Error::Protocol {
                 expected: String::from(
@@ -533,8 +532,25 @@ impl AcpSession {
         }
         Err(Error::Cancelled {
             reason: CancelReason::Shutdown,
-        }
-        .with_dispatch(Dispatch::NotSubmitted))
+        })
+    }
+
+    /// The preflight of a configuration change: refuses after a host shutdown or once the watcher
+    /// has ended the session, before any request is written.
+    ///
+    /// Marked `NotSubmitted`, because nothing has reached the agent yet. The same two refusals at
+    /// the publication step stay unmarked: by then earlier options were already sent, so a host
+    /// must not be told a replay is safe.
+    ///
+    /// ```ignore
+    /// host.cancel().cancel();
+    /// assert_eq!(session.refuse_configuration_before_submission().unwrap_err().dispatch(),
+    ///     Dispatch::NotSubmitted);
+    /// ```
+    fn refuse_configuration_before_submission(&self) -> Result<()> {
+        self.refuse_after_host_shutdown()
+            .and_then(|()| self.refuse_after_peer_ended())
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))
     }
 
     /// Refuses work once the lifecycle watcher has begun ending the session without a `close`.

@@ -676,6 +676,13 @@ async fn acp_teardown_watcher_close_refuses_later_configuration() {
         ),
         "expected error: Closed(ACP connection) | received: {error:?}"
     );
+    // Nothing reached the agent, so a host may replay it without reconciling.
+    assert_eq!(
+        error.dispatch(),
+        Dispatch::NotSubmitted,
+        "expected dispatch: NotSubmitted | received: {:?}",
+        error.dispatch()
+    );
     let accepted = watched.session.snapshot().configuration.accepted.routing;
     assert_eq!(
         accepted, None,
