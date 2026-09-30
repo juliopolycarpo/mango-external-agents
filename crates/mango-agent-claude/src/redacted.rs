@@ -37,6 +37,13 @@ pub(crate) fn text(value: &str) -> Redacted {
     Redacted { bytes: value.len() }
 }
 
+impl Redacted {
+    /// The combined size of several members, for a collection reported as one figure.
+    pub(crate) fn sum(sizes: impl Iterator<Item = usize>) -> Self {
+        Self { bytes: sizes.sum() }
+    }
+}
+
 /// A JSON object member, reported by the length of its compact serialization.
 pub(crate) fn object(fields: &Map<String, Value>) -> Redacted {
     // `Value`'s `Display` is its compact serialization and cannot fail, so an unserializable value
@@ -89,6 +96,14 @@ mod tests {
         assert_eq!(
             printed, "<9 bytes redacted>",
             "expected the byte length of a 9-byte string and no text | received: {printed}"
+        );
+    }
+
+    #[test]
+    fn several_members_are_reported_as_one_combined_size() {
+        assert_eq!(
+            format!("{:?}", Redacted::sum([3_usize, 4].into_iter())),
+            "<7 bytes redacted>"
         );
     }
 

@@ -152,3 +152,37 @@ fn an_unknown_discriminator_is_reported_by_size_not_by_text() {
     assert_omits("StreamRecord", &record, &[("type", "CANARY")]);
     assert_names("StreamRecord", &record, "ok");
 }
+
+/// The reducer holds the streamed text of each open block until its `assistant` record lands, the
+/// text a subagent forwarded, the message of each permission denial and the call ids that key them,
+/// so a debug-logged reducer is a debug-logged transcript.
+#[test]
+fn a_reducer_does_not_print_what_it_is_holding() {
+    let mut turn = mango_agent_claude::reducer::TurnReducer::new();
+    for line in [
+        r#"{"type":"system","subtype":"permission_denied","tool_use_id":"CANARY-denied-id",
+            "message":"CANARY-denied-message"}"#,
+        r#"{"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"CANARY-call","name":"Read","input":{"file_path":"CANARY-path"}}]}}"#,
+        r#"{"type":"assistant","parent_tool_use_id":"CANARY-call","message":{"content":[
+            {"type":"text","text":"CANARY-nested"}]}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":3,
+            "delta":{"type":"text_delta","text":"CANARY-delta"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":4,
+            "content_block":{"type":"thinking"}}}"#,
+    ] {
+        let _ = turn.reduce(&record(line));
+    }
+    assert_omits(
+        "TurnReducer",
+        &turn,
+        &[
+            ("open activity call id", "CANARY-call"),
+            ("denied activity id", "CANARY-denied-id"),
+            ("denied activity message", "CANARY-denied-message"),
+            ("nested subagent text", "CANARY-nested"),
+            ("delivered block text", "CANARY-delta"),
+        ],
+    );
+    assert_names("TurnReducer", &turn, "TurnReducer");
+}

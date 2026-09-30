@@ -504,6 +504,10 @@ and `subtype` (when they have a label's shape, otherwise their size), how many m
 how many bytes they take, never a value. A debug-logged tool result reads
 `ContentBlock { kind: Some("tool_result"), is_error: false, members: 3, size: <96 bytes redacted> }`.
 
+`TurnReducer` follows the same rule. It holds the streamed text of each open block, the text a
+subagent forwarded, each permission denial's message and the call ids that key them, so it reports
+how many of each it holds and how many bytes, never the text or an id.
+
 ## Deliberate differences from the mangostudio TypeScript adapter
 
 - The turn stream is a **bounded** channel; a host that stops reading applies backpressure to the

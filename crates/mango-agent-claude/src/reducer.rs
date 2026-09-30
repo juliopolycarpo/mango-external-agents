@@ -26,6 +26,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{
@@ -36,6 +37,7 @@ use serde_json::Value;
 
 use crate::commands;
 use crate::protocol::{ContentBlock, PermissionDenied, StreamRecord, char_head as head};
+use crate::redacted;
 
 /// How much text any detail carries on its way to the sink.
 ///
@@ -142,7 +144,7 @@ impl Delivered {
 }
 
 /// One run's records, reduced to neutral events.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TurnReducer {
     finished: bool,
     /// Tool calls this run has opened, in the order it opened them, so an unclosed call can be
@@ -169,6 +171,40 @@ pub struct TurnReducer {
     open_reasoning_blocks: BTreeSet<u64>,
     /// The most delivered text kept for one block; `None` keeps all of it.
     max_message_bytes: Option<usize>,
+}
+
+impl fmt::Debug for TurnReducer {
+    /// What the reducer is holding, by count and size. The streamed text of each open block, the
+    /// text a subagent forwarded and each denial's message are the transcript itself, and the call
+    /// ids that key them are the vendor's; none is printed.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnReducer")
+            .field("finished", &self.finished)
+            .field("open_activities", &self.open_activities.len())
+            .field("nested_texts", &self.nested_text.len())
+            .field(
+                "nested_text_bytes",
+                &redacted::Redacted::sum(self.nested_text.values().map(String::len)),
+            )
+            .field("denied_activities", &self.denied_activities.len())
+            .field(
+                "denied_message_bytes",
+                &redacted::Redacted::sum(self.denied_activities.values().map(String::len)),
+            )
+            .field("delivered_blocks", &self.delivered_by_block.len())
+            .field(
+                "delivered_text_bytes",
+                &redacted::Redacted::sum(
+                    self.delivered_by_block
+                        .values()
+                        .map(|block| block.text.len()),
+                ),
+            )
+            .field("open_reasoning_blocks", &self.open_reasoning_blocks.len())
+            .field("max_message_bytes", &self.max_message_bytes)
+            .finish()
+    }
 }
 
 /// Configures a [`TurnReducer`].
