@@ -6421,11 +6421,36 @@ async fn the_harness_passes_the_cores_conformance_suite() {
                         })
                         .to_string(),
                     ]),
-                    // `check_cancelled_turn`: the existing synthetic cancel id.
+                    // `check_cancelled_turn`: the existing synthetic cancel id. The turn opens a
+                    // reasoning phase and a running command before the host cancels it, and the
+                    // interrupt answers with neither closed, so the suite's "a cancelled turn closes
+                    // what it opened" rule has something to hold Codex to. A cancel fake that opened
+                    // nothing let a harness that never closed either of them pass.
                     _ => Some(vec![
                         serde_json::json!({
                             "id": id,
                             "result": {"turn": {"id": "conformance-cancel"}},
+                        })
+                        .to_string(),
+                        serde_json::json!({
+                            "method": "item/started",
+                            "params": {
+                                "threadId": thread_id,
+                                "turnId": "conformance-cancel",
+                                "item": {"type": "reasoning", "id": "conformance-reasoning",
+                                         "summary": [], "content": []},
+                            },
+                        })
+                        .to_string(),
+                        serde_json::json!({
+                            "method": "item/started",
+                            "params": {
+                                "threadId": thread_id,
+                                "turnId": "conformance-cancel",
+                                "item": {"type": "commandExecution",
+                                         "id": "conformance-command",
+                                         "command": "sleep 1000", "status": "inProgress"},
+                            },
                         })
                         .to_string(),
                     ]),

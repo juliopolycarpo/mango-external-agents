@@ -440,6 +440,9 @@ fn approval_outcome(
     }
 }
 
+/// How many times the suite lets the runtime run other tasks before it cancels the second turn.
+const SETTLE_YIELDS: usize = 64;
+
 async fn check_cancelled_turn(session: &dyn Session, options: &Options, report: &mut Report) {
     let request = TurnRequest::new("conformance-turn-2", options.prompt.clone());
     let mut turn = match session.start_turn(request).await {
@@ -453,6 +456,17 @@ async fn check_cancelled_turn(session: &dyn Session, options: &Options, report: 
         }
     };
 
+    // A harness that is already working gets to show what it opened before the host cancels. The
+    // rule "a cancelled turn closes what it opened" is vacuous for a turn the cancel outran: the
+    // pump has read nothing yet, so there is nothing open to close. Yielding is not a sleep and
+    // waits for nothing in particular, so a harness that opens nothing costs no time, and a
+    // multi-threaded runtime that has not scheduled the pump simply keeps the old, weaker check.
+    let mut events = Vec::new();
+    for _ in 0..SETTLE_YIELDS {
+        tokio::task::yield_now().await;
+        drain_queued(&mut turn, &mut events);
+    }
+
     if let Err(error) = session.cancel(CancelReason::Requested).await {
         report.record(
             "a cancelled turn still completes",
@@ -461,7 +475,6 @@ async fn check_cancelled_turn(session: &dyn Session, options: &Options, report: 
         return;
     }
 
-    let mut events = Vec::new();
     let drained = tokio::time::timeout(options.turn_timeout, async {
         while let Some(event) = turn.recv().await {
             let terminal = event.is_terminal();

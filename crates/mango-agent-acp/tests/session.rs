@@ -4471,8 +4471,18 @@ async fn the_harness_passes_the_core_conformance_suite() {
             .printing_version("fake-acp 1.2.3")
             .version_process(),
     );
+    // Every turn opens a running command and a reasoning phase before the agent asks anything, so
+    // the turn the suite cancels ends with both still open and the suite's "a cancelled turn
+    // closes what it opened" rule has something to hold ACP to.
     launcher.push(
         FakeAcpAgent::new()
+            .with_updates(vec![
+                running_call("conformance-call"),
+                serde_json::json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "weighing it" }
+                }),
+            ])
             .asking_for_approval(Approval::Once)
             .closing_sessions()
             .process(),
