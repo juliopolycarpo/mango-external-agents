@@ -1023,6 +1023,13 @@ async fn a_stream_that_never_acknowledged_the_turn_is_reported_as_uncertain() {
         Some(Dispatch::AcceptanceUnknown),
         "expected the stream's own certainty to be kept for the turn"
     );
+    // The split is the point: what a host persisting only the record reads stays "handed to the
+    // vendor". Writing the stream's doubt onto the record would send a resumed run to reconcile.
+    assert_eq!(
+        supervisor.record(&turn_id).map(|record| record.dispatch()),
+        Some(Dispatch::Accepted),
+        "expected the record to keep saying the vendor holds the turn"
+    );
 }
 
 /// While the stream is held the host only observes: it never asks the Hub whether to send again.
