@@ -423,7 +423,8 @@ answer, not how often the vendor asks. What is known, read on 2026-09-30 against
   switch for questions in Default mode; this note claims nothing beyond its stage and state.
 - `TurnStartParams.collaborationMode` is absent from the pinned inventory and, at `0.159.2`,
   appears only in the schema generated with `--experimental`, so the library has no supported way
-  to select Plan mode, the other mode the vendor associates with questions.
+  to select a collaboration mode such as Plan. This note cites no vendor sentence tying Plan mode
+  to questions, so it does not claim that it would make one arrive.
 - The one candidate setting found is that feature flag, and it is the user's to set. With
   `-c features.default_mode_request_user_input=true`, `codex features list` reports it `true`, and
   `codex features enable` writes it to the user's `config.toml`. That shows the flag can be turned
@@ -444,7 +445,7 @@ answer.
 **Capture task, open:** once a question is reachable (the feature flag enabled in the user's own
 Codex configuration on a build that has it, or a supported way to select a collaboration mode),
 record one round with `mea capture` and replay it as a fixture, so the question path is proven against
-the vendor's own frames rather than a synthetic one. Re-check the three facts above at each pin
+the vendor's own frames rather than a synthetic one. Re-check the facts above at each pin
 refresh; if the vendor removes the label or turns the flag on by default, this note is out of date.
 
 ### MCP elicitations
