@@ -1607,6 +1607,71 @@ async fn a_second_turn_started_while_one_is_running_is_refused_rather_than_steer
     );
 }
 
+/// The requested host of a managed-network approval reaches the host's prompt through the whole
+/// session, not only through the unit that builds it: the context is read from the raw frame, so a
+/// session that stopped passing it on would show a person nothing about where the command goes.
+#[tokio::test]
+async fn a_managed_network_approval_reaches_the_host_naming_the_requested_host() {
+    let transcript = Transcript::load("turn");
+    let thread_id = transcript
+        .thread_id()
+        .expect("expected the turn recording to name its thread");
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(transcript.as_process_intercepting(move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/start") => Some(vec![
+                serde_json::json!({"id": id, "result": {"turn": {"id": "net-turn"}}}).to_string(),
+                serde_json::json!({
+                    "id": 88_001,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": thread_id, "turnId": "net-turn", "itemId": "cmd-1",
+                        "startedAtMs": 1_u64, "command": "curl https://api.example.com",
+                        "networkApprovalContext": {"host": "api.example.com", "protocol": "https"},
+                    },
+                })
+                .to_string(),
+            ]),
+            _ => None,
+        }
+    }));
+    let (host, launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "fetch"))
+        .await
+        .expect("expected a turn");
+
+    let request = await_approval(&mut turn).await;
+    let detail = request.detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("https to api.example.com"),
+        "expected the requested host in the detail the host sees | received: {detail:?}"
+    );
+
+    session
+        .respond(PermissionResponse::from_user(
+            request.id().clone(),
+            "decline",
+        ))
+        .await
+        .expect("expected the refusal to be accepted");
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected a clean close");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected the app-server reaped"
+    );
+}
+
 /// A cancel cannot name a turn until `turn/start` answers. The unnamed vendor turn still occupies
 /// the app-server, so another start in that interval would be treated as a steer of it.
 #[tokio::test]
@@ -3775,6 +3840,67 @@ async fn an_overlapping_older_quota_read_does_not_rewind_a_fresher_baseline() {
         .close(CloseReason::Shutdown)
         .await
         .expect("expected cleanup");
+}
+
+/// How many lines the host writes before it answers the recorded approval: the handshake and the
+/// turn's own start. The answer is the next one, and the pipe breaks there.
+const LINES_BEFORE_THE_APPROVAL_ANSWER: usize = 6;
+
+/// The vendor asks and the host's answer cannot be written. The vendor would wait for that answer
+/// for as long as its own deadline allows, so the link has to end at once: the turn fails with the
+/// connection error and the child is reaped, instead of the turn hanging until the idle watchdog
+/// reports it as a timeout. `FakeStdin` answered `Ok` to every write until it could fail on
+/// command, which is why no harness-level test could reach this.
+#[tokio::test]
+async fn an_approval_answer_the_pipe_refuses_ends_the_link_and_reaps_the_child() {
+    let launcher = Arc::new(FakeLauncher::new());
+    launcher.push(
+        Transcript::load("approval")
+            .as_process()
+            .failing_stdin_after(LINES_BEFORE_THE_APPROVAL_ANSWER, "EPIPE"),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+    let request = await_approval(&mut turn).await;
+    // The break has to land on the answer and on nothing before it, so drift in the handshake or
+    // the turn start fails here by name rather than as a hang or a break on the wrong write.
+    assert_eq!(
+        launcher.written().len(),
+        LINES_BEFORE_THE_APPROVAL_ANSWER,
+        "expected lines written before the approval answer: {LINES_BEFORE_THE_APPROVAL_ANSWER} | received: {}",
+        launcher.written().len()
+    );
+
+    // Whether the host's own call reports the refused write is not the contract; the turn ending
+    // is.
+    let _ = session
+        .respond(request.deny().expect("expected a way to refuse"))
+        .await;
+
+    let events = drain(&mut turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Error { .. })),
+        "expected the turn to end with a connection error after the refused answer | received {events:?}"
+    );
+    let mut live = launcher.live_children();
+    let reaped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while live != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            live = launcher.live_children();
+        }
+    })
+    .await;
+    assert!(
+        reaped.is_ok(),
+        "expected live children: 0 after the refused answer | received: {live}"
+    );
 }
 
 /// A pending approval has its own deadline and does not consume the turn's idle budget.
@@ -6356,11 +6482,36 @@ async fn the_harness_passes_the_cores_conformance_suite() {
                         })
                         .to_string(),
                     ]),
-                    // `check_cancelled_turn`: the existing synthetic cancel id.
+                    // `check_cancelled_turn`: the existing synthetic cancel id. The turn opens a
+                    // reasoning phase and a running command before the host cancels it, and the
+                    // interrupt answers with neither closed, so the suite's "a cancelled turn closes
+                    // what it opened" rule has something to hold Codex to. A cancel fake that opened
+                    // nothing let a harness that never closed either of them pass.
                     _ => Some(vec![
                         serde_json::json!({
                             "id": id,
                             "result": {"turn": {"id": "conformance-cancel"}},
+                        })
+                        .to_string(),
+                        serde_json::json!({
+                            "method": "item/started",
+                            "params": {
+                                "threadId": thread_id,
+                                "turnId": "conformance-cancel",
+                                "item": {"type": "reasoning", "id": "conformance-reasoning",
+                                         "summary": [], "content": []},
+                            },
+                        })
+                        .to_string(),
+                        serde_json::json!({
+                            "method": "item/started",
+                            "params": {
+                                "threadId": thread_id,
+                                "turnId": "conformance-cancel",
+                                "item": {"type": "commandExecution",
+                                         "id": "conformance-command",
+                                         "command": "sleep 1000", "status": "inProgress"},
+                            },
                         })
                         .to_string(),
                     ]),

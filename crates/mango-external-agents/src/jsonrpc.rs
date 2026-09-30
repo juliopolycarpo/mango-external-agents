@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::error::{Error, ErrorCode, Result, VendorError, jsonrpc_code_is_retryable};
@@ -140,12 +140,13 @@ impl std::fmt::Debug for ServerRequestOutcome {
     }
 }
 
-/// Why the peer's read side stopped without this client closing it first.
+/// Why the connection ended without this client closing it first.
 #[derive(Clone, PartialEq, Eq)]
 pub enum PeerTermination {
     /// The peer closed its output.
     Exited,
-    /// Reading the peer failed.
+    /// The link failed: reading the peer failed, or a reply to one of its questions could not be
+    /// written, which leaves the peer waiting on an answer that will never arrive.
     LinkFailed(String),
     /// Peer work filled the bounded handoff queue before the handler could consume it.
     NotificationByteBackpressure {
@@ -407,6 +408,13 @@ struct ClientState {
     next_id: AtomicU64,
     closed: AtomicBool,
     shutdown: CancelToken,
+    /// Why a reply to the peer could not be written, once one could not.
+    ///
+    /// A reply is written on a task the pump waits for when it tears the connection down, so that
+    /// task must never run the teardown itself. It records the cause here and wakes the pump, which
+    /// owns termination.
+    reply_failure: StdMutex<Option<String>>,
+    reply_failed: Notify,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
     notifications: StdMutex<Option<JoinHandle<()>>>,
@@ -461,6 +469,8 @@ impl Client {
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             shutdown: CancelToken::new(),
+            reply_failure: StdMutex::new(None),
+            reply_failed: Notify::new(),
             in_flight: StdMutex::new(JoinSet::new()),
             notifications: StdMutex::new(None),
             peer_bytes,
@@ -924,6 +934,31 @@ impl ClientState {
             let _ = answer.send(outcome);
         }
     }
+
+    /// Records that a reply could not be written and wakes the pump, which ends the connection.
+    ///
+    /// Only signals: the caller may be an answer task or the peer-work worker, both of which the
+    /// pump waits for while it terminates, so terminating from here would wait on itself. Nothing
+    /// is recorded once the connection is closing, since the pump is then already on its way out
+    /// and a refusal that lands on a link being shut down is expected. The first cause is kept.
+    fn signal_reply_failure(&self, error: &Error) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        self.reply_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| error.to_string());
+        self.reply_failed.notify_one();
+    }
+
+    /// The cause of the first reply that could not be written, if one was.
+    fn take_reply_failure(&self) -> Option<String> {
+        self.reply_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
 }
 
 async fn pump(
@@ -936,6 +971,15 @@ async fn pump(
         let message = tokio::select! {
             biased;
             () = state.shutdown.cancelled() => break,
+            // A reply that could not be written is a dead link the read side has not noticed yet.
+            // It ends the connection here, on the one task that owns termination.
+            () = state.reply_failed.notified() => {
+                let cause = state
+                    .take_reply_failure()
+                    .unwrap_or_else(|| String::from("a reply could not be written"));
+                link_failed(&state, &handler, notifications, cause).await;
+                break;
+            }
             message = receiver.recv() => message,
         };
 
@@ -979,24 +1023,35 @@ async fn pump(
                 break;
             }
             Err(error) => {
-                let termination = PeerTermination::LinkFailed(error.to_string());
-                state.closed.store(true, Ordering::Release);
-                state
-                    .fail_pending(JsonRpcError {
-                        code: -32000,
-                        message: format!("the {} link failed: {error}", state.options.peer_name),
-                        data: None,
-                    })
-                    .await;
-                drop(notifications);
-                state.drain_notifications().await;
-                state.shutdown.cancel();
-                state.drain_in_flight().await;
-                handler.on_terminated(termination).await;
+                link_failed(&state, &handler, notifications, error.to_string()).await;
                 break;
             }
         }
     }
+}
+
+/// Ends the connection because its link failed, on either side: the read side errored, or a reply
+/// could not be written. Runs on the pump only, once, as the last thing it does.
+async fn link_failed(
+    state: &Arc<ClientState>,
+    handler: &Arc<dyn PeerHandler>,
+    notifications: mpsc::Sender<BudgetedWork>,
+    cause: String,
+) {
+    let termination = PeerTermination::LinkFailed(cause.clone());
+    state.closed.store(true, Ordering::Release);
+    state
+        .fail_pending(JsonRpcError {
+            code: -32000,
+            message: format!("the {} link failed: {cause}", state.options.peer_name),
+            data: None,
+        })
+        .await;
+    drop(notifications);
+    state.drain_notifications().await;
+    state.shutdown.cancel();
+    state.drain_in_flight().await;
+    handler.on_terminated(termination).await;
 }
 
 async fn dispatch(
@@ -1145,8 +1200,12 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
             );
         }
     }
-    // The peer may have died between its question and this reply; the pump reports that.
-    let _ = state.write(Value::Object(frame).to_string()).await;
+    // A reply that never lands leaves the peer blocked on a question this side believes it has
+    // answered, and a timed-out write may have left half a frame on the link. Either way the link
+    // is unusable, so the pump is told; it is the only place that ends a connection.
+    if let Err(error) = state.write(Value::Object(frame).to_string()).await {
+        state.signal_reply_failure(&error);
+    }
 }
 
 #[cfg(test)]
@@ -1688,6 +1747,36 @@ mod tests {
         // Closing fails everything still pending. A call whose write failed is not pending — it
         // already failed — so there is nothing here for a second failure to land on.
         client.close().await.ok();
+    }
+
+    /// Only a reply the peer is waiting on ends the connection. A request the host sends that
+    /// fails to write reports to its own caller, who decides what to do, and leaves the link open.
+    #[tokio::test]
+    async fn a_failed_outbound_write_reports_to_its_caller_and_leaves_the_connection_open() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = client(link.clone(), Arc::clone(&handler));
+        link.fail_sends("EPIPE");
+
+        let error = client
+            .request::<_, Value>("thread/start", json!({}))
+            .await
+            .expect_err("expected a failure, received an answer");
+        assert!(
+            error.to_string().contains("EPIPE"),
+            "expected the write failure to reach the caller | received {error}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let terminations = handler.terminations.lock().await.len();
+        assert_eq!(
+            terminations, 0,
+            "expected terminations: 0 after a failed outbound write | received: {terminations}"
+        );
+        assert!(
+            !client.is_closed(),
+            "expected closed: false after a failed outbound write | received: true"
+        );
+        client.close().await.expect("expected a clean close");
     }
 
     #[tokio::test]
@@ -2295,5 +2384,242 @@ mod tests {
             "expected abandoned request correlation to be removed without another call or close; received {} pending entries",
             state.pending.lock().await.len()
         );
+    }
+
+    /// Waits for `count` terminations to reach the handler and reports the last count it saw.
+    async fn terminations_after(
+        handler: &RecordingHandler,
+        count: usize,
+    ) -> std::result::Result<Vec<PeerTermination>, usize> {
+        let mut seen = 0;
+        // Paused-time tests advance virtual time here, so the horizon covers a 5 s write deadline.
+        for _ in 0..2_000 {
+            seen = handler.terminations.lock().await.len();
+            if seen >= count {
+                return Ok(handler.terminations.lock().await.clone());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Err(seen)
+    }
+
+    /// A reply the link refused reached nobody, so the connection cannot be trusted with the next
+    /// question. The read side is held open, which is the case the pump alone never notices.
+    #[tokio::test]
+    async fn a_reply_that_cannot_be_written_ends_the_connection_once() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = client(link.clone(), Arc::clone(&handler));
+        link.fail_sends("EPIPE");
+        link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"item/requestApproval"}"#);
+
+        let terminations = terminations_after(&handler, 1)
+            .await
+            .unwrap_or_else(|seen| {
+                panic!("expected terminations: 1 after a failed reply write | received: {seen}")
+            });
+        assert!(
+            matches!(&terminations[..], [PeerTermination::LinkFailed(cause)] if cause.contains("EPIPE")),
+            "expected one LinkFailed naming EPIPE | received {terminations:?}"
+        );
+        assert!(
+            client.is_closed(),
+            "expected closed: true after a failed reply write | received: false"
+        );
+        let later = client
+            .request::<_, Value>("thread/start", json!({}))
+            .await
+            .expect_err("expected a refusal on a connection whose reply failed");
+        assert!(
+            matches!(later, Error::Closed { .. }),
+            "expected a closed-link refusal for the later request | received {later:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let total = handler.terminations.lock().await.len();
+        assert_eq!(
+            total, 1,
+            "expected exactly one termination | received: {total}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+
+    /// A request already waiting fails as a link failure the moment a reply fails, rather than at
+    /// its own deadline.
+    #[tokio::test]
+    async fn a_failed_reply_fails_the_requests_still_waiting() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = Arc::new(client(link.clone(), Arc::clone(&handler)));
+        let waiting = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request::<_, Value>("thread/start", json!({})).await })
+        };
+        link.wait_for_sent(1).await;
+        link.fail_sends("EPIPE");
+        link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"item/requestApproval"}"#);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("expected the waiting request to fail promptly after the reply failed")
+            .expect("expected the request task to finish");
+        let error = outcome.expect_err("expected a link failure, received an answer");
+        assert!(
+            matches!(&error, Error::Vendor(vendor) if vendor.message.contains("link failed")),
+            "expected the waiting request to fail with a link failure | received {error:?}"
+        );
+    }
+
+    /// A handler whose answers are held until the test lets them go, the way an approval waits on
+    /// a person. `asked` counts the questions that reached it.
+    struct GatedAnswers {
+        asked: std::sync::atomic::AtomicUsize,
+        terminated: std::sync::atomic::AtomicUsize,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for GatedAnswers {
+        async fn on_notification(&self, _method: String, _params: Value) {}
+
+        async fn on_request(
+            &self,
+            _method: String,
+            _params: Value,
+            _id: RequestId,
+        ) -> ServerRequestOutcome {
+            self.asked.fetch_add(1, Ordering::AcqRel);
+            self.release.notified().await;
+            ServerRequestOutcome::Answer(json!({}))
+        }
+
+        async fn on_terminated(&self, _termination: PeerTermination) {
+            self.terminated.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Two replies failing together while a close races them still end in one clean shutdown: the
+    /// reply path only signals, so nothing waits on the task that is waiting on it.
+    ///
+    /// Both questions are held inside the handler until the replies are about to fail, so the
+    /// close arrives while answers are in flight and the reply writes are reached, not skipped.
+    #[tokio::test]
+    async fn failed_replies_racing_a_close_neither_deadlock_nor_terminate_twice() {
+        let link = ScriptedLink::new();
+        let gated = Arc::new(GatedAnswers {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+            terminated: std::sync::atomic::AtomicUsize::new(0),
+            release: Notify::new(),
+        });
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&gated) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_request_timeout(Duration::from_secs(5)),
+        );
+        link.fail_sends("EPIPE");
+        link.push_line(r#"{"jsonrpc":"2.0","id":1,"method":"item/requestApproval"}"#);
+        link.push_line(r#"{"jsonrpc":"2.0","id":2,"method":"item/requestApproval"}"#);
+        let mut asked = 0;
+        for _ in 0..400 {
+            asked = gated.asked.load(Ordering::Acquire);
+            if asked == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            asked, 2,
+            "expected both questions held in the handler | received: {asked}"
+        );
+
+        gated.release.notify_waiters();
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.close())
+            .await
+            .expect("expected close to return while replies were failing");
+        assert!(
+            closed.is_ok(),
+            "expected a clean close | received {closed:?}"
+        );
+        assert_eq!(
+            link.refused_sends(),
+            2,
+            "expected both replies to reach the writer and be refused | received: {}",
+            link.refused_sends()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let terminated = gated.terminated.load(Ordering::Acquire);
+        assert!(
+            terminated <= 1,
+            "expected at most one termination for a racing close | received: {terminated}"
+        );
+    }
+
+    /// Two failed replies with nothing else going on are one termination, not two.
+    #[tokio::test]
+    async fn two_failed_replies_report_one_termination() {
+        let link = ScriptedLink::new();
+        let handler = RecordingHandler::arc(None);
+        let client = client(link.clone(), Arc::clone(&handler));
+        link.fail_sends("EPIPE");
+        link.push_line(r#"{"jsonrpc":"2.0","id":1,"method":"item/requestApproval"}"#);
+        link.push_line(r#"{"jsonrpc":"2.0","id":2,"method":"item/requestApproval"}"#);
+
+        terminations_after(&handler, 1)
+            .await
+            .unwrap_or_else(|seen| panic!("expected terminations: 1 | received: {seen}"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let total = handler.terminations.lock().await.len();
+        assert_eq!(
+            total, 1,
+            "expected exactly one termination | received: {total}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+
+    /// A stdin that never drains: the write is abandoned at its deadline, and a frame that may be
+    /// half on the wire is as unusable as one that failed.
+    struct StalledReplies {
+        inner: Box<dyn crate::link::LinkSender>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::link::LinkSender for StalledReplies {
+        async fn send(&mut self, message: String) -> crate::error::Result<()> {
+            if message.contains("\"result\"") || message.contains("\"error\"") {
+                std::future::pending::<()>().await;
+            }
+            self.inner.send(message).await
+        }
+
+        async fn close(&mut self) -> crate::error::Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_write_that_times_out_ends_the_connection_like_one_that_failed() {
+        let link = ScriptedLink::new();
+        let (sender, receiver) = link.clone().into_link().split();
+        let handler = RecordingHandler::arc(None);
+        let client = Client::connect(
+            crate::link::Link::new(Box::new(StalledReplies { inner: sender }), receiver),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_request_timeout(Duration::from_secs(5)),
+        );
+        link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"item/requestApproval"}"#);
+
+        let terminations = terminations_after(&handler, 1)
+            .await
+            .unwrap_or_else(|seen| {
+                panic!("expected terminations: 1 after a reply write timeout | received: {seen}")
+            });
+        assert!(
+            matches!(&terminations[..], [PeerTermination::LinkFailed(cause)] if cause.contains("JSON-RPC frame write")),
+            "expected one LinkFailed naming the frame write timeout | received {terminations:?}"
+        );
+        assert!(
+            client.is_closed(),
+            "expected closed: true | received: false"
+        );
+        client.close().await.expect("expected a clean close");
     }
 }
