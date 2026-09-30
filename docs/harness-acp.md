@@ -351,8 +351,10 @@ outstanding.
 time. Answers at or after the deadline cannot allow work, even before the timer task runs.
 Expiry selects the agent's `reject_once` option and records `DecisionSource::Expired`. If the agent
 offers no one-time refusal, the harness cancels the turn with `CancelReason::Timeout` and
-withdraws the question with ACP's `Cancelled` outcome;
-there is no `ApprovalResolved` selection event because no vendor option was selected. It never
+withdraws the question with ACP's `Cancelled` outcome and closes the host's dialog with an
+`ApprovalResolved` whose option id is `withdrawn`, `DecisionSource::Cancelled` and no effect,
+because no vendor option was selected. The cancel starts the same kill-grace fallback a host
+`cancel` does, so an agent that ignores `session/cancel` is still reaped. It never
 chooses `reject_always` for a timeout. These outcomes follow the
 [ACP v1 permission specification](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission).
 The timer answers the agent even if the bounded event channel is full. Approval events remain
@@ -557,6 +559,20 @@ the same bound, but it has no caller to report to: if the turn slot is still hel
 expires, it leaves the session `Closing` without an error. A host that watches status only should
 call `close` on a session that stays `Closing`: the close either settles the turn and publishes
 `Closed`, or returns the `Error::Timeout` described above.
+
+The host's `CancelToken` is a shutdown signal the same watcher observes. `open_session` refuses an
+already-cancelled token before it launches anything (`Error::Cancelled`, `NotSubmitted`) and ends
+a handshake or a mode and setting request still in flight when the token fires, reaping the child
+and reporting `Shutdown` to the launcher. Once the session is open, a
+cancelled token takes the watcher's path: admission closes, the running turn is cancelled with
+`CancelReason::Shutdown` and its parked questions are withdrawn with ACP's `Cancelled` outcome, as
+[the prompt-turn cancellation rules](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation)
+require, then the same bounded cleanup runs
+and the turn writes its terminal before `Closed` is published. The watcher holds the connection only
+weakly, so the token does not keep a dropped session's child alive. After the token fires,
+`configure` is refused as `Cancelled { reason: Shutdown }` (`NotSubmitted`), the same shape a turn
+start gets, including a patch that touches no wire request. That guard is keyed on the token, so it
+does not cover a session that ended because the agent vanished.
 
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
