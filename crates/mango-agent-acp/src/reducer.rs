@@ -619,12 +619,10 @@ fn tool_call(call: ToolCall) -> Vec<EventKind> {
     // `Activity::item_id`'s own doc, "distinct from the call", is real: ACP names no id for a tool
     // call's transcript item apart from `tool_call_id`. Carried anyway, so a host can route an
     // update by item id the same way across harnesses, even on the one where the two ids coincide.
-    let activity = Activity::new(
-        tool_name(&call),
-        activity_kind(call.kind),
-        call.title.clone(),
-    )
-    .with_item_id(call_id.clone());
+    // The name is a copy of the title (see `tool_name`) and the title itself is not read again, so
+    // it moves into the activity instead of being cloned a second time.
+    let activity = Activity::new(tool_name(&call), activity_kind(call.kind), call.title)
+        .with_item_id(call_id.clone());
     // The detail reads the blocks by reference; the content then consumes them, so a diff's bodies
     // move into the event instead of being copied for it.
     let detail = content_detail(&call.content);
@@ -1186,6 +1184,10 @@ mod tests {
         assert_eq!(call_id, "call_1");
         assert_eq!(activity.kind, ActivityKind::Command);
         assert_eq!(activity.title, "Run `cargo test`");
+        assert_eq!(
+            activity.name, "Run `cargo test`",
+            "expected the name to carry the title on the stable v1 wire"
+        );
         assert_eq!(
             activity.item_id.as_deref(),
             Some("call_1"),
