@@ -657,7 +657,7 @@ impl TurnReducer {
                 continue;
             }
             self.nested_text.remove(call_id);
-            let body = block.result_text();
+            let body = block.result_text_head(DETAIL_CARRY_MAX_CHARS);
             // The structured content is the tool's own body, regardless of a held denial: a host
             // reading `content` sees what the tool actually returned, while `detail` keeps the
             // vendor's own statement of why the call was refused.
@@ -1586,5 +1586,72 @@ mod tests {
         };
         assert_eq!(error.message, "Claude Code ended the turn with \"error\".");
         assert_eq!(error.vendor_code, None);
+    }
+
+    /// Runs one Bash call to completion with `content` as its `tool_result` payload, returning the
+    /// events of the closing record.
+    fn close_call_with(content: &serde_json::Value) -> Vec<EventKind> {
+        let mut reducer = TurnReducer::new();
+        reduce(
+            &mut reducer,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cat big"}}]}}"#,
+        );
+        let line = json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": content}
+        ]}})
+        .to_string();
+        reduce(&mut reducer, &line)
+    }
+
+    /// An array result must reach the host exactly as the same text delivered as one string does,
+    /// which is what the flatten-then-cut path produced. The parts straddle the carry bound with
+    /// multi-byte characters and empty elements on both sides of the cut.
+    #[test]
+    fn an_array_tool_result_closes_exactly_like_its_flattened_string() {
+        let bound = DETAIL_CARRY_MAX_CHARS;
+        let filler = "a".repeat(bound - 3);
+        let cases = [
+            json!(["short", "", {"text": "second"}, 4]),
+            json!([filler.clone(), "\u{1f600}\u{1f600}\u{1f600}"]),
+            json!([filler.clone(), "\u{65e5}", "tail after the cut"]),
+            json!(["b".repeat(bound - 1), "c", "d"]),
+            json!(["b".repeat(bound), "c"]),
+            json!(["b".repeat(bound + 1), "c"]),
+            json!(["\u{e9}".repeat(bound), "\u{e9}".repeat(bound)]),
+            json!(["x".repeat(1_000_000), "y".repeat(1_000_000)]),
+        ];
+        for parts in cases {
+            let flattened = parts
+                .as_array()
+                .expect("expected an array case")
+                .iter()
+                .filter_map(|part| part.as_str().or_else(|| part["text"].as_str()))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let from_array = close_call_with(&parts);
+            let from_string = close_call_with(&json!(flattened));
+            assert_eq!(
+                from_array,
+                from_string,
+                "expected the array result to close like its flattened string, received a difference for a payload of {} elements",
+                parts.as_array().map_or(0, Vec::len)
+            );
+        }
+    }
+
+    #[test]
+    fn an_array_tool_result_past_the_carry_bound_still_reports_the_cut() {
+        let parts = json!(["x".repeat(DETAIL_CARRY_MAX_CHARS), "y".repeat(50)]);
+        let events = close_call_with(&parts);
+        let Some(EventKind::ActivityCompleted { result, .. }) = events.last() else {
+            panic!("expected the call to close, received {events:?}");
+        };
+        let normalized = result.clone().normalized();
+        assert!(
+            normalized.truncated,
+            "expected truncated: true for a result of {} chars, received {normalized:?}",
+            DETAIL_CARRY_MAX_CHARS + 51
+        );
     }
 }
