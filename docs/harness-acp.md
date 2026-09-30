@@ -352,13 +352,15 @@ outstanding.
 `PermissionRequest::expires_at` comes from `Limits::approval_timeout`. The core's
 `ApprovalDeadline` starts when the question arrives and covers broker deliberation and host response
 time. Answers at or after the deadline cannot allow work, even before the timer task runs.
-Expiry selects the agent's `reject_once` option and records `DecisionSource::Expired`. If the agent
-offers no one-time refusal, the harness cancels the turn with `CancelReason::Timeout` and
-withdraws the question with ACP's `Cancelled` outcome and closes the host's dialog with an
-`ApprovalResolved` whose option id is `withdrawn`, `DecisionSource::Cancelled` and no effect,
-because no vendor option was selected. The cancel starts the same kill-grace fallback a host
-`cancel` does, so an agent that ignores `session/cancel` is still reaped. It never
-chooses `reject_always` for a timeout. These outcomes follow the
+Expiry answers with the agent's refusal, preferring the one-time one: `reject_once` when offered,
+otherwise `reject_always`, which is then the only refusal the agent left and the alternative is to
+end the whole turn. Either way the resolution is `DecisionSource::Expired`. Only when the agent
+offers no refusal at all does the harness cancel the turn with `CancelReason::Timeout` and withdraw
+the question with ACP's `Cancelled` outcome. It closes the host's dialog with an `ApprovalResolved`
+whose option id is `withdrawn`, `DecisionSource::Cancelled` and no effect, because no vendor option
+was selected. The cancel starts the same kill-grace fallback a host `cancel` does, so an agent that
+ignores `session/cancel` is still reaped. Expiry never selects an allow option. These outcomes
+follow the
 [ACP v1 permission specification](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission).
 The timer answers the agent even if the bounded event channel is full. Approval events remain
 ordered before the turn terminal and arrive when the host resumes reading.
