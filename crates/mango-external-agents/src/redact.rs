@@ -292,12 +292,7 @@ fn strip_control_characters(raw: &str) -> String {
         if character == '\u{1b}' {
             if characters.peek() == Some(&'[') {
                 characters.next();
-                // Parameter and intermediate bytes, up to and including the final byte.
-                for character in characters.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&character) {
-                        break;
-                    }
-                }
+                skip_csi_body(&mut characters);
             }
             continue;
         }
@@ -310,6 +305,28 @@ fn strip_control_characters(raw: &str) -> String {
         }
     }
     out
+}
+
+/// Consumes what follows `ESC [`: parameter bytes (`0x30..=0x3f`) and then one final byte
+/// (`0x40..=0x7e`).
+///
+/// A byte that is neither ends the sequence and is left in place. Reading on to the next letter
+/// would let `ESC [` followed by a space or a line break swallow the first letter of whatever came
+/// next, and with it the name a credential rule needs: `ESC [ API_KEY=x` came back as `PI_KEY=x`.
+/// The intermediate bytes ECMA-48 allows between the two (`0x20..=0x2f`) are left out for the same
+/// reason. A sequence that needs one is not one a diagnostic carries, and the cost of being wrong
+/// is a stray letter, where the cost of the other reading is a credential shown.
+fn skip_csi_body(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(next) = characters.peek() {
+        if ('\u{30}'..='\u{3f}').contains(next) {
+            characters.next();
+            continue;
+        }
+        if ('\u{40}'..='\u{7e}').contains(next) {
+            characters.next();
+        }
+        return;
+    }
 }
 
 /// Every code point a diagnostic must not carry across a boundary, tab and newline excepted.
@@ -523,6 +540,33 @@ mod tests {
     fn keeps_text_that_carries_no_credential() {
         let line = "error: the vendor exited with status 1 (no configuration found)";
         assert_eq!(stderr_text(line), line);
+    }
+
+    /// After `ESC [` the stripper must stop at the first byte that cannot belong to the sequence
+    /// and leave it alone. A space or a line break used to be skipped over, and the next letter
+    /// was taken as the final byte: the first letter of a credential's name.
+    #[test]
+    fn a_malformed_escape_sequence_does_not_hide_a_credential_name() {
+        for (raw, cause) in [
+            ("\u{1b}[ API_KEY=secret", "a space"),
+            ("\u{1b}[\nAPI_KEY=secret", "a line break"),
+            ("\u{1b}[1;\nAPI_KEY=secret", "parameters then a line break"),
+            ("\u{1b}[\u{7}TOKEN=secret", "a control character"),
+        ] {
+            let redacted = stderr_text(raw);
+            assert!(
+                !redacted.contains("secret"),
+                "expected the value redacted after an escape sequence broken by {cause} | received {redacted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_complete_escape_sequence_is_still_taken_out_whole() {
+        assert_eq!(
+            stderr_text("\u{1b}[1;31mred\u{1b}[0m and \u{1b}[2Kdone\u{1b}[31"),
+            "red and done"
+        );
     }
 
     #[test]
