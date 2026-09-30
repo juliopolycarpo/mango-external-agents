@@ -480,13 +480,18 @@ async fn an_expired_unrefusable_approval_stops_an_agent_that_ignores_the_cancel(
         ended && live == 0,
         "expected a terminal and no live child within {bound:?} of the expiry | received terminal={ended} waited={waited:?} live_children={live} events={events:?}"
     );
-    let resolved = events
-        .iter()
-        .filter(|event| matches!(event, EventKind::ApprovalResolved { .. }))
-        .count();
-    assert_eq!(
-        resolved, 1,
-        "expected exactly one resolution for the expired approval | received {events:?}"
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                EventKind::ApprovalResolved { .. },
+                EventKind::Cancelled {
+                    reason: CancelReason::Timeout
+                },
+                EventKind::Completed
+            ]
+        ),
+        "expected one resolution, then a timeout cancellation, then the terminal | received {events:?}"
     );
     session.close(CloseReason::Shutdown).await.expect("close");
 }
