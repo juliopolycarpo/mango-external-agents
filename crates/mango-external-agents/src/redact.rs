@@ -9,6 +9,10 @@
 //! with the same shapes as the patterns they replace, so each rule can be read on its own:
 //! a bearer header, a `key = value` assignment, and the password in a URL's userinfo.
 
+mod strip;
+
+use strip::{remove_boundaries, strip_control_characters};
+
 /// Redacts a stderr tail and strips terminal-unsafe control characters.
 ///
 /// # Example
@@ -24,31 +28,9 @@ pub fn stderr_text(raw: &str) -> String {
     // ` Bearer sk-live-x` either side of an escape sequence, and a rule that reads the two as
     // neighbours never sees the token at all if the sequence is still sitting between them.
     let plain = strip_control_characters(raw);
-    let redacted = redact_plain(&plain);
-    if !raw.contains('\u{1b}') {
-        return redacted;
-    }
-    // `ESC [ SP A` is a complete sequence, and it is also the start of `ESC [ SP API_KEY=x`. The
-    // two readings differ only in whether that intermediate byte and the letter after it are
-    // taken as a sequence, and each leaves a credential shown for the other's input. Both are
-    // redacted and the one that hides more is returned; a tie takes the standard reading, which
-    // leaves no stray letter.
-    let standard_plain = strip_with(raw, true);
-    if standard_plain == plain {
-        return redacted;
-    }
-    let standard = redact_plain(&standard_plain);
-    if standard.matches(REDACTED).count() >= redacted.matches(REDACTED).count() {
-        return standard;
-    }
-    redacted
-}
-
-/// The three rules, on text that has already been stripped.
-fn redact_plain(plain: &str) -> String {
-    let bearer = redact_bearer(plain);
+    let bearer = redact_bearer(&plain);
     let assignments = redact_assignments(&bearer);
-    redact_url_passwords(&assignments)
+    remove_boundaries(redact_url_passwords(&assignments))
 }
 
 /// A safe executable summary from a host-owned path.
@@ -108,6 +90,13 @@ fn is_known_program(name: &str) -> bool {
     KNOWN_PROGRAMS.contains(&bare)
 }
 
+/// The keyword that makes a variable name a credential's: `api_key` or one of a short list.
+fn match_credential_keyword(bytes: &[u8], at: usize) -> Option<usize> {
+    const KEYWORDS: &[&[u8]] = &[b"secret", b"token", b"password", b"passwd", b"credential"];
+    match_api_key(bytes, at)
+        .or_else(|| KEYWORDS.iter().find_map(|word| match_word(bytes, at, word)))
+}
+
 /// `authorization : bearer <token>`, however it was spaced and cased.
 ///
 /// `basic` counts as well as `bearer`: it is the same header carrying the same credential, and a
@@ -136,10 +125,8 @@ fn redact_bearer(raw: &str) -> String {
 
 /// `api_key=`, `secret:`, `token = `, … and whatever value follows.
 fn redact_assignments(raw: &str) -> String {
-    const KEYWORDS: &[&[u8]] = &[b"secret", b"token", b"password", b"passwd", b"credential"];
     rewrite(raw, |bytes, at| {
-        let after_keyword = match_api_key(bytes, at)
-            .or_else(|| KEYWORDS.iter().find_map(|word| match_word(bytes, at, word)))?;
+        let after_keyword = match_credential_keyword(bytes, at)?;
         // `AWS_SECRET_ACCESS_KEY=` is a keyword with the rest of a name after it. Requiring the
         // separator to follow the keyword itself would redact only the spellings that happen to
         // end on one, which is a minority of the names credentials actually have.
@@ -294,72 +281,6 @@ fn is_value_byte(byte: u8) -> bool {
 
 fn as_text(bytes: &[u8], from: usize, to: usize) -> String {
     String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default()).into_owned()
-}
-
-/// Keeps tab and newline, drops every other C0 control, DEL, the C1 block and every bidirectional
-/// formatting character, and takes a CSI sequence out whole rather than leaving its parameters
-/// behind as text.
-///
-/// A lone `\r` or an escape sequence in a vendor's diagnostic is a terminal-rendering problem the
-/// moment anyone tails a log. Dropping only the `ESC` would leave `[31m` sitting in the middle of
-/// a header, which reads as noise and hides a token from the rules that run after this.
-///
-/// The bidirectional set goes for the reason it goes everywhere else in this crate — see
-/// [`normalize::is_strippable`](crate::normalize) — and this tail is rendered in a host's
-/// diagnostics like any other vendor-written string, so the answer has to be the same one.
-fn strip_control_characters(raw: &str) -> String {
-    strip_with(raw, false)
-}
-
-/// [`strip_control_characters`], reading `ESC [ <params> <intermediates> <final>` as ECMA-48 does
-/// when `intermediates` is set.
-fn strip_with(raw: &str, intermediates: bool) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut characters = raw.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\u{1b}' {
-            if characters.peek() == Some(&'[') {
-                characters.next();
-                skip_csi_body(&mut characters, intermediates);
-            }
-            continue;
-        }
-        if character == '\t' || character == '\n' {
-            out.push(character);
-            continue;
-        }
-        if !is_unsafe_to_render(character) {
-            out.push(character);
-        }
-    }
-    out
-}
-
-/// Consumes what follows `ESC [`: parameter bytes (`0x30..=0x3f`), then intermediate bytes
-/// (`0x20..=0x2f`) when `intermediates` is set, then one final byte (`0x40..=0x7e`).
-///
-/// A byte that fits none of those ends the sequence and is left in place. Reading on to the next
-/// letter would let `ESC [` followed by a space or a line break swallow the first letter of
-/// whatever came next, and with it the name a credential rule needs: `ESC [ API_KEY=x` came back
-/// as `PI_KEY=x`. Without `intermediates` an intermediate byte ends the sequence the same way,
-/// which is the reading that keeps that name; [`stderr_text`] weighs it against the standard one.
-fn skip_csi_body(characters: &mut std::iter::Peekable<std::str::Chars<'_>>, intermediates: bool) {
-    let mut in_parameters = true;
-    while let Some(next) = characters.peek() {
-        if in_parameters && ('\u{30}'..='\u{3f}').contains(next) {
-            characters.next();
-            continue;
-        }
-        if intermediates && ('\u{20}'..='\u{2f}').contains(next) {
-            in_parameters = false;
-            characters.next();
-            continue;
-        }
-        if ('\u{40}'..='\u{7e}').contains(next) {
-            characters.next();
-        }
-        return;
-    }
 }
 
 /// Every code point a diagnostic must not carry across a boundary, tab and newline excepted.
@@ -573,55 +494,6 @@ mod tests {
     fn keeps_text_that_carries_no_credential() {
         let line = "error: the vendor exited with status 1 (no configuration found)";
         assert_eq!(stderr_text(line), line);
-    }
-
-    /// After `ESC [` the stripper must stop at the first byte that cannot belong to the sequence
-    /// and leave it alone. A space or a line break used to be skipped over, and the next letter
-    /// was taken as the final byte: the first letter of a credential's name.
-    #[test]
-    fn a_malformed_escape_sequence_does_not_hide_a_credential_name() {
-        for (raw, cause) in [
-            ("\u{1b}[ API_KEY=secret", "a space"),
-            ("\u{1b}[\nAPI_KEY=secret", "a line break"),
-            ("\u{1b}[1;\nAPI_KEY=secret", "parameters then a line break"),
-            ("\u{1b}[\u{7}TOKEN=secret", "a control character"),
-        ] {
-            let redacted = stderr_text(raw);
-            assert!(
-                !redacted.contains("secret"),
-                "expected the value redacted after an escape sequence broken by {cause} | received {redacted:?}"
-            );
-        }
-    }
-
-    /// A complete sequence with an intermediate byte is also legal, and when the letter after it
-    /// begins a credential name the two readings disagree; the one that hides more is returned.
-    #[test]
-    fn a_complete_intermediate_sequence_before_a_name_does_not_hide_the_value() {
-        for raw in [
-            "\u{1b}[ qAPI_KEY=secret",
-            "\u{1b}[0 qTOKEN=secret",
-            "\u{1b}[1;2 @password=secret",
-        ] {
-            let redacted = stderr_text(raw);
-            assert!(
-                !redacted.contains("secret"),
-                "expected the value redacted after a complete sequence with an intermediate byte | received {redacted:?}"
-            );
-        }
-        assert_eq!(
-            stderr_text("\u{1b}[0 qready"),
-            "ready",
-            "expected a complete intermediate sequence taken out whole"
-        );
-    }
-
-    #[test]
-    fn a_complete_escape_sequence_is_still_taken_out_whole() {
-        assert_eq!(
-            stderr_text("\u{1b}[1;31mred\u{1b}[0m and \u{1b}[2Kdone\u{1b}[31"),
-            "red and done"
-        );
     }
 
     #[test]
