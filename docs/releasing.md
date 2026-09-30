@@ -33,7 +33,8 @@ stored in the repository or in CI.
 
 4. Watch the `Release` workflow. It verifies the manifests match the tag, runs `scripts/check.sh`,
    publishes each crate that is not on crates.io yet, and creates the GitHub release with
-   git-cliff notes.
+   git-cliff notes. A full rerun is safe: a crate already on crates.io and a GitHub release that
+   already exists are skipped, and the existing release keeps its notes.
 
 ## First release checklist
 

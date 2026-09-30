@@ -141,10 +141,9 @@ jobs:
           tool: git-cliff
       - name: Release notes for this tag
         run: git-cliff --config cliff.toml --current --strip header --output release-notes.md
+      # A full rerun after the release exists skips this step instead of failing on it.
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          case "$VERSION" in *-*) prerelease=--prerelease ;; *) prerelease= ;; esac
-          gh release create "v$VERSION" --title "v$VERSION" --notes-file release-notes.md $prerelease
+        run: scripts/publish-github-release.sh "$VERSION" release-notes.md

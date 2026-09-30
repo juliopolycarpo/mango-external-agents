@@ -104,3 +104,47 @@ else
   trap - EXIT
   echo 'changelog rendering checks passed'
 fi
+
+# A full rerun after the release exists must not fail at the last step, and a first run must still
+# create it. The fake `gh` refuses to create a release that exists, and records what it was asked.
+release_bin=$(mktemp -d)
+release_log=$release_bin/gh.log
+trap 'rm -rf "$release_bin"' EXIT
+ln -s "$PWD/scripts/test-fixtures/fake-release-publish-cli.sh" "$release_bin/gh"
+printf 'notes\n' > "$release_bin/notes.md"
+publish() {
+  : > "$release_log"
+  PATH="$release_bin:$PATH" FAKE_GH_LOG=$release_log FAKE_GH_EXISTING_RELEASE=$1 \
+    scripts/publish-github-release.sh "$2" "$release_bin/notes.md" >/dev/null 2>&1
+}
+expect_release_calls() {
+  local expected=$1
+  local received
+  received=$(tr '\n' '|' < "$release_log")
+  if [ "$received" != "$expected" ]; then
+    echo "expected gh calls '$expected', received '$received'" >&2
+    exit 1
+  fi
+}
+publish v0.4.0 0.4.0 || {
+  echo 'expected a rerun to succeed when release v0.4.0 exists, received a failure' >&2
+  exit 1
+}
+expect_release_calls 'release view v0.4.0|'
+publish none 0.4.0 || {
+  echo 'expected the first run to create release v0.4.0, received a failure' >&2
+  exit 1
+}
+expect_release_calls "release view v0.4.0|release create v0.4.0 --title v0.4.0 --notes-file $release_bin/notes.md|"
+publish none 0.5.0-rc.1 || {
+  echo 'expected the first run to create prerelease v0.5.0-rc.1, received a failure' >&2
+  exit 1
+}
+expect_release_calls "release view v0.5.0-rc.1|release create v0.5.0-rc.1 --title v0.5.0-rc.1 --notes-file $release_bin/notes.md --prerelease|"
+if PATH="$release_bin:$PATH" FAKE_GH_LOG=$release_log scripts/publish-github-release.sh 0.4.0 "$release_bin/missing.md" 2>/dev/null; then
+  echo 'expected a missing notes file to be refused, received success' >&2
+  exit 1
+fi
+rm -rf "$release_bin"
+trap - EXIT
+echo 'github release checks passed'
