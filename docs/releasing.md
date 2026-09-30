@@ -14,8 +14,10 @@ stored in the repository or in CI.
    ```
 
 2. Move the workspace to the new version: `version` under `[workspace.package]` and the four
-   `version = "…"` entries under `[workspace.dependencies]` in `Cargo.toml`, then refresh the
-   lockfile and prove the lockstep:
+   `version = "…"` entries under `[workspace.dependencies]` in `Cargo.toml`. Set the install
+   snippet in each of the four `crates/*/README.md` files to the new `major.minor` (`"0.3"` for
+   0.3.x): a published README is immutable, and 0.3.0 shipped `"0.1"`, which a caret requirement
+   never resolves to 0.3. Then refresh the lockfile and prove the lockstep:
 
    ```sh
    cargo update --workspace
@@ -28,7 +30,7 @@ stored in the repository or in CI.
    maintainer made it.
 
    ```sh
-   git add Cargo.toml Cargo.lock CHANGELOG.md
+   git add Cargo.toml Cargo.lock CHANGELOG.md crates/*/README.md
    git commit -m "chore(release): v0.2.0" -m "Release the four crates at the same version."
    git tag -s v0.2.0 -m "v0.2.0"
    git push origin main v0.2.0
