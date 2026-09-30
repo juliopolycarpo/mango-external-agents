@@ -175,6 +175,20 @@ fn reducer_with_open_calls(count: usize) -> Reducer {
     reducer
 }
 
+/// A streaming call's updates all arriving inside the coalescing window: the first is delivered and
+/// every later one is merged into the held update, so this is the cost of holding.
+fn hold_within_interval(frames: Vec<SessionUpdate>) -> usize {
+    let mut reducer = reducer_with_open_calls(1);
+    let start = Instant::now();
+    let mut delivered = 0;
+    for frame in frames {
+        let (events, _) = reducer.update_at(frame, start);
+        delivered += events.len();
+        std::hint::black_box(events);
+    }
+    delivered + std::hint::black_box(reducer.finish()).len()
+}
+
 fn main() {
     let bench = Bench::new("acp reducer (tool-call content)");
     let large = Unit::new(LARGE_FRAMES as u64, "frame");
@@ -268,4 +282,37 @@ fn main() {
             replay_facts_only,
         );
     }
+
+    // A running call that re-sends its whole body with every update, all inside one coalescing
+    // window, so the reducer holds each merge. One call, so the unit is the update. The 2 KiB case
+    // is under the bound and is held as it arrived.
+    let held_frames = |content: &[Value]| -> Vec<SessionUpdate> {
+        (0..LARGE_FRAMES)
+            .map(|_| tool_call_update(0, "in_progress", content))
+            .collect()
+    };
+    bench.run(
+        "acp/reduce/tool-call-update/held-text-20x2KiB",
+        large,
+        || held_frames(&[text_block(&"output line\n".repeat(2048 / 12))]),
+        hold_within_interval,
+    );
+    bench.run(
+        "acp/reduce/tool-call-update/held-text-20x64KiB",
+        large,
+        || held_frames(&[text_block(&"output line\n".repeat(64 * 1024 / 12))]),
+        hold_within_interval,
+    );
+    bench.run(
+        "acp/reduce/tool-call-update/held-text-20x1MiB",
+        large,
+        || held_frames(&[text_block(&big_output)]),
+        hold_within_interval,
+    );
+    bench.run(
+        "acp/reduce/tool-call-update/held-diffs-20x10x100KiB",
+        large,
+        || held_frames(&large_diffs),
+        hold_within_interval,
+    );
 }
