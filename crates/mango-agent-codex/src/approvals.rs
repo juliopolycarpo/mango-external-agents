@@ -28,7 +28,7 @@ use crate::protocol::approvals::{
 /// The options are derived from the decision values the pinned schema declares, narrowed by the
 /// two amendment fields the request either carries or does not. The server also writes an
 /// undeclared `availableDecisions` list; `crate::protocol::approvals` says why it is not read.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PendingApproval {
     /// What a host renders and a broker decides on.
     pub request: PermissionRequest,
@@ -36,6 +36,22 @@ pub struct PendingApproval {
     decisions: Vec<(String, ServerAnswer)>,
     /// The answer that refuses without stopping the turn.
     refusal: ServerAnswer,
+}
+
+impl std::fmt::Debug for PendingApproval {
+    /// The question's shape and the ids of the options it offers, never the command, reason, rule
+    /// or profile behind them. The option ids are this harness's own (`accept`, `grant:turn`), so
+    /// they are printed; the answers they map to are not, because an amendment answer carries the
+    /// exact rule it writes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let option_ids: Vec<&str> = self.decisions.iter().map(|(id, _)| id.as_str()).collect();
+        formatter
+            .debug_struct("PendingApproval")
+            .field("request", &self.request)
+            .field("option_ids", &option_ids)
+            .field("refusal", &self.refusal)
+            .finish()
+    }
 }
 
 impl PendingApproval {
@@ -1456,6 +1472,56 @@ mod tests {
             assert!(
                 detail.contains(&context.to_string()),
                 "expected the whole context in the detail | received: {detail:?}"
+            );
+        }
+    }
+
+    /// A host that debug-logs a question must not log the command, the reason, the working
+    /// directory, or the standing rule an amendment option would write: the pending approval holds
+    /// the wire answers, which carry the amendment payloads.
+    #[test]
+    fn a_pending_approval_does_not_print_the_content_it_holds() {
+        let pending = to_request(
+            &command_request(json!({
+                "command": "CANARY-command", "cwd": "CANARY-cwd", "reason": "CANARY-reason",
+                "proposedExecpolicyAmendment": ["CANARY-prefix"],
+                "proposedNetworkPolicyAmendments": [{"host": "CANARY-host", "action": "allow"}],
+            })),
+            now(),
+        )
+        .expect("expected a question");
+        assert!(
+            pending
+                .decision_for("acceptWithExecpolicyAmendment")
+                .is_some(),
+            "expected the amendments to be offered, so the canaries are really held"
+        );
+        for (form, text) in [
+            ("{:?}", format!("{pending:?}")),
+            ("{:#?}", format!("{pending:#?}")),
+        ] {
+            for (field, canary) in [
+                ("command", "CANARY-command"),
+                ("cwd", "CANARY-cwd"),
+                ("reason", "CANARY-reason"),
+                ("execpolicy amendment", "CANARY-prefix"),
+                ("network amendment host", "CANARY-host"),
+            ] {
+                assert!(
+                    !text.contains(canary),
+                    "expected PendingApproval {form} to omit the {field} canary {canary:?} | received: {text}"
+                );
+            }
+        }
+        let text = format!("{pending:?}");
+        for named in [
+            "PendingApproval",
+            "acceptWithExecpolicyAmendment",
+            "decline",
+        ] {
+            assert!(
+                text.contains(named),
+                "expected PendingApproval {{:?}} to name {named:?} | received: {text}"
             );
         }
     }
