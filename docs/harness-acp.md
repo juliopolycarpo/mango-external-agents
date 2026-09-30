@@ -274,7 +274,9 @@ whole conversation through `session/update` before it answers, and a frame betwe
 same case. No host stream is open to receive those events, so the turn reducer is not fed: such a frame
 contributes only its session facts (the command catalog and the configuration catalog, which
 `Reducer::session_facts` reads), and a replayed tool call leaves no open call behind for the next turn
-to reset. `current_mode_update` produces no fact on either path.
+to reset. `current_mode_update` produces no fact on either path. A frame the client read for a turn
+that has since claimed its terminal is treated the same way, so it cannot leave a call open in the
+reducer of the turn that replaced it.
 
 ## Permissions
 
