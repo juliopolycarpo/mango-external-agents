@@ -113,7 +113,10 @@ completion or failure. A stream that already committed a terminal, an overflow f
 refuses every close, so nothing follows it. Nothing waits for room.
 
 **Conversation events and approvals retain thread and native-turn ownership.** Delayed events
-cannot finish a replacement turn. Reviews explicitly account for the early `turn/started` id
+cannot finish a replacement turn. Until the `turn/start` answer names the native turn, only a frame on this session's own thread can
+claim the pending id: a subagent's traffic on the shared connection is ignored there, so it cannot
+be announced as the turn, cannot drop the session's own early output, and cannot become the target
+of a cancel. Reviews explicitly account for the early `turn/started` id
 differing from the review response. Child-thread events remain excluded until the shared API
 can represent parent-child activity and approval ownership. A terminal or an explicitly refused
 `turn/start` clears every owner-bound marker before it releases admission, so a cancellation reaper
@@ -442,6 +445,20 @@ confirms that answer and consumes its bounded acknowledgement; it cannot become 
 that spends capacity for a later approval. This is client-side timing only: it adds no app-server
 method or wire field beyond the existing [documented surface][readme].
 
+### Debug output
+
+Every interaction carrier prints metadata only, following the `Debug` policy in
+`docs/compliance.md`: `PendingApproval`, `ServerRequest`, the approval, permissions, question and
+elicitation params, and every answer type (`ServerAnswer`, `ApprovalDecisionValue`,
+`ApprovalResponse`, `PermissionsRequestApprovalResponse` and the question-round answers). A
+debug-logged command approval reads, abridged,
+`CommandExecution(CommandExecutionApprovalParams { command: Some(<14 bytes redacted>), .. })`:
+which members are present and how large they are, never the command, reason, working directory,
+amendment prefix, host, permission profile or answer text. Vendor-minted ids are reported by
+length, as core does for an `InteractionId`; the option ids this harness offers (`accept`,
+`grant:turn`) and the method names it recognises print as themselves. Notifications, thread items
+and the reducers are raw protocol types outside this set.
+
 ### Permissions
 
 `item/permissions/requestApproval` is a third approval family: a permission profile the agent asks
@@ -627,11 +644,13 @@ reported only by a full read, so a sparse update leaves the last read's in place
 
 ## Transports
 
-`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket, and its README
-says of the first: "Websocket transport is currently experimental and unsupported. Do not rely on
-it for production workloads." Declaring it would invite hosts to build on a surface the vendor has
-already withdrawn once. The unix socket is the later opportunity; an undeclared transport is
-refused as `Error::UnsupportedTransport` before anything is spawned.
+`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket. OpenAI's
+[app-server documentation][app-server] (read 2026-09-30) lists the first as "websocket (--listen
+ws://IP:PORT, experimental and unsupported)" and says: "The app-server command and WebSocket
+transport are experimental and aren’t supported for production workloads." Declaring it would
+invite hosts to build on a surface the vendor does not support for production. The unix socket is
+the later opportunity; an undeclared transport is refused as `Error::UnsupportedTransport` before
+anything is spawned.
 
 ## MCP
 
