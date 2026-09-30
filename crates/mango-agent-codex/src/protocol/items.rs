@@ -7,8 +7,12 @@
 //! records can still be shown — or an echo of the client's own input dropped — by name rather
 //! than by silence.
 
+use std::fmt;
+
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::redacted;
 
 /// How a piece of a turn's work ended, in the one spelling every item family shares.
 ///
@@ -37,7 +41,7 @@ pub enum ItemStatus {
 pub type CommandExecutionStatus = ItemStatus;
 
 /// One file a patch touches.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileUpdateChange {
     /// The file.
@@ -51,7 +55,7 @@ pub struct FileUpdateChange {
 /// One unit of a turn's work, in the families this harness renders.
 ///
 /// Non-exhaustive: a family that starts mattering becomes a variant here.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -219,6 +223,151 @@ const MODELLED_FAMILIES: &[&str] = &[
 /// `userMessage` is the input of this turn, `hookPrompt` the user's own configuration replayed,
 /// and `functionCallOutput` tool output a client supplied through `turn/start.toolOutput`.
 const CLIENT_ECHO_FAMILIES: &[&str] = &["userMessage", "hookPrompt", "functionCallOutput"];
+
+// Metadata-only `Debug`: what kind of item, its status and counts, and how large each piece of text
+// is, never the message, command, output, diff, path or plan the vendor sent. Item ids are reported
+// by length. See `docs/compliance.md`, and `crate::redacted` for the placeholder.
+
+impl fmt::Debug for FileUpdateChange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileUpdateChange")
+            .field("path", &redacted::text(&self.path))
+            .field("diff", &redacted::text(&self.diff))
+            .finish()
+    }
+}
+
+/// The combined size of every path and diff in a patch, so a log can show a huge one without
+/// showing a file.
+pub(crate) fn changes_size(changes: &[FileUpdateChange]) -> redacted::Redacted {
+    redacted::Redacted::sum(
+        changes
+            .iter()
+            .map(|change| change.path.len() + change.diff.len()),
+    )
+}
+
+impl fmt::Debug for ThreadItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AgentMessage { id, text } => formatter
+                .debug_struct("AgentMessage")
+                .field("id", &redacted::text(id))
+                .field("text", &redacted::text(text))
+                .finish(),
+            Self::Reasoning {
+                id,
+                summary,
+                content,
+            } => formatter
+                .debug_struct("Reasoning")
+                .field("id", &redacted::text(id))
+                .field("summary_parts", &summary.len())
+                .field(
+                    "summary",
+                    &redacted::Redacted::sum(summary.iter().map(String::len)),
+                )
+                .field("content_parts", &content.len())
+                .field(
+                    "content",
+                    &redacted::Redacted::sum(content.iter().map(String::len)),
+                )
+                .finish(),
+            Self::CommandExecution {
+                id,
+                command,
+                cwd,
+                status,
+                aggregated_output,
+                exit_code,
+            } => formatter
+                .debug_struct("CommandExecution")
+                .field("id", &redacted::text(id))
+                .field("command", &redacted::text(command))
+                .field("cwd", &redacted::opt_text(cwd.as_deref()))
+                .field("status", status)
+                .field(
+                    "aggregated_output",
+                    &redacted::opt_text(aggregated_output.as_deref()),
+                )
+                .field("exit_code", exit_code)
+                .finish(),
+            Self::FileChange {
+                id,
+                changes,
+                status,
+            } => formatter
+                .debug_struct("FileChange")
+                .field("id", &redacted::text(id))
+                .field("change_count", &changes.len())
+                .field("changes", &changes_size(changes))
+                .field("status", status)
+                .finish(),
+            Self::McpToolCall {
+                id,
+                server,
+                tool,
+                status,
+            } => formatter
+                .debug_struct("McpToolCall")
+                .field("id", &redacted::text(id))
+                .field("server", &redacted::text(server))
+                .field("tool", &redacted::text(tool))
+                .field("status", status)
+                .finish(),
+            Self::WebSearch { id, query } => formatter
+                .debug_struct("WebSearch")
+                .field("id", &redacted::text(id))
+                .field("query", &redacted::text(query))
+                .finish(),
+            Self::Plan { id, text } => formatter
+                .debug_struct("Plan")
+                .field("id", &redacted::text(id))
+                .field("text", &redacted::text(text))
+                .finish(),
+            Self::SubAgentActivity { id, kind } => formatter
+                .debug_struct("SubAgentActivity")
+                .field("id", &redacted::text(id))
+                .field("kind", &redacted::opt_text(kind.as_deref()))
+                .finish(),
+            Self::EnteredReviewMode { id, review } => formatter
+                .debug_struct("EnteredReviewMode")
+                .field("id", &redacted::text(id))
+                .field("review", &redacted::text(review))
+                .finish(),
+            Self::ExitedReviewMode { id, review } => formatter
+                .debug_struct("ExitedReviewMode")
+                .field("id", &redacted::text(id))
+                .field("review", &redacted::text(review))
+                .finish(),
+            Self::ContextCompaction { id } => formatter
+                .debug_struct("ContextCompaction")
+                .field("id", &redacted::text(id))
+                .finish(),
+            // The family is the vendor's own discriminator. A family this harness names reads as
+            // itself; any other is the server's text, so only its length is reported.
+            Self::Other {
+                item_type,
+                id,
+                status,
+            } => {
+                let known = MODELLED_FAMILIES.contains(&item_type.as_str())
+                    || CLIENT_ECHO_FAMILIES.contains(&item_type.as_str());
+                let mut other = formatter.debug_struct("Other");
+                if known {
+                    other.field("item_type", item_type);
+                } else {
+                    other.field("item_type", &redacted::text(item_type));
+                }
+                other
+                    .field("id", &redacted::opt_text(id.as_deref()))
+                    .field("status", status)
+                    .finish()
+            }
+        }
+    }
+}
 
 impl ThreadItem {
     /// The vendor's own id for this item, when it has one.
