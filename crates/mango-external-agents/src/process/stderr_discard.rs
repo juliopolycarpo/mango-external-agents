@@ -200,6 +200,34 @@ mod tests {
         );
     }
 
+    /// A name far behind a string escape is only awaiting a value when nothing but blanks follows
+    /// it, and blanks collapse to one byte, so the terminator is then always in the window. Text
+    /// that follows the name after the escape ended ends the wait, and the look-back need not
+    /// reach the escape.
+    #[test]
+    fn a_name_behind_an_escape_that_ended_lines_ago_is_not_awaiting_a_value() {
+        let mut dropped = b"API_KEY \x1b]0;".to_vec();
+        dropped.extend(std::iter::repeat_n(b'x', 400));
+        dropped.push(0x07);
+        dropped.extend_from_slice(b"=\n");
+        for line in 0..30 {
+            dropped.extend(format!("line{line} noise\n").bytes());
+        }
+        assert!(
+            Discard::after_line(&dropped).is_none(),
+            "expected the assignment settled by the lines after it, leaving no value awaited"
+        );
+
+        let mut awaiting = b"API_KEY \x1b]0;".to_vec();
+        awaiting.extend(std::iter::repeat_n(b'x', 400));
+        awaiting.push(0x07);
+        awaiting.extend_from_slice(b" \n\n\r \n\t=\n\n  \n");
+        assert!(
+            Discard::after_line(&awaiting).is_some(),
+            "expected blanks after the separator to leave the value awaited"
+        );
+    }
+
     #[test]
     fn a_line_that_leaves_no_value_awaited_ends_the_discard_at_its_terminator() {
         let mut discard = Discard::mid_line(b"noise API_KEY=value");
