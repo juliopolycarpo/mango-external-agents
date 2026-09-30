@@ -156,16 +156,18 @@ pub fn sanitize_field(raw: &str) -> BoundedText {
 /// it is the buffer that keeps the survivors. The result is byte-identical to
 /// `sanitize_field(&raw)`.
 pub(crate) fn sanitize_owned(mut raw: String) -> BoundedText {
-    if !raw.chars().any(is_strippable) {
+    if !may_need_stripping(&raw) {
         return BoundedText {
             text: raw,
             truncated: false,
         };
     }
+    // One pass: a removal always shortens the text, so the length says whether anything went.
+    let before = raw.len();
     raw.retain(|character| !is_strippable(character));
     BoundedText {
+        truncated: raw.len() != before,
         text: raw,
-        truncated: true,
     }
 }
 
@@ -282,6 +284,29 @@ pub fn is_argv_value_with_max(raw: &str, max_code_points: usize) -> bool {
             .all(|character| !character.is_control() && !is_strippable(character))
 }
 
+/// A byte scan that never misses text [`is_strippable`] would strip, and is much cheaper than
+/// decoding every character to find out that ordinary text has nothing to strip.
+///
+/// It looks for the UTF-8 bytes a stripped character must contain: a C0 control or DEL as itself,
+/// and the lead byte of each multi-byte sequence that holds a stripped character (`C2` for the C1
+/// controls, `D8` for U+061C, `E2` for the marks, embeddings and isolates). Text without any of
+/// them is clean; text with one may still be clean (an em dash leads with `E2`), so the caller
+/// confirms with the exact per-character test.
+fn may_need_stripping(text: &str) -> bool {
+    // Sixteen bytes at a time with no early exit inside a block, so the compiler can test a block
+    // with vector instructions instead of branching on every byte.
+    text.as_bytes().chunks(16).any(|block| {
+        block
+            .iter()
+            .fold(false, |found, byte| found | is_flagged_byte(*byte))
+    })
+}
+
+/// Whether a byte can belong to a stripped character.
+const fn is_flagged_byte(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x08 | 0x0b..=0x1f | 0x7f | 0xc2 | 0xd8 | 0xe2)
+}
+
 /// C0 and C1 controls except tab and newline, and every bidirectional formatting character.
 ///
 /// Expressed as code-point tests rather than as a character class: a regular expression made of
@@ -360,6 +385,14 @@ mod tests {
             String::from("\u{1b}[0m"),
             String::from("\u{0}\u{7f}\u{9f}\u{202e}"),
         ];
+        // A stripped character at every offset around the prefilter's 16-byte blocks.
+        for offset in 0..40 {
+            for dirty in ['\u{1b}', '\u{202e}', '\u{85}'] {
+                let mut text = "a".repeat(40);
+                text.insert(offset, dirty);
+                inputs.push(text);
+            }
+        }
         for code in edges {
             let character = char::from_u32(code).expect("expected a scalar value");
             inputs.push(character.to_string());
@@ -385,6 +418,19 @@ mod tests {
                 (owned.text.as_bytes(), owned.truncated),
                 (expected_text.as_bytes(), expected_truncated),
                 "expected sanitize_owned to match the reference | input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_byte_prefilter_flags_every_character_that_is_stripped() {
+        let mut buffer = [0_u8; 4];
+        for character in ('\0'..=char::MAX).filter(|character| super::is_strippable(*character)) {
+            let encoded: &str = character.encode_utf8(&mut buffer);
+            assert!(
+                super::may_need_stripping(encoded),
+                "expected the prefilter to flag U+{:04X} | received clean",
+                u32::from(character)
             );
         }
     }
