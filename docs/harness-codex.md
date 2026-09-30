@@ -442,6 +442,20 @@ confirms that answer and consumes its bounded acknowledgement; it cannot become 
 that spends capacity for a later approval. This is client-side timing only: it adds no app-server
 method or wire field beyond the existing [documented surface][readme].
 
+### Debug output
+
+Every interaction carrier prints metadata only, following the `Debug` policy in
+`docs/compliance.md`: `PendingApproval`, `ServerRequest`, the approval, permissions, question and
+elicitation params, and every answer type (`ServerAnswer`, `ApprovalDecisionValue`,
+`ApprovalResponse`, `PermissionsRequestApprovalResponse` and the question-round answers). A
+debug-logged command approval reads, abridged,
+`CommandExecution(CommandExecutionApprovalParams { command: Some(<14 bytes redacted>), .. })`:
+which members are present and how large they are, never the command, reason, working directory,
+amendment prefix, host, permission profile or answer text. Vendor-minted ids are reported by
+length, as core does for an `InteractionId`; the option ids this harness offers (`accept`,
+`grant:turn`) and the method names it recognises print as themselves. Notifications, thread items
+and the reducers are raw protocol types outside this set.
+
 ### Permissions
 
 `item/permissions/requestApproval` is a third approval family: a permission profile the agent asks
