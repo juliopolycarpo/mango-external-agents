@@ -486,10 +486,21 @@ struct FakeStdin {
 #[async_trait::async_trait]
 impl ByteSink for FakeStdin {
     async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        // Each byte is scanned once, from where the last write stopped, and the consumed lines are
+        // removed in one pass at the end rather than one drain per line.
+        let mut line_start = 0;
+        let mut scan_from = self.partial.len();
         self.partial.extend_from_slice(bytes);
-        while let Some(newline) = self.partial.iter().position(|byte| *byte == b'\n') {
-            let record: Vec<u8> = self.partial.drain(..=newline).collect();
-            let line = String::from_utf8_lossy(&record).trim_end().to_owned();
+        while let Some(offset) = self.partial[scan_from..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let line_end = scan_from + offset + 1;
+            let line = String::from_utf8_lossy(&self.partial[line_start..line_end])
+                .trim_end()
+                .to_owned();
+            line_start = line_end;
+            scan_from = line_end;
             self.state
                 .written
                 .lock()
@@ -506,6 +517,7 @@ impl ByteSink for FakeStdin {
             }
             self.state.changed.notify_waiters();
         }
+        self.partial.drain(..line_start);
         Ok(())
     }
 
@@ -598,6 +610,100 @@ mod tests {
         assert_eq!(launch.argv[0], "claude");
         assert_eq!(launch.cwd.to_string_lossy(), "/workspace");
         assert_eq!(launch.env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    /// Feeds `input` to a fresh child's stdin in `sizes`-long writes (cycled) and returns the
+    /// lines the fake recorded.
+    async fn written_lines(input: &[u8], sizes: &[usize]) -> Vec<String> {
+        let launcher = FakeLauncher::new();
+        launcher.push(FakeProcess::responding(|_| Vec::new()));
+        let mut child = launcher
+            .spawn(spec(&["codex", "app-server"]))
+            .await
+            .expect("expected a child");
+        let mut stdin = child.stdin.take().expect("expected a stdin");
+        let mut rest = input;
+        for size in sizes.iter().copied().cycle() {
+            if rest.is_empty() {
+                break;
+            }
+            let (piece, tail) = rest.split_at(size.max(1).min(rest.len()));
+            stdin
+                .write_all(piece)
+                .await
+                .expect("expected the write to land");
+            rest = tail;
+        }
+        launcher.written()
+    }
+
+    /// What the peer reads: the stream cut at every newline, however it was chunked on the way.
+    fn expected_lines(input: &[u8]) -> Vec<String> {
+        let mut lines: Vec<&[u8]> = input.split(|byte| *byte == b'\n').collect();
+        lines.pop();
+        lines
+            .into_iter()
+            .map(|line| String::from_utf8_lossy(line).trim_end().to_owned())
+            .collect()
+    }
+
+    /// A deterministic pseudo-random stream of short lines: some empty, some with CRs, trailing
+    /// blanks or bytes that are not UTF-8, and a tail with no newline.
+    fn noisy_stream(seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet: &[u8] = b"ab {}\":,\r\t\n\n\xc3\xa9\xff\xe2\x80";
+        (0..2_000)
+            .map(|_| alphabet[usize::try_from(next() % alphabet.len() as u64).unwrap_or(0)])
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stdin_lines_do_not_depend_on_how_the_bytes_are_chunked() {
+        for seed in 1..=40 {
+            let input = noisy_stream(seed);
+            let expected = expected_lines(&input);
+            for sizes in [&[1][..], &[2, 3], &[7], &[64], &[1, 500, 2], &[usize::MAX]] {
+                assert_eq!(
+                    written_lines(&input, sizes).await,
+                    expected,
+                    "expected the recorded lines to match the newline split | seed: {seed} | write sizes: {sizes:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_split_across_writes_is_recorded_once_and_the_tail_waits() {
+        let lines = written_lines(b"one\r\ntw", &[4, 100]).await;
+        assert_eq!(lines, vec![String::from("one")]);
+        let lines = written_lines(b"one\ntwo\nthr", &[3, 3, 3, 3]).await;
+        assert_eq!(lines, vec![String::from("one"), String::from("two")]);
+    }
+
+    /// One write carrying every line, the shape that once cost time quadratic in its size.
+    #[tokio::test]
+    async fn one_large_write_of_many_lines_records_every_line_in_order() {
+        let lines: Vec<String> = (0..25_000)
+            .map(|index| format!("{{\"id\":\"{index}\",\"p\":\"{}\"}}", "x".repeat(24)))
+            .collect();
+        let input = format!("{}\n", lines.join("\n"));
+        let recorded = written_lines(input.as_bytes(), &[usize::MAX]).await;
+        assert_eq!(
+            (recorded.len(), recorded.first(), recorded.last()),
+            (lines.len(), lines.first(), lines.last()),
+            "expected every line of a {} byte write recorded in order",
+            input.len()
+        );
+        assert_eq!(
+            recorded, lines,
+            "expected the recorded lines to equal the written lines"
+        );
     }
 
     #[tokio::test]
