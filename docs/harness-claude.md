@@ -483,6 +483,16 @@ skill, a plugin's `plugin:command`, an MCP server's `mcp__*`. Announcing nothing
 an empty catalog: the last announcement wins wherever it lands, so an empty one would erase a real
 catalog an earlier run published.
 
+### Debug output
+
+The raw `stream-json` records are carriers under the `Debug` policy in `docs/compliance.md`: a
+`tool_result` body arrives in them, and a `Read` of a `.env` is that body. `StreamRecord` keeps the
+whole line's JSON and `InitRecord`, `PermissionDenied`, `ContentBlock`, `StreamEvent`, `Delta` and
+`ResultRecord` borrow from it, so each has a hand-written `Debug` that reports the record's `type`
+and `subtype` (when they have a label's shape, otherwise their size), how many members it has and
+how many bytes they take, never a value. A debug-logged tool result reads
+`ContentBlock { kind: Some("tool_result"), is_error: false, members: 3, size: <96 bytes redacted> }`.
+
 ## Deliberate differences from the mangostudio TypeScript adapter
 
 - The turn stream is a **bounded** channel; a host that stops reading applies backpressure to the
