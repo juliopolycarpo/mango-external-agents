@@ -70,7 +70,7 @@ tag_log=$tag_bin/gh.log
 ln -s "$PWD/scripts/test-fixtures/fake-tag-verification-cli.sh" "$tag_bin/gh"
 check_tag() {
   env PATH="$tag_bin:$PATH" FAKE_GH_LOG=$tag_log FAKE_TAG_NAME=v0.4.0 "$@" \
-    scripts/check-release-tag-signature.sh owner/repository "$TAG_VERSION"
+    scripts/check-release-tag-signature.sh owner/repository "$TAG_VERSION" "$RELEASE_COMMIT"
 }
 expect_tag_refusal() {
   local status=$1
@@ -95,6 +95,7 @@ expect_tag_refusal() {
   esac
 }
 TAG_VERSION=0.4.0
+RELEASE_COMMIT=56307d67182e53594382e04682800b36eb421689
 check_tag FAKE_TAG_VERIFIED=true FAKE_TAG_REASON=valid >/dev/null || {
   echo 'expected a verified annotated tag to pass, received a refusal' >&2
   exit 1
@@ -105,9 +106,13 @@ expect_tag_refusal 1 'received verified=false reason=unknown_key' \
   FAKE_TAG_VERIFIED=false FAKE_TAG_REASON=unknown_key
 expect_tag_refusal 1 'expected v0.4.0 to be an annotated signed tag, received a commit object' \
   FAKE_TAG_OBJECT=commit
+expect_tag_refusal 1 'expected tag v0.4.0 to be signed under that name, received a signature over the name candidate' \
+  FAKE_TAG_SIGNED_NAME=candidate
+expect_tag_refusal 1 'expected tag v0.4.0 to point at the commit being released 56307d67182e53594382e04682800b36eb421689, received 1111111111111111111111111111111111111111' \
+  FAKE_TAG_COMMIT=1111111111111111111111111111111111111111
 TAG_VERSION=0.9.0
 expect_tag_refusal 2 'expected tag v0.9.0 to exist in owner/repository' FAKE_TAG_VERIFIED=true
-if scripts/check-release-tag-signature.sh owner/repository >/dev/null 2>&1; then
+if scripts/check-release-tag-signature.sh owner/repository 0.4.0 >/dev/null 2>&1; then
   echo 'expected the tag check to refuse a missing version, received success' >&2
   exit 1
 fi

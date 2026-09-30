@@ -34,7 +34,7 @@ stored in the repository or in CI.
    git push origin main v0.2.0
    ```
 
-4. Watch the `Release` workflow. It verifies the manifests match the tag, runs `scripts/check.sh`,
+4. Watch the `Release` workflow. It verifies the tag signature and that the manifests match the tag, runs `scripts/check.sh`,
    publishes each crate that is not on crates.io yet, and creates the GitHub release with
    git-cliff notes.
 
