@@ -3408,7 +3408,7 @@ impl CodexSession {
                 native_turn_id: String::new(),
                 announced: false,
                 earlier_native_turn_ids: VecDeque::new(),
-                reducer: crate::turn_reducer::TurnReducer::new(),
+                reducer: crate::turn_reducer::TurnReducer::for_limits(self.shared.host.limits()),
                 is_review: rpc_method == method::REVIEW_START,
                 start_unanswerable: false,
                 interrupt_dispatched: false,
