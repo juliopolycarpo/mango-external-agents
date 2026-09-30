@@ -75,18 +75,37 @@ impl PendingApproval {
     }
 }
 
+/// The `networkApprovalContext` member of a raw command-approval frame.
+///
+/// Read from the raw params, beside the public [`CommandExecutionApprovalParams`], so that type
+/// keeps the fields it has: adding a public field to it would break a struct literal built outside
+/// the crate. `None` for another method, an absent member and an explicit `null`.
+pub(crate) fn network_context(method: &str, params: &Value) -> Option<Value> {
+    if method != crate::protocol::approvals::method::COMMAND_EXECUTION_APPROVAL {
+        return None;
+    }
+    params
+        .get("networkApprovalContext")
+        .filter(|context| !context.is_null())
+        .cloned()
+}
+
 /// One of the server's approvals, as a question with options.
+///
+/// `network_context` is [`network_context`] of the frame the request was parsed from; only a
+/// command approval uses it.
 ///
 /// `None` for a request this harness refuses; the caller answers those with a protocol error.
 #[must_use]
 pub(crate) fn to_request(
     request: &ServerRequest,
+    network_context: Option<&Value>,
     operation: OperationRef,
     expires_at: SystemTime,
 ) -> Option<PendingApproval> {
     match request {
         ServerRequest::CommandExecution(params) => {
-            Some(from_command(params, operation, expires_at))
+            Some(from_command(params, network_context, operation, expires_at))
         }
         ServerRequest::FileChange(params) => Some(from_file_change(params, operation, expires_at)),
         ServerRequest::Permissions(params) => Some(from_permissions(params, operation, expires_at)),
@@ -97,6 +116,7 @@ pub(crate) fn to_request(
 
 fn from_command(
     params: &CommandExecutionApprovalParams,
+    network_context: Option<&Value>,
     operation: OperationRef,
     expires_at: SystemTime,
 ) -> PendingApproval {
@@ -139,7 +159,7 @@ fn from_command(
     // The requested host leads the detail, ahead of anything the agent wrote, so a long `reason`
     // cannot push it past the display bound.
     let mut lines: Vec<String> = Vec::with_capacity(4);
-    if let Some(context) = params.network_approval_context.as_ref() {
+    if let Some(context) = network_context {
         lines.push(network_context_line(context));
     }
     lines.extend(unoffered_line(&unoffered));
@@ -558,6 +578,7 @@ mod tests {
         );
         super::to_request(
             &request,
+            None,
             operation(),
             mango_external_agents::Limits::default()
                 .approval_expires_at(std::time::SystemTime::UNIX_EPOCH)
@@ -586,11 +607,35 @@ mod tests {
     fn to_request(request: &ServerRequest, now: SystemTime) -> Option<super::PendingApproval> {
         build_request(
             request,
+            None,
             operation(),
             mango_external_agents::Limits::default()
                 .approval_expires_at(now)
                 .ok()?,
         )
+    }
+
+    /// A command approval built the way the session builds it: the raw frame supplies the network
+    /// context, and the parsed request supplies everything else.
+    fn command_pending(extra: serde_json::Value) -> super::PendingApproval {
+        let mut params = json!({
+            "threadId": "thread-1", "turnId": "turn-1", "itemId": "exec-1",
+            "startedAtMs": 1_u64, "command": "curl example.com", "cwd": "/workspace",
+        });
+        if let (Some(base), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            base.extend(extra.clone());
+        }
+        let context = super::network_context(method::COMMAND_EXECUTION_APPROVAL, &params);
+        let request = ServerRequest::parse(method::COMMAND_EXECUTION_APPROVAL, params);
+        build_request(
+            &request,
+            context.as_ref(),
+            operation(),
+            mango_external_agents::Limits::default()
+                .approval_expires_at(now())
+                .expect("default approval deadline"),
+        )
+        .expect("expected a question")
     }
 
     fn now() -> SystemTime {
@@ -1365,14 +1410,10 @@ mod tests {
 
     #[test]
     fn a_managed_network_approval_shows_the_host_it_asks_about() {
-        let pending = to_request(
-            &command_request(json!({
-                "networkApprovalContext": {"host": "api.example.com", "protocol": "https"},
-                "reason": "y".repeat(8_192),
-            })),
-            now(),
-        )
-        .expect("expected a question");
+        let pending = command_pending(json!({
+            "networkApprovalContext": {"host": "api.example.com", "protocol": "https"},
+            "reason": "y".repeat(8_192),
+        }));
 
         let bounded = pending.request.normalized().expect("expected bounding");
         let detail = bounded.detail.unwrap_or_default();
@@ -1410,11 +1451,7 @@ mod tests {
             json!({"host": "example.com", "protocol": "https", "port": 8443}),
             json!({"host": "example.com", "protocol": "ftp"}),
         ] {
-            let pending = to_request(
-                &command_request(json!({"networkApprovalContext": context})),
-                now(),
-            )
-            .expect("expected a question");
+            let pending = command_pending(json!({"networkApprovalContext": context}));
             let detail = detail_of(&pending);
             assert!(
                 detail.contains(&context.to_string()),
@@ -1423,14 +1460,36 @@ mod tests {
         }
     }
 
+    /// The context is read from the raw frame and only for a command approval; an absent member and
+    /// an explicit `null` are the same thing.
+    #[test]
+    fn the_network_context_is_read_from_a_command_frame_only() {
+        let with = json!({"networkApprovalContext": {"host": "a.example", "protocol": "http"}});
+        assert_eq!(
+            super::network_context(method::COMMAND_EXECUTION_APPROVAL, &with),
+            Some(json!({"host": "a.example", "protocol": "http"})),
+            "expected the declared member of a command frame to be read"
+        );
+        assert_eq!(
+            super::network_context(method::FILE_CHANGE_APPROVAL, &with),
+            None,
+            "expected no context from a file-change frame"
+        );
+        for absent in [json!({}), json!({"networkApprovalContext": null})] {
+            assert_eq!(
+                super::network_context(method::COMMAND_EXECUTION_APPROVAL, &absent),
+                None,
+                "expected {absent} to carry no context"
+            );
+        }
+    }
+
     /// Whatever the network context looks like, a person is shown it rather than nothing.
     #[test]
     fn a_network_context_of_an_undeclared_shape_is_shown_as_it_arrived() {
-        let pending = to_request(
-            &command_request(json!({"networkApprovalContext": {"target": "api.example.com"}})),
-            now(),
-        )
-        .expect("expected a question");
+        let pending = command_pending(json!({
+            "networkApprovalContext": {"target": "api.example.com"}
+        }));
         let detail = detail_of(&pending);
         assert!(
             detail.contains(r#"{"target":"api.example.com"}"#),

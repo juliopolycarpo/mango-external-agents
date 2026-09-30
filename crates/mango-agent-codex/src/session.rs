@@ -1814,6 +1814,7 @@ impl PeerHandler for CodexHandler {
         params: Value,
         id: RequestId,
     ) -> ServerRequestOutcome {
+        let network_context = approvals::network_context(&method, &params);
         let request = ServerRequest::parse(&method, params);
 
         if let Some(refusal) = request.refusal() {
@@ -1933,6 +1934,7 @@ impl PeerHandler for CodexHandler {
 
         let Some(pending) = approvals::to_request(
             &request,
+            network_context.as_ref(),
             route.operation(self.shared.session_id.clone()),
             expires_at,
         ) else {
