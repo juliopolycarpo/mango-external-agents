@@ -629,6 +629,11 @@ mod tests {
             matches!(&result, Err(Error::Timeout { operation, .. }) if operation.contains("reaping")),
             "expected a capture error naming the reap failure | received {result:?}"
         );
+        assert_eq!(
+            launcher.live_children(),
+            0,
+            "expected the child to be ended before the reap failure is reported"
+        );
     }
 
     #[tokio::test]
