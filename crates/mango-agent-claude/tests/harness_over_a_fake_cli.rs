@@ -532,6 +532,60 @@ mod discovery {
         );
     }
 
+    /// The receipt of an unreadable `--version` must not carry the wrapper's line as a version:
+    /// opening re-parses the receipt's version, and with `--help` still cut off that would turn
+    /// `Unknown` into a false `VersionTooOld`.
+    #[tokio::test]
+    async fn a_receipt_of_an_unreadable_version_does_not_reopen_as_too_old() {
+        let banner = format!("wrapper 1.0.0\n{}\n2.1.270 (Claude Code)", "x".repeat(8192));
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_version(&banner)
+                .with_help(&cut_off_help()),
+        );
+        let harness = ClaudeHarness::new();
+        let host = host_under(launcher, narrow_lines());
+        let discovery = harness.discover(&host).await.expect("expected a discovery");
+        assert_eq!(discovery.gate, GateVerdict::Unknown);
+        assert_eq!(
+            discovery.version, None,
+            "expected no version to be reported for a banner that never named Claude Code | \
+             received {:?}",
+            discovery.version
+        );
+
+        let mut request = OpenSession::new("chat-1");
+        if let Some(executable) = &discovery.executable {
+            request = request.with_executable(ExecutablePath::resolved(executable.clone()));
+        }
+        let receipt = DiscoveryReceipt::new(HarnessId::claude(), discovery, host.now())
+            .with_executable_fingerprint("same-test-binary")
+            .with_environment_fingerprint("same-test-environment")
+            .with_authorization_fingerprint("same-test-authorization")
+            .bind_to_open(
+                harness.descriptor(),
+                &host,
+                &request,
+                DiscoveryReceiptMeasurements::new()
+                    .with_executable_fingerprint("same-test-binary")
+                    .with_environment_fingerprint("same-test-environment")
+                    .with_authorization_fingerprint("same-test-authorization"),
+            )
+            .expect("expected current receipt evidence to match");
+
+        let opened = harness
+            .open_session(&host, request.with_discovery(receipt))
+            .await;
+        let error = match opened {
+            Ok(_) => panic!("expected an unreadable help surface to refuse opening"),
+            Err(error) => error,
+        };
+        assert!(
+            !matches!(error, Error::VersionGate { .. }),
+            "expected an unreadable version not to refuse opening as too old | received {error:?}"
+        );
+    }
+
     /// The compact form (a bare version) is only trusted when the read finished: a bare number
     /// followed by a read error could be a wrapper's own.
     #[tokio::test]

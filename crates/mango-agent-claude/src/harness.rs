@@ -135,10 +135,14 @@ impl ClaudeHarness {
                 let version = version::parse(&banner);
                 (banner, version)
             }
-            Probed::Incomplete(banner) => {
-                let version = version::parse_incomplete(&banner);
-                (banner, version)
-            }
+            Probed::Incomplete(banner) => match version::parse_incomplete(&banner) {
+                Some(version) => (banner, Some(version)),
+                // Lines that never named Claude Code are not a version, and they must not be
+                // shown as one either: a receipt carries `Discovery::version` and opening parses
+                // it again, so a wrapper's "1.0.0" would come back as a too-old CLI. An empty
+                // banner keeps the CLI installed without offering anything to show or re-parse.
+                None => (String::new(), None),
+            },
         };
         let surface = probe::output(host, executable, &["--help"])
             .await?

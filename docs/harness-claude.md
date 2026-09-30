@@ -51,7 +51,8 @@ concludes from the lines that did arrive differs:
   including the bare compact form `2.1.270`, is not trusted, because the banner line behind a
   wrapper's own preamble may be the one that was lost. Otherwise, and when no line arrived, the CLI
   is installed with an unreadable version and the gate comes from `--help`, as for an unparseable
-  banner. Only a spawn that failed or a child that printed nothing
+  banner. Discovery then reports no `version` at all rather than the lines that arrived, so a
+  receipt never hands a wrapper's number back to opening as if it were Claude Code's. Only a spawn that failed or a child that printed nothing
   reports the CLI as not installed, and opening is never refused as "a CLI that reported no
   version" for a read that failed part way.
 - `auth status` gives the lines that arrived to the same parser as a complete read, which trusts
