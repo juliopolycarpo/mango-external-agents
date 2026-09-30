@@ -186,6 +186,11 @@ struct PendingApproval {
     turn: TurnHandle,
     /// Dropping a resolved question stops its timer task.
     _timer_done: tokio::sync::oneshot::Sender<()>,
+    /// Dropping a settled question ends the broker call deliberating on it.
+    ///
+    /// Every way a question leaves the pending map consumes it, so this drops exactly when the
+    /// question is answered, withdrawn, expired or swept by a cancel or a close.
+    _broker_settled: tokio::sync::oneshot::Sender<()>,
 }
 
 impl PendingApproval {
@@ -1121,6 +1126,7 @@ async fn on_request_permission(
         return responder.respond(permission::cancelled());
     };
     let (timer_done, done) = tokio::sync::oneshot::channel();
+    let (broker_settled, settled) = tokio::sync::oneshot::channel();
     let pending = PendingApproval {
         responder,
         host_answerable: false,
@@ -1136,6 +1142,7 @@ async fn on_request_permission(
         cancel: CancelNotification::new(request.session_id),
         turn: turn.clone(),
         _timer_done: timer_done,
+        _broker_settled: broker_settled,
     };
     if !state.park_pending(id.clone(), pending)? {
         return Ok(());
@@ -1143,28 +1150,41 @@ async fn on_request_permission(
 
     expire_pending(state, &turn, id.clone(), deadline, done);
 
-    resolve_pending(Arc::clone(state), turn, id, question, deadline);
+    resolve_pending(Arc::clone(state), turn, id, question, deadline, settled);
     Ok(())
 }
 
 /// Resolves one parked permission away from ACP's serialized dispatch loop.
 ///
-/// The pending-map admission cap limits these tasks. `ApprovalDeadline::run` bounds policy work,
-/// so a broker that never decides cannot keep an orphan task after the request expires.
+/// The broker call lives exactly as long as its question is parked. `settled` resolves when the
+/// pending map lets go of the question, however it does — answered, withdrawn, expired, cancelled or
+/// swept by a close — and the call is dropped at that point rather than left to run out its
+/// approval deadline. That is what ties these tasks to `max_pending_requests`: an entry in the map
+/// is the only thing that keeps one alive. `ApprovalDeadline::run` still bounds a broker that
+/// never decides, for a question nothing else settles.
+///
+/// A host's [`PermissionBroker`](mango_external_agents::PermissionBroker) therefore sees its
+/// `decide` future dropped, the same as it already does when the deadline passes.
 fn resolve_pending(
     state: Arc<SessionState>,
     turn: TurnHandle,
     id: String,
     question: mango_external_agents::PermissionRequest,
     deadline: ApprovalDeadline,
+    settled: tokio::sync::oneshot::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let decided = match turn.level {
             Some(PermissionLevel::ReadOnly) => standing_refusal(&question),
-            Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => deadline
-                .run(broker_response(state.broker.as_ref(), &question))
-                .await
-                .flatten(),
+            Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => {
+                let deliberation = deadline.run(broker_response(state.broker.as_ref(), &question));
+                tokio::select! {
+                    biased;
+                    // Only ever a dropped sender: nothing is sent on this channel.
+                    _ = settled => return,
+                    decided = deliberation => decided.flatten(),
+                }
+            }
         };
         if !state.announce_pending(&id, decided.is_none()) {
             return;

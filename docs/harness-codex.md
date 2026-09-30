@@ -497,6 +497,48 @@ without sending another answer to the server. An answer already accepted by `Ses
 retains its outcome during shutdown and terminal cleanup. The pending round remains owned until
 its resolution is published, so `Completed` cannot leave an accepted answer's prompt open.
 
+#### When a question can actually arrive
+
+The library declares `questions: true` and drives the whole round trip, but that says what it can
+answer, not how often the vendor asks. What is known, read on 2026-09-30 against the pinned schema
+(`0.154.0`) and a live `codex-cli 0.159.2`:
+
+- `item/tool/requestUserInput` is in the **stable** schema of both builds, the one generated
+  without `--experimental`, described as "EXPERIMENTAL". The label is a description, not a gate:
+  the vendor's [app-server documentation][app-server] says some methods and fields "are
+  intentionally gated behind `experimentalApi` capability" and lists `tool/requestUserInput`
+  "(experimental)", yet this request stays in the stable schema. This harness sends no
+  `capabilities` in `initialize`, so it never opts in to `experimentalApi`.
+- The vendor's own feature list (`codex features list`, `0.159.2`, an empty `CODEX_HOME`) reports
+  `default_mode_request_user_input` as "under development" and `false`. By its name it is the
+  switch for questions in Default mode; this note claims nothing beyond its stage and state.
+- `TurnStartParams.collaborationMode` is absent from the pinned inventory and, at `0.159.2`,
+  appears only in the schema generated with `--experimental`, so the library has no supported way
+  to select a collaboration mode such as Plan. This note cites no vendor sentence tying Plan mode
+  to questions, so it does not claim that it would make one arrive.
+- The one candidate setting found is that feature flag, and it is the user's to set. With
+  `-c features.default_mode_request_user_input=true`, `codex features list` reports it `true`, and
+  `codex features enable` writes it to the user's `config.toml`. That shows the flag can be turned
+  on, not that turning it on makes the vendor raise `requestUserInput`; no vendor source or capture
+  confirms that yet, which is what the capture task below is for. The library cannot set it. It
+  starts `codex app-server` with no `-c` argument, edits no persistent Codex configuration, and its
+  per-thread `config` override on `thread/start` and `thread/resume` carries only the host's MCP
+  servers and the reasoning effort.
+
+So with default settings the vendor probably never asks a question on a library turn. That has
+**not** been observed end to end: no authenticated turn was run for this note, and the conformance
+suite exercises the question path with a pushed synthetic request, not a captured one.
+
+`questions` stays `true` on purpose. Reporting `false` would make conformance require `answer` to
+refuse as unsupported, and a user who enabled the feature would then receive rounds the host cannot
+answer.
+
+**Capture task, open:** once a question is reachable (the feature flag enabled in the user's own
+Codex configuration on a build that has it, or a supported way to select a collaboration mode),
+record one round with `mea capture` and replay it as a fixture, so the question path is proven against
+the vendor's own frames rather than a synthetic one. Re-check the facts above at each pin
+refresh; if the vendor removes the label or turns the flag on by default, this note is out of date.
+
 ### MCP elicitations
 
 `mcpServer/elicitation/request` asks the client to fill in an arbitrary JSON-schema form on an MCP
