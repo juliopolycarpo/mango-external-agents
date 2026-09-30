@@ -71,7 +71,7 @@ pub const ACTIVITY_UPDATE_DETAIL_MAX_CHARS: usize = 2_000;
 /// );
 /// assert_eq!(outcome, mango_agent_codex::reducer::Outcome::Ignore);
 /// ```
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct TurnReducer {
     activities: HashMap<String, OpenActivity>,
     /// The answer text already emitted per message item, until that item completes.
@@ -80,6 +80,38 @@ pub struct TurnReducer {
     max_message_bytes: Option<usize>,
     /// The vendor code of the last error report the server did not mean to retry.
     reported_code: Option<String>,
+}
+
+impl std::fmt::Debug for TurnReducer {
+    /// What the reducer is holding, by count and size: the answer text streamed so far and each open
+    /// activity's latest output are the transcript itself, so neither is printed, and neither are
+    /// the call ids that key them or the vendor's error code.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let streamed_bytes = self.streamed.values().map(|streamed| match streamed {
+            Streamed::Text(text) => text.len(),
+            Streamed::Overflowed => 0,
+        });
+        formatter
+            .debug_struct("TurnReducer")
+            .field("open_activities", &self.activities.len())
+            .field(
+                "activity_tails",
+                &crate::redacted::Redacted::sum(
+                    self.activities.values().map(|activity| activity.tail.len()),
+                ),
+            )
+            .field("streamed_messages", &self.streamed.len())
+            .field(
+                "streamed_text",
+                &crate::redacted::Redacted::sum(streamed_bytes),
+            )
+            .field("max_message_bytes", &self.max_message_bytes)
+            .field(
+                "reported_code",
+                &crate::redacted::opt_text(self.reported_code.as_deref()),
+            )
+            .finish()
+    }
 }
 
 /// What the deltas of one message item delivered, for the completion to be compared against.

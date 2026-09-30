@@ -5,8 +5,12 @@
 //! collapses the rest into [`Notification::Other`], which the reducer drops. A family that starts
 //! mattering becomes a variant here and a case in the reducer, together.
 
+use std::fmt;
+
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::redacted;
 
 use super::items::{FileUpdateChange, ThreadItem};
 use super::requests::{ThreadSummary, TurnHandle};
@@ -268,7 +272,7 @@ pub struct TurnNotification {
 }
 
 /// An item appeared or finished.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemNotification {
     /// Which conversation.
@@ -280,7 +284,7 @@ pub struct ItemNotification {
 }
 
 /// A piece of the answer.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AgentMessageDelta {
@@ -301,7 +305,7 @@ pub struct AgentMessageDelta {
 /// One type for both families the server streams. A default build withholds the raw reasoning and
 /// sends only the summary, so a harness that read one method and not the other would show an empty
 /// reasoning phase on every ordinary turn.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningDelta {
     /// Which conversation.
@@ -320,7 +324,7 @@ pub struct ReasoningDelta {
 ///
 /// Between a command's `item/started` and its `item/completed` this is the only frame the
 /// app-server writes for it, so it is what says a long build is still working.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct CommandOutputDelta {
@@ -336,7 +340,7 @@ pub struct CommandOutputDelta {
 }
 
 /// A progress message from a running MCP tool call.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct McpToolCallProgress {
@@ -352,7 +356,7 @@ pub struct McpToolCallProgress {
 }
 
 /// The files a patch in progress touches, as they stand now.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct FileChangePatchUpdated {
@@ -365,6 +369,82 @@ pub struct FileChangePatchUpdated {
     /// Every file the patch touches so far, each with its diff.
     #[serde(default)]
     pub changes: Vec<FileUpdateChange>,
+}
+
+// Metadata-only `Debug` for the records that carry what the agent wrote or ran. Ids are reported by
+// length and text by size, never the delta, message, output, path or diff. The other records here
+// hold ids, counts and enums, so they keep the derive; `Notification` itself holds only these and
+// those. See `docs/compliance.md`.
+
+impl fmt::Debug for ItemNotification {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ItemNotification")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item", &self.item)
+            .finish()
+    }
+}
+
+impl fmt::Debug for AgentMessageDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentMessageDelta")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field("delta", &redacted::text(&self.delta))
+            .finish()
+    }
+}
+
+impl fmt::Debug for ReasoningDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReasoningDelta")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field("delta", &redacted::text(&self.delta))
+            .finish()
+    }
+}
+
+impl fmt::Debug for CommandOutputDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommandOutputDelta")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field("delta", &redacted::text(&self.delta))
+            .finish()
+    }
+}
+
+impl fmt::Debug for McpToolCallProgress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpToolCallProgress")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field("message", &redacted::text(&self.message))
+            .finish()
+    }
+}
+
+impl fmt::Debug for FileChangePatchUpdated {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileChangePatchUpdated")
+            .field("thread_id", &redacted::text(&self.thread_id))
+            .field("turn_id", &redacted::text(&self.turn_id))
+            .field("item_id", &redacted::text(&self.item_id))
+            .field("change_count", &self.changes.len())
+            .finish()
+    }
 }
 
 /// Tokens, as the server counts them.

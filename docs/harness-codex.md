@@ -456,8 +456,17 @@ debug-logged command approval reads, abridged,
 which members are present and how large they are, never the command, reason, working directory,
 amendment prefix, host, permission profile or answer text. Vendor-minted ids are reported by
 length, as core does for an `InteractionId`; the option ids this harness offers (`accept`,
-`grant:turn`) and the method names it recognises print as themselves. Notifications, thread items
-and the reducers are raw protocol types outside this set.
+`grant:turn`) and the method names it recognises print as themselves.
+
+The records decoded from the app-server's notifications follow the same rule, because command
+output, diffs and answer text arrive in them: `ThreadItem`, `FileUpdateChange`, `TurnError`, the
+item, message-delta, reasoning-delta, command-output, MCP-progress and patch-update notifications,
+and `TurnReducer`, which buffers streamed text and each open activity's output until the item
+completes. They print the item family, status, counts and byte sizes. `Notification` itself holds
+only those records and ids, so it keeps its derive. Token usage, rate limits, statuses and the
+handshake hold numbers and labels and keep theirs, and so do `CodexHarness`, `CodexDiscovery` and
+`VendorConfiguration`, which reach their paths and account only through core types whose `Debug`
+is already metadata-only. The boundary is stated in `docs/compliance.md`.
 
 ### Permissions
 
