@@ -24,17 +24,21 @@ use tokio::sync::Notify;
 ///
 /// On a [`Delivery::Gap`] the subscriber must stop treating what it accumulated for the current
 /// operation as complete. Text deltas are not idempotent, so it cannot patch the hole. It should
-/// mark the view as incomplete and keep reading: the remaining events, including the terminal,
-/// are still delivered after the gap, so the operation's end is never lost.
+/// mark the view as incomplete and keep reading: the events the queue still holds are delivered
+/// after the gap, so the end of the operation being read normally still arrives. It does not
+/// always, because a stalled subscriber that spans several turns can have an earlier turn's
+/// terminal pushed out of the queue by a later turn's events.
 ///
-/// That is all a gap leaves recoverable: the terminal event that follows it, and `missed`, how many
-/// events were dropped. The lost deltas cannot be rebuilt. The stream cannot be replayed, and this
-/// crate keeps no transcript to rebuild them from: [`HubApi`](crate::HubApi) records only an
-/// operation's committed terminal outcome, never its events, and this fan-out retains only a
-/// bounded window of them. A subscriber's own copy has the same hole, so it cannot fill it either.
-/// A host that must be able to show the whole text of an operation has to record the events where
-/// the supervisor drains the stream, before the fan-out, and own that storage. A subscriber that
-/// only renders a live view may instead show the answer as truncated.
+/// That is all a gap leaves recoverable from the fan-out: the events still held after it, and
+/// `missed`, how many were dropped. The lost deltas cannot be rebuilt. The stream cannot be
+/// replayed, and this crate keeps no transcript to rebuild them from: [`HubApi`](crate::HubApi)
+/// records only an operation's committed terminal outcome, never its events, and this fan-out
+/// retains only a bounded window of them. A terminal that was dropped is still on record at the
+/// Hub, and [`HubApi::reconcile`](crate::HubApi::reconcile) answers with it. A subscriber's own
+/// copy of the events has the same hole, so it cannot fill it either. A host that must be able to
+/// show the whole text of an operation has to record the events where the supervisor drains the
+/// stream, before the fan-out, and own that storage. A subscriber that only renders a live view
+/// may instead show the answer as truncated.
 ///
 /// A gap names no operation. One broadcast serves every turn a supervisor runs, so the dropped
 /// events may include an earlier turn's terminal, and the next retained event may already belong

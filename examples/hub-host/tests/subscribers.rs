@@ -196,7 +196,7 @@ async fn try_recv_reports_the_events_a_slow_subscriber_missed_then_delivers_the_
 }
 
 /// The terminal survives the gap, which is how a lagged subscriber learns to stop trusting what
-/// it accumulated and resync.
+/// it accumulated and mark the view incomplete.
 #[tokio::test]
 async fn the_terminal_is_delivered_after_a_gap() {
     let events = TurnBroadcast::new(2);
