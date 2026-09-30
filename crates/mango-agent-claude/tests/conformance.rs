@@ -14,12 +14,38 @@ use mango_agent_claude::ClaudeHarness;
 use mango_external_agents::testing::conformance::{self, Outcome};
 use support::{FakeClaudeCli, READ_TURN, Run, host};
 
+/// What a second turn has shown when the host cancels it: a running command and a reasoning block
+/// that is still streaming, neither of which the vendor will get to finish.
+///
+/// The suite's "a cancelled turn closes what it opened" rule can only fail a harness that has
+/// something to close, and a cancel fake that opened nothing let one that never closed either
+/// pass it.
+fn work_in_flight() -> Vec<String> {
+    let stream_event = |event: serde_json::Value| {
+        serde_json::json!({"type": "stream_event", "event": event}).to_string()
+    };
+    vec![
+        serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_cancelled", "name": "Bash",
+             "input": {"command": "sleep 600"}}]}})
+        .to_string(),
+        stream_event(
+            serde_json::json!({"type": "content_block_start", "index": 1,
+            "content_block": {"type": "thinking"}}),
+        ),
+        stream_event(
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+            "delta": {"type": "thinking_delta", "thinking": "weighing it"}}),
+        ),
+    ]
+}
+
 /// A build that replays the captured turn, then holds a second turn open to be cancelled.
 fn scripted() -> Arc<FakeClaudeCli> {
     Arc::new(
         FakeClaudeCli::new()
             .with_turn(Run::replaying(READ_TURN))
-            .with_turn(Run::stalling(Vec::<String>::new())),
+            .with_turn(Run::stalling(work_in_flight())),
     )
 }
 
