@@ -145,8 +145,9 @@ impl std::fmt::Debug for ServerRequestOutcome {
 pub enum PeerTermination {
     /// The peer closed its output.
     Exited,
-    /// The link failed: reading the peer failed, or a reply to one of its questions could not be
-    /// written, which leaves the peer waiting on an answer that will never arrive.
+    /// The link failed: reading the peer failed, a reply to one of its questions could not be
+    /// written (which leaves the peer waiting on an answer that will never arrive), or a write
+    /// timed out with its frame possibly half on the wire.
     LinkFailed(String),
     /// Peer work filled the bounded handoff queue before the handler could consume it.
     NotificationByteBackpressure {
@@ -408,13 +409,14 @@ struct ClientState {
     next_id: AtomicU64,
     closed: AtomicBool,
     shutdown: CancelToken,
-    /// Why a reply to the peer could not be written, once one could not.
+    /// Why a write to the peer left the link unusable, once one did: a reply that could not be
+    /// written, or any frame whose write timed out mid-send.
     ///
     /// A reply is written on a task the pump waits for when it tears the connection down, so that
     /// task must never run the teardown itself. It records the cause here and wakes the pump, which
     /// owns termination.
-    reply_failure: StdMutex<Option<String>>,
-    reply_failed: Notify,
+    write_failure: StdMutex<Option<String>>,
+    write_failed: Notify,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
     notifications: StdMutex<Option<JoinHandle<()>>>,
@@ -465,8 +467,8 @@ impl Client {
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             shutdown: CancelToken::new(),
-            reply_failure: StdMutex::new(None),
-            reply_failed: Notify::new(),
+            write_failure: StdMutex::new(None),
+            write_failed: Notify::new(),
             in_flight: StdMutex::new(JoinSet::new()),
             notifications: StdMutex::new(None),
             peer_bytes,
@@ -904,18 +906,31 @@ impl ClientState {
 
     /// Writes one frame, setting `started` once this write holds the sender and begins.
     async fn write_marking(&self, frame: String, started: Option<&AtomicBool>) -> Result<()> {
-        tokio::time::timeout(self.options.request_timeout, async {
+        // Set once this write holds the sender: a timeout before that only waited behind another
+        // writer, and that writer's own deadline reports the stall.
+        let began = AtomicBool::new(false);
+        let written = tokio::time::timeout(self.options.request_timeout, async {
             let mut sender = self.sender.lock().await;
+            began.store(true, Ordering::Release);
             if let Some(started) = started {
                 started.store(true, Ordering::Release);
             }
             sender.send(frame).await
         })
-        .await
-        .map_err(|_| Error::Timeout {
-            operation: String::from("JSON-RPC frame write"),
-            after: self.options.request_timeout,
-        })?
+        .await;
+        written.unwrap_or_else(|_| {
+            let timeout = Error::Timeout {
+                operation: String::from("JSON-RPC frame write"),
+                after: self.options.request_timeout,
+            };
+            // A send abandoned mid-frame may have left half of it on the wire, and every later
+            // frame would follow it. That is a dead link whichever side asked for the write, so
+            // the pump is told. A write that fails outright reports only to its own caller.
+            if began.load(Ordering::Acquire) {
+                self.signal_write_failure(&timeout);
+            }
+            Err(timeout)
+        })
     }
 
     async fn fail_pending(&self, failure: JsonRpcError) {
@@ -931,26 +946,26 @@ impl ClientState {
         }
     }
 
-    /// Records that a reply could not be written and wakes the pump, which ends the connection.
+    /// Records that a write failed and wakes the pump, which ends the connection.
     ///
     /// Only signals: the caller may be an answer task or the peer-work worker, both of which the
     /// pump waits for while it terminates, so terminating from here would wait on itself. Nothing
     /// is recorded once the connection is closing, since the pump is then already on its way out
     /// and a refusal that lands on a link being shut down is expected. The first cause is kept.
-    fn signal_reply_failure(&self, error: &Error) {
+    fn signal_write_failure(&self, error: &Error) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        self.reply_failure
+        self.write_failure
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get_or_insert_with(|| error.to_string());
-        self.reply_failed.notify_one();
+        self.write_failed.notify_one();
     }
 
     /// The cause of the first reply that could not be written, if one was.
-    fn take_reply_failure(&self) -> Option<String> {
-        self.reply_failure
+    fn take_write_failure(&self) -> Option<String> {
+        self.write_failure
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
@@ -969,10 +984,10 @@ async fn pump(
             () = state.shutdown.cancelled() => break,
             // A reply that could not be written is a dead link the read side has not noticed yet.
             // It ends the connection here, on the one task that owns termination.
-            () = state.reply_failed.notified() => {
+            () = state.write_failed.notified() => {
                 let cause = state
-                    .take_reply_failure()
-                    .unwrap_or_else(|| String::from("a reply could not be written"));
+                    .take_write_failure()
+                    .unwrap_or_else(|| String::from("a frame could not be written"));
                 link_failed(&state, &handler, notifications, cause).await;
                 break;
             }
@@ -1200,7 +1215,7 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
     // answered, and a timed-out write may have left half a frame on the link. Either way the link
     // is unusable, so the pump is told; it is the only place that ends a connection.
     if let Err(error) = state.write(Value::Object(frame).to_string()).await {
-        state.signal_reply_failure(&error);
+        state.signal_write_failure(&error);
     }
 }
 
@@ -2590,6 +2605,96 @@ mod tests {
             client.is_closed(),
             "expected closed: true | received: false"
         );
+        client.close().await.expect("expected a clean close");
+    }
+
+    /// A peer that is alive but no longer draining its input: the one send whose frame names
+    /// `method` never completes, so the write is abandoned at its deadline with the frame possibly
+    /// half on the wire.
+    struct StalledMethod {
+        inner: Box<dyn crate::link::LinkSender>,
+        method: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::link::LinkSender for StalledMethod {
+        async fn send(&mut self, message: String) -> crate::error::Result<()> {
+            if message.contains(self.method) {
+                std::future::pending::<()>().await;
+            }
+            self.inner.send(message).await
+        }
+
+        async fn close(&mut self) -> crate::error::Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    fn stalled_client(handler: Arc<RecordingHandler>, method: &'static str) -> Client {
+        let (sender, receiver) = ScriptedLink::new().into_link().split();
+        Client::connect(
+            crate::link::Link::new(
+                Box::new(StalledMethod {
+                    inner: sender,
+                    method,
+                }),
+                receiver,
+            ),
+            handler as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_request_timeout(Duration::from_secs(5)),
+        )
+    }
+
+    async fn assert_write_timeout_ended_the_connection(
+        handler: &RecordingHandler,
+        client: &Client,
+    ) {
+        let terminations = terminations_after(handler, 1).await.unwrap_or_else(|seen| {
+            panic!("expected terminations: 1 after a write timeout | received: {seen}")
+        });
+        assert!(
+            matches!(&terminations[..], [PeerTermination::LinkFailed(cause)] if cause.contains("JSON-RPC frame write")),
+            "expected one LinkFailed naming the frame write timeout | received {terminations:?}"
+        );
+        assert!(
+            client.is_closed(),
+            "expected closed: true after a write timeout | received: false"
+        );
+    }
+
+    /// A request whose write times out may have left half a frame on the pipe, so the caller gets
+    /// its timeout and the connection ends rather than carrying a corrupt stream.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_write_that_times_out_on_a_stalled_peer_ends_the_connection() {
+        let handler = RecordingHandler::arc(None);
+        let client = stalled_client(Arc::clone(&handler), "thread/start");
+
+        let error = client
+            .request::<_, Value>("thread/start", json!({}))
+            .await
+            .expect_err("expected the stalled write to time out");
+        assert!(
+            matches!(error, Error::Timeout { .. }),
+            "expected the caller to receive the write timeout | received {error:?}"
+        );
+        assert_write_timeout_ended_the_connection(&handler, &client).await;
+        client.close().await.expect("expected a clean close");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_notification_write_that_times_out_on_a_stalled_peer_ends_the_connection() {
+        let handler = RecordingHandler::arc(None);
+        let client = stalled_client(Arc::clone(&handler), "turn/interrupt");
+
+        let error = client
+            .notify("turn/interrupt", json!({}))
+            .await
+            .expect_err("expected the stalled write to time out");
+        assert!(
+            matches!(error, Error::Timeout { .. }),
+            "expected the caller to receive the write timeout | received {error:?}"
+        );
+        assert_write_timeout_ended_the_connection(&handler, &client).await;
         client.close().await.expect("expected a clean close");
     }
 }
