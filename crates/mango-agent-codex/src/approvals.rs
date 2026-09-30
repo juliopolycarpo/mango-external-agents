@@ -187,11 +187,21 @@ fn unoffered_line(rules: &[String]) -> Option<String> {
     Some(line)
 }
 
+/// The values the pinned `NetworkApprovalProtocol` declares.
+const NETWORK_PROTOCOLS: [&str; 4] = ["http", "https", "socks5Tcp", "socks5Udp"];
+
 /// The host and protocol a managed-network approval asks about.
 fn network_context_line(context: &Value) -> String {
     let field = |name: &str| context.get(name).and_then(Value::as_str);
+    // The abbreviated form is for exactly the declared shape: `{host, protocol}` with a protocol
+    // from the pinned enum. Anything wider is shown whole, so no member is hidden behind it.
+    let declared = context
+        .as_object()
+        .is_some_and(|members| members.len() == 2);
     match (field("protocol"), field("host")) {
-        (Some(protocol), Some(host)) => format!("Network access requested: {protocol} to {host}"),
+        (Some(protocol), Some(host)) if declared && NETWORK_PROTOCOLS.contains(&protocol) => {
+            format!("Network access requested: {protocol} to {host}")
+        }
         _ => format!("Network access requested: {context}"),
     }
 }
@@ -259,6 +269,11 @@ struct NetworkRule {
 impl NetworkRule {
     /// `None` for a shape the pin does not declare, which cannot be shown exactly.
     fn decode(value: &Value) -> Option<Self> {
+        // Exactly the two declared members: the label names `{host, action}`, so a proposal that
+        // carries more is one the label would misdescribe.
+        if value.as_object()?.len() != 2 {
+            return None;
+        }
         let host = value
             .get("host")?
             .as_str()
@@ -1366,6 +1381,46 @@ mod tests {
             "expected the requested host at the head of the bounded detail | received: {:?}",
             &detail[..detail.len().min(96)]
         );
+    }
+
+    /// A rule with a member the pin does not declare cannot be shown as received: the label would
+    /// name `{host, action}` while the vendor holds more.
+    #[test]
+    fn a_network_proposal_with_an_undeclared_member_is_not_offered() {
+        let pending = to_request(
+            &command_request(json!({
+                "proposedNetworkPolicyAmendments": [
+                    {"host": "example.com", "action": "allow", "port": 8080}
+                ]
+            })),
+            now(),
+        )
+        .expect("expected a question");
+        assert!(
+            !offers(&pending, "applyNetworkPolicyAmendment"),
+            "expected a member outside {{host, action}} to refuse the option | received: {:?}",
+            pending.request.options
+        );
+    }
+
+    /// The abbreviated rendering is for the declared shape only; anything wider is shown whole.
+    #[test]
+    fn a_network_context_wider_than_the_declared_shape_is_shown_as_it_arrived() {
+        for context in [
+            json!({"host": "example.com", "protocol": "https", "port": 8443}),
+            json!({"host": "example.com", "protocol": "ftp"}),
+        ] {
+            let pending = to_request(
+                &command_request(json!({"networkApprovalContext": context})),
+                now(),
+            )
+            .expect("expected a question");
+            let detail = detail_of(&pending);
+            assert!(
+                detail.contains(&context.to_string()),
+                "expected the whole context in the detail | received: {detail:?}"
+            );
+        }
     }
 
     /// Whatever the network context looks like, a person is shown it rather than nothing.

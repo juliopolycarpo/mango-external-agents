@@ -358,7 +358,7 @@ prefix), `proposedNetworkPolicyAmendments` is `NetworkPolicyAmendment[]` where
   too long to show) as a standing rule "proposed but not offered".
 - **A proposal outside the declared shape is not offered**: an execpolicy amendment that is not a
   nonempty array of strings, or a network amendment without a nonempty `host` and an `action` of
-  exactly `allow` or `deny`. A rule that cannot be labelled exactly cannot be consented to.
+  exactly `allow` or `deny`, or that carries any other member. A rule that cannot be labelled exactly cannot be consented to.
 - **The action is what the wire proposes.** A `deny` proposal is labelled `deny`, never "Allow".
   What Codex does with the current request when a `deny` amendment is applied is **unverified**:
   the pinned description says only "User chose a persistent network policy rule (allow/deny) for
@@ -366,7 +366,7 @@ prefix), `proposedNetworkPolicyAmendments` is `NetworkPolicyAmendment[]` where
   carries exactly the `{action, host}` that was labelled.
 - **`networkApprovalContext` leads the detail**, ahead of the agent's own `reason`, as
   `Network access requested: <protocol> to <host>`. A context of a shape the pin does not declare
-  is shown as it arrived rather than dropped.
+  (an extra member, or a protocol outside the enum) is shown whole as it arrived.
 - **The refusal is unchanged**: `decline`. Options stay `Other`, destructive and
   `policy_changing`, so a broker's `allow()` never selects one, and nothing is auto-selected.
 
