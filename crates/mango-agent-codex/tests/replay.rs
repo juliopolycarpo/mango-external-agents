@@ -2980,6 +2980,72 @@ async fn a_command_that_keeps_printing_keeps_its_turn_alive_past_the_idle_deadli
         .expect("expected cleanup");
 }
 
+/// A patch that keeps changing is a turn that is still working, even while its updates are held.
+///
+/// A patch update is the whole patch as it stands and is emitted at most once per
+/// `ACTIVITY_UPDATE_INTERVAL`, so most frames of a busy edit render nothing. The idle deadline is
+/// reset for the frame, not for what it renders: here it is shorter than that interval, so the
+/// gaps between emitted updates are covered only by held ones.
+#[tokio::test(start_paused = true)]
+async fn a_patch_whose_updates_are_held_keeps_its_turn_alive_past_the_idle_deadline() {
+    let mut limits = replay_limits();
+    limits.idle_timeout = std::time::Duration::from_secs(3);
+    assert!(
+        limits.idle_timeout < mango_agent_codex::turn_reducer::ACTIVITY_UPDATE_INTERVAL,
+        "expected the idle deadline to be shorter than the update interval so held frames matter"
+    );
+    let mut running = AnnouncedTurn::open(limits).await;
+    running.announce(
+        "item/started",
+        serde_json::json!({"turnId": AnnouncedTurn::NATIVE_TURN_ID, "item": {
+            "type": "fileChange", "id": "patch-long", "changes": [], "status": "inProgress"}}),
+    );
+
+    // One update a second for twenty seconds: about four are emitted, the rest are held.
+    let rounds = 20_u64;
+    for round in 0..rounds {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            !running.interrupted(),
+            "expected a patch that keeps changing to keep the turn alive | received turn/interrupt \
+             after round {round} ({round}s, idle deadline {:?})",
+            limits.idle_timeout
+        );
+        running.announce(
+            "item/fileChange/patchUpdated",
+            serde_json::json!({"turnId": AnnouncedTurn::NATIVE_TURN_ID, "itemId": "patch-long",
+                               "changes": [{"path": "src/lib.rs", "kind": {"type": "update"},
+                                            "diff": format!("+revision {round}\n")}]}),
+        );
+    }
+    running.complete();
+
+    let events = drain(&mut running.turn).await;
+    assert!(
+        !running.interrupted(),
+        "expected no idle interrupt for a patch that kept changing"
+    );
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed)),
+        "expected the turn to complete on its own, received {events:#?}"
+    );
+    let updates = events
+        .iter()
+        .filter(|event| {
+            matches!(event, EventKind::ActivityUpdated { call_id, .. } if call_id == "patch-long")
+        })
+        .count();
+    assert!(
+        (1..rounds as usize).contains(&updates),
+        "expected some patch updates to be emitted and some held | emitted {updates} of {rounds}"
+    );
+    running
+        .session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("expected cleanup");
+}
+
 /// The answer's text, as a host would join its deltas.
 fn answer_text(events: &[EventKind]) -> String {
     events

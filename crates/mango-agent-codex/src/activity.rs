@@ -323,6 +323,92 @@ mod tests {
         }
     }
 
+    /// Whether an item is shown must be the same on start and on completion. A family shown on start
+    /// but not on completion leaves the host an activity that never ends; the reverse completes
+    /// a call id it was never told about. Every family, including the ones that fall into the
+    /// untagged fallback, is listed with the answer it must give.
+    #[test]
+    fn every_item_family_is_shown_or_hidden_the_same_on_start_and_on_completion() {
+        let cases = [
+            (
+                json!({"type": "agentMessage", "id": "i", "text": "hi"}),
+                false,
+            ),
+            (json!({"type": "reasoning", "id": "i"}), false),
+            (
+                json!({"type": "commandExecution", "id": "i", "command": "ls"}),
+                true,
+            ),
+            (
+                json!({"type": "fileChange", "id": "i", "changes": []}),
+                true,
+            ),
+            (
+                json!({"type": "mcpToolCall", "id": "i", "server": "s", "tool": "t"}),
+                true,
+            ),
+            (json!({"type": "webSearch", "id": "i", "query": "q"}), true),
+            (json!({"type": "plan", "id": "i", "text": "1. go"}), true),
+            (json!({"type": "subAgentActivity", "id": "i"}), true),
+            (
+                json!({"type": "enteredReviewMode", "id": "i", "review": "r"}),
+                true,
+            ),
+            (
+                json!({"type": "exitedReviewMode", "id": "i", "review": "r"}),
+                true,
+            ),
+            (json!({"type": "contextCompaction", "id": "i"}), true),
+            // A family this build does not model is work the agent did, when it can be addressed.
+            (
+                json!({"type": "imageView", "id": "i", "status": "completed"}),
+                true,
+            ),
+            (json!({"type": "imageView"}), false),
+            (json!({"type": "imageView", "id": 7}), false),
+            // The client's own input echoed back is not work.
+            (
+                json!({"type": "userMessage", "id": "i", "content": []}),
+                false,
+            ),
+            (json!({"type": "hookPrompt", "id": "i"}), false),
+            (json!({"type": "functionCallOutput", "id": "i"}), false),
+            // A modelled family whose fields did not decode is malformed, not a new kind of work.
+            (
+                json!({"type": "commandExecution", "id": "i", "command": []}),
+                false,
+            ),
+            (
+                json!({"type": "fileChange", "id": "i", "changes": 3}),
+                false,
+            ),
+            (
+                json!({"type": "agentMessage", "id": "i", "text": []}),
+                false,
+            ),
+            (json!({"type": "plan"}), false),
+            // Not an item at all.
+            (json!({"id": "i"}), false),
+            (json!({"type": null, "id": "i"}), false),
+        ];
+        for (raw, shown) in cases {
+            let Ok(item) = serde_json::from_value::<ThreadItem>(raw.clone()) else {
+                assert!(!shown, "expected {raw} to decode as an item that is shown");
+                continue;
+            };
+            assert_eq!(
+                started(&item).is_some(),
+                shown,
+                "expected started to show {raw}: {shown}"
+            );
+            assert_eq!(
+                completed(&item).is_some(),
+                shown,
+                "expected completed to show {raw}: {shown}"
+            );
+        }
+    }
+
     #[test]
     fn a_patch_names_one_file_or_counts_them() {
         let one = started(&item(json!({

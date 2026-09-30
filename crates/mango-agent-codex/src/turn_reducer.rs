@@ -355,16 +355,25 @@ impl TurnReducer {
         let Some(open) = self.activities.get_mut(item_id) else {
             return Outcome::Ignore;
         };
+        // The window is checked before an update is built: a held update would otherwise copy a
+        // whole patch, or the output tail, only to drop it. The output is still folded in first,
+        // so what was held back arrives with the next update.
         let update = match progress {
             Progress::Output(chunk) if chunk.is_empty() => return Outcome::Ignore,
             Progress::Output(chunk) => {
                 open.append(&chunk);
+                if open.holds_back(instant) {
+                    return Outcome::Ignore;
+                }
                 let mut update = ActivityUpdate::new().with_detail(open.tail.clone());
                 update.truncated = open.truncated;
                 update
             }
             Progress::Patch([]) => return Outcome::Ignore,
             Progress::Patch(changes) => {
+                if open.holds_back(instant) {
+                    return Outcome::Ignore;
+                }
                 let update = ActivityUpdate::new();
                 let update = match activity::file_change_detail(changes) {
                     Some(detail) => update.with_detail(detail),
@@ -376,12 +385,6 @@ impl TurnReducer {
                 }
             }
         };
-        if open
-            .last_update
-            .is_some_and(|last| instant.saturating_duration_since(last) < ACTIVITY_UPDATE_INTERVAL)
-        {
-            return Outcome::Ignore;
-        }
         open.last_update = Some(instant);
         Outcome::Emit(vec![EventKind::ActivityUpdated {
             call_id: item_id.to_owned(),
@@ -391,6 +394,15 @@ impl TurnReducer {
 }
 
 impl OpenActivity {
+    /// Whether an update at `instant` falls inside the window of the one last emitted.
+    ///
+    /// The window opens when an update is emitted and only then, so a held update never pushes it
+    /// back.
+    fn holds_back(&self, instant: tokio::time::Instant) -> bool {
+        self.last_update
+            .is_some_and(|last| instant.saturating_duration_since(last) < ACTIVITY_UPDATE_INTERVAL)
+    }
+
     /// Appends output, keeping only the most recent characters.
     fn append(&mut self, chunk: &str) {
         self.tail.push_str(chunk);
@@ -616,6 +628,72 @@ mod tests {
             matches!(&update.content, Some(ActivityContent::Diff { files }) if files.len() == 2),
             "expected both files as a diff, received {:?}",
             update.content
+        );
+    }
+
+    fn patch(item_id: &str, diff: &str) -> Notification {
+        Notification::parse(
+            method::FILE_CHANGE_PATCH_UPDATED,
+            json!({"threadId": THREAD, "turnId": TURN, "itemId": item_id, "changes": [
+                {"path": "src/lib.rs", "kind": {"type": "update"}, "diff": diff}]}),
+        )
+    }
+
+    fn diff_of(update: &ActivityUpdate) -> &str {
+        match &update.content {
+            Some(ActivityContent::Diff { files }) => match files.as_slice() {
+                [file] => file.unified_diff.as_deref().unwrap_or_default(),
+                other => panic!("expected one file in the update, received {other:?}"),
+            },
+            other => panic!("expected the update to carry a diff, received {other:?}"),
+        }
+    }
+
+    /// A patch is sampled like output: what lands inside the window is dropped, and the next
+    /// update outside it carries the patch as it stands then, not an older one.
+    #[test]
+    fn a_patch_update_inside_the_window_is_held_and_the_next_carries_the_latest_patch() {
+        let (mut turn, start) = running("fileChange", "patch-1");
+        let first = reduce_at(&mut turn, &patch("patch-1", "+first\n"), start);
+        assert_eq!(diff_of(update_of(&first)), "+first\n");
+        let held = reduce_at(
+            &mut turn,
+            &patch("patch-1", "+second\n"),
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(
+            held,
+            Outcome::Ignore,
+            "expected a patch update inside the window to be held"
+        );
+        let next = reduce_at(
+            &mut turn,
+            &patch("patch-1", "+third\n"),
+            start + ACTIVITY_UPDATE_INTERVAL,
+        );
+        assert_eq!(diff_of(update_of(&next)), "+third\n");
+    }
+
+    /// The window opens when an update is emitted, so a held one must not push it back.
+    #[test]
+    fn a_held_patch_update_does_not_restart_the_window() {
+        let (mut turn, start) = running("fileChange", "patch-1");
+        let _ = reduce_at(&mut turn, &patch("patch-1", "+a\n"), start);
+        let just_inside = start + ACTIVITY_UPDATE_INTERVAL - Duration::from_millis(1);
+        assert_eq!(
+            reduce_at(&mut turn, &patch("patch-1", "+b\n"), just_inside),
+            Outcome::Ignore,
+            "expected an update a millisecond before the window closes to be held"
+        );
+        let at_close = reduce_at(
+            &mut turn,
+            &patch("patch-1", "+c\n"),
+            start + ACTIVITY_UPDATE_INTERVAL,
+        );
+        assert_eq!(
+            diff_of(update_of(&at_close)),
+            "+c\n",
+            "expected the window to close ACTIVITY_UPDATE_INTERVAL after the emitted update"
         );
     }
 
