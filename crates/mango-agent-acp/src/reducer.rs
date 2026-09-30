@@ -397,9 +397,8 @@ impl Reducer {
     /// which leaves the host's copy alone. A call that already ended stays ended.
     fn tool_call(&mut self, call: ToolCall, now: Instant) -> Vec<EventKind> {
         let call_id = call.tool_call_id.to_string();
-        if self.is_finished(&call_id) {
-            return Vec::new();
-        }
+        // A call is never both open and finished, so a running call is recognised by its one map
+        // lookup and only a call that is not running pays for a digest.
         if self.open_calls.contains_key(&call_id) {
             // `tool_call` has no way to say "unchanged": an absent collection deserialises as an
             // empty one. So only a non-empty collection replaces what the host holds; an empty one
@@ -415,6 +414,9 @@ impl Reducer {
                 fields = fields.locations(call.locations);
             }
             return self.tool_call_update(ToolCallUpdate::new(call.tool_call_id, fields), now);
+        }
+        if self.is_finished(&call_id) {
+            return Vec::new();
         }
         let finished = finished(call.status).is_some();
         let events = tool_call(call);
@@ -433,10 +435,10 @@ impl Reducer {
     /// [`TOOL_UPDATE_INTERVAL`]), and a terminal one first delivers whatever is still held.
     fn tool_call_update(&mut self, update: ToolCallUpdate, now: Instant) -> Vec<EventKind> {
         let call_id = update.tool_call_id.to_string();
-        if self.is_finished(&call_id) {
-            return Vec::new();
-        }
         if !self.open_calls.contains_key(&call_id) {
+            if self.is_finished(&call_id) {
+                return Vec::new();
+            }
             let fields = update.fields;
             let title = fields
                 .title
@@ -1761,6 +1763,59 @@ mod tests {
             repeat.is_empty(),
             "expected a late update for a finished id to be dropped | received {repeat:?}"
         );
+    }
+
+    /// A running call is found by its open entry alone, so its frames must still be routed as before
+    /// while it runs and be dropped once it ends, whichever frame kind arrives.
+    #[test]
+    fn a_running_call_with_a_long_id_ends_once_and_then_stays_ended() {
+        let call_id = long_call_id(0, 128 * 1024);
+        let mut reducer = Reducer::new().with_update_interval(Duration::ZERO);
+        let mut frames = |value: serde_json::Value| reducer.update(update(value)).0;
+        let started = frames(json!({
+            "sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Tool",
+            "kind": "other", "status": "in_progress"
+        }));
+        assert_eq!(
+            started.len(),
+            1,
+            "expected one start | received {started:?}"
+        );
+        let progress = frames(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": call_id, "title": "Tool 2"
+        }));
+        assert_eq!(
+            progress.len(),
+            1,
+            "expected one update | received {progress:?}"
+        );
+        let repeat = frames(json!({
+            "sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Tool 3",
+            "kind": "other", "status": "in_progress"
+        }));
+        assert_eq!(
+            repeat.len(),
+            1,
+            "expected a repeat as one update | received {repeat:?}"
+        );
+        let done = frames(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": "completed"
+        }));
+        assert!(
+            matches!(done.as_slice(), [EventKind::ActivityCompleted { .. }]),
+            "expected one completion | received {done:?}"
+        );
+        for late in [
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": call_id, "status": "completed" }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Again",
+                    "kind": "other", "status": "in_progress" }),
+        ] {
+            let dropped = frames(late);
+            assert!(
+                dropped.is_empty(),
+                "expected a frame after the end to be dropped | received {dropped:?}"
+            );
+        }
     }
 
     /// Remembering less than the id must not merge calls: every distinct id still gets its own
