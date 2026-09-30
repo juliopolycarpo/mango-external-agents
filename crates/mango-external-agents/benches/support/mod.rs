@@ -4,11 +4,12 @@
 //! the runner prints every raw sample beside the median, minimum, maximum and coefficient of
 //! variation, so a Base / Variant / Delta receipt can quote the numbers it computed from.
 //!
-//! The Codex, ACP and Claude crates carry byte-identical copies of this file at
-//! `crates/mango-agent-codex/benches/support/mod.rs`,
-//! `crates/mango-agent-acp/benches/support/mod.rs` and
-//! `crates/mango-agent-claude/benches/support/mod.rs`; a crate cannot package a file that lives in
-//! another crate. Change all four together.
+//! The Codex, ACP and Claude crates and the `hub-host` example carry byte-identical copies of this
+//! file at `crates/mango-agent-codex/benches/support/mod.rs`,
+//! `crates/mango-agent-acp/benches/support/mod.rs`,
+//! `crates/mango-agent-claude/benches/support/mod.rs` and
+//! `examples/hub-host/benches/support/mod.rs`; a crate cannot package a file that lives in another
+//! crate. Change all five together.
 //!
 //! Usage from a bench binary:
 //!
@@ -46,6 +47,23 @@ impl Unit {
     }
 }
 
+/// Reads the `BENCH_SAMPLES` value: absent means the default, anything else must be a positive
+/// integer, because a run with no samples has no median to report.
+///
+/// The error names the received value and the expected shape, for example
+/// `parse_samples(Some("0"))`.
+pub fn parse_samples(requested: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = requested else {
+        return Ok(DEFAULT_SAMPLES);
+    };
+    match raw.parse::<usize>() {
+        Ok(samples) if samples > 0 => Ok(samples),
+        _ => Err(format!(
+            "expected BENCH_SAMPLES to be a positive integer, received {requested:?}"
+        )),
+    }
+}
+
 /// One benchmark binary: its title, its sample count and its case filter.
 pub struct Bench {
     samples: usize,
@@ -56,13 +74,8 @@ impl Bench {
     /// Reads the sample count and filters, then prints the environment header.
     pub fn new(title: &str) -> Self {
         let requested = std::env::var("BENCH_SAMPLES").ok();
-        let samples = requested
-            .as_deref()
-            .map_or(Some(DEFAULT_SAMPLES), |raw| raw.parse::<usize>().ok())
-            .filter(|samples| *samples > 0)
-            .unwrap_or_else(|| {
-                panic!("expected BENCH_SAMPLES to be a positive integer, received {requested:?}")
-            });
+        let samples =
+            parse_samples(requested.as_deref()).unwrap_or_else(|message| panic!("{message}"));
         let filters = std::env::args()
             .skip(1)
             .filter(|argument| !argument.starts_with('-'))
@@ -161,4 +174,48 @@ fn print_summary(name: &str, unit: Unit, samples: &[Duration]) {
         .map(|sample| format!("{:.4}", millis(sample)))
         .collect();
     println!("    samples_ms: {}", raw.join(" "));
+}
+
+// A bench target built with `harness = false` cannot run `#[test]`s, so these run where the file is
+// included as a module of a test crate: `examples/hub-host/tests/bench_runner.rs`. The five copies
+// are byte-identical, so that one run covers them all.
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn an_absent_value_is_the_default_sample_count() {
+        let received = super::parse_samples(None);
+
+        assert_eq!(
+            received,
+            Ok(super::DEFAULT_SAMPLES),
+            "expected the default sample count when BENCH_SAMPLES is unset | received {received:?}"
+        );
+    }
+
+    #[test]
+    fn a_positive_integer_is_the_sample_count() {
+        let received = super::parse_samples(Some("25"));
+
+        assert_eq!(
+            received,
+            Ok(25),
+            "expected 25 samples for BENCH_SAMPLES=25 | received {received:?}"
+        );
+    }
+
+    #[test]
+    fn zero_and_non_numbers_are_refused_naming_the_value_and_the_expected_shape() {
+        for raw in ["0", "abc", "-3", ""] {
+            let received = super::parse_samples(Some(raw));
+            let expected =
+                format!("expected BENCH_SAMPLES to be a positive integer, received Some({raw:?})");
+
+            assert_eq!(
+                received,
+                Err(expected.clone()),
+                "expected BENCH_SAMPLES={raw:?} to be refused as `{expected}` | received {received:?}"
+            );
+        }
+    }
 }
