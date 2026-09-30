@@ -250,6 +250,14 @@ final output. `Reducer::with_update_interval` changes the interval; `Duration::Z
 update. This bounds how often one call reaches a host, not how large one update is: each is still
 bounded by the core's `TextLimit::Detail`.
 
+A `session/update` that arrives while no turn exists is not transcript. ACP's
+[`session/load`](https://agentclientprotocol.com/protocol/v1/session-setup) has the agent replay the
+whole conversation through `session/update` before it answers, and a frame between two turns is the
+same case. No host stream is open to receive those events, so the turn reducer is not fed: such a frame
+contributes only its session facts (the command catalog and the configuration catalog, which
+`Reducer::session_facts` reads), and a replayed tool call leaves no open call behind for the next turn
+to reset. `current_mode_update` produces no fact on either path.
+
 ## Permissions
 
 Each session owns its own agent process, so a `session/update` or `session/request_permission`
