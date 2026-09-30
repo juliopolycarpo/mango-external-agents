@@ -234,6 +234,11 @@ key called `locations` holding a number tells a host the paths are in there and 
 extension channel means they never can be. `raw_input`/`raw_output` never reach a host: both are unbounded vendor
 payloads. The tool-call activity's `item_id` is the same string as its call id, ACP naming no separate
 id for the item; the plan's is left absent; `PLAN_CALL_ID` is this crate's own, not the agent's.
+Because an ACP `toolCallId` is an opaque string, the reducer keeps agent ids out of the plan's
+namespace: an agent id that starts with `acp:` is published with `acp:vendor:` in front (so a tool
+call named `acp:plan` becomes `acp:vendor:acp:plan`, and the plan keeps `acp:plan`). No other id
+changes, the rewrite is reversible so two agent ids never merge, and a call has one id from its
+start to its completion. No agent with a shipped profile sends such an id.
 
 ACP says a [`tool_call_update` collection replaces the previous collection](https://agentclientprotocol.com/protocol/v1/tool-calls#updating), rather than extending it. An omitted `content` field therefore leaves the host's structured content and detail untouched. An explicit empty collection emits `Some(ActivityContent::Empty)` and an empty detail, so the host removes the prior diff or output instead of retaining it.
 
