@@ -138,7 +138,10 @@ fn redact_bearer(raw: &str) -> String {
         let scheme_start = skip_spaces(bytes, after_colon);
         let after_scheme = match_word(bytes, scheme_start, b"bearer")
             .or_else(|| match_word(bytes, scheme_start, b"basic"))?;
-        let token_start = skip_spaces(bytes, after_scheme);
+        // A boundary marker stands where a byte was removed between the scheme and its token.
+        let token_start = take_while(bytes, after_scheme, |byte| {
+            is_space_byte(byte) || byte == strip::BOUNDARY_BYTE
+        });
         if token_start == after_scheme {
             return None;
         }

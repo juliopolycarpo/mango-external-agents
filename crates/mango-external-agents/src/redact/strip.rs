@@ -17,6 +17,9 @@ use super::{is_unsafe_to_render, match_credential_keyword, match_word};
 /// starts a word, and it is not a space, so it does not end a value.
 const BOUNDARY: char = '\u{1}';
 
+/// [`BOUNDARY`] as a byte, for the rules that skip the gap between a scheme and its token.
+pub(super) const BOUNDARY_BYTE: u8 = 0x01;
+
 /// The text with every [`BOUNDARY`] taken out, once the rules have run.
 pub(super) fn remove_boundaries(text: String) -> String {
     if !text.contains(BOUNDARY) {
@@ -25,9 +28,14 @@ pub(super) fn remove_boundaries(text: String) -> String {
     text.replace(BOUNDARY, "")
 }
 
-/// The longest OSC payload taken out whole. A payload past this is not a title or a link; the
-/// introducer alone is removed and the text after it is kept, to be redacted like any other.
+/// The longest OSC, DCS, PM, SOS or APC payload taken out whole. A payload past this is not a
+/// title or a link; the introducer alone is removed and the text after it is kept, to be redacted
+/// like any other.
 const OSC_PAYLOAD_LIMIT: usize = 4096;
+
+/// The byte after `ESC` that opens a DCS, SOS, PM or APC string: `ESC P`, `ESC X`, `ESC ^` and
+/// `ESC _`. Each runs to an ST.
+const STRING_INTRODUCERS: &[u8] = b"PX^_";
 
 /// The byte after `ESC` in the two-byte forms a terminal program writes: save and restore cursor,
 /// the keypad modes, reset, the line and tab movers, and ST.
@@ -74,7 +82,7 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
         }
         if removed
             && out.ends_with(|last: char| last.is_ascii_alphanumeric())
-            && starts_credential_name(bytes, at)
+            && (starts_credential_name(bytes, at) || ends_with_scheme(&out))
         {
             out.push(BOUNDARY);
         }
@@ -92,12 +100,29 @@ fn starts_credential_name(bytes: &[u8], at: usize) -> bool {
         || match_word(bytes, at, b"authorization").is_some()
 }
 
+/// Whether `text` ends in an authorization scheme, `Bearer` or `Basic`, whose token the bearer
+/// rule reads after a gap. A removed byte in that gap is a boundary, not a join.
+fn ends_with_scheme(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    [&b"bearer"[..], b"basic"].iter().any(|scheme| {
+        bytes
+            .len()
+            .checked_sub(scheme.len())
+            .and_then(|from| bytes.get(from..))
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(scheme))
+    })
+}
+
 /// Where the escape that starts at `at` ends, or `None` when `character` does not start one.
 fn escape_end(bytes: &[u8], at: usize, character: char) -> Option<usize> {
+    let after = at + character.len_utf8();
     match character {
-        '\u{1b}' => Some(after_escape(bytes, at + 1)),
-        '\u{9b}' => Some(csi_end(bytes, at + character.len_utf8())),
-        '\u{9d}' => Some(osc_end(bytes, at + character.len_utf8())),
+        '\u{1b}' => Some(after_escape(bytes, after)),
+        '\u{9b}' => Some(csi_end(bytes, after)),
+        '\u{9d}' => Some(string_end(bytes, after, true).unwrap_or(after)),
+        '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => {
+            Some(string_end(bytes, after, false).unwrap_or(after))
+        }
         _ => None,
     }
 }
@@ -112,7 +137,12 @@ fn after_escape(bytes: &[u8], start: usize) -> usize {
         return csi_end(bytes, start + 1);
     }
     if *next == b']' {
-        return osc_end(bytes, start + 1);
+        return string_end(bytes, start + 1, true).unwrap_or(start + 1);
+    }
+    if STRING_INTRODUCERS.contains(next) {
+        // Unterminated, only `ESC` goes if the letter begins a name: `ESC PASSWORD=x`.
+        return string_end(bytes, start + 1, false)
+            .unwrap_or_else(|| pick(bytes, start, start + 1));
     }
     if CHARSET_INTRODUCERS.contains(next) {
         // The designator is one byte from `0x30..=0x7e`, `B` for ASCII and `0` for line drawing.
@@ -151,26 +181,34 @@ fn csi_end(bytes: &[u8], start: usize) -> usize {
     pick(bytes, at, final_end(bytes, at, 0x40..=0x7e))
 }
 
-/// The end of an OSC whose introducer ends at `start`: everything up to a BEL or an ST, `ESC \`
-/// or the 8-bit `0x9c`.
+/// The end of an OSC, DCS, SOS, PM or APC string whose introducer ends at `start`: everything up
+/// to an ST (`ESC \` or the 8-bit `0x9c`), or a BEL as well when `bel_ends` is set, which is an
+/// OSC's own way to end. `None` when the string does not end.
 ///
-/// An OSC with no terminator inside [`OSC_PAYLOAD_LIMIT`] bytes, or one that meets another
-/// escape first, is not taken out: only its introducer is, so an unterminated title cannot hide
-/// the rest of the output.
-fn osc_end(bytes: &[u8], start: usize) -> usize {
-    let limit = bytes.len().min(start.saturating_add(OSC_PAYLOAD_LIMIT));
+/// A string is not taken out when no terminator comes within [`OSC_PAYLOAD_LIMIT`] bytes, or when
+/// a line feed or another escape comes first. Only its introducer goes then, so a stray one cannot
+/// hide the lines after it. A title or a link has no line feed in it. The scan ends at the next
+/// escape, so the work over a whole text stays linear.
+fn string_end(bytes: &[u8], start: usize, bel_ends: bool) -> Option<usize> {
+    let limit = bytes
+        .len()
+        .min(start.saturating_add(OSC_PAYLOAD_LIMIT).saturating_add(1));
     let mut at = start;
     while at < limit {
         match bytes[at] {
-            0x07 => return at + 1,
-            0x1b if bytes.get(at + 1) == Some(&b'\\') => return at + 2,
-            0x1b => return start,
-            0xc2 if bytes.get(at + 1) == Some(&0x9c) => return at + 2,
-            0xc2 if matches!(bytes.get(at + 1), Some(0x9b | 0x9d)) => return start,
+            0x07 if bel_ends => return Some(at + 1),
+            b'\n' => return None,
+            0x1b if bytes.get(at + 1) == Some(&b'\\') => return Some(at + 2),
+            0x1b => return None,
+            0xc2 => match bytes.get(at + 1) {
+                Some(0x9c) => return Some(at + 2),
+                Some(0x80..=0x9b | 0x9d..=0x9f) => return None,
+                _ => at += 1,
+            },
             _ => at += 1,
         }
     }
-    start
+    None
 }
 
 /// Chooses where an escape ends when its last byte might be the first letter of a name.
@@ -350,6 +388,80 @@ mod tests {
         assert_eq!(
             stderr_text("\u{1b}[1;31mred\u{1b}[0m and \u{1b}[2Kdone\u{1b}[31"),
             "red and done"
+        );
+    }
+
+    /// A stray introducer must not take a diagnostic with it: a line break is not part of a title
+    /// or a link, so the scan for a terminator ends there.
+    #[test]
+    fn an_osc_introducer_does_not_hide_lines_up_to_a_stray_bell() {
+        assert_eq!(
+            stderr_text("\u{1b}]\nERROR: real failure\n\u{7}"),
+            "\nERROR: real failure\n",
+            "expected the lines between a stray introducer and a later BEL kept"
+        );
+    }
+
+    #[test]
+    fn an_osc_payload_of_exactly_the_limit_is_still_terminated() {
+        let payload = "x".repeat(super::OSC_PAYLOAD_LIMIT);
+        for terminator in ["\u{7}", "\u{1b}\\", "\u{9c}"] {
+            let redacted = stderr_text(&format!("\u{1b}]{payload}{terminator}kept"));
+            assert_eq!(
+                redacted,
+                "kept",
+                "expected a payload of exactly {} bytes ended by {terminator:?} taken out | received {} bytes",
+                super::OSC_PAYLOAD_LIMIT,
+                redacted.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_scheme_and_its_token_parted_only_by_a_removed_byte_are_still_redacted() {
+        assert_hidden(
+            &[
+                "Authorization: Bearer\rsk-live-secret",
+                "Authorization: Bearer\u{1b}[0msk-live-secret",
+                "Authorization: bearer\u{7}sk-live-secret",
+                "Authorization: Basic\u{1b}[0msecret-value",
+                "Authorization:\rBearer\rsk-live-secret",
+            ],
+            "a scheme parted from its token by a removed byte",
+        );
+        assert_eq!(
+            stderr_text("Authorization: Bearer\rsk-live-x"),
+            "Authorization: Bearer [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn dcs_pm_sos_and_apc_strings_are_taken_out_like_an_osc_but_end_only_at_st() {
+        assert_hidden(
+            &[
+                "\u{1b}P1$r TOKEN=secret \u{1b}\\",
+                "\u{1b}P1$rTOKEN=secret\u{1b}\\",
+                "\u{90}1$rTOKEN=secret\u{9c}",
+                "\u{1b}^TOKEN=secret\u{1b}\\",
+                "\u{1b}_password=secret\u{1b}\\",
+                "\u{1b}Xtoken=secret\u{1b}\\",
+                "\u{90}1$r TOKEN=secret \u{9c}",
+                "\u{9e}TOKEN=secret\u{9c}",
+                "\u{98}TOKEN=secret\u{9c}",
+                "\u{9f}TOKEN=secret\u{9c}",
+                // Not ended by BEL, so only the introducer goes, and what follows is redacted.
+                "\u{1b}Pabc\u{7}TOKEN=secret",
+                // A name that begins with the byte after `ESC` keeps it.
+                "\u{1b}PASSWORD=secret",
+                "\u{1b}Xtoken=secret",
+            ],
+            "a DCS, PM, SOS or APC string",
+        );
+        assert_eq!(stderr_text("\u{1b}P1$rdata\u{1b}\\shown"), "shown");
+        assert_eq!(
+            stderr_text("\u{1b}P\nERROR: real failure\n\u{1b}\\"),
+            "\nERROR: real failure\n",
+            "expected a line break to end the scan as it does for an OSC"
         );
     }
 
