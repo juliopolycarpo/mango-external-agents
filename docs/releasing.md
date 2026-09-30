@@ -17,7 +17,9 @@ stored in the repository or in CI.
    `version = "…"` entries under `[workspace.dependencies]` in `Cargo.toml`. Set the install
    snippet in each of the four `crates/*/README.md` files to the new `major.minor` (`"0.3"` for
    0.3.x): a published README is immutable, and 0.3.0 shipped `"0.1"`, which a caret requirement
-   never resolves to 0.3. Then refresh the lockfile and prove the lockstep:
+   never resolves to 0.3. For a pre-release, write the full version with its suffix instead
+   (`"0.4.0-rc.1"`), because no caret requirement resolves to one. Then refresh the lockfile and
+   prove the lockstep:
 
    ```sh
    cargo update --workspace
