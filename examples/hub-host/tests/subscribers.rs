@@ -195,8 +195,38 @@ async fn try_recv_reports_the_events_a_slow_subscriber_missed_then_delivers_the_
     );
 }
 
-/// The terminal survives the gap, which is how a lagged subscriber learns to stop trusting what
-/// it accumulated and resync.
+/// A watcher that stays stalled across turns can lose an earlier turn's terminal: the queue drops
+/// from the front, so the next turn's events push it out. The fan-out then holds no end for the
+/// first turn, and only the Hub's record has that outcome.
+#[tokio::test]
+async fn a_later_turns_events_can_push_an_earlier_terminal_out() {
+    let events = TurnBroadcast::new(1);
+    let mut watcher = events.subscribe();
+    for event in turn_events(1).await {
+        events.publish(event);
+    }
+    let second_turn = turn_events(1).await;
+    events.publish(
+        second_turn
+            .into_iter()
+            .next()
+            .expect("expected the second turn's opening delta"),
+    );
+    drop(events);
+
+    let seen = drain_async(&mut watcher).await;
+
+    assert_eq!(
+        seen,
+        ["gap:2", "text:0"],
+        "expected the first turn's terminal to be gone with only the second turn's delta held \
+         | received {seen:?}"
+    );
+}
+
+/// For one turn published before the subscriber drains, the terminal survives the gap, which is
+/// how a lagged subscriber learns to stop trusting what it accumulated and mark the view
+/// incomplete. The test above shows the case where a later turn pushes it out.
 #[tokio::test]
 async fn the_terminal_is_delivered_after_a_gap() {
     let events = TurnBroadcast::new(2);

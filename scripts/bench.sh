@@ -48,3 +48,4 @@ run cargo bench --locked -p mango-external-agents --bench framing --bench events
 run cargo bench --locked -p mango-agent-codex --bench pipeline -- "$@"
 run cargo bench --locked -p mango-agent-acp --bench reducer -- "$@"
 run cargo bench --locked -p mango-agent-claude --bench tool_results -- "$@"
+run cargo bench --locked -p hub-host --bench retry -- "$@"
