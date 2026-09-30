@@ -4870,3 +4870,288 @@ mod cancelling_and_closing {
         );
     }
 }
+
+/// A turn that ends while the model is still thinking has to end the reasoning it opened, whatever
+/// ended it, because no `content_block_stop` will ever arrive to do it.
+mod ending_mid_thinking {
+    use super::*;
+    use mango_external_agents::ExitStatus;
+
+    /// The two records a turn shows while a reasoning block is open and streaming.
+    fn thinking_lines() -> Vec<String> {
+        let event = |event: serde_json::Value| {
+            serde_json::json!({"type": "stream_event", "event": event}).to_string()
+        };
+        vec![
+            event(
+                serde_json::json!({"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "thinking"}}),
+            ),
+            event(
+                serde_json::json!({"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "thinking_delta", "thinking": "weighing it"}}),
+            ),
+        ]
+    }
+
+    async fn events_of(run: Run) -> Vec<EventKind> {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(run));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "think about it"))
+            .await
+            .expect("expected a turn");
+        drain(&mut turn).await
+    }
+
+    fn assert_ended_once_before_terminal(path: &str, events: &[EventKind]) {
+        let ended: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, EventKind::ReasoningEnded))
+            .map(|(position, _)| position)
+            .collect();
+        let terminal = events.iter().position(|event| {
+            matches!(
+                event,
+                EventKind::Completed | EventKind::Error { .. } | EventKind::Cancelled { .. }
+            )
+        });
+        assert!(
+            matches!((ended.as_slice(), terminal), ([end], Some(terminal)) if *end < terminal),
+            "expected exactly one ReasoningEnded before the {path} terminal | received: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_result_while_thinking_ends_the_reasoning() {
+        let mut lines = thinking_lines();
+        lines.push(String::from(r#"{"type":"result","is_error":false}"#));
+        let events = events_of(Run::Transcript {
+            lines,
+            exit: ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        })
+        .await;
+        assert_ended_once_before_terminal("result", &events);
+    }
+
+    #[tokio::test]
+    async fn a_process_that_dies_while_thinking_ends_the_reasoning() {
+        let events = events_of(Run::Transcript {
+            lines: thinking_lines(),
+            exit: ExitStatus {
+                code: Some(1),
+                signal: None,
+            },
+        })
+        .await;
+        assert_ended_once_before_terminal("abort", &events);
+    }
+
+    #[tokio::test]
+    async fn a_host_cancel_while_thinking_ends_the_reasoning() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::stalling(thinking_lines())));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "think about it"))
+            .await
+            .expect("expected a turn");
+
+        // The cancel has to land while the block is open, not before the pump has read it.
+        let mut events = Vec::new();
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = turn.recv().await {
+                let thinking = matches!(event.kind, EventKind::ReasoningDelta { .. });
+                events.push(event.kind);
+                if thinking {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(
+            seen.ok(),
+            Some(true),
+            "expected the reasoning to stream before the cancel | received: {events:?}"
+        );
+
+        session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect("expected the cancel to land");
+        events.extend(drain(&mut turn).await);
+        assert_ended_once_before_terminal("cancel", &events);
+    }
+
+    /// A turn whose queue is exactly full of what the model thought before the run ended: the
+    /// turn's start, the reasoning's start and one delta, under a capacity of three, read by
+    /// nobody until the run is over.
+    async fn events_of_a_full_queue(run: Run, cancel: bool) -> Vec<EventKind> {
+        events_under_capacity(3, run, cancel).await
+    }
+
+    /// The same turn under a queue of `capacity` payload events, read by nobody until it ends.
+    async fn events_under_capacity(capacity: usize, run: Run, cancel: bool) -> Vec<EventKind> {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(run));
+        let limits = Limits {
+            turn_channel_capacity: capacity,
+            ..Limits::default()
+        };
+        let session = ClaudeHarness::new()
+            .open_session(
+                &host_under(Arc::clone(&launcher) as Arc<dyn ProcessLauncher>, limits),
+                OpenSession::new("chat-1"),
+            )
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "think about it"))
+            .await
+            .expect("expected a turn");
+        // Paused time only advances once every task is idle, so this returns once the pump has
+        // read every scripted line and is waiting on the child.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if cancel {
+            session
+                .cancel(CancelReason::Requested)
+                .await
+                .expect("expected the cancel to land");
+        }
+        drain(&mut turn).await
+    }
+
+    /// What a host must be able to rely on when the queue has no room for the close: the turn's
+    /// own terminal still ends it, and the refused close never becomes the failure.
+    fn assert_terminal_survives_a_full_queue(path: &str, events: &[EventKind], terminal: &str) {
+        let last = events.last().map(|event| format!("{event:?}"));
+        assert!(
+            last.as_deref()
+                .is_some_and(|last| last.starts_with(terminal)),
+            "expected the {path} to end with {terminal} on a full queue | received: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(event,
+                EventKind::Error { error } if error.code.as_str() == "stream-overflow")),
+            "expected no stream-overflow terminal in place of the {path} | received: {events:?}"
+        );
+        // The other half of the contract: the queue had no room, so the close and the usage are
+        // dropped and the host reads the terminal as ending the reasoning. A close that shows up
+        // here went through plain `emit`, or was squeezed in behind the terminal's back.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventKind::ReasoningEnded | EventKind::Usage { .. })),
+            "expected the close and the usage to be dropped on a full queue in the {path} | received: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_on_a_full_queue_still_ends_cancelled() {
+        let run = Run::stalling(thinking_lines());
+        let events = events_of_a_full_queue(run, true).await;
+        assert!(
+            events.contains(&EventKind::Cancelled {
+                reason: CancelReason::Requested
+            }),
+            "expected the cancel to end Cancelled on a full queue | received: {events:?}"
+        );
+        assert_terminal_survives_a_full_queue("cancel", &events, "Completed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_process_death_on_a_full_queue_still_ends_with_its_own_error() {
+        let run = Run::Transcript {
+            lines: thinking_lines(),
+            exit: ExitStatus {
+                code: Some(1),
+                signal: None,
+            },
+        };
+        let events = events_of_a_full_queue(run, false).await;
+        assert_terminal_survives_a_full_queue("abort", &events, "Error");
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { error })
+                if error.code.as_str() == "claude-no-result"),
+            "expected the vendor's own no-result error to end the turn | received: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_result_on_a_full_queue_still_completes() {
+        let mut lines = thinking_lines();
+        lines.push(String::from(r#"{"type":"result","is_error":false}"#));
+        let run = Run::Transcript {
+            lines,
+            exit: ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        };
+        let events = events_of_a_full_queue(run, false).await;
+        assert_terminal_survives_a_full_queue("result", &events, "Completed");
+    }
+
+    /// A refused close is sticky, so the usage that rides between the closes and the completion
+    /// would overflow behind it and take the completion's place. Nothing was lost by the close (a
+    /// terminal ends what is open), so the usage is dropped with it and the turn completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_result_carrying_usage_on_a_full_queue_still_completes() {
+        let mut lines = thinking_lines();
+        lines.push(String::from(
+            r#"{"type":"result","is_error":false,"usage":{"input_tokens":4,"output_tokens":9}}"#,
+        ));
+        let run = Run::Transcript {
+            lines,
+            exit: ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        };
+        let events = events_of_a_full_queue(run, false).await;
+        assert_terminal_survives_a_full_queue("result", &events, "Completed");
+    }
+
+    /// The other side of the line: the close fits, the usage does not. Usage is data the host
+    /// asked for, so leaving it out silently would hide an incomplete transcript; it is ordinary
+    /// payload, and the turn ends as `stream-overflow` exactly as it would for a delta.
+    #[tokio::test(start_paused = true)]
+    async fn a_usage_that_does_not_fit_overflows_like_any_payload() {
+        let mut lines = thinking_lines();
+        lines.push(String::from(
+            r#"{"type":"result","is_error":false,"usage":{"input_tokens":4,"output_tokens":9}}"#,
+        ));
+        let run = Run::Transcript {
+            lines,
+            exit: ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        };
+        // Three payload events fill the queue's first three places; the close takes the fourth,
+        // and the usage has none left.
+        let events = events_under_capacity(4, run, false).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EventKind::ReasoningEnded))
+                .count(),
+            1,
+            "expected the close to be delivered when it fits | received: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventKind::Usage { .. })),
+            "expected the usage that did not fit to be absent | received: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { error })
+                if error.code.as_str() == "stream-overflow"),
+            "expected the turn to end as stream-overflow when the usage does not fit | received: {events:?}"
+        );
+    }
+}

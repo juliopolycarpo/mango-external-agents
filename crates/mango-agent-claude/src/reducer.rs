@@ -327,9 +327,17 @@ impl TurnReducer {
 
     /// Marks the run over and closes whatever it left open, for [`abort`](Self::abort),
     /// [`cancel`](Self::cancel) and a terminal `result` record alike.
+    ///
+    /// A reasoning phase still open ends first, in the same call that builds the terminal: a host
+    /// cancelling, or a process dying, during a long thinking block never sees that block's own
+    /// `content_block_stop`, and nothing after the terminal may speak for it. The block indices
+    /// and what was kept per block go with it, since `finished` turns every later record away.
     fn end_run(&mut self) -> Vec<EventKind> {
         self.finished = true;
-        self.close_open_activities()
+        let mut events = self.close_reasoning_blocks();
+        self.delivered_by_block.clear();
+        events.extend(self.close_open_activities());
+        events
     }
 
     fn reduce_system(&mut self, record: &StreamRecord) -> Reduction {
@@ -481,10 +489,11 @@ impl TurnReducer {
 
     /// Closes every reasoning phase still open, one [`EventKind::ReasoningEnded`] each.
     ///
-    /// The safety net for a message that ended without a `content_block_stop` for its reasoning
-    /// block: the phase is over either way, and a projection left holding an open one would go on
-    /// treating a finished turn as stopped inside it. A no-op on every recorded run — the stops do
-    /// arrive.
+    /// The safety net for a message or a run that ended without a `content_block_stop` for its
+    /// reasoning block: the phase is over either way, and a projection left holding an open one
+    /// would go on treating a finished turn as stopped inside it. A no-op on every recorded run —
+    /// the stops do arrive — so it fires for a cancel, an abort or a `result` that lands while the
+    /// model is still thinking.
     fn close_reasoning_blocks(&mut self) -> Vec<EventKind> {
         let open = self.open_reasoning_blocks.len();
         self.open_reasoning_blocks.clear();
@@ -978,7 +987,8 @@ mod tests {
     use crate::protocol::StreamRecord;
     use mango_external_agents::normalize::TextLimit;
     use mango_external_agents::{
-        ActivityContent, ActivityKind, ActivityUpdate, EventKind, FileChangeKind,
+        ActivityContent, ActivityKind, ActivityUpdate, ErrorCode, EventKind, FileChangeKind,
+        VendorError,
     };
     use serde_json::json;
 
@@ -1696,5 +1706,134 @@ mod tests {
                 "expected no content for an Edit of {missing}"
             );
         }
+    }
+
+    /// A reducer whose only reasoning block, index 0, has opened and streamed but not stopped.
+    fn thinking() -> TurnReducer {
+        let mut reducer = TurnReducer::new();
+        reduce(&mut reducer, &open_block_line(0, "thinking"));
+        reduce(
+            &mut reducer,
+            &delta_line(0, "thinking_delta", "weighing the options"),
+        );
+        reducer
+    }
+
+    fn stop_line(index: u64) -> String {
+        json!({"type": "stream_event", "event": {"type": "content_block_stop", "index": index}})
+            .to_string()
+    }
+
+    fn message_stop_line() -> String {
+        json!({"type": "stream_event", "event": {"type": "message_stop"}}).to_string()
+    }
+
+    fn count_ended(events: &[EventKind]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, EventKind::ReasoningEnded))
+            .count()
+    }
+
+    /// The events every way of ending the run must show: one `ReasoningEnded`, first, ahead of the
+    /// terminal, and nothing more for a stop or message end that arrives afterwards.
+    fn assert_reasoning_ended_once(path: &str, reducer: &mut TurnReducer, events: &[EventKind]) {
+        assert_eq!(
+            count_ended(events),
+            1,
+            "expected exactly one ReasoningEnded before the {path} terminal | received: {events:?}"
+        );
+        assert_eq!(
+            events.first(),
+            Some(&EventKind::ReasoningEnded),
+            "expected ReasoningEnded ahead of everything else the {path} emits | received: {events:?}"
+        );
+        for late in [stop_line(0), message_stop_line()] {
+            let after = reduce(reducer, &late);
+            assert_eq!(
+                after,
+                Vec::<EventKind>::new(),
+                "expected nothing for a late record after the {path} ended the run | received: {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancel_mid_thinking_ends_the_reasoning_once() {
+        let mut reducer = thinking();
+        let events = reducer.cancel();
+        assert_reasoning_ended_once("cancel", &mut reducer, &events);
+        assert_eq!(
+            reducer.cancel(),
+            Vec::<EventKind>::new(),
+            "expected a second cancel to add nothing"
+        );
+    }
+
+    #[test]
+    fn an_abort_mid_thinking_ends_the_reasoning_before_the_error() {
+        let mut reducer = thinking();
+        let events = reducer.abort(VendorError::new(ErrorCode::from_static("gone"), "exited"));
+        assert_reasoning_ended_once("abort", &mut reducer, &events);
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { .. })),
+            "expected the error to end the abort | received: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_result_mid_thinking_ends_the_reasoning_before_it_completes() {
+        let mut reducer = thinking();
+        let events = reduce(&mut reducer, r#"{"type":"result","is_error":false}"#);
+        assert_reasoning_ended_once("result", &mut reducer, &events);
+        assert_eq!(
+            events.last(),
+            Some(&EventKind::Completed),
+            "expected the result to end with Completed | received: {events:?}"
+        );
+    }
+
+    #[test]
+    fn every_open_reasoning_block_ends_when_the_run_does() {
+        let mut reducer = thinking();
+        reduce(&mut reducer, &open_block_line(1, "redacted_thinking"));
+        let events = reducer.cancel();
+        assert_eq!(
+            count_ended(&events),
+            2,
+            "expected one ReasoningEnded per open block | received: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_reasoning_block_already_stopped_is_not_ended_again_by_the_run() {
+        let mut reducer = thinking();
+        assert_eq!(
+            reduce(&mut reducer, &stop_line(0)),
+            vec![EventKind::ReasoningEnded],
+            "expected the block's own stop to end it"
+        );
+        let events = reducer.cancel();
+        assert_eq!(
+            count_ended(&events),
+            0,
+            "expected no second ReasoningEnded for an already stopped block | received: {events:?}"
+        );
+    }
+
+    #[test]
+    fn ending_the_run_drops_the_text_kept_to_deduplicate_blocks() {
+        let mut reducer = thinking();
+        assert!(
+            reducer.retained_text_capacity() > 0,
+            "expected the streamed reasoning to be kept while the run is open"
+        );
+        reducer.cancel();
+        assert_eq!(
+            reducer.retained_text_capacity(),
+            0,
+            "expected no delivered text kept once the run ended, received {} bytes of capacity",
+            reducer.retained_text_capacity()
+        );
     }
 }

@@ -26,13 +26,12 @@ open_issue_number() {
   local body
   title=$(issue_title "$vendor")
   marker="<!-- vendor-drift:$vendor -->"
-  if ! candidates=$(gh issue list \
-    --repo "$repository" \
-    --state open \
-    --limit 100 \
-    --search "in:title drift($vendor)" \
-    --json number,title \
-    --jq '.[] | [.number, .title] | @tsv'); then
+  # The issues endpoint rather than `gh issue list --search`: the search index answers nothing for a
+  # title with parentheses, so every run opened a duplicate. The endpoint also lists pull requests,
+  # which are told apart by their `pull_request` member and dropped here.
+  if ! candidates=$(gh api --paginate \
+    "repos/$repository/issues?state=open&labels=type:+drift&per_page=100" \
+    --jq '.[] | select(has("pull_request") | not) | [.number, .title] | @tsv'); then
     echo "could not list open drift issues for $vendor in $repository" >&2
     return 2
   fi
