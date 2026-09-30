@@ -231,6 +231,11 @@ where
     }
 }
 
+/// Decodes `input` as every payload type `Notification::parse` reads.
+///
+/// One line per `read(...)` arm in the `match method` block of `Notification::parse`
+/// (`src/protocol/notifications.rs`): a family added there needs its type added here, or its
+/// reference decode goes unchecked.
 fn assert_every_type_decodes_alike(input: &Input) {
     assert_decodes_alike::<ThreadStarted>(input);
     assert_decodes_alike::<TurnNotification>(input);
