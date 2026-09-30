@@ -98,6 +98,51 @@ async fn dropping_the_session_off_the_runtime_ends_the_turn_and_reaps_the_child(
     assert_children_reaped(&launcher).await;
 }
 
+/// A question parked when the handle is dropped is settled once, before the terminal: the drop
+/// takes the same cancellation path as a host shutdown, so the protocol debt is paid too.
+#[tokio::test]
+async fn dropping_the_session_with_an_approval_pending_settles_it_and_reaps_the_child() {
+    let launcher = FakeLauncher::new();
+    let (session, mut turn) = open_running_turn(
+        &launcher,
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .asking_for_approval(Approval::Once)
+            .process(),
+    )
+    .await;
+    let state = session.state().clone();
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), turn.recv())
+            .await
+            .unwrap_or_else(|_| panic!("expected an approval request | received: {events:?}"))
+            .unwrap_or_else(|| {
+                panic!("expected an approval request | received a closed stream: {events:?}")
+            });
+        let asked = matches!(event.kind, EventKind::ApprovalRequested { .. });
+        events.push(event.kind);
+        if asked {
+            break;
+        }
+    }
+
+    drop(session);
+
+    events.extend(events_to_terminal(&mut turn).await);
+    let resolved = events
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::ApprovalResolved { .. }))
+        .count();
+    assert_eq!(
+        resolved, 1,
+        "expected approval resolutions: 1 | received: {events:?}"
+    );
+    assert_shutdown_terminal(&events);
+    assert_state_settles_closed(&state).await;
+    assert_children_reaped(&launcher).await;
+}
+
 /// Once the turn has ended, the drop has nothing left to cancel: the child is ended by the one
 /// idle-session teardown, exactly once and as an ordinary shutdown.
 #[tokio::test]
