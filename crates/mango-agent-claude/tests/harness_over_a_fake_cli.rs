@@ -4870,3 +4870,120 @@ mod cancelling_and_closing {
         );
     }
 }
+
+/// A turn that ends while the model is still thinking has to end the reasoning it opened, whatever
+/// ended it, because no `content_block_stop` will ever arrive to do it.
+mod ending_mid_thinking {
+    use super::*;
+    use mango_external_agents::ExitStatus;
+
+    /// The two records a turn shows while a reasoning block is open and streaming.
+    fn thinking_lines() -> Vec<String> {
+        let event = |event: serde_json::Value| {
+            serde_json::json!({"type": "stream_event", "event": event}).to_string()
+        };
+        vec![
+            event(
+                serde_json::json!({"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "thinking"}}),
+            ),
+            event(
+                serde_json::json!({"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "thinking_delta", "thinking": "weighing it"}}),
+            ),
+        ]
+    }
+
+    async fn events_of(run: Run) -> Vec<EventKind> {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(run));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "think about it"))
+            .await
+            .expect("expected a turn");
+        drain(&mut turn).await
+    }
+
+    fn assert_ended_once_before_terminal(path: &str, events: &[EventKind]) {
+        let ended: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, EventKind::ReasoningEnded))
+            .map(|(position, _)| position)
+            .collect();
+        let terminal = events.iter().position(|event| {
+            matches!(
+                event,
+                EventKind::Completed | EventKind::Error { .. } | EventKind::Cancelled { .. }
+            )
+        });
+        assert!(
+            matches!((ended.as_slice(), terminal), ([end], Some(terminal)) if *end < terminal),
+            "expected exactly one ReasoningEnded before the {path} terminal | received: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_result_while_thinking_ends_the_reasoning() {
+        let mut lines = thinking_lines();
+        lines.push(String::from(r#"{"type":"result","is_error":false}"#));
+        let events = events_of(Run::Transcript {
+            lines,
+            exit: ExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        })
+        .await;
+        assert_ended_once_before_terminal("result", &events);
+    }
+
+    #[tokio::test]
+    async fn a_process_that_dies_while_thinking_ends_the_reasoning() {
+        let events = events_of(Run::Transcript {
+            lines: thinking_lines(),
+            exit: ExitStatus {
+                code: Some(1),
+                signal: None,
+            },
+        })
+        .await;
+        assert_ended_once_before_terminal("abort", &events);
+    }
+
+    #[tokio::test]
+    async fn a_host_cancel_while_thinking_ends_the_reasoning() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::stalling(thinking_lines())));
+        let session = open(&launcher).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "think about it"))
+            .await
+            .expect("expected a turn");
+
+        // The cancel has to land while the block is open, not before the pump has read it.
+        let mut events = Vec::new();
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = turn.recv().await {
+                let thinking = matches!(event.kind, EventKind::ReasoningDelta { .. });
+                events.push(event.kind);
+                if thinking {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(
+            seen.ok(),
+            Some(true),
+            "expected the reasoning to stream before the cancel | received: {events:?}"
+        );
+
+        session
+            .cancel(CancelReason::Requested)
+            .await
+            .expect("expected the cancel to land");
+        events.extend(drain(&mut turn).await);
+        assert_ended_once_before_terminal("cancel", &events);
+    }
+}
