@@ -350,11 +350,23 @@ async fn expiry_withdraws_a_question_that_offers_no_one_time_refusal() {
         "expected expiry to cancel the prompt when no refusal exists, received {:?}",
         launcher.written()
     );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, EventKind::ApprovalResolved { .. })),
-        "withdrawal must not invent a selected vendor option, received {events:?}"
+    let resolutions: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            EventKind::ApprovalResolved { decision, .. } => Some(decision),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        resolutions.len(),
+        1,
+        "expected exactly one resolution for the expired approval before the terminal | received {events:?}"
+    );
+    assert_eq!(
+        (resolutions[0].option_id.as_str(), resolutions[0].source),
+        ("withdrawn", DecisionSource::Cancelled),
+        "expected a withdrawal that invents no vendor option | received {:?}",
+        resolutions[0]
     );
     assert!(
         events.iter().any(|event| matches!(
@@ -364,6 +376,117 @@ async fn expiry_withdraws_a_question_that_offers_no_one_time_refusal() {
             }
         )),
         "expected the fake agent to cancel its turn after withdrawal, received {events:?}"
+    );
+    session.close(CloseReason::Shutdown).await.expect("close");
+}
+
+/// A named ACP peer that asks an allow-only question, then ignores everything the client says.
+///
+/// It never answers `session/prompt`, never reacts to the permission answer and never honours
+/// `session/cancel`, which is the peer only the kill-grace fallback can stop. The core's fakes end
+/// a turn on a cancel, so none of them can stand in for it.
+struct CancelIgnoringAgent;
+
+impl CancelIgnoringAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(Self::answer)
+    }
+
+    fn answer(line: &str) -> Vec<String> {
+        let message: serde_json::Value =
+            serde_json::from_str(line).expect("expected harness JSON-RPC request");
+        let id = message["id"].clone();
+        match message["method"].as_str() {
+            Some("initialize") => vec![Self::result(
+                id,
+                serde_json::json!({
+                    "protocolVersion": 1,
+                    "agentInfo": { "name": "cancel-ignoring-fake", "version": "1" },
+                    "agentCapabilities": { "loadSession": false, "promptCapabilities": {} },
+                    "authMethods": []
+                }),
+            )],
+            Some("session/new") => vec![Self::result(
+                id,
+                serde_json::json!({ "sessionId": "sess_fake" }),
+            )],
+            Some("session/set_mode") => vec![Self::result(id, serde_json::json!({}))],
+            Some("session/prompt") => vec![
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 900,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "sess_fake",
+                        "toolCall": { "toolCallId": "call_1", "kind": "execute", "title": "Run it" },
+                        "options": [{ "optionId": "allow", "name": "Allow", "kind": "allow_once" }]
+                    }
+                })
+                .to_string(),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    fn result(id: serde_json::Value, result: serde_json::Value) -> String {
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
+    }
+}
+
+/// An approval that expires with no refusal on offer cannot be answered with a vendor option, so
+/// the turn is cancelled instead. An agent that ignores that cancel is stopped by the kill-grace
+/// fallback, exactly as it would be after a host `cancel`.
+#[tokio::test(start_paused = true)]
+async fn an_expired_unrefusable_approval_stops_an_agent_that_ignores_the_cancel() {
+    let launcher = FakeLauncher::new();
+    launcher.push(CancelIgnoringAgent::process());
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("expiry", "run it"))
+        .await
+        .expect("expected turn");
+    loop {
+        let event = turn.recv().await.expect("expected approval request");
+        if matches!(event.kind, EventKind::ApprovalRequested { .. }) {
+            break;
+        }
+    }
+    let limits = Limits::default();
+    tokio::time::advance(Duration::from_secs(121)).await;
+    // One second at a time, so a failure says how long the turn outlived the deadline.
+    let bound = limits.kill_grace + limits.shutdown_timeout + Duration::from_secs(1);
+    let mut events = Vec::new();
+    let mut ended = false;
+    let mut waited = Duration::ZERO;
+    while waited <= bound && !ended {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(event) = turn.try_recv() {
+            ended |= event.is_terminal();
+            events.push(event.kind);
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        waited += Duration::from_secs(1);
+    }
+    let live = launcher.live_children();
+    assert!(
+        ended && live == 0,
+        "expected a terminal and no live child within {bound:?} of the expiry | received terminal={ended} waited={waited:?} live_children={live} events={events:?}"
+    );
+    let resolved = events
+        .iter()
+        .filter(|event| matches!(event, EventKind::ApprovalResolved { .. }))
+        .count();
+    assert_eq!(
+        resolved, 1,
+        "expected exactly one resolution for the expired approval | received {events:?}"
     );
     session.close(CloseReason::Shutdown).await.expect("close");
 }

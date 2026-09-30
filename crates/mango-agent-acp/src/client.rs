@@ -881,13 +881,23 @@ impl SessionState {
         pending.announce();
         let Some(option_id) = pending.expiry_option.as_ref() else {
             cancelling.get_or_insert(CancelReason::Timeout);
-            // Structural rather than ordered: both calls below leave through `?`, and a question
-            // stranded in the map holds a responder the agent is still waiting on and a slot
-            // against `max_pending_requests` for the rest of the session. A guard settles the
-            // debt on every exit, so no later rearrangement of these two lines can strand it.
+            // Released before the turn's cancellation is triggered: the prompt owner it wakes, and
+            // `begin_cancellation`, take this same lock. The reason is already recorded, so a
+            // late request or answer sees a cancelling turn whether or not the guard is held.
+            drop(cancelling);
+            let cancellation = pending.turn.cancellation.clone();
+            // Structural rather than ordered: the notification's failure leaves through `?`, and a
+            // question stranded in the map holds a responder the agent is still waiting on and a
+            // slot against `max_pending_requests` for the rest of the session. A guard settles the
+            // debt on every exit, so no later rearrangement of these lines can strand it.
             let _debts = WithdrawOnDrop(self);
-            let sent = pending.connection.send_notification(pending.cancel);
-            pending.responder.respond(permission::cancelled())?;
+            let sent = pending.connection.send_notification(pending.cancel.clone());
+            // Through `withdraw`, so the host's dialog is closed ahead of the terminal. Nothing is
+            // chosen for the agent: it hears ACP's own `Cancelled` outcome.
+            pending.withdraw();
+            // The agent may ignore `session/cancel`; this starts the kill-grace fallback that
+            // reaps it, the same as a host `cancel` does.
+            cancellation.cancel();
             sent?;
             return Ok(Answered::AlreadyResolved);
         };
