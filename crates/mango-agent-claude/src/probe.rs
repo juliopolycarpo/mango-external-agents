@@ -5,11 +5,17 @@
 //! moment the child is up: a CLI that waits for input otherwise holds the probe open until the
 //! timeout, and a probe that timed out is indistinguishable from a binary that is not there.
 //!
-//! Ordinary probe failures land on `None`. That is deliberate and is not the same as "the binary
-//! has no options": a spawn that failed, a CLI that printed to stderr or a wrapper that swallowed
-//! the output must not look like a vendor that removed everything. `Error::CleanupRequired` is the
-//! exception: the host must receive its process control rather than silently losing a child it has
-//! to reconcile. Callers read `None` as "not established" and fall back rather than narrowing.
+//! A probe answers one of three things, and they are not interchangeable. `Probed::Nothing` is a
+//! spawn that failed or a child that printed nothing: not established. `Probed::Whole` is output
+//! the child finished writing. `Probed::Incomplete` is output that a read error, the size cap or
+//! the timeout cut short: the child ran, and the complete lines it wrote are kept, but nothing may
+//! be concluded from what is missing. That is deliberate and is not the same as "the binary has no
+//! options": a cut-off `--help` must not look like a vendor that removed everything, so
+//! `output` reads anything but `Whole` as `None` and callers fall back rather than narrowing. A
+//! caller for which the lines that did arrive are still evidence, such as the version banner,
+//! reads them through the crate-private `read`. `Error::CleanupRequired` is the exception to all
+//! of this: the host must receive its process control rather than silently losing a child it has
+//! to reconcile.
 
 use mango_external_agents::{
     CancelReason, ExecutablePath, HostContext, LinkReceiver, ProcessCleanupGuard, Result,
@@ -26,15 +32,67 @@ pub const PROGRAM: &str = "claude";
 /// The largest captured `--help` is 21,401 bytes (`fixtures/claude/help/2.1.270.txt`), so 1 MiB
 /// leaves a margin of about 49x for a CLI that grows its help, while a wrapper that streams
 /// without end stops being held in memory long before the probe timeout. Output past the cap is
-/// treated exactly like a read error: not established.
+/// treated exactly like a read error: incomplete.
 const OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 
-/// Everything one probe wrote to stdout, joined by newlines, or nothing when it wrote nothing.
+/// What one probe established about the child's stdout.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Probed {
+    /// The spawn failed, or the child printed nothing before it closed stdout or the timeout hit.
+    Nothing,
+    /// A read error, the size cap or the timeout cut the output short. Holds the complete lines
+    /// that arrived before, joined by newlines; empty when the failure came before the first line.
+    Incomplete(String),
+    /// The child closed stdout: every line it wrote, joined by newlines.
+    Whole(String),
+}
+
+impl Probed {
+    /// The complete lines that arrived, whether or not the output ended cleanly.
+    ///
+    /// For a caller whose answer does not depend on what came after them: a version banner names
+    /// its version on a line that either arrived whole or did not, and a status document is either
+    /// a complete JSON object or is not parsed at all.
+    pub(crate) fn lines(self) -> Option<String> {
+        match self {
+            Self::Nothing => None,
+            Self::Incomplete(text) | Self::Whole(text) => Some(text),
+        }
+    }
+}
+
+/// Everything one probe wrote to stdout, joined by newlines, or nothing when it wrote nothing or
+/// the output is not known to be complete.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(host: &mango_external_agents::HostContext) -> mango_external_agents::Result<()> {
+/// use mango_agent_claude::probe::output;
+/// use mango_external_agents::ExecutablePath;
+///
+/// let help = output(host, &ExecutablePath::default(), &["--help"]).await?;
+/// # let _ = help;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn output(
     host: &HostContext,
     executable: &ExecutablePath,
     arguments: &[&str],
 ) -> Result<Option<String>> {
+    Ok(match read(host, executable, arguments).await? {
+        Probed::Whole(text) => Some(text),
+        Probed::Nothing | Probed::Incomplete(_) => None,
+    })
+}
+
+/// Runs one probe and says how much of its output can be trusted.
+pub(crate) async fn read(
+    host: &HostContext,
+    executable: &ExecutablePath,
+    arguments: &[&str],
+) -> Result<Probed> {
     let mut argv = vec![String::from(PROGRAM)];
     argv.extend(arguments.iter().map(|argument| String::from(*argument)));
 
@@ -48,7 +106,7 @@ pub async fn output(
     {
         Ok(transport) => transport,
         Err(error) if error.cleanup_control().is_some() => return Err(error),
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(Probed::Nothing),
     };
     let cleanup =
         ProcessCleanupGuard::new(transport.control, *host.limits(), CancelReason::Shutdown);
@@ -56,9 +114,11 @@ pub async fn output(
     // A probe reads and never writes.
     let _ = sender.close().await;
 
-    let printed = tokio::time::timeout(
+    // The lines live outside the timed future so that a timeout keeps the ones that arrived.
+    let mut captured = Captured::default();
+    let end = tokio::time::timeout(
         PROBE_TIMEOUT,
-        collect(receiver.as_mut(), OUTPUT_LIMIT_BYTES),
+        collect(receiver.as_mut(), OUTPUT_LIMIT_BYTES, &mut captured),
     )
     .await;
 
@@ -67,53 +127,72 @@ pub async fn output(
     // guard, which starts the same bounded cleanup worker.
     cleanup.finish().await?;
 
-    Ok(match printed {
-        Ok(Collected::Whole(text)) => text,
-        Ok(Collected::Unknown) | Err(_) => None,
+    Ok(match end {
+        Ok(End::Closed) => captured.whole(),
+        Ok(End::Failed | End::OverCap) => Probed::Incomplete(captured.text),
+        // A child that never spoke before the timeout is still "nothing", as it always was.
+        Err(_) if captured.any => Probed::Incomplete(captured.text),
+        Err(_) => Probed::Nothing,
     })
 }
 
-/// What reading a probe's stdout established.
-#[derive(Debug, PartialEq, Eq)]
-enum Collected {
-    /// The child closed stdout: every line it wrote, joined by newlines, or nothing when it wrote
-    /// no line at all.
-    Whole(Option<String>),
-    /// The output may be incomplete: a read failed or the output outgrew its cap. Parsing what
-    /// arrived would report a cut-off listing as a CLI that lacks features.
-    Unknown,
+/// The complete lines read so far, joined by newlines.
+#[derive(Debug, Default)]
+struct Captured {
+    text: String,
+    /// Whether any line arrived, which an empty `text` cannot say: one empty line is output.
+    any: bool,
 }
 
-/// Reads `receiver` to its end, keeping at most `limit` bytes.
+impl Captured {
+    /// What a closed stdout established.
+    fn whole(self) -> Probed {
+        if self.any {
+            Probed::Whole(self.text)
+        } else {
+            Probed::Nothing
+        }
+    }
+}
+
+/// Why [`collect`] stopped reading.
+#[derive(Debug, PartialEq, Eq)]
+enum End {
+    /// The child closed stdout.
+    Closed,
+    /// A read failed.
+    Failed,
+    /// The next line would have taken the output past the cap.
+    OverCap,
+}
+
+/// Reads `receiver` until it ends, fails or would pass `limit` bytes, appending to `captured`.
 ///
 /// Lines are appended to one string as they arrive, so the output is held once rather than as a
-/// list of lines and then again as their join. A read error and output past `limit` both answer
-/// [`Collected::Unknown`] and stop reading at once; only a closed stdout answers
-/// [`Collected::Whole`].
-async fn collect(receiver: &mut dyn LinkReceiver, limit: usize) -> Collected {
-    let mut text = String::new();
-    let mut any = false;
+/// list of lines and then again as their join. Only complete lines are ever appended, so `captured`
+/// stays valid whichever way this stops, including when the caller drops it at a timeout.
+async fn collect(receiver: &mut dyn LinkReceiver, limit: usize, captured: &mut Captured) -> End {
     loop {
         let line = match receiver.recv().await {
             Ok(Some(line)) => line,
-            Ok(None) => return Collected::Whole(any.then_some(text)),
-            Err(_) => return Collected::Unknown,
+            Ok(None) => return End::Closed,
+            Err(_) => return End::Failed,
         };
-        let separator = usize::from(any);
-        if text.len() + separator + line.len() > limit {
-            return Collected::Unknown;
+        let separator = usize::from(captured.any);
+        if captured.text.len() + separator + line.len() > limit {
+            return End::OverCap;
         }
-        if any {
-            text.push('\n');
+        if captured.any {
+            captured.text.push('\n');
         }
-        text.push_str(&line);
-        any = true;
+        captured.text.push_str(&line);
+        captured.any = true;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Collected, OUTPUT_LIMIT_BYTES, PROGRAM, collect, output};
+    use super::{Captured, End, OUTPUT_LIMIT_BYTES, PROGRAM, Probed, collect, output, read};
     use mango_external_agents::testing::{FakeLauncher, FakeProcess};
     use mango_external_agents::{
         CancelReason, EnvSource, Error, ExecutablePath, ExitStatus, HostContext, LaunchSpec,
@@ -366,31 +445,38 @@ mod tests {
         }
     }
 
+    /// Runs `collect` to whatever end it reaches and returns that end with what it captured.
+    async fn gather(receiver: &mut dyn LinkReceiver, limit: usize) -> (End, Captured) {
+        let mut captured = Captured::default();
+        let end = collect(receiver, limit, &mut captured).await;
+        (end, captured)
+    }
+
     #[tokio::test]
     async fn collect_joins_lines_with_newlines_and_no_trailing_one() {
-        let mut receiver = ScriptedReceiver::lines(["a", "b", "c"]);
-        assert_eq!(
-            collect(&mut receiver, 64).await,
-            Collected::Whole(Some(String::from("a\nb\nc")))
-        );
+        let (end, captured) = gather(&mut ScriptedReceiver::lines(["a", "b", "c"]), 64).await;
+        assert_eq!(end, End::Closed);
+        assert_eq!(captured.whole(), Probed::Whole(String::from("a\nb\nc")));
     }
 
     #[tokio::test]
     async fn collect_tells_no_lines_from_one_empty_line() {
+        let (_, none) = gather(&mut ScriptedReceiver::lines([]), 64).await;
         assert_eq!(
-            collect(&mut ScriptedReceiver::lines([]), 64).await,
-            Collected::Whole(None),
+            none.whole(),
+            Probed::Nothing,
             "expected a child that wrote nothing to yield no text"
         );
+        let (_, empty) = gather(&mut ScriptedReceiver::lines([""]), 64).await;
         assert_eq!(
-            collect(&mut ScriptedReceiver::lines([""]), 64).await,
-            Collected::Whole(Some(String::new())),
+            empty.whole(),
+            Probed::Whole(String::new()),
             "expected one empty line to stay distinct from no output"
         );
     }
 
     #[tokio::test]
-    async fn collect_reads_a_link_error_as_unknown_not_as_the_end() {
+    async fn collect_reads_a_link_error_as_a_failure_and_keeps_the_lines_before_it() {
         let mut receiver = ScriptedReceiver {
             script: VecDeque::from([
                 Ok(Some(String::from("Usage: claude"))),
@@ -403,25 +489,33 @@ mod tests {
             reads: 0,
         };
 
+        let (end, captured) = gather(&mut receiver, 64).await;
+
         assert_eq!(
-            collect(&mut receiver, 64).await,
-            Collected::Unknown,
-            "expected a read error after a valid prefix to be unknown"
+            end,
+            End::Failed,
+            "expected a read error after a valid prefix to be a failure"
         );
+        assert_eq!(captured.text, "Usage: claude");
         assert_eq!(receiver.reads, 2, "expected reading to stop at the error");
     }
 
     #[tokio::test]
     async fn collect_accepts_output_of_exactly_the_cap_and_refuses_one_byte_more() {
         // "aa\nbb" is 5 bytes: two lines and the newline that joins them.
+        let (end, captured) = gather(&mut ScriptedReceiver::lines(["aa", "bb"]), 5).await;
+        assert_eq!(end, End::Closed);
+        assert_eq!(captured.text, "aa\nbb");
+
+        let (end, captured) = gather(&mut ScriptedReceiver::lines(["aa", "bbb"]), 5).await;
         assert_eq!(
-            collect(&mut ScriptedReceiver::lines(["aa", "bb"]), 5).await,
-            Collected::Whole(Some(String::from("aa\nbb")))
+            end,
+            End::OverCap,
+            "expected 6 bytes to be refused by a 5-byte cap"
         );
         assert_eq!(
-            collect(&mut ScriptedReceiver::lines(["aa", "bbb"]), 5).await,
-            Collected::Unknown,
-            "expected 6 bytes to be refused by a 5-byte cap"
+            captured.text, "aa",
+            "expected the lines before the cap to be kept"
         );
     }
 
@@ -429,10 +523,103 @@ mod tests {
     async fn collect_stops_reading_once_the_cap_is_passed() {
         let mut receiver = ScriptedReceiver::lines(["aaaa", "bbbb", "cccc", "dddd"]);
 
-        assert_eq!(collect(&mut receiver, 6).await, Collected::Unknown);
+        let (end, _) = gather(&mut receiver, 6).await;
+
+        assert_eq!(end, End::OverCap);
         assert_eq!(
             receiver.reads, 2,
             "expected the reader to stop at the first line that broke the cap"
+        );
+    }
+
+    /// A receiver that delivers its lines and then never speaks again.
+    struct StalledReceiver {
+        lines: VecDeque<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl LinkReceiver for StalledReceiver {
+        async fn recv(&mut self) -> Result<Option<String>> {
+            match self.lines.pop_front() {
+                Some(line) => Ok(Some(line)),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timeout_keeps_the_lines_that_arrived_before_it() {
+        let mut receiver = StalledReceiver {
+            lines: VecDeque::from([String::from("2.1.270 (Claude Code)")]),
+        };
+        let mut captured = Captured::default();
+
+        let end = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            collect(&mut receiver, 64, &mut captured),
+        )
+        .await;
+
+        assert!(end.is_err(), "expected a stalled child to time out");
+        assert_eq!(
+            captured.text, "2.1.270 (Claude Code)",
+            "expected the banner read before the stall to survive the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_keeps_the_complete_lines_before_a_read_error() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript([
+            String::from("2.1.270 (Claude Code)"),
+            "x".repeat(2048),
+        ]));
+        let host = host_with_line_cap(Arc::clone(&launcher), 1024);
+
+        let probed = read(&host, &ExecutablePath::default(), &["--version"])
+            .await
+            .expect("expected a completed probe");
+
+        assert_eq!(
+            probed,
+            Probed::Incomplete(String::from("2.1.270 (Claude Code)"))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_reports_a_failure_before_any_line_as_incomplete_and_empty() {
+        let launcher = Arc::new(FakeLauncher::new());
+        launcher.push(FakeProcess::transcript(["x".repeat(2048)]));
+        let host = host_with_line_cap(Arc::clone(&launcher), 1024);
+
+        let probed = read(&host, &ExecutablePath::default(), &["--version"])
+            .await
+            .expect("expected a completed probe");
+
+        assert_eq!(probed, Probed::Incomplete(String::new()));
+    }
+
+    #[tokio::test]
+    async fn read_reports_a_silent_child_and_a_failed_spawn_as_nothing() {
+        let silent = Arc::new(FakeLauncher::new());
+        silent.push(FakeProcess::transcript(Vec::<String>::new()));
+        assert_eq!(
+            read(&host(silent), &ExecutablePath::default(), &["--version"])
+                .await
+                .expect("expected a completed probe"),
+            Probed::Nothing
+        );
+
+        let unspawnable = Arc::new(FakeLauncher::new());
+        assert_eq!(
+            read(
+                &host(unspawnable),
+                &ExecutablePath::default(),
+                &["--version"]
+            )
+            .await
+            .expect("expected an unavailable probe"),
+            Probed::Nothing
         );
     }
 

@@ -35,14 +35,27 @@ reports `GateVerdict::VersionTooOld`, while a current or unreadable version repo
 `GateVerdict::Unknown` and opening returns a distinct safe `Error::Protocol` refusal. A multi-line
 wrapper banner can include its own semver, so discovery reads the semver from the line that
 identifies Claude Code rather than accepting the first semver in all stdout. A single bare version
-remains accepted for the documented compact form. A probe whose output may be incomplete is
-treated the same way as one that printed nothing: a read error before the CLI closed stdout, a
-line over the host's line cap, or more than 1 MiB of stdout all leave that probe unestablished, so
-a cut-off `--help` reports `GateVerdict::Unknown` rather than `MissingRequiredSurface`. The same
-rule covers the other two probes: an incomplete `--version` reads like a `--version` that never answered (the CLI is reported as not
-installed, as it already is for a probe that times out), and an
-incomplete `auth status` as unknown authentication. The largest captured help is 21,401 bytes,
-about 2% of that cap.
+remains accepted for the documented compact form.
+
+Probe output that may be incomplete is never read as a verdict. A read error before the CLI closed
+stdout, a line over the host's line cap, more than 1 MiB of stdout (the largest captured help is
+21,401 bytes, about 2% of that cap) or the 15 s timeout cut a probe short, and what each probe
+concludes from the lines that did arrive differs:
+
+- `--help` is strict: a cut-off listing is unestablished, so discovery reports
+  `GateVerdict::Unknown` rather than `MissingRequiredSurface`. Missing lines cannot show that a flag
+  is absent.
+- `--version` uses the complete lines it read, because an incomplete read proves the binary ran. A
+  banner line that arrived whole still supplies the version, exactly as if the read had finished.
+  When no line arrived, the CLI is installed with an unreadable version and the gate comes from
+  `--help`, as for an unparseable banner. Only a spawn that failed or a child that printed nothing
+  reports the CLI as not installed, and opening is never refused as "a CLI that reported no
+  version" for a read that failed part way.
+- `auth status` gives the lines that arrived to the same parser as a complete read, which trusts
+  only a whole JSON object. A status document that arrived complete keeps its answer, so a
+  signed-in account keeps `auto` even if later output failed. A document cut off inside the object
+  is not parsed and the answer is unknown authentication, which leaves `auto` unavailable, as for
+  any unknown account.
 
 Anthropic's [CLI reference](https://code.claude.com/docs/en/cli-reference.md#cli-flags) cautions
 that `claude --help` does not list every supported flag. This harness deliberately applies the

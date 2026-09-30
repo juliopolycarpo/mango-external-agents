@@ -435,6 +435,112 @@ mod discovery {
         );
     }
 
+    /// Narrow caps under which an 8 KiB line is a read error, as the cut-off tests use.
+    fn narrow_lines() -> Limits {
+        Limits {
+            line: LineLimits {
+                max_line_bytes: 4096,
+                max_buffered_bytes: 8192,
+            },
+            ..Limits::default()
+        }
+    }
+
+    /// An incomplete `--version` proves the binary ran, so it must never read as "not installed":
+    /// the banner's complete first line still carries the version, exactly as it did before the
+    /// probe learned to refuse partial output.
+    #[tokio::test]
+    async fn a_version_banner_followed_by_a_read_error_is_still_an_installed_cli() {
+        let banner = format!("2.1.270 (Claude Code)\n{}", "x".repeat(8192));
+        let launcher = Arc::new(FakeClaudeCli::new().with_version(&banner));
+        let host = host_under(launcher, narrow_lines());
+
+        let discovery = ClaudeHarness::new()
+            .discover(&host)
+            .await
+            .expect("expected a discovery");
+        assert_ne!(
+            discovery.gate,
+            GateVerdict::NotInstalled,
+            "expected a CLI that printed its version before the read failed to be installed | \
+             received {:?}",
+            discovery.gate
+        );
+        assert_eq!(
+            discovery.version.as_deref(),
+            Some("2.1.270 (Claude Code)"),
+            "expected the complete first line to keep supplying the version"
+        );
+
+        let opened = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await;
+        assert!(
+            opened.is_ok(),
+            "expected opening not to be refused for an incomplete --version | received {:?}",
+            opened.err()
+        );
+    }
+
+    /// With no complete line at all there is no version to read, but a child that started and then
+    /// failed to speak is still not "a CLI that is not there".
+    #[tokio::test]
+    async fn a_version_probe_that_failed_before_any_line_is_installed_with_no_version() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_version(&"x".repeat(8192)));
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_ne!(
+            discovery.gate,
+            GateVerdict::NotInstalled,
+            "expected a --version that failed mid-read not to report a missing CLI | received {:?}",
+            discovery.gate
+        );
+        assert_eq!(discovery.version, None);
+    }
+
+    /// A status document read whole is trusted even when more output follows and fails: narrowing
+    /// the permission matrix over an answer that was complete would lose `auto` for a signed-in
+    /// account.
+    #[tokio::test]
+    async fn a_complete_auth_status_line_survives_a_read_error_after_it() {
+        let status = format!("{}\n{}", support::SIGNED_IN, "x".repeat(8192));
+        let launcher = Arc::new(FakeClaudeCli::new().with_auth(&status));
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.auth,
+            mango_external_agents::AuthState::LoggedIn {
+                mode: mango_external_agents::AuthMode::Subscription
+            },
+            "expected the complete status line to keep its answer | received {:?}",
+            discovery.auth
+        );
+    }
+
+    /// A status document cut off part way is not a document: the answer stays unknown.
+    #[tokio::test]
+    async fn an_auth_status_cut_off_inside_its_document_is_unknown() {
+        let status = format!("{{\n  \"loggedIn\": true,\n{}", "x".repeat(8192));
+        let launcher = Arc::new(FakeClaudeCli::new().with_auth(&status));
+        let discovery = ClaudeHarness::new()
+            .discover(&host_under(launcher, narrow_lines()))
+            .await
+            .expect("expected a discovery");
+
+        assert_eq!(
+            discovery.auth,
+            mango_external_agents::AuthState::Unknown,
+            "expected a truncated status document not to be trusted | received {:?}",
+            discovery.auth
+        );
+    }
+
     /// The same rule for the total cap: a runaway listing made of legal lines is not a listing that
     /// lacks flags either, and discovery stops holding it once it passes the cap.
     #[tokio::test]

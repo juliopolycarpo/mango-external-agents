@@ -124,7 +124,10 @@ impl ClaudeHarness {
 
     /// Everything the three probes established, in one pass.
     async fn survey(&self, host: &HostContext, executable: &ExecutablePath) -> Result<Survey> {
-        let Some(banner) = probe::output(host, executable, &["--version"]).await? else {
+        // An incomplete banner still proves the binary ran, so its complete lines are used and an
+        // empty one leaves an installed CLI whose version is unreadable; only a probe that
+        // established nothing reads as "not installed".
+        let Some(banner) = probe::read(host, executable, &["--version"]).await?.lines() else {
             return Ok(Survey::default());
         };
         let version = version::parse(&banner);
@@ -147,7 +150,12 @@ impl ClaudeHarness {
         // Neither read depends on the other's result: one is a process boot, the other a file read.
         let (authentication, auto_mode_disabled_by_policy) = tokio::join!(
             async {
-                let stdout = probe::output(host, executable, &["auth", "status"]).await?;
+                // `parse_status` trusts only a complete JSON object, so the lines that arrived
+                // before a cut-off are safe to give it: a whole document keeps its answer and a
+                // truncated one stays unknown.
+                let stdout = probe::read(host, executable, &["auth", "status"])
+                    .await?
+                    .lines();
                 Ok::<Authentication, Error>(stdout.map_or_else(Authentication::unknown, |stdout| {
                     auth::parse_status(&stdout)
                 }))
