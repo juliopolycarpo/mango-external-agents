@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Lockstep: one version in [workspace.package], inherited by every crate, and repeated
-# verbatim in every in-workspace [workspace.dependencies] entry.
+# verbatim in every in-workspace [workspace.dependencies] entry. Each crate README's install
+# requirement follows the release rule; see scripts/check-readme-requirements.sh.
 # Usage: scripts/check-versions.sh [expected]   # expected = a tag without the leading v
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -32,6 +33,8 @@ while IFS= read -r line; do
     status=1
   fi
 done < <(sed -n '/^\[workspace\.dependencies\]/,/^\[/p' Cargo.toml | grep -E '^mango-' || true)
+
+scripts/check-readme-requirements.sh "$workspace_version" crates/*/README.md || status=1
 
 [ $status -eq 0 ] && echo "versions in lockstep: $workspace_version"
 exit $status
