@@ -378,6 +378,56 @@ async fn a_call_id_over_the_bound_fails_the_turn_and_frees_the_session() {
     );
 }
 
+/// A call the agent already had running is closed as failed, ahead of the failure that ends the turn,
+/// so the host's transcript does not end with it still running.
+#[tokio::test]
+async fn a_refused_call_id_after_a_valid_call_closes_the_valid_call_first() {
+    let (session, launcher) = open(
+        FakeAcpAgent::new().with_updates(vec![
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_ok",
+                "title": "Run tests",
+                "kind": "execute",
+                "status": "in_progress"
+            }),
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "c".repeat(129),
+                "title": "Run more tests",
+                "kind": "execute",
+                "status": "in_progress"
+            }),
+        ]),
+        permissive(),
+    )
+    .await;
+    let mut turn = start_when_free(session.as_ref(), "turn-1").await;
+    let events = drain(&mut turn).await;
+    let shape: Vec<String> = events
+        .iter()
+        .filter_map(|kind| match kind {
+            EventKind::ActivityStarted { call_id, .. } => Some(format!("started {call_id}")),
+            EventKind::ActivityCompleted { call_id, result } => {
+                Some(format!("completed {call_id} {:?}", result.status))
+            }
+            EventKind::Error { error } => Some(format!("error {}", error.code.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "started call_ok",
+            "completed call_ok Failed",
+            "error acp-refused-event"
+        ],
+        "expected the valid call closed as failed before the refusal | received {events:?}"
+    );
+    session.close(CloseReason::Requested).await.expect("close");
+    assert_eq!(launcher.live_children(), 0, "expected live children: 0");
+}
+
 /// Starts a turn, retrying while the previous turn's slot is still being released.
 async fn start_when_free(session: &dyn Session, turn_id: &str) -> TurnStream {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

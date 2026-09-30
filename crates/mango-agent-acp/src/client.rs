@@ -39,7 +39,7 @@ use mango_external_agents::approval::ApprovalDeadline;
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
 };
-use mango_external_agents::event::{EventKind, SessionId};
+use mango_external_agents::event::{ActivityStatus, EventKind, SessionId};
 use mango_external_agents::permission::{
     ApprovalDecision, DecisionSource, PermissionBroker, PermissionLevel, PermissionResponse,
     broker_response,
@@ -1095,7 +1095,7 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
             return;
         }
         if let Err(error) = turn.sink.emit(kind).await {
-            report_refused_event(&turn.sink, &error).await;
+            report_refused_event(state, &turn, &error).await;
             return;
         }
     }
@@ -1110,13 +1110,25 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
 /// into a failure by the sink itself (an overflow), so it stays silent. An already-terminal turn
 /// keeps its outcome, because a terminal commits once.
 ///
-/// The failure is committed on the sink, like an overflow, so the prompt owner sees the terminal
-/// and stops native work before it releases the generation.
-async fn report_refused_event(sink: &EventSink, error: &Error) {
-    if !matches!(error, Error::InvalidVendorValue { .. }) || sink.is_terminal() {
+/// The failure is committed on the sink, so the prompt owner sees the terminal and stops native
+/// work before it releases the generation. That owner adds nothing to a terminal it did not write,
+/// so what the turn still owes is settled here first, in the order the prompt owner would have
+/// used: the questions still waiting are withdrawn and their resolutions flushed, the calls,
+/// reasoning and plan the agent left running are closed as failed, and only then does the terminal
+/// commit. A host therefore never sees a transcript that ends with an activity still running or a
+/// question still waiting.
+async fn report_refused_event(state: &SessionState, turn: &TurnHandle, error: &Error) {
+    if !matches!(error, Error::InvalidVendorValue { .. }) || turn.sink.is_terminal() {
         return;
     }
-    let _ = sink
+    if let Some((_, _, mut closing)) = state.prepare_terminal_matching(turn) {
+        let _ = turn.approvals.flush(&turn.sink).await;
+        for kind in closing.finish_with(ActivityStatus::Failed) {
+            let _ = turn.sink.emit(kind).await;
+        }
+    }
+    let _ = turn
+        .sink
         .fail(VendorError::new(
             mango_external_agents::ErrorCode::from_static("acp-refused-event"),
             format!("the ACP agent sent an event the core refused to publish: {error}"),
@@ -2978,6 +2990,59 @@ mod tests {
             );
         }
 
+        /// What the turn still owes when a refused event ends it is settled before the terminal, so
+        /// the host's transcript never ends with a call running, a plan open or a thought unended.
+        #[tokio::test]
+        async fn a_refusal_closes_what_the_turn_left_running_before_the_terminal() {
+            use mango_external_agents::ActivityStatus;
+
+            let (state, _sink, mut events) = running_turn();
+            for frame in [
+                running_call(0),
+                notification(serde_json::json!({
+                    "sessionUpdate": "plan",
+                    "entries": [{ "content": "build", "priority": "high", "status": "pending" }]
+                })),
+                notification(serde_json::json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "thinking" }
+                })),
+                call_named(&"c".repeat(129)),
+            ] {
+                crate::client::on_session_update(&state, frame).await;
+            }
+            let mut sequence = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                sequence.push(match event.kind {
+                    EventKind::ActivityStarted { call_id, .. } => format!("started {call_id}"),
+                    EventKind::ActivityCompleted { call_id, result } => {
+                        format!("completed {call_id} {:?}", result.status)
+                    }
+                    EventKind::ReasoningEnded => String::from("reasoning ended"),
+                    EventKind::Error { error } => format!("error {}", error.code.as_str()),
+                    _ => continue,
+                });
+            }
+            let failed = format!("{:?}", ActivityStatus::Failed);
+            let mut closed = vec![
+                format!("completed call-0 {failed}"),
+                format!("completed acp:plan {:?}", ActivityStatus::Completed),
+                String::from("reasoning ended"),
+            ];
+            let (last, before) = sequence.split_last().expect("expected events");
+            let mut owed: Vec<String> = before
+                .iter()
+                .filter(|entry| !entry.starts_with("started"))
+                .cloned()
+                .collect();
+            owed.sort();
+            closed.sort();
+            assert!(
+                last == "error acp-refused-event" && owed == closed,
+                "expected the running call, plan and thought closed before acp-refused-event | received {sequence:?}"
+            );
+        }
+
         #[tokio::test]
         async fn a_blank_call_id_fails_the_turn_too() {
             let (state, _sink, events) = running_turn();
@@ -3005,7 +3070,8 @@ mod tests {
         /// Only a value the core cannot make safe is reported; a closed stream or an overflow is not.
         #[tokio::test]
         async fn only_an_invalid_vendor_value_is_reported() {
-            let (_state, sink, events) = running_turn();
+            let (state, _sink, events) = running_turn();
+            let turn = state.turn().expect("expected the turn to be running");
             for error in [
                 mango_external_agents::Error::Closed {
                     subject: "turn stream",
@@ -3016,7 +3082,7 @@ mod tests {
                     received: 2,
                 },
             ] {
-                crate::client::report_refused_event(&sink, &error).await;
+                crate::client::report_refused_event(&state, &turn, &error).await;
                 let outcome = outcome(&events);
                 assert_eq!(
                     outcome, "still running",
@@ -3027,7 +3093,7 @@ mod tests {
                 field: "activity call id",
                 received: String::from("x"),
             };
-            crate::client::report_refused_event(&sink, &invalid).await;
+            crate::client::report_refused_event(&state, &turn, &invalid).await;
             let outcome = outcome(&events);
             assert_eq!(
                 outcome, "acp-refused-event",

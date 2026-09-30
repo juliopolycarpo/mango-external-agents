@@ -258,7 +258,11 @@ an id is refused on every event that names it, so the reducer does not track it 
 announced again), and the turn ends with an `EventKind::Error` whose code is `acp-refused-event`, for
 example `the ACP agent sent an event the core refused to publish: expected a usable activity call id,
 received invalid vendor data`. The turn is failed rather than left running with the call missing
-from the host's transcript. Only a value the core cannot make safe is reported this way; a stream
+from the host's transcript. What the turn still owes is settled first, in the order a normal ending
+uses: waiting questions are withdrawn and their resolutions sent, then the calls the agent left
+running are closed as failed, an open thought is ended and the plan is completed, and only then
+does the failure commit, so the transcript never ends with an activity still running. Only a value
+the core cannot make safe is reported this way; a stream
 that is already closed or terminal, and an overflow (which the sink already turns into its own
 failure), are not. The longest id seen from a live agent is Cursor's, 85 code points.
 
