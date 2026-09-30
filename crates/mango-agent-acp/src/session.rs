@@ -232,7 +232,7 @@ impl AcpSession {
         if self.lifecycle.is_closed() {
             return Err(Error::Closed { subject: "session" });
         }
-        self.refuse_after_host_shutdown()?;
+        self.refuse_configuration_before_submission()?;
         if self.connection_state.turn().is_some() {
             return Err(Error::Protocol {
                 expected: String::from(
@@ -532,8 +532,44 @@ impl AcpSession {
         }
         Err(Error::Cancelled {
             reason: CancelReason::Shutdown,
+        })
+    }
+
+    /// The preflight of a configuration change: refuses after a host shutdown or once the watcher
+    /// has ended the session, before any request is written.
+    ///
+    /// Marked `NotSubmitted`, because nothing has reached the agent yet. The same two refusals at
+    /// the publication step stay unmarked: by then earlier options were already sent, so a host
+    /// must not be told a replay is safe.
+    ///
+    /// ```ignore
+    /// host.cancel().cancel();
+    /// assert_eq!(session.refuse_configuration_before_submission().unwrap_err().dispatch(),
+    ///     Dispatch::NotSubmitted);
+    /// ```
+    fn refuse_configuration_before_submission(&self) -> Result<()> {
+        self.refuse_after_host_shutdown()
+            .and_then(|()| self.refuse_after_peer_ended())
+            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))
+    }
+
+    /// Refuses work once the lifecycle watcher has begun ending the session without a `close`.
+    ///
+    /// The watcher does not claim the close state, so a patch that touches no wire request would
+    /// otherwise still succeed after the agent vanished. The refusal is the one a request on the
+    /// sealed connection gives, so an abandoned request and a vanished agent read the same.
+    ///
+    /// ```ignore
+    /// // once the agent's output has ended and the watcher has woken
+    /// assert!(session.refuse_after_peer_ended().is_err());
+    /// ```
+    fn refuse_after_peer_ended(&self) -> Result<()> {
+        if !self.connection_state.has_peer_ended() {
+            return Ok(());
         }
-        .with_dispatch(Dispatch::NotSubmitted))
+        Err(Error::Closed {
+            subject: "ACP connection",
+        })
     }
 
     /// Publishes the configuration state confirmed before a later option request can fail.
@@ -548,6 +584,7 @@ impl AcpSession {
             return Err(Error::Closed { subject: "session" });
         };
         self.refuse_after_host_shutdown()?;
+        self.refuse_after_peer_ended()?;
         self.connection_state.accept_configuration(accepted.clone());
         Ok(self.connection_state.publish_response_configuration(
             catalog_revision,
@@ -1614,6 +1651,38 @@ pub(crate) async fn wait_for_turn_release(
             ),
             after: bound,
         })
+}
+
+impl Drop for AcpSession {
+    /// Ends a running turn's child when the last session handle disappears.
+    ///
+    /// The prompt task owns the connection while a turn runs, so releasing the handle does not wind
+    /// the connection down: a host that keeps the stream and drops the session would leave the agent
+    /// running, with nobody left to answer its questions. This records `Shutdown` as the turn's
+    /// reason, withdraws its parked questions and starts the connection's single-flight shutdown,
+    /// which `begin_shutdown` spawns on the runtime the connection was driven on, so a drop from a
+    /// thread with no runtime still ends the child. The prompt task then writes the terminal and the
+    /// connection watcher publishes `Closed` after it.
+    ///
+    /// An idle session keeps its existing teardown (its watcher reaps once the connection is
+    /// released), and an explicit `close` owns everything when one has started.
+    ///
+    /// ```ignore
+    /// drop(session); // the held `TurnStream` now ends as `Cancelled { reason: Shutdown }`
+    /// ```
+    fn drop(&mut self) {
+        if self.close.is_started() {
+            return;
+        }
+        let cancelling = {
+            let _starting = self.connection_state.lock_turn_start();
+            self.connection_state
+                .begin_cancellation(CancelReason::Shutdown)
+        };
+        if cancelling {
+            self.connection.begin_shutdown(CancelReason::Shutdown);
+        }
+    }
 }
 
 impl AcpSession {
