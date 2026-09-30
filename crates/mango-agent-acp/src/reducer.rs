@@ -36,7 +36,7 @@ use mango_external_agents::event::{
 };
 use mango_external_agents::{
     ActivityContent, ErrorCode, ExtensionValue, Extensions, FileChange, PlanStep, PlanStepPriority,
-    PlanStepStatus, VendorError,
+    PlanStepStatus, VendorError, normalize,
 };
 
 /// The call id every plan update shares.
@@ -459,7 +459,12 @@ impl Reducer {
         }
         let finished = finished(call.status).is_some();
         let events = tool_call(call);
-        self.track(call_id, finished);
+        // An id the core refuses is refused on every event that names it, so this call can never
+        // reach a host and a running entry for it would only hold its id and any held update for a
+        // call nobody can follow. It is remembered as ended instead, at the fixed size of a digest,
+        // so later frames for the same id stay one dropped bracket rather than a new one each.
+        let refused = normalize::opaque_id(&call_id, "activity call id").is_err();
+        self.track(call_id, finished || refused);
         events
     }
 
@@ -2006,7 +2011,8 @@ mod tests {
     /// while it runs and be dropped once it ends, whichever frame kind arrives.
     #[test]
     fn a_running_call_with_a_long_id_ends_once_and_then_stays_ended() {
-        let call_id = long_call_id(0, 128 * 1024);
+        // As long as the core publishes: a longer id is refused, so it is not a running call.
+        let call_id = long_call_id(0, 128);
         let mut reducer = Reducer::new().with_update_interval(Duration::ZERO);
         let mut frames = |value: serde_json::Value| reducer.update(update(value)).0;
         let started = frames(json!({
@@ -2637,5 +2643,61 @@ mod tests {
                 "expected no failure for {reason:?}"
             );
         }
+    }
+
+    /// A call id the core refuses to publish is never a running call, so it cannot hold state.
+    #[test]
+    fn a_call_id_the_core_refuses_is_not_tracked_as_running() {
+        for refused in ["c".repeat(129), String::from("  ")] {
+            let mut reducer = Reducer::new();
+            let (events, _) = reducer.update_at(update(announced(&refused)), Instant::now());
+            let open = reducer.open_calls_len();
+            assert_eq!(
+                open, 0,
+                "expected open calls for the refused id {refused:?}: 0 | received: {open}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, EventKind::ActivityStarted { .. })),
+                "expected the refused call still reported, for the sink to refuse | received: {events:?}"
+            );
+        }
+    }
+
+    /// Later frames for a refused id are one dropped bracket, not a fresh `ActivityStarted` each.
+    #[test]
+    fn later_frames_for_a_refused_call_id_are_dropped() {
+        let long = "c".repeat(129);
+        let mut reducer = Reducer::new();
+        let _ = reducer.update_at(update(announced(&long)), Instant::now());
+        for frame in [
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": long, "title": "again" }),
+            announced(&long),
+        ] {
+            let (events, _) = reducer.update_at(update(frame.clone()), Instant::now());
+            assert!(
+                events.is_empty(),
+                "expected a repeat frame for a refused id to be dropped | received: {events:?} for {frame}"
+            );
+        }
+        assert!(
+            reducer.finish().is_empty(),
+            "expected nothing owed for a call the host never saw"
+        );
+    }
+
+    /// An id at the limit is still a running call.
+    #[test]
+    fn a_call_id_at_the_limit_is_tracked() {
+        let exact = "c".repeat(128);
+        let mut reducer = Reducer::new();
+        let _ = reducer.update_at(update(announced(&exact)), Instant::now());
+        assert_eq!(
+            reducer.open_calls_len(),
+            1,
+            "expected a 128-code-point id to be tracked | received: {}",
+            reducer.open_calls_len()
+        );
     }
 }

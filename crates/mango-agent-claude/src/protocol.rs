@@ -16,11 +16,14 @@
 //! an unknown value falls through to the ignore path.
 
 use std::borrow::Cow;
+use std::fmt;
 
 use serde_json::{Map, Value};
 
+use crate::redacted;
+
 /// One line of `claude --print --output-format stream-json`, before it has been recognised.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct StreamRecord {
     fields: Map<String, Value>,
 }
@@ -116,7 +119,7 @@ impl StreamRecord {
 }
 
 /// `system/init` — the first record of every run.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct InitRecord<'a> {
     fields: &'a Map<String, Value>,
 }
@@ -179,7 +182,7 @@ impl<'a> InitRecord<'a> {
 /// `system/permission_denied` — the vendor's own statement of why a call was refused.
 ///
 /// Reported before the `tool_result` that closes the call arrives.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct PermissionDenied<'a> {
     fields: &'a Map<String, Value>,
 }
@@ -197,7 +200,7 @@ impl<'a> PermissionDenied<'a> {
 }
 
 /// One block inside an `assistant` or `user` message.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ContentBlock<'a> {
     fields: &'a Map<String, Value>,
 }
@@ -379,7 +382,7 @@ fn take_chars(text: &str, max: usize) -> (&str, usize) {
 }
 
 /// `stream_event` — a raw Anthropic streaming event, forwarded verbatim.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct StreamEvent<'a> {
     fields: &'a Map<String, Value>,
 }
@@ -412,7 +415,7 @@ impl<'a> StreamEvent<'a> {
 }
 
 /// One `content_block_delta` payload.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Delta<'a> {
     fields: &'a Map<String, Value>,
 }
@@ -435,7 +438,7 @@ impl<'a> Delta<'a> {
 }
 
 /// `result` — the last record of a completed run.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ResultRecord<'a> {
     fields: &'a Map<String, Value>,
 }
@@ -490,6 +493,90 @@ impl<'a> ResultRecord<'a> {
             return None;
         }
         Some(reported)
+    }
+}
+
+// Metadata-only `Debug` for the raw records and the views borrowed from them: the record kind, how
+// many members it has and how large they are, never a member's value. A `tool_result` body is one
+// of them, and a `Read` of a `.env` is that body. `docs/compliance.md` states the boundary and
+// `crate::redacted` is the placeholder.
+
+impl fmt::Debug for StreamRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamRecord")
+            .field("kind", &redacted::label(self.kind()))
+            .field("subtype", &redacted::label(self.subtype()))
+            .field("members", &self.fields.len())
+            .field("size", &redacted::object(&self.fields))
+            .finish()
+    }
+}
+
+impl fmt::Debug for InitRecord<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InitRecord")
+            .field("members", &self.fields.len())
+            .field("size", &redacted::object(self.fields))
+            .finish()
+    }
+}
+
+impl fmt::Debug for PermissionDenied<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionDenied")
+            .field("members", &self.fields.len())
+            .field("size", &redacted::object(self.fields))
+            .finish()
+    }
+}
+
+impl fmt::Debug for ContentBlock<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContentBlock")
+            .field("kind", &redacted::label(self.kind()))
+            .field("is_error", &self.is_error())
+            .field("members", &self.fields.len())
+            .field("size", &redacted::object(self.fields))
+            .finish()
+    }
+}
+
+impl fmt::Debug for StreamEvent<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamEvent")
+            .field("kind", &redacted::label(self.kind()))
+            .field("index", &self.index())
+            .field("members", &self.fields.len())
+            .field("size", &redacted::object(self.fields))
+            .finish()
+    }
+}
+
+impl fmt::Debug for Delta<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Delta")
+            .field("kind", &redacted::label(self.kind()))
+            .field("members", &self.fields.len())
+            .field("size", &redacted::object(self.fields))
+            .finish()
+    }
+}
+
+impl fmt::Debug for ResultRecord<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResultRecord")
+            .field("is_error", &self.is_error())
+            .field("api_error_status", &self.api_error_status())
+            .field("members", &self.fields.len())
+            .field("size", &redacted::object(self.fields))
+            .finish()
     }
 }
 

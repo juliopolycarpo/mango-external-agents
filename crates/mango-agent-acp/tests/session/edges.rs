@@ -328,6 +328,123 @@ async fn a_parameterized_model_id_survives_the_catalog_verbatim() {
     session.close(CloseReason::Shutdown).await.expect("close");
 }
 
+/// An id over the core's 128-code-point bound can never reach a host. The turn is failed with a
+/// named error instead of running on with the call missing, and the session is free for the next.
+#[tokio::test]
+async fn a_call_id_over_the_bound_fails_the_turn_and_frees_the_session() {
+    let (session, launcher) = open(
+        FakeAcpAgent::new().with_updates(vec![serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c".repeat(129),
+            "title": "Run tests",
+            "kind": "execute",
+            "status": "in_progress"
+        })]),
+        permissive(),
+    )
+    .await;
+    for turn_id in ["turn-1", "turn-2"] {
+        let mut turn = start_when_free(session.as_ref(), turn_id).await;
+        let events = drain(&mut turn).await;
+        let summary: Vec<String> = events
+            .iter()
+            .map(|kind| format!("{kind:?}").chars().take(200).collect())
+            .collect();
+        let errors: Vec<&mango_external_agents::VendorError> = events
+            .iter()
+            .filter_map(|kind| match kind {
+                EventKind::Error { error } => Some(error),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            errors.len() == 1
+                && errors[0].code.as_str() == "acp-refused-event"
+                && errors[0].message.contains("activity call id"),
+            "expected one acp-refused-event error naming the activity call id in {turn_id} | received {summary:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|kind| matches!(kind, EventKind::ActivityStarted { .. })),
+            "expected no call the core refused to be published in {turn_id} | received {summary:?}"
+        );
+    }
+    session.close(CloseReason::Requested).await.expect("close");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected live children after close: 0"
+    );
+}
+
+/// A call the agent already had running is closed as failed, ahead of the failure that ends the turn,
+/// so the host's transcript does not end with it still running.
+#[tokio::test]
+async fn a_refused_call_id_after_a_valid_call_closes_the_valid_call_first() {
+    let (session, launcher) = open(
+        FakeAcpAgent::new().with_updates(vec![
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_ok",
+                "title": "Run tests",
+                "kind": "execute",
+                "status": "in_progress"
+            }),
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "c".repeat(129),
+                "title": "Run more tests",
+                "kind": "execute",
+                "status": "in_progress"
+            }),
+        ]),
+        permissive(),
+    )
+    .await;
+    let mut turn = start_when_free(session.as_ref(), "turn-1").await;
+    let events = drain(&mut turn).await;
+    let shape: Vec<String> = events
+        .iter()
+        .filter_map(|kind| match kind {
+            EventKind::ActivityStarted { call_id, .. } => Some(format!("started {call_id}")),
+            EventKind::ActivityCompleted { call_id, result } => {
+                Some(format!("completed {call_id} {:?}", result.status))
+            }
+            EventKind::Error { error } => Some(format!("error {}", error.code.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "started call_ok",
+            "completed call_ok Failed",
+            "error acp-refused-event"
+        ],
+        "expected the valid call closed as failed before the refusal | received {events:?}"
+    );
+    session.close(CloseReason::Requested).await.expect("close");
+    assert_eq!(launcher.live_children(), 0, "expected live children: 0");
+}
+
+/// Starts a turn, retrying while the previous turn's slot is still being released.
+async fn start_when_free(session: &dyn Session, turn_id: &str) -> TurnStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match session.start_turn(TurnRequest::new(turn_id, "go")).await {
+            Ok(turn) => return turn,
+            Err(error)
+                if matches!(error.cause(), mango_external_agents::Error::Busy)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => panic!("expected {turn_id} to be admitted | received {error:?}"),
+        }
+    }
+}
+
 /// A host launcher that ignores `LaunchSpec::stdin: true`: the child is live and its stdout is
 /// readable, but it was never given a writable stdin.
 struct StdinlessLauncher {
