@@ -132,22 +132,19 @@ fn final_end(bytes: &[u8], at: usize, range: std::ops::RangeInclusive<u8>) -> us
     }
 }
 
-/// The end of a CSI whose introducer ends at `start`: parameter bytes (`0x30..=0x3f`),
-/// intermediate bytes (`0x20..=0x2f`), then one final byte (`0x40..=0x7e`).
+/// The end of a CSI whose introducer ends at `start`: parameter and intermediate bytes
+/// (`0x20..=0x3f`), then one final byte (`0x40..=0x7e`).
 ///
-/// A byte that fits none of those ends the sequence and is left in place, so a space or a line
-/// break after `ESC [` cannot carry the sequence on into the next word.
+/// The standard puts every parameter byte before every intermediate one. A sequence that does not
+/// (`ESC [ SP 1 m`) is malformed, and it still ends at its final byte here: stopping at the first
+/// misplaced byte would leave `1m` in front of whatever follows and glue it onto a name. A byte
+/// outside that range ends the sequence and is left in place, so a line break after `ESC [` cannot
+/// carry the sequence on into the next word.
 fn csi_end(bytes: &[u8], start: usize) -> usize {
     let mut at = start;
     while bytes
         .get(at)
-        .is_some_and(|byte| (0x30..=0x3f).contains(byte))
-    {
-        at += 1;
-    }
-    while bytes
-        .get(at)
-        .is_some_and(|byte| (0x20..=0x2f).contains(byte))
+        .is_some_and(|byte| (0x20..=0x3f).contains(byte))
     {
         at += 1;
     }
@@ -217,6 +214,9 @@ mod tests {
                 "\u{1b}[\u{7}TOKEN=secret",
                 "\u{1b}[API_KEY=secret",
                 "\u{1b}[1;TOKEN=secret",
+                "\u{1b}[ 1mAPI_KEY=secret",
+                "\u{1b}[ 1API_KEY=secret",
+                "\u{1b}[1 2;mTOKEN=secret",
             ],
             "an escape sequence broken by the name that follows",
         );
