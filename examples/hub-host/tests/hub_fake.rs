@@ -65,3 +65,45 @@ async fn reconciling_after_a_scripted_already_recorded_commit_answers_that_termi
         "expected the terminal the commit reported, received {answer:?}"
     );
 }
+
+/// A terminal the Hub already recorded is not replaced by a script that contradicts it.
+///
+/// The first commit records `Completed`. A scripted `AlreadyRecorded` for a different terminal
+/// afterwards cannot be true of a Hub that keeps one terminal per logical operation, so the fake
+/// answers what it holds and reconciliation keeps agreeing with it.
+#[tokio::test]
+async fn a_scripted_already_recorded_terminal_does_not_replace_one_the_hub_recorded() {
+    let hub = FakeHubApi::new().committing([
+        CommitAnswer::Record,
+        CommitAnswer::AlreadyRecorded { terminal: failed() },
+    ]);
+    let first = hub
+        .commit(&operation(), &TerminalStatus::Completed)
+        .await
+        .expect("expected the first commit to answer");
+    assert_eq!(first, Commit::Recorded);
+
+    let second = hub
+        .commit(&operation(), &TerminalStatus::Completed)
+        .await
+        .expect("expected the contradicting commit to answer");
+    let reconciled = hub
+        .reconcile(&operation())
+        .await
+        .expect("expected reconciliation to answer");
+
+    assert_eq!(
+        second,
+        Commit::AlreadyRecorded {
+            terminal: TerminalStatus::Completed
+        },
+        "expected the terminal the hub first recorded, received {second:?}"
+    );
+    assert_eq!(
+        reconciled,
+        Reconciliation::Answered(HubStatus::Committed {
+            terminal: TerminalStatus::Completed
+        }),
+        "expected reconciliation to keep the first terminal, received {reconciled:?}"
+    );
+}
