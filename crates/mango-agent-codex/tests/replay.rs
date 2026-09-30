@@ -3869,6 +3869,14 @@ async fn an_approval_answer_the_pipe_refuses_ends_the_link_and_reaps_the_child()
         .await
         .expect("expected a turn");
     let request = await_approval(&mut turn).await;
+    // The break has to land on the answer and on nothing before it, so drift in the handshake or
+    // the turn start fails here by name rather than as a hang or a break on the wrong write.
+    assert_eq!(
+        launcher.written().len(),
+        LINES_BEFORE_THE_APPROVAL_ANSWER,
+        "expected lines written before the approval answer: {LINES_BEFORE_THE_APPROVAL_ANSWER} | received: {}",
+        launcher.written().len()
+    );
 
     // Whether the host's own call reports the refused write is not the contract; the turn ending
     // is.
