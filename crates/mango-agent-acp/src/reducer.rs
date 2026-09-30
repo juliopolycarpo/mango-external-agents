@@ -25,7 +25,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    ContentBlock, ContentChunk, Diff, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     SessionConfigOption, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
@@ -619,17 +619,19 @@ fn tool_call(call: ToolCall) -> Vec<EventKind> {
     // `Activity::item_id`'s own doc, "distinct from the call", is real: ACP names no id for a tool
     // call's transcript item apart from `tool_call_id`. Carried anyway, so a host can route an
     // update by item id the same way across harnesses, even on the one where the two ids coincide.
-    let activity = Activity::new(
-        tool_name(&call),
-        activity_kind(call.kind),
-        call.title.clone(),
-    )
-    .with_item_id(call_id.clone());
-    let activity = match content_detail(&call.content) {
+    // The name is a copy of the title (see `tool_name`) and the title itself is not read again, so
+    // it moves into the activity instead of being cloned a second time.
+    let activity = Activity::new(tool_name(&call), activity_kind(call.kind), call.title)
+        .with_item_id(call_id.clone());
+    // The detail reads the blocks by reference; the content then consumes them, so a diff's bodies
+    // move into the event instead of being copied for it.
+    let detail = content_detail(&call.content);
+    let content = tool_call_content(call.content);
+    let activity = match detail {
         Some(detail) => activity.with_detail(detail),
         None => activity,
     };
-    let activity = match tool_call_content(&call.content) {
+    let activity = match content {
         Some(content) => activity.with_content(content),
         None => activity,
     };
@@ -656,14 +658,14 @@ fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
     // while an explicit empty (or one carrying no shape this crate renders) clears the content a
     // host retained from the earlier call. `detail` is derived from that same collection, so it is
     // explicitly empty too instead of leaving an old diff path or output line visible.
-    let detail = fields
-        .content
-        .as_deref()
-        .map(|content| content_detail(content).unwrap_or_default());
-    let content = fields
-        .content
-        .as_deref()
-        .map(|content| tool_call_content(content).unwrap_or(ActivityContent::Empty));
+    let (detail, content) = match fields.content {
+        Some(blocks) => {
+            let detail = content_detail(&blocks).unwrap_or_default();
+            let content = tool_call_content(blocks).unwrap_or(ActivityContent::Empty);
+            (Some(detail), Some(content))
+        }
+        None => (None, None),
+    };
     // `locations` on an update is left uncarried: unlike `Activity`, `ActivityUpdate` has no
     // extensions slot to put a count in, and `raw_input`/`raw_output` never go anywhere — both are
     // unbounded vendor payloads this library forbids carrying.
@@ -771,11 +773,12 @@ pub fn activity_kind(kind: ToolKind) -> ActivityKind {
 #[must_use]
 pub fn content_detail(content: &[ToolCallContent]) -> Option<String> {
     content_text(content)
+        .map(str::to_owned)
         .or_else(|| {
-            content_diffs(content)
-                .into_iter()
-                .next()
-                .map(|file| file.path)
+            content.iter().find_map(|block| match block {
+                ToolCallContent::Diff(diff) => Some(diff.path.display().to_string()),
+                _ => None,
+            })
         })
         .or_else(|| {
             // A terminal is the host's to own, and this harness declines the capability — so an
@@ -787,15 +790,21 @@ pub fn content_detail(content: &[ToolCallContent]) -> Option<String> {
         })
 }
 
-/// The first text block's own words, when the call carries one.
-fn content_text(content: &[ToolCallContent]) -> Option<String> {
+/// The first text block's own words, borrowed, when the call carries one.
+///
+/// Borrowed so that reading the detail never copies a block it does not return: an image or an
+/// embedded resource ahead of the text is stepped over, not cloned.
+fn content_text(content: &[ToolCallContent]) -> Option<&str> {
     content.iter().find_map(|block| match block {
-        ToolCallContent::Content(inner) => plain_text(inner.content.clone()),
+        ToolCallContent::Content(inner) => match &inner.content {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        },
         _ => None,
     })
 }
 
-/// Every diff block as its own row, in the vendor's own order.
+/// One diff block as a row, its texts moved rather than copied.
 ///
 /// Never a unified diff synthesised from the two texts: the core forbids computing one
 /// representation of a change from another, so `old_text`/`new_text` are carried as ACP sent them
@@ -808,17 +817,8 @@ fn content_text(content: &[ToolCallContent]) -> Option<String> {
 /// omitted one does, and that file is reported as created. Following the protocol's own definition
 /// is the documented behaviour; the alternative is dropping the signal for every honest agent to
 /// guard against a broken one.
-fn content_diffs(content: &[ToolCallContent]) -> Vec<FileChange> {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            ToolCallContent::Diff(diff) => Some(
-                FileChange::new(diff.path.display().to_string())
-                    .with_texts(diff.old_text.clone(), diff.new_text.clone()),
-            ),
-            _ => None,
-        })
-        .collect()
+fn file_change(diff: Diff) -> FileChange {
+    FileChange::new(diff.path.display().to_string()).with_texts(diff.old_text, diff.new_text)
 }
 
 /// The structured thing a tool call's content blocks describe, when they describe one this crate
@@ -829,13 +829,26 @@ fn content_diffs(content: &[ToolCallContent]) -> Vec<FileChange> {
 /// diff gets that text as [`ActivityContent::Output`] too, its own thing rather than only the one
 /// bounded line `detail` carries. A call with only a terminal id produces no content — a terminal is
 /// the host's to own, and this harness has nothing else to say about it.
+///
+/// Consumes the blocks: the diffs' texts and the text body move into the result, where reading them
+/// through a borrow would copy every byte of a body that can run to megabytes. Read
+/// [`content_detail`] first when the same blocks also feed a detail line.
 #[must_use]
-fn tool_call_content(content: &[ToolCallContent]) -> Option<ActivityContent> {
-    let files = content_diffs(content);
+fn tool_call_content(content: Vec<ToolCallContent>) -> Option<ActivityContent> {
+    let mut files = Vec::new();
+    let mut text = None;
+    for block in content {
+        match block {
+            ToolCallContent::Diff(diff) => files.push(file_change(diff)),
+            // The first text block, as `content_text` picks it: an image ahead of it is skipped.
+            ToolCallContent::Content(inner) if text.is_none() => text = plain_text(inner.content),
+            _ => {}
+        }
+    }
     if !files.is_empty() {
         return Some(ActivityContent::Diff { files });
     }
-    content_text(content).map(|text| ActivityContent::Output { text })
+    text.map(|text| ActivityContent::Output { text })
 }
 
 /// A bounded, observational count of the files a call names, when it names any.
@@ -984,9 +997,9 @@ pub fn stop_failure(stop_reason: StopReason) -> Option<VendorError> {
 mod tests {
     use super::{
         CallDigest, PLAN_CALL_ID, Reducer, SessionFact, TURN_INCOMPLETE_CODE, activity_kind,
-        stop_failure, was_cancelled,
+        content_detail, stop_failure, tool_call_content, was_cancelled,
     };
-    use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolKind};
+    use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolCallContent, ToolKind};
     use mango_external_agents::event::{
         ActivityKind, ActivityStatus, ActivityUpdate, Command, EventKind, ThreadUsage, Usage,
     };
@@ -1171,6 +1184,10 @@ mod tests {
         assert_eq!(call_id, "call_1");
         assert_eq!(activity.kind, ActivityKind::Command);
         assert_eq!(activity.title, "Run `cargo test`");
+        assert_eq!(
+            activity.name, "Run `cargo test`",
+            "expected the name to carry the title on the stable v1 wire"
+        );
         assert_eq!(
             activity.item_id.as_deref(),
             Some("call_1"),
@@ -1381,6 +1398,129 @@ mod tests {
                 text: String::from("2 tests passed")
             })
         );
+    }
+
+    fn blocks(value: serde_json::Value) -> Vec<ToolCallContent> {
+        serde_json::from_value(value).expect("expected v1 tool-call content blocks")
+    }
+
+    /// The wire order of the blocks changes nothing about which one `detail` reads: a text block
+    /// wins over a diff whether it comes before or after it, and an image ahead of the text is
+    /// skipped rather than ending the search.
+    #[test]
+    fn content_detail_prefers_text_over_a_diff_in_either_order() {
+        let diff = json!({ "type": "diff", "path": "/repo/a.rs", "newText": "a" });
+        let text = json!({ "type": "content", "content": { "type": "text", "text": "did it" } });
+        let image = json!({
+            "type": "content",
+            "content": { "type": "image", "mimeType": "image/png", "data": "AAAA" }
+        });
+        for order in [
+            vec![diff.clone(), text.clone()],
+            vec![text.clone(), diff.clone()],
+            vec![image.clone(), diff.clone(), text.clone()],
+        ] {
+            assert_eq!(
+                content_detail(&blocks(json!(order))).as_deref(),
+                Some("did it"),
+                "expected the text block's words as detail | received the other for {order:?}"
+            );
+        }
+    }
+
+    /// A call with diffs and no text reports the first diff's path, and only that.
+    #[test]
+    fn content_detail_of_a_diff_only_call_is_the_first_diffs_path() {
+        let content = blocks(json!([
+            { "type": "diff", "path": "/repo/first.rs", "oldText": "old", "newText": "new" },
+            { "type": "diff", "path": "/repo/second.rs", "newText": "other" }
+        ]));
+        assert_eq!(
+            content_detail(&content).as_deref(),
+            Some("/repo/first.rs"),
+            "expected the first diff's path as detail"
+        );
+    }
+
+    /// An image is neither detail nor content: a call whose only block is one reports neither.
+    #[test]
+    fn an_image_only_tool_call_carries_neither_detail_nor_content() {
+        let content = blocks(json!([{
+            "type": "content",
+            "content": { "type": "image", "mimeType": "image/png", "data": "AAAA" }
+        }]));
+        assert_eq!(content_detail(&content), None);
+        assert_eq!(tool_call_content(content), None);
+    }
+
+    /// The path `detail` reports and the files `content` carries come from the same blocks: every
+    /// diff survives in its own row, in the agent's order, with both texts.
+    #[test]
+    fn a_diff_only_tool_call_carries_the_first_path_and_every_file() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_diffs",
+            "title": "Edit",
+            "kind": "edit",
+            "status": "completed",
+            "content": [
+                { "type": "diff", "path": "/repo/first.rs", "oldText": "old", "newText": "new" },
+                { "type": "diff", "path": "/repo/second.rs", "newText": "created" }
+            ]
+        })]);
+        let [
+            EventKind::ActivityStarted { activity, .. },
+            EventKind::ActivityCompleted { .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected one activity, received {events:?}");
+        };
+        assert_eq!(activity.detail.as_deref(), Some("/repo/first.rs"));
+        let Some(ActivityContent::Diff { files }) = &activity.content else {
+            panic!("expected diff content, received {:?}", activity.content);
+        };
+        let seen: Vec<_> = files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.as_str(),
+                    file.old_text.as_deref(),
+                    file.new_text.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("/repo/first.rs", Some("old"), Some("new")),
+                ("/repo/second.rs", None, Some("created")),
+            ]
+        );
+    }
+
+    /// The same rule when the diffs arrive as an update to a running call: the update's detail is
+    /// the first path and its content is the files.
+    #[test]
+    fn a_diff_only_tool_call_update_carries_the_first_path_and_every_file() {
+        let events = reduce(vec![
+            announced("call_upd"),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_upd",
+                "content": [
+                    { "type": "diff", "path": "/repo/first.rs", "newText": "new" },
+                    { "type": "diff", "path": "/repo/second.rs", "newText": "other" }
+                ]
+            }),
+        ]);
+        let Some(EventKind::ActivityUpdated { update, .. }) = events.get(1) else {
+            panic!("expected an update after the start, received {events:?}");
+        };
+        assert_eq!(update.detail.as_deref(), Some("/repo/first.rs"));
+        let Some(ActivityContent::Diff { files }) = &update.content else {
+            panic!("expected diff content, received {:?}", update.content);
+        };
+        assert_eq!(files.len(), 2, "received {files:?}");
     }
 
     /// A call that names files it touches, without a diff, gets that as a bounded count rather than

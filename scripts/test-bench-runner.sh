@@ -23,6 +23,25 @@ grep -q 'to be identical, received a difference' "$scratch/drift.err" || {
   exit 1
 }
 
+# Every copy is compared, not only the first: a drifted third copy is rejected too.
+if scripts/check-bench-runner.sh "$scratch/a.rs" "$scratch/same.rs" "$scratch/drifted.rs" >/dev/null 2>"$scratch/third.err"; then
+  echo "expected rejection of a drifted third runner copy, received success" >&2
+  exit 1
+fi
+grep -q 'drifted.rs to be identical, received a difference' "$scratch/third.err" || {
+  echo "expected the drift message to name the third copy, received: $(cat "$scratch/third.err")" >&2
+  exit 1
+}
+
+if scripts/check-bench-runner.sh "$scratch/a.rs" >/dev/null 2>"$scratch/lonely.err"; then
+  echo "expected rejection of a single runner path, received success" >&2
+  exit 1
+fi
+grep -q 'a reference runner and at least one copy' "$scratch/lonely.err" || {
+  echo "expected the single-path message, received: $(cat "$scratch/lonely.err")" >&2
+  exit 1
+}
+
 if scripts/check-bench-runner.sh "$scratch/a.rs" "$scratch/missing.rs" >/dev/null 2>"$scratch/missing.err"; then
   echo "expected rejection of a missing runner copy, received success" >&2
   exit 1
