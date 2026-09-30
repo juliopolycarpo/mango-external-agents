@@ -186,6 +186,11 @@ struct PendingApproval {
     turn: TurnHandle,
     /// Dropping a resolved question stops its timer task.
     _timer_done: tokio::sync::oneshot::Sender<()>,
+    /// Dropping a settled question ends the broker call deliberating on it.
+    ///
+    /// Every way a question leaves the pending map consumes it, so this drops exactly when the
+    /// question is answered, withdrawn, expired or swept by a cancel or a close.
+    _broker_settled: tokio::sync::oneshot::Sender<()>,
 }
 
 impl PendingApproval {
@@ -735,6 +740,13 @@ impl SessionState {
             .update_at(notification.update, tokio::time::Instant::now().into_std())
     }
 
+    /// How many tool calls the turn reducer holds open, for the tests that prove a turnless frame
+    /// did not reach it.
+    #[cfg(test)]
+    fn open_call_count(&self) -> usize {
+        self.lock_reducer().open_calls_len()
+    }
+
     /// Publishes a session-scoped fact the reducer surfaced.
     ///
     /// Applied to the core's own live state rather than folded into the turn stream — see
@@ -1035,19 +1047,25 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     if !state.serves(&notification.session_id) {
         return;
     }
-    // Capture the current owner before reducing session facts. Facts may arrive between turns;
-    // their publication must not attach turn events to a newly admitted generation.
+    // Capture the current owner before anything is reduced. Facts may arrive between turns; their
+    // publication must not attach turn events to a newly admitted generation.
     let turn = state.turn();
     state.touch();
+    // No turn owns this frame (a `session/load` replay, or a frame between turns): its events would
+    // be dropped, so only its session facts are read and the turn reducer is not fed, which keeps a
+    // long history from leaving open calls behind for the next turn to reset.
+    let Some(turn) = turn else {
+        for fact in Reducer::session_facts(notification.update) {
+            state.apply_fact(fact);
+        }
+        return;
+    };
     let (events, facts) = state.reduce(notification);
     // Published before the turn events: a session fact is true the moment the agent announced it,
     // not only once a host has read every event that preceded it on this turn's own stream.
     for fact in facts {
         state.apply_fact(fact);
     }
-    let Some(turn) = turn else {
-        return;
-    };
     for kind in events {
         // Re-checked each time round: close can commit the terminal after reduction, and no later
         // event may follow it.
@@ -1121,6 +1139,7 @@ async fn on_request_permission(
         return responder.respond(permission::cancelled());
     };
     let (timer_done, done) = tokio::sync::oneshot::channel();
+    let (broker_settled, settled) = tokio::sync::oneshot::channel();
     let pending = PendingApproval {
         responder,
         host_answerable: false,
@@ -1136,6 +1155,7 @@ async fn on_request_permission(
         cancel: CancelNotification::new(request.session_id),
         turn: turn.clone(),
         _timer_done: timer_done,
+        _broker_settled: broker_settled,
     };
     if !state.park_pending(id.clone(), pending)? {
         return Ok(());
@@ -1143,28 +1163,41 @@ async fn on_request_permission(
 
     expire_pending(state, &turn, id.clone(), deadline, done);
 
-    resolve_pending(Arc::clone(state), turn, id, question, deadline);
+    resolve_pending(Arc::clone(state), turn, id, question, deadline, settled);
     Ok(())
 }
 
 /// Resolves one parked permission away from ACP's serialized dispatch loop.
 ///
-/// The pending-map admission cap limits these tasks. `ApprovalDeadline::run` bounds policy work,
-/// so a broker that never decides cannot keep an orphan task after the request expires.
+/// The broker call lives exactly as long as its question is parked. `settled` resolves when the
+/// pending map lets go of the question, however it does — answered, withdrawn, expired, cancelled or
+/// swept by a close — and the call is dropped at that point rather than left to run out its
+/// approval deadline. That is what ties these tasks to `max_pending_requests`: an entry in the map
+/// is the only thing that keeps one alive. `ApprovalDeadline::run` still bounds a broker that
+/// never decides, for a question nothing else settles.
+///
+/// A host's [`PermissionBroker`](mango_external_agents::PermissionBroker) therefore sees its
+/// `decide` future dropped, the same as it already does when the deadline passes.
 fn resolve_pending(
     state: Arc<SessionState>,
     turn: TurnHandle,
     id: String,
     question: mango_external_agents::PermissionRequest,
     deadline: ApprovalDeadline,
+    settled: tokio::sync::oneshot::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let decided = match turn.level {
             Some(PermissionLevel::ReadOnly) => standing_refusal(&question),
-            Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => deadline
-                .run(broker_response(state.broker.as_ref(), &question))
-                .await
-                .flatten(),
+            Some(PermissionLevel::Default | PermissionLevel::FullAccess) | None => {
+                let deliberation = deadline.run(broker_response(state.broker.as_ref(), &question));
+                tokio::select! {
+                    biased;
+                    // Only ever a dropped sender: nothing is sent on this channel.
+                    _ = settled => return,
+                    decided = deliberation => decided.flatten(),
+                }
+            }
         };
         if !state.announce_pending(&id, decided.is_none()) {
             return;
@@ -2680,5 +2713,148 @@ mod tests {
                 if operation.contains("turn slot release") && *after == bound),
             "expected Timeout naming the turn slot release after {bound:?} | received: {error:?}"
         );
+    }
+
+    /// Frames delivered while no turn exists: a `session/load` replay, or a frame between turns.
+    mod replay {
+        use std::sync::Arc;
+
+        use mango_external_agents::{AttemptId, EventSink, TurnId};
+
+        use super::{SessionId, state};
+
+        /// One `session/update` notification for `session-1`, composed as the agent's JSON.
+        fn notification(
+            update: serde_json::Value,
+        ) -> agent_client_protocol::schema::v1::SessionNotification {
+            serde_json::from_value(serde_json::json!({
+                "sessionId": "session-1",
+                "update": update,
+            }))
+            .expect("expected the test frame to be a v1 session notification")
+        }
+
+        fn running_call(index: usize) -> agent_client_protocol::schema::v1::SessionNotification {
+            notification(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": format!("call-{index}"),
+                "title": "Run tests",
+                "kind": "execute",
+                "status": "in_progress",
+                "content": [{ "type": "content", "content": { "type": "text", "text": "output" } }],
+            }))
+        }
+
+        /// `session/load` replays a whole history while no turn exists. Those frames build events that
+        /// are dropped, so they must not also leave a call open in the reducer until the next turn.
+        #[tokio::test]
+        async fn replayed_tool_calls_leave_no_open_call_when_no_turn_exists() {
+            const REPLAYED: usize = 50;
+            let (state, _) = state();
+            let state = Arc::new(state);
+            for index in 0..REPLAYED {
+                crate::client::on_session_update(&state, running_call(index)).await;
+            }
+            let open = state.open_call_count();
+            assert_eq!(
+                open, 0,
+                "expected open calls after turnless replay: 0 | received: {open}"
+            );
+        }
+
+        /// Skipping the transcript must not skip what the replay says about the session itself.
+        #[tokio::test]
+        async fn replayed_session_facts_are_still_applied_when_no_turn_exists() {
+            let (state, _) = state();
+            let state = Arc::new(state);
+            crate::client::on_session_update(&state, running_call(0)).await;
+            crate::client::on_session_update(
+                &state,
+                notification(serde_json::json!({
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{ "name": "review", "description": "Review the diff" }],
+                })),
+            )
+            .await;
+            crate::client::on_session_update(
+                &state,
+                notification(serde_json::json!({
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": [{
+                        "id": "model",
+                        "name": "Model",
+                        "type": "select",
+                        "currentValue": "fast",
+                        "options": [
+                            { "value": "fast", "name": "Fast" },
+                            { "value": "deep", "name": "Deep" }
+                        ],
+                    }],
+                })),
+            )
+            .await;
+            let snapshot = state.core_state.snapshot();
+            let commands: Vec<&str> = snapshot.commands.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(
+                commands,
+                ["review"],
+                "expected replayed commands: [review] | received: {commands:?}"
+            );
+            let options = snapshot.catalog.options().len();
+            assert_eq!(
+                options, 1,
+                "expected replayed configuration options: 1 | received: {options}"
+            );
+        }
+
+        /// The turn events one session emits for a repeat of call 0 after `replayed` turnless frames.
+        async fn events_after_replay(replayed: usize) -> Vec<String> {
+            use mango_external_agents::event::EventKind;
+
+            let (state, host) = state();
+            let state = Arc::new(state);
+            for index in 0..replayed {
+                crate::client::on_session_update(&state, running_call(index)).await;
+            }
+            let (sink, mut events) = EventSink::new(
+                SessionId::new("session-1"),
+                TurnId::new("turn-1"),
+                AttemptId::default(),
+                Arc::clone(host.clock()),
+                16,
+            );
+            let turn = state
+                .begin_turn(sink, None)
+                .expect("expected the turn to be admitted");
+            crate::client::on_session_update(&state, running_call(0)).await;
+            let closing = state.prepare_terminal_matching(&turn);
+            let closed = closing.map_or(0, |(_, _, mut reducer)| reducer.finish().len());
+            let mut kinds = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                kinds.push(match event.kind {
+                    EventKind::ActivityStarted { .. } => String::from("started"),
+                    other => format!("{other:?}"),
+                });
+            }
+            kinds.push(format!("owed-closings:{closed}"));
+            kinds
+        }
+
+        /// A turn that starts after a replay reduces its own frames exactly as it would have on a
+        /// session that never replayed anything: the replay's calls are neither open nor finished in it.
+        #[tokio::test]
+        async fn a_turn_after_replay_reduces_as_on_a_fresh_session() {
+            let fresh = events_after_replay(0).await;
+            let replayed = events_after_replay(50).await;
+            assert_eq!(
+                fresh,
+                ["started", "owed-closings:1"],
+                "expected a fresh turn to start one call and owe its close | received: {fresh:?}"
+            );
+            assert_eq!(
+                replayed, fresh,
+                "expected a turn after replay to match a fresh session: {fresh:?} | received: {replayed:?}"
+            );
+        }
     }
 }

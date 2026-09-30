@@ -4497,6 +4497,9 @@ async fn the_harness_passes_the_core_conformance_suite() {
     );
 }
 
+#[path = "session/broker_lifetime.rs"]
+mod broker_lifetime;
+
 #[path = "session/expiry.rs"]
 mod expiry;
 

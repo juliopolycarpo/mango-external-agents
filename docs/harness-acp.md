@@ -101,7 +101,10 @@ Handlers leave the dispatch loop promptly:
   dispatch never waits for a host to read.
 - A `session/request_permission` handler must not wait for an answer, because the answer arrives
   through `Session::respond` on another task. It parks the agent's responder and returns; broker
-  deliberation is a separately bounded callback, capped by `Limits::max_pending_requests`.
+  deliberation is a separate callback that lives only as long as its question stays parked, so
+  `Limits::max_pending_requests` caps it too. Once the question is answered, withdrawn, expired,
+  cancelled or swept by a close, the broker's `decide` future is dropped rather than left to run
+  out the approval deadline; a broker must tolerate that, as it already must at the deadline.
 
 The typed handlers are installed before connecting. A final SDK handler consumes unsupported
 notifications and answers unsupported requests with `Method not found`; it does not retain them
@@ -247,6 +250,14 @@ final output. `Reducer::with_update_interval` changes the interval; `Duration::Z
 update. This bounds how often one call reaches a host, not how large one update is: each is still
 bounded by the core's `TextLimit::Detail`.
 
+A `session/update` that arrives while no turn exists is not transcript. ACP's
+[`session/load`](https://agentclientprotocol.com/protocol/v1/session-setup) has the agent replay the
+whole conversation through `session/update` before it answers, and a frame between two turns is the
+same case. No host stream is open to receive those events, so the turn reducer is not fed: such a frame
+contributes only its session facts (the command catalog and the configuration catalog, which
+`Reducer::session_facts` reads), and a replayed tool call leaves no open call behind for the next turn
+to reset. `current_mode_update` produces no fact on either path.
+
 ## Permissions
 
 Each session owns its own agent process, so a `session/update` or `session/request_permission`
@@ -349,13 +360,15 @@ outstanding.
 `PermissionRequest::expires_at` comes from `Limits::approval_timeout`. The core's
 `ApprovalDeadline` starts when the question arrives and covers broker deliberation and host response
 time. Answers at or after the deadline cannot allow work, even before the timer task runs.
-Expiry selects the agent's `reject_once` option and records `DecisionSource::Expired`. If the agent
-offers no one-time refusal, the harness cancels the turn with `CancelReason::Timeout` and
-withdraws the question with ACP's `Cancelled` outcome and closes the host's dialog with an
-`ApprovalResolved` whose option id is `withdrawn`, `DecisionSource::Cancelled` and no effect,
-because no vendor option was selected. The cancel starts the same kill-grace fallback a host
-`cancel` does, so an agent that ignores `session/cancel` is still reaped. It never
-chooses `reject_always` for a timeout. These outcomes follow the
+Expiry answers with the agent's refusal, preferring the one-time one: `reject_once` when offered,
+otherwise `reject_always`, which is then the only refusal the agent left and the alternative is to
+end the whole turn. Either way the resolution is `DecisionSource::Expired`. Only when the agent
+offers no refusal at all does the harness cancel the turn with `CancelReason::Timeout` and withdraw
+the question with ACP's `Cancelled` outcome. It closes the host's dialog with an `ApprovalResolved`
+whose option id is `withdrawn`, `DecisionSource::Cancelled` and no effect, because no vendor option
+was selected. The cancel starts the same kill-grace fallback a host `cancel` does, so an agent that
+ignores `session/cancel` is still reaped. Expiry never selects an allow option. These outcomes
+follow the
 [ACP v1 permission specification](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission).
 The timer answers the agent even if the bounded event channel is full. Approval events remain
 ordered before the turn terminal and arrive when the host resumes reading.
@@ -634,8 +647,11 @@ official crate's own encoding of the same request. A host that wants larger prom
   environment. HTTP preserves name, endpoint, and headers only when `initialize` advertised
   `mcpCapabilities.http`; a request without that capability is refused before either lifecycle call.
   Before any ACP process starts, every entry must have a unique valid name; a stdio command must be
-  an absolute, control-free path; arguments and server-only environment entries must have valid
-  shapes; and an HTTP endpoint must parse as an absolute `http` or `https` URI with a host and valid
+  an absolute, control-free path; each argument must be non-empty, at most 128 code points and free
+  of control and bidi characters, and may start with `-` because it is the MCP server's own argv,
+  sent as JSON and never parsed as an agent option (the core argv rule that refuses a leading `-`
+  is unchanged, and Claude and Codex apply no MCP argument check at all); server-only environment
+  entries must have valid shapes; and an HTTP endpoint must parse as an absolute `http` or `https` URI with a host and valid
   port. Header names and values are checked before launch. The mapping follows
   [ACP v1 session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
   ACP-over-HTTP remains unrelated and unsupported.
