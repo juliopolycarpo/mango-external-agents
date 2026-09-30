@@ -15,6 +15,10 @@ description = "OpenAI Codex harness for mango-external-agents: the app-server JS
 [lints]
 workspace = true
 
+[lib]
+# The library has no benchmarks of its own, so `cargo bench` skips its unit tests.
+bench = false
+
 [dependencies]
 async-trait = "0.1.92"
 http = "1.4.0"
@@ -29,6 +33,12 @@ tokio = { version = "1.53.1", default-features = false, features = ["macros", "r
 [dev-dependencies]
 mango-external-agents = { workspace = true, features = ["launcher-tokio", "stdio", "testing"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
+
+# Non-gating benchmarks: a plain `harness = false` binary with no extra dependencies. Run it with
+# `cargo bench -p mango-agent-codex`; see docs/benchmarks.md.
+[[bench]]
+name = "pipeline"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true
