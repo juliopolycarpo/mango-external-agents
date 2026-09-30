@@ -596,8 +596,18 @@ require, then the same bounded cleanup runs
 and the turn writes its terminal before `Closed` is published. The watcher holds the connection only
 weakly, so the token does not keep a dropped session's child alive. After the token fires,
 `configure` is refused as `Cancelled { reason: Shutdown }` (`NotSubmitted`), the same shape a turn
-start gets, including a patch that touches no wire request. That guard is keyed on the token, so it
-does not cover a session that ended because the agent vanished.
+start gets, including a patch that touches no wire request. A session the watcher ends because the
+agent vanished refuses `configure` too, as `Closed` on the ACP connection: the watcher sets a mark
+of its own on every wake and never claims the close, so a later `close` still returns the shared
+result.
+
+Dropping the last session handle while a turn is running does the same for that turn. The prompt
+task owns the connection while the turn runs, so the drop itself records `CancelReason::Shutdown`,
+withdraws the parked questions and starts the connection's shutdown on the runtime it was driven
+on, which also works from a thread with no runtime. The held `TurnStream` ends as
+`Cancelled { reason: Shutdown }` then `Completed`, and the watcher publishes `Closed` after it. A
+drop with no turn running keeps its earlier behaviour: the watcher reaps once the connection is
+released.
 
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
