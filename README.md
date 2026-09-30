@@ -36,40 +36,22 @@ a typed error before anything is spawned.
 
 Versions are lockstep: one tag releases the four crates.
 
-## A host in twenty lines
+## A host, step by step
 
 The host implements `ProcessLauncher` (or takes `TokioLauncher` from the `launcher-tokio`
-feature), authorises a working directory, and reads events. Replacing `FakeLauncher` with a real
-launcher and `ClaudeHarness` with the vendor's own is the only difference from a production host;
-the same example against `testing::FakeHarness` is a running doctest on the core crate.
+feature), authorises a working directory, and reads events. Two complete examples are compiled by
+the test suite, so neither can drift from the API:
 
-```rust,ignore
-use mango_external_agents::testing::FakeLauncher;
-use mango_external_agents::{
-    CloseReason, EventKind, Harness, HostContext, OpenSession, TurnRequest,
-};
-use std::sync::Arc;
+- [`crates/mango-external-agents/README.md`](crates/mango-external-agents/README.md) is a whole
+  host against `testing::FakeLauncher` and `testing::FakeHarness`. It is a running doctest on the
+  core crate with the `testing` feature enabled.
+- [`crates/mango-agent-claude/README.md`](crates/mango-agent-claude/README.md) is the same shape
+  against the real `ClaudeHarness`: build a `HostContext`, discover, open a session, stream a turn.
+  It is compiled as a doctest and not run, because it needs the vendor CLI installed and signed in.
 
-let launcher = FakeLauncher::scripted(include_str!("../fixtures/claude/transcripts/hello.ndjson"));
-let host = HostContext::builder()
-    .launcher(Arc::new(launcher))
-    .cwd(std::env::current_dir()?)
-    .client_info("my-host", env!("CARGO_PKG_VERSION"))
-    .build()?;
-
-let harness = mango_agent_claude::ClaudeHarness::default();
-let session = harness.open_session(&host, OpenSession::new("chat-1")).await?;
-let mut turn = session.start_turn(TurnRequest::new("turn-1", "say hello")).await?;
-while let Some(event) = turn.recv().await {
-    match event.kind {
-        EventKind::TextDelta { text } => print!("{text}"),
-        EventKind::ApprovalRequested { request } => session.respond(request.deny()?).await?,
-        EventKind::Completed => break,
-        _ => {}
-    }
-}
-session.close(CloseReason::Requested).await?;
-```
+What separates the two is the launcher and the harness: a real host swaps `FakeLauncher` for its own
+`ProcessLauncher` (or `TokioLauncher`) and `FakeHarness` for a vendor harness, and discovers the
+CLI first, as the Claude example does.
 
 An event carries its session, its turn and the instant it was stamped alongside its `kind`, so a
 host can log or route one without matching on what happened first.

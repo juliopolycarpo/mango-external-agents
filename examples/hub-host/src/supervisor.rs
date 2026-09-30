@@ -152,7 +152,6 @@ struct Progress {
     /// reconciliation would reset a consecutive counter on each reconciliation, and the host would
     /// hammer it at the base delay for as long as it stayed down.
     failures: u32,
-    dispatched: bool,
     terminal_came_from_hub: bool,
 }
 
@@ -182,9 +181,23 @@ pub struct Supervisor {
 /// no state for "the control plane will never take this", because the control plane is not the
 /// library's business. Without it the refusal lives only as long as the `Settled` value a caller
 /// may drop, and the next run reconciles and dispatches work the Hub refused for good.
+///
+/// `settlement` is the Hub's half of the terminal. The record keeps the outcome the vendor produced
+/// and refuses to be overwritten by a different one, but when the Hub already held another
+/// terminal, the Hub's is the outcome of the logical operation. It is kept apart from the native
+/// one so neither stands in for the other, and so a repeated run answers with it instead of
+/// committing again.
+///
+/// `reserved` is the same kind of fact: whether the record's current attempt has been offered to
+/// the Hub. It is set before the reservation call is awaited, so a run dropped anywhere after that
+/// point leaves it set, and the next run that gets proof of absence takes a strictly newer
+/// attempt. Held on the run instead, it resets to false with the dropped future and the resumed
+/// run reserves the same attempt a second time, which the Hub cannot tell from the first.
 struct LogicalTurn {
     record: RecoveryRecord,
     refusal: Option<String>,
+    settlement: Option<TerminalStatus>,
+    reserved: bool,
 }
 
 impl LogicalTurn {
@@ -192,6 +205,8 @@ impl LogicalTurn {
         Self {
             record,
             refusal: None,
+            settlement: None,
+            reserved: false,
         }
     }
 }
@@ -320,7 +335,7 @@ impl Supervisor {
     ///
     /// The watcher sees every turn this supervisor runs from now on, not one operation. If it
     /// falls behind it receives a [`Delivery::Gap`](crate::Delivery::Gap), which names no turn:
-    /// resync every operation it is showing, as that type's documentation describes.
+    /// mark every operation it is showing as incomplete, as that type's documentation describes.
     ///
     /// # Example
     ///
@@ -410,6 +425,44 @@ impl Supervisor {
         self.records.get(turn_id).map(|turn| &turn.record)
     }
 
+    /// The terminal the Hub already held for this logical turn, when it answered instead of
+    /// taking the one this host offered.
+    ///
+    /// [`Supervisor::record`]'s terminal is the outcome the vendor produced, and the record
+    /// refuses to be overwritten by a different one. When the Hub had already recorded another —
+    /// an earlier attempt that ended `Failed` outranks a later `Completed` — the Hub's is the
+    /// outcome of the logical operation, and this is where a host persisting the record reads it.
+    /// `None` until a run has been answered with one.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use hub_host::testing::{FakeHubApi, FakeVendorSession, ScriptedJitter};
+    /// # use hub_host::{RetryPolicy, Stop, Supervisor};
+    /// # use mango_external_agents::{SystemClock, TurnId};
+    /// # use std::sync::Arc;
+    /// # use std::time::Duration;
+    /// # let policy = RetryPolicy::new(
+    /// #     Duration::from_millis(10),
+    /// #     Duration::from_secs(1),
+    /// #     Duration::from_secs(5),
+    /// #     Arc::new(ScriptedJitter::maximum()),
+    /// # );
+    /// # let supervisor = Supervisor::new(
+    /// #     Box::new(FakeVendorSession::new()),
+    /// #     Arc::new(FakeHubApi::new()),
+    /// #     policy,
+    /// #     Arc::new(Stop::new()),
+    /// #     Arc::new(SystemClock),
+    /// # );
+    /// assert!(supervisor.settlement(&TurnId::new("never-run")).is_none());
+    /// ```
+    pub fn settlement(&self, turn_id: &TurnId) -> Option<&TerminalStatus> {
+        self.records
+            .get(turn_id)
+            .and_then(|turn| turn.settlement.as_ref())
+    }
+
     /// Drives one logical operation until it is committed, refused, stopped or uncertain.
     ///
     /// Reusing a `turn_id` with different content is refused before anything is dispatched;
@@ -493,6 +546,13 @@ impl Supervisor {
                 reason: reason.clone(),
             });
         }
+        // The same for the Hub's settlement: it is the operation's outcome, so a repeat answers it
+        // without reaching the vendor or the Hub.
+        if let Some(terminal) = &turn.settlement {
+            return Ok(Settled::AlreadyCommitted {
+                terminal: terminal.clone(),
+            });
+        }
         self.inner.drive(turn, &request, stop).await
     }
 }
@@ -508,7 +568,6 @@ impl SupervisorInner {
             stop,
             stream: None,
             failures: 0,
-            dispatched: false,
             terminal_came_from_hub: false,
         };
         loop {
@@ -527,9 +586,14 @@ impl SupervisorInner {
                 self.abandon(&mut progress, reason).await;
                 return Ok(Settled::Stopped { reason });
             }
-            let record = &mut turn.record;
+            let LogicalTurn {
+                record, reserved, ..
+            } = &mut *turn;
             let step = match record.action() {
-                RecoveryAction::Submit => self.submit(record, request, &mut progress).await?,
+                RecoveryAction::Submit => {
+                    self.submit(record, reserved, request, &mut progress)
+                        .await?
+                }
                 RecoveryAction::Observe => self.observe(record, &mut progress).await?,
                 RecoveryAction::Reconcile => self.reconcile(record, &mut progress).await?,
                 RecoveryAction::Finished => self.settle(record, &progress).await?,
@@ -546,8 +610,12 @@ impl SupervisorInner {
                 Step::Settled(settled) => {
                     // Recorded on the logical turn, not just returned: the refusal has to outlive
                     // the `Settled` value the caller is free to drop.
-                    if let Settled::Refused { reason } = &settled {
-                        turn.refusal = Some(reason.clone());
+                    match &settled {
+                        Settled::Refused { reason } => turn.refusal = Some(reason.clone()),
+                        Settled::AlreadyCommitted { terminal } => {
+                            turn.settlement = Some(terminal.clone());
+                        }
+                        _ => {}
                     }
                     return Ok(settled);
                 }
@@ -564,18 +632,21 @@ impl SupervisorInner {
     }
 
     /// Dispatches one attempt, recording uncertainty before anything side-effecting happens.
+    ///
+    /// `reserved` is the logical turn's own flag, not the run's: see [`LogicalTurn`].
     async fn submit(
         &self,
         record: &mut RecoveryRecord,
+        reserved: &mut bool,
         request: &TurnRequest,
         progress: &mut Progress,
     ) -> Result<Step> {
-        let (operation, retried) = self.next_dispatch(record, request, progress.dispatched)?;
+        let (operation, retried) = self.next_dispatch(record, request, *reserved)?;
         // Before the Hub reservation, not after it: reserving *is* the side-effecting submission
         // in a Hub-owned model, so a reservation whose acknowledgement is lost must leave this
         // record on `Reconcile` rather than on "nothing happened".
         record.record_dispatch(&operation, Dispatch::AcceptanceUnknown)?;
-        progress.dispatched = true;
+        *reserved = true;
 
         match self
             .bounded(self.hub.reserve(&operation, record.fingerprint()))
@@ -756,9 +827,9 @@ impl SupervisorInner {
         &self,
         record: &mut RecoveryRecord,
         request: &TurnRequest,
-        dispatched: bool,
+        reserved: bool,
     ) -> Result<(OperationRef, Option<TurnRequest>)> {
-        if !dispatched {
+        if !reserved {
             return Ok((record.operation().clone(), None));
         }
         let attempt = request

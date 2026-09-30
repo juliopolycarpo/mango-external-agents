@@ -93,8 +93,39 @@ when that names none, from the last report the server did not mean to retry. The
 not one — it carries `willRetry`, and the turn's own completion still follows. Ending a turn there
 would end the host's turn twice.
 
+**Every terminal closes what it leaves open.** The app-server documents `item/started` and
+`item/completed` as the lifecycle of a thread item and `turn/interrupt` as ending the turn with
+status `interrupted` ([app-server][app-server]); it does not promise a completion for an item that
+was still running when the turn was interrupted, failed or torn down. A host that only saw the
+opening would keep an activity spinning and a reasoning block open, so the session tracks what it
+has published and, in the same step that claims the terminal, emits one `ActivityCompleted` per
+open call, in start order, and one `ReasoningEnded` per open phase, and then the terminal. The
+status is `cancelled` for an interrupt, a host shutdown, and a turn the vendor reported complete
+with items unreported, and `failed` for a failed turn, a malformed terminal, a lost connection
+and a poisoned session. The claim is taken once, so a late second terminal closes nothing. A turn
+with nothing open emits nothing extra.
+
+The closes go through `EventSink::emit_close`. They are payload, so a turn whose payload budget
+is spent has no room for them; the sink refuses such a close without committing anything, the
+first refusal stops the closes, and the terminal the turn was ending with is committed as usual. A
+full queue therefore costs the host the closes it had no room for and never the cancellation,
+completion or failure. A stream that already committed a terminal, an overflow for instance,
+refuses every close, so nothing follows it. Nothing waits for room.
+
+**An event the core refuses fails the turn.** Every vendor id is untrusted: an activity id that is
+blank, longer than the bound, or containing characters the core refuses (control and bidirectional
+formatting characters) is refused rather than shortened or repaired, because a changed id would
+name a different object. Dropping that event in silence would leave a host rendering a turn that is
+missing an activity, so the turn closes what it holds open as failed and ends with the code
+`codex-refused-event`, and the native turn is interrupted like any other abandoned one. What the turn was still asking is settled before the failure, as before an ordinary terminal, and a steer is rejected as already completed from the moment the failure is on the stream. Ids the
+app-server sends today are UUIDs, so this is a guard against a malformed or changed vendor stream,
+not something seen in the captured transcripts.
+
 **Conversation events and approvals retain thread and native-turn ownership.** Delayed events
-cannot finish a replacement turn. Reviews explicitly account for the early `turn/started` id
+cannot finish a replacement turn. Until the `turn/start` answer names the native turn, only a frame on this session's own thread can
+claim the pending id: a subagent's traffic on the shared connection is ignored there, so it cannot
+be announced as the turn, cannot drop the session's own early output, and cannot become the target
+of a cancel. Reviews explicitly account for the early `turn/started` id
 differing from the review response. Child-thread events remain excluded until the shared API
 can represent parent-child activity and approval ownership. A terminal or an explicitly refused
 `turn/start` clears every owner-bound marker before it releases admission, so a cancellation reaper
@@ -313,20 +344,92 @@ Two of the server's questions are approvals a person can answer:
 `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`. Options come from
 the declared `CommandExecutionApprovalDecision` / `FileChangeApprovalDecision` enums:
 
-| Vendor decision                 | Effect  | Scope     | Risk        | Writes a rule | Note                                         |
-| ------------------------------- | ------- | --------- | ----------- | ------------- | -------------------------------------------- |
-| `accept`                        | Allow   | `Once`    | unspecified | no            |                                              |
-| `acceptForSession`              | Allow   | `Session` | unspecified | no            | Codex forgets it when the thread ends        |
-| `decline`                       | Reject  | `Once`    | unspecified | no            | The turn goes on                             |
-| `cancel`                        | `Other` | —         | destructive | no            | Stops the turn, which a reject must not mean |
-| `acceptWithExecpolicyAmendment` | `Other` | —         | destructive | **yes**       | Only when the request proposed one           |
-| `applyNetworkPolicyAmendment`   | `Other` | —         | destructive | **yes**       | Only when the request proposed one           |
+| Vendor decision                 | Effect  | Scope     | Risk        | Writes a rule | Note                                                     |
+| ------------------------------- | ------- | --------- | ----------- | ------------- | -------------------------------------------------------- |
+| `accept`                        | Allow   | `Once`    | unspecified | no            |                                                          |
+| `acceptForSession`              | Allow   | `Session` | unspecified | no            | Codex forgets it when the thread ends                    |
+| `decline`                       | Reject  | `Once`    | unspecified | no            | The turn goes on                                         |
+| `cancel`                        | `Other` | —         | destructive | no            | Stops the turn, which a reject must not mean             |
+| `acceptWithExecpolicyAmendment` | `Other` | —         | destructive | **yes**       | Only when the request proposed one and it displays whole |
+| `applyNetworkPolicyAmendment`   | `Other` | —         | destructive | **yes**       | Only when the request proposed one and it displays whole |
 
 Four facts rather than one word. The two amendments are the reason: each one writes a policy Codex
 applies to later requests on its own, and the old vocabulary had no way to say that — `Other` said
 "only a person can weigh this" and nothing about what agreeing would leave behind. Their scope is
 left **unstated**, because Codex does not say how far an amendment reaches, and an unstated reach is
 never read as the narrow one.
+
+### Standing rules an amendment writes
+
+An amendment option writes a rule Codex applies on its own from then on, so the option's label
+carries the rule itself and never a generic description of it. The pinned digest in
+`vendor/schema.json` lists property names only, with no field types. The types come from
+`codex app-server generate-json-schema` run at the pinned 0.154.0:
+`CommandExecutionRequestApprovalParams.proposedExecpolicyAmendment` is `string[]` (a command
+prefix), `proposedNetworkPolicyAmendments` is `NetworkPolicyAmendment[]` where
+`NetworkPolicyAmendment` is `{host: string, action: "allow" | "deny"}`, and
+`networkApprovalContext` is `{host: string, protocol: "http" | "https" | "socks5Tcp" |
+"socks5Udp"}`. The reply shapes are the `acceptWithExecpolicyAmendment` and
+`applyNetworkPolicyAmendment` arms of `CommandExecutionApprovalDecision`.
+
+| Proposal                             | Label                                                             |
+| ------------------------------------ | ----------------------------------------------------------------- |
+| `["git","status"]`                   | `Allow, and always allow commands starting with ["git","status"]` |
+| `{host: "a.example", action: allow}` | `Apply standing network rule: allow "a.example"`                  |
+| `{host: "a.example", action: deny}`  | `Apply standing network rule: deny "a.example"`                   |
+
+- **The prefix is compact JSON**, because a space-joined prefix reads the same for `["rm -rf","x"]`
+  and `["rm","-rf","x"]`.
+- **An option is offered only when its label survives the core's option-label bound**
+  (`TextLimit::ApprovalOptionLabel`, 128 code points, with control and bidirectional characters
+  stripped) unchanged, checked with `normalize::bound_text` on the final string. Cutting a label
+  would show a person less than the rule they are writing, which is the concealment the label
+  exists to prevent, so the option is dropped instead. The four plain options remain, and the
+  dropped rule is spelled out in the detail (up to 256 code points; a longer one is described as
+  too long to show) as a standing rule "proposed but not offered".
+- **A proposal outside the declared shape is not offered**: an execpolicy amendment that is not a
+  nonempty array of strings, or a network amendment without a nonempty `host` and an `action` of
+  exactly `allow` or `deny`, or that carries any other member. A rule that cannot be labelled exactly cannot be consented to.
+- **The action is what the wire proposes.** A `deny` proposal is labelled `deny`, never "Allow".
+  What Codex does with the current request when a `deny` amendment is applied is **unverified**:
+  the pinned description says only "User chose a persistent network policy rule (allow/deny) for
+  this host", so the label says nothing about the request in front of the person. The reply
+  carries exactly the `{action, host}` that was labelled.
+- **`networkApprovalContext` leads the detail**, ahead of the agent's own `reason`, as
+  `Network access requested: <protocol> to <host>`. A context of a shape the pin does not declare
+  (an extra member, or a protocol outside the enum) is shown whole as it arrived.
+- **The refusal is unchanged**: `decline`. Options stay `Other`, destructive and
+  `policy_changing`, so a broker's `allow()` never selects one, and nothing is auto-selected.
+
+**Only the first network proposal is a candidate.** The choice was made deliberately:
+
+- Every network amendment answers with the same option id, `applyNetworkPolicyAmendment`, because
+  `ApprovalDecisionValue::option_id` is a public `&'static str`. Offering several would need
+  indexed ids, and the broker path resolves the chosen option by reading that id back off the
+  decision, so a broker choosing the second would be audited as an unresolved option, losing its
+  `policy_changing` and destructive flags.
+- The core refuses a request of more than `APPROVAL_MAX_OPTIONS` (16) options, and the pin
+  declares no bound on the number of proposals, so offering all of them lets a long proposal list
+  stop a prompt from reaching the host at all.
+- Nothing is lost silently: every later proposal is listed in the detail (four at most, then a
+  count). A person who wants one of those rules can decline and write it in their own Codex
+  configuration.
+
+Offering every proposal remains possible once options can carry ids other than the vendor
+decision's own.
+
+**How often a prefix survives.** The label wording leaves 81 code points for the compact JSON of a
+prefix, and 91 for a network host. A host name is short enough that a network option is dropped
+only for a host longer than that. A prefix keeps its option when the JSON of the whole argv fits:
+`["git","status"]` (16), `["cargo","test","--workspace"]` (32) and
+`["curl","-s","https://api.example.com/v1/status"]` (48) all do. It loses it for a long argv, such
+as a shell wrapper around a whole script or a `curl` with an inline payload, whose JSON exceeds 81.
+There is no captured corpus of real proposals to count against: the archival capture in
+`fixtures/codex/approval.jsonl` records one three-word prefix with its text redacted, and the
+sample of commands available locally is too small to state a rate. What is asserted is the
+boundary itself, by
+`approvals::tests::realistic_prefixes_mostly_keep_their_option`. A prefix that loses its option is
+not silently gone: the detail carries the rule and the four plain options still work.
 
 The running server also writes an `availableDecisions` member that **its own generated schema does
 not declare**. It is deliberately not read: building the option set a person chooses from out of an
@@ -350,6 +453,20 @@ composing a reply does not outlive the question. The same notification after thi
 confirms that answer and consumes its bounded acknowledgement; it cannot become an early marker
 that spends capacity for a later approval. This is client-side timing only: it adds no app-server
 method or wire field beyond the existing [documented surface][readme].
+
+### Debug output
+
+Every interaction carrier prints metadata only, following the `Debug` policy in
+`docs/compliance.md`: `PendingApproval`, `ServerRequest`, the approval, permissions, question and
+elicitation params, and every answer type (`ServerAnswer`, `ApprovalDecisionValue`,
+`ApprovalResponse`, `PermissionsRequestApprovalResponse` and the question-round answers). A
+debug-logged command approval reads, abridged,
+`CommandExecution(CommandExecutionApprovalParams { command: Some(<14 bytes redacted>), .. })`:
+which members are present and how large they are, never the command, reason, working directory,
+amendment prefix, host, permission profile or answer text. Vendor-minted ids are reported by
+length, as core does for an `InteractionId`; the option ids this harness offers (`accept`,
+`grant:turn`) and the method names it recognises print as themselves. Notifications, thread items
+and the reducers are raw protocol types outside this set.
 
 ### Permissions
 
@@ -405,6 +522,48 @@ A `serverRequest/resolved` withdrawal closes an announced question with `Questio
 without sending another answer to the server. An answer already accepted by `Session::answer`
 retains its outcome during shutdown and terminal cleanup. The pending round remains owned until
 its resolution is published, so `Completed` cannot leave an accepted answer's prompt open.
+
+#### When a question can actually arrive
+
+The library declares `questions: true` and drives the whole round trip, but that says what it can
+answer, not how often the vendor asks. What is known, read on 2026-09-30 against the pinned schema
+(`0.154.0`) and a live `codex-cli 0.159.2`:
+
+- `item/tool/requestUserInput` is in the **stable** schema of both builds, the one generated
+  without `--experimental`, described as "EXPERIMENTAL". The label is a description, not a gate:
+  the vendor's [app-server documentation][app-server] says some methods and fields "are
+  intentionally gated behind `experimentalApi` capability" and lists `tool/requestUserInput`
+  "(experimental)", yet this request stays in the stable schema. This harness sends no
+  `capabilities` in `initialize`, so it never opts in to `experimentalApi`.
+- The vendor's own feature list (`codex features list`, `0.159.2`, an empty `CODEX_HOME`) reports
+  `default_mode_request_user_input` as "under development" and `false`. By its name it is the
+  switch for questions in Default mode; this note claims nothing beyond its stage and state.
+- `TurnStartParams.collaborationMode` is absent from the pinned inventory and, at `0.159.2`,
+  appears only in the schema generated with `--experimental`, so the library has no supported way
+  to select a collaboration mode such as Plan. This note cites no vendor sentence tying Plan mode
+  to questions, so it does not claim that it would make one arrive.
+- The one candidate setting found is that feature flag, and it is the user's to set. With
+  `-c features.default_mode_request_user_input=true`, `codex features list` reports it `true`, and
+  `codex features enable` writes it to the user's `config.toml`. That shows the flag can be turned
+  on, not that turning it on makes the vendor raise `requestUserInput`; no vendor source or capture
+  confirms that yet, which is what the capture task below is for. The library cannot set it. It
+  starts `codex app-server` with no `-c` argument, edits no persistent Codex configuration, and its
+  per-thread `config` override on `thread/start` and `thread/resume` carries only the host's MCP
+  servers and the reasoning effort.
+
+So with default settings the vendor probably never asks a question on a library turn. That has
+**not** been observed end to end: no authenticated turn was run for this note, and the conformance
+suite exercises the question path with a pushed synthetic request, not a captured one.
+
+`questions` stays `true` on purpose. Reporting `false` would make conformance require `answer` to
+refuse as unsupported, and a user who enabled the feature would then receive rounds the host cannot
+answer.
+
+**Capture task, open:** once a question is reachable (the feature flag enabled in the user's own
+Codex configuration on a build that has it, or a supported way to select a collaboration mode),
+record one round with `mea capture` and replay it as a fixture, so the question path is proven against
+the vendor's own frames rather than a synthetic one. Re-check the facts above at each pin
+refresh; if the vendor removes the label or turns the flag on by default, this note is out of date.
 
 ### MCP elicitations
 
@@ -494,11 +653,13 @@ reported only by a full read, so a sparse update leaves the last read's in place
 
 ## Transports
 
-`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket, and its README
-says of the first: "Websocket transport is currently experimental and unsupported. Do not rely on
-it for production workloads." Declaring it would invite hosts to build on a surface the vendor has
-already withdrawn once. The unix socket is the later opportunity; an undeclared transport is
-refused as `Error::UnsupportedTransport` before anything is spawned.
+`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket. OpenAI's
+[app-server documentation][app-server] (read 2026-09-30) lists the first as "websocket (--listen
+ws://IP:PORT, experimental and unsupported)" and says: "The app-server command and WebSocket
+transport are experimental and aren’t supported for production workloads." Declaring it would
+invite hosts to build on a surface the vendor does not support for production. The unix socket is
+the later opportunity; an undeclared transport is refused as `Error::UnsupportedTransport` before
+anything is spawned.
 
 ## MCP
 
