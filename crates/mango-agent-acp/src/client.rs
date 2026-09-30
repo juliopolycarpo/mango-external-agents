@@ -753,13 +753,29 @@ impl SessionState {
         }
     }
 
-    /// The events and session facts one frame produces, computed under the guard because the
-    /// reducer is pure.
-    fn reduce(&self, notification: SessionNotification) -> (Vec<EventKind>, Vec<SessionFact>) {
+    /// The events and session facts one frame produces for `turn`, computed under the guard because
+    /// the reducer is pure.
+    ///
+    /// `turn` is the owner the caller read before getting here, and it may have ended since: its
+    /// terminal is claimed before its slot is released, and the slot is released before a later
+    /// turn resets the reducer. A frame for a turn that already claimed its terminal has nowhere to
+    /// go (the caller drops its events), and reducing it would leave a call open in a reducer the
+    /// next turn then owns, to be closed there as a call its host never saw start. So such a frame
+    /// contributes only its session facts. The claim is read under the reducer's own guard, which
+    /// is what the next turn's reset waits for, so a turn that has replaced `turn` is always seen
+    /// as ended here.
+    fn reduce(
+        &self,
+        turn: &TurnHandle,
+        notification: SessionNotification,
+    ) -> (Vec<EventKind>, Vec<SessionFact>) {
+        let mut reducer = self.lock_reducer();
+        if turn.is_finished() {
+            return (Vec::new(), Reducer::session_facts(notification.update));
+        }
         // Tokio's clock rather than the host's: this instant only spaces a running call's updates,
         // and a runtime with paused time has to see that spacing move with it.
-        self.lock_reducer()
-            .update_at(notification.update, tokio::time::Instant::now().into_std())
+        reducer.update_at(notification.update, tokio::time::Instant::now().into_std())
     }
 
     /// How many tool calls the turn reducer holds open, for the tests that prove a turnless frame
@@ -1082,7 +1098,7 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
         }
         return;
     };
-    let (events, facts) = state.reduce(notification);
+    let (events, facts) = state.reduce(&turn, notification);
     // Published before the turn events: a session fact is true the moment the agent announced it,
     // not only once a host has read every event that preceded it on this turn's own stream.
     for fact in facts {
@@ -3116,6 +3132,101 @@ mod tests {
             assert_eq!(
                 outcome, "Completed",
                 "expected the terminal to stay Completed | received: {outcome}"
+            );
+        }
+    }
+
+    /// A frame read for a turn that has since ended must not reach the reducer of the turn that
+    /// replaced it: the read of the owner and the reduction are two steps, and a turn can end and
+    /// another begin between them.
+    mod stale {
+        use std::sync::Arc;
+
+        use mango_external_agents::{AttemptId, EventSink, TurnId};
+
+        use super::replay::{notification, running_call};
+        use super::{SessionId, SessionState, state};
+        use crate::client::TurnHandle;
+
+        fn sink(host: &mango_external_agents::HostContext, turn_id: &str) -> EventSink {
+            EventSink::new(
+                SessionId::new("session-1"),
+                TurnId::new(turn_id),
+                AttemptId::default(),
+                Arc::clone(host.clock()),
+                16,
+            )
+            .0
+        }
+
+        /// A state whose first turn has ended and a second one begun, with the first turn's handle
+        /// as a handler that had already read it would still hold it.
+        fn second_turn_after_first() -> (Arc<SessionState>, TurnHandle) {
+            let (state, host) = state();
+            let state = Arc::new(state);
+            let first = state
+                .begin_turn(sink(&host, "turn-1"), None)
+                .expect("expected the first turn to be admitted");
+            assert!(first.finish(), "expected the first turn's terminal claim");
+            let _ = state.prepare_terminal_matching(&first);
+            state.release_turn_matching(&first);
+            state
+                .begin_turn(sink(&host, "turn-2"), None)
+                .expect("expected the second turn to be admitted");
+            (state, first)
+        }
+
+        #[test]
+        fn a_frame_for_an_ended_turn_leaves_no_call_in_the_next_turns_reducer() {
+            let (state, first) = second_turn_after_first();
+            let _ = state.reduce(&first, running_call(0));
+            let open = state.open_call_count();
+            assert_eq!(
+                open, 0,
+                "expected open calls in the next turn after a stale frame: 0 | received: {open}"
+            );
+            let second = state
+                .turn()
+                .expect("expected the second turn to be running");
+            let owed = state
+                .prepare_terminal_matching(&second)
+                .map(|(_, _, mut reducer)| reducer.finish());
+            assert_eq!(
+                owed,
+                Some(Vec::new()),
+                "expected the next turn to owe no call closing | received: {owed:?}"
+            );
+        }
+
+        /// What the agent said about the session itself is still true whichever turn it was read for.
+        #[test]
+        fn a_frame_for_an_ended_turn_still_yields_its_session_facts() {
+            let (state, first) = second_turn_after_first();
+            let (events, facts) = state.reduce(
+                &first,
+                notification(serde_json::json!({
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{ "name": "review", "description": "Review" }],
+                })),
+            );
+            assert!(
+                events.is_empty() && facts.len() == 1,
+                "expected no events and one session fact | received: {events:?} and {facts:?}"
+            );
+        }
+
+        /// The turn that owns the slot reduces its own frames as before.
+        #[test]
+        fn a_frame_for_the_running_turn_is_reduced() {
+            let (state, _first) = second_turn_after_first();
+            let current = state
+                .turn()
+                .expect("expected the second turn to be running");
+            let (events, _) = state.reduce(&current, running_call(0));
+            let open = state.open_call_count();
+            assert!(
+                events.len() == 1 && open == 1,
+                "expected one event and one open call | received: {events:?} and {open}"
             );
         }
     }
