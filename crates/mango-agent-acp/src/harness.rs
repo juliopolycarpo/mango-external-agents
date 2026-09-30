@@ -445,6 +445,14 @@ impl Harness for AcpHarness {
         } else {
             &self.executable
         };
+        // A host that has already shut down gets no child: nothing would own it, and the watcher
+        // that reaps on the token is only spawned once the session exists.
+        if host.cancel().is_cancelled() {
+            return Err(Error::Cancelled {
+                reason: mango_external_agents::CancelReason::Shutdown,
+            }
+            .with_dispatch(mango_external_agents::Dispatch::NotSubmitted));
+        }
         let spec = AcpSpec::ChildPipes(StdioSpec::new(self.profile.resolved_argv(executable)));
         let launched =
             transport::connect(host, &spec, self.descriptor.vendor_environment_keys).await?;
@@ -500,10 +508,24 @@ impl Harness for AcpHarness {
         // would leave an agent running with nothing driving it: the dispatch loop only winds down
         // when the shutdown channel drops, so the process would outlive the call that started it by
         // however long the drop took to reach it.
-        let opened = match self
-            .handshake_and_open(connection.connection(), &connection_state, host, &request)
-            .await
-        {
+        //
+        // The host's token ends the handshake too: an agent that never answers `initialize` would
+        // otherwise hold the caller for the full request timeout after the host asked to stop.
+        let handshake = async {
+            tokio::select! {
+                biased;
+                () = host.cancel().cancelled() => Err(Error::Cancelled {
+                    reason: mango_external_agents::CancelReason::Shutdown,
+                }),
+                opened = self.handshake_and_open(
+                    connection.connection(),
+                    &connection_state,
+                    host,
+                    &request,
+                ) => opened,
+            }
+        };
+        let opened = match handshake.await {
             Ok(opened) => opened,
             Err(error) => {
                 connection
@@ -548,6 +570,7 @@ impl Harness for AcpHarness {
         // this state would otherwise keep the loop this watcher waits on alive.
         let turn_state = Arc::downgrade(&connection_state);
         let settle_limit = host.limits().shutdown_timeout;
+        let host_cancel = host.cancel().clone();
 
         let catalog = opened
             .config_options
@@ -629,10 +652,14 @@ impl Harness for AcpHarness {
         // An explicit close has its own task which owns terminal settlement and status publication.
         // This watcher is only the no-close path where a peer disappeared on its own.
         tokio::spawn(async move {
-            tokio::select! {
-                () = watched.incoming_closed() => {}
-                () = driver_done.cancelled() => {}
-            }
+            let host_cancelled = tokio::select! {
+                () = watched.incoming_closed() => false,
+                () = driver_done.cancelled() => false,
+                // The host's shutdown signal winds down a session nobody asked to close, like a
+                // peer that vanished. The connection stays weak here, so this arm cannot keep a
+                // dropped session's child alive.
+                () = host_cancel.cancelled() => true,
+            };
             if close.is_started() {
                 return;
             }
@@ -640,6 +667,15 @@ impl Harness for AcpHarness {
             // connection and could still be writing its terminal after `Closed`.
             if let Some(state) = turn_state.upgrade() {
                 state.close_turn_admission();
+                // A host shutdown is the reason the turn ends, and its parked questions are
+                // withdrawn the way `close` withdraws them. A vanished peer is not a host request,
+                // so that path keeps its own reporting.
+                if host_cancelled {
+                    // Behind the start gate, as `close` and a native cancel are, so it never
+                    // lands between a prompt's admission and its wire request.
+                    let _starting = state.lock_turn_start();
+                    state.begin_cancellation(mango_external_agents::CancelReason::Shutdown);
+                }
             }
             // `Closing` first, and `Closed` only after the owned connection cleanup succeeds:
             // neither EOF nor a dead dispatch loop proves the agent process is gone.

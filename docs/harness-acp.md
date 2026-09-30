@@ -558,6 +558,16 @@ expires, it leaves the session `Closing` without an error. A host that watches s
 call `close` on a session that stays `Closing`: the close either settles the turn and publishes
 `Closed`, or returns the `Error::Timeout` described above.
 
+The host's `CancelToken` is a shutdown signal the same watcher observes. `open_session` refuses an
+already-cancelled token before it launches anything (`Error::Cancelled`, `NotSubmitted`) and ends
+a handshake still in flight when the token fires, reaping the child. Once the session is open, a
+cancelled token takes the watcher's path: admission closes, the running turn is cancelled with
+`CancelReason::Shutdown` and its parked questions are withdrawn with ACP's `Cancelled` outcome, as
+[the prompt-turn cancellation rules](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation)
+require, then the same bounded cleanup runs
+and the turn writes its terminal before `Closed` is published. The watcher holds the connection only
+weakly, so the token does not keep a dropped session's child alive.
+
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
 that absence or the pinned profiles return a stale-session reply (`session/load` code `-32002`),
