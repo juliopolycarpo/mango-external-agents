@@ -106,16 +106,20 @@ impl Notification {
     /// Reads one announcement, or `Other` when it is a family this harness does not act on.
     #[must_use]
     pub fn parse(method: &str, params: Value) -> Self {
+        // Decoded from a reference: a malformed frame still needs its params for routing, and
+        // cloning them first copied every long delta and diff to decode a value that is then
+        // dropped. `T::deserialize(&Value)` accepts what `from_value(Value)` accepts; a payload
+        // type added to the `match` below is added to `tests/notification_decode.rs` too.
         fn read<T: serde::de::DeserializeOwned>(
-            params: Value,
+            params: &Value,
             method: &str,
             wrap: impl FnOnce(T) -> Notification,
         ) -> Notification {
-            serde_json::from_value(params.clone()).map_or_else(
+            T::deserialize(params).map_or_else(
                 |_| Notification::Malformed {
                     method: method.to_owned(),
-                    thread_id: routing_string(&params, "threadId"),
-                    turn_id: routing_string(&params, "turnId").or_else(|| {
+                    thread_id: routing_string(params, "threadId"),
+                    turn_id: routing_string(params, "turnId").or_else(|| {
                         params
                             .pointer("/turn/id")
                             .and_then(Value::as_str)
@@ -127,24 +131,26 @@ impl Notification {
         }
 
         match method {
-            method::THREAD_STARTED => read(params, method, Self::ThreadStarted),
-            method::TURN_STARTED => read(params, method, Self::TurnStarted),
-            method::TURN_COMPLETED => read(params, method, Self::TurnCompleted),
-            method::ITEM_STARTED => read(params, method, Self::ItemStarted),
-            method::ITEM_COMPLETED => read(params, method, Self::ItemCompleted),
-            method::AGENT_MESSAGE_DELTA => read(params, method, Self::AgentMessageDelta),
+            method::THREAD_STARTED => read(&params, method, Self::ThreadStarted),
+            method::TURN_STARTED => read(&params, method, Self::TurnStarted),
+            method::TURN_COMPLETED => read(&params, method, Self::TurnCompleted),
+            method::ITEM_STARTED => read(&params, method, Self::ItemStarted),
+            method::ITEM_COMPLETED => read(&params, method, Self::ItemCompleted),
+            method::AGENT_MESSAGE_DELTA => read(&params, method, Self::AgentMessageDelta),
             method::REASONING_TEXT_DELTA | method::REASONING_SUMMARY_TEXT_DELTA => {
-                read(params, method, Self::ReasoningDelta)
+                read(&params, method, Self::ReasoningDelta)
             }
             method::COMMAND_EXECUTION_OUTPUT_DELTA => {
-                read(params, method, Self::CommandOutputDelta)
+                read(&params, method, Self::CommandOutputDelta)
             }
-            method::MCP_TOOL_CALL_PROGRESS => read(params, method, Self::McpToolCallProgress),
-            method::FILE_CHANGE_PATCH_UPDATED => read(params, method, Self::FileChangePatchUpdated),
-            method::THREAD_TOKEN_USAGE_UPDATED => read(params, method, Self::ThreadTokenUsage),
-            method::ACCOUNT_RATE_LIMITS_UPDATED => read(params, method, Self::RateLimits),
-            method::SERVER_REQUEST_RESOLVED => read(params, method, Self::ServerRequestResolved),
-            method::ERROR => read(params, method, Self::Error),
+            method::MCP_TOOL_CALL_PROGRESS => read(&params, method, Self::McpToolCallProgress),
+            method::FILE_CHANGE_PATCH_UPDATED => {
+                read(&params, method, Self::FileChangePatchUpdated)
+            }
+            method::THREAD_TOKEN_USAGE_UPDATED => read(&params, method, Self::ThreadTokenUsage),
+            method::ACCOUNT_RATE_LIMITS_UPDATED => read(&params, method, Self::RateLimits),
+            method::SERVER_REQUEST_RESOLVED => read(&params, method, Self::ServerRequestResolved),
+            method::ERROR => read(&params, method, Self::Error),
             other => Self::Other {
                 method: other.to_owned(),
             },
