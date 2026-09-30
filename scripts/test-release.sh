@@ -148,3 +148,27 @@ fi
 rm -rf "$release_bin"
 trap - EXIT
 echo 'github release checks passed'
+
+# A path-only dev-dependency vanishes from the packaged manifest, taking its features with it.
+# `workspace = true` and a version beside the path both survive; a bare path does not.
+dev_fixture=$(mktemp -d)
+trap 'rm -rf "$dev_fixture"' EXIT
+printf '[dev-dependencies]\n# path = "../commented" is only a comment\nsibling = { workspace = true, features = ["testing"] }\nother = { path = "../other", version = "0.3.0" }\n' > "$dev_fixture/kept.toml"
+printf '[dev-dependencies]\nsibling = { features = ["testing"], path = "../sibling" }\n' > "$dev_fixture/dropped.toml"
+printf 'dev-dependencies.sibling.path = "../sibling"\n\n[package]\nname = "x"\n' > "$dev_fixture/dotted.toml"
+printf '[target.x86_64-unknown-linux-gnu.dev-dependencies]\nsibling = { path = "../sibling" }\n' > "$dev_fixture/target.toml"
+scripts/check-dev-dependencies.sh "$dev_fixture/kept.toml" >/dev/null
+for rejected in dropped dotted target; do
+  if scripts/check-dev-dependencies.sh "$dev_fixture/$rejected.toml" >/dev/null 2>"$dev_fixture/$rejected.err"; then
+    echo "expected rejection of the path-only dev-dependency in $rejected.toml, received success" >&2
+    exit 1
+  fi
+  grep -q "$rejected.toml: \[.*dev-dependencies\] sibling = " "$dev_fixture/$rejected.err" || {
+    echo "expected the rejection to name $rejected.toml and the dependency, received: $(cat "$dev_fixture/$rejected.err")" >&2
+    exit 1
+  }
+done
+rm -rf "$dev_fixture"
+trap - EXIT
+scripts/check-dev-dependencies.sh >/dev/null
+echo 'dev-dependency packaging checks passed'
