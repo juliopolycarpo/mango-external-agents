@@ -104,14 +104,15 @@ const ACTIVITY_OVERHEAD_BYTES: usize = 512;
 /// What one event costs against the byte budget.
 ///
 /// The event's own size plus its payload. What can be large is text, so the payload is measured
-/// by its text and never by serializing it: a text or reasoning delta is its text, and an activity
+/// by its text and never by serializing it: a text or reasoning delta is the buffer holding its text
+/// (its capacity, because sanitizing can leave a short string in a large buffer), and an activity
 /// update or result is its detail plus its content (a diff of up to
 /// [`DIFF_MAX_CONTENT_LENGTH`](mango_external_agents::content::DIFF_MAX_CONTENT_LENGTH) code
 /// points, or output). Every other kind is small, bounded by the library's field limits, and is
 /// counted by its encoded JSON length instead.
 fn event_bytes(event: &AgentEvent) -> usize {
     let payload = match &event.kind {
-        EventKind::TextDelta { text } | EventKind::ReasoningDelta { text } => text.len(),
+        EventKind::TextDelta { text } | EventKind::ReasoningDelta { text } => text.capacity(),
         EventKind::ActivityUpdated { update, .. } => activity_bytes(
             [update.title.as_deref(), update.detail.as_deref()],
             update.content.as_ref(),
@@ -128,7 +129,7 @@ fn event_bytes(event: &AgentEvent) -> usize {
 fn activity_bytes(texts: [Option<&str>; 2], content: Option<&ActivityContent>) -> usize {
     let text: usize = texts.into_iter().flatten().map(str::len).sum();
     let content = match content {
-        Some(ActivityContent::Output { text }) => text.len(),
+        Some(ActivityContent::Output { text }) => text.capacity(),
         Some(ActivityContent::Diff { files }) => files.iter().map(file_change_bytes).sum(),
         Some(ActivityContent::Plan { steps }) => steps.iter().map(plan_step_bytes).sum(),
         Some(_) | None => 0,
@@ -530,6 +531,27 @@ mod tests {
             cost,
             size_of::<AgentEvent>() + 1_000,
             "expected the event size plus 1000 bytes of text | received {cost}"
+        );
+    }
+
+    /// Sanitizing a delta leaves a short string in a buffer sized for the raw one, and it is the
+    /// buffer that a stalled watcher keeps alive.
+    #[tokio::test]
+    async fn a_delta_costs_the_buffer_it_pins_not_only_its_length() {
+        // Bidirectional overrides are stripped, so 90 KB of them leave five bytes of text.
+        let raw = format!("{}short", "\u{202e}".repeat(30_000));
+        let stamped = event(EventKind::TextDelta { text: raw }).await;
+        let EventKind::TextDelta { text } = &stamped.kind else {
+            panic!("expected a text delta back, received {stamped:?}");
+        };
+        assert_eq!(text, "short", "expected the overrides to be stripped");
+        let held = text.capacity();
+        let cost = event_bytes(&stamped);
+        assert!(
+            cost >= size_of::<AgentEvent>() + held,
+            "expected the cost to include the {held} byte buffer of a {} byte string | \
+             received {cost}",
+            text.len()
         );
     }
 
