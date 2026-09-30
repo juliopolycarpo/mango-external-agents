@@ -463,3 +463,35 @@ async fn running_a_turn_again_retries_the_cancel_and_confirms_the_stop() {
         "expected the stopped turn not to be dispatched again"
     );
 }
+
+/// The retry after a cleanup failure still hands the host the handle, not a bare `Stopped`.
+///
+/// The host that retries a stop is the host that needs the process handle to retry the kill, so
+/// it has to come back on every attempt and not only the first.
+#[tokio::test(start_paused = true)]
+async fn a_rerun_after_a_cleanup_failure_hands_the_host_the_same_process_handle_again() {
+    let control: Arc<dyn ProcessControl> = Arc::new(UnreapedControl);
+    let inner = FakeVendorSession::new().by_default(TurnAnswer::CompleteWhenReleased);
+    let session = FailingCancelSession::requiring_cleanup(inner.clone(), Arc::clone(&control));
+
+    let (mut supervisor, first) = stop_a_live_turn_on(session, &inner).await;
+    assert!(
+        first.is_err(),
+        "expected the first run to surface the failed cancel, received {first:?}"
+    );
+    let again = supervisor.run(TurnRequest::new("turn-1", "ship it")).await;
+
+    let error = again.expect_err("expected the rerun to surface the still-failing cancel");
+    let received = error.cleanup_control().unwrap_or_else(|| {
+        panic!("expected a cleanup handle on the rerun's error, received {error:?}")
+    });
+    assert!(
+        Arc::ptr_eq(&received, &control),
+        "expected the rerun to hand back the very handle the session returned, received a different one"
+    );
+    assert_eq!(
+        inner.start_count(),
+        1,
+        "expected the stopped turn not to be dispatched again"
+    );
+}
