@@ -182,6 +182,12 @@ pub struct Supervisor {
 /// library's business. Without it the refusal lives only as long as the `Settled` value a caller
 /// may drop, and the next run reconciles and dispatches work the Hub refused for good.
 ///
+/// `settlement` is the Hub's half of the terminal. The record keeps the outcome the vendor produced
+/// and refuses to be overwritten by a different one, but when the Hub already held another
+/// terminal, the Hub's is the outcome of the logical operation. It is kept apart from the native
+/// one so neither stands in for the other, and so a repeated run answers with it instead of
+/// committing again.
+///
 /// `reserved` is the same kind of fact: whether the record's current attempt has been offered to
 /// the Hub. It is set before the reservation call is awaited, so a run dropped anywhere after that
 /// point leaves it set, and the next run that gets proof of absence takes a strictly newer
@@ -190,6 +196,7 @@ pub struct Supervisor {
 struct LogicalTurn {
     record: RecoveryRecord,
     refusal: Option<String>,
+    settlement: Option<TerminalStatus>,
     reserved: bool,
 }
 
@@ -198,6 +205,7 @@ impl LogicalTurn {
         Self {
             record,
             refusal: None,
+            settlement: None,
             reserved: false,
         }
     }
@@ -417,6 +425,44 @@ impl Supervisor {
         self.records.get(turn_id).map(|turn| &turn.record)
     }
 
+    /// The terminal the Hub already held for this logical turn, when it answered instead of
+    /// taking the one this host offered.
+    ///
+    /// [`Supervisor::record`]'s terminal is the outcome the vendor produced, and the record
+    /// refuses to be overwritten by a different one. When the Hub had already recorded another —
+    /// an earlier attempt that ended `Failed` outranks a later `Completed` — the Hub's is the
+    /// outcome of the logical operation, and this is where a host persisting the record reads it.
+    /// `None` until a run has been answered with one.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use hub_host::testing::{FakeHubApi, FakeVendorSession, ScriptedJitter};
+    /// # use hub_host::{RetryPolicy, Stop, Supervisor};
+    /// # use mango_external_agents::{SystemClock, TurnId};
+    /// # use std::sync::Arc;
+    /// # use std::time::Duration;
+    /// # let policy = RetryPolicy::new(
+    /// #     Duration::from_millis(10),
+    /// #     Duration::from_secs(1),
+    /// #     Duration::from_secs(5),
+    /// #     Arc::new(ScriptedJitter::maximum()),
+    /// # );
+    /// # let supervisor = Supervisor::new(
+    /// #     Box::new(FakeVendorSession::new()),
+    /// #     Arc::new(FakeHubApi::new()),
+    /// #     policy,
+    /// #     Arc::new(Stop::new()),
+    /// #     Arc::new(SystemClock),
+    /// # );
+    /// assert!(supervisor.settlement(&TurnId::new("never-run")).is_none());
+    /// ```
+    pub fn settlement(&self, turn_id: &TurnId) -> Option<&TerminalStatus> {
+        self.records
+            .get(turn_id)
+            .and_then(|turn| turn.settlement.as_ref())
+    }
+
     /// Drives one logical operation until it is committed, refused, stopped or uncertain.
     ///
     /// Reusing a `turn_id` with different content is refused before anything is dispatched;
@@ -500,6 +546,13 @@ impl Supervisor {
                 reason: reason.clone(),
             });
         }
+        // The same for the Hub's settlement: it is the operation's outcome, so a repeat answers it
+        // without reaching the vendor or the Hub.
+        if let Some(terminal) = &turn.settlement {
+            return Ok(Settled::AlreadyCommitted {
+                terminal: terminal.clone(),
+            });
+        }
         self.inner.drive(turn, &request, stop).await
     }
 }
@@ -557,8 +610,12 @@ impl SupervisorInner {
                 Step::Settled(settled) => {
                     // Recorded on the logical turn, not just returned: the refusal has to outlive
                     // the `Settled` value the caller is free to drop.
-                    if let Settled::Refused { reason } = &settled {
-                        turn.refusal = Some(reason.clone());
+                    match &settled {
+                        Settled::Refused { reason } => turn.refusal = Some(reason.clone()),
+                        Settled::AlreadyCommitted { terminal } => {
+                            turn.settlement = Some(terminal.clone());
+                        }
+                        _ => {}
                     }
                     return Ok(settled);
                 }
