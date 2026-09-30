@@ -11,12 +11,12 @@ use std::time::Duration;
 
 use hub_host::testing::{
     CommitAnswer, FakeHubApi, FakeVendorSession, HubCallKind, ReconcileAnswer, ReserveAnswer,
-    TurnAnswer, WithdrawAnswer,
+    TurnAnswer, UnconfirmedAcceptanceSession, WithdrawAnswer,
 };
-use hub_host::{Commit, HubError, HubStatus, Reconciliation, Settled, Stop};
+use hub_host::{Commit, HubApi, HubError, HubStatus, Reconciliation, Settled, Stop, Supervisor};
 use mango_external_agents::{
-    Attachment, AttachmentKind, AttemptId, Dispatch, Error, ErrorCode, TerminalStatus, TurnId,
-    TurnRequest,
+    Attachment, AttachmentKind, AttemptId, Dispatch, Error, ErrorCode, SystemClock, TerminalStatus,
+    TurnId, TurnRequest,
 };
 
 /// Long enough for the supervisor to reach the held turn, short enough to stay a test.
@@ -975,5 +975,159 @@ async fn a_repeated_run_after_a_reconciled_terminal_does_not_commit_it_back() {
         supervisor.settlement(&TurnId::new("turn-1")),
         Some(&hub_failure()),
         "expected the reconciled terminal to be kept as the hub's settlement"
+    );
+}
+
+/// A vendor that returns a stream without acknowledging the turn, mid-turn and held open.
+fn unacknowledged_turn() -> (FakeVendorSession, UnconfirmedAcceptanceSession) {
+    let inner = FakeVendorSession::new().by_default(TurnAnswer::CompleteWhenReleased);
+    (inner.clone(), UnconfirmedAcceptanceSession::new(inner))
+}
+
+/// The stream's own certainty is reported as it is, not as the Hub's reservation.
+///
+/// The record says the operation was handed to the vendor, which is true once a stream exists. It
+/// cannot also say the vendor acknowledged the turn, because the stream said it did not, and a
+/// host that saves the record and reads only that would take the vendor's silence for a yes.
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_never_acknowledged_the_turn_is_reported_as_uncertain() {
+    let hub = Arc::new(FakeHubApi::new());
+    let (inner, session) = unacknowledged_turn();
+    let mut supervisor = Supervisor::new(
+        Box::new(session),
+        Arc::clone(&hub) as Arc<dyn HubApi>,
+        common::policy(),
+        Arc::new(Stop::new()),
+        Arc::new(SystemClock),
+    );
+    let turn_id = TurnId::new("turn-1");
+    assert_eq!(
+        supervisor.stream_dispatch(&turn_id),
+        None,
+        "expected no stream certainty for a turn that has not run"
+    );
+
+    let abandoned = tokio::time::timeout(
+        MID_TURN,
+        supervisor.run(TurnRequest::new("turn-1", "ship it")),
+    )
+    .await;
+
+    assert!(
+        abandoned.is_err(),
+        "expected the run to be dropped while the turn was held open, received {abandoned:?}"
+    );
+    assert_eq!(inner.start_count(), 1);
+    assert_eq!(
+        supervisor.stream_dispatch(&turn_id),
+        Some(Dispatch::AcceptanceUnknown),
+        "expected the stream's own certainty to be kept for the turn"
+    );
+    // The split is the point: what a host persisting only the record reads stays "handed to the
+    // vendor". Writing the stream's doubt onto the record would send a resumed run to reconcile.
+    assert_eq!(
+        supervisor.record(&turn_id).map(|record| record.dispatch()),
+        Some(Dispatch::Accepted),
+        "expected the record to keep saying the vendor holds the turn"
+    );
+}
+
+/// While the stream is held the host only observes: it never asks the Hub whether to send again.
+///
+/// A Hub scripted to say `NeverArrived` is what turns a record of `AcceptanceUnknown` into a
+/// second dispatch, so it stays unasked.
+#[tokio::test(start_paused = true)]
+async fn an_unacknowledged_stream_is_drained_without_reconciling_or_dispatching_again() {
+    let hub = Arc::new(FakeHubApi::new().reconciling([never_arrived()]));
+    let (inner, session) = unacknowledged_turn();
+    let mut supervisor = Supervisor::new(
+        Box::new(session),
+        Arc::clone(&hub) as Arc<dyn HubApi>,
+        common::policy(),
+        Arc::new(Stop::new()),
+        Arc::new(SystemClock),
+    );
+    let running =
+        tokio::spawn(async move { supervisor.run(TurnRequest::new("turn-1", "ship it")).await });
+
+    common::until("the turn to start", || inner.start_count() >= 1).await;
+    tokio::time::advance(MID_TURN).await;
+    assert_eq!(
+        hub.count(HubCallKind::Reconcile),
+        0,
+        "expected a held stream to be observed, not reconciled, received the call sequence {:?}",
+        hub.sequence()
+    );
+    inner.release();
+    let settled = running
+        .await
+        .expect("expected the run task to finish")
+        .expect("expected the operation to settle");
+
+    assert!(
+        matches!(settled, Settled::Committed { .. }),
+        "expected the drained turn to commit, received {settled:?}"
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Reserve),
+        vec![AttemptId::FIRST],
+        "expected one reservation, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        inner.start_count(),
+        1,
+        "expected the turn to be started once"
+    );
+}
+
+/// A run dropped with the unacknowledged stream live does not run the turn a second time.
+///
+/// The stream went with the run, so the resumed one has only the Hub to ask. A Hub that then says
+/// `NeverArrived` contradicts the reservation it acknowledged, and unlocking a newer attempt on
+/// that word would run the turn twice.
+#[tokio::test(start_paused = true)]
+async fn a_resumed_run_does_not_dispatch_again_on_a_never_arrived_after_an_unacknowledged_stream() {
+    let hub = Arc::new(FakeHubApi::new().reconciling([never_arrived()]));
+    let (inner, session) = unacknowledged_turn();
+    let mut supervisor = Supervisor::new(
+        Box::new(session),
+        Arc::clone(&hub) as Arc<dyn HubApi>,
+        common::policy(),
+        Arc::new(Stop::new()),
+        Arc::new(SystemClock),
+    );
+    let request = TurnRequest::new("turn-1", "ship it");
+
+    let abandoned = tokio::time::timeout(MID_TURN, supervisor.run(request.clone())).await;
+    assert!(
+        abandoned.is_err(),
+        "expected the run to be dropped while the turn was held open, received {abandoned:?}"
+    );
+    assert_eq!(
+        inner.start_count(),
+        1,
+        "expected the live unacknowledged stream to be the only start, received the call sequence {:?}",
+        hub.sequence()
+    );
+    // Released so that a second dispatch, if the host made one, would run to its end and show up in
+    // the counts below instead of holding the resumed run open.
+    inner.release();
+    let resumed = supervisor.run(request).await;
+
+    assert!(
+        matches!(resumed, Err(Error::HostConfiguration { .. })),
+        "expected the contradiction to surface as a host-configuration error, received {resumed:?}"
+    );
+    assert_eq!(
+        hub.attempts(HubCallKind::Reserve),
+        vec![AttemptId::FIRST],
+        "expected no newer attempt after the dropped run, received the call sequence {:?}",
+        hub.sequence()
+    );
+    assert_eq!(
+        inner.start_count(),
+        1,
+        "expected the vendor to be started once across both runs"
     );
 }

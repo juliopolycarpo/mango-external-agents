@@ -112,6 +112,15 @@ full queue therefore costs the host the closes it had no room for and never the 
 completion or failure. A stream that already committed a terminal, an overflow for instance,
 refuses every close, so nothing follows it. Nothing waits for room.
 
+**An event the core refuses fails the turn.** Every vendor id is untrusted: an activity id that is
+blank, longer than the bound, or containing characters the core refuses (control and bidirectional
+formatting characters) is refused rather than shortened or repaired, because a changed id would
+name a different object. Dropping that event in silence would leave a host rendering a turn that is
+missing an activity, so the turn closes what it holds open as failed and ends with the code
+`codex-refused-event`, and the native turn is interrupted like any other abandoned one. What the turn was still asking is settled before the failure, as before an ordinary terminal, and a steer is rejected as already completed from the moment the failure is on the stream. Ids the
+app-server sends today are UUIDs, so this is a guard against a malformed or changed vendor stream,
+not something seen in the captured transcripts.
+
 **Conversation events and approvals retain thread and native-turn ownership.** Delayed events
 cannot finish a replacement turn. Until the `turn/start` answer names the native turn, only a frame on this session's own thread can
 claim the pending id: a subagent's traffic on the shared connection is ignored there, so it cannot
@@ -644,11 +653,13 @@ reported only by a full read, so a sparse update leaves the last read's in place
 
 ## Transports
 
-`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket, and its README
-says of the first: "Websocket transport is currently experimental and unsupported. Do not rely on
-it for production workloads." Declaring it would invite hosts to build on a surface the vendor has
-already withdrawn once. The unix socket is the later opportunity; an undeclared transport is
-refused as `Error::UnsupportedTransport` before anything is spawned.
+`stdio` only. The app-server also offers `--listen ws://IP:PORT` and a unix socket. OpenAI's
+[app-server documentation][app-server] (read 2026-09-30) lists the first as "websocket (--listen
+ws://IP:PORT, experimental and unsupported)" and says: "The app-server command and WebSocket
+transport are experimental and aren’t supported for production workloads." Declaring it would
+invite hosts to build on a surface the vendor does not support for production. The unix socket is
+the later opportunity; an undeclared transport is refused as `Error::UnsupportedTransport` before
+anything is spawned.
 
 ## MCP
 

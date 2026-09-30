@@ -63,6 +63,14 @@ use crate::reducer::{self, Outcome};
 /// call is made.
 pub const CALL_FAILED: ErrorCode = ErrorCode::from_static("codex-call-failed");
 
+/// The code a turn fails with when the core refuses to publish one of its events.
+///
+/// Only a value the core cannot make safe is reported, such as a vendor id that is blank, longer
+/// than the bound, or containing characters the core refuses (control and bidirectional formatting
+/// characters), because dropping it in silence would leave the host rendering a turn that is
+/// missing part of what happened.
+pub const REFUSED_EVENT: ErrorCode = ErrorCode::from_static("codex-refused-event");
+
 /// Native ids retained after terminal frames so a delayed old frame cannot attach while the next
 /// start still waits for its response.
 const RECENT_COMPLETED_TURNS: usize = 16;
@@ -1346,6 +1354,54 @@ impl Shared {
         active.publish(kind).await
     }
 
+    /// Fails the turn because the core refused to publish one of its events.
+    ///
+    /// Only a value the core cannot make safe is reported: a vendor id that is blank, longer than
+    /// the bound, or containing characters the core refuses. It means part of the turn can never
+    /// reach the host, and dropping it in
+    /// silence leaves a host rendering a turn that is missing something. Any other refusal is an
+    /// ordinary end of the stream, a closed or already terminal sink, or was already turned into
+    /// a failure by the sink itself, an overflow, so it stays silent. A terminal commits once, so
+    /// a turn that already ended keeps its outcome.
+    ///
+    /// What the host still holds open is closed first, as failed, and the failure is committed on
+    /// the sink like an overflow. Admission is not released here: the committed terminal is what
+    /// wakes the abandonment watcher, which interrupts the native turn and releases the slot once
+    /// Codex reports it over, so a new turn cannot start on top of one that is still running.
+    async fn fail_refused_event(&self, route: &ActiveTurnRoute, error: &Error) {
+        // What the turn was still asking is settled first, as it is ahead of an ordinary terminal:
+        // once the sink holds the failure it refuses the resolutions, and the host would keep a
+        // prompt nobody can answer. Held through the failure, so a request that routed to this
+        // turn cannot register a new round after the drain.
+        let _settlement = self.question_settlements.lock().await;
+        self.release_pending_approvals_for(Some(&route.owner), DecisionSource::Cancelled)
+            .await;
+        self.release_pending_questions_for_locked(Some(&route.owner))
+            .await;
+        let mut turn = self.turn.lock().await;
+        let Some(active) = turn
+            .as_mut()
+            .filter(|active| !active.finishing && Arc::ptr_eq(&active.owner, &route.owner))
+        else {
+            return;
+        };
+        if active.sink.is_terminal() {
+            return;
+        }
+        for close in active.open.close_all(ActivityStatus::Failed) {
+            if active.sink.emit_close(close).await.is_err() {
+                break;
+            }
+        }
+        let _ = active
+            .sink
+            .fail(VendorError::new(
+                REFUSED_EVENT,
+                format!("expected an app-server event the core can publish, received one it refused: {error}"),
+            ))
+            .await;
+    }
+
     /// Claims a turn's terminal while retaining admission until it is committed.
     async fn claim_terminal(&self, owner: Option<&Arc<()>>) -> Option<TerminalClaim> {
         let mut turn = self.turn.lock().await;
@@ -2146,14 +2202,21 @@ impl CodexHandler {
                     } else {
                         self.shared.emit(event).await
                     };
-                    if matches!(emitted, Err(Error::LimitExceeded { .. })) {
-                        self.shared
-                            .poison(VendorError::new(
-                                CALL_FAILED,
-                                "expected bounded Codex transcript publication, received overflow",
-                            ))
-                            .await;
-                        return;
+                    match emitted {
+                        Err(Error::LimitExceeded { .. }) => {
+                            self.shared
+                                .poison(VendorError::new(
+                                    CALL_FAILED,
+                                    "expected bounded Codex transcript publication, received overflow",
+                                ))
+                                .await;
+                            return;
+                        }
+                        Err(error @ Error::InvalidVendorValue { .. }) => {
+                            self.shared.fail_refused_event(&active_route, &error).await;
+                            return;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3957,8 +4020,11 @@ impl Session for CodexSession {
         let _steering = self.shared.steering.lock().await;
         let running = {
             let turn = self.shared.turn.lock().await;
+            // A turn whose stream already ended is not one the host can steer, even while Codex
+            // has not yet reported it over: input sent now would reach a turn the host was told
+            // is finished, and race the interrupt that is stopping it.
             turn.as_ref()
-                .filter(|active| !active.finishing)
+                .filter(|active| !active.finishing && !active.sink.is_terminal())
                 .map(|active| {
                     (
                         Arc::clone(&active.owner),
