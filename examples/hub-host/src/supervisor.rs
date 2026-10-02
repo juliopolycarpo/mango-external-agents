@@ -68,7 +68,7 @@ pub enum Settled {
     /// Remembered by the supervisor: running the same logical turn id again answers with this
     /// same refusal rather than reconciling or dispatching anything.
     Refused {
-        /// The bounded diagnostic identifying the refusal.
+        /// The Hub or SDK diagnostic identifying the refusal.
         reason: String,
     },
     /// The host stopped the operation and the vendor accepted the stop.
