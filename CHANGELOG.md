@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.3.2] - 2026-10-02
+
+### 🚀 Features
+
+- **(acp)** Allow an independent outbound byte budget (#113)
+
+### 🐛 Bug Fixes
+
+- **(core)** Close links after completed transport write failures (#112)
+- **(examples)** Settle refusals in independent SDK hosts (#111)
+
 ## [0.3.1] - 2026-09-30
 
 ### 🚀 Features
