@@ -117,7 +117,10 @@ impl FakeCodex {
                 json!({"account":{"type":"chatgpt","planType":"plus"},"requiresOpenaiAuth":true})
             }
             Some("model/list") => json!({"data":[],"nextCursor":null}),
-            Some("thread/start") => json!({"thread":{"id":"thread-fake","cwd":cwd}}),
+            // The protocol workspace can omit a trailing separator retained by the launch spec.
+            Some("thread/start") => {
+                json!({"thread":{"id":"thread-fake","cwd":frame["params"]["cwd"]}})
+            }
             Some("turn/start") => json!({"turn":{"id":"turn-fake","status":"inProgress"}}),
             _ => json!({}),
         };
@@ -167,7 +170,13 @@ fn harnesses() -> Vec<Box<dyn Harness>> {
 async fn each_registry_harness_discovers_opens_sends_reads_responds_and_closes() {
     for harness in harnesses() {
         let launcher = Arc::new(InstalledClis::default());
-        let cwd = std::env::temp_dir();
+        // Exercise the trailing separator supplied by macOS and Windows on every platform.
+        let workspace = std::env::temp_dir().join("independent-workspace");
+        let cwd = std::path::PathBuf::from(format!(
+            "{}{}",
+            workspace.display(),
+            std::path::MAIN_SEPARATOR
+        ));
         let host = HostContext::builder()
             .launcher(launcher.clone())
             .cwd(&cwd)
@@ -216,9 +225,15 @@ async fn each_registry_harness_cancels_live_work_then_closes() {
             hold_turn: true,
             ..InstalledClis::default()
         });
+        let workspace = std::env::temp_dir().join("independent-workspace");
+        let cwd = std::path::PathBuf::from(format!(
+            "{}{}",
+            workspace.display(),
+            std::path::MAIN_SEPARATOR
+        ));
         let host = HostContext::builder()
             .launcher(launcher.clone())
-            .cwd(std::env::temp_dir())
+            .cwd(cwd)
             .client_info("unrelated-host", "1.0.0")
             .build()
             .expect("expected host");
