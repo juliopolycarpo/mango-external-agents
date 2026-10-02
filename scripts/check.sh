@@ -23,6 +23,7 @@ run scripts/test-vendor-drift.sh
 run scripts/check-dev-dependencies.sh
 run scripts/check-bench-runner.sh
 run scripts/test-bench-runner.sh
+run scripts/check-standalone.sh
 run cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 run cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 run cargo nextest run --workspace --all-features --locked

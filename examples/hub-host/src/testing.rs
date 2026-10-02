@@ -917,11 +917,7 @@ fn lost_acknowledgement() -> Error {
 }
 
 fn never_left() -> Error {
-    Error::Link {
-        peer: String::from("hub vendor session"),
-        message: String::from("expected an open link, received one closed before the write"),
-    }
-    .with_dispatch(Dispatch::NotSubmitted)
+    Error::Busy.with_dispatch(Dispatch::NotSubmitted)
 }
 
 #[async_trait::async_trait]

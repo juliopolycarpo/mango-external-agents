@@ -49,6 +49,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: scripts/check-tls.sh
+      - run: scripts/check-standalone.sh
 
   policy:
     name: Policy (deny, versions, docs format)
@@ -84,6 +85,7 @@ jobs:
           key: msrv
       - run: cargo +1.96.0 build --workspace --all-features --locked
       - run: cargo +1.96.0 build --workspace --no-default-features --locked
+      - run: cargo +1.96.0 check --manifest-path tests/standalone/Cargo.toml --all-targets --all-features --locked
 
   gate:
     name: Gate
