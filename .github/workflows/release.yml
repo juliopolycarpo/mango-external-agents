@@ -81,6 +81,10 @@ jobs:
       # Running the bare dry run here instead would let a tag pass a check the gate rejects.
       - name: Publication gate
         run: scripts/check-publish.sh --list
+      # Expanded package sources contain ordinary tests/ directories. The pinned cache action
+      # treats them as nested build targets and logs missing target/trybuild errors on save.
+      - name: Remove successful publication scratch before caching
+        run: rm -rf -- target/package
 
   crates:
     name: Publish to crates.io
@@ -134,6 +138,8 @@ jobs:
             cargo publish -p "$crate" --locked
             echo "::endgroup::"
           done
+      - name: Remove successful publication scratch before caching
+        run: rm -rf -- target/package
 
   github-release:
     name: GitHub release
