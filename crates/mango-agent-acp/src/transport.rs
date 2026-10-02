@@ -151,7 +151,8 @@ pub fn frame(process: ManagedProcess, host: &HostContext) -> Result<LaunchedAgen
     let outgoing: OutgoingLines = Box::pin(outgoing_lines(stdin));
 
     Ok(LaunchedAgent {
-        transport: BoundedTransport::new(outgoing, incoming, *host.limits()),
+        transport: BoundedTransport::new(outgoing, incoming, *host.limits())
+            .with_outbound_buffer_bytes(host.outbound_buffer_bytes()),
         control,
     })
 }

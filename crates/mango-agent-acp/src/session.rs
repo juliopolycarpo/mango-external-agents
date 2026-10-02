@@ -1090,11 +1090,15 @@ impl Session for AcpSession {
         )
         .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         // Each attachment is capped alone, but the frame the SDK writes for all of them is not. The
-        // transport refuses an outgoing frame over `Limits::turn_buffer_bytes` only once the turn
+        // transport refuses an outgoing frame over the host's outgoing byte budget only once the turn
         // has started, which fails the connection and leaves the host with `AcceptanceUnknown`.
         // Refused here, nothing has been submitted and the session stays usable.
-        prompt_size::refuse_oversized_prompt(&self.native_session_id, &prompt, self.host.limits())
-            .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
+        prompt_size::refuse_oversized_prompt(
+            &self.native_session_id,
+            &prompt,
+            self.host.outbound_buffer_bytes(),
+        )
+        .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
         let _configuration = self.configuration_gate.lock().await;
 
         let (sink, events) = EventSink::with_limits(

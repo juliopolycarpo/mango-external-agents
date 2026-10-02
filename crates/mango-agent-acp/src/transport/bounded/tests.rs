@@ -372,7 +372,7 @@ async fn outgoing_bytes_remain_owned_until_the_physical_write_finishes() {
         input,
         pending,
         Arc::clone(&budget),
-        Limits::default(),
+        line.len(),
         &OverflowSlot::default(),
     )
     .await
@@ -406,12 +406,12 @@ async fn a_stalled_writer_refuses_outgoing_count_and_byte_pressure() {
         }
         drop(frames);
         let (pending, _writing) = mpsc::channel(1);
-        let budget = Arc::new(Semaphore::new(bytes.min(u32::MAX as usize)));
+        let budget = Arc::new(Semaphore::new(outgoing_frame_limit(bytes)));
         let error = queue_output(
             input,
             pending,
             budget,
-            Limits::default(),
+            outgoing_frame_limit(bytes),
             &OverflowSlot::default(),
         )
         .await
@@ -426,6 +426,106 @@ async fn a_stalled_writer_refuses_outgoing_count_and_byte_pressure() {
             error.contains(expected),
             "expected {expected:?} in the refusal, received {error}"
         );
+    }
+}
+
+/// A larger outgoing allowance never raises the unread input allowance.
+#[tokio::test(start_paused = true)]
+async fn an_outbound_override_preserves_the_incoming_byte_budget() {
+    let line = notification();
+    let transport = BoundedTransport::new(
+        output(GatedSink::default()),
+        Box::pin(futures::stream::iter([Ok(line.clone()), Ok(line.clone())])),
+        Limits {
+            turn_buffer_bytes: line.len(),
+            ..Limits::default()
+        },
+    )
+    .with_outbound_buffer_bytes(4 * line.len());
+    let slot = transport.overflow();
+    let (mut channel, drive) = transport.parts();
+    let error = tokio::time::timeout(Duration::from_secs(1), drive)
+        .await
+        .expect("bounded input observation")
+        .expect_err("second unread frame exceeds the original incoming bytes");
+    assert!(
+        serde_json::to_string(&error)
+            .expect("error")
+            .contains("incoming queue")
+    );
+    assert_eq!(
+        slot.get().copied(),
+        Some(Overflow {
+            budget: Budget::IncomingBytes,
+            limit: line.len(),
+            received: 2 * line.len(),
+        })
+    );
+    assert!(channel.rx.next().await.is_some());
+    assert!(channel.rx.next().await.is_none());
+}
+
+/// Concurrent output still charges the blocked physical write and obeys the original frame cap.
+#[tokio::test]
+async fn an_independent_outbound_budget_bounds_queued_and_inflight_frames() {
+    let line = notification();
+    for (bytes, expected) in [
+        (
+            2 * line.len(),
+            Overflow {
+                budget: Budget::OutgoingBytes,
+                limit: 2 * line.len(),
+                received: 3 * line.len(),
+            },
+        ),
+        (
+            4 * line.len(),
+            Overflow {
+                budget: Budget::OutgoingFrames,
+                limit: 1,
+                received: 2,
+            },
+        ),
+    ] {
+        let sink = GatedSink::default();
+        let transport = BoundedTransport::new(
+            output(sink.clone()),
+            Box::pin(futures::stream::pending()),
+            Limits {
+                turn_buffer_bytes: line.len(),
+                turn_channel_capacity: 1,
+                max_pending_requests: 1,
+                ..Limits::default()
+            },
+        )
+        .with_outbound_buffer_bytes(bytes);
+        let slot = transport.overflow();
+        let (channel, drive) = transport.parts();
+        let driver = tokio::spawn(drive);
+        channel
+            .tx
+            .unbounded_send(TransportFrame::parse_json(&line))
+            .expect("first frame");
+        tokio::time::timeout(Duration::from_secs(1), sink.entered.cancelled())
+            .await
+            .expect("first frame must enter the named physical writer");
+        for _ in 0..2 {
+            channel
+                .tx
+                .unbounded_send(TransportFrame::parse_json(&line))
+                .expect("concurrent frame");
+        }
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("bounded pressure observation")
+            .expect("transport task")
+            .expect_err("third frame exceeds the independent budget or original count");
+        assert_eq!(slot.get().copied(), Some(expected));
+        assert!(
+            sink.writes.lock().expect("writes").is_empty(),
+            "the physical writer is deliberately blocked"
+        );
+        sink.release.cancel();
     }
 }
 
@@ -532,7 +632,7 @@ async fn the_overflow_is_recorded_before_the_incoming_channel_closes() {
 fn the_outgoing_frame_limit_is_the_turn_buffer_capped_to_the_permit_range() {
     let default = Limits::default();
     assert_eq!(
-        outgoing_frame_limit(&default),
+        outgoing_frame_limit(default.turn_buffer_bytes),
         default.turn_buffer_bytes,
         "expected the default budget to pass through"
     );
@@ -541,8 +641,8 @@ fn the_outgoing_frame_limit_is_the_turn_buffer_capped_to_the_permit_range() {
         ..Limits::default()
     };
     assert_eq!(
-        outgoing_frame_limit(&unbounded),
-        u32::MAX as usize,
+        outgoing_frame_limit(unbounded.turn_buffer_bytes),
+        (u32::MAX as usize).min(Semaphore::MAX_PERMITS),
         "expected a budget beyond the permit range to be capped"
     );
 }

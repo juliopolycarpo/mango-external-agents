@@ -39,13 +39,13 @@ fi
 echo "samples:     ${BENCH_SAMPLES:-15} per case (BENCH_SAMPLES)"
 echo "toolchain:"
 rustc -vV | sed 's/^/  /'
-echo "features:    default features of each crate (no --features flag); dev-dependency features as in Cargo.toml"
+echo "features:    ACP testing for its named-fake prompt bench; other crate defaults; dev-dependency features as in Cargo.toml"
 echo
 
 run() { echo "## $*"; "$@"; echo; }
 
 run cargo bench --locked -p mango-external-agents --bench framing --bench events --bench copies -- "$@"
 run cargo bench --locked -p mango-agent-codex --bench pipeline -- "$@"
-run cargo bench --locked -p mango-agent-acp --bench reducer -- "$@"
+run cargo bench --locked -p mango-agent-acp --features testing --bench reducer --bench prompt -- "$@"
 run cargo bench --locked -p mango-agent-claude --bench tool_results -- "$@"
 run cargo bench --locked -p hub-host --bench retry -- "$@"

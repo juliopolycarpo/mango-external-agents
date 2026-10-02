@@ -1,7 +1,7 @@
 //! The size of a `session/prompt` frame, measured before the turn is submitted.
 //!
-//! The bounded transport refuses any outgoing frame over `Limits::turn_buffer_bytes`, but it sees
-//! the frame only after the turn has started: the connection fails, the session closes and the host
+//! The bounded transport refuses any outgoing frame over `HostContext::outbound_buffer_bytes()`.
+//! It sees the frame only after the turn has started: the connection fails, the session closes and the host
 //! is told the acceptance is unknown. Each attachment is capped alone, and the encoding grows what
 //! it carries (base64 by a third, a control character sixfold), so inputs that pass every earlier
 //! check can still overflow. This module measures the frame the SDK will write so the overflow is
@@ -11,7 +11,7 @@ use std::io;
 
 use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, RequestId, SessionId};
 use agent_client_protocol::{JsonRpcMessage, RawJsonRpcMessage, TransportFrame};
-use mango_external_agents::{Error, Limits, Result};
+use mango_external_agents::{Error, Result};
 
 use crate::transport::{Overflow, outgoing_frame_limit};
 
@@ -28,21 +28,21 @@ const REQUEST_ID_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
 ///
 /// # Errors
 ///
-/// [`Error::LimitExceeded`] naming the frame's byte count and `Limits::turn_buffer_bytes` when the
+/// [`Error::LimitExceeded`] naming the frame's byte count and effective outgoing budget when the
 /// frame is over; [`Error::Protocol`] when the prompt cannot be serialised at all.
 ///
 /// # Example
 ///
 /// ```ignore
 /// let prompt = content::prompt("hello", &[], &capabilities)?;
-/// refuse_oversized_prompt(&session_id, &prompt, host.limits())?;
+/// refuse_oversized_prompt(&session_id, &prompt, host.outbound_buffer_bytes())?;
 /// ```
 pub(crate) fn refuse_oversized_prompt(
     session_id: &SessionId,
     prompt: &[ContentBlock],
-    limits: &Limits,
+    outbound_buffer_bytes: usize,
 ) -> Result<()> {
-    let limit = outgoing_frame_limit(limits);
+    let limit = outgoing_frame_limit(outbound_buffer_bytes);
     let received = prompt_frame_bytes(session_id, prompt)?;
     match received > limit {
         true => Err(Overflow::outgoing_frame(limit, received).error()),
@@ -123,6 +123,7 @@ mod tests {
     };
 
     use super::*;
+    use mango_external_agents::Limits;
 
     fn session_id() -> SessionId {
         SessionId::new("sess_0123456789abcdef")
@@ -231,13 +232,13 @@ mod tests {
             "expected the fixture to fill the limit exactly"
         );
         assert!(
-            refuse_oversized_prompt(&session_id, &fits, &limits).is_ok(),
+            refuse_oversized_prompt(&session_id, &fits, limits.turn_buffer_bytes).is_ok(),
             "expected a frame of exactly {} bytes to be accepted",
             limits.turn_buffer_bytes
         );
 
         let over = [text(&"a".repeat(101))];
-        let error = refuse_oversized_prompt(&session_id, &over, &limits)
+        let error = refuse_oversized_prompt(&session_id, &over, limits.turn_buffer_bytes)
             .expect_err("expected a frame one byte over to be refused");
         assert!(
             matches!(
@@ -260,7 +261,7 @@ mod tests {
         };
         let prompt = [text("hello")];
         assert!(
-            refuse_oversized_prompt(&session_id(), &prompt, &limits).is_ok(),
+            refuse_oversized_prompt(&session_id(), &prompt, limits.turn_buffer_bytes).is_ok(),
             "expected a small prompt to fit an unbounded budget"
         );
     }

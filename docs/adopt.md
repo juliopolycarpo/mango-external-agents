@@ -111,6 +111,17 @@ let host = HostContext::builder()
    `host.limits()`, and a host constructing `TokioLauncher` hands it the same ones with
    `TokioLauncher::with_limits`, so one setting governs a bound wherever it is enforced.
 
+For ACP, outgoing prompts and the writer queue default to `Limits::turn_buffer_bytes`. Set
+`HostContext::builder().outbound_buffer_bytes(16 * 1024 * 1024)` when the host authorizes larger
+encoded prompts while retaining smaller incoming and turn-event caps. The override is optional,
+validated at `build`, and read through `host.outbound_buffer_bytes()`. It budgets serialized bytes,
+not heap use; queued and in-flight frames share the allowance. See
+[harness-acp.md](harness-acp.md#transport) for the concrete queue accounting and exclusions.
+
+The override lives on the builder rather than the exhaustive public `Limits` struct, so existing
+full struct literals and constructor signatures remain compatible. Unset uses the caller's current
+limits, including custom `turn_buffer_bytes`; other harness transports retain their existing caps.
+
 There is no credential field, and there never will be. The library reuses whatever the user
 already logged into with the vendor's own CLI.
 

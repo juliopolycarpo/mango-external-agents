@@ -1,6 +1,6 @@
 //! A prompt whose encoded request cannot leave the transport is refused before the turn starts.
 //!
-//! The transport refuses any outgoing frame over `Limits::turn_buffer_bytes`. Refused there, the
+//! The transport refuses any outgoing frame over the effective `HostContext::outbound_buffer_bytes()` budget. Refused there, the
 //! turn has already started: the connection fails, the session closes and the host is left with
 //! `AcceptanceUnknown`. These tests drive the real outbound path (the SDK's own serialisation and
 //! the bounded transport's own check), so the boundary they pin is the one a host meets.
@@ -13,20 +13,60 @@ use mango_external_agents::{Attachment, AttachmentKind};
 const SMALL_BUDGET: usize = 64 * 1024;
 
 async fn open_with(agent: FakeAcpAgent, limits: Limits) -> (Box<dyn Session>, FakeLauncher) {
+    open_with_outbound(agent, limits, None).await
+}
+
+/// Opens the real harness over the named fake, with an optional independent writer budget.
+async fn open_with_outbound(
+    agent: FakeAcpAgent,
+    limits: Limits,
+    outbound: Option<usize>,
+) -> (Box<dyn Session>, FakeLauncher) {
     let launcher = FakeLauncher::new();
     launcher.push(agent.process());
-    let host = HostContext::builder()
+    let builder = HostContext::builder()
         .launcher(Arc::new(launcher.clone()))
         .cwd(std::env::temp_dir())
         .client_info("mea-tests", "0.1.0")
-        .limits(limits)
-        .build()
-        .expect("expected a host");
+        .limits(limits);
+    let builder = match outbound {
+        Some(bytes) => builder.outbound_buffer_bytes(bytes),
+        None => builder,
+    };
+    let host = builder.build().expect("expected a host");
     let session = AcpHarness::new(profile())
         .open_session(&host, OpenSession::new("chat-1"))
         .await
         .expect("expected a session");
     (session, launcher)
+}
+
+/// A host may send a larger prompt without increasing incoming or turn-event byte caps.
+#[tokio::test]
+async fn an_independent_outbound_budget_submits_a_frame_larger_than_the_turn_buffer() {
+    let outbound = 2 * SMALL_BUDGET;
+    let (session, launcher) =
+        open_with_outbound(FakeAcpAgent::new(), small_budget(), Some(outbound)).await;
+    assert_completes(
+        session.as_ref(),
+        TurnRequest::new("turn-larger", "a".repeat(SMALL_BUDGET)),
+    )
+    .await;
+    let lengths = prompt_frame_lengths(&launcher);
+    assert!(
+        lengths.len() == 1 && lengths[0] > SMALL_BUDGET && lengths[0] < outbound,
+        "expected one submitted frame between {SMALL_BUDGET} and {outbound} bytes; received {lengths:?}"
+    );
+    assert_eq!(session.snapshot().status, SessionStatus::Ready);
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("clean session close");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "the named fake must leave no live child"
+    );
 }
 
 fn small_budget() -> Limits {
@@ -171,6 +211,105 @@ async fn the_exact_frame_budget_is_sent_and_one_byte_more_is_refused_before_subm
         SessionStatus::Ready,
         "expected the session to stay usable after the refusal"
     );
+}
+
+/// The override measures encoded frames exactly, including their envelope, and permits recovery.
+#[tokio::test]
+async fn the_independent_budget_accepts_below_and_exact_and_refuses_one_byte_above() {
+    let outbound = 2 * SMALL_BUDGET;
+    let (session, launcher) =
+        open_with_outbound(FakeAcpAgent::new(), small_budget(), Some(outbound)).await;
+    assert_completes(session.as_ref(), TurnRequest::new("turn-empty", "")).await;
+    let base = prompt_frame_lengths(&launcher)[0];
+    for (id, length) in [("turn-below", outbound - 1), ("turn-exact", outbound)] {
+        assert_completes(
+            session.as_ref(),
+            TurnRequest::new(id, "a".repeat(length - base)),
+        )
+        .await;
+        assert_eq!(
+            prompt_frame_lengths(&launcher).last().copied(),
+            Some(length)
+        );
+    }
+    let refused = assert_refused_before_submission(
+        session.as_ref(),
+        TurnRequest::new("turn-above", "a".repeat(outbound + 1 - base)),
+    )
+    .await;
+    assert_eq!(refused, (outbound, outbound + 1));
+    assert_eq!(prompt_frame_lengths(&launcher).len(), 3);
+    assert_completes(
+        session.as_ref(),
+        TurnRequest::new("turn-after", "still usable"),
+    )
+    .await;
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("clean session close");
+    assert_eq!(launcher.live_children(), 0);
+}
+
+/// An explicit smaller override wins over the default incoming/event budget.
+#[tokio::test]
+async fn a_smaller_outbound_override_refuses_before_submission() {
+    let (session, launcher) =
+        open_with_outbound(FakeAcpAgent::new(), Limits::default(), Some(SMALL_BUDGET)).await;
+    let (limit, received) = assert_refused_before_submission(
+        session.as_ref(),
+        TurnRequest::new("turn-refused", "a".repeat(SMALL_BUDGET)),
+    )
+    .await;
+    assert_eq!(limit, SMALL_BUDGET);
+    assert!(received > SMALL_BUDGET);
+    assert!(prompt_frame_lengths(&launcher).is_empty());
+    assert_completes(
+        session.as_ref(),
+        TurnRequest::new("turn-after", "still usable"),
+    )
+    .await;
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("clean session close");
+    assert_eq!(launcher.live_children(), 0);
+}
+
+/// A larger outgoing allowance submits valid capped attachments while defaults remain bounded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_larger_outbound_override_submits_images_and_escaped_text_past_the_default_budget() {
+    let outbound = 16 * 1024 * 1024;
+    let (session, launcher) =
+        open_with_outbound(FakeAcpAgent::new(), Limits::default(), Some(outbound)).await;
+    assert_completes(
+        session.as_ref(),
+        TurnRequest::new("turn-images", "inspect")
+            .with_attachments((0..3).map(|_| image(ATTACHMENT_MAX_BYTES)).collect()),
+    )
+    .await;
+    assert_completes(
+        session.as_ref(),
+        TurnRequest::new("turn-escaped", "inspect").with_attachments(vec![attachment(
+            AttachmentKind::Text,
+            "text/plain",
+            vec![0x01; ATTACHMENT_MAX_BYTES],
+        )]),
+    )
+    .await;
+    let lengths = prompt_frame_lengths(&launcher);
+    assert_eq!(lengths.len(), 2);
+    assert!(
+        lengths
+            .iter()
+            .all(|bytes| *bytes > Limits::default().turn_buffer_bytes && *bytes < outbound),
+        "expected actual frames above the unchanged default and below the override, received {lengths:?}"
+    );
+    session
+        .close(CloseReason::Shutdown)
+        .await
+        .expect("clean session close");
+    assert_eq!(launcher.live_children(), 0);
 }
 
 /// The escaping counts: a control character is six bytes on the wire, so a text that is a sixth of

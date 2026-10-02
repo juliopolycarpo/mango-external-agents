@@ -161,7 +161,8 @@ pub struct Limits {
     /// ACP also uses it, or [`Self::max_pending_requests`] when larger, as the message cap at its
     /// SDK boundary: at most that many JSON-RPC messages (batch members counted individually)
     /// queue per direction of the connection. Messages and turn events are related but not one to
-    /// one; [`Self::turn_buffer_bytes`] is what bounds the queued bytes there.
+    /// one; [`Self::turn_buffer_bytes`] bounds incoming queued bytes and defaults the outgoing
+    /// budget. A host can set the latter independently with [`HostContextBuilder::outbound_buffer_bytes`].
     pub turn_channel_capacity: usize,
     /// Maximum serialized bytes queued per turn, excluding its reserved terminal.
     ///
@@ -297,6 +298,7 @@ pub struct HostContext {
     cancel: CancelToken,
     broker: Option<Arc<dyn PermissionBroker>>,
     limits: Limits,
+    outbound_buffer_bytes: Option<usize>,
 }
 
 impl std::fmt::Debug for HostContext {
@@ -306,6 +308,7 @@ impl std::fmt::Debug for HostContext {
             .field("scratch_configured", &self.scratch.is_some())
             .field("client_info", &self.client_info)
             .field("limits", &self.limits)
+            .field("outbound_buffer_bytes", &self.outbound_buffer_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -421,6 +424,25 @@ impl HostContext {
         &self.limits
     }
 
+    /// The encoded-byte budget for outgoing protocol frames and their writer queue.
+    ///
+    /// Defaults to [`Limits::turn_buffer_bytes`]. ACP uses this for prompt preflight and holds
+    /// queued-byte charges through the physical write. Incoming frames and turn events retain
+    /// their own limits. This is a wire-byte budget, not a bound on parsed messages or heap use.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn example(host: &mango_external_agents::HostContext) {
+    /// let outgoing_bytes = host.outbound_buffer_bytes();
+    /// println!("Outgoing frame/queue budget: {outgoing_bytes} bytes");
+    /// # }
+    /// ```
+    pub fn outbound_buffer_bytes(&self) -> usize {
+        self.outbound_buffer_bytes
+            .unwrap_or(self.limits.turn_buffer_bytes)
+    }
+
     /// The current instant, from the host's clock.
     pub fn now(&self) -> SystemTime {
         self.clock.now()
@@ -454,6 +476,7 @@ pub struct HostContextBuilder {
     cancel: Option<CancelToken>,
     broker: Option<Arc<dyn PermissionBroker>>,
     limits: Option<Limits>,
+    outbound_buffer_bytes: Option<usize>,
 }
 
 impl HostContextBuilder {
@@ -526,12 +549,35 @@ impl HostContextBuilder {
         self
     }
 
+    /// Sets an independent encoded-byte budget for outgoing protocol frames and their queue.
+    ///
+    /// ACP uses this budget without increasing incoming-frame or turn-event limits. Leaving it
+    /// unset preserves the caller's [`Limits::turn_buffer_bytes`], including custom limits.
+    /// [`Self::build`] refuses zero or a value beyond the `u32`/Tokio semaphore permit range.
+    /// Frame-count limits and per-attachment caps still apply. Other harnesses currently retain
+    /// their existing transport limits.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::HostContext;
+    ///
+    /// let builder = HostContext::builder().outbound_buffer_bytes(16 * 1024 * 1024);
+    /// # let _ = builder;
+    /// ```
+    #[must_use]
+    pub fn outbound_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.outbound_buffer_bytes = Some(bytes);
+        self
+    }
+
     /// Builds it.
     ///
     /// # Errors
     ///
     /// [`Error::HostConfiguration`] when the launcher, the working directory or the client
-    /// identity is missing. None of the three has a default a library could pick: a launcher is
+    /// identity is missing, or an outbound byte override is zero or outside the permit range.
+    /// None of the three required ports has a default a library could pick: a launcher is
     /// the host's sandbox policy, a working directory is an authorisation, and a client name is
     /// what a vendor logs.
     pub fn build(self) -> Result<HostContext> {
@@ -550,6 +596,15 @@ impl HostContextBuilder {
 
         let limits = self.limits.unwrap_or_default();
         limits.approval_expires_at(SystemTime::UNIX_EPOCH)?;
+        let maximum = (u32::MAX as usize).min(tokio::sync::Semaphore::MAX_PERMITS);
+        if let Some(bytes) = self.outbound_buffer_bytes
+            && !(1..=maximum).contains(&bytes)
+        {
+            return Err(Error::HostConfiguration {
+                expected: "a nonzero outbound byte budget within the u32 and Tokio semaphore permit range",
+                received: format!("{bytes} bytes (maximum {maximum})"),
+            });
+        }
 
         Ok(HostContext {
             launcher,
@@ -561,6 +616,7 @@ impl HostContextBuilder {
             cancel: self.cancel.unwrap_or_default(),
             broker: self.broker,
             limits,
+            outbound_buffer_bytes: self.outbound_buffer_bytes,
         })
     }
 }
@@ -610,6 +666,87 @@ mod tests {
             ]))
             .build()
             .expect("expected a context, received a refusal")
+    }
+
+    #[test]
+    fn an_unset_outbound_override_preserves_default_and_custom_limits() {
+        assert_eq!(context().outbound_buffer_bytes(), 8 * 1024 * 1024);
+        let defaults = Limits::default();
+        // An exhaustive literal remains source compatible; callers need no new Limits field.
+        let limits = Limits {
+            turn_channel_capacity: defaults.turn_channel_capacity,
+            turn_buffer_bytes: 4096,
+            max_pending_requests: defaults.max_pending_requests,
+            line: defaults.line,
+            stderr_tail_bytes: defaults.stderr_tail_bytes,
+            request_timeout: defaults.request_timeout,
+            idle_timeout: defaults.idle_timeout,
+            shutdown_timeout: defaults.shutdown_timeout,
+            cancel_settle_timeout: defaults.cancel_settle_timeout,
+            approval_timeout: defaults.approval_timeout,
+            kill_grace: defaults.kill_grace,
+        };
+        let host = HostContext::builder()
+            .launcher(Arc::new(RefusingLauncher))
+            .cwd("/workspace")
+            .client_info("budget-tests", "1.0")
+            .limits(limits)
+            .build()
+            .expect("custom limits remain valid");
+        assert_eq!(host.outbound_buffer_bytes(), 4096);
+        assert_eq!(*host.limits(), limits);
+    }
+
+    #[test]
+    fn an_outbound_override_is_independent_and_survives_cloning_and_builder_order() {
+        for override_first in [false, true] {
+            let limits = Limits {
+                turn_buffer_bytes: 4096,
+                ..Limits::default()
+            };
+            let builder = HostContext::builder()
+                .launcher(Arc::new(RefusingLauncher))
+                .cwd("/workspace")
+                .client_info("budget-tests", "1.0");
+            let builder = if override_first {
+                builder.outbound_buffer_bytes(8192).limits(limits)
+            } else {
+                builder.limits(limits).outbound_buffer_bytes(8192)
+            };
+            let host = builder.build().expect("valid independent byte override");
+            assert_eq!(host.clone().outbound_buffer_bytes(), 8192);
+            assert_eq!(*host.limits(), limits);
+        }
+    }
+
+    #[test]
+    fn zero_and_unrepresentable_outbound_overrides_are_configuration_refusals() {
+        let maximum = (u32::MAX as usize).min(tokio::sync::Semaphore::MAX_PERMITS);
+        for bytes in [0, maximum + 1, usize::MAX] {
+            let error = HostContext::builder()
+                .launcher(Arc::new(RefusingLauncher))
+                .cwd("/workspace")
+                .client_info("budget-tests", "1.0")
+                .outbound_buffer_bytes(bytes)
+                .build()
+                .expect_err("invalid override must be refused before creating a transport");
+            assert!(
+                matches!(&error, Error::HostConfiguration { expected, received }
+                if *expected == "a nonzero outbound byte budget within the u32 and Tokio semaphore permit range"
+                    && *received == format!("{bytes} bytes (maximum {maximum})")),
+                "expected the invalid value and permit shape; received {error:?}"
+            );
+        }
+        for bytes in [1, maximum] {
+            let host = HostContext::builder()
+                .launcher(Arc::new(RefusingLauncher))
+                .cwd("/workspace")
+                .client_info("budget-tests", "1.0")
+                .outbound_buffer_bytes(bytes)
+                .build()
+                .expect("inclusive supported override boundaries");
+            assert_eq!(host.outbound_buffer_bytes(), bytes);
+        }
     }
 
     #[test]

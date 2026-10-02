@@ -124,16 +124,20 @@ request and idle deadlines.
 
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
-individually), and `turn_buffer_bytes` serialized bytes in each direction. Output byte accounting includes the active
-physical write, and an oversized batch or queue fails the connection. Generic outgoing ACP
-requests reserve admission before entering the SDK queue.
+individually), and `turn_buffer_bytes` serialized incoming bytes. Outgoing frames and the writer
+queue use `host.outbound_buffer_bytes()`, which defaults to `turn_buffer_bytes`; the optional
+builder override changes outgoing bytes without raising incoming or event caps. Output byte
+accounting includes the active physical write, and an oversized batch or queue fails the
+connection. Generic outgoing ACP requests reserve admission before entering the SDK queue. See
+[the ACP transport guide](harness-acp.md#transport) for retained-buffer accounting and exclusions.
 
 Framed transports also enforce `Limits::line`, and stderr has its own bounded tail. These are
 per-stream and per-connection budgets, not a total host-memory limit. The host caps the number of
 sessions, retained completed streams, attachments and source buffers it supplies through its
 launcher.
 
-Every byte budget in this library, including `turn_buffer_bytes`, `max_pending_bytes` (the JSON-RPC
+Every byte budget in this library, including `turn_buffer_bytes`, `outbound_buffer_bytes`,
+`max_pending_bytes` (the JSON-RPC
 callback byte cap on `ClientOptions`, not a `Limits` field; `ClientOptions::with_limits` sets it from
 `turn_buffer_bytes`) and the line caps, counts encoded (wire) bytes. None of them measures parsed memory, and event and request
 counts do not bound it either: one large message is a single event however much it expands once
