@@ -9,6 +9,8 @@ mod contracts;
 mod support;
 #[path = "replay/teardown.rs"]
 mod teardown;
+#[path = "replay/write_failure.rs"]
+mod write_failure;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
