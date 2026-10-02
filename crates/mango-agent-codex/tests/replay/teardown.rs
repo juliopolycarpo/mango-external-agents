@@ -14,12 +14,12 @@ fn teardown_limits() -> mango_external_agents::Limits {
 }
 
 /// One session over a gated app-server whose host lifetime token the test controls.
-struct WatchedSession {
-    session: Arc<dyn Session>,
-    launcher: Arc<GatedLauncher>,
-    inner: Arc<FakeLauncher>,
-    kill_gate: Arc<FakeGate>,
-    cancel: mango_external_agents::CancelToken,
+pub(super) struct WatchedSession {
+    pub(super) session: Arc<dyn Session>,
+    pub(super) launcher: Arc<GatedLauncher>,
+    pub(super) inner: Arc<FakeLauncher>,
+    pub(super) kill_gate: Arc<FakeGate>,
+    pub(super) cancel: mango_external_agents::CancelToken,
 }
 
 async fn open_watched(fail_kill: bool) -> WatchedSession {
@@ -57,14 +57,14 @@ async fn open_watched(fail_kill: bool) -> WatchedSession {
 
 /// Opens the kill gate for more callers than one owner needs, so a duplicate reaper is counted
 /// instead of hanging the test.
-fn release_kills(gate: &FakeGate) {
+pub(super) fn release_kills(gate: &FakeGate) {
     for _ in 0..8 {
         gate.open();
     }
 }
 
 /// Lets any second teardown owner that was wrongly started reach the process control.
-async fn settle() {
+pub(super) async fn settle() {
     for _ in 0..256 {
         tokio::task::yield_now().await;
     }
@@ -81,7 +81,7 @@ async fn wait_for_closed(session: &Arc<dyn Session>) {
     );
 }
 
-fn assert_one_teardown(launcher: &GatedLauncher, inner: &FakeLauncher) {
+pub(super) fn assert_one_teardown(launcher: &GatedLauncher, inner: &FakeLauncher) {
     assert_eq!(
         launcher.kills(),
         1,

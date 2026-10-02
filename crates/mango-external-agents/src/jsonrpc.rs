@@ -145,9 +145,9 @@ impl std::fmt::Debug for ServerRequestOutcome {
 pub enum PeerTermination {
     /// The peer closed its output.
     Exited,
-    /// The link failed: reading the peer failed, a reply to one of its questions could not be
-    /// written (which leaves the peer waiting on an answer that will never arrive), or a write
-    /// was abandoned mid-send (timed out or dropped) with its frame possibly half on the wire.
+    /// The link failed: reading or writing the peer failed, a reply to one of its questions could
+    /// not be written, or a write was abandoned mid-send (timed out or dropped) with its frame
+    /// possibly half on the wire.
     LinkFailed(String),
     /// Peer work filled the bounded handoff queue before the handler could consume it.
     NotificationByteBackpressure {
@@ -236,7 +236,7 @@ pub trait PeerHandler: Send + Sync {
         id: RequestId,
     ) -> ServerRequestOutcome;
 
-    /// The peer's read side ended unexpectedly.
+    /// The peer's link ended unexpectedly, on its read or write side.
     ///
     /// A handler can release state that only a complete vendor turn would otherwise clear. This
     /// callback is never made for [`Client::close`], whose caller already owns that shutdown.
@@ -409,18 +409,18 @@ struct ClientState {
     next_id: AtomicU64,
     closed: AtomicBool,
     shutdown: CancelToken,
-    /// Why a write to the peer left the link unusable, once one did: a reply that could not be
-    /// written, or any frame whose send was abandoned mid-frame (a timeout, a shorter caller
-    /// deadline, or a dropped request).
+    /// Why a write to the peer left the link unusable, once one did: a transport failure, a reply
+    /// that could not be written, or any frame whose send was abandoned mid-frame (a timeout, a
+    /// shorter caller deadline, or a dropped request).
     ///
     /// A reply is written on a task the pump waits for when it tears the connection down, so that
     /// task must never run the teardown itself. It records the cause here and wakes the pump, which
     /// owns termination.
     write_failure: StdMutex<Option<String>>,
     write_failed: Notify,
-    /// Set synchronously, before the sender is released, by the write that abandoned a frame
-    /// mid-send, so a writer already queued for the sender refuses instead of appending a whole
-    /// frame behind the half one. The pump ends the connection later, on its own task.
+    /// Set synchronously, before the sender is released, by a transport failure or abandoned
+    /// mid-frame send, so a queued writer refuses instead of using the broken physical link.
+    /// The pump ends the connection later, on its own task.
     link_poisoned: AtomicBool,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
@@ -433,7 +433,8 @@ struct ClientState {
 /// A send dropped mid-frame, by its own write deadline, by a caller's shorter deadline or because
 /// the caller dropped the future, may have put half a frame on the wire, and every later frame
 /// would follow it. Whatever dropped it, this is the one place that notices, so the pump is
-/// told. A send that returns, even with an error, is finished and signals nothing.
+/// told. A completed transport failure is handled by `write_marking` instead; local refusals do
+/// not damage the link.
 struct MidSend<'a> {
     state: &'a ClientState,
     finished: bool,
@@ -957,14 +958,14 @@ impl ClientState {
         tokio::time::timeout(self.options.request_timeout, async {
             let mut sender = self.sender.lock().await;
             // Read again holding the sender: the write that held it before may have been
-            // abandoned mid-frame while this one waited, and the pump has not necessarily ended
-            // the connection yet. `closed` is deliberately not the test, because a connection
-            // that is closing still writes the refusals its in-flight questions are owed.
+            // abandoned mid-frame or failed while this one waited, and the pump has not
+            // necessarily ended the connection yet. `closed` is deliberately not the test:
+            // a closing connection still writes the refusals its in-flight questions are owed.
             if self.link_poisoned.load(Ordering::Acquire) {
                 return Err(Error::Link {
                     peer: self.options.peer_name.clone(),
                     message: String::from(
-                        "the link was abandoned mid-frame by an earlier JSON-RPC frame write",
+                        "the link became unusable during an earlier JSON-RPC frame write",
                     ),
                 });
             }
@@ -976,6 +977,15 @@ impl ClientState {
             let mut midsend = MidSend::arm(self);
             let sent = sender.send(frame).await;
             midsend.finish();
+            if let Err(error) = &sent
+                && matches!(error.cause(), Error::Link { .. })
+            {
+                // A completed transport failure can leave the read half open. Poison before
+                // releasing the sender so a queued writer cannot race the pump's termination.
+                // Local admission and validation refusals leave a healthy transport usable.
+                self.link_poisoned.store(true, Ordering::Release);
+                self.signal_write_failure(error);
+            }
             sent
         })
         .await
@@ -1034,9 +1044,8 @@ async fn pump(
         let message = tokio::select! {
             biased;
             () = state.shutdown.cancelled() => break,
-            // A write that left the link unusable (a reply that could not be written, or a send
-            // abandoned mid-frame) is a dead link the read side has not noticed yet. It ends the
-            // connection here, on the one task that owns termination.
+            // A transport failure, refused reply or abandoned send can leave the read side open.
+            // End the connection here, on the one task that owns termination.
             () = state.write_failed.notified() => {
                 let cause = state
                     .take_write_failure()
@@ -1094,8 +1103,8 @@ async fn pump(
     }
 }
 
-/// Ends the connection because its link failed, on either side: the read side errored, or a reply
-/// could not be written. Runs on the pump only, once, as the last thing it does.
+/// Ends the connection because its link failed, on either side. Runs on the pump only, once, as
+/// the last thing it does.
 async fn link_failed(
     state: &Arc<ClientState>,
     handler: &Arc<dyn PeerHandler>,
@@ -1274,6 +1283,8 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
 
 #[cfg(test)]
 mod tests {
+    mod write_failure_tests;
+
     use super::{
         Client, ClientOptions, JsonRpcError, PeerHandler, PeerTermination, RequestId,
         ServerRequestOutcome,
@@ -1399,7 +1410,10 @@ mod tests {
         let link = ScriptedLink::new();
         let client = client(link.clone(), RecordingHandler::arc(None));
 
-        let refused = client.request::<_, Value>("thread/start", Unwritable).await;
+        let started = AtomicBool::new(false);
+        let refused = client
+            .request_tracking_write::<_, Value>("thread/start", Unwritable, &started)
+            .await;
         assert!(
             matches!(refused, Err(Error::Protocol { .. })),
             "expected the params to be refused, received {refused:?}"
@@ -1411,6 +1425,14 @@ mod tests {
             "expected nothing left waiting, received {waiting}"
         );
         assert!(link.sent().is_empty(), "received {:?}", link.sent());
+        assert!(!started.load(Ordering::Acquire));
+        link.push_line(r#"{"id":"2","result":"fresh"}"#);
+        let answer: String = client
+            .request("fresh", json!({}))
+            .await
+            .expect("expected serialization refusal to leave the link usable");
+        assert_eq!(answer, "fresh");
+        assert!(!client.is_closed());
     }
 
     #[tokio::test]
@@ -1460,6 +1482,12 @@ mod tests {
         assert_eq!(link.sent().len(), 1);
         first.abort();
         let _ = first.await;
+        client
+            .notify("fresh", json!({}))
+            .await
+            .expect("expected pending admission refusal to preserve the link");
+        assert_eq!(link.sent().len(), 2);
+        assert!(!client.is_closed());
     }
 
     /// A host may set a huge count to mean "no cap". The queues behind these limits are semaphore
@@ -1811,36 +1839,6 @@ mod tests {
         // Closing fails everything still pending. A call whose write failed is not pending — it
         // already failed — so there is nothing here for a second failure to land on.
         client.close().await.ok();
-    }
-
-    /// Only a reply the peer is waiting on ends the connection. A request the host sends that
-    /// fails to write reports to its own caller, who decides what to do, and leaves the link open.
-    #[tokio::test]
-    async fn a_failed_outbound_write_reports_to_its_caller_and_leaves_the_connection_open() {
-        let link = ScriptedLink::new();
-        let handler = RecordingHandler::arc(None);
-        let client = client(link.clone(), Arc::clone(&handler));
-        link.fail_sends("EPIPE");
-
-        let error = client
-            .request::<_, Value>("thread/start", json!({}))
-            .await
-            .expect_err("expected a failure, received an answer");
-        assert!(
-            error.to_string().contains("EPIPE"),
-            "expected the write failure to reach the caller | received {error}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let terminations = handler.terminations.lock().await.len();
-        assert_eq!(
-            terminations, 0,
-            "expected terminations: 0 after a failed outbound write | received: {terminations}"
-        );
-        assert!(
-            !client.is_closed(),
-            "expected closed: false after a failed outbound write | received: true"
-        );
-        client.close().await.expect("expected a clean close");
     }
 
     #[tokio::test]
@@ -2565,7 +2563,8 @@ mod tests {
     /// reply path only signals, so nothing waits on the task that is waiting on it.
     ///
     /// Both questions are held inside the handler until the replies are about to fail, so the
-    /// close arrives while answers are in flight and the reply writes are reached, not skipped.
+    /// close arrives while answers are in flight. The first reaches the physical sender and
+    /// poisons it; the second settles without another write to that broken sender.
     #[tokio::test]
     async fn failed_replies_racing_a_close_neither_deadlock_nor_terminate_twice() {
         let link = ScriptedLink::new();
@@ -2605,9 +2604,17 @@ mod tests {
         );
         assert_eq!(
             link.refused_sends(),
-            2,
-            "expected both replies to reach the writer and be refused | received: {}",
+            1,
+            "expected only the first reply to reach the broken physical sender | received: {}",
             link.refused_sends()
+        );
+        assert!(
+            client
+                .state
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         let terminated = gated.terminated.load(Ordering::Acquire);
@@ -2838,7 +2845,7 @@ mod tests {
         client.close().await.expect("expected a clean close");
     }
 
-    /// A send that completes, or fails outright, was not abandoned: nothing is signalled.
+    /// A successful send leaves the connection usable.
     #[tokio::test]
     async fn a_send_that_returns_leaves_the_connection_open() {
         let link = ScriptedLink::new();
@@ -2849,11 +2856,6 @@ mod tests {
             .notify("ping", json!({}))
             .await
             .expect("expected the send to land");
-        link.fail_sends("EPIPE");
-        client
-            .notify("ping", json!({}))
-            .await
-            .expect_err("expected the refused send to fail");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let terminations = handler.terminations.lock().await.len();
         assert_eq!(
