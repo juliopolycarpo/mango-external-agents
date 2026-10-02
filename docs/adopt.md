@@ -251,8 +251,9 @@ a retry. Decide using the existing queries together:
 The reference host withdraws one reservation for `NotSubmitted`, then retries Busy or a retryable
 vendor refusal only while the session is usable. Deterministic input/configuration refusals settle
 once and remain remembered for that logical turn. Link, Timeout, nonretryable Vendor and unfinished
-cleanup return their original typed error for host recovery when unsubmitted. Acknowledged errors
-keep `Accepted` in the recovery record, so a contradictory absence answer cannot authorize replay.
+cleanup return their original typed error for host recovery when unsubmitted. Acknowledged start
+errors also return unchanged, keeping `Accepted` in the recovery record for an explicit observation
+run. A contradictory absence answer cannot authorize replay.
 Acceptance-unknown work keeps reconciliation state. Cleanup controls return to their owner before
 either recovery path proceeds. These choices belong to that example's host, not the SDK.
 

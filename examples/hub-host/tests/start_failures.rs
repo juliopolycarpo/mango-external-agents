@@ -202,6 +202,45 @@ async fn cleanup_during_uncertain_start_returns_control_without_replay_or_withdr
     }
 }
 
+/// An acknowledged start error returns promptly without polling its live Hub reservation.
+#[tokio::test(start_paused = true)]
+async fn an_accepted_start_failure_returns_without_polling_a_live_hub_reservation() {
+    let mut session = RefusingSession::new(Error::Link {
+        peer: "fake Codex app-server".into(),
+        message: "the acknowledged turn lost its observation link".into(),
+    });
+    session.error = session.error.with_dispatch(Dispatch::Accepted);
+    session.state().set_status(SessionStatus::Closed);
+    let hub = Arc::new(FakeHubApi::new());
+    let mut supervisor = Supervisor::new(
+        Box::new(session.clone()),
+        Arc::clone(&hub) as Arc<dyn HubApi>,
+        common::policy(),
+        Arc::new(Stop::new()),
+        Arc::new(SystemClock),
+    );
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        supervisor.run(TurnRequest::new("accepted", "hello")),
+    )
+    .await
+    .expect("expected the accepted start failure to return without polling the reservation");
+    let error = result.expect_err("expected the original observation-link error");
+    assert_eq!(error.to_string(), session.error.to_string());
+    assert_eq!(error.dispatch(), Dispatch::Accepted);
+    assert_eq!(session.attempts(), 1);
+    assert_eq!(hub.count(HubCallKind::Reserve), 1);
+    assert_eq!(hub.count(HubCallKind::Withdraw), 0);
+    assert_eq!(hub.count(HubCallKind::Reconcile), 0);
+    assert_eq!(
+        supervisor
+            .record(&TurnId::new("accepted"))
+            .expect("expected the accepted recovery record")
+            .action(),
+        RecoveryAction::Observe
+    );
+}
+
 /// A vendor acknowledgement outranks a later control-plane answer claiming absence.
 #[tokio::test(start_paused = true)]
 async fn an_accepted_start_failure_cannot_be_replayed_after_a_contradictory_hub_answer() {
@@ -213,27 +252,36 @@ async fn an_accepted_start_failure_cannot_be_replayed_after_a_contradictory_hub_
     let hub = Arc::new(FakeHubApi::new().reconciling([ReconcileAnswer::Answer(
         Reconciliation::Answered(HubStatus::NeverArrived),
     )]));
-    let stop = Arc::new(Stop::new());
     let mut supervisor = Supervisor::new(
         Box::new(session.clone()),
         Arc::clone(&hub) as Arc<dyn HubApi>,
         common::policy(),
-        Arc::clone(&stop),
+        Arc::new(Stop::new()),
         Arc::new(SystemClock),
     );
-    let mut running =
-        tokio::spawn(async move { supervisor.run(TurnRequest::new("accepted", "hello")).await });
-    let result = match tokio::time::timeout(Duration::from_millis(100), &mut running).await {
-        Ok(result) => result,
-        Err(_) => {
-            stop.stop(CancelReason::Shutdown);
-            running.await
-        }
-    }
-    .expect("expected observation task to finish");
+    let request = TurnRequest::new("accepted", "hello");
+    let error = tokio::time::timeout(Duration::from_millis(100), supervisor.run(request.clone()))
+        .await
+        .expect("expected the acknowledged start error to return promptly")
+        .expect_err("expected the original acknowledged error");
+    assert_eq!(error.to_string(), session.error.to_string());
+    assert_eq!(error.dispatch(), Dispatch::Accepted);
+    assert_eq!(hub.count(HubCallKind::Reconcile), 0);
+    assert_eq!(
+        supervisor
+            .record(&request.turn_id)
+            .expect("expected the accepted recovery record")
+            .action(),
+        RecoveryAction::Observe
+    );
+
+    let error = tokio::time::timeout(Duration::from_millis(100), supervisor.run(request))
+        .await
+        .expect("expected resumed observation to refuse contradictory absence")
+        .expect_err("expected contradictory absence to be refused");
     assert_eq!(session.attempts(), 1);
-    let error = result.expect_err("expected contradictory absence to be refused");
     assert!(matches!(error.cause(), Error::HostConfiguration { .. }));
+    assert_eq!(hub.count(HubCallKind::Reserve), 1);
     assert_eq!(hub.count(HubCallKind::Withdraw), 0);
     assert_eq!(hub.count(HubCallKind::Reconcile), 1);
 }

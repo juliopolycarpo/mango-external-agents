@@ -561,6 +561,8 @@ impl Supervisor {
     /// remains usable. Other failures, including link, timeout and unfinished cleanup, return
     /// unchanged for the caller to recover or close the session. `retryable() == false` alone
     /// proves neither a caller refusal nor a healthy session.
+    /// An acknowledged start failure also returns unchanged, retaining acceptance in the record.
+    /// Running that turn again observes its existing operation rather than starting another one.
     ///
     /// # Example
     ///
@@ -817,12 +819,11 @@ impl SupervisorInner {
             }
             // Native acknowledgement must survive an error too: no later absence answer can
             // authorize a second execution of work the vendor already acknowledged.
+            // No stream was returned to observe, so return the original failure to the caller
+            // before an explicit recovery run consults the Hub about the accepted operation.
             Ok(Err(error)) if error.dispatch() == Dispatch::Accepted => {
                 record.record_dispatch(&operation, Dispatch::Accepted)?;
-                if error.cleanup_control().is_some() {
-                    return Err(error);
-                }
-                Ok(Step::Backoff(None))
+                Err(error)
             }
             // A cleanup obligation survives every dispatch state. Keep this record uncertain,
             // return the control to its owner, and let that owner complete cleanup before recovery.

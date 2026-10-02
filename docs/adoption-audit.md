@@ -64,6 +64,9 @@ unchanged in every dispatch state. A second failing regression showed those hand
 until external shutdown; the fixed host returns the handle before recovery. A third failing
 regression showed acknowledged errors losing `Accepted` and allowing a contradictory absence answer
 to unlock replay. The corrected record retains native acceptance and refuses that contradiction.
+An acknowledged start error without a stream now returns its original error promptly instead of
+polling a live Hub reservation indefinitely. An explicit recovery run observes the retained
+operation, and the resumed regression proves contradictory absence still cannot unlock replay.
 Unsubmitted nonretryable Link/Timeout/Vendor errors return to the host for recovery rather than
 acquiring a caller-error label. Session usability is checked separately before an otherwise
 retryable refusal is replayed. `examples/hub-host/tests/start_failures.rs` records these dispositions;
