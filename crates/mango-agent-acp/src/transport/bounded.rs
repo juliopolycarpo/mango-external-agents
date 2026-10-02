@@ -20,6 +20,7 @@ pub struct BoundedTransport {
     incoming: IncomingLines,
     limits: Limits,
     overflow: OverflowSlot,
+    outbound_buffer_bytes: usize,
 }
 
 /// Where the transport records the budget that failed the connection, shared with its owner.
@@ -72,7 +73,7 @@ impl Overflow {
     /// The overflow of one outgoing frame of `received` bytes under `limit`, for the caller that
     /// measures a frame before the transport does.
     ///
-    /// For example, `Overflow::outgoing_frame(outgoing_frame_limit(&limits), 9_000_000).error()`.
+    /// For example, `Overflow::outgoing_frame(outgoing_frame_limit(limits.turn_buffer_bytes), 9_000_000).error()`.
     pub(crate) fn outgoing_frame(limit: usize, received: usize) -> Self {
         Self {
             budget: Budget::OutgoingFrameBytes,
@@ -111,7 +112,16 @@ impl BoundedTransport {
             incoming,
             limits,
             overflow: OverflowSlot::default(),
+            outbound_buffer_bytes: outgoing_frame_limit(limits.turn_buffer_bytes),
         }
+    }
+
+    /// Uses a host's independent outgoing budget without widening incoming or frame-count limits.
+    ///
+    /// For example, `transport.with_outbound_buffer_bytes(host.outbound_buffer_bytes())`.
+    pub(super) fn with_outbound_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.outbound_buffer_bytes = outgoing_frame_limit(bytes);
+        self
     }
 
     /// The slot this transport fills when a budget fails its connection.
@@ -131,13 +141,20 @@ impl BoundedTransport {
             outgoing,
             limits,
             overflow,
+            outbound_buffer_bytes,
         } = self;
         let future = async move {
             let (pending, writing) = mpsc::channel(outgoing_capacity(&limits));
-            let budget = Arc::new(Semaphore::new(outgoing_frame_limit(&limits)));
+            let budget = Arc::new(Semaphore::new(outbound_buffer_bytes));
             futures::try_join!(
                 read_frames(incoming, transport.tx, limits, &overflow),
-                queue_output(transport.rx, pending, budget, limits, &overflow),
+                queue_output(
+                    transport.rx,
+                    pending,
+                    budget,
+                    outbound_buffer_bytes,
+                    &overflow
+                ),
                 write_frames(outgoing, writing),
             )?;
             Ok(())
@@ -250,12 +267,11 @@ async fn queue_output(
     mut frames: futures::channel::mpsc::UnboundedReceiver<TransportFrame>,
     pending: mpsc::Sender<PendingFrame>,
     budget: Arc<Semaphore>,
-    limits: Limits,
+    byte_limit: usize,
     slot: &OverflowSlot,
 ) -> agent_client_protocol::Result<()> {
     while let Some(frame) = frames.next().await {
         let line = frame.to_json()?;
-        let byte_limit = outgoing_frame_limit(&limits);
         if line.len() > byte_limit {
             let overflow = Overflow::outgoing_frame(byte_limit, line.len());
             return Err(overflow.fail(slot, format!(
@@ -324,7 +340,7 @@ async fn write_frames(
 ///
 /// The queue carries `session/update` notifications and responses to the requests admitted under
 /// `max_pending_requests`, so it holds at least as many messages as either. Notifications and turn
-/// events are related but not one to one; the byte budget is what bounds memory. For example, the
+/// events are related but not one to one; the byte budget bounds retained serialized payloads. For example, the
 /// default limits allow 1,024 queued messages.
 fn frame_limit(limits: &Limits) -> usize {
     limits
@@ -333,15 +349,14 @@ fn frame_limit(limits: &Limits) -> usize {
         .max(1)
 }
 
-/// The most bytes one outgoing frame may carry: `Limits::turn_buffer_bytes`, capped to what the
-/// byte budget's permits can express.
+/// Caps the effective outgoing byte budget to what its semaphore permits can express.
 ///
 /// The transport refuses a longer frame after the turn has started; a caller that measures its
 /// frame first compares against this same number.
 ///
 /// For example, the default 8 MiB budget gives `8 * 1024 * 1024`.
-pub(crate) fn outgoing_frame_limit(limits: &Limits) -> usize {
-    limits.turn_buffer_bytes.min(u32::MAX as usize)
+pub(crate) fn outgoing_frame_limit(bytes: usize) -> usize {
+    bytes.min(u32::MAX as usize).min(Semaphore::MAX_PERMITS)
 }
 
 /// The outgoing writer queue's capacity: the message cap, clamped to what tokio can allocate.

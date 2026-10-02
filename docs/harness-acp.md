@@ -43,10 +43,11 @@ The core's `LineStream` and `ByteSink` frame the pipes under `Limits::line`. `Bo
 passes frames through the SDK's [`Channel` interface](https://docs.rs/agent-client-protocol/2.1.0/agent_client_protocol/struct.Channel.html),
 leaving JSON-RPC parsing and routing to the official SDK. Each direction has two bounds:
 
-| Bound           | Limit                                                                | Unit              | Default           |
-| --------------- | -------------------------------------------------------------------- | ----------------- | ----------------- |
-| Queued messages | larger of `Limits::turn_channel_capacity` and `max_pending_requests` | JSON-RPC messages | 1,024             |
-| Queued bytes    | `Limits::turn_buffer_bytes`                                          | serialized bytes  | 8 MiB (8,388,608) |
+| Bound                      | Limit                                                                    | Unit                                | Default           |
+| -------------------------- | ------------------------------------------------------------------------ | ----------------------------------- | ----------------- |
+| Queued messages            | larger of `Limits::turn_channel_capacity` and `max_pending_requests`     | JSON-RPC messages                   | 1,024             |
+| Incoming bytes             | `Limits::turn_buffer_bytes`                                              | serialized bytes                    | 8 MiB (8,388,608) |
+| Outgoing frame/queue bytes | `HostContext::outbound_buffer_bytes()` (defaults to `turn_buffer_bytes`) | serialized bytes, excluding newline | 8 MiB (8,388,608) |
 
 Incoming messages are counted individually: a batch is charged one message per member, so
 batches cannot multiply the queue past the cap. Outgoing frames are single messages from the SDK
@@ -56,12 +57,24 @@ quantity. It is deliberately not `max_pending_requests` alone: a burst of ordina
 ahead of the SDK actor is not request concurrency. Notifications and turn events are related but
 not one to one (a first thought chunk opens reasoning and adds a delta; a completed tool call
 starts and completes an activity), so the message count is a coarse guard and the byte budget is
-what bounds memory. A host may set a very large count to rely on bytes alone; the outgoing writer
+what bounds retained wire payloads. These are not heap bounds. A host may set a very large count to rely on bytes alone; the outgoing writer
 queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking, and so is the request
 admission semaphore that `max_pending_requests` sizes (a `usize::MAX` there means no cap in
 practice, and opens, runs turns and closes like any other value).
 
-Output bytes remain charged through the physical write. A single frame larger than the byte
+A host can set `HostContext::builder().outbound_buffer_bytes(bytes)` independently of incoming
+frames and turn events. An explicit override must be nonzero and at most the smaller of
+`u32::MAX` and tokio's `Semaphore::MAX_PERMITS`; invalid values are configuration refusals.
+Unset preserves existing default and custom `Limits::turn_buffer_bytes` behavior. Legacy values
+above the permit range are clamped at the ACP boundary.
+
+Output bytes remain charged through the physical write. For a byte budget `B` and writer queue
+capacity `N`, accepted serialized payload lengths sum to at most `B` across at most `N` queued
+frames plus one physical write. The writer adds one newline byte. One additional candidate is
+serialized before its size and queue charges are checked; a fitting candidate is at most `B`, but
+a refused oversized candidate can be larger. String allocation capacity, parsed messages,
+attachments, the official SDK's unbounded actor channel, and host-supplied sinks are outside that
+accounting, so this is not a hard memory bound. A single frame larger than the byte
 budget, or a queue that would exceed either bound, fails the connection with an error naming the
 received count or size and the limit; the session then closes and its child is released. A prompt
 too large for one frame does not reach that path: `start_turn` measures it first and refuses it
@@ -660,22 +673,23 @@ turn starts. Rejected mid-turn it reads to a user as the agent breaking rather t
 never going to work.
 
 The whole prompt is checked too, not only each attachment. The transport refuses any outgoing frame
-over `Limits::turn_buffer_bytes` (8 MiB by default), and the encoding grows what it carries: base64
+over `host.outbound_buffer_bytes()` (8 MiB by default), and the encoding grows what it carries: base64
 adds a third, and a control character in a text attachment becomes a six-byte `\u00XX` escape. Three
 2 MiB images or one 2 MiB text of control characters pass the per-attachment cap and still exceed the
 frame. Refused there, the turn has already started: the connection fails, the session closes and the
 host is left with `AcceptanceUnknown`. So `start_turn` measures the exact `session/prompt` frame the
 official crate will write, before it submits anything, and answers `LimitExceeded` ("bytes in one
 frame to the ACP agent") with `Dispatch::NotSubmitted`. The session stays usable for the next turn.
-The count is exact, not a bound: the check accepts a frame of exactly `turn_buffer_bytes` bytes,
+The count is exact, not a bound: the check accepts a frame of exactly the effective outgoing budget in bytes,
 refuses one byte more, and refuses nothing that fits the frame budget today. It guarantees only that
 the frame fits alone. The outgoing byte budget is shared by every frame queued for the agent until it
 is written, so a near-budget prompt can still fail the connection after submission when another
 outgoing frame is queued at the same moment (a `session/cancel`, a permission or file response).
 That is the transport's queue cap described above, not a prompt-size refusal. It serialises into a counting sink, so no second
-copy of an attachment is built. It is one extra serialisation pass per turn, cheaper than the
-official crate's own encoding of the same request. A host that wants larger prompts raises
-`Limits::turn_buffer_bytes` itself.
+copy of an attachment is built. It is one extra serialization pass per turn. A host that wants larger prompts can set
+`HostContextBuilder::outbound_buffer_bytes` without raising incoming or turn-event caps. This is
+host budgeting around the documented [v1 prompt frame](https://agentclientprotocol.com/protocol/v1/prompt-turn);
+it does not change the vendor wire, prompt capability checks, or per-attachment caps.
 
 ## Known caveats
 
