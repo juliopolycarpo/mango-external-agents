@@ -59,5 +59,10 @@ tokio = { version = "1.53.1", default-features = false, features = ["macros", "r
 name = "reducer"
 harness = false
 
+[[bench]]
+name = "prompt"
+harness = false
+required-features = ["testing"]
+
 [package.metadata.docs.rs]
 all-features = true

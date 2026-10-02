@@ -32,6 +32,13 @@ with `-` filter cases by substring; flags such as `--bench` are ignored.
 | `hub-host` / `retry`                  | `Supervisor::run` re-sending an 8 MiB, 2 MiB, 1 MiB or attachment-free request after `NotSubmitted` answers (1 or 3 re-sends), on a paused clock so backoff costs nothing; the process's peak resident set is printed after the cases                                                                                                                                                                                                                                                                  |
 | `mango-agent-claude` / `tool_results` | `TurnReducer::reduce` closing a call: a `tool_result` record with a string payload (1 MiB, 32 KiB) or an array of text blocks (1 MiB in one block and in 100 blocks, 12 KiB and 32 KiB in one block, 6 KiB and 600 bytes in three); starting a `Write` (16 KiB, 200 KiB) or an `Edit` (two 2 KiB or two 100-byte strings) call; 1000 subagent text blocks of 1 KiB forwarded under one `Task`                                                                                                          |
 
+The ACP `prompt` binary adds `prompt/4KiB` (100 turns per sample) and `prompt/1MiB`
+(16 turns). It drives exact preflight, the official serializer, the physical writer, and terminal
+drain through the named `FakeAcpAgent`, with unchanged default limits and no override. Session
+opening and request construction are outside the clock; final cleanup and the fake's wire capture
+are included. It needs `--features testing`, which `scripts/bench.sh` supplies. This measures the
+shared prompt path; admitting larger frames is a separate functional result, not a speedup.
+
 Reading the output: one line per case with the median, minimum, maximum, coefficient of variation
 (CV) and a per-unit cost, then a `samples_ms:` line with every raw sample in run order. The raw
 samples are what a receipt quotes.
