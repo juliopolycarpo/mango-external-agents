@@ -63,12 +63,12 @@ pub enum Settled {
         /// The attempt whose fate nothing can establish, for the caller to record.
         operation: OperationRef,
     },
-    /// The Hub refused the operation for good.
+    /// The Hub or the SDK refused the operation for good.
     ///
     /// Remembered by the supervisor: running the same logical turn id again answers with this
     /// same refusal rather than reconciling or dispatching anything.
     Refused {
-        /// What the Hub gave as its reason.
+        /// The Hub or SDK diagnostic identifying the refusal.
         reason: String,
     },
     /// The host stopped the operation and the vendor accepted the stop.
@@ -556,6 +556,14 @@ impl Supervisor {
     /// rather than a `Settled` variant because `Settled` is `Clone + Eq` and an [`Error`] holding
     /// a live process handle is neither.
     ///
+    /// A start failure proved not submitted withdraws its reservation once. Deterministic input
+    /// refusals settle as [`Settled::Refused`]; retryable failures back off only while the session
+    /// remains usable. Other failures, including link, timeout and unfinished cleanup, return
+    /// unchanged for the caller to recover or close the session. `retryable() == false` alone
+    /// proves neither a caller refusal nor a healthy session.
+    /// An acknowledged start failure also returns unchanged, retaining acceptance in the record.
+    /// Running that turn again observes its existing operation rather than starting another one.
+    ///
     /// # Example
     ///
     /// ```
@@ -789,10 +797,37 @@ impl SupervisorInner {
                 // the Hub's half of this bargain.
                 let withdrawn = self.bounded(self.hub.withdraw(&operation)).await;
                 record.reconcile_not_submitted(&operation)?;
-                Ok(Step::Backoff(
-                    withdrawn.err().and_then(|error| error.retry_hint()),
-                ))
+                if error.cleanup_control().is_some() || !self.session.snapshot().status.is_usable()
+                {
+                    return Err(error);
+                }
+                if error.retryable() {
+                    return Ok(Step::Backoff(
+                        withdrawn.err().and_then(|error| error.retry_hint()),
+                    ));
+                }
+                match error.cause() {
+                    Error::LimitExceeded { .. }
+                    | Error::HostConfiguration { .. }
+                    | Error::NotSupported { .. }
+                    | Error::UnsupportedTransport { .. } => Ok(Step::Settled(Settled::Refused {
+                        reason: error.to_string(),
+                    })),
+                    // A nonretryable link or timeout needs recovery, not a caller-error label.
+                    _ => Err(error),
+                }
             }
+            // Native acknowledgement must survive an error too: no later absence answer can
+            // authorize a second execution of work the vendor already acknowledged.
+            // No stream was returned to observe, so return the original failure to the caller
+            // before an explicit recovery run consults the Hub about the accepted operation.
+            Ok(Err(error)) if error.dispatch() == Dispatch::Accepted => {
+                record.record_dispatch(&operation, Dispatch::Accepted)?;
+                Err(error)
+            }
+            // A cleanup obligation survives every dispatch state. Keep this record uncertain,
+            // return the control to its owner, and let that owner complete cleanup before recovery.
+            Ok(Err(error)) if error.cleanup_control().is_some() => Err(error),
             // Everything else — an uncertain failure or a deadline — leaves `AcceptanceUnknown`,
             // so the next turn of the loop reconciles instead of replaying.
             Ok(Err(_)) | Err(_) => Ok(Step::Backoff(None)),

@@ -477,6 +477,15 @@ impl Error {
     ///
     /// A busy session may be retried after its owner finishes. Other retryable refusals come
     /// from the vendor. Dispatch certainty must still be checked before replaying any request.
+    /// `false` does not classify a caller error, prove the session healthy, or establish completed
+    /// cleanup: link and timeout failures also return `false`. Inspect [`Self::cause`],
+    /// [`Self::cleanup_control`] and the session's own snapshot separately.
+    ///
+    /// ```
+    /// use mango_external_agents::{Dispatch, Error};
+    /// let error = Error::Busy.with_dispatch(Dispatch::NotSubmitted);
+    /// assert!(error.retryable() && error.dispatch().is_safe_to_replay());
+    /// ```
     pub fn retryable(&self) -> bool {
         match self {
             Self::Busy => true,
@@ -672,7 +681,8 @@ mod tests {
     }
 
     #[test]
-    fn only_a_vendor_failure_can_be_retryable() {
+    fn busy_and_vendor_advice_can_be_retryable() {
+        assert!(Error::Busy.retryable());
         let vendor = Error::Vendor(
             VendorError::new(ErrorCode::from_static("codex-busy"), "busy")
                 .with_vendor_code("-31000", true),
@@ -772,6 +782,59 @@ mod tests {
             !retryable.dispatch().is_safe_to_replay(),
             "expected a vendor-acknowledged failure not to read as never-dispatched"
         );
+    }
+
+    /// Native proof of absence cannot turn refusal, recovery and cleanup into the same decision.
+    #[test]
+    fn not_submitted_preserves_distinct_retry_and_recovery_advice() {
+        let failures = [
+            (Error::Busy, true),
+            (
+                Error::LimitExceeded {
+                    subject: "bytes of turn input",
+                    limit: 4,
+                    received: 5,
+                },
+                false,
+            ),
+            (
+                Error::Link {
+                    peer: "fake".into(),
+                    message: "a closed pipe".into(),
+                },
+                false,
+            ),
+            (
+                Error::Timeout {
+                    operation: "turn/start".into(),
+                    after: Duration::from_secs(1),
+                },
+                false,
+            ),
+            (
+                Error::Vendor(
+                    VendorError::new(ErrorCode::from_static("vendor-busy"), "busy")
+                        .with_vendor_code("-31000", true),
+                ),
+                true,
+            ),
+            (
+                Error::CleanupRequired {
+                    control: Arc::new(UnreapedControl),
+                    source: Box::new(Error::Busy),
+                },
+                false,
+            ),
+        ];
+        for (failure, retryable) in failures {
+            let had_cleanup = failure.cleanup_control().is_some();
+            let cause = failure.cause().to_string();
+            let error = failure.with_dispatch(Dispatch::NotSubmitted);
+            assert!(error.dispatch().is_safe_to_replay());
+            assert_eq!(error.retryable(), retryable);
+            assert_eq!(error.cause().to_string(), cause);
+            assert_eq!(error.cleanup_control().is_some(), had_cleanup);
+        }
     }
 
     #[test]

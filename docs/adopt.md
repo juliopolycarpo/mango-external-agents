@@ -1,8 +1,31 @@
 # Adopting the library in a host
 
-How a host (an IDE, a runtime, a CLI) embeds mango-external-agents. Every type named here exists
-in the core crate; the crate's own README carries the same walkthrough as a doctest, so the shape
-below is compiled rather than described.
+Embed ACP, Claude Code or Codex in an unrelated Rust CLI, service or IDE. No MangoStudio service,
+Mango Protocol, HTTP server, database or recovery loop is required.
+
+## Start with the independent consumer
+
+[`tests/standalone`](../tests/standalone/README.md) is a small consumer with its own workspace
+and lockfile. Its four SDK dependencies are exact registry pins at `=0.3.1`, with no path override.
+Copy that directory anywhere and run:
+
+```sh
+cargo test --locked
+cargo run --locked --features bundled-launcher -- codex
+```
+
+The tests discover, open, send, read, answer approvals, cancel live work and close each concrete
+harness over named fakes. They need no installed vendor CLI. The executable needs the selected
+vendor installed and authenticated through that vendor's CLI, and a Tokio runtime. It uses the
+optional `launcher-tokio` feature; the library function also accepts a host's custom launcher.
+It denies every approval as an explicit example-host policy. Real hosts supply their own consent
+and approval UI. Ctrl+C cancels an active turn; events continue through its terminal before close.
+
+`scripts/check-standalone.sh` copies the consumer outside the repository, verifies registry sources
+and the absence of product dependencies, then tests with and without the bundled launcher.
+The [coupling audit](adoption-audit.md) records the dependency and contract evidence.
+
+The remaining sections explain the ports and optional services when your host needs them.
 
 ## What the host provides
 
@@ -190,7 +213,11 @@ review returns `Error::NotSupported`; the host needs no vendor protocol code.
 See [`contracts.md`](contracts.md) for the rationale behind each of these shapes, the identifier
 mapping a host persists, and which public types are protected against future growth.
 
-## Hub-owned retry
+## Optional durable host orchestration
+
+`examples/hub-host` is an advanced, self-contained example. Its `HubApi` is a local example trait,
+not MangoStudio's Hub service. Its reservation, withdrawal, reconciliation and persistence design
+is optional host policy. Ordinary consumers can use the session lifecycle above directly.
 
 The library gives you the retry *contract* — `RequestFingerprint`, `RecoveryRecord`, `Dispatch`
 and the transitions between them. It does not give you a loop, and
@@ -205,10 +232,30 @@ never reached the vendor is safe to replay; a socket that closed after the reque
 not. `TurnStream::dispatch()` answers it for an attempt you are holding, and
 `Error::Operation`'s `dispatch` answers it for one that failed.
 
-Branch on the answer, not on the error kind. `Dispatch::is_safe_to_replay` is true only for
+`Dispatch::is_safe_to_replay` is true only for
 `NotSubmitted`; `AcceptanceUnknown` is deliberately false, because "probably did not arrive" is
 the reading that runs a turn twice. `Dispatch::needs_reconciliation` is the other branch, and it
 is the one your supervisor spends its time in.
+
+Replay safety answers whether a second submission can duplicate accepted work. It never commands
+a retry. Decide using the existing queries together:
+
+| Fact                        | Meaning and host decision                                                                                                                       |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dispatch()`                | `NotSubmitted` proves absence; accepted or unknown work cannot be replayed on a hunch.                                                          |
+| `retryable()`               | Busy can become free, and some vendor refusals advise another attempt. `false` also covers broken links and timeouts.                           |
+| `cause()`                   | Match the typed underlying cause. A caller's oversized prompt needs changed input; Link/Timeout need recovery rather than a caller-error label. |
+| `cleanup_control()`         | Retain and finish bounded process cleanup even when submission never happened.                                                                  |
+| `session.snapshot().status` | Session usability is separate from the error. A nonretryable error does not prove the session remains healthy.                                  |
+
+The reference host withdraws one reservation for `NotSubmitted`, then retries Busy or a retryable
+vendor refusal only while the session is usable. Deterministic input/configuration refusals settle
+once and remain remembered for that logical turn. Link, Timeout, nonretryable Vendor and unfinished
+cleanup return their original typed error for host recovery when unsubmitted. Acknowledged start
+errors also return unchanged, keeping `Accepted` in the recovery record for an explicit observation
+run. A contradictory absence answer cannot authorize replay.
+Acceptance-unknown work keeps reconciliation state. Cleanup controls return to their owner before
+either recovery path proceeds. These choices belong to that example's host, not the SDK.
 
 None of this makes a turn idempotent. The vendor decides what a second dispatch does, and no
 identifier the library mints changes that — see [`contracts.md`](contracts.md) for the three
