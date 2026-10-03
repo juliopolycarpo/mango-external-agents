@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.4.0] - 2026-10-03
+
+### 🐛 Bug Fixes
+
+- **(ci)** Remove publication scratch before caching (#115)
+
+### ⚡ Performance
+
+- **(core)** Find line breaks a block at a time (#123)
+- **(core)** Keep the ASCII prefix scan branch-free (#122)
+- **(core)** Keep the clean-text scan vectorized on Rust 1.99 (#120)
+
+### 🧪 Testing
+
+- **(core)** Time the send, not buffer release, in the stdio benches (#121)
+
+### 🏗️ Build
+
+- [**breaking**] **(build)** Raise the minimum Rust version to 1.97 (#118)
+- **(build)** Pin Rust 1.99.0 (#117)
+
 ## [0.3.2] - 2026-10-02
 
 ### 🚀 Features
