@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::{Notify, mpsc::error::TryRecvError};
 
 use super::TerminalStatus;
+use super::size::serialized_len;
 use crate::{AgentEvent, CancelToken, Error, EventKind, Limits, Result};
 
 /// The serialized size one interaction event is budgeted at.
@@ -332,8 +333,26 @@ impl Drop for EventReceiver {
     }
 }
 
-/// Counts the encoded payload without allocating another copy of it.
+/// The serialized size an event is budgeted at: what `serde_json::to_vec(event)` would produce.
+///
+/// Counted by [`serialized_len`] without producing the JSON. A value that serializer cannot count
+/// with certainty is counted by `serde_json` into a writer that only adds up lengths, so neither
+/// path allocates a copy of the payload. Debug builds compare the two on every event, so any test
+/// that queues one also checks the fast count.
 fn payload_bytes(event: &AgentEvent) -> Result<usize> {
+    let Ok(bytes) = serialized_len(event) else {
+        return serde_json_len(event);
+    };
+    debug_assert_eq!(
+        Some(bytes),
+        serde_json_len(event).ok(),
+        "expected the size counter (left) to equal the serde_json length (right) of a queued event"
+    );
+    Ok(bytes)
+}
+
+/// Counts the encoded payload with `serde_json`, without allocating another copy of it.
+fn serde_json_len(event: &AgentEvent) -> Result<usize> {
     #[derive(Default)]
     struct Counter(usize);
     impl std::io::Write for Counter {
@@ -355,13 +374,23 @@ fn payload_bytes(event: &AgentEvent) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Buffer, control_reserve_bytes};
-    use crate::event::{ActivityKind, AgentEvent, EventKind, SessionId, TurnId};
+    use super::super::size::{serialized_len, tests::nasty_texts};
+    use super::{Buffer, control_reserve_bytes, payload_bytes};
+    use crate::content::{ActivityContent, FileChange, FileChangeKind, PlanStep};
+    use crate::event::{
+        Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, AgentEvent,
+        EventKind, SessionId, ThreadUsage, TurnId, Usage,
+    };
+    use crate::extension::{ExtensionValue, Extensions};
     use crate::interaction::{Interaction, InteractionId, InteractionKind};
+    use crate::interaction::{
+        Question, QuestionForm, QuestionId, QuestionOutcome, QuestionRequest,
+    };
     use crate::operation::AttemptId;
     use crate::permission::{
         PermissionEffect, PermissionOption, PermissionRequest, PermissionScope,
     };
+    use crate::{AccountLimits, ApprovalDecision, DecisionSource, ErrorCode, VendorError};
     use crate::{Error, Limits};
     use std::time::SystemTime;
 
@@ -587,5 +616,244 @@ mod tests {
             2_048,
             "expected the clamp to hold the reserve at half of a small turn budget"
         );
+    }
+
+    /// One event of every shape the stream carries, each holding `text` wherever a vendor string
+    /// can reach the transcript, so every kind of field is checked against the escapes in it.
+    fn corpus(text: &str) -> Vec<AgentEvent> {
+        let interaction = || {
+            Interaction::new(
+                InteractionId::new(text),
+                InteractionKind::Permission,
+                SessionId::new("chat-1"),
+                SystemTime::UNIX_EPOCH,
+            )
+        };
+        let option = PermissionOption::new(text, PermissionEffect::Allow)
+            .with_label(text)
+            .with_scope(PermissionScope::Session);
+        let activity = Activity {
+            name: text.to_owned(),
+            title: text.to_owned(),
+            detail: Some(text.to_owned()),
+            item_id: Some(text.to_owned()),
+            parent_id: Some(String::from("parent")),
+            extensions: Extensions::new()
+                .with(text, ExtensionValue::text(text))
+                .with("count", ExtensionValue::Integer(-1_234_567_890_123))
+                .with("ratio", ExtensionValue::Float(0.1))
+                .with("flag", ExtensionValue::Boolean(true)),
+            content: Some(ActivityContent::Plan {
+                steps: vec![PlanStep::new(text).with_id(text)],
+            }),
+            ..Activity::default()
+        };
+        let diff = Activity {
+            content: Some(ActivityContent::Diff {
+                files: vec![
+                    FileChange::new(text)
+                        .with_kind(FileChangeKind::Renamed)
+                        .with_line_counts(3, 4_000_000_000)
+                        .with_unified_diff(text)
+                        .with_texts(Some(text.to_owned()), text),
+                ],
+            }),
+            ..Activity::default()
+        };
+        let output = Activity {
+            content: Some(ActivityContent::Output {
+                text: text.to_owned(),
+            }),
+            ..Activity::default()
+        };
+        let update = ActivityUpdate {
+            title: Some(text.to_owned()),
+            content: Some(ActivityContent::Empty),
+            ..ActivityUpdate::default()
+        };
+        let mut completed = ActivityResult::new(ActivityStatus::Completed);
+        completed.detail = Some(text.to_owned());
+        completed.content = Some(ActivityContent::Output {
+            text: text.to_owned(),
+        });
+        let mut error = VendorError::new(ErrorCode::from_static("vendor-failed"), text);
+        error.request_id = Some(text.to_owned());
+        error.vendor_code = Some(text.to_owned());
+        let mut limits = AccountLimits::unknown(SystemTime::UNIX_EPOCH);
+        limits.plan_type = Some(text.to_owned());
+        let usage = Usage {
+            input_tokens: Some(u64::MAX),
+            output_tokens: Some(0),
+            ..Usage::default()
+        };
+        let question = Question::new(
+            QuestionId::new(text),
+            text,
+            QuestionForm::FreeText {
+                placeholder: Some(text.to_owned()),
+            },
+        )
+        .with_detail(text)
+        .required();
+        [
+            EventKind::TurnStarted {
+                native_turn_id: text.to_owned(),
+            },
+            EventKind::TextDelta {
+                text: text.to_owned(),
+            },
+            EventKind::ReasoningStarted,
+            EventKind::ReasoningDelta {
+                text: text.to_owned(),
+            },
+            EventKind::ReasoningEnded,
+            EventKind::ActivityStarted {
+                call_id: text.to_owned(),
+                activity,
+            },
+            EventKind::ActivityStarted {
+                call_id: String::from("diff"),
+                activity: diff,
+            },
+            EventKind::ActivityStarted {
+                call_id: String::from("output"),
+                activity: output,
+            },
+            EventKind::ActivityUpdated {
+                call_id: text.to_owned(),
+                update,
+            },
+            EventKind::ActivityCompleted {
+                call_id: text.to_owned(),
+                result: completed,
+            },
+            EventKind::ApprovalRequested {
+                request: PermissionRequest::new(
+                    interaction(),
+                    ActivityKind::Command,
+                    text,
+                    vec![option.clone()],
+                )
+                .with_detail(text),
+            },
+            EventKind::ApprovalResolved {
+                interaction_id: InteractionId::new(text),
+                decision: ApprovalDecision::from_option(&option, DecisionSource::User),
+            },
+            EventKind::QuestionAsked {
+                request: QuestionRequest::new(interaction(), vec![question]).with_title(text),
+            },
+            EventKind::QuestionResolved {
+                interaction_id: InteractionId::new(text),
+                outcome: QuestionOutcome::Expired,
+            },
+            EventKind::Usage { usage },
+            EventKind::ThreadUsage {
+                usage: ThreadUsage {
+                    last: Some(usage),
+                    total: None,
+                    context_window_tokens: Some(200_000),
+                },
+            },
+            EventKind::AccountLimits { limits },
+            EventKind::Completed,
+            EventKind::Error { error },
+        ]
+        .into_iter()
+        .map(event)
+        .collect()
+    }
+
+    /// The contract: the number the buffer budgets an event at is its serialized length, byte for
+    /// byte, whatever escaping, tagging, metadata or nesting it carries. A field's character
+    /// count is not that number.
+    #[test]
+    fn the_budgeted_size_of_every_event_shape_is_its_serialized_length() {
+        for text in nasty_texts().iter().take(500) {
+            for event in corpus(text) {
+                let serialized = serde_json::to_vec(&event)
+                    .expect("expected the corpus event to serialize")
+                    .len();
+                let counted = serialized_len(&event).unwrap_or_else(|_| {
+                    panic!(
+                        "expected the {:?} event to be countable without serde_json, received Unsupported for {text:?}",
+                        event.kind
+                    )
+                });
+                assert_eq!(
+                    counted, serialized,
+                    "expected the {:?} event holding {text:?} to count {serialized} bytes, received {counted}",
+                    event.kind
+                );
+                let budgeted = payload_bytes(&event).expect("expected a countable event");
+                assert_eq!(
+                    budgeted, serialized,
+                    "expected the buffer to budget {serialized} bytes for the {:?} event holding {text:?}, received {budgeted}",
+                    event.kind
+                );
+            }
+        }
+    }
+
+    /// An event is admitted when its serialized size is exactly the payload budget and refused one
+    /// byte under it, for text whose character count, escaped length and byte length all differ.
+    #[test]
+    fn a_payload_is_admitted_at_its_exact_serialized_size_and_refused_one_byte_under() {
+        let texts = [
+            "plain ascii",
+            "a \"quoted\" word and a back\\slash",
+            "line\nbreak\tand\rreturn",
+            "\u{1}\u{1f}\u{b}control",
+            "caf\u{e9} \u{65e5}\u{672c} \u{1f600}",
+            &"{\"k\":\"v\"}\n".repeat(40),
+        ];
+        for text in texts {
+            let delta = event(EventKind::TextDelta {
+                text: text.to_owned(),
+            });
+            let serialized = serde_json::to_vec(&delta)
+                .expect("expected the delta to serialize")
+                .len();
+            // The reserve is half the turn budget here, so the payload budget is half of it too.
+            let exact = Limits {
+                turn_buffer_bytes: 2 * serialized,
+                ..Limits::default()
+            };
+            assert_eq!(
+                exact.turn_buffer_bytes - control_reserve_bytes(&exact),
+                serialized,
+                "expected the payload budget to equal the {serialized} serialized bytes of {text:?}"
+            );
+            let (buffer, events) = Buffer::new(exact);
+            buffer.push(delta.clone()).unwrap_or_else(|error| {
+                panic!("expected {text:?} to fit a budget of exactly {serialized} bytes, received {error:?}")
+            });
+            assert_eq!(
+                events.queued_bytes(),
+                serialized,
+                "expected {text:?} to be queued at its {serialized} serialized bytes"
+            );
+
+            let under = Limits {
+                turn_buffer_bytes: 2 * serialized - 2,
+                ..Limits::default()
+            };
+            let (buffer, _events) = Buffer::new(under);
+            let refusal = buffer
+                .push(delta)
+                .expect_err("expected a budget one byte short to refuse the event");
+            assert!(
+                matches!(
+                    refusal,
+                    Error::LimitExceeded {
+                        subject: "queued turn payload bytes",
+                        limit,
+                        received,
+                    } if limit == serialized - 1 && received == serialized
+                ),
+                "expected a refusal at limit {} of {serialized} bytes for {text:?}, received {refusal:?}",
+                serialized - 1
+            );
+        }
     }
 }

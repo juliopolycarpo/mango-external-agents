@@ -48,9 +48,10 @@ Three things to know when reading them:
 
 - The byte counter behind `turn_buffer_bytes` is private. The `events/emit+drain/*` cases are the
   authoritative measurement of it, since a change to it moves them. The
-  `events/serialize-count/*` cases are a stand-in: the same counting-writer serialization the
-  counter performs today, over already-queued events. They stay comparable only while the counter
-  keeps that shape.
+  `events/serialize-count/*` cases are a stand-in and no longer the counter's shape: they are the
+  `serde_json` counting writer the counter used before it added up sizes itself. That is still the
+  exact reference its answer is tested against, and the path it falls back to for a value it
+  cannot size with certainty, so the stand-in stays as the number to compare with.
 - `stage/*` cases time one step and drop what it returns inside the timing, so a step that
   allocates is charged for freeing too. The `pipeline/*` cases run every step, so they will not
   equal the sum of the stages: a step's output is warm in cache for the next one.
@@ -77,6 +78,13 @@ same way. Its `matches!` form was still vectorized on 1.97 to 1.99, but only bec
 the pattern's branches first.
 
 The line-feed search behind `LineStream` tests 32 bytes at a time for the same reason.
+
+The byte counter behind `turn_buffer_bytes` sums each string's escape cost over 32-byte blocks with
+byte arithmetic (`stream::size::escaped_len`), so it is also fast only while the loop is vectorized;
+a version over 16-byte blocks of the same expression fell to scalar code about 15 times slower in a
+standalone probe. A vectorized counter holds `psadbw` on x86-64, as `objdump -d` on the `events`
+bench shows. When the toolchain moves, compare `events/emit+drain/delta-1KiB-ascii` and
+`events/emit+drain/delta-1KiB-escapes`.
 
 The redactor behind `redact::stderr_text` finds the bytes it has to stop at the same way, 32 at a
 time: a `:` or `=` for the credential rules, and the first byte of a removed character for the

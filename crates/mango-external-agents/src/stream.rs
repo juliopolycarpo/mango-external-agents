@@ -5,6 +5,7 @@
 //! never waits for the UI.
 
 mod buffer;
+mod size;
 use buffer::Buffer;
 pub use buffer::EventReceiver;
 

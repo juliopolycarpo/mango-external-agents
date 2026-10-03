@@ -3,9 +3,10 @@
 //! `EventSink::emit` normalizes the event, counts its serialized bytes against the turn budget and
 //! queues it; `EventReceiver::try_recv` releases those bytes. The byte counter itself is private
 //! to the crate, so the `emit+drain` cases are the authoritative number for it: a change to the
-//! counter moves them. The `serialize/*` cases are a labelled stand-in, not the counter: the same
-//! `serde_json::to_writer` into a counting writer that the counter uses today, run over the same
-//! events, so the two can be compared. Run with:
+//! counter moves them. The `serialize-count/*` cases are a labelled stand-in, not the counter: the
+//! `serde_json::to_writer` into a counting writer that the counter used before it added up sizes
+//! itself and still uses as its reference, run over the same events, so the two can be compared.
+//! Run with:
 //!
 //! ```sh
 //! cargo bench -p mango-external-agents --bench events
