@@ -23,9 +23,12 @@ pub(super) const BOUNDARY_BYTE: u8 = 0x01;
 
 /// The text with every [`BOUNDARY`] taken out, once the rules have run.
 pub(super) fn remove_boundaries(text: String) -> String {
+    // One search, and one rewrite when it finds a marker.
+    count_steps(text.len());
     if !text.contains(BOUNDARY) {
         return text;
     }
+    count_steps(text.len());
     text.replace(BOUNDARY, "")
 }
 
@@ -85,6 +88,7 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
     let mut at = 0;
     let mut removed = false;
     loop {
+        count_steps(1);
         // Nothing is removed from, or marked in, text that follows a kept character and holds
         // no byte a removed character starts with, so it is copied whole.
         if !removed {
@@ -150,12 +154,14 @@ fn starts_a_removed_character(byte: u8) -> bool {
 /// Whether a credential's name starts at `at`: `api_key` or one of the keywords, or the
 /// `Authorization` header.
 fn starts_credential_name(bytes: &[u8], at: usize) -> bool {
+    count_steps(1);
     match_credential_keyword(bytes, at).is_some() || match_word(bytes, at, AUTHORIZATION).is_some()
 }
 
 /// Whether `text` ends in an authorization scheme, `Bearer` or `Basic`, whose token the bearer
 /// rule reads after a gap. A removed byte in that gap is a boundary, not a join.
 fn ends_with_scheme(text: &str) -> bool {
+    count_steps(1);
     let bytes = text.as_bytes();
     [&b"bearer"[..], b"basic"].iter().any(|scheme| {
         bytes
@@ -273,6 +279,7 @@ fn string_end(bytes: &[u8], start: usize, bel_ends: bool) -> Option<usize> {
 /// sequence and a name, `ESC [ 1 m API_KEY=x` is a sequence and a name. Anywhere else the whole
 /// sequence goes, as the standard has it.
 fn pick(bytes: &[u8], intro_end: usize, full_end: usize) -> usize {
+    count_steps(1);
     if full_end > intro_end
         && starts_credential_name(bytes, intro_end)
         && !starts_credential_name(bytes, full_end)

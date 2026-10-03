@@ -68,6 +68,7 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
     let plain = strip_control_characters(dropped);
     // Nothing is awaited without a keyword in the text, and most tails have none.
     let names_a_credential = (0..plain.len()).any(|at| {
+        count_steps(1);
         match_credential_keyword(plain.as_bytes(), at).is_some()
             || match_word(plain.as_bytes(), at, AUTHORIZATION).is_some()
     });
@@ -75,6 +76,8 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
         return false;
     }
     PROBES.iter().any(|probe| {
+        // The text is copied once with its probe, then redacted by the rules, which count their own.
+        count_steps(plain.len());
         let probed = redact_assignments(&redact_bearer(&format!("{plain}{probe}")));
         !probed.ends_with('Z')
     })
