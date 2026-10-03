@@ -75,16 +75,16 @@ The clean-prefix scan behind `normalize::bound_text` tests 16 bytes at a time an
 same way. Its `matches!` form was still vectorized on 1.97 to 1.99, but only because LLVM removed
 the pattern's branches first.
 
-The line-feed search behind `LineStream` tests 32 bytes at a time for the same reason. A
-vectorized `first_line_feed` holds `pcmpeqb`; a scalar one shows as a several-fold step in
-`framing/records-1KiB/chunk-16KiB` with `framing/records-15B/chunk-16KiB` unmoved.
+The line-feed search behind `LineStream` tests 32 bytes at a time for the same reason.
 
-When `rust-toolchain.toml` moves, build the `events` binary with the old and the new toolchain
-(`RUSTUP_TOOLCHAIN` and a `CARGO_TARGET_DIR` each) and compare `normalize/sanitize_field-1KiB/*`
-and `normalize/bound_text-4KiB/clean-ascii`. A scalar loop is a several-fold step in the clean
-cases with the `dirty` case unmoved, not a few percent. `objdump -d` on the bench binary confirms
-it: a vectorized `sanitize_owned` holds `pcmpeqb` instructions on x86-64, a scalar one holds none.
-A vectorized `bound_text` holds `pminub`.
+When `rust-toolchain.toml` moves, build the `events` and `framing` binaries with the old and the
+new toolchain (`RUSTUP_TOOLCHAIN` and a `CARGO_TARGET_DIR` each) and compare
+`normalize/sanitize_field-1KiB/*`, `normalize/bound_text-4KiB/clean-ascii` and
+`framing/records-1KiB/chunk-16KiB`. A scalar loop is a several-fold step in the clean cases and
+the 1 KiB records, with the `dirty` case and `framing/records-15B/chunk-16KiB` unmoved, not a few
+percent. `objdump -d` on the bench binary confirms it: a vectorized `sanitize_owned` holds
+`pcmpeqb` instructions on x86-64, a scalar one holds none. A vectorized `bound_text` holds
+`pminub`, and a vectorized `first_line_feed` holds `pcmpeqb`.
 
 ## Why this harness
 
