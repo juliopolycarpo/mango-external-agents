@@ -10,7 +10,7 @@
 //! One pass over the text. Nothing here looks back, and a scan for an OSC terminator stops at the
 //! next escape, so the work is linear in the length of the text.
 
-use super::scan::first_match;
+use super::scan::{count_steps, first_match};
 use super::{AUTHORIZATION, is_unsafe_to_render, match_credential_keyword, match_word};
 
 /// Marks where a removed byte stood in front of a credential name. Every C0 control is stripped
@@ -23,9 +23,12 @@ pub(super) const BOUNDARY_BYTE: u8 = 0x01;
 
 /// The text with every [`BOUNDARY`] taken out, once the rules have run.
 pub(super) fn remove_boundaries(text: String) -> String {
+    // One search, and one rewrite when it finds a marker.
+    count_steps(text.len());
     if !text.contains(BOUNDARY) {
         return text;
     }
+    count_steps(text.len());
     text.replace(BOUNDARY, "")
 }
 
@@ -85,6 +88,7 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
     let mut at = 0;
     let mut removed = false;
     loop {
+        count_steps(1);
         // Nothing is removed from, or marked in, text that follows a kept character and holds
         // no byte a removed character starts with, so it is copied whole.
         if !removed {
@@ -95,41 +99,6 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
         let Some(character) = raw.get(at..).and_then(|rest| rest.chars().next()) else {
             break;
         };
-        let after = at + character.len_utf8();
-        if let Some(end) = escape_end(bytes, at, character) {
-            at = end;
-            removed = true;
-            continue;
-        }
-        let kept = character == '\t' || character == '\n' || !is_unsafe_to_render(character);
-        if !kept {
-            at = after;
-            removed = true;
-            continue;
-        }
-        if removed
-            && out.ends_with(|last: char| last.is_ascii_alphanumeric())
-            && (starts_credential_name(bytes, at) || ends_with_scheme(&out))
-        {
-            out.push(BOUNDARY);
-        }
-        removed = false;
-        out.push(character);
-        at = after;
-    }
-    out
-}
-
-/// [`strip_control_characters`] as it was before clean text was copied whole: every character
-/// read and pushed on its own. Kept as the definition of the right answer for
-/// `redact::differential`.
-#[cfg(test)]
-pub(super) fn strip_every_character(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = String::with_capacity(raw.len());
-    let mut at = 0;
-    let mut removed = false;
-    while let Some(character) = raw.get(at..).and_then(|rest| rest.chars().next()) {
         let after = at + character.len_utf8();
         if let Some(end) = escape_end(bytes, at, character) {
             at = end;
@@ -185,12 +154,14 @@ fn starts_a_removed_character(byte: u8) -> bool {
 /// Whether a credential's name starts at `at`: `api_key` or one of the keywords, or the
 /// `Authorization` header.
 fn starts_credential_name(bytes: &[u8], at: usize) -> bool {
+    count_steps(1);
     match_credential_keyword(bytes, at).is_some() || match_word(bytes, at, AUTHORIZATION).is_some()
 }
 
 /// Whether `text` ends in an authorization scheme, `Bearer` or `Basic`, whose token the bearer
 /// rule reads after a gap. A removed byte in that gap is a boundary, not a join.
 fn ends_with_scheme(text: &str) -> bool {
+    count_steps(1);
     let bytes = text.as_bytes();
     [&b"bearer"[..], b"basic"].iter().any(|scheme| {
         bytes
@@ -264,6 +235,7 @@ fn csi_end(bytes: &[u8], start: usize) -> usize {
         .get(at)
         .is_some_and(|byte| (0x20..=0x3f).contains(byte))
     {
+        count_steps(1);
         at += 1;
     }
     pick(bytes, at, final_end(bytes, at, 0x40..=0x7e))
@@ -283,6 +255,7 @@ fn string_end(bytes: &[u8], start: usize, bel_ends: bool) -> Option<usize> {
         .min(start.saturating_add(OSC_PAYLOAD_LIMIT).saturating_add(1));
     let mut at = start;
     while at < limit {
+        count_steps(1);
         match bytes[at] {
             0x07 if bel_ends => return Some(at + 1),
             b'\n' => return None,
@@ -306,6 +279,7 @@ fn string_end(bytes: &[u8], start: usize, bel_ends: bool) -> Option<usize> {
 /// sequence and a name, `ESC [ 1 m API_KEY=x` is a sequence and a name. Anywhere else the whole
 /// sequence goes, as the standard has it.
 fn pick(bytes: &[u8], intro_end: usize, full_end: usize) -> usize {
+    count_steps(1);
     if full_end > intro_end
         && starts_credential_name(bytes, intro_end)
         && !starts_credential_name(bytes, full_end)

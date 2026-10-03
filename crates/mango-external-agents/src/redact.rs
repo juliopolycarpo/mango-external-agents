@@ -8,13 +8,25 @@
 //! Written as a scanner rather than as regular expressions. Three passes, in the same order and
 //! with the same shapes as the patterns they replace, so each rule can be read on its own:
 //! a bearer header, a `key = value` assignment, and the password in a URL's userinfo.
+//!
+//! Every pass is linear in the text. A rule is asked at each place a match can start, and the
+//! places that share an end share everything after their start, so what depends on the end is
+//! decided once, by the function that finds the anchor (see `scan::Candidates`), and not by
+//! each start. The work tests in `redact::work` count the bytes read and hold that to the length.
 
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod reference;
 mod scan;
 mod strip;
+#[cfg(test)]
+mod work;
 
-use scan::{Anchor, Candidates, first_match, run_start};
+use std::borrow::Cow;
+use std::ops::Range;
+
+use scan::{Anchor, Candidates, count_steps, first_match, run_start};
 pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
 use strip::{remove_boundaries, strip_control_characters};
 
@@ -56,6 +68,7 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
     let plain = strip_control_characters(dropped);
     // Nothing is awaited without a keyword in the text, and most tails have none.
     let names_a_credential = (0..plain.len()).any(|at| {
+        count_steps(1);
         match_credential_keyword(plain.as_bytes(), at).is_some()
             || match_word(plain.as_bytes(), at, AUTHORIZATION).is_some()
     });
@@ -63,6 +76,8 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
         return false;
     }
     PROBES.iter().any(|probe| {
+        // The text is copied once with its probe, then redacted by the rules, which count their own.
+        count_steps(plain.len());
         let probed = redact_assignments(&redact_bearer(&format!("{plain}{probe}")));
         !probed.ends_with('Z')
     })
@@ -162,7 +177,8 @@ fn bearer_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
     }
     Some(Rewrite {
         end: token_end,
-        replacement: format!("{} {REDACTED}", as_text(bytes, at, after_scheme)),
+        kept_end: after_scheme,
+        joiner: " ",
     })
 }
 
@@ -201,7 +217,8 @@ fn assignment_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
     }
     Some(Rewrite {
         end: value_end,
-        replacement: format!("{}={REDACTED}", as_text(bytes, at, name_end)),
+        kept_end: name_end,
+        joiner: "=",
     })
 }
 
@@ -210,14 +227,36 @@ fn assignment_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
 /// The rule wants a keyword, the rest of the name, any spaces, then the separator. A keyword is
 /// made of name bytes, so the whole match up to the spaces lies in the run of name bytes that
 /// ends where those spaces begin, and it can start anywhere in that run.
+///
+/// Every start in that run reaches the same separator and the same value: the rule reads on from
+/// the keyword to the end of the run whichever start it came from. So whether a value follows is
+/// decided here, once, and a separator with none allows no start. Left to the rule, each start
+/// of a name like `token_token_token_…` read the rest of it again before finding that out. Only
+/// the first byte of the value is read: a value that is there is read by the rule that claims it,
+/// and the text is then consumed.
 fn assignment_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
     let separator = first_match(bytes, from, |byte| (byte == b'=') | (byte == b':'))?;
     let name_end = run_start(bytes, separator, is_space_byte);
     let name_start = run_start(bytes, name_end, is_name_byte);
+    if name_start == name_end || !has_value(bytes, separator + 1) {
+        return Some(Anchor {
+            at: separator,
+            starts: 0..0,
+        });
+    }
     Some(Anchor {
         at: separator,
         starts: name_start..name_end,
     })
+}
+
+/// Whether a value starts after `from`, past any spaces: the check [`assignment_rule`] makes
+/// before it redacts anything.
+fn has_value(bytes: &[u8], from: usize) -> bool {
+    let value_start = skip_spaces(bytes, from);
+    bytes
+        .get(value_start)
+        .is_some_and(|byte| is_value_byte(*byte))
 }
 
 /// The password half of `scheme://user:password@host`.
@@ -234,6 +273,19 @@ fn url_password_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
     }
     let scheme_end = take_while(bytes, at + 1, is_scheme_byte);
     let after_scheme = match_word(bytes, scheme_end, SCHEME_SEPARATOR)?;
+    let password = url_password(bytes, after_scheme)?;
+    Some(Rewrite {
+        end: password.end,
+        kept_end: password.start,
+        joiner: "",
+    })
+}
+
+/// Where the password of the URL whose `://` ends at `after_scheme` starts and ends.
+///
+/// `None` unless the authority is `user:password@`, the user optional and the password not: a
+/// URL that has no password, or whose userinfo is never closed by an `@`, is left as it is.
+fn url_password(bytes: &[u8], after_scheme: usize) -> Option<Range<usize>> {
     let user_end = take_while(bytes, after_scheme, |byte| {
         !matches!(
             byte,
@@ -252,10 +304,7 @@ fn url_password_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
     if password_end == password_start || bytes.get(password_end) != Some(&b'@') {
         return None;
     }
-    Some(Rewrite {
-        end: password_end,
-        replacement: format!("{}{REDACTED}", as_text(bytes, at, password_start)),
-    })
+    Some(password_start..password_end)
 }
 
 /// What a URL's scheme is made of after its first letter.
@@ -265,21 +314,33 @@ fn is_scheme_byte(byte: u8) -> bool {
 
 /// The next `:` and the places [`url_password_rule`] can start to reach it.
 ///
-/// The rule wants a letter, the rest of a scheme, then `://`. A colon that does not open `://`
-/// allows no start; one that does allows any start in the run of scheme bytes that ends at it.
+/// The rule wants a letter, the rest of a scheme, then `://`, then a userinfo with a password in
+/// it. A colon that does not open `://`, or opens a URL with no password to redact, allows no
+/// start; one that does allows any start in the run of scheme bytes that ends at it.
+///
+/// Every start in that run reaches the same authority, so the answer is found here, once, and
+/// not by each start of a scheme like `a.a.a.…` reading the rest of the text again. The
+/// check stops at a `/`, and the next `://` has one right after its colon, so no byte is read
+/// for two separators.
 fn scheme_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
     let colon = first_match(bytes, from, |byte| byte == b':')?;
     let starts = match match_word(bytes, colon, SCHEME_SEPARATOR) {
-        Some(_) => run_start(bytes, colon, is_scheme_byte)..colon,
-        None => 0..0,
+        Some(after_scheme) if url_password(bytes, after_scheme).is_some() => {
+            run_start(bytes, colon, is_scheme_byte)..colon
+        }
+        _ => 0..0,
     };
     Some(Anchor { at: colon, starts })
 }
 
 /// What one rule matched: where the match ends, and what stands in its place.
+///
+/// The replacement is the start of the match up to `kept_end`, which stays, then `joiner` and
+/// [`REDACTED`]. It is described rather than built, so a match costs no allocation.
 struct Rewrite {
     end: usize,
-    replacement: String,
+    kept_end: usize,
+    joiner: &'static str,
 }
 
 /// Scans left to right, letting `rule` claim a span starting at a word boundary.
@@ -309,7 +370,9 @@ fn rewrite(
             continue;
         };
         out.push_str(&raw[copied..at]);
-        out.push_str(&found.replacement);
+        out.push_str(&as_text(bytes, at, found.kept_end));
+        out.push_str(found.joiner);
+        out.push_str(REDACTED);
         copied = found.end;
         from = found.end;
     }
@@ -377,6 +440,7 @@ fn take_while(bytes: &[u8], at: usize, keep: impl Fn(u8) -> bool) -> usize {
         if !keep(*byte) {
             break;
         }
+        count_steps(1);
         end += 1;
     }
     end
@@ -392,8 +456,9 @@ fn is_value_byte(byte: u8) -> bool {
     !is_space_byte(byte) && !matches!(byte, b',' | b';')
 }
 
-fn as_text(bytes: &[u8], from: usize, to: usize) -> String {
-    String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default()).into_owned()
+/// `bytes[from..to]` as text, borrowed unless it is not valid UTF-8.
+fn as_text(bytes: &[u8], from: usize, to: usize) -> Cow<'_, str> {
+    String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default())
 }
 
 /// Every code point a diagnostic must not carry across a boundary, tab and newline excepted.
@@ -410,7 +475,9 @@ fn is_unsafe_to_render(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ends_awaiting_value, is_stripped_byte, program_name, stderr_text};
+    use super::{
+        ends_awaiting_value, has_value, is_stripped_byte, program_name, stderr_text, url_password,
+    };
 
     /// The fixture a vendor child writes in the port's own process test.
     const FIXTURE: &str =
@@ -672,5 +739,50 @@ mod tests {
             "API_KEY=[REDACTED]",
             "expected the redactor to join the text around a carriage return"
         );
+    }
+
+    #[test]
+    fn a_value_is_what_the_assignment_rule_would_claim() {
+        for (text, expected) in [
+            ("v", true),
+            ("  \n\tv", true),
+            ("=:", true),
+            ("", false),
+            ("   ", false),
+            (",", false),
+            ("  ;x", false),
+        ] {
+            assert_eq!(
+                has_value(text.as_bytes(), 0),
+                expected,
+                "expected has_value({text:?}) to be {expected}"
+            );
+        }
+        assert!(
+            !has_value(b"k=  ", 2),
+            "expected no value after the separator at 1 of \"k=  \""
+        );
+    }
+
+    #[test]
+    fn a_url_password_is_found_only_where_the_authority_closes_it_with_an_at() {
+        for (text, expected) in [
+            ("user:secret@host", Some(5..11)),
+            (":secret@host", Some(1..7)),
+            ("u:p@", Some(2..3)),
+            ("user@host", None),
+            ("user:@host", None),
+            ("user:secret", None),
+            ("user:secret/x@host", None),
+            ("user:sec ret@host", None),
+            ("a/b:c@d", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                url_password(text.as_bytes(), 0),
+                expected,
+                "expected the password of {text:?} to span {expected:?}"
+            );
+        }
     }
 }

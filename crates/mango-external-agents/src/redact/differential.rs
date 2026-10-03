@@ -1,19 +1,23 @@
-//! The redactor held to the scan it replaced.
+//! The redactor held to the scan it replaced and to the release before this one.
 //!
 //! [`stderr_text`](super::stderr_text) copies clean text whole and tries a rule only where
 //! [`Candidates`](super::scan::Candidates) says it can match. The scan it replaced read every
-//! character and tried each rule at every word. That scan is kept here, over the same rules, as
-//! the definition of the right answer: each stage has to return it byte for byte, for every input
-//! below. A difference is a credential left in a diagnostic, so the failure names the input.
+//! character and tried each rule at every word. That scan is kept here, over the 0.4.1 rules in
+//! `reference`, as the definition of the right answer: each stage has to return it byte for byte,
+//! for every input below, and so does the 0.4.1 pipeline as shipped. A difference is a credential
+//! left in a diagnostic, so the failure names the input.
 
-use super::strip::{remove_boundaries, strip_control_characters, strip_every_character};
+use super::reference::{
+    self, Rewrite, assignment_rule, bearer_rule, remove_boundaries, starts_a_word,
+    strip_every_character, url_password_rule,
+};
+use super::strip::strip_control_characters;
 use super::{
-    Rewrite, assignment_rule, bearer_rule, redact_assignments, redact_bearer, redact_url_passwords,
-    starts_a_word, stderr_text, url_password_rule,
+    ends_awaiting_value, redact_assignments, redact_bearer, redact_url_passwords, stderr_text,
 };
 
-/// `rewrite` as it was: `rule` tried at every word boundary, the text pushed a character at a
-/// time.
+/// `rewrite` as it was first written: `rule` tried at every word boundary, the text pushed a
+/// character at a time.
 fn rewrite_every_word(raw: &str, rule: impl Fn(&[u8], usize) -> Option<Rewrite>) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
@@ -97,6 +101,21 @@ fn assert_matches_the_replaced_scan(raw: &str) {
         raw,
         stderr_text,
         remove_boundaries(urls),
+    );
+    expect(
+        "the whole redactor as 0.4.1 shipped it",
+        raw,
+        stderr_text,
+        reference::stderr_text(raw),
+    );
+    let (shipped, received) = (
+        reference::ends_awaiting_value(raw),
+        ends_awaiting_value(raw),
+    );
+    assert!(
+        shipped == received,
+        "expected ends_awaiting_value to return {shipped} as 0.4.1 did | input {raw:?} received \
+         {received}"
     );
 }
 
@@ -360,6 +379,99 @@ fn generated_diagnostic_lines_match_the_replaced_scan() {
             };
             raw.push_str(word);
             raw.push_str(sequence.pick(&[" ", " ", " ", "\n", "", "\t", ": ", "="]));
+        }
+        assert_matches_the_replaced_scan(&raw);
+    }
+}
+
+/// What a name or a scheme is repeated from: the unit a rule reads again for each of many starts.
+const REPEATED_UNITS: &[&str] = &[
+    "token_",
+    "secret-",
+    "api_key_",
+    "API-KEY.",
+    "password_",
+    "Credential_",
+    "token_a.",
+    "a.",
+    "a.b-",
+    "x1+",
+    "ab",
+    "_",
+    ".",
+    "Z",
+];
+
+/// What follows a repeated unit: every way a value, a separator or an authority can be missing,
+/// empty, present, or cut short by the byte that ends it.
+const AFTER_REPEATED: &[&str] = &[
+    "",
+    "=",
+    ":",
+    " =",
+    "= ",
+    "=v",
+    ":v",
+    "= v",
+    "=  ,x",
+    "=;x",
+    "=\n",
+    "= \n v",
+    "=\rv",
+    ":::",
+    "==",
+    "=:",
+    "://",
+    "://u",
+    "://u:p@h",
+    "://:p@h",
+    "://u:p",
+    "://u:p/x@h",
+    "://u@h",
+    "://u:@h",
+    "://u:p@",
+    "://u:p @h",
+    "://a.b://c:d@e",
+    "=://u:p@h",
+    "=v://u:p@h",
+    "bearer v",
+    ": bearer v",
+    " ",
+    "\n",
+];
+
+/// Names and schemes repeated to every length from none to past a scan block, each ending every
+/// way and behind text that does and does not let a word start. The reference is quadratic on
+/// these, so the lengths stay short; what matters is that every start of a repeated unit is asked.
+#[test]
+fn repeated_names_and_schemes_match_the_replaced_scan() {
+    for unit in REPEATED_UNITS {
+        for repeats in (0..=12).chain([20, 33]) {
+            for after in AFTER_REPEATED {
+                for before in ["", "x ", "1", "\n", "é", ":"] {
+                    let raw = format!("{before}{}{after}", unit.repeat(repeats));
+                    assert_matches_the_replaced_scan(&raw);
+                }
+            }
+        }
+    }
+}
+
+/// Repeated units joined to each other and to shapes at random: a rejected anchor beside an
+/// accepted one, a match that ends in the middle of a run, a second run that starts inside the
+/// value of the first.
+#[test]
+fn generated_runs_of_repeated_units_match_the_replaced_scan() {
+    let mut sequence = Sequence(0xd1b5_4a32_d192_ed03);
+    for _ in 0..30_000 {
+        let mut raw = String::new();
+        for _ in 0..1 + sequence.next() % 5 {
+            match sequence.next() % 3 {
+                0 => raw.push_str(&sequence.pick(REPEATED_UNITS).repeat(sequence.next() % 9)),
+                1 => raw.push_str(sequence.pick(AFTER_REPEATED)),
+                _ => raw.push_str(sequence.pick(SHAPES)),
+            }
+            raw.push_str(sequence.pick(&["", "", " ", "\n", ", ", "x"]));
         }
         assert_matches_the_replaced_scan(&raw);
     }
