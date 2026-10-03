@@ -236,8 +236,13 @@ fn leading_clean_bytes(bytes: &[u8]) -> usize {
 }
 
 /// Whether a byte is a whole character that [`is_strippable`] keeps: printable ASCII, tab or newline.
+///
+/// Comparisons joined by `|` and `&` for the reason [`is_flagged_byte`] gives: the block test in
+/// [`clean_ascii_prefix_len`] is vectorized only while this has no branch, and a `matches!`
+/// pattern is one optimizer change from having one.
 const fn is_clean_ascii_byte(byte: u8) -> bool {
-    matches!(byte, 0x20..=0x7e | b'\t' | b'\n')
+    let printable = (byte >= 0x20) & (byte <= 0x7e);
+    printable | (byte == b'\t') | (byte == b'\n')
 }
 
 /// An opaque vendor identifier, refused rather than repaired.
@@ -785,6 +790,63 @@ mod tests {
                 clean_ascii_prefix_len(&bytes),
                 offset,
                 "expected an ESC at byte {offset} to end the clean prefix there"
+            );
+        }
+    }
+
+    /// The pattern `is_clean_ascii_byte` was written as before it became comparisons.
+    const fn reference_clean_ascii(byte: u8) -> bool {
+        matches!(byte, 0x20..=0x7e | b'\t' | b'\n')
+    }
+
+    #[test]
+    fn the_clean_ascii_byte_test_agrees_with_the_pattern_for_every_byte() {
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                super::is_clean_ascii_byte(byte),
+                reference_clean_ascii(byte),
+                "expected byte {byte:#04x} clean: {} | received: {}",
+                reference_clean_ascii(byte),
+                super::is_clean_ascii_byte(byte)
+            );
+        }
+    }
+
+    #[test]
+    fn the_clean_ascii_prefix_agrees_with_a_byte_by_byte_scan_at_every_offset() {
+        // Both sides of every range and value the clean test draws, and bytes far from all of them.
+        let probes = [
+            0x00, 0x08, b'\t', b'\n', 0x0b, 0x1f, 0x20, b'a', 0x7e, 0x7f, 0x80, 0xc2, 0xff,
+        ];
+        // No block, one block, two blocks, and every remainder length beside them.
+        for length in 0..=2 * 16 + 2 {
+            for offset in 0..length {
+                for probe in probes {
+                    let mut bytes = vec![b'a'; length];
+                    bytes[offset] = probe;
+                    let expected = bytes
+                        .iter()
+                        .position(|byte| !reference_clean_ascii(*byte))
+                        .unwrap_or(length);
+                    let received = clean_ascii_prefix_len(&bytes);
+                    assert_eq!(
+                        received, expected,
+                        "expected a clean prefix of {expected} bytes for byte {probe:#04x} at \
+                         offset {offset} of {length} | received: {received}"
+                    );
+                }
+            }
+        }
+        // Two unclean bytes in one block, and in neighbouring blocks: the first one ends the prefix.
+        for (first, second) in [(3, 9), (15, 16), (17, 31), (0, 33)] {
+            let mut bytes = vec![b'a'; 34];
+            bytes[first] = 0x7f;
+            bytes[second] = 0x00;
+            let received = clean_ascii_prefix_len(&bytes);
+            assert_eq!(
+                received, first,
+                "expected the prefix to end at the first unclean byte, offset {first}, with \
+                 another at {second} | received: {received}"
             );
         }
     }

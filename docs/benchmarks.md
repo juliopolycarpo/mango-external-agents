@@ -63,11 +63,16 @@ back on. Rust 1.99 (LLVM 23) stopped doing that for a byte test written as a `ma
 machine with no source change. The test is now comparisons joined by `|`, which has no branch to
 lose.
 
+The clean-prefix scan behind `normalize::bound_text` tests 16 bytes at a time and is written the
+same way. Its `matches!` form was still vectorized on 1.97 to 1.99, but only because LLVM removed
+the pattern's branches first.
+
 When `rust-toolchain.toml` moves, build the `events` binary with the old and the new toolchain
 (`RUSTUP_TOOLCHAIN` and a `CARGO_TARGET_DIR` each) and compare `normalize/sanitize_field-1KiB/*`
 and `normalize/bound_text-4KiB/clean-ascii`. A scalar loop is a several-fold step in the clean
 cases with the `dirty` case unmoved, not a few percent. `objdump -d` on the bench binary confirms
 it: a vectorized `sanitize_owned` holds `pcmpeqb` instructions on x86-64, a scalar one holds none.
+A vectorized `bound_text` holds `pminub`.
 
 ## Why this harness
 
