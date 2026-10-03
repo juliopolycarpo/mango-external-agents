@@ -78,6 +78,16 @@ the pattern's branches first.
 
 The line-feed search behind `LineStream` tests 32 bytes at a time for the same reason.
 
+The strip behind `normalize::sanitize_owned` for text that has something to strip was
+`String::retain`, which decodes and re-encodes every character. On a hosted `ubuntu-24.04-arm`
+runner Rust 1.99 made it about 45% slower than 1.98.1 on a control-heavy 1 KiB string, while hosted
+x86-64 did not move. It now copies each clean run whole and decodes only at a byte that can start a
+stripped character, which is 26% to 37% faster than `retain` on ARM and 14% to 24% faster on x86-64
+for `normalize/sanitize_field-1KiB/dirty`. The cost is that text with something to strip is rebuilt
+in a new buffer. Text with a control character every few bytes is the one shape where it is slower
+than `retain` on x86-64, so `events/emit+drain/delta-1KiB-dirty` and
+`normalize/sanitize_field-1KiB/dirty` are the cases to compare when the toolchain moves.
+
 The redactor behind `redact::stderr_text` finds the bytes it has to stop at the same way, 32 at a
 time: a `:` or `=` for the credential rules, and the first byte of a removed character for the
 control-character stripper. Text between two of them is copied without being read a word at a

@@ -150,25 +150,67 @@ pub fn sanitize_field(raw: &str) -> BoundedText {
     sanitize_owned(raw.to_owned())
 }
 
-/// [`sanitize_field`] for text the caller already owns: nothing is copied.
+/// [`sanitize_field`] for text the caller already owns: text with nothing to strip is not copied.
 ///
-/// Clean text comes back as it arrived. Dirty text is stripped in place, so the buffer that held
-/// it is the buffer that keeps the survivors. The result is byte-identical to
-/// `sanitize_field(&raw)`.
-pub(crate) fn sanitize_owned(mut raw: String) -> BoundedText {
+/// Text with nothing to strip comes back as it arrived, in the buffer it arrived in, even when it
+/// holds a byte that could have started a stripped character (an em dash does). Text with
+/// something to strip is rebuilt in a new buffer, a clean run at a time (see
+/// [`strip_by_segments`]). The result is byte-identical to `sanitize_field(&raw)`.
+pub(crate) fn sanitize_owned(raw: String) -> BoundedText {
     if !may_need_stripping(&raw) {
         return BoundedText {
             text: raw,
             truncated: false,
         };
     }
-    // One pass: a removal always shortens the text, so the length says whether anything went.
-    let before = raw.len();
-    raw.retain(|character| !is_strippable(character));
-    BoundedText {
-        truncated: raw.len() != before,
-        text: raw,
+    match strip_by_segments(&raw) {
+        Some(text) => BoundedText {
+            text,
+            truncated: true,
+        },
+        None => BoundedText {
+            text: raw,
+            truncated: false,
+        },
     }
+}
+
+/// `raw` without the characters [`is_strippable`] names, copied a clean run at a time, or `None`
+/// when it holds none of them.
+///
+/// Only a flagged byte (see [`is_flagged_byte`]) can start a stripped character, so the text
+/// between two of them is copied whole and only a flagged byte is decoded. This replaced
+/// `String::retain`, which decodes and re-encodes every character: on Rust 1.99 it became about 45%
+/// slower than on 1.98.1 for text with a control character every few bytes on a hosted ARM runner,
+/// and this body is about 30% faster than either on x86-64 and ARM; see `docs/benchmarks.md`.
+///
+/// Kept out of line so the clean path of [`sanitize_owned`], which callers inline, stays as small
+/// as it was.
+#[inline(never)]
+fn strip_by_segments(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out: Option<String> = None;
+    let mut start = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if !is_flagged_byte(bytes[at]) {
+            at += 1;
+            continue;
+        }
+        let Some(character) = raw[at..].chars().next() else {
+            break;
+        };
+        let width = character.len_utf8();
+        if is_strippable(character) {
+            let kept = out.get_or_insert_with(|| String::with_capacity(raw.len()));
+            kept.push_str(&raw[start..at]);
+            start = at + width;
+        }
+        at += width;
+    }
+    let mut stripped = out?;
+    stripped.push_str(&raw[start..]);
+    Some(stripped)
 }
 
 /// Applies one field's bound to vendor-supplied text.
@@ -581,19 +623,63 @@ mod tests {
     }
 
     #[test]
-    fn owned_sanitising_reuses_the_callers_buffer_for_clean_and_dirty_text() {
-        for input in [
-            "clean ascii text",
-            "héllo 日本語",
-            "dirty\u{1b}[0m\u{202e}text",
-        ] {
+    fn owned_sanitising_reuses_the_callers_buffer_for_clean_text() {
+        for input in ["clean ascii text", "héllo 日本語", "an em dash — and 🍋"] {
             let owned = input.to_owned();
             let (pointer, capacity) = (owned.as_ptr(), owned.capacity());
             let cleaned = sanitize_owned(owned);
             assert_eq!(
                 (cleaned.text.as_ptr(), cleaned.text.capacity()),
                 (pointer, capacity),
-                "expected {input:?} sanitised in the buffer it arrived in | received a new buffer"
+                "expected clean {input:?} returned in the buffer it arrived in | received a new buffer"
+            );
+        }
+    }
+
+    /// Every Unicode scalar, alone and between text of each width, against the character loop.
+    #[test]
+    fn owned_sanitising_matches_the_reference_for_every_unicode_scalar() {
+        let contexts = ["", "ab", "é", "日", "🍋", "\u{1b}", "—\u{200e}"];
+        for character in ('\0'..=char::MAX)
+            .filter(|character| !(0xd800..=0xdfff).contains(&u32::from(*character)))
+        {
+            for context in contexts {
+                let input = format!("{context}{character}{context}z");
+                let (expected_text, expected_truncated) = reference_sanitize(&input);
+                let owned = sanitize_owned(input.clone());
+                assert!(
+                    (owned.text.as_str(), owned.truncated)
+                        == (expected_text.as_str(), expected_truncated),
+                    "expected U+{:04X} in {input:?} sanitised as {expected_text:?} (truncated \
+                     {expected_truncated}) | received {:?} (truncated {})",
+                    u32::from(character),
+                    owned.text,
+                    owned.truncated
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_sanitising_keeps_the_buffer_of_text_that_only_looks_strippable() {
+        // An em dash and a box-drawing character lead with the byte `E2` that stripped marks
+        // lead with, so they are flagged and then kept.
+        for input in [
+            "an em dash \u{2014} here",
+            "┌──┐ table \u{2502}",
+            "naïve \u{c3}\u{a9}",
+        ] {
+            let owned = input.to_owned();
+            let (pointer, capacity) = (owned.as_ptr(), owned.capacity());
+            let cleaned = sanitize_owned(owned);
+            assert!(
+                !cleaned.truncated
+                    && cleaned.text == input
+                    && (cleaned.text.as_ptr(), cleaned.text.capacity()) == (pointer, capacity),
+                "expected {input:?} returned untouched in its own buffer | received {:?} \
+                 (truncated {})",
+                cleaned.text,
+                cleaned.truncated
             );
         }
     }

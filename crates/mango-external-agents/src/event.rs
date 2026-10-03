@@ -1780,11 +1780,10 @@ mod tests {
     }
 
     #[test]
-    fn streaming_text_is_cleaned_in_the_buffer_it_arrived_in() {
+    fn streaming_text_with_nothing_to_strip_keeps_the_buffer_it_arrived_in() {
         let cases = [
             ("clean ascii", "the quick brown fox ".repeat(52)),
             ("clean non-ascii", "héllo wörld 日本語 🍋 —".repeat(40)),
-            ("dirty", "clean\u{1b}[0m\u{0}text \u{202e}".repeat(64)),
         ];
         for (label, text) in cases {
             for reasoning in [false, true] {
