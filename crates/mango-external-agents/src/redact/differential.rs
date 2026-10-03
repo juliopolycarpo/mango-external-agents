@@ -8,9 +8,10 @@
 //! left in a diagnostic, so the failure names the input.
 
 use super::reference::{
-    self, Rewrite, assignment_rule, bearer_rule, starts_a_word, url_password_rule,
+    self, Rewrite, assignment_rule, bearer_rule, remove_boundaries, starts_a_word,
+    strip_every_character, url_password_rule,
 };
-use super::strip::{remove_boundaries, strip_control_characters, strip_every_character};
+use super::strip::strip_control_characters;
 use super::{
     ends_awaiting_value, redact_assignments, redact_bearer, redact_url_passwords, stderr_text,
 };

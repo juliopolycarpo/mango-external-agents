@@ -120,41 +120,6 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
     out
 }
 
-/// [`strip_control_characters`] as it was before clean text was copied whole: every character
-/// read and pushed on its own. Kept as the definition of the right answer for
-/// `redact::differential`.
-#[cfg(test)]
-pub(super) fn strip_every_character(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = String::with_capacity(raw.len());
-    let mut at = 0;
-    let mut removed = false;
-    while let Some(character) = raw.get(at..).and_then(|rest| rest.chars().next()) {
-        let after = at + character.len_utf8();
-        if let Some(end) = escape_end(bytes, at, character) {
-            at = end;
-            removed = true;
-            continue;
-        }
-        let kept = character == '\t' || character == '\n' || !is_unsafe_to_render(character);
-        if !kept {
-            at = after;
-            removed = true;
-            continue;
-        }
-        if removed
-            && out.ends_with(|last: char| last.is_ascii_alphanumeric())
-            && (starts_credential_name(bytes, at) || ends_with_scheme(&out))
-        {
-            out.push(BOUNDARY);
-        }
-        removed = false;
-        out.push(character);
-        at = after;
-    }
-    out
-}
-
 /// Where the text from `at` first holds a byte a removed character can start with: the end of
 /// what [`strip_control_characters`] may copy without reading it a character at a time.
 fn clean_end(bytes: &[u8], at: usize) -> usize {

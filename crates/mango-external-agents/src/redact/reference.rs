@@ -7,14 +7,29 @@
 //! text (the reason for the rewrite), so only short text is run through it. It is frozen: do not
 //! edit it to follow a change to the rules, edit the rules and keep this one as it is.
 //!
-//! Only the leaf scanners [`first_match`] and [`run_start`] and the control-character stripper are
-//! shared with the code under test, because the rewrite did not touch them; the stripper has its
-//! own oracle in `strip_every_character`.
+//! Nothing is shared with the code under test. The scanners (`scan`, with `Anchor` and
+//! `Candidates`) and the control-character stripper (`strip`, with its character-at-a-time oracle)
+//! are the files of the tag too, so a change to a leaf function of the live redactor is held to
+//! the same answer as a change to a rule. Only `BOUNDARY_BYTE`, a byte the stripper writes, is
+//! named here a second time.
 
-use std::ops::Range;
+mod scan;
+mod strip;
 
-use super::scan::{first_match, run_start};
-use super::strip::{BOUNDARY_BYTE, remove_boundaries, strip_control_characters};
+use scan::{Anchor, Candidates, first_match, run_start};
+use strip::BOUNDARY_BYTE;
+pub(super) use strip::strip_every_character;
+pub(super) use strip::{remove_boundaries, strip_control_characters};
+
+/// Every code point a diagnostic must not carry across a boundary, tab and newline excepted, as
+/// 0.4.1 listed them.
+fn is_unsafe_to_render(character: char) -> bool {
+    let code = u32::from(character);
+    matches!(
+        code,
+        0x00..=0x1f | 0x7f..=0x9f | 0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+    )
+}
 
 /// [`super::stderr_text`] as 0.4.1 shipped it.
 pub(super) fn stderr_text(raw: &str) -> String {
@@ -42,65 +57,6 @@ pub(super) fn ends_awaiting_value(dropped: &str) -> bool {
 }
 
 const REDACTED: &str = "[REDACTED]";
-
-/// One byte a rule cannot match without, and the starts a match that uses it can have.
-struct Anchor {
-    /// Where the byte is.
-    at: usize,
-    /// Every index a match reaching this byte can start at. A rule is still asked at each one:
-    /// this is a list of places it may match, not of places it does.
-    starts: Range<usize>,
-}
-
-/// The places a rule may match, in ascending order, drawn from one anchor after another.
-///
-/// `locate(bytes, from)` returns the first anchor at or after `from`. It must report every anchor,
-/// and `starts` must hold every start whose match reaches that anchor, or a credential goes
-/// unredacted; `redact::differential` holds each rule's `locate` to the scan that tries every
-/// word. Anchors are visited once each, so the work is linear in the text as long as `locate`
-/// reads only the bytes between the anchor before and the one it returns.
-struct Candidates<Locate> {
-    locate: Locate,
-    /// Where the search for the next anchor resumes.
-    searched: usize,
-    /// The starts of the current anchor not handed out yet.
-    starts: Range<usize>,
-}
-
-impl<Locate: Fn(&[u8], usize) -> Option<Anchor>> Candidates<Locate> {
-    /// Candidates of the rule whose anchors `locate` finds.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut candidates = Candidates::new(locate);
-    /// while let Some(at) = candidates.next_from(bytes, from) { /* try the rule at `at` */ }
-    /// ```
-    fn new(locate: Locate) -> Self {
-        Self {
-            locate,
-            searched: 0,
-            starts: 0..0,
-        }
-    }
-
-    /// The next place to try the rule at or after `from`, or `None` when the text has none left.
-    ///
-    /// `from` never moves backwards between calls: it is one past the last place tried, or the
-    /// end of the last match.
-    fn next_from(&mut self, bytes: &[u8], from: usize) -> Option<usize> {
-        loop {
-            let start = self.starts.start.max(from);
-            if start < self.starts.end {
-                self.starts.start = start + 1;
-                return Some(start);
-            }
-            let anchor = (self.locate)(bytes, self.searched.max(from))?;
-            self.searched = anchor.at + 1;
-            self.starts = anchor.starts;
-        }
-    }
-}
 
 /// The keyword that makes a variable name a credential's: `api_key` or one of a short list.
 fn match_credential_keyword(bytes: &[u8], at: usize) -> Option<usize> {
