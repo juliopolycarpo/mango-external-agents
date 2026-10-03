@@ -26,7 +26,7 @@ with `-` filter cases by substring; flags such as `--bench` are ignored.
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `mango-external-agents` / `framing`   | `LineStream`: a 128 KiB line at 16 KiB chunks; a 1 MiB line at 4 KiB, 16 KiB and 1 MiB chunks; 15-byte records; an invalid-UTF-8 line (the lossy repair path); the captured fixture transcripts replayed at 4 KiB and 16 KiB chunks                                                                                                                                                                                                                                                                    |
 | `mango-external-agents` / `events`    | `EventSink::emit` plus drain for 1 KiB deltas (ASCII, JSON escapes, non-ASCII, characters the sanitiser strips) and a rich activity; the same events serialized to a counting writer and to a string; `normalize::sanitize_field` alone; `normalize::bound_text` at the detail limit over clean ASCII, a late or early non-ASCII character, an escape at, before and after the bound, and ANSI command output; the emit and drain of an activity whose detail has a late non-ASCII character or escape |
-| `mango-external-agents` / `copies`    | `Client` dispatch of prebuilt frames through a scripted link (1 KiB notification, 500 KB diff notification, 500 KB and error responses); `stdio::open` link sends of 1 KiB and 1 MiB messages into a counting sink                                                                                                                                                                                                                                                                                     |
+| `mango-external-agents` / `copies`    | `Client` dispatch of prebuilt frames through a scripted link (1 KiB notification, 500 KB diff notification, 500 KB and error responses); `stdio::open` link sends of 1 KiB and 1 MiB messages into a counting sink, each timed from its call to the end of its write                                                                                                                                                                                                                                   |
 | `mango-agent-acp` / `reducer`         | `Reducer::update_at` on tool-call frames: ten 100 KiB diffs as a new call, as an update and as a completion; a 1 MiB image ahead of a text block; a 1 MiB text body; the frames most agents send (two 2 KiB diffs, a short text); and a 1000- and 10000-call `session/load` replay, through `update_at` and through `Reducer::session_facts`; held updates of one call (2 KiB to 1 MiB)                                                                                                                |
 | `mango-agent-codex` / `pipeline`      | Per stage and end to end: raw line to JSON, `Notification::parse`, `TurnReducer::reduce`, emit, drain, serialize. 1 KiB text deltas; 500 KB patch updates (throttled and emitted); a file change started and completed; command output inside the throttle window (1 KiB, 8 KiB and 64 KiB chunks); every captured Codex transcript                                                                                                                                                                    |
 | `hub-host` / `retry`                  | `Supervisor::run` re-sending an 8 MiB, 2 MiB, 1 MiB or attachment-free request after `NotSubmitted` answers (1 or 3 re-sends), on a paused clock so backoff costs nothing; the process's peak resident set is printed after the cases                                                                                                                                                                                                                                                                  |
@@ -43,7 +43,7 @@ Reading the output: one line per case with the median, minimum, maximum, coeffic
 (CV) and a per-unit cost, then a `samples_ms:` line with every raw sample in run order. The raw
 samples are what a receipt quotes.
 
-Two things to know when reading them:
+Three things to know when reading them:
 
 - The byte counter behind `turn_buffer_bytes` is private. The `events/emit+drain/*` cases are the
   authoritative measurement of it, since a change to it moves them. The
@@ -53,6 +53,14 @@ Two things to know when reading them:
 - `stage/*` cases time one step and drop what it returns inside the timing, so a step that
   allocates is charged for freeing too. The `pipeline/*` cases run every step, so they will not
   equal the sum of the stages: a step's output is warm in cache for the next one.
+- `copies/stdio-send/*` cases do not time the release of the message. `LinkSender::send` takes its
+  message by value and frees it after the write, and a free costs whatever the allocator makes it
+  cost: glibc hands a 1 MiB buffer straight back to the kernel, which was about 98% of the 1 MiB
+  case while the whole call was on the clock. Each send is timed from its call to the moment the
+  sink's write ends, and a sample is the sum over its messages, so it holds the newline, the one
+  write and one clock read per message. The 1 MiB sample is 20 sends and a few microseconds long,
+  so read it for a step change (a send that copied its message would add a 1 MiB copy to each one),
+  not for a few percent.
 
 ## Cases that depend on the compiler
 
@@ -141,7 +149,10 @@ produce, is closed or dropped with these numbers, not merged on an assumed gain.
 - In a bench binary, `bench.run(name, Unit::new(count, "label"), setup, routine)` runs
   `routine(setup())` once per sample. Only `routine` is timed. Build inputs in `setup`, and do at
   least a millisecond of work per call (loop over a few hundred events) so timer and scheduler
-  noise is small next to it.
+  noise is small next to it. When the measured call cannot be separated from work the case must
+  not pay for, such as an API that frees its input before returning, use
+  `bench.run_measured(name, unit, setup, routine)`: the routine times the part it is charged for
+  and returns that duration beside its output.
 - Make the routine assert what it should have done (an `Emit`, a line count). A bench that quietly
   times the `Ignore` path measures nothing.
 - Build a fresh reducer or sink per sample. Reducers keep per-message state and a sink refuses
