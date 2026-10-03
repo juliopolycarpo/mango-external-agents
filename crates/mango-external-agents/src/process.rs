@@ -21,10 +21,12 @@ use crate::error::{Error, Result};
 use crate::redact;
 use crate::session::CancelReason;
 
+mod line_break;
 #[cfg(test)]
 mod shutdown_tests;
 mod stderr_discard;
 
+use line_break::first_line_feed;
 use stderr_discard::Discard;
 
 /// What the library asks a host's launcher for.
@@ -431,10 +433,7 @@ impl StderrTail {
             return;
         }
         let overflow = buffer.len() - self.max_bytes;
-        let boundary = buffer[overflow..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|offset| overflow + offset);
+        let boundary = first_line_feed(&buffer[overflow..]).map(|offset| overflow + offset);
         let Some(boundary) = boundary else {
             // Nothing retained starts a line, so the whole window is the middle of one — a single
             // line longer than the cap. The middle of a line is exactly what cannot be redacted,
@@ -614,8 +613,7 @@ impl LineStream {
 
     /// The index of the first newline at or after `from`.
     fn next_newline(&self, from: usize) -> Option<usize> {
-        let found = self.buffer[from..].iter().position(|byte| *byte == b'\n');
-        found.map(|offset| from + offset)
+        first_line_feed(&self.buffer[from..]).map(|offset| from + offset)
     }
 
     /// A vendor that exits without a final newline still said something.

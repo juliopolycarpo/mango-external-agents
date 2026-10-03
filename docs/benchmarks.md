@@ -75,6 +75,10 @@ The clean-prefix scan behind `normalize::bound_text` tests 16 bytes at a time an
 same way. Its `matches!` form was still vectorized on 1.97 to 1.99, but only because LLVM removed
 the pattern's branches first.
 
+The line-feed search behind `LineStream` tests 32 bytes at a time for the same reason. A
+vectorized `first_line_feed` holds `pcmpeqb`; a scalar one shows as a several-fold step in
+`framing/records-1KiB/chunk-16KiB` with `framing/records-15B/chunk-16KiB` unmoved.
+
 When `rust-toolchain.toml` moves, build the `events` binary with the old and the new toolchain
 (`RUSTUP_TOOLCHAIN` and a `CARGO_TARGET_DIR` each) and compare `normalize/sanitize_field-1KiB/*`
 and `normalize/bound_text-4KiB/clean-ascii`. A scalar loop is a several-fold step in the clean
