@@ -508,6 +508,39 @@ impl Default for LineLimits {
     }
 }
 
+/// Decodes one raw record, replacing each invalid sequence with U+FFFD.
+///
+/// The same text as `String::from_utf8_lossy`. A valid record is validated once and keeps its
+/// allocation. A malformed one skips the lossy decoder's second pass over the valid text in front
+/// of the first error, which walks it sequence by sequence and is several times slower than
+/// validating it: that prefix is already known to be valid, so only what follows it is walked.
+///
+/// For example, `decode_record(b"a\xffb".to_vec())` is `"a\u{fffd}b"`.
+fn decode_record(raw: Vec<u8>) -> String {
+    match String::from_utf8(raw) {
+        Ok(valid) => valid,
+        Err(invalid) => repair(invalid.as_bytes(), invalid.utf8_error().valid_up_to()),
+    }
+}
+
+/// `raw` with every invalid sequence replaced, given that its first `valid_up_to` bytes are valid.
+fn repair(raw: &[u8], valid_up_to: usize) -> String {
+    let (prefix, rest) = raw.split_at(valid_up_to);
+    let Ok(prefix) = std::str::from_utf8(prefix) else {
+        // The caller's contract was broken; the lossy decoder is the reference and never panics.
+        return String::from_utf8_lossy(raw).into_owned();
+    };
+    let mut repaired = String::with_capacity(raw.len());
+    repaired.push_str(prefix);
+    for chunk in rest.utf8_chunks() {
+        repaired.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            repaired.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    repaired
+}
+
 /// Newline-delimited records over a [`ByteSource`], under a cap.
 ///
 /// Overflow is a typed error rather than a truncated line: a half-read JSON frame parsed as if it
@@ -595,9 +628,11 @@ impl LineStream {
             if let Some(without_return) = record.strip_suffix(b"\r") {
                 record = without_return;
             }
-            let record = record.to_vec();
+            // The raw cap is checked on the borrowed bytes, so a refused line is never copied.
+            self.check_line_length(record.len())?;
+            let line = decode_record(record.to_vec());
             consumed = newline + 1;
-            self.queue(record, self.buffer.len() - consumed)?;
+            self.enqueue(line, self.buffer.len() - consumed)?;
         }
         self.buffer.drain(..consumed);
 
@@ -623,23 +658,26 @@ impl LineStream {
             return Ok(());
         }
         let record = std::mem::take(&mut self.buffer);
-        self.queue(record, 0)
+        self.check_line_length(record.len())?;
+        self.enqueue(decode_record(record), 0)
     }
 
-    /// Queues one raw line; `remaining` is how many raw bytes are still buffered behind it.
-    fn queue(&mut self, record: Vec<u8>, remaining: usize) -> Result<()> {
-        if record.len() > self.limits.max_line_bytes {
+    /// Refuses a raw line longer than `max_line_bytes`.
+    fn check_line_length(&self, raw_len: usize) -> Result<()> {
+        if raw_len > self.limits.max_line_bytes {
             return Err(Error::LimitExceeded {
                 subject: "bytes of one vendor output line",
                 limit: self.limits.max_line_bytes,
-                received: record.len(),
+                received: raw_len,
             });
         }
-        // Repair can triple a line: each invalid sequence becomes a 3-byte U+FFFD. The raw checks
-        // above cannot see that, so the decoded size is counted against the unread-output budget
-        // too. A valid line keeps its own allocation.
-        let line = String::from_utf8(record)
-            .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned());
+        Ok(())
+    }
+
+    /// Queues one decoded line; `remaining` is how many raw bytes are still buffered behind it.
+    fn enqueue(&mut self, line: String, remaining: usize) -> Result<()> {
+        // Repair can triple a line: each invalid sequence becomes a 3-byte U+FFFD. The raw check
+        // cannot see that, so the decoded size is counted against the unread-output budget too.
         // What is still buffered behind this record (later lines, an unterminated tail) is held too.
         let unread = self.queued_bytes + line.len() + remaining;
         if unread > self.limits.max_buffered_bytes {
@@ -1609,5 +1647,191 @@ mod tests {
             "expected at most 32 bytes, received {}",
             read.len()
         );
+    }
+
+    /// Byte sequences that cover every way UTF-8 can be invalid, and the valid ones next to them:
+    /// overlong forms, a surrogate, a code point past U+10FFFF, bytes that can never start a
+    /// character, lone continuation bytes, and every multibyte character cut short.
+    const PIECES: [&[u8]; 27] = [
+        b"a",
+        b"y",
+        "\u{e9}".as_bytes(),
+        "\u{20ac}".as_bytes(),
+        "\u{1f600}".as_bytes(),
+        b"\xff",
+        b"\xfe",
+        b"\xc0\x80",
+        b"\xc1\xbf",
+        b"\xe0\x80\x80",
+        b"\xe0\x9f\xbf",
+        b"\xed\xa0\x80",
+        b"\xf0\x80\x80\x80",
+        b"\xf4\x90\x80\x80",
+        b"\xf5\x80\x80\x80",
+        b"\x80",
+        b"\xbf",
+        b"\xc3",
+        b"\xe2",
+        b"\xe2\x82",
+        b"\xf0",
+        b"\xf0\x9f",
+        b"\xf0\x9f\x98",
+        b"\xe2\x28\xa1",
+        b"\xf0\x28\x8c\xbc",
+        b"\r",
+        b"\x00",
+    ];
+
+    /// Every record the decoder is checked on: all pairs and triples of pieces, runs of them,
+    /// and one invalid piece at every offset around the 32-byte blocks of the newline search.
+    fn decoder_inputs() -> Vec<Vec<u8>> {
+        let mut inputs = vec![Vec::new()];
+        for first in PIECES {
+            for second in PIECES {
+                inputs.push([first, second].concat());
+                for third in PIECES {
+                    inputs.push([first, second, third].concat());
+                }
+            }
+        }
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |bound: usize| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_f491_4f6c_dd1d) % bound as u64) as usize
+        };
+        for _ in 0..3_000 {
+            let pieces = next(60);
+            inputs.push(
+                (0..pieces)
+                    .flat_map(|_| PIECES[next(PIECES.len())].to_vec())
+                    .collect(),
+            );
+        }
+        for offset in 0..130 {
+            for piece in [
+                &b"\xff"[..],
+                b"\xe2\x82",
+                b"\xed\xa0\x80",
+                "\u{20ac}".as_bytes(),
+            ] {
+                let mut record = vec![b'y'; offset];
+                record.extend_from_slice(piece);
+                record.extend_from_slice(&b"tail"[..offset % 5]);
+                inputs.push(record);
+            }
+        }
+        inputs
+    }
+
+    /// The contract of the decoder: the text `String::from_utf8_lossy` produces, byte for byte.
+    #[test]
+    fn decoding_a_record_matches_the_lossy_decoder_for_every_invalid_shape() {
+        for raw in decoder_inputs() {
+            let expected = String::from_utf8_lossy(&raw).into_owned();
+            let decoded = super::decode_record(raw.clone());
+            assert_eq!(
+                decoded, expected,
+                "expected the decode of {raw:02x?} to be {expected:?}, received {decoded:?}"
+            );
+        }
+    }
+
+    /// A valid record is neither repaired nor changed.
+    #[test]
+    fn decoding_a_valid_record_returns_it_unchanged() {
+        for text in [
+            "",
+            "plain",
+            "caf\u{e9} \u{20ac} \u{1f600}",
+            "\u{fffd} is already valid",
+        ] {
+            assert_eq!(super::decode_record(text.as_bytes().to_vec()), text);
+        }
+    }
+
+    /// The framing around the decoder: the same lines as the lossy decoder however the bytes are
+    /// cut, with LF, CRLF and an unterminated final line, and the repaired size in every limit.
+    #[tokio::test]
+    async fn framed_malformed_records_equal_the_lossy_decoder_however_they_are_cut() {
+        let inputs = decoder_inputs();
+        for group in inputs.chunks(7).take(400) {
+            let mut bytes = Vec::new();
+            for (index, record) in group.iter().enumerate() {
+                bytes.extend_from_slice(record);
+                // Alternate LF and CRLF, and leave the last record of every third group open.
+                let last = index + 1 == group.len();
+                if !last || index % 3 == 0 {
+                    bytes.extend_from_slice(if index % 2 == 1 { b"\r\n" } else { b"\n" });
+                }
+            }
+            let reference = reference_lines(&bytes);
+            for size in [1, 2, 5, 31, 32, 33, bytes.len().max(1)] {
+                let chunks = bytes.chunks(size).map(<[u8]>::to_vec).collect();
+                let mut stream = RawChunkSource::stream(chunks, LineLimits::default());
+                let framed = drain(&mut stream)
+                    .await
+                    .expect("expected the lines to fit the default caps");
+                assert_eq!(
+                    framed, reference,
+                    "expected {bytes:02x?} cut every {size} bytes to frame like the lossy decoder"
+                );
+            }
+        }
+    }
+
+    /// Lines as the pre-repair framing defines them: split at LF, one trailing CR dropped, each
+    /// decoded by `String::from_utf8_lossy`, and an unterminated tail kept.
+    fn reference_lines(bytes: &[u8]) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut rest = bytes;
+        while let Some(at) = rest.iter().position(|byte| *byte == b'\n') {
+            let record = &rest[..at];
+            let record = record.strip_suffix(b"\r").unwrap_or(record);
+            lines.push(String::from_utf8_lossy(record).into_owned());
+            rest = &rest[at + 1..];
+        }
+        if !rest.is_empty() {
+            lines.push(String::from_utf8_lossy(rest).into_owned());
+        }
+        lines
+    }
+
+    /// The raw cap is checked on the raw bytes before any repair, so an invalid line past it is
+    /// refused with its raw length, not the repaired one, terminated or not.
+    #[tokio::test]
+    async fn an_invalid_line_past_the_raw_cap_is_refused_with_its_raw_length() {
+        let limits = LineLimits {
+            max_line_bytes: 10,
+            max_buffered_bytes: 1_000,
+        };
+        for bytes in [[vec![0xff; 11], b"\n".to_vec()].concat(), vec![0xff; 11]] {
+            let mut stream = RawChunkSource::stream(vec![bytes.clone()], limits);
+            let error = stream
+                .next_line()
+                .await
+                .expect_err("expected an 11 byte invalid line to pass a 10 byte cap");
+            assert!(
+                matches!(
+                    error,
+                    Error::LimitExceeded {
+                        subject: "bytes of one vendor output line",
+                        limit: 10,
+                        received: 11,
+                    }
+                ),
+                "expected the raw length 11 against a limit of 10 for {} bytes, received {error:?}",
+                bytes.len()
+            );
+            assert_eq!(
+                stream
+                    .next_line()
+                    .await
+                    .expect("expected the end after a refusal"),
+                None,
+                "expected no line after a refusal"
+            );
+        }
     }
 }
