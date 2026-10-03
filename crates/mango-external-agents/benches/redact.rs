@@ -4,7 +4,10 @@
 //! credential rule. Its cost follows what the text holds, so each size is run over four kinds of
 //! tail: lines with nothing to remove, lines that carry credentials, coloured output with control
 //! characters throughout, and lines dense in the punctuation and lead bytes the redactor has to
-//! stop at without finding anything. The fixtures are synthetic; no vendor wrote them. Run with:
+//! stop at without finding anything. Two more shapes are built to repeat a read for each word
+//! start, a credential name made of one keyword over and over and a URL scheme made of dotted
+//! letters, at 16 KiB, 120 KB and 1 MiB: their cost has to grow with the length, not with its
+//! square. The fixtures are synthetic; no vendor wrote them. Run with:
 //!
 //! ```sh
 //! cargo bench -p mango-external-agents --bench redact
@@ -65,6 +68,18 @@ const SEPARATOR_LINES: &str = concat!(
     "a=1 b=2 c=3 d:4 e:5 f::6 g=h=i j.k-l://m n_o_p=q\n",
 );
 
+/// A keyword repeated in a credential name that never gets a value: every word start in the name
+/// reaches the same separator, and the redactor has to learn once that nothing follows it.
+const NAME_UNIT: &str = "token_";
+
+/// Dotted letters before a `://` with no password after it: every letter reaches the same scheme.
+const SCHEME_UNIT: &str = "a.";
+
+/// `unit` repeated to about `len` bytes and closed by `tail`.
+fn repeated(unit: &str, tail: &str, len: usize) -> String {
+    format!("{}{tail}", unit.repeat(len / unit.len()))
+}
+
 /// `lines` repeated and cut to exactly `len` bytes, at a character boundary.
 fn tail(lines: &str, len: usize) -> String {
     let mut text = lines.repeat(len / lines.len() + 1);
@@ -79,7 +94,7 @@ fn tail(lines: &str, len: usize) -> String {
 /// Fails the run when a case did not do the work its name claims.
 fn assert_redacted(label: &str, raw: &str, redacted: &str) {
     match label {
-        "plain" | "separators" => assert!(
+        "plain" | "separators" | "names" | "schemes" => assert!(
             redacted == raw,
             "expected a {label} tail of {} bytes returned unchanged | received {} bytes",
             raw.len(),
@@ -124,6 +139,31 @@ fn main() {
                         .map(|_| stderr_text(std::hint::black_box(&raw)).len())
                         .sum::<usize>()
                 },
+            );
+        }
+    }
+    pathological(&bench);
+}
+
+/// The same call over text that is built to cost more than its length when a rule reads the same
+/// bytes for each candidate. One call per sample: at 1 MiB a quadratic redactor does not finish.
+fn pathological(bench: &Bench) {
+    for (size_label, len) in [("16KiB", 16 * KIB), ("120KB", 120_000), ("1MiB", KIB * KIB)] {
+        for (label, raw) in [
+            ("names", repeated(NAME_UNIT, "=", len)),
+            ("schemes", repeated(SCHEME_UNIT, "://", len)),
+        ] {
+            let name = format!("redact/stderr_text-{size_label}/{label}");
+            // Checked only when the case runs: a filtered-out case must not pay for the call.
+            if !bench.selected(&name) {
+                continue;
+            }
+            assert_redacted(label, &raw, &stderr_text(&raw));
+            bench.run(
+                &name,
+                Unit::new(raw.len() as u64, "byte"),
+                || (),
+                |()| stderr_text(std::hint::black_box(&raw)).len(),
             );
         }
     }
