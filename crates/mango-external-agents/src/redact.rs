@@ -23,6 +23,7 @@ mod strip;
 #[cfg(test)]
 mod work;
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use scan::{Anchor, Candidates, count_steps, first_match, run_start};
@@ -173,7 +174,8 @@ fn bearer_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
     }
     Some(Rewrite {
         end: token_end,
-        replacement: format!("{} {REDACTED}", as_text(bytes, at, after_scheme)),
+        kept_end: after_scheme,
+        joiner: " ",
     })
 }
 
@@ -212,7 +214,8 @@ fn assignment_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
     }
     Some(Rewrite {
         end: value_end,
-        replacement: format!("{}={REDACTED}", as_text(bytes, at, name_end)),
+        kept_end: name_end,
+        joiner: "=",
     })
 }
 
@@ -270,7 +273,8 @@ fn url_password_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
     let password = url_password(bytes, after_scheme)?;
     Some(Rewrite {
         end: password.end,
-        replacement: format!("{}{REDACTED}", as_text(bytes, at, password.start)),
+        kept_end: password.start,
+        joiner: "",
     })
 }
 
@@ -327,9 +331,13 @@ fn scheme_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
 }
 
 /// What one rule matched: where the match ends, and what stands in its place.
+///
+/// The replacement is the start of the match up to `kept_end`, which stays, then `joiner` and
+/// [`REDACTED`]. It is described rather than built, so a match costs no allocation.
 struct Rewrite {
     end: usize,
-    replacement: String,
+    kept_end: usize,
+    joiner: &'static str,
 }
 
 /// Scans left to right, letting `rule` claim a span starting at a word boundary.
@@ -359,7 +367,9 @@ fn rewrite(
             continue;
         };
         out.push_str(&raw[copied..at]);
-        out.push_str(&found.replacement);
+        out.push_str(&as_text(bytes, at, found.kept_end));
+        out.push_str(found.joiner);
+        out.push_str(REDACTED);
         copied = found.end;
         from = found.end;
     }
@@ -443,8 +453,9 @@ fn is_value_byte(byte: u8) -> bool {
     !is_space_byte(byte) && !matches!(byte, b',' | b';')
 }
 
-fn as_text(bytes: &[u8], from: usize, to: usize) -> String {
-    String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default()).into_owned()
+/// `bytes[from..to]` as text, borrowed unless it is not valid UTF-8.
+fn as_text(bytes: &[u8], from: usize, to: usize) -> Cow<'_, str> {
+    String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default())
 }
 
 /// Every code point a diagnostic must not carry across a boundary, tab and newline excepted.
