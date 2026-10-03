@@ -2,8 +2,10 @@
 //!
 //! `dispatch/*` feeds prebuilt frames to a [`Client`] and waits for the peer to end, so the timed
 //! part is parsing and routing (including the hand-off to the handler). `stdio-send/*` writes
-//! prebuilt messages through the link a stdio transport returns, into a sink that discards. Frames
-//! and messages are built in `setup`. Run with:
+//! prebuilt messages through the link a stdio transport returns, into a sink that discards, and
+//! times each send from the call to the end of its write: the link frees the message it was handed
+//! after that, and what a free costs belongs to the allocator, not to the send. Frames and
+//! messages are built in `setup`. Run with:
 //!
 //! ```sh
 //! cargo bench -p mango-external-agents --bench copies
@@ -12,8 +14,9 @@
 mod support;
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use mango_external_agents::host::HostContext;
 use mango_external_agents::jsonrpc::{
@@ -190,18 +193,47 @@ impl ByteSource for EndedSource {
     }
 }
 
-/// Counts the bytes written and the number of writes.
-struct CountingSink {
-    bytes: Arc<AtomicUsize>,
-    writes: Arc<AtomicUsize>,
+/// What a [`CountingSink`] saw: the bytes, the writes, and when the latest write ended.
+struct Written {
+    bytes: AtomicUsize,
+    writes: AtomicUsize,
+    latest: Mutex<Instant>,
 }
+
+impl Written {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            latest: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// When the latest write ended.
+    fn latest(&self) -> Instant {
+        *self
+            .latest
+            .lock()
+            .expect("expected the write clock to be unpoisoned")
+    }
+}
+
+/// Counts the bytes written and the number of writes, and notes when each write ended.
+struct CountingSink(Arc<Written>);
 
 #[async_trait::async_trait]
 impl ByteSink for CountingSink {
     async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        self.bytes.fetch_add(bytes.len(), Ordering::AcqRel);
-        self.writes.fetch_add(1, Ordering::AcqRel);
+        self.0.bytes.fetch_add(bytes.len(), Ordering::AcqRel);
+        self.0.writes.fetch_add(1, Ordering::AcqRel);
         std::hint::black_box(bytes);
+        // Read the clock first, so storing the reading is not part of what it measures.
+        let ended = Instant::now();
+        *self
+            .0
+            .latest
+            .lock()
+            .expect("expected the write clock to be unpoisoned") = ended;
         Ok(())
     }
 
@@ -210,35 +242,30 @@ impl ByteSink for CountingSink {
     }
 }
 
-struct SilentLauncher {
-    bytes: Arc<AtomicUsize>,
-    writes: Arc<AtomicUsize>,
-}
+struct SilentLauncher(Arc<Written>);
 
 #[async_trait::async_trait]
 impl ProcessLauncher for SilentLauncher {
     async fn spawn(&self, _spec: LaunchSpec) -> Result<ManagedProcess> {
         Ok(ManagedProcess {
             stdout: Box::new(EndedSource),
-            stdin: Some(Box::new(CountingSink {
-                bytes: Arc::clone(&self.bytes),
-                writes: Arc::clone(&self.writes),
-            })),
+            stdin: Some(Box::new(CountingSink(Arc::clone(&self.0)))),
             control: Arc::new(SilentControl),
         })
     }
 }
 
-/// Sends every message through a stdio link and checks each went out as one write.
-fn stdio_send(rt: &tokio::runtime::Runtime, messages: Vec<String>) {
+/// Sends every message through a stdio link, checks each went out as one write, and returns the
+/// time the sends took.
+///
+/// A send is timed from its call to the end of its write. `LinkSender::send` takes the message by
+/// value and frees it once the write returns; that part is left out, because a 1 MiB buffer goes
+/// back to the kernel on glibc and the case then reports the allocator instead of the send.
+fn stdio_send(rt: &tokio::runtime::Runtime, messages: Vec<String>) -> Duration {
     rt.block_on(async {
-        let bytes = Arc::new(AtomicUsize::new(0));
-        let writes = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(Written::new());
         let host = HostContext::builder()
-            .launcher(Arc::new(SilentLauncher {
-                bytes: Arc::clone(&bytes),
-                writes: Arc::clone(&writes),
-            }))
+            .launcher(Arc::new(SilentLauncher(Arc::clone(&written))))
             .cwd(std::env::temp_dir())
             .client_info("bench", "0")
             .build()
@@ -253,21 +280,46 @@ fn stdio_send(rt: &tokio::runtime::Runtime, messages: Vec<String>) {
         .expect("expected the silent child to open");
         let count = messages.len();
         let expected: usize = messages.iter().map(|message| message.len() + 1).sum();
-        for message in messages {
+        let mut sending = Duration::ZERO;
+        for (index, message) in messages.into_iter().enumerate() {
+            let writes_before = written.writes.load(Ordering::Acquire);
+            let started = Instant::now();
             transport
                 .link
                 .sender
                 .send(message)
                 .await
                 .expect("expected the sink to accept the message");
+            let ended = written.latest();
+            // Checked after both clock readings, so neither check is on the clock. A write that
+            // had not happened by the time `send` returned, or a reading left by an earlier
+            // message, would otherwise count as a send that took no time.
+            let writes_after = written.writes.load(Ordering::Acquire);
+            assert_eq!(
+                writes_after,
+                writes_before + 1,
+                "expected exactly one write during the send of message {index}: {} writes | \
+                 received {writes_after}",
+                writes_before + 1
+            );
+            assert!(
+                ended >= started,
+                "expected the write of message {index} to end after its send began at \
+                 {started:?} | received a write that ended at {ended:?}"
+            );
+            sending += ended.duration_since(started);
         }
-        let (written, calls) = (bytes.load(Ordering::Acquire), writes.load(Ordering::Acquire));
-        assert_eq!(
-            (written, calls),
-            (expected, count),
-            "expected {expected} bytes in {count} writes, received {written} bytes in {calls} writes"
+        let (bytes, calls) = (
+            written.bytes.load(Ordering::Acquire),
+            written.writes.load(Ordering::Acquire),
         );
-    });
+        assert_eq!(
+            (bytes, calls),
+            (expected, count),
+            "expected {expected} bytes in {count} writes, received {bytes} bytes in {calls} writes"
+        );
+        sending
+    })
 }
 
 fn main() {
@@ -318,16 +370,16 @@ fn main() {
                 .collect::<Vec<String>>()
         }
     };
-    bench.run(
+    bench.run_measured(
         "stdio-send/1KiB",
         Unit::new(DELTAS as u64, "message"),
         messages(KIB, DELTAS),
-        |batch| stdio_send(&rt, batch),
+        |batch| (stdio_send(&rt, batch), ()),
     );
-    bench.run(
+    bench.run_measured(
         "stdio-send/1MiB",
         Unit::new(LARGE_FRAMES as u64, "message"),
         messages(MIB, LARGE_FRAMES),
-        |batch| stdio_send(&rt, batch),
+        |batch| (stdio_send(&rt, batch), ()),
     );
 }

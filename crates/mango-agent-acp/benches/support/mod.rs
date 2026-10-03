@@ -127,6 +127,47 @@ impl Bench {
         }
         print_summary(name, unit, &samples);
     }
+
+    /// [`Bench::run`] for a routine that times itself: `routine` returns how long the work the
+    /// case is charged for took, beside its output, and that duration is the sample.
+    ///
+    /// For measured code that cannot be called apart from work the case must not pay for. A send
+    /// that takes its message by value frees it before returning, so only the routine can stop the
+    /// clock ahead of that:
+    ///
+    /// ```ignore
+    /// bench.run_measured("stdio-send/1MiB", unit, || messages(), |batch| (send_all(batch), ()));
+    /// ```
+    pub fn run_measured<I, O>(
+        &self,
+        name: &str,
+        unit: Unit,
+        setup: impl FnMut() -> I,
+        routine: impl FnMut(I) -> (Duration, O),
+    ) {
+        if !self.selected(name) {
+            return;
+        }
+        print_summary(name, unit, &self.measured_samples(setup, routine));
+    }
+
+    /// The duration `routine` reports for each sample, in run order, after the warmup runs.
+    fn measured_samples<I, O>(
+        &self,
+        mut setup: impl FnMut() -> I,
+        mut routine: impl FnMut(I) -> (Duration, O),
+    ) -> Vec<Duration> {
+        for _ in 0..WARMUP_RUNS {
+            black_box(routine(setup()));
+        }
+        let mut samples = Vec::with_capacity(self.samples);
+        for _ in 0..self.samples {
+            let (elapsed, output) = routine(black_box(setup()));
+            drop(black_box(output));
+            samples.push(elapsed);
+        }
+        samples
+    }
 }
 
 /// A runtime for driving async code from a synchronous bench, one `block_on` per sample.
@@ -181,6 +222,43 @@ fn print_summary(name: &str, unit: Unit, samples: &[Duration]) {
 // are byte-identical, so that one run covers them all.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_self_timed_case_reports_the_routines_durations_after_the_warmup_runs() {
+        use std::time::Duration;
+
+        let bench = super::Bench {
+            samples: 3,
+            filters: Vec::new(),
+        };
+        let mut built = 0_u64;
+        let mut inputs = Vec::new();
+
+        let received = bench.measured_samples(
+            || {
+                built += 1;
+                built
+            },
+            |input| {
+                inputs.push(input);
+                (Duration::from_millis(input), input)
+            },
+        );
+
+        let expected: Vec<Duration> = [3, 4, 5].map(Duration::from_millis).to_vec();
+        assert_eq!(
+            received,
+            expected,
+            "expected the durations the routine reported for the 3 samples after {} warmup runs: \
+             {expected:?} | received {received:?}",
+            super::WARMUP_RUNS
+        );
+        assert_eq!(
+            inputs,
+            [1, 2, 3, 4, 5],
+            "expected one fresh setup result per warmup run and per sample, in order | received \
+             {inputs:?}"
+        );
+    }
 
     #[test]
     fn an_absent_value_is_the_default_sample_count() {
