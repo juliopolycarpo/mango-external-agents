@@ -42,5 +42,8 @@ for manifest in crates/*/Cargo.toml; do
 done
 scripts/check-readme-requirements.sh "$workspace_version" "${readmes[@]}" || status=1
 
+# The current registry consumer pins a published release, so it follows the workspace by one release.
+scripts/check-consumer-pin.sh || status=1
+
 [ $status -eq 0 ] && echo "versions in lockstep: $workspace_version"
 exit $status

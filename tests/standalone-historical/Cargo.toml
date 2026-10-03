@@ -5,7 +5,9 @@ edition = "2024"
 publish = false
 rust-version = "1.96"
 
-# Deliberately outside the SDK workspace. All four crates resolve through the registry.
+# HISTORICAL CONTROL: frozen at the 0.3.1 release and its Rust 1.96 minimum; never bumped. Not evidence
+# for later releases (tests/standalone-current covers those). Deliberately outside the SDK workspace.
+# All four crates resolve through the registry.
 [workspace]
 
 [features]

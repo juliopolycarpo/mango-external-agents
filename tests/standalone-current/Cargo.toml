@@ -1,0 +1,33 @@
+[package]
+name = "independent-agent-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+rust-version = "1.97"
+
+# Deliberately outside the SDK workspace. All four crates resolve through the registry, pinned to the
+# current published release. After each release is on crates.io, bump the four `=` pins and the lock
+# together (docs/releasing.md); scripts/check-versions.sh refuses a pin that lags further.
+[workspace]
+
+[features]
+default = []
+bundled-launcher = ["mango-external-agents/launcher-tokio", "tokio/signal"]
+
+[dependencies]
+mango-agent-acp = { version = "=0.4.1", default-features = false }
+mango-agent-claude = { version = "=0.4.1", default-features = false }
+mango-agent-codex = { version = "=0.4.1", default-features = false }
+mango-external-agents = { version = "=0.4.1", default-features = false, features = ["stdio"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+async-trait = "0.1.92"
+mango-agent-acp = { version = "=0.4.1", default-features = false, features = ["testing"] }
+mango-external-agents = { version = "=0.4.1", default-features = false, features = ["testing"] }
+serde_json = "1.0.151"
+
+[[bin]]
+name = "independent-agent-host"
+path = "src/main.rs"
+required-features = ["bundled-launcher"]
