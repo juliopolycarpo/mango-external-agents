@@ -54,6 +54,21 @@ Two things to know when reading them:
   allocates is charged for freeing too. The `pipeline/*` cases run every step, so they will not
   equal the sum of the stages: a step's output is warm in cache for the next one.
 
+## Cases that depend on the compiler
+
+The clean-text scan behind `normalize::sanitize_field` is fast only while the compiler turns its
+loop into vector instructions; the workspace forbids `unsafe`, so there are no intrinsics to fall
+back on. Rust 1.99 (LLVM 23) stopped doing that for a byte test written as a `matches!` pattern, and
+`normalize/sanitize_field-1KiB/ascii-clean` went from about 0.28 ms to about 1.8 ms on the reference
+machine with no source change. The test is now comparisons joined by `|`, which has no branch to
+lose.
+
+When `rust-toolchain.toml` moves, build the `events` binary with the old and the new toolchain
+(`RUSTUP_TOOLCHAIN` and a `CARGO_TARGET_DIR` each) and compare `normalize/sanitize_field-1KiB/*`
+and `normalize/bound_text-4KiB/clean-ascii`. A scalar loop is a several-fold step in the clean
+cases with the `dirty` case unmoved, not a few percent. `objdump -d` on the bench binary confirms
+it: a vectorized `sanitize_owned` holds `pcmpeqb` instructions on x86-64, a scalar one holds none.
+
 ## Why this harness
 
 The runner is a small `std`-only module (`benches/support/mod.rs` in each crate that has benches)

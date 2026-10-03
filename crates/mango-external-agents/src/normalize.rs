@@ -331,18 +331,38 @@ pub fn is_argv_value_with_max(raw: &str, max_code_points: usize) -> bool {
 /// them is clean; text with one may still be clean (an em dash leads with `E2`), so the caller
 /// confirms with the exact per-character test.
 fn may_need_stripping(text: &str) -> bool {
-    // Sixteen bytes at a time with no early exit inside a block, so the compiler can test a block
-    // with vector instructions instead of branching on every byte.
-    text.as_bytes().chunks(16).any(|block| {
-        block
-            .iter()
-            .fold(false, |found, byte| found | is_flagged_byte(*byte))
-    })
+    contains_flagged_byte(text.as_bytes())
+}
+
+/// Bytes [`contains_flagged_byte`] tests between two chances to stop.
+const SCAN_BLOCK: usize = 64;
+
+/// Whether any byte is one [`is_flagged_byte`] flags.
+///
+/// Whole blocks with no early exit inside one, so the compiler can test a block with vector
+/// instructions instead of branching on every byte. A flagged block still ends the scan, so dirty
+/// text is not read past the block that proves it dirty.
+fn contains_flagged_byte(bytes: &[u8]) -> bool {
+    let (blocks, remainder) = bytes.as_chunks::<SCAN_BLOCK>();
+    blocks.iter().any(|block| any_flagged(block)) || any_flagged(remainder)
+}
+
+/// [`is_flagged_byte`] over every byte, joined with `|` so the loop body has no branch.
+fn any_flagged(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .fold(false, |found, byte| found | is_flagged_byte(*byte))
 }
 
 /// Whether a byte can belong to a stripped character.
+///
+/// Written as comparisons joined by `|` and `&`, never as a `match` or `matches!`: a pattern
+/// compiles to a branch per byte, and the loop above is vectorized only while its body has none.
+/// Rust 1.99 (LLVM 23) stopped vectorizing the pattern form, which made clean text six times
+/// slower to pass; see `docs/benchmarks.md`.
 const fn is_flagged_byte(byte: u8) -> bool {
-    matches!(byte, 0x00..=0x08 | 0x0b..=0x1f | 0x7f | 0xc2 | 0xd8 | 0xe2)
+    let control = (byte < 0x20) & (byte != b'\t') & (byte != b'\n');
+    control | (byte == 0x7f) | (byte == 0xc2) | (byte == 0xd8) | (byte == 0xe2)
 }
 
 /// C0 and C1 controls except tab and newline, and every bidirectional formatting character.
@@ -471,6 +491,87 @@ mod tests {
                 "expected the prefilter to flag U+{:04X} | received clean",
                 u32::from(character)
             );
+        }
+    }
+
+    /// The pattern `is_flagged_byte` was written as before it became comparisons.
+    const fn reference_flagged(byte: u8) -> bool {
+        matches!(byte, 0x00..=0x08 | 0x0b..=0x1f | 0x7f | 0xc2 | 0xd8 | 0xe2)
+    }
+
+    #[test]
+    fn the_flagged_byte_test_agrees_with_the_pattern_for_every_byte() {
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                super::is_flagged_byte(byte),
+                reference_flagged(byte),
+                "expected byte {byte:#04x} flagged: {} | received: {}",
+                reference_flagged(byte),
+                super::is_flagged_byte(byte)
+            );
+        }
+    }
+
+    #[test]
+    fn the_block_scan_agrees_with_a_byte_by_byte_scan_at_every_offset() {
+        // Both sides of every range and value the flag test draws, and bytes far from all of them.
+        let probes = [
+            0x00, 0x08, b'\t', b'\n', 0x0b, 0x1f, 0x20, b'a', 0x7e, 0x7f, 0x80, 0xc1, 0xc2, 0xc3,
+            0xd7, 0xd8, 0xd9, 0xe1, 0xe2, 0xe3, 0xff,
+        ];
+        assert!(
+            !super::contains_flagged_byte(&[]),
+            "expected empty input clean | received flagged"
+        );
+        // No block, one block, two blocks, and every remainder length beside them.
+        for length in 1..=2 * super::SCAN_BLOCK + 2 {
+            let mut bytes = vec![b'a'; length];
+            assert!(
+                !super::contains_flagged_byte(&bytes),
+                "expected {length} clean bytes to pass | received flagged"
+            );
+            for offset in 0..length {
+                for probe in probes {
+                    bytes[offset] = probe;
+                    let expected = bytes.iter().any(|byte| reference_flagged(*byte));
+                    assert_eq!(
+                        super::contains_flagged_byte(&bytes),
+                        expected,
+                        "expected flagged: {expected} for byte {probe:#04x} at offset {offset} \
+                         of {length} | received: {}",
+                        !expected
+                    );
+                }
+                bytes[offset] = b'a';
+            }
+        }
+    }
+
+    #[test]
+    fn sanitising_matches_the_reference_for_every_class_at_every_offset_across_scan_blocks() {
+        // One stripped character per flagged class (C0, DEL, a `C2`, the `D8` and an `E2` lead),
+        // then characters that share a lead byte or sit beside one and must survive.
+        let characters = [
+            '\u{1b}', '\u{7f}', '\u{85}', '\u{61c}', '\u{202e}', '\t', '\n', 'é', '\u{a0}',
+            '\u{620}', '—', '日', '🍋',
+        ];
+        let length = 2 * super::SCAN_BLOCK + 8;
+        for offset in 0..=length {
+            for character in characters {
+                let mut input = "a".repeat(length);
+                input.insert(offset, character);
+                let (expected_text, expected_truncated) = reference_sanitize(&input);
+                let owned = sanitize_owned(input.clone());
+                assert_eq!(
+                    (owned.text.as_bytes(), owned.truncated),
+                    (expected_text.as_bytes(), expected_truncated),
+                    "expected U+{:04X} at byte {offset} sanitised as the reference does | \
+                     received text {:?}, truncated {}",
+                    u32::from(character),
+                    owned.text,
+                    owned.truncated
+                );
+            }
         }
     }
 
