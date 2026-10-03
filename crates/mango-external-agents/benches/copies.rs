@@ -281,7 +281,8 @@ fn stdio_send(rt: &tokio::runtime::Runtime, messages: Vec<String>) -> Duration {
         let count = messages.len();
         let expected: usize = messages.iter().map(|message| message.len() + 1).sum();
         let mut sending = Duration::ZERO;
-        for message in messages {
+        for (index, message) in messages.into_iter().enumerate() {
+            let writes_before = written.writes.load(Ordering::Acquire);
             let started = Instant::now();
             transport
                 .link
@@ -289,7 +290,24 @@ fn stdio_send(rt: &tokio::runtime::Runtime, messages: Vec<String>) -> Duration {
                 .send(message)
                 .await
                 .expect("expected the sink to accept the message");
-            sending += written.latest().duration_since(started);
+            let ended = written.latest();
+            // Checked after both clock readings, so neither check is on the clock. A write that
+            // had not happened by the time `send` returned, or a reading left by an earlier
+            // message, would otherwise count as a send that took no time.
+            let writes_after = written.writes.load(Ordering::Acquire);
+            assert_eq!(
+                writes_after,
+                writes_before + 1,
+                "expected exactly one write during the send of message {index}: {} writes | \
+                 received {writes_after}",
+                writes_before + 1
+            );
+            assert!(
+                ended >= started,
+                "expected the write of message {index} to end after its send began at \
+                 {started:?} | received a write that ended at {ended:?}"
+            );
+            sending += ended.duration_since(started);
         }
         let (bytes, calls) = (
             written.bytes.load(Ordering::Acquire),
