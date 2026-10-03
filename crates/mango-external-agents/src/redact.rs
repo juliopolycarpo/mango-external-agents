@@ -9,8 +9,12 @@
 //! with the same shapes as the patterns they replace, so each rule can be read on its own:
 //! a bearer header, a `key = value` assignment, and the password in a URL's userinfo.
 
+#[cfg(test)]
+mod differential;
+mod scan;
 mod strip;
 
+use scan::{Anchor, Candidates, first_match, run_start};
 pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
 use strip::{remove_boundaries, strip_control_characters};
 
@@ -53,7 +57,7 @@ pub(crate) fn ends_awaiting_value(dropped: &str) -> bool {
     // Nothing is awaited without a keyword in the text, and most tails have none.
     let names_a_credential = (0..plain.len()).any(|at| {
         match_credential_keyword(plain.as_bytes(), at).is_some()
-            || match_word(plain.as_bytes(), at, b"authorization").is_some()
+            || match_word(plain.as_bytes(), at, AUTHORIZATION).is_some()
     });
     if !names_a_credential {
         return false;
@@ -133,86 +137,143 @@ fn match_credential_keyword(bytes: &[u8], at: usize) -> Option<usize> {
 /// `basic` counts as well as `bearer`: it is the same header carrying the same credential, and a
 /// base64 user:password is no less a secret for being the older spelling.
 fn redact_bearer(raw: &str) -> String {
-    rewrite(raw, |bytes, at| {
-        let after_keyword = match_word(bytes, at, b"authorization")?;
-        let after_colon = match_byte(bytes, skip_spaces(bytes, after_keyword), b':')?;
-        let scheme_start = skip_spaces(bytes, after_colon);
-        let after_scheme = match_word(bytes, scheme_start, b"bearer")
-            .or_else(|| match_word(bytes, scheme_start, b"basic"))?;
-        // A boundary marker stands where a byte was removed between the scheme and its token.
-        let token_start = take_while(bytes, after_scheme, |byte| {
-            is_space_byte(byte) || byte == strip::BOUNDARY_BYTE
-        });
-        if token_start == after_scheme {
-            return None;
-        }
-        let token_end = take_while(bytes, token_start, is_value_byte);
-        if token_end == token_start {
-            return None;
-        }
-        Some(Rewrite {
-            end: token_end,
-            replacement: format!("{} {REDACTED}", as_text(bytes, at, after_scheme)),
-        })
+    rewrite(raw, header_colon, bearer_rule)
+}
+
+/// The header name the bearer rule starts at.
+const AUTHORIZATION: &[u8] = b"authorization";
+
+fn bearer_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
+    let after_keyword = match_word(bytes, at, AUTHORIZATION)?;
+    let after_colon = match_byte(bytes, skip_spaces(bytes, after_keyword), b':')?;
+    let scheme_start = skip_spaces(bytes, after_colon);
+    let after_scheme = match_word(bytes, scheme_start, b"bearer")
+        .or_else(|| match_word(bytes, scheme_start, b"basic"))?;
+    // A boundary marker stands where a byte was removed between the scheme and its token.
+    let token_start = take_while(bytes, after_scheme, |byte| {
+        is_space_byte(byte) || byte == strip::BOUNDARY_BYTE
+    });
+    if token_start == after_scheme {
+        return None;
+    }
+    let token_end = take_while(bytes, token_start, is_value_byte);
+    if token_end == token_start {
+        return None;
+    }
+    Some(Rewrite {
+        end: token_end,
+        replacement: format!("{} {REDACTED}", as_text(bytes, at, after_scheme)),
     })
+}
+
+/// The next `:` and the one place [`bearer_rule`] can start to reach it.
+///
+/// The rule wants `authorization`, any spaces, then the colon. The name ends in a letter, so it
+/// ends where the spaces before the colon begin and starts its own length before that.
+fn header_colon(bytes: &[u8], from: usize) -> Option<Anchor> {
+    let colon = first_match(bytes, from, |byte| byte == b':')?;
+    let name_end = run_start(bytes, colon, is_space_byte);
+    let starts = match name_end.checked_sub(AUTHORIZATION.len()) {
+        Some(start) => start..start + 1,
+        None => 0..0,
+    };
+    Some(Anchor { at: colon, starts })
 }
 
 /// `api_key=`, `secret:`, `token = `, … and whatever value follows.
 fn redact_assignments(raw: &str) -> String {
-    rewrite(raw, |bytes, at| {
-        let after_keyword = match_credential_keyword(bytes, at)?;
-        // `AWS_SECRET_ACCESS_KEY=` is a keyword with the rest of a name after it. Requiring the
-        // separator to follow the keyword itself would redact only the spellings that happen to
-        // end on one, which is a minority of the names credentials actually have.
-        let name_end = take_while(bytes, after_keyword, is_name_byte);
-        let separator = skip_spaces(bytes, name_end);
-        let after_separator =
-            match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
-        let value_start = skip_spaces(bytes, after_separator);
-        let value_end = take_while(bytes, value_start, is_value_byte);
-        if value_end == value_start {
-            return None;
-        }
-        Some(Rewrite {
-            end: value_end,
-            replacement: format!("{}={REDACTED}", as_text(bytes, at, name_end)),
-        })
+    rewrite(raw, assignment_separator, assignment_rule)
+}
+
+fn assignment_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
+    let after_keyword = match_credential_keyword(bytes, at)?;
+    // `AWS_SECRET_ACCESS_KEY=` is a keyword with the rest of a name after it. Requiring the
+    // separator to follow the keyword itself would redact only the spellings that happen to
+    // end on one, which is a minority of the names credentials actually have.
+    let name_end = take_while(bytes, after_keyword, is_name_byte);
+    let separator = skip_spaces(bytes, name_end);
+    let after_separator =
+        match_byte(bytes, separator, b'=').or_else(|| match_byte(bytes, separator, b':'))?;
+    let value_start = skip_spaces(bytes, after_separator);
+    let value_end = take_while(bytes, value_start, is_value_byte);
+    if value_end == value_start {
+        return None;
+    }
+    Some(Rewrite {
+        end: value_end,
+        replacement: format!("{}={REDACTED}", as_text(bytes, at, name_end)),
+    })
+}
+
+/// The next `=` or `:` and the places [`assignment_rule`] can start to reach it.
+///
+/// The rule wants a keyword, the rest of the name, any spaces, then the separator. A keyword is
+/// made of name bytes, so the whole match up to the spaces lies in the run of name bytes that
+/// ends where those spaces begin, and it can start anywhere in that run.
+fn assignment_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
+    let separator = first_match(bytes, from, |byte| (byte == b'=') | (byte == b':'))?;
+    let name_end = run_start(bytes, separator, is_space_byte);
+    let name_start = run_start(bytes, name_end, is_name_byte);
+    Some(Anchor {
+        at: separator,
+        starts: name_start..name_end,
     })
 }
 
 /// The password half of `scheme://user:password@host`.
 fn redact_url_passwords(raw: &str) -> String {
-    rewrite(raw, |bytes, at| {
-        if !bytes.get(at)?.is_ascii_alphabetic() {
-            return None;
-        }
-        let scheme_end = take_while(bytes, at + 1, |byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-')
-        });
-        let after_scheme = match_word(bytes, scheme_end, b"://")?;
-        let user_end = take_while(bytes, after_scheme, |byte| {
-            !matches!(
-                byte,
-                b' ' | b'\t' | b'\n' | b'\r' | b':' | b'/' | b'?' | b'#'
-            )
-        });
-        // The user half is optional: `redis://:hunter2@db/main` is what a URL looks like when
-        // only a password was configured.
-        let password_start = match_byte(bytes, user_end, b':')?;
-        let password_end = take_while(bytes, password_start, |byte| {
-            !matches!(
-                byte,
-                b' ' | b'\t' | b'\n' | b'\r' | b'@' | b'/' | b'?' | b'#'
-            )
-        });
-        if password_end == password_start || bytes.get(password_end) != Some(&b'@') {
-            return None;
-        }
-        Some(Rewrite {
-            end: password_end,
-            replacement: format!("{}{REDACTED}", as_text(bytes, at, password_start)),
-        })
+    rewrite(raw, scheme_separator, url_password_rule)
+}
+
+/// What ends a scheme and opens the authority of a URL.
+const SCHEME_SEPARATOR: &[u8] = b"://";
+
+fn url_password_rule(bytes: &[u8], at: usize) -> Option<Rewrite> {
+    if !bytes.get(at)?.is_ascii_alphabetic() {
+        return None;
+    }
+    let scheme_end = take_while(bytes, at + 1, is_scheme_byte);
+    let after_scheme = match_word(bytes, scheme_end, SCHEME_SEPARATOR)?;
+    let user_end = take_while(bytes, after_scheme, |byte| {
+        !matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b':' | b'/' | b'?' | b'#'
+        )
+    });
+    // The user half is optional: `redis://:hunter2@db/main` is what a URL looks like when
+    // only a password was configured.
+    let password_start = match_byte(bytes, user_end, b':')?;
+    let password_end = take_while(bytes, password_start, |byte| {
+        !matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b'@' | b'/' | b'?' | b'#'
+        )
+    });
+    if password_end == password_start || bytes.get(password_end) != Some(&b'@') {
+        return None;
+    }
+    Some(Rewrite {
+        end: password_end,
+        replacement: format!("{}{REDACTED}", as_text(bytes, at, password_start)),
     })
+}
+
+/// What a URL's scheme is made of after its first letter.
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-')
+}
+
+/// The next `:` and the places [`url_password_rule`] can start to reach it.
+///
+/// The rule wants a letter, the rest of a scheme, then `://`. A colon that does not open `://`
+/// allows no start; one that does allows any start in the run of scheme bytes that ends at it.
+fn scheme_separator(bytes: &[u8], from: usize) -> Option<Anchor> {
+    let colon = first_match(bytes, from, |byte| byte == b':')?;
+    let starts = match match_word(bytes, colon, SCHEME_SEPARATOR) {
+        Some(_) => run_start(bytes, colon, is_scheme_byte)..colon,
+        None => 0..0,
+    };
+    Some(Anchor { at: colon, starts })
 }
 
 /// What one rule matched: where the match ends, and what stands in its place.
@@ -221,23 +282,38 @@ struct Rewrite {
     replacement: String,
 }
 
-/// Scans left to right, letting `rule` claim a span starting at each word boundary.
-fn rewrite(raw: &str, rule: impl Fn(&[u8], usize) -> Option<Rewrite>) -> String {
+/// Scans left to right, letting `rule` claim a span starting at a word boundary.
+///
+/// The result is what trying `rule` at every word boundary in turn gives, the leftmost match
+/// first and the next one looked for where it ends. `locate` is how the scan gets there without
+/// trying every word: it finds the punctuation the rule cannot match without and the starts that
+/// reach it (see [`Candidates`]), and the text between two matches is copied whole. Every rule
+/// starts at an ASCII letter and ends at an ASCII byte or the end of the text, so both ends of a
+/// copied span are character boundaries.
+fn rewrite(
+    raw: &str,
+    locate: impl Fn(&[u8], usize) -> Option<Anchor>,
+    rule: impl Fn(&[u8], usize) -> Option<Rewrite>,
+) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        if starts_a_word(bytes, at)
-            && let Some(found) = rule(bytes, at)
-        {
-            out.push_str(&found.replacement);
-            at = found.end;
+    let mut candidates = Candidates::new(locate);
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(at) = candidates.next_from(bytes, from) {
+        from = at + 1;
+        if !starts_a_word(bytes, at) {
             continue;
         }
-        let next = next_char_boundary(raw, at);
-        out.push_str(&raw[at..next]);
-        at = next;
+        let Some(found) = rule(bytes, at) else {
+            continue;
+        };
+        out.push_str(&raw[copied..at]);
+        out.push_str(&found.replacement);
+        copied = found.end;
+        from = found.end;
     }
+    out.push_str(&raw[copied..]);
     out
 }
 
@@ -251,14 +327,6 @@ fn starts_a_word(bytes: &[u8], at: usize) -> bool {
         Some(byte) => !byte.is_ascii_alphanumeric(),
         None => true,
     }
-}
-
-fn next_char_boundary(raw: &str, at: usize) -> usize {
-    let mut next = at + 1;
-    while next < raw.len() && !raw.is_char_boundary(next) {
-        next += 1;
-    }
-    next.min(raw.len())
 }
 
 fn match_word(bytes: &[u8], at: usize, word: &[u8]) -> Option<usize> {

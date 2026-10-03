@@ -26,6 +26,7 @@ with `-` filter cases by substring; flags such as `--bench` are ignored.
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `mango-external-agents` / `framing`   | `LineStream`: a 128 KiB line at 16 KiB chunks; a 1 MiB line at 4 KiB, 16 KiB and 1 MiB chunks; 15-byte, 100-byte, 1 KiB and 64 KiB records at 16 KiB chunks; an invalid-UTF-8 line (the lossy repair path); the captured fixture transcripts replayed at 4 KiB and 16 KiB chunks                                                                                                                                                                                                                       |
 | `mango-external-agents` / `events`    | `EventSink::emit` plus drain for 1 KiB deltas (ASCII, JSON escapes, non-ASCII, characters the sanitiser strips) and a rich activity; the same events serialized to a counting writer and to a string; `normalize::sanitize_field` alone; `normalize::bound_text` at the detail limit over clean ASCII, a late or early non-ASCII character, an escape at, before and after the bound, and ANSI command output; the emit and drain of an activity whose detail has a late non-ASCII character or escape |
+| `mango-external-agents` / `redact`    | `redact::stderr_text` over a 1 KiB and a 16 KiB stderr tail, 320 KiB per sample: plain diagnostic lines, lines that carry each credential shape, coloured output with control characters throughout, and lines dense in separators and box-drawing characters with nothing to redact                                                                                                                                                                                                                   |
 | `mango-external-agents` / `copies`    | `Client` dispatch of prebuilt frames through a scripted link (1 KiB notification, 500 KB diff notification, 500 KB and error responses); `stdio::open` link sends of 1 KiB and 1 MiB messages into a counting sink, each timed from its call to the end of its write                                                                                                                                                                                                                                   |
 | `mango-agent-acp` / `reducer`         | `Reducer::update_at` on tool-call frames: ten 100 KiB diffs as a new call, as an update and as a completion; a 1 MiB image ahead of a text block; a 1 MiB text body; the frames most agents send (two 2 KiB diffs, a short text); and a 1000- and 10000-call `session/load` replay, through `update_at` and through `Reducer::session_facts`; held updates of one call (2 KiB to 1 MiB)                                                                                                                |
 | `mango-agent-codex` / `pipeline`      | Per stage and end to end: raw line to JSON, `Notification::parse`, `TurnReducer::reduce`, emit, drain, serialize. 1 KiB text deltas; 500 KB patch updates (throttled and emitted); a file change started and completed; command output inside the throttle window (1 KiB, 8 KiB and 64 KiB chunks); every captured Codex transcript                                                                                                                                                                    |
@@ -77,14 +78,21 @@ the pattern's branches first.
 
 The line-feed search behind `LineStream` tests 32 bytes at a time for the same reason.
 
-When `rust-toolchain.toml` moves, build the `events` and `framing` binaries with the old and the
-new toolchain (`RUSTUP_TOOLCHAIN` and a `CARGO_TARGET_DIR` each) and compare
-`normalize/sanitize_field-1KiB/*`, `normalize/bound_text-4KiB/clean-ascii` and
-`framing/records-1KiB/chunk-16KiB`. A scalar loop is a several-fold step in the clean cases and
-the 1 KiB records, with the `dirty` case and `framing/records-15B/chunk-16KiB` unmoved, not a few
-percent. `objdump -d` on the bench binary confirms it: a vectorized `sanitize_owned` holds
-`pcmpeqb` instructions on x86-64, a scalar one holds none. A vectorized `bound_text` holds
-`pminub`, and a vectorized `first_line_feed` holds `pcmpeqb`.
+The redactor behind `redact::stderr_text` finds the bytes it has to stop at the same way, 32 at a
+time: a `:` or `=` for the credential rules, and the first byte of a removed character for the
+control-character stripper. Text between two of them is copied without being read a word at a
+time.
+
+When `rust-toolchain.toml` moves, build the `events`, `framing` and `redact` binaries with the old
+and the new toolchain (`RUSTUP_TOOLCHAIN` and a `CARGO_TARGET_DIR` each) and compare
+`normalize/sanitize_field-1KiB/*`, `normalize/bound_text-4KiB/clean-ascii`,
+`framing/records-1KiB/chunk-16KiB` and `redact/stderr_text-16KiB/plain`. A scalar loop is a
+several-fold step in the clean cases and the 1 KiB records, with the `dirty` case and
+`framing/records-15B/chunk-16KiB` unmoved, not a few percent. The redactor does more than search,
+so there the step is smaller: a byte-wise search made the plain cases about 1.7 times slower.
+`objdump -d` on the bench binary confirms it: a vectorized `sanitize_owned` holds `pcmpeqb`
+instructions on x86-64, a scalar one holds none. A vectorized `bound_text` holds `pminub`, and a
+vectorized `first_line_feed` or `redact::scan::first_match` holds `pcmpeqb`.
 
 ## Why this harness
 

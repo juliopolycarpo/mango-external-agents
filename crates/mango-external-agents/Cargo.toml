@@ -77,6 +77,10 @@ name = "events"
 harness = false
 
 [[bench]]
+name = "redact"
+harness = false
+
+[[bench]]
 name = "copies"
 harness = false
 required-features = ["stdio"]
