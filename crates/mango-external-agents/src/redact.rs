@@ -16,6 +16,8 @@
 
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod reference;
 mod scan;
 mod strip;
 #[cfg(test)]
