@@ -150,11 +150,6 @@ fn assert_work_is_linear(caller: &str, measure: fn(&str) -> usize, per_byte: usi
         let small = (shape.build)(SMALL);
         let large = (shape.build)(2 * SMALL);
         let (small_steps, large_steps) = (measure(&small), measure(&large));
-        eprintln!(
-            "RATIO {caller} {} {}",
-            shape.what,
-            small_steps / small.len()
-        );
         for (len, steps) in [(small.len(), small_steps), (large.len(), large_steps)] {
             let budget = per_byte * len;
             if steps > budget {
