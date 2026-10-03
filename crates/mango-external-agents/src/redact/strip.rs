@@ -10,7 +10,7 @@
 //! One pass over the text. Nothing here looks back, and a scan for an OSC terminator stops at the
 //! next escape, so the work is linear in the length of the text.
 
-use super::scan::first_match;
+use super::scan::{count_steps, first_match};
 use super::{AUTHORIZATION, is_unsafe_to_render, match_credential_keyword, match_word};
 
 /// Marks where a removed byte stood in front of a credential name. Every C0 control is stripped
@@ -264,6 +264,7 @@ fn csi_end(bytes: &[u8], start: usize) -> usize {
         .get(at)
         .is_some_and(|byte| (0x20..=0x3f).contains(byte))
     {
+        count_steps(1);
         at += 1;
     }
     pick(bytes, at, final_end(bytes, at, 0x40..=0x7e))
@@ -283,6 +284,7 @@ fn string_end(bytes: &[u8], start: usize, bel_ends: bool) -> Option<usize> {
         .min(start.saturating_add(OSC_PAYLOAD_LIMIT).saturating_add(1));
     let mut at = start;
     while at < limit {
+        count_steps(1);
         match bytes[at] {
             0x07 if bel_ends => return Some(at + 1),
             b'\n' => return None,

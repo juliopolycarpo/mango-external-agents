@@ -11,6 +11,46 @@
 
 use std::ops::Range;
 
+/// A count of the bytes the scanners below look at, kept only in test builds.
+///
+/// A rule that reads the same text again for each of many candidates is linear on ordinary input
+/// and quadratic on a crafted one, and a timer cannot tell the two apart without being slow or
+/// flaky. The count can: it is the same on every machine, so a test asserts the work a text costs
+/// is proportional to its length. A release build compiles every call to nothing.
+#[cfg(test)]
+pub(super) mod steps {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SCANNED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Adds `count` bytes looked at.
+    pub(in crate::redact) fn add(count: usize) {
+        SCANNED.with(|scanned| scanned.set(scanned.get().saturating_add(count)));
+    }
+
+    /// Runs `work` and returns how many bytes the scanners looked at while it ran.
+    ///
+    /// Counted per thread, so a test that runs beside others reads only its own work.
+    pub(in crate::redact) fn counted(work: impl FnOnce()) -> usize {
+        let before = SCANNED.with(Cell::get);
+        work();
+        SCANNED.with(Cell::get).saturating_sub(before)
+    }
+}
+
+/// Records `count` bytes looked at; nothing outside a test build.
+#[cfg(not(test))]
+#[inline(always)]
+pub(super) fn count_steps(_count: usize) {}
+
+/// Records `count` bytes looked at, for the work tests.
+#[cfg(test)]
+pub(super) fn count_steps(count: usize) {
+    steps::add(count);
+}
+
 /// Bytes [`first_match`] tests between two chances to stop.
 ///
 /// 32, as in the line-feed search of `process::line_break`: the wanted byte is found by a
@@ -46,6 +86,7 @@ pub(super) fn first_match(bytes: &[u8], from: usize, wanted: impl Fn(u8) -> bool
         .count();
     let skipped = clean * SCAN_BLOCK;
     let found = rest[skipped..].iter().position(|byte| wanted(*byte));
+    count_steps(skipped + found.map_or(rest.len() - skipped, |offset| offset + 1));
     found.map(|offset| from + skipped + offset)
 }
 
@@ -62,6 +103,7 @@ pub(super) fn run_start(bytes: &[u8], end: usize, keep: impl Fn(u8) -> bool) -> 
     while let Some(before) = start.checked_sub(1)
         && bytes.get(before).is_some_and(|byte| keep(*byte))
     {
+        count_steps(1);
         start = before;
     }
     start
@@ -81,8 +123,13 @@ pub(super) struct Anchor {
 /// `locate(bytes, from)` returns the first anchor at or after `from`. It must report every anchor,
 /// and `starts` must hold every start whose match reaches that anchor, or a credential goes
 /// unredacted; `redact::differential` holds each rule's `locate` to the scan that tries every
-/// word. Anchors are visited once each, so the work is linear in the text as long as `locate`
-/// reads only the bytes between the anchor before and the one it returns.
+/// word.
+///
+/// Two things keep the work linear. Anchors are visited once each. And a start that a rule rejects
+/// must not cost a read of text that the next start would read again: whatever every start of an
+/// anchor shares, such as the value after a separator or the authority after `://`, is decided in
+/// `locate`, which returns no starts when no match can follow. What `locate` reads past its anchor
+/// has to be read for this anchor only, and each `locate` says why it is.
 pub(super) struct Candidates<Locate> {
     locate: Locate,
     /// Where the search for the next anchor resumes.
@@ -117,6 +164,7 @@ impl<Locate: Fn(&[u8], usize) -> Option<Anchor>> Candidates<Locate> {
             let start = self.starts.start.max(from);
             if start < self.starts.end {
                 self.starts.start = start + 1;
+                count_steps(1);
                 return Some(start);
             }
             let anchor = (self.locate)(bytes, self.searched.max(from))?;
