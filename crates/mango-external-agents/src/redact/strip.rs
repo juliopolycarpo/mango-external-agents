@@ -10,7 +10,8 @@
 //! One pass over the text. Nothing here looks back, and a scan for an OSC terminator stops at the
 //! next escape, so the work is linear in the length of the text.
 
-use super::{is_unsafe_to_render, match_credential_keyword, match_word};
+use super::scan::first_match;
+use super::{AUTHORIZATION, is_unsafe_to_render, match_credential_keyword, match_word};
 
 /// Marks where a removed byte stood in front of a credential name. Every C0 control is stripped
 /// from the input, so it cannot already be in the text; it is not a letter, so a name after it
@@ -83,6 +84,51 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut at = 0;
     let mut removed = false;
+    loop {
+        // Nothing is removed from, or marked in, text that follows a kept character and holds
+        // no byte a removed character starts with, so it is copied whole.
+        if !removed {
+            let end = clean_end(bytes, at);
+            out.push_str(&raw[at..end]);
+            at = end;
+        }
+        let Some(character) = raw.get(at..).and_then(|rest| rest.chars().next()) else {
+            break;
+        };
+        let after = at + character.len_utf8();
+        if let Some(end) = escape_end(bytes, at, character) {
+            at = end;
+            removed = true;
+            continue;
+        }
+        let kept = character == '\t' || character == '\n' || !is_unsafe_to_render(character);
+        if !kept {
+            at = after;
+            removed = true;
+            continue;
+        }
+        if removed
+            && out.ends_with(|last: char| last.is_ascii_alphanumeric())
+            && (starts_credential_name(bytes, at) || ends_with_scheme(&out))
+        {
+            out.push(BOUNDARY);
+        }
+        removed = false;
+        out.push(character);
+        at = after;
+    }
+    out
+}
+
+/// [`strip_control_characters`] as it was before clean text was copied whole: every character
+/// read and pushed on its own. Kept as the definition of the right answer for
+/// `redact::differential`.
+#[cfg(test)]
+pub(super) fn strip_every_character(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut at = 0;
+    let mut removed = false;
     while let Some(character) = raw.get(at..).and_then(|rest| rest.chars().next()) {
         let after = at + character.len_utf8();
         if let Some(end) = escape_end(bytes, at, character) {
@@ -109,11 +155,37 @@ pub(super) fn strip_control_characters(raw: &str) -> String {
     out
 }
 
+/// Where the text from `at` first holds a byte a removed character can start with: the end of
+/// what [`strip_control_characters`] may copy without reading it a character at a time.
+fn clean_end(bytes: &[u8], at: usize) -> usize {
+    // A kept character that shares a lead byte with a removed one seldom comes alone (a drawn
+    // table is a run of them), and a block search that stops where it started only adds work.
+    if bytes
+        .get(at)
+        .is_some_and(|byte| starts_a_removed_character(*byte))
+    {
+        return at;
+    }
+    first_match(bytes, at, starts_a_removed_character).unwrap_or(bytes.len())
+}
+
+/// Whether a byte can be the first of a character [`strip_control_characters`] removes: a C0
+/// control or DEL as itself, and the lead byte of each multi-byte sequence that holds one (`C2`
+/// for the C1 controls, `D8` for U+061C, `E2` for the marks, embeddings and isolates). Every
+/// escape starts with one of them. Tab and line feed are kept, so they are not counted; a kept
+/// character can share a lead byte (an em dash leads with `E2`), and the caller then decides with
+/// the exact per-character test.
+///
+/// Comparisons joined by `|` and `&`, as [`first_match`] needs.
+fn starts_a_removed_character(byte: u8) -> bool {
+    let control = (byte < 0x20) & (byte != b'\t') & (byte != b'\n');
+    control | (byte == 0x7f) | (byte == 0xc2) | (byte == 0xd8) | (byte == 0xe2)
+}
+
 /// Whether a credential's name starts at `at`: `api_key` or one of the keywords, or the
 /// `Authorization` header.
 fn starts_credential_name(bytes: &[u8], at: usize) -> bool {
-    match_credential_keyword(bytes, at).is_some()
-        || match_word(bytes, at, b"authorization").is_some()
+    match_credential_keyword(bytes, at).is_some() || match_word(bytes, at, AUTHORIZATION).is_some()
 }
 
 /// Whether `text` ends in an authorization scheme, `Bearer` or `Basic`, whose token the bearer
@@ -254,6 +326,53 @@ mod tests {
             assert!(
                 !redacted.contains("secret"),
                 "expected the value redacted after {what} | input {raw:?} received {redacted:?}"
+            );
+        }
+    }
+
+    /// The clean-text copy skips every character whose first byte is not counted, so each
+    /// character the stripper removes, and each one that starts an escape, has to be counted.
+    #[test]
+    fn every_removed_character_starts_with_a_counted_byte() {
+        for character in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let mut buffer = [0; 4];
+            let encoded = character.encode_utf8(&mut buffer).as_bytes();
+            let kept =
+                character == '\t' || character == '\n' || !super::is_unsafe_to_render(character);
+            let removed = !kept || super::escape_end(encoded, 0, character).is_some();
+            assert!(
+                !removed || super::starts_a_removed_character(encoded[0]),
+                "expected the first byte of removed U+{:04X} counted | received {:#04x} not \
+                 counted",
+                u32::from(character),
+                encoded[0]
+            );
+        }
+        for byte in [b'\t', b'\n', b' ', b'a', b'~', 0x80, 0xc3, 0xe1, 0xe3, 0xff] {
+            assert!(
+                !super::starts_a_removed_character(byte),
+                "expected {byte:#04x} not counted, so text made of it is copied whole | received \
+                 counted"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_text_ends_at_the_first_counted_byte_or_the_end_of_the_text() {
+        for (text, at, expected) in [
+            ("plain\ttext\n", 0, 11),
+            ("ab\u{1b}[0m", 0, 2),
+            ("ab\u{1b}[0m", 2, 2),
+            ("ab\u{1b}[0m", 3, 6),
+            ("é—x", 0, 2),
+            ("", 0, 0),
+            ("abc", 3, 3),
+        ] {
+            let received = super::clean_end(text.as_bytes(), at);
+            assert_eq!(
+                received, expected,
+                "expected the clean text of {text:?} from {at} to end at {expected} | received \
+                 {received}"
             );
         }
     }
