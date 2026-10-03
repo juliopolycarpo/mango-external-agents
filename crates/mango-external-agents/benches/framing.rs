@@ -155,21 +155,29 @@ fn main() {
         );
     }
 
-    // Many short records: total framing cost, not only the drain.
-    let records = 1092 * 256;
-    let bytes = short_records(records, 15);
-    bench.run(
-        "framing/records-15B/chunk-16KiB",
-        Unit::new(records as u64, "record"),
-        || ChunkSource::new(&bytes, 16 * KIB),
-        |source| {
-            let (lines, _) = frame(&rt, source);
-            assert_eq!(
-                lines, records,
-                "expected {records} records, received {lines}"
-            );
-        },
-    );
+    // Many records per read, then a record that spans reads: total framing cost, not only the
+    // drain. 16 KiB is what the launcher reads from a child's stdout at a time. 15 bytes is the
+    // floor, 100 bytes a short notification, 1 KiB a text delta, 64 KiB a tool result.
+    for (label, record_len, records) in [
+        ("records-15B", 15, 1092 * 256),
+        ("records-100B", 100, 16 * KIB),
+        ("records-1KiB", KIB, 2 * KIB),
+        ("records-64KiB", 64 * KIB, 32),
+    ] {
+        let bytes = short_records(records, record_len);
+        bench.run(
+            &format!("framing/{label}/chunk-16KiB"),
+            Unit::new(records as u64, "record"),
+            || ChunkSource::new(&bytes, 16 * KIB),
+            |source| {
+                let (lines, _) = frame(&rt, source);
+                assert_eq!(
+                    lines, records,
+                    "expected {records} records, received {lines}"
+                );
+            },
+        );
+    }
 
     // Invalid UTF-8 takes the lossy repair path. 256 KiB raw repairs to 768 KiB, which stays
     // inside the default buffer budget whether or not the repaired size is checked.

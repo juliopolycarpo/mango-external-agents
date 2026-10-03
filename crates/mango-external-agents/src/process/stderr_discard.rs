@@ -7,6 +7,7 @@
 //! rules read on the next line, because they skip line breaks between a name, its separator and
 //! its value. Bytes are only ever dropped here; nothing is cut before redaction.
 
+use super::line_break::first_line_feed;
 use crate::redact::{
     self, MAX_ESCAPE_BYTES, holds_string_terminator, is_space_byte, is_stripped_byte,
 };
@@ -76,7 +77,7 @@ impl Discard {
                 }
                 self.phase = Phase::Line;
             }
-            let Some(offset) = chunk[at..].iter().position(|byte| *byte == b'\n') else {
+            let Some(offset) = first_line_feed(&chunk[at..]) else {
                 self.push_text(&chunk[at..]);
                 return None;
             };
