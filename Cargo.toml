@@ -9,7 +9,7 @@ edition = "2024"
 homepage = "https://mangostudio.dev"
 license = "MIT"
 repository = "https://github.com/juliopolycarpo/mango-external-agents"
-rust-version = "1.96"
+rust-version = "1.97"
 
 # Lockstep: every crate takes its version from [workspace.package] and every
 # in-workspace dependency is declared here once, so a release bump touches one

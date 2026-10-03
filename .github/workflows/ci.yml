@@ -72,19 +72,21 @@ jobs:
       - run: dprint check
 
   msrv:
-    name: MSRV (1.96)
+    name: MSRV (1.97)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.96.0 --profile minimal
+      - run: rustup toolchain install 1.97.0 1.96.0 --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: msrv
-      - run: cargo +1.96.0 build --workspace --all-features --locked
-      - run: cargo +1.96.0 build --workspace --no-default-features --locked
+      - run: cargo +1.97.0 build --workspace --all-features --locked
+      - run: cargo +1.97.0 build --workspace --no-default-features --locked
+      # The registry consumer pins the published 0.3.1 crates and declares its own minimum, so it is
+      # checked with the compiler it names rather than with the workspace minimum.
       - run: cargo +1.96.0 check --manifest-path tests/standalone/Cargo.toml --all-targets --all-features --locked
 
   gate:

@@ -84,6 +84,6 @@ jobs:
       # The MSRV lane in ci.yml builds the committed lock, so a compatible release that raises the
       # effective minimum toolchain would only surface when someone next updates the lock. Build the
       # resolved tree with the same toolchain.
-      - run: rustup toolchain install 1.96.0 --profile minimal
-      - run: cargo +1.96.0 build --workspace --all-features
-      - run: cargo +1.96.0 build --workspace --no-default-features
+      - run: rustup toolchain install 1.97.0 --profile minimal
+      - run: cargo +1.97.0 build --workspace --all-features
+      - run: cargo +1.97.0 build --workspace --no-default-features
