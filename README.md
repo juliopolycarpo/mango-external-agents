@@ -83,5 +83,5 @@ probes and one complete event per line for turns. See [fixture capture rules](fi
 
 ## Status
 
-The core and all three harness crates are implemented. Rust 1.96 or newer, edition 2024, MIT.
+The core and all three harness crates are implemented. Rust 1.97 or newer, edition 2024, MIT.
 Release and publishing steps are in [docs/releasing.md](docs/releasing.md).
