@@ -19,8 +19,10 @@ use mango_external_agents::content::ActivityContent;
 use mango_external_agents::host::SystemClock;
 use mango_external_agents::normalize::{TextLimit, bound_text, sanitize_field};
 use mango_external_agents::{
-    Activity, ActivityKind, AgentEvent, AttemptId, EventKind, EventReceiver, EventSink, Limits,
-    SessionId, TurnId,
+    Activity, ActivityKind, ActivityResult, ActivityStatus, AgentEvent, ApprovalDecision,
+    AttemptId, DecisionSource, EventKind, EventReceiver, EventSink, Interaction, InteractionId,
+    InteractionKind, Limits, PermissionEffect, PermissionOption, PermissionRequest,
+    PermissionScope, SessionId, TurnId,
 };
 use support::{Bench, Unit};
 
@@ -60,6 +62,79 @@ fn text_deltas(unit: &str) -> Vec<EventKind> {
     let text = unit.repeat(1024 / unit.len().max(1) + 1);
     (0..EVENTS)
         .map(|_| EventKind::TextDelta { text: text.clone() })
+        .collect()
+}
+
+/// `EVENTS` deltas of `text`, as short as a token or two: here the fixed fields (ids, attempt,
+/// timestamp, tag) are most of what is serialized.
+fn small_deltas(text: &str) -> Vec<EventKind> {
+    let sanitized = sanitize_field(text).text;
+    assert_eq!(
+        sanitized, text,
+        "expected the delta text to reach the buffer unchanged by normalization, received {sanitized:?}"
+    );
+    (0..EVENTS)
+        .map(|_| EventKind::TextDelta {
+            text: text.to_owned(),
+        })
+        .collect()
+}
+
+/// `EVENTS` approval requests with a title, a command detail and three options: the control class
+/// the turn budget reserves room for.
+fn approval_requests() -> Vec<EventKind> {
+    (0..EVENTS)
+        .map(|index| {
+            let interaction = Interaction::new(
+                InteractionId::new(format!("req-{index}")),
+                InteractionKind::Permission,
+                SessionId::new("bench-session"),
+                std::time::SystemTime::UNIX_EPOCH,
+            );
+            let options = vec![
+                PermissionOption::new("allow-once", PermissionEffect::Allow)
+                    .with_scope(PermissionScope::Once),
+                PermissionOption::new("allow-always", PermissionEffect::Allow)
+                    .with_scope(PermissionScope::Session),
+                PermissionOption::new("deny", PermissionEffect::Reject),
+            ];
+            let request = PermissionRequest::new(
+                interaction,
+                ActivityKind::Command,
+                "Run `cargo test`",
+                options,
+            )
+            .with_detail("cargo nextest run --workspace --all-features --locked\n".repeat(4));
+            EventKind::ApprovalRequested { request }
+        })
+        .collect()
+}
+
+/// `EVENTS` answered approvals: a short payload that is all identifiers and tags.
+fn approval_resolutions() -> Vec<EventKind> {
+    (0..EVENTS)
+        .map(|index| {
+            let option = PermissionOption::new("allow-once", PermissionEffect::Allow)
+                .with_scope(PermissionScope::Once);
+            EventKind::ApprovalResolved {
+                interaction_id: InteractionId::new(format!("req-{index}")),
+                decision: ApprovalDecision::from_option(&option, DecisionSource::User),
+            }
+        })
+        .collect()
+}
+
+/// `EVENTS` finished activities with a detail of a few hundred bytes.
+fn completed_activities() -> Vec<EventKind> {
+    (0..EVENTS)
+        .map(|index| {
+            let mut result = ActivityResult::new(ActivityStatus::Completed);
+            result.detail = Some("test result: ok. 42 passed; 0 failed\n".repeat(8));
+            EventKind::ActivityCompleted {
+                call_id: format!("call-{index}"),
+                result,
+            }
+        })
         .collect()
 }
 
@@ -173,7 +248,12 @@ fn main() {
     let per_event = Unit::new(EVENTS as u64, "event");
 
     // A dirty delta carries characters `sanitize_field` strips, so its output is a new string.
-    let shapes: [(&str, Shape); 5] = [
+    let shapes: [(&str, Shape); 10] = [
+        ("delta-16B-ascii", || small_deltas("hello, world....")),
+        ("delta-64B-escapes", || small_deltas(&"a\"b\\".repeat(16))),
+        ("approval-requested", approval_requests),
+        ("approval-resolved", approval_resolutions),
+        ("activity-completed", completed_activities),
         ("delta-1KiB-ascii", || text_deltas("the quick brown fox ")),
         ("delta-1KiB-escapes", || text_deltas("say \"hi\"\\n\t")),
         ("delta-1KiB-unicode", || text_deltas("héllo wörld 日本語 ")),

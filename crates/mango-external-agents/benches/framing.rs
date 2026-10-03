@@ -64,6 +64,62 @@ fn invalid_utf8_line(raw_len: usize) -> Vec<u8> {
     bytes
 }
 
+/// A line of `len` bytes of ASCII with `damage` applied, newline-terminated.
+fn damaged_line(len: usize, damage: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut bytes = vec![b'y'; len];
+    damage(&mut bytes);
+    bytes.push(b'\n');
+    bytes
+}
+
+/// The malformed-record fixtures: where the first invalid byte sits, how much repair expands the
+/// line, and a line cut inside a multibyte character. `len` is the raw line length.
+fn malformed_lines(len: usize) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("valid", damaged_line(len, |_| {})),
+        ("invalid-start", damaged_line(len, |line| line[0] = 0xff)),
+        (
+            "invalid-mid",
+            damaged_line(len, |line| line[len / 2] = 0xff),
+        ),
+        (
+            "invalid-end",
+            damaged_line(len, |line| line[len - 1] = 0xff),
+        ),
+        (
+            "truncated-tail",
+            damaged_line(len, |line| {
+                line[len - 2] = 0xe2;
+                line[len - 1] = 0x82;
+            }),
+        ),
+        (
+            "sparse-1-in-64",
+            damaged_line(len, |line| {
+                line.iter_mut().step_by(64).for_each(|byte| *byte = 0xff);
+            }),
+        ),
+        ("dense-ff", damaged_line(len, |line| line.fill(0xff))),
+    ]
+}
+
+/// Reads `source` to the end and hands the lines back, so the caller drops them outside the clock.
+/// The stream's own buffers are dropped inside it, and both sides of a comparison pay for that.
+fn frame_lines(
+    rt: &tokio::runtime::Runtime,
+    source: ChunkSource,
+    limits: LineLimits,
+) -> Result<Vec<String>> {
+    rt.block_on(async {
+        let mut stream = LineStream::new(Box::new(source), limits);
+        let mut lines = Vec::new();
+        while let Some(line) = stream.next_line().await? {
+            lines.push(line);
+        }
+        Ok(lines)
+    })
+}
+
 /// The lines of every captured transcript under `fixtures/`, as the vendor wrote them.
 ///
 /// A transcript line carries a `>>` or `<<` direction marker that the vendor never sent; it is
@@ -189,6 +245,61 @@ fn main() {
         |source| {
             let (lines, _) = frame(&rt, source);
             assert_eq!(lines, 1, "expected one repaired line, received {lines}");
+        },
+    );
+
+    // Malformed records by invalid-byte position, repaired expansion and raw-line size, either side
+    // of the 128 KiB size at which glibc starts mapping buffers. The routine returns the repaired
+    // lines, so freeing those is outside the clock; the stream's own buffers are freed inside it.
+    // Output is checked against `String::from_utf8_lossy` once, outside the clock.
+    for len in [16 * KIB, 64 * KIB, 512 * KIB] {
+        for (label, bytes) in malformed_lines(len) {
+            let name = format!("framing/malformed/{label}-{}KiB", len / KIB);
+            if !bench.selected(&name) {
+                continue;
+            }
+            let reference = String::from_utf8_lossy(&bytes[..bytes.len() - 1]).into_owned();
+            let framed = frame_lines(
+                &rt,
+                ChunkSource::new(&bytes, 16 * KIB),
+                LineLimits::default(),
+            )
+            .expect("expected the malformed fixture to stay within the default line limits");
+            assert_eq!(
+                framed,
+                [reference],
+                "expected {name} to repair like String::from_utf8_lossy, received a different line"
+            );
+            bench.run(
+                &name,
+                Unit::new(bytes.len() as u64, "byte"),
+                || ChunkSource::new(&bytes, 16 * KIB),
+                |source| frame_lines(&rt, source, LineLimits::default()),
+            );
+        }
+    }
+
+    // A raw line inside `max_line_bytes` whose repair passes `max_buffered_bytes`: refused after
+    // the repaired string is built, with the error naming the repaired size.
+    let refused = damaged_line(MIB - 1, |line| line.fill(0xff));
+    bench.run(
+        "framing/malformed/dense-ff-1MiB-refused",
+        Unit::new(refused.len() as u64, "byte"),
+        || ChunkSource::new(&refused, 16 * KIB),
+        |source| {
+            let error = frame_lines(&rt, source, LineLimits::default()).expect_err(
+                "expected a dense-invalid line at the raw cap to exceed the buffered limit",
+            );
+            assert!(
+                matches!(
+                    error,
+                    mango_external_agents::Error::LimitExceeded {
+                        subject: "bytes of unread vendor output",
+                        ..
+                    }
+                ),
+                "expected the repaired size to be refused as unread output, received {error:?}"
+            );
         },
     );
 
