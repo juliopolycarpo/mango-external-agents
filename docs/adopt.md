@@ -5,9 +5,9 @@ Mango Protocol, HTTP server, database or recovery loop is required.
 
 ## Start with the independent consumer
 
-[`tests/standalone`](../tests/standalone/README.md) is a small consumer with its own workspace
-and lockfile. Its four SDK dependencies are exact registry pins at `=0.3.1`, with no path override.
-Copy that directory anywhere and run:
+[`tests/standalone-current`](../tests/standalone-current/README.md) is a small consumer with its own
+workspace and lockfile. Its four SDK dependencies are exact registry pins at the current published
+release (`=0.4.1`), with no path override. Copy that directory anywhere and run:
 
 ```sh
 cargo test --locked
@@ -21,8 +21,11 @@ optional `launcher-tokio` feature; the library function also accepts a host's cu
 It denies every approval as an explicit example-host policy. Real hosts supply their own consent
 and approval UI. Ctrl+C cancels an active turn; events continue through its terminal before close.
 
-`scripts/check-standalone.sh` copies the consumer outside the repository, verifies registry sources
-and the absence of product dependencies, then tests with and without the bundled launcher.
+`scripts/check-standalone.sh` copies each consumer outside the repository, verifies registry sources
+and the absence of product dependencies, then tests with and without the bundled launcher. CI runs
+the current consumer on the declared minimum Rust version. A second consumer,
+[`tests/standalone-historical`](../tests/standalone-historical/README.md), stays at `=0.3.1` on its
+own older minimum as a fixed control; it is not evidence for any later release.
 The [coupling audit](adoption-audit.md) records the dependency and contract evidence.
 
 The remaining sections explain the ports and optional services when your host needs them.

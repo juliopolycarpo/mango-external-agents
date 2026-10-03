@@ -300,7 +300,9 @@ expect_readme_refusal not-a-version "expected a version like 0.3.1 or 0.4.0-rc.1
 # `check-versions.sh` is what `check.sh`, CI and the release workflow run, so the README rule has to
 # be wired into it: a workspace in lockstep at 0.3.1 whose README says "0.1" must not pass.
 mkdir -p "$readme_fixture/tree/scripts" "$readme_fixture/tree/crates/demo" "$readme_fixture/tree/examples/demo-host"
-cp scripts/check-versions.sh scripts/check-readme-requirements.sh "$readme_fixture/tree/scripts/"
+cp scripts/check-versions.sh scripts/check-readme-requirements.sh scripts/check-consumer-pin.sh "$readme_fixture/tree/scripts/"
+mkdir -p "$readme_fixture/tree/tests/standalone-current"
+printf '[dependencies]\nmango-demo = { version = "=0.3.1", default-features = false }\n' > "$readme_fixture/tree/tests/standalone-current/Cargo.toml"
 printf '[workspace.package]\nversion = "0.3.1"\n\n[workspace.dependencies]\nmango-demo = { path = "crates/demo", version = "0.3.1" }\n' > "$readme_fixture/tree/Cargo.toml"
 printf '[package]\nname = "mango-demo"\nversion.workspace = true\n' > "$readme_fixture/tree/crates/demo/Cargo.toml"
 printf '[package]\nname = "demo-host"\nversion.workspace = true\n' > "$readme_fixture/tree/examples/demo-host/Cargo.toml"
@@ -309,6 +311,35 @@ if ! "$readme_fixture/tree/scripts/check-versions.sh" >/dev/null 2>&1; then
   echo 'expected a lockstep workspace with current README snippets to pass, received a refusal' >&2
   exit 1
 fi
+# The registry consumer's pin is part of the same gate: one release behind passes (a release pull
+# request precedes its publication), two behind is refused with both values named.
+set_consumer_pin() {
+  printf '[dependencies]\nmango-demo = { version = "=%s", default-features = false }\n' "$1" > "$readme_fixture/tree/tests/standalone-current/Cargo.toml"
+}
+set_workspace_version() {
+  printf '[workspace.package]\nversion = "%s"\n\n[workspace.dependencies]\nmango-demo = { path = "crates/demo", version = "%s" }\n' "$1" "$1" > "$readme_fixture/tree/Cargo.toml"
+}
+set_consumer_pin 0.3.0
+if ! output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
+  echo 'expected a consumer pin one release behind to pass, received:' >&2
+  echo "$output" >&2
+  exit 1
+fi
+set_workspace_version 0.3.2
+if output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
+  echo 'expected check-versions.sh to refuse a consumer pin two releases behind, received success' >&2
+  exit 1
+fi
+case $output in
+  *'received =0.3.0 (workspace 0.3.2)'*) ;;
+  *)
+    echo 'expected check-versions.sh to name pin 0.3.0 and workspace 0.3.2, received:' >&2
+    echo "$output" >&2
+    exit 1
+    ;;
+esac
+set_workspace_version 0.3.1
+set_consumer_pin 0.3.1
 write_readme tree/crates/demo/README 0.3 0.1
 if output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
   echo 'expected check-versions.sh to refuse a stale README snippet, received success' >&2

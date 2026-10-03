@@ -43,6 +43,26 @@ stored in the repository or in CI.
    git-cliff notes. A full rerun is safe: a crate already on crates.io and a GitHub release that
    already exists are skipped, and the existing release keeps its notes.
 
+5. Bump the current registry consumer once the release is on crates.io. The consumer can only name
+   a version the registry already has, so the release pull request cannot do this. In a follow-up
+   pull request, change the four `=` pins in `tests/standalone-current/Cargo.toml` to the new
+   version, set its `rust-version` (and "Rust … or newer" in its README) to the minimum the
+   published release declares, update only those four lock entries with that compiler, and test
+   it. `scripts/check-standalone.sh` fails if the consumer's `rust-version` differs from the one the
+   pinned crates declare:
+
+   ```sh
+   export RUSTUP_TOOLCHAIN=$(scripts/check-msrv-features.sh --print-toolchain)
+   cargo update --manifest-path tests/standalone-current/Cargo.toml \
+     -p mango-external-agents -p mango-agent-acp -p mango-agent-claude -p mango-agent-codex
+   scripts/check-standalone.sh --test-only current
+   ```
+
+   `scripts/check-versions.sh` allows the pin to be the workspace version, the release just before
+   it, or a pre-release of the same version, and fails when it falls further behind, so the next
+   release pull request cannot merge before this bump.
+   `tests/standalone-historical` stays at `=0.3.1`; never bump it.
+
 ## First release checklist
 
 Before publishing 0.1.0, run `scripts/check.sh` and `scripts/check-publish.sh`, and verify each

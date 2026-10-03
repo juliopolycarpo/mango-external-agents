@@ -69,7 +69,10 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
   version, and the file is never patched in place. See `docs/harness-codex.md` for why the source
   tree is not vendored.
 - **Toolchain policy.** `rust-toolchain.toml` is bumped within a week of a stable release;
-  `rust-version` is stable − 2 and enforced by the MSRV lane.
+  `rust-version` is stable − 2 and enforced by the MSRV lane, which checks each package with only
+  its own features through `scripts/check-msrv-features.sh` (needs that toolchain installed). A
+  workspace-wide `--no-default-features` build is not bare-core coverage: Cargo unifies the other
+  members' features into it.
 - Every new function gets a test. A bug fix gets a regression test that fails first with the
   expected shape. Mock external I/O with named fake classes, not inline stubs.
 - Error messages include the received value and the expected shape.
