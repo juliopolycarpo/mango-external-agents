@@ -1128,7 +1128,7 @@ impl Session for FailingCancelSession {
     async fn cancel(&self, reason: CancelReason) -> Result<()> {
         let failing = self
             .failures_left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_sub(1)
             })
             .is_ok();
