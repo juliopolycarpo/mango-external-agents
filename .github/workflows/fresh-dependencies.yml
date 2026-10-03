@@ -5,6 +5,17 @@ name: Fresh dependencies
 # tree: this lane does the same, weekly, and reports what would break. It is not part of the CI
 # `Gate` and is not a required check, so a red run here is a signal for the maintainers, never a
 # reason a pull request cannot merge. The committed lock is only ever changed by a reviewed commit.
+#
+# Every run that produced a fresh lock uploads it as the `fresh-dependencies-receipt` artifact with
+# its sha256, the source commit, `rustc -Vv` and the outcome of each gate, whether the gates passed
+# or not. `receipt.json` says which kind of failure a red run is: the resolution (`cargo update`
+# failed, no lock), a gate after it (lock kept), or a gate that rewrote the lock after the snapshot.
+# Gates run with `--locked` against the snapshot, so the kept lock is the graph that was tested.
+#
+# Resolution is `cargo update` under the workspace's `resolver = "3"`, which prefers releases whose
+# `rust-version` fits the declared minimum and falls back only when none does. So this lane tests
+# the graph a host that honours `rust-version` would get; a release that raised the minimum is held
+# back and listed in the summary rather than built.
 
 on:
   schedule:
@@ -14,6 +25,8 @@ on:
     branches: [main]
     paths:
       - .github/workflows/fresh-dependencies.yml
+      - scripts/fresh-receipt.sh
+      - scripts/check-msrv-features.sh
 
 permissions:
   contents: read
@@ -45,45 +58,118 @@ jobs:
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-nextest,cargo-deny
-      - name: Resolve every dependency to its newest compatible release
+      - id: resolve
+        name: Resolve every dependency to its newest compatible release
         # No colour: the workflow-wide `always` puts escape codes in front of the status words the
         # summary greps for.
         env:
           CARGO_TERM_COLOR: never
+          UPDATE_LOG: ${{ runner.temp }}/cargo-update.log
+          RECEIPT_DIR: ${{ runner.temp }}/fresh-receipt
         run: |
-          cargo update 2>&1 | tee "$RUNNER_TEMP/cargo-update.log"
+          cargo update 2>&1 | tee "$UPDATE_LOG"
           {
             echo '### Packages that moved from the committed lock'
             echo
             echo '```'
-            grep -E '^\s*(Updating|Adding|Removing) ' "$RUNNER_TEMP/cargo-update.log" | grep -v 'crates.io index' || echo 'none'
+            grep -E '^\s*(Updating|Adding|Removing) ' "$UPDATE_LOG" | grep -v 'crates.io index' || echo 'none'
+            echo '```'
+            echo
+            echo '### Held back by the minimum Rust version'
+            echo
+            echo '```'
+            grep -E 'requires Rust' "$UPDATE_LOG" || echo 'none'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          # Keep the graph the gates below are about to test, before any of them can touch it.
+          scripts/fresh-receipt.sh snapshot
+      # Every step from here on needs a lock this run resolved, so it is skipped when resolution
+      # failed (otherwise it would test the committed lock and report a misleading green). They are
+      # not chained on each other: one failing gate does not hide the outcome of the rest.
       - name: Record the protocol crates this run resolved
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
         run: |
           {
             echo '### Protocol crates in this run'
             echo
             echo '```'
-            cargo tree -i agent-client-protocol -e normal --depth 0
-            cargo tree -i agent-client-protocol-schema -e normal --depth 0
+            cargo tree -i agent-client-protocol -e normal --depth 0 --locked
+            cargo tree -i agent-client-protocol-schema -e normal --depth 0 --locked
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       # The repository's own rules, applied to the tree this run resolved: a new compatible release
       # must not bring in aws-lc-rs or OpenSSL, or a licence or source the policy refuses. Advisories
       # are left out; they change with the database, not with the lock.
-      - run: scripts/check-tls.sh
-      - run: cargo deny check bans licenses sources
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
-      - run: cargo nextest run --workspace --all-features
-      - run: cargo test --doc --workspace --all-features
-      - run: cargo doc --no-deps --workspace --all-features
+      - id: gate_tls
+        name: TLS policy (ring only)
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        run: scripts/check-tls.sh
+      - id: gate_deny
+        name: cargo deny (bans, licenses, sources)
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        run: cargo deny --locked check bans licenses sources
+      - id: gate_clippy_all_features
+        name: Clippy (all features)
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - id: gate_clippy_no_default_features
+        name: Clippy (workspace, no default features)
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+      - id: gate_nextest
+        name: Tests
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        run: cargo nextest run --workspace --all-features --locked
+      - id: gate_doctest
+        name: Doc tests
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        run: cargo test --doc --workspace --all-features --locked
+      - id: gate_rustdoc
+        name: Docs build
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        run: cargo doc --no-deps --workspace --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      # The MSRV lane in ci.yml builds the committed lock, so a compatible release that raises the
-      # effective minimum toolchain would only surface when someone next updates the lock. Build the
-      # resolved tree with the same toolchain.
-      - run: rustup toolchain install 1.97.0 --profile minimal
-      - run: cargo +1.97.0 build --workspace --all-features
-      - run: cargo +1.97.0 build --workspace --no-default-features
+      # The MSRV lane in ci.yml builds the committed lock, so a compatible release that breaks the
+      # minimum toolchain would only surface when someone next updates the lock. Build the resolved
+      # tree with the same toolchain, and run the same isolated per-package feature checks (one
+      # definition, scripts/check-msrv-features.sh, shared with ci.yml) against the fresh graph.
+      - id: gate_install_msrv
+        name: Install the declared minimum toolchain
+        if: ${{ !cancelled() && steps.resolve.outcome == 'success' }}
+        run: |
+          toolchain=$(scripts/check-msrv-features.sh --print-toolchain)
+          echo "MSRV_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          rustup toolchain install "$toolchain" --profile minimal
+      - id: gate_msrv_workspace
+        name: Minimum toolchain, workspace build (all features)
+        if: ${{ !cancelled() && steps.gate_install_msrv.outcome == 'success' }}
+        run: cargo +"$MSRV_TOOLCHAIN" build --workspace --all-features --locked
+      - id: gate_msrv_isolated_features
+        name: Minimum toolchain, isolated feature checks
+        if: ${{ !cancelled() && steps.gate_install_msrv.outcome == 'success' }}
+        run: scripts/check-msrv-features.sh --locked
+      # Runs after any outcome except a missing resolution step (checkout failed, nothing to keep).
+      - id: receipt
+        name: Write the receipt
+        if: ${{ always() && steps.resolve.outcome != 'skipped' }}
+        env:
+          UPDATE_LOG: ${{ runner.temp }}/cargo-update.log
+          RECEIPT_DIR: ${{ runner.temp }}/fresh-receipt
+          STEPS_JSON: ${{ toJSON(steps) }}
+          SOURCE_SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPOSITORY: ${{ github.repository }}
+        run: scripts/fresh-receipt.sh finish
+      - name: Upload the receipt
+        if: ${{ always() && steps.receipt.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fresh-dependencies-receipt
+          path: ${{ runner.temp }}/fresh-receipt
+          if-no-files-found: error
+          retention-days: 90

@@ -65,6 +65,7 @@ jobs:
       - run: cargo deny check
       - run: scripts/check-versions.sh
       - run: scripts/test-consumer-pin.sh
+      - run: scripts/test-fresh-receipt.sh
       - run: scripts/test-release.sh
       - run: scripts/test-vendor-drift.sh
       - run: scripts/check-dev-dependencies.sh
