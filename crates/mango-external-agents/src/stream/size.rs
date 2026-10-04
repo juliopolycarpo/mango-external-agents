@@ -51,7 +51,13 @@ const SERDE_JSON_PRIVATE: &str = "$serde_json::private::";
 /// [`Unsupported`] when the value needs `serde_json` to be counted, or fails to serialize. The
 /// caller counts it with `serde_json`, which returns the authoritative result.
 pub(super) fn serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<usize, Unsupported> {
-    let mut sizer = Sizer { bytes: 0 };
+    count_from(0, value)
+}
+
+/// [`serialized_len`] with `already` bytes counted before the value, so a test can start the count
+/// next to `usize::MAX`, where an event too large to build would take it.
+fn count_from<T: Serialize + ?Sized>(already: usize, value: &T) -> Result<usize, Unsupported> {
+    let mut sizer = Sizer { bytes: already };
     value.serialize(&mut sizer)?;
     Ok(sizer.bytes)
 }
@@ -91,7 +97,11 @@ fn table_extra(bytes: &[u8]) -> usize {
 /// How many bytes the contents of `text` take once escaped, without the surrounding quotes.
 ///
 /// For example, a line feed is two bytes (`\n`) and U+0001 is six (`\u0001`).
-fn escaped_len(text: &str) -> usize {
+///
+/// # Errors
+///
+/// [`Unsupported`] when the length does not fit in a `usize`, which only a 32-bit target can reach.
+fn escaped_len(text: &str) -> Result<usize, Unsupported> {
     // 32 bytes at a time: the widest escape adds five bytes, so a block's sum is at most 160 and
     // fits one byte, which keeps the inner loop in vector lanes.
     let (blocks, remainder) = text.as_bytes().as_chunks::<32>();
@@ -101,14 +111,22 @@ fn escaped_len(text: &str) -> usize {
         for &byte in block {
             sum = sum.wrapping_add(escape_extra(byte));
         }
-        extra += usize::from(sum);
+        extra = extra.checked_add(usize::from(sum)).ok_or(Unsupported)?;
     }
-    text.len() + extra + table_extra(remainder)
+    extra = extra
+        .checked_add(table_extra(remainder))
+        .ok_or(Unsupported)?;
+    text.len().checked_add(extra).ok_or(Unsupported)
 }
 
 /// A quoted string's length.
-fn quoted_len(text: &str) -> usize {
-    escaped_len(text) + 2
+fn quoted_len(text: &str) -> Result<usize, Unsupported> {
+    plus(escaped_len(text)?, 2)
+}
+
+/// `left + right`, or [`Unsupported`] when the sum does not fit in a `usize`.
+fn plus(left: usize, right: usize) -> Result<usize, Unsupported> {
+    left.checked_add(right).ok_or(Unsupported)
 }
 
 /// How many decimal digits `value` takes.
@@ -134,7 +152,7 @@ fn float_len<T: Serialize>(value: &T) -> Result<usize, Unsupported> {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 += bytes.len();
+            self.0 = self.0.saturating_add(bytes.len());
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -150,6 +168,15 @@ struct Sizer {
     bytes: usize,
 }
 
+impl Sizer {
+    /// Counts `bytes` more, or refuses when the total would pass `usize::MAX`: a wrapped count
+    /// would admit more than the budget allows, so `serde_json` counts such a value instead.
+    fn add(&mut self, bytes: usize) -> Result<(), Unsupported> {
+        self.bytes = plus(self.bytes, bytes)?;
+        Ok(())
+    }
+}
+
 /// A sequence, tuple or map being sized: the separator before every element but the first.
 struct Compound<'a> {
     sizer: &'a mut Sizer,
@@ -159,28 +186,28 @@ struct Compound<'a> {
 }
 
 impl<'a> Compound<'a> {
-    fn open(sizer: &'a mut Sizer, opening: usize, closing: usize) -> Self {
-        sizer.bytes += opening;
-        Self {
+    fn open(sizer: &'a mut Sizer, opening: usize, closing: usize) -> Result<Self, Unsupported> {
+        sizer.add(opening)?;
+        Ok(Self {
             sizer,
             first: true,
             closing,
-        }
+        })
     }
 
-    fn separator(&mut self) {
-        self.sizer.bytes += usize::from(!self.first);
+    fn separator(&mut self) -> Result<(), Unsupported> {
+        self.sizer.add(usize::from(!self.first))?;
         self.first = false;
+        Ok(())
     }
 
     fn element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Unsupported> {
-        self.separator();
+        self.separator()?;
         value.serialize(&mut *self.sizer)
     }
 
     fn finish(self) -> Result<(), Unsupported> {
-        self.sizer.bytes += self.closing;
-        Ok(())
+        self.sizer.add(self.closing)
     }
 }
 
@@ -196,8 +223,7 @@ impl<'a> ser::Serializer for &'a mut Sizer {
     type SerializeStructVariant = Compound<'a>;
 
     fn serialize_bool(self, value: bool) -> Result<(), Unsupported> {
-        self.bytes += if value { 4 } else { 5 };
-        Ok(())
+        self.add(if value { 4 } else { 5 })
     }
 
     fn serialize_i8(self, value: i8) -> Result<(), Unsupported> {
@@ -213,13 +239,11 @@ impl<'a> ser::Serializer for &'a mut Sizer {
     }
 
     fn serialize_i64(self, value: i64) -> Result<(), Unsupported> {
-        self.bytes += signed_digits(value);
-        Ok(())
+        self.add(signed_digits(value))
     }
 
     fn serialize_i128(self, value: i128) -> Result<(), Unsupported> {
-        self.bytes += digits_wide(value.unsigned_abs()) + usize::from(value < 0);
-        Ok(())
+        self.add(digits_wide(value.unsigned_abs()) + usize::from(value < 0))
     }
 
     fn serialize_u8(self, value: u8) -> Result<(), Unsupported> {
@@ -235,23 +259,19 @@ impl<'a> ser::Serializer for &'a mut Sizer {
     }
 
     fn serialize_u64(self, value: u64) -> Result<(), Unsupported> {
-        self.bytes += digits(value);
-        Ok(())
+        self.add(digits(value))
     }
 
     fn serialize_u128(self, value: u128) -> Result<(), Unsupported> {
-        self.bytes += digits_wide(value);
-        Ok(())
+        self.add(digits_wide(value))
     }
 
     fn serialize_f32(self, value: f32) -> Result<(), Unsupported> {
-        self.bytes += float_len(&value)?;
-        Ok(())
+        self.add(float_len(&value)?)
     }
 
     fn serialize_f64(self, value: f64) -> Result<(), Unsupported> {
-        self.bytes += float_len(&value)?;
-        Ok(())
+        self.add(float_len(&value)?)
     }
 
     fn serialize_char(self, value: char) -> Result<(), Unsupported> {
@@ -260,13 +280,12 @@ impl<'a> ser::Serializer for &'a mut Sizer {
     }
 
     fn serialize_str(self, value: &str) -> Result<(), Unsupported> {
-        self.bytes += quoted_len(value);
-        Ok(())
+        self.add(quoted_len(value)?)
     }
 
     /// `serde_json` writes bytes as an array of numbers.
     fn serialize_bytes(self, value: &[u8]) -> Result<(), Unsupported> {
-        let mut seq = Compound::open(self, 1, 1);
+        let mut seq = Compound::open(self, 1, 1)?;
         for byte in value {
             seq.element(byte)?;
         }
@@ -282,8 +301,7 @@ impl<'a> ser::Serializer for &'a mut Sizer {
     }
 
     fn serialize_unit(self) -> Result<(), Unsupported> {
-        self.bytes += 4;
-        Ok(())
+        self.add(4)
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<(), Unsupported> {
@@ -318,14 +336,13 @@ impl<'a> ser::Serializer for &'a mut Sizer {
         value: &T,
     ) -> Result<(), Unsupported> {
         // `{"variant":value}`
-        self.bytes += 1 + quoted_len(variant) + 1;
+        self.add(plus(quoted_len(variant)?, 2)?)?;
         value.serialize(&mut *self)?;
-        self.bytes += 1;
-        Ok(())
+        self.add(1)
     }
 
     fn serialize_seq(self, _len: Option<usize>) -> Result<Compound<'a>, Unsupported> {
-        Ok(Compound::open(self, 1, 1))
+        Compound::open(self, 1, 1)
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Compound<'a>, Unsupported> {
@@ -348,11 +365,11 @@ impl<'a> ser::Serializer for &'a mut Sizer {
         _len: usize,
     ) -> Result<Compound<'a>, Unsupported> {
         // `{"variant":[` ... `]}`
-        Ok(Compound::open(self, 1 + quoted_len(variant) + 1 + 1, 2))
+        Compound::open(self, plus(quoted_len(variant)?, 3)?, 2)
     }
 
     fn serialize_map(self, _len: Option<usize>) -> Result<Compound<'a>, Unsupported> {
-        Ok(Compound::open(self, 1, 1))
+        Compound::open(self, 1, 1)
     }
 
     fn serialize_struct(
@@ -363,7 +380,7 @@ impl<'a> ser::Serializer for &'a mut Sizer {
         if name.starts_with(SERDE_JSON_PRIVATE) {
             return Err(Unsupported);
         }
-        Ok(Compound::open(self, 1, 1))
+        Compound::open(self, 1, 1)
     }
 
     fn serialize_struct_variant(
@@ -374,22 +391,21 @@ impl<'a> ser::Serializer for &'a mut Sizer {
         _len: usize,
     ) -> Result<Compound<'a>, Unsupported> {
         // `{"variant":{` ... `}}`
-        Ok(Compound::open(self, 1 + quoted_len(variant) + 1 + 1, 2))
+        Compound::open(self, plus(quoted_len(variant)?, 3)?, 2)
     }
 
     /// `serde_json` escapes each fragment the formatter writes, and escaping is per character, so
     /// the pieces add up to the escaped whole without building the string.
     fn collect_str<T: fmt::Display + ?Sized>(self, value: &T) -> Result<(), Unsupported> {
-        struct Fragments<'a>(&'a mut usize);
+        struct Fragments<'a>(&'a mut Sizer);
         impl fmt::Write for Fragments<'_> {
             fn write_str(&mut self, fragment: &str) -> fmt::Result {
-                *self.0 += escaped_len(fragment);
-                Ok(())
+                let escaped = escaped_len(fragment).map_err(|_| fmt::Error)?;
+                self.0.add(escaped).map_err(|_| fmt::Error)
             }
         }
-        self.bytes += 2;
-        fmt::write(&mut Fragments(&mut self.bytes), format_args!("{value}"))
-            .map_err(|_| Unsupported)
+        self.add(2)?;
+        fmt::write(&mut Fragments(self), format_args!("{value}")).map_err(|_| Unsupported)
     }
 }
 
@@ -450,12 +466,12 @@ impl ser::SerializeMap for Compound<'_> {
     type Error = Unsupported;
 
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Unsupported> {
-        self.separator();
+        self.separator()?;
         key.serialize(KeySizer(&mut *self.sizer))
     }
 
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Unsupported> {
-        self.sizer.bytes += 1;
+        self.sizer.add(1)?;
         value.serialize(&mut *self.sizer)
     }
 
@@ -473,9 +489,9 @@ impl ser::SerializeStruct for Compound<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), Unsupported> {
-        self.separator();
+        self.separator()?;
         // `"key":`
-        self.sizer.bytes += quoted_len(key) + 1;
+        self.sizer.add(plus(quoted_len(key)?, 1)?)?;
         value.serialize(&mut *self.sizer)
     }
 
@@ -507,8 +523,7 @@ struct KeySizer<'a>(&'a mut Sizer);
 
 impl KeySizer<'_> {
     fn quoted(self, unquoted: usize) -> Result<(), Unsupported> {
-        self.0.bytes += unquoted + 2;
-        Ok(())
+        self.0.add(plus(unquoted, 2)?)
     }
 }
 
@@ -581,7 +596,7 @@ impl ser::Serializer for KeySizer<'_> {
     }
 
     fn serialize_str(self, value: &str) -> Result<(), Unsupported> {
-        self.quoted(escaped_len(value))
+        self.quoted(escaped_len(value)?)
     }
 
     fn serialize_bytes(self, _value: &[u8]) -> Result<(), Unsupported> {
@@ -812,11 +827,12 @@ pub(in crate::stream) mod tests {
     fn escaped_len_equals_the_serde_json_string_length_minus_its_quotes() {
         for text in nasty_texts() {
             let expected = expected_len(&text) - 2;
+            let counted = escaped_len(&text).unwrap_or_else(|Unsupported| {
+                panic!("expected the escaped length of {text:?} to be countable")
+            });
             assert_eq!(
-                escaped_len(&text),
-                expected,
-                "expected the escaped length of {text:?} to be {expected} like serde_json, received {}",
-                escaped_len(&text)
+                counted, expected,
+                "expected the escaped length of {text:?} to be {expected} like serde_json, received {counted}"
             );
         }
     }
@@ -1169,5 +1185,66 @@ pub(in crate::stream) mod tests {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             serializer.serialize_f64(f64::from_bits(self.0))
         }
+    }
+
+    use super::count_from;
+
+    /// Starting the count `room` bytes short of `usize::MAX` leaves exactly `room` bytes for the
+    /// value: an overflowing count must be refused, not wrapped to a small number.
+    fn assert_overflow_refused<T: Serialize + ?Sized>(label: &str, value: &T) {
+        let len = serialized_len(value)
+            .unwrap_or_else(|Unsupported| panic!("expected {label} to be countable"));
+        assert_eq!(
+            count_from(usize::MAX - len, value).ok(),
+            Some(usize::MAX),
+            "expected {label} of {len} bytes to fit exactly into the room left below usize::MAX"
+        );
+        assert!(
+            count_from(usize::MAX - len + 1, value).is_err(),
+            "expected a count one byte past usize::MAX for {label} of {len} bytes to be refused \
+             for serde_json to count, received a wrapped or saturated number"
+        );
+    }
+
+    /// An overflow is an undercount in release and a panic in debug, and the budget is a safety
+    /// limit, so the counter hands the value to the saturating `serde_json` count instead.
+    #[test]
+    fn a_count_that_would_pass_usize_max_is_refused_rather_than_wrapped() {
+        assert_overflow_refused("a bool", &true);
+        assert_overflow_refused("a number", &-1_234_567_i64);
+        assert_overflow_refused("a wide number", &u128::MAX);
+        assert_overflow_refused("a float", &0.1_f64);
+        assert_overflow_refused("a string", &"a\"b\u{1}c");
+        assert_overflow_refused("a long string", &"x\n".repeat(100));
+        assert_overflow_refused("a char", &'"');
+        assert_overflow_refused("a unit", &());
+        assert_overflow_refused("bytes", &Bytes(&[1, 22, 255]));
+        assert_overflow_refused("a displayed value", &Displayed(String::from("a\"b\n")));
+        assert_overflow_refused("a sequence", &[1_u8, 2, 3]);
+        assert_overflow_refused("a map", &BTreeMap::from([("k", 1_u8), ("j", 2)]));
+        assert_overflow_refused("an integer-keyed map", &BTreeMap::from([(1_u8, 1_u8)]));
+        assert_overflow_refused("a struct", &record("text"));
+        assert_overflow_refused(
+            "an external newtype variant",
+            &External::Newtype(String::from("a")),
+        );
+        assert_overflow_refused(
+            "an external tuple variant",
+            &External::Tuple(String::from("a"), 7),
+        );
+        assert_overflow_refused(
+            "an external struct variant",
+            &External::Struct {
+                text: String::from("a"),
+                count: -1,
+            },
+        );
+        assert_overflow_refused(
+            "a tagged enum",
+            &Internal::Struct {
+                text: String::from("a"),
+            },
+        );
+        assert_overflow_refused("a nested value", &Nested(3));
     }
 }
