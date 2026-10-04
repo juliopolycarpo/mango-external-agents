@@ -381,18 +381,22 @@ mod tests {
         Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate, AgentEvent,
         EventKind, SessionId, ThreadUsage, TurnId, Usage,
     };
+    use crate::event::{Credits, RateLimitWindow, ResetCredit, ResetCredits, SpendControl};
     use crate::extension::{ExtensionValue, Extensions};
-    use crate::interaction::{Interaction, InteractionId, InteractionKind};
     use crate::interaction::{
-        Question, QuestionForm, QuestionId, QuestionOutcome, QuestionRequest,
+        Answer, AnswerValue, InteractionStatus, Question, QuestionForm, QuestionId, QuestionOption,
+        QuestionOptionId, QuestionOutcome, QuestionRequest, UnsupportedQuestion,
     };
+    use crate::interaction::{Interaction, InteractionId, InteractionKind};
     use crate::operation::AttemptId;
+    use crate::operation::OperationRef;
     use crate::permission::{
         PermissionEffect, PermissionOption, PermissionRequest, PermissionScope,
     };
+    use crate::session::CancelReason;
     use crate::{AccountLimits, ApprovalDecision, DecisionSource, ErrorCode, VendorError};
     use crate::{Error, Limits};
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     /// Small enough to fill with a handful of events, large enough that the half reserved for
     /// interactions still holds several of them: a payload delta is 205 serialized bytes here and
@@ -679,8 +683,43 @@ mod tests {
         let mut error = VendorError::new(ErrorCode::from_static("vendor-failed"), text);
         error.request_id = Some(text.to_owned());
         error.vendor_code = Some(text.to_owned());
-        let mut limits = AccountLimits::unknown(SystemTime::UNIX_EPOCH);
+        // A moment with a fraction of a second, so the timestamps carry both of their fields.
+        let moment = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        let mut limits = AccountLimits::unknown(moment);
         limits.plan_type = Some(text.to_owned());
+        limits.windows = vec![
+            RateLimitWindow {
+                label: Some(text.to_owned()),
+                used_percent: 12.5,
+                window_duration_minutes: Some(300),
+                resets_at: Some(moment),
+            },
+            RateLimitWindow::default(),
+        ];
+        limits.credits = Some(Credits {
+            has_credits: Some(true),
+            unlimited: Some(false),
+            balance: Some(text.to_owned()),
+        });
+        limits.spend_control = Some(SpendControl {
+            limit: Some(text.to_owned()),
+            used: Some(text.to_owned()),
+            remaining_percent: Some(33.3),
+            resets_at: Some(moment),
+            reached: Some(false),
+        });
+        limits.reset_credits = Some(ResetCredits {
+            available_count: u64::MAX,
+            credits: Some(vec![ResetCredit {
+                id: text.to_owned(),
+                reset_type: Some(text.to_owned()),
+                status: text.to_owned(),
+                granted_at: Some(moment),
+                expires_at: None,
+                title: Some(text.to_owned()),
+                description: Some(text.to_owned()),
+            }]),
+        });
         let usage = Usage {
             input_tokens: Some(u64::MAX),
             output_tokens: Some(0),
@@ -695,6 +734,38 @@ mod tests {
         )
         .with_detail(text)
         .required();
+        let choice = Question::new(
+            QuestionId::new("choice"),
+            text,
+            QuestionForm::Choice {
+                options: vec![
+                    QuestionOption::new(QuestionOptionId::new(text))
+                        .with_label(text)
+                        .with_description(text),
+                    QuestionOption::new(QuestionOptionId::new("plain")),
+                ],
+                multi_select: true,
+            },
+        );
+        let answers = vec![
+            Answer::new(
+                QuestionId::new(text),
+                AnswerValue::Chosen {
+                    option_ids: vec![QuestionOptionId::new(text)],
+                },
+            ),
+            Answer::new(
+                QuestionId::new("free"),
+                AnswerValue::Text {
+                    text: text.to_owned(),
+                },
+            ),
+            Answer::new(QuestionId::new("skipped"), AnswerValue::Declined),
+        ];
+        let resolved = |outcome| EventKind::QuestionResolved {
+            interaction_id: InteractionId::new(text),
+            outcome,
+        };
         [
             EventKind::TurnStarted {
                 native_turn_id: text.to_owned(),
@@ -741,17 +812,49 @@ mod tests {
                 decision: ApprovalDecision::from_option(&option, DecisionSource::User),
             },
             EventKind::QuestionAsked {
-                request: QuestionRequest::new(interaction(), vec![question]).with_title(text),
+                request: QuestionRequest::new(
+                    interaction()
+                        .during(OperationRef::new(
+                            SessionId::new(text),
+                            TurnId::new(text),
+                            AttemptId::FIRST,
+                        ))
+                        .resolved_as(InteractionStatus::Resolved),
+                    vec![question, choice],
+                )
+                .with_title(text),
             },
-            EventKind::QuestionResolved {
-                interaction_id: InteractionId::new(text),
-                outcome: QuestionOutcome::Expired,
+            resolved(QuestionOutcome::Answered { answers }),
+            resolved(QuestionOutcome::Expired),
+            resolved(QuestionOutcome::Cancelled),
+            resolved(QuestionOutcome::Refused {
+                reason: UnsupportedQuestion::UnrecognisedForm {
+                    received: text.to_owned(),
+                },
+            }),
+            resolved(QuestionOutcome::Refused {
+                reason: UnsupportedQuestion::SecretCollection,
+            }),
+            resolved(QuestionOutcome::Refused {
+                reason: UnsupportedQuestion::ArbitraryForm,
+            }),
+            EventKind::Cancelled {
+                reason: CancelReason::Requested,
+            },
+            EventKind::Cancelled {
+                reason: CancelReason::ConsentRevoked,
+            },
+            EventKind::Cancelled {
+                reason: CancelReason::Timeout,
+            },
+            EventKind::Cancelled {
+                reason: CancelReason::Shutdown,
             },
             EventKind::Usage { usage },
             EventKind::ThreadUsage {
                 usage: ThreadUsage {
                     last: Some(usage),
-                    total: None,
+                    total: Some(usage),
                     context_window_tokens: Some(200_000),
                 },
             },
@@ -762,6 +865,46 @@ mod tests {
         .into_iter()
         .map(event)
         .collect()
+    }
+
+    /// The name of an event kind, matched exhaustively so a new kind fails to compile here until the
+    /// corpus is taught about it.
+    fn kind_name(kind: &EventKind) -> &'static str {
+        match kind {
+            EventKind::TurnStarted { .. } => "TurnStarted",
+            EventKind::TextDelta { .. } => "TextDelta",
+            EventKind::ReasoningStarted => "ReasoningStarted",
+            EventKind::ReasoningDelta { .. } => "ReasoningDelta",
+            EventKind::ReasoningEnded => "ReasoningEnded",
+            EventKind::ActivityStarted { .. } => "ActivityStarted",
+            EventKind::ActivityUpdated { .. } => "ActivityUpdated",
+            EventKind::ActivityCompleted { .. } => "ActivityCompleted",
+            EventKind::ApprovalRequested { .. } => "ApprovalRequested",
+            EventKind::ApprovalResolved { .. } => "ApprovalResolved",
+            EventKind::QuestionAsked { .. } => "QuestionAsked",
+            EventKind::QuestionResolved { .. } => "QuestionResolved",
+            EventKind::Usage { .. } => "Usage",
+            EventKind::ThreadUsage { .. } => "ThreadUsage",
+            EventKind::AccountLimits { .. } => "AccountLimits",
+            EventKind::Cancelled { .. } => "Cancelled",
+            EventKind::Completed => "Completed",
+            EventKind::Error { .. } => "Error",
+        }
+    }
+
+    /// Every kind of event is in the corpus, so "one event of every kind" is a checked claim.
+    #[test]
+    fn the_corpus_holds_every_event_kind() {
+        const KINDS: usize = 18;
+        let names: std::collections::BTreeSet<&str> = corpus("text")
+            .iter()
+            .map(|event| kind_name(&event.kind))
+            .collect();
+        assert_eq!(
+            names.len(),
+            KINDS,
+            "expected the corpus to hold all {KINDS} event kinds, received {names:?}"
+        );
     }
 
     /// The contract: the number the buffer budgets an event at is its serialized length, byte for
