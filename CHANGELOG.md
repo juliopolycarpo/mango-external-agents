@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.4.2] - 2026-10-04
+
+### 🐛 Bug Fixes
+
+- **(core)** Redact long credential names and URL schemes in linear time (#128)
+
+### ⚡ Performance
+
+- **(core)** Count event bytes and repair malformed lines faster (#129)
+
+### 👷 CI
+
+- Check isolated features on the minimum Rust and keep fresh locks (#127)
+
 ## [0.4.1] - 2026-10-03
 
 ### ⚡ Performance
