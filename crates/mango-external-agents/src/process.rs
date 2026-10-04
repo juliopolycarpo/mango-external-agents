@@ -1756,7 +1756,7 @@ mod tests {
     #[tokio::test]
     async fn framed_malformed_records_equal_the_lossy_decoder_however_they_are_cut() {
         let inputs = decoder_inputs();
-        for group in inputs.chunks(7).take(400) {
+        for group in inputs.chunks(7) {
             let mut bytes = Vec::new();
             for (index, record) in group.iter().enumerate() {
                 bytes.extend_from_slice(record);
