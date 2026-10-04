@@ -1,7 +1,7 @@
 # Independent Rust host
 
 Copy this directory outside the repository. It has its own workspace and lockfile, and resolves
-all four published SDK crates at `=0.4.1` through crates.io. This is the **current-release**
+all four published SDK crates at `=0.4.2` through crates.io. This is the **current-release**
 consumer: its pin follows the latest published release (bumped after each release, see
 `docs/releasing.md`), and CI runs it on the declared minimum Rust version. It is evidence for the
 published release it names, not for unpublished code in the repository. The fixed
