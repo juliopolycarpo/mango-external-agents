@@ -280,7 +280,10 @@ fn main() {
     }
 
     // A raw line inside `max_line_bytes` whose repair passes `max_buffered_bytes`: refused after
-    // the repaired string is built, with the error naming the repaired size.
+    // the repaired string is built, with the error naming the repaired size. Nothing is returned
+    // from this routine, so the roughly 3 MiB repaired string and the stream's 1 MiB buffer are
+    // freed inside the clock, and so is the assertion on the error. A bench cannot move those
+    // outside it; read the case as the cost of a refusal, frees included, on both sides.
     let refused = damaged_line(MIB - 1, |line| line.fill(0xff));
     bench.run(
         "framing/malformed/dense-ff-1MiB-refused",
