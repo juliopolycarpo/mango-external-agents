@@ -1570,6 +1570,10 @@ impl Shared {
                         .map_or_else(|| String::from("none"), |signal| signal.to_string())
                 ));
             }
+            // Redacted here even though `StderrTail::read` already redacts: the control is the
+            // host's own `ProcessControl`, its tail is only asked to be redacted, and this text
+            // is about to cross into a failure the host logs. The second pass never reveals
+            // anything and may redact more.
             let stderr = mango_external_agents::redact::stderr_text(&control.stderr_tail());
             if !stderr.is_empty() {
                 message.push_str(&format!("; stderr: {stderr}"));
@@ -4792,6 +4796,66 @@ mod tests {
         assert!(
             !error.message.contains("sk-private-value"),
             "expected credential-redacted stderr"
+        );
+    }
+
+    /// A host's own `ProcessControl`, whose tail is whatever the child wrote: the trait asks an
+    /// implementor to redact it and nothing checks that it did.
+    struct UnredactedTailControl {
+        tail: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl mango_external_agents::ProcessControl for UnredactedTailControl {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.tail.to_owned()
+        }
+
+        async fn wait(&self) -> mango_external_agents::Result<mango_external_agents::ExitStatus> {
+            Ok(mango_external_agents::ExitStatus {
+                code: Some(1),
+                signal: None,
+            })
+        }
+
+        async fn kill(
+            &self,
+            _reason: mango_external_agents::CancelReason,
+        ) -> mango_external_agents::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_failure_redacts_a_tail_the_host_did_not() {
+        let shared = shared();
+        let control = UnredactedTailControl {
+            tail: "fatal: API_KEY=sk-host-unredacted\nAuthorization: Bearer host-bearer-secret",
+        };
+        assert!(shared.control.set(Arc::new(control)).is_ok());
+        let (_, mut stream) = running(&shared, "turn-1").await;
+
+        shared.connection_terminated(PeerTermination::Exited).await;
+
+        let event = stream.recv().await.expect("terminal error");
+        let EventKind::Error { error } = event.kind else {
+            panic!("expected a terminal error | received {:?}", event.kind)
+        };
+        for secret in ["sk-host-unredacted", "host-bearer-secret"] {
+            assert!(
+                !error.message.contains(secret),
+                "expected a tail the host did not redact to be redacted before it is reported | received {:?}",
+                error.message
+            );
+        }
+        assert!(
+            error.message.contains("stderr: fatal: API_KEY=[REDACTED]"),
+            "expected the redacted stderr in the failure | received {:?}",
+            error.message
         );
     }
 

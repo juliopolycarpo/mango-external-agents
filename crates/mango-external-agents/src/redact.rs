@@ -369,14 +369,14 @@ fn rewrite(
         let Some(found) = rule(bytes, at) else {
             continue;
         };
-        out.push_str(&raw[copied..at]);
+        out.push_str(&span(raw, copied, at));
         out.push_str(&as_text(bytes, at, found.kept_end));
         out.push_str(found.joiner);
         out.push_str(REDACTED);
         copied = found.end;
         from = found.end;
     }
-    out.push_str(&raw[copied..]);
+    out.push_str(&span(raw, copied, raw.len()));
     out
 }
 
@@ -456,6 +456,25 @@ fn is_value_byte(byte: u8) -> bool {
     !is_space_byte(byte) && !matches!(byte, b',' | b';')
 }
 
+/// `raw[from..to]`, borrowed, for a span whose ends are character boundaries.
+///
+/// Every rule starts at an ASCII letter and ends at an ASCII byte or the end of the text, so the
+/// spans [`rewrite`] copies always are. Should one ever not be, the text is repaired the way
+/// [`as_text`] repairs it rather than panicking in a diagnostic path. The boundary check is the
+/// one slicing makes, so the common case costs the same.
+///
+/// # Example
+///
+/// ```ignore
+/// assert_eq!(span("caf\u{e9}", 0, 3), "caf");
+/// ```
+fn span(raw: &str, from: usize, to: usize) -> Cow<'_, str> {
+    match raw.get(from..to) {
+        Some(text) => Cow::Borrowed(text),
+        None => as_text(raw.as_bytes(), from, to),
+    }
+}
+
 /// `bytes[from..to]` as text, borrowed unless it is not valid UTF-8.
 fn as_text(bytes: &[u8], from: usize, to: usize) -> Cow<'_, str> {
     String::from_utf8_lossy(bytes.get(from..to).unwrap_or_default())
@@ -476,12 +495,63 @@ fn is_unsafe_to_render(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ends_awaiting_value, has_value, is_stripped_byte, program_name, stderr_text, url_password,
+        Anchor, Rewrite, ends_awaiting_value, has_value, is_stripped_byte, program_name, rewrite,
+        span, stderr_text, url_password,
     };
 
     /// The fixture a vendor child writes in the port's own process test.
     const FIXTURE: &str =
         "Authorization: Bearer top-secret API_KEY=another-secret redis://app:password@db/main";
+
+    /// A rule that breaks the invariant `rewrite` relies on: it claims a span that begins in the
+    /// middle of the two-byte `\u{e9}`. No rule in this module does, which is the point of not
+    /// depending on it.
+    #[test]
+    fn rewrite_does_not_panic_when_a_span_starts_inside_a_character() {
+        let outcome = std::panic::catch_unwind(|| {
+            rewrite(
+                "\u{e9}-ab",
+                |_, from| {
+                    (from == 0).then_some(Anchor {
+                        at: 1,
+                        starts: 1..2,
+                    })
+                },
+                |_, at| {
+                    (at == 1).then_some(Rewrite {
+                        end: 3,
+                        kept_end: 1,
+                        joiner: "=",
+                    })
+                },
+            )
+        });
+
+        let text = outcome.unwrap_or_else(|_| {
+            panic!(
+                "expected rewrite to copy the text before a span that starts mid-character | received a panic"
+            )
+        });
+        assert_eq!(
+            text, "\u{fffd}=[REDACTED]ab",
+            "expected the split character repaired and the rest kept | received {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_borrows_a_whole_slice_and_repairs_a_cut_character() {
+        assert!(
+            matches!(span("caf\u{e9}", 0, 3), std::borrow::Cow::Borrowed("caf")),
+            "expected a borrowed slice between boundaries"
+        );
+        assert_eq!(span("caf\u{e9}", 0, 4), "caf\u{fffd}");
+        assert_eq!(span("caf\u{e9}", 4, 5), "\u{fffd}");
+        assert_eq!(
+            span("abc", 2, 9),
+            "",
+            "expected an out-of-range span to be empty"
+        );
+    }
 
     #[test]
     fn redacts_every_credential_shape_in_the_fixture() {

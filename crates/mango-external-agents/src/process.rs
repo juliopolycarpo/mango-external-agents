@@ -113,6 +113,14 @@ pub trait ProcessControl: Send + Sync {
     fn pid(&self) -> Option<u32>;
 
     /// Whatever the child wrote to stderr, bounded and credential-redacted.
+    ///
+    /// Both properties are the implementor's to provide: the library does not check the length or
+    /// the content of what this returns. A launcher satisfies the contract by keeping the child's
+    /// stderr in a [`StderrTail`] and returning its [`read`](StderrTail::read), which bounds it by
+    /// the capacity the host chose and redacts it. The Claude, Codex and ACP harnesses redact the
+    /// tail again before they put it in an error or a diagnostic, because they cannot know every
+    /// host did, so a control that skips this does not leak through them. Text a host reads from
+    /// the control itself is only as redacted as the control made it.
     fn stderr_tail(&self) -> String;
 
     /// Waits for the child to exit.
@@ -380,6 +388,38 @@ impl Default for StderrTail {
 
 impl StderrTail {
     /// A tail that keeps at most `max_bytes` of the most recent output.
+    ///
+    /// The capacity is the host's to choose: the library imposes no upper bound, because no
+    /// documented limit in this crate could justify one. [`DEFAULT_STDERR_TAIL_BYTES`] is a
+    /// default, not a maximum, and `0` retains nothing for `read` to return. What a larger value
+    /// costs, per tail:
+    ///
+    /// - Memory. Up to `max_bytes` stay resident for as long as the tail lives, and
+    ///   [`push`](Self::push) appends a chunk before it trims, so the buffer briefly holds
+    ///   `max_bytes` plus that chunk. Each [`read`](Self::read) then copies the tail, and the text
+    ///   it returns is not bounded by `max_bytes`: a byte that is not valid UTF-8 becomes a 3-byte
+    ///   replacement character and a credential's value becomes `[REDACTED]`. A cut that is still
+    ///   open also keeps a window of the stderr it dropped, so the next bytes can be judged
+    ///   against the name that preceded them: a few KiB at most, whatever the capacity,
+    ///   so `0` returns nothing from `read` but does not hold nothing.
+    /// - Time. Redaction is linear in the tail, so a read costs in proportion to `max_bytes`. It
+    ///   runs after the tail's lock is released, so it delays the caller of `read` and never the
+    ///   writer calling `push`.
+    ///
+    /// A host that sets this from untrusted configuration should bound it first.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::StderrTail;
+    /// use mango_external_agents::process::DEFAULT_STDERR_TAIL_BYTES;
+    ///
+    /// // A host-owned bound: never more than four times the default.
+    /// let requested = usize::MAX;
+    /// let tail = StderrTail::with_capacity(requested.min(4 * DEFAULT_STDERR_TAIL_BYTES));
+    /// tail.push(b"diagnostic\n");
+    /// assert_eq!(tail.read(), "diagnostic\n");
+    /// ```
     pub fn with_capacity(max_bytes: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(TailState::default())),
@@ -471,8 +511,26 @@ impl StderrTail {
     /// assert_eq!(tail.read(), "Authorization: Bearer [REDACTED]");
     /// ```
     pub fn read(&self) -> String {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        redact::stderr_text(&String::from_utf8_lossy(&state.buffer))
+        self.read_with(redact::stderr_text)
+    }
+
+    /// [`read`](Self::read) with the redactor injected, so a test can stand inside the window
+    /// where the tail is being redacted.
+    ///
+    /// Only the copy happens under the lock, so a large tail never holds up the stderr writer for
+    /// the length of a redaction. The copy is a local that goes straight into `redact`, and what
+    /// comes back is its result: no code path returns, stores or logs the unredacted bytes, and a
+    /// concurrent reader runs the same function on its own copy. A push that lands after the copy
+    /// is not part of this read and is part of the next, so the tail is read as one snapshot, in
+    /// push order.
+    fn read_with(&self, redact: impl FnOnce(&str) -> String) -> String {
+        let copy = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .buffer
+            .clone();
+        redact(&String::from_utf8_lossy(&copy))
     }
 }
 
@@ -1646,6 +1704,83 @@ mod tests {
             read.len() <= 32,
             "expected at most 32 bytes, received {}",
             read.len()
+        );
+    }
+
+    /// What a reader running alongside a redaction observed, recorded by [`MidRedaction`].
+    #[derive(Default)]
+    struct Observed {
+        lock_state: Option<&'static str>,
+        concurrent_read: Option<String>,
+        text_seen_by_redactor: Option<String>,
+    }
+
+    /// A redactor that stops the tail at the point where its text has been copied out and is being
+    /// redacted, and uses that window the way a stderr writer and a second reader would. The real
+    /// redactor then runs, so the result is what `read` would have returned.
+    struct MidRedaction<'a> {
+        tail: &'a StderrTail,
+        late_chunk: &'a [u8],
+        observed: std::cell::RefCell<Observed>,
+    }
+
+    impl<'a> MidRedaction<'a> {
+        fn new(tail: &'a StderrTail, late_chunk: &'a [u8]) -> Self {
+            Self {
+                tail,
+                late_chunk,
+                observed: std::cell::RefCell::default(),
+            }
+        }
+
+        fn redact(&self, text: &str) -> String {
+            let free = self.tail.state.try_lock().is_ok();
+            let mut observed = self.observed.borrow_mut();
+            observed.lock_state = Some(if free { "unlocked" } else { "locked" });
+            observed.text_seen_by_redactor = Some(text.to_owned());
+            // The writer and the second reader can only run here when the lock is free. Where it is
+            // held, calling them would deadlock instead of failing with a message.
+            if free {
+                self.tail.push(self.late_chunk);
+                observed.concurrent_read = Some(self.tail.read());
+            }
+            crate::redact::stderr_text(text)
+        }
+    }
+
+    #[test]
+    fn a_stderr_tail_is_redacted_after_the_lock_is_released() {
+        let tail = StderrTail::with_capacity(1024);
+        tail.push(b"first line\nAPI_KEY=first-secret\n");
+        let mid = MidRedaction::new(&tail, b"later line\nAPI_KEY=later-secret\n");
+
+        let read = tail.read_with(|text| mid.redact(text));
+
+        let observed = mid.observed.into_inner();
+        assert_eq!(
+            observed.lock_state,
+            Some("unlocked"),
+            "expected the tail lock released while the tail is redacted | received {:?}",
+            observed.lock_state
+        );
+        assert_eq!(
+            read, "first line\nAPI_KEY=[REDACTED]\n",
+            "expected the read to hold the tail as it was when it was copied | received {read:?}"
+        );
+        let concurrent = observed.concurrent_read.unwrap_or_default();
+        assert_eq!(
+            concurrent, "first line\nAPI_KEY=[REDACTED]\nlater line\nAPI_KEY=[REDACTED]\n",
+            "expected a reader during the redaction to see the push, redacted | received {concurrent:?}"
+        );
+        let after = tail.read();
+        assert_eq!(
+            after, concurrent,
+            "expected a later read to keep every byte in push order | received {after:?}"
+        );
+        let seen = observed.text_seen_by_redactor.unwrap_or_default();
+        assert_eq!(
+            seen, "first line\nAPI_KEY=first-secret\n",
+            "expected the redactor to be handed the copied tail, not the later push | received {seen:?}"
         );
     }
 

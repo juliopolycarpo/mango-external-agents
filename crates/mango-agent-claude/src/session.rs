@@ -1938,7 +1938,12 @@ fn no_result_error(
         Some((None, Some(signal))) => format!("signal {signal}"),
         Some((None, None)) | None => String::from("no exit status"),
     };
-    let detail = stderr_tail.trim().to_owned();
+    // Redacted here although `StderrTail::read` redacts: the control is the host's own
+    // `ProcessControl`, whose tail is only asked to be redacted, and this text goes into an error
+    // the host logs. The second pass never reveals anything and may redact more.
+    let detail = mango_external_agents::redact::stderr_text(&stderr_tail)
+        .trim()
+        .to_owned();
     let message = if detail.is_empty() {
         format!("Claude Code ended without a result ({ended})")
     } else {

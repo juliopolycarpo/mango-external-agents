@@ -122,6 +122,26 @@ const SHAPES: &[Shape] = &[
         what: "keywords with no separator at all",
         build: |len| repeated("token password secret ", "", len),
     },
+    Shape {
+        what: "nothing but colons",
+        build: |len| ":".repeat(len),
+    },
+    Shape {
+        what: "one assignment after another with one-letter names",
+        build: |len| repeated("a=", "", len),
+    },
+    Shape {
+        what: "one long name made of short words before a single assignment",
+        build: |len| repeated("a_", "=v", len),
+    },
+    Shape {
+        what: "spaces before a colon with no name",
+        build: |len| format!("{}:", " ".repeat(len)),
+    },
+    Shape {
+        what: "scheme separators one after another with one-letter schemes",
+        build: |len| repeated("a://", "", len),
+    },
 ];
 
 fn redaction_steps(text: &str) -> usize {
