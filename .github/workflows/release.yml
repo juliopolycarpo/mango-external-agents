@@ -1,7 +1,8 @@
 name: Release
 
 # Cut a release from a signed v* tag: verify GitHub reports the tag as signed,
-# verify the manifests agree with the tag, run the check lane, publish the four crates to crates.io in dependency order
+# verify the manifests agree with the tag, run the check lane and the isolated minimum-Rust
+# feature checks, publish the four crates to crates.io in dependency order
 # through crates.io trusted publishing (OIDC, no stored token), and create a
 # GitHub release with git-cliff notes. The publish job runs in the `release`
 # environment, whose deployment rule admits only v* tags.
@@ -65,6 +66,12 @@ jobs:
           VERSION: ${{ steps.resolve.outputs.version }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: scripts/check-release-tag-signature.sh "$REPOSITORY" "$VERSION" "$RELEASE_COMMIT"
+      # The compiler comes from `rust-version` in Cargo.toml through the script that checks it, as in
+      # ci.yml's MSRV job, so the release cannot drift from the declared minimum. Installing it does
+      # not select it: the steps below keep the toolchain pinned in rust-toolchain.toml, and only
+      # check-msrv-features.sh asks cargo for the minimum by name.
+      - name: Install the declared minimum toolchain
+        run: rustup toolchain install "$(scripts/check-msrv-features.sh --print-toolchain)" --profile minimal
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
@@ -81,6 +88,12 @@ jobs:
       # Running the bare dry run here instead would let a tag pass a check the gate rejects.
       - name: Publication gate
         run: scripts/check-publish.sh --list
+      # One package at a time, so no other member can switch a feature on for it: bare core, each
+      # public feature alone, all features, and the harness crates without defaults. check.sh above
+      # builds the whole workspace on the pinned toolchain, which proves neither the minimum nor
+      # isolation. A tag that fails here publishes nothing.
+      - name: Isolated feature checks on the declared minimum
+        run: scripts/check-msrv-features.sh --locked
       # Expanded package sources contain ordinary tests/ directories. The pinned cache action
       # treats them as nested build targets and logs missing target/trybuild errors on save.
       - name: Remove successful publication scratch before caching

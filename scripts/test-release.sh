@@ -119,6 +119,86 @@ fi
 rm -rf "$tag_bin"
 echo 'release tag signature checks passed'
 
+# A tag must pass the isolated minimum-Rust feature check before the publish job exists to run, and
+# a release workflow change can only be exercised by a real tag, so its shape is pinned here. The
+# verify job installs the toolchain the script itself names (no version literal to drift from
+# `rust-version`), runs `scripts/check-msrv-features.sh --locked`, and never selects the minimum for
+# the other steps: `check.sh` and `check-publish.sh` stay on the pinned toolchain. Comment lines are
+# ignored so a note cannot satisfy a check. Every refusal names the behaviour, the file and what
+# the file holds instead. RELEASE_WORKFLOW points the check at another file.
+release_workflow=${RELEASE_WORKFLOW:-$PWD/.github/workflows/release.yml}
+workflow_job() {
+  awk -v job="  $2:" '$0 == job { found = 1; next } found && /^  [A-Za-z0-9_-]+:/ { found = 0 } found' "$1" |
+    grep -v '^[[:space:]]*#' || true
+}
+check_release_workflow() {
+  local file=$1
+  local verify check_line install_line found
+  verify=$(workflow_job "$file" verify)
+  if ! grep -qF -- 'scripts/check-msrv-features.sh --locked' <<<"$verify"; then
+    echo "expected the release verify job in $file to run the isolated minimum-Rust feature check 'scripts/check-msrv-features.sh --locked' before publishing, received no such step" >&2
+    return 1
+  fi
+  if ! grep -qF -- 'rustup toolchain install' <<<"$verify" || ! grep -qF -- 'check-msrv-features.sh --print-toolchain' <<<"$verify"; then
+    echo "expected the release verify job in $file to install the minimum toolchain named by 'scripts/check-msrv-features.sh --print-toolchain', received no such install step" >&2
+    return 1
+  fi
+  install_line=$(grep -nF -- 'rustup toolchain install' <<<"$verify" | head -n 1)
+  if grep -q '[0-9]\.[0-9]' <<<"$install_line"; then
+    echo "expected the minimum toolchain install in $file to read its version from the script, received a literal version: ${install_line#*:}" >&2
+    return 1
+  fi
+  check_line=$(grep -nF -- 'scripts/check-msrv-features.sh --locked' <<<"$verify" | head -n 1)
+  if [ "${install_line%%:*}" -ge "${check_line%%:*}" ]; then
+    echo "expected the minimum toolchain to be installed before the isolated feature check in $file, received the install at verify line ${install_line%%:*} and the check at line ${check_line%%:*}" >&2
+    return 1
+  fi
+  found=$(workflow_job "$file" crates | grep -E '^[[:space:]]+needs:[[:space:]]*verify[[:space:]]*$' || true)
+  if [ -z "$found" ]; then
+    echo "expected the publish job (crates) in $file to need the verify job, received no 'needs: verify'" >&2
+    return 1
+  fi
+  found=$(grep -v '^[[:space:]]*#' "$file" | grep -E 'RUSTUP_TOOLCHAIN.*GITHUB_ENV|^[[:space:]]*RUSTUP_TOOLCHAIN:' || true)
+  if [ -n "$found" ]; then
+    echo "expected $file to leave the pinned toolchain selected for every other step, received RUSTUP_TOOLCHAIN set job-wide in: $found" >&2
+    return 1
+  fi
+}
+check_release_workflow "$release_workflow"
+workflow_dir=$(mktemp -d)
+trap 'rm -rf "$workflow_dir"' EXIT
+expect_workflow_refusal() {
+  local expected=$1
+  local output
+  if output=$(check_release_workflow "$workflow_dir/release.yml" 2>&1); then
+    echo "expected the workflow check to refuse a mutated copy with '$expected', received success" >&2
+    exit 1
+  fi
+  case "$output" in
+    *"$expected"*) ;;
+    *)
+      echo "expected the workflow check to say '$expected', received: $output" >&2
+      exit 1
+      ;;
+  esac
+}
+grep -v 'check-msrv-features.sh --locked' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to run the isolated minimum-Rust feature check'
+grep -v 'rustup toolchain install' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to install the minimum toolchain named by'
+sed 's/rustup toolchain install "/rustup toolchain install 1.97.0 "/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to read its version from the script, received a literal version'
+awk '/rustup toolchain install/ { held = $0; next } { print } /scripts\/check-msrv-features.sh --locked/ { print held }' \
+  "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to be installed before the isolated feature check'
+sed 's/needs: verify$/needs: []/' "$release_workflow" > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to need the verify job'
+{ cat "$release_workflow"; printf '      - run: echo "RUSTUP_TOOLCHAIN=1.97.0" >> "$GITHUB_ENV"\n'; } > "$workflow_dir/release.yml"
+expect_workflow_refusal 'to leave the pinned toolchain selected for every other step'
+rm -rf "$workflow_dir"
+trap - EXIT
+echo 'release workflow checks passed'
+
 # What the title gate protects: git-cliff has to keep a squash subject that carries no Conventional
 # Commit type, show only its first line, and mark a breaking change. `filter_unconventional = true`
 # — the setting that kept #18 out of v0.1.0's notes — fails the first assertion, dropping the
