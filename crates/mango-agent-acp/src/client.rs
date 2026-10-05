@@ -1983,10 +1983,12 @@ pub(crate) fn is_link_closure(error: &agent_client_protocol::Error) -> bool {
 
 /// A message with the child's stderr appended, when it wrote any.
 ///
-/// The tail arrives already redacted from [`StderrTail`](mango_external_agents::StderrTail) — this
-/// only decides whether there is anything worth appending.
+/// The tail is redacted here, whatever the control did: one from the library's own launchers
+/// arrives redacted from [`StderrTail`](mango_external_agents::StderrTail), but a host's own
+/// `ProcessControl` is only asked to redact, and this text goes into an error the host logs.
+/// Redaction is idempotent, so a tail that arrives clean costs one linear pass.
 pub(crate) fn with_stderr(message: &str, control: &dyn ProcessControl) -> String {
-    let tail = control.stderr_tail();
+    let tail = mango_external_agents::redact::stderr_text(&control.stderr_tail());
     let tail = tail.trim();
     if tail.is_empty() {
         return message.to_owned();
@@ -2259,6 +2261,54 @@ mod tests {
                 "expected the tail to stay off the diagnostic, received {rendered}"
             );
         }
+    }
+
+    /// A host's own `ProcessControl`, whose tail is whatever the child wrote: the trait asks an
+    /// implementor to redact it and nothing checks that it did.
+    struct UnredactedTailControl {
+        tail: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl mango_external_agents::ProcessControl for UnredactedTailControl {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.tail.to_owned()
+        }
+
+        async fn wait(&self) -> mango_external_agents::Result<mango_external_agents::ExitStatus> {
+            Ok(mango_external_agents::ExitStatus::default())
+        }
+
+        async fn kill(
+            &self,
+            _reason: mango_external_agents::CancelReason,
+        ) -> mango_external_agents::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_link_failure_redacts_a_stderr_tail_the_host_did_not() {
+        let control = UnredactedTailControl {
+            tail: "fatal: API_KEY=sk-host-unredacted\nAuthorization: Bearer host-bearer-secret",
+        };
+
+        let message = super::with_stderr("the agent exited", &control);
+
+        for secret in ["sk-host-unredacted", "host-bearer-secret"] {
+            assert!(
+                !message.contains(secret),
+                "expected a tail the host did not redact to be redacted before it is reported | received {message:?}"
+            );
+        }
+        assert!(
+            message.contains("the agent's stderr: fatal: API_KEY=[REDACTED]"),
+            "expected the redacted stderr in the message | received {message:?}"
+        );
     }
 
     /// The cancellation reason belongs to the prompt that was cancelled, even when another prompt
