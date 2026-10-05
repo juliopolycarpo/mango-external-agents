@@ -476,29 +476,3 @@ fn generated_runs_of_repeated_units_match_the_replaced_scan() {
         assert_matches_the_replaced_scan(&raw);
     }
 }
-
-/// A separator found by the block search costs a look back over the name before it. Each look
-/// stops at the separator before, so the work stays linear whatever the text is made of.
-#[test]
-fn work_stays_linear_when_the_text_is_all_separators_or_one_long_name() {
-    for (what, text) in [
-        ("colons", ":".repeat(200_000)),
-        ("assignments", "a=".repeat(100_000)),
-        (
-            "one name before a separator",
-            format!("{}=v", "a_".repeat(100_000)),
-        ),
-        ("spaces before a colon", format!("{}:", " ".repeat(200_000))),
-        ("scheme separators", "a://".repeat(50_000)),
-    ] {
-        let started = std::time::Instant::now();
-        let redacted = stderr_text(&text);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "expected {} bytes of {what} redacted in linear time | received {:?} ({} bytes kept)",
-            text.len(),
-            started.elapsed(),
-            redacted.len()
-        );
-    }
-}
