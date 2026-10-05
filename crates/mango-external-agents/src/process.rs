@@ -117,8 +117,10 @@ pub trait ProcessControl: Send + Sync {
     /// Both properties are the implementor's to provide: the library does not check the length or
     /// the content of what this returns. A launcher satisfies the contract by keeping the child's
     /// stderr in a [`StderrTail`] and returning its [`read`](StderrTail::read), which bounds it by
-    /// the capacity the host chose and redacts it. A harness that puts the text in a diagnostic
-    /// may redact it again, because it cannot know every host did.
+    /// the capacity the host chose and redacts it. The Claude, Codex and ACP harnesses redact the
+    /// tail again before they put it in an error or a diagnostic, because they cannot know every
+    /// host did, so a control that skips this does not leak through them. Text a host reads from
+    /// the control itself is only as redacted as the control made it.
     fn stderr_tail(&self) -> String;
 
     /// Waits for the child to exit.
