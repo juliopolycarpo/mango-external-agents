@@ -134,6 +134,60 @@ impl ByteSink for BrokenPipeStdin {
     }
 }
 
+/// A `claude` whose turn children report a stderr tail the host's own `ProcessControl` did not
+/// redact: the trait only asks an implementor to, and nothing checks that it did.
+struct UnredactedTailLauncher {
+    inner: Arc<FakeClaudeCli>,
+    tail: &'static str,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for UnredactedTailLauncher {
+    async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+        let is_turn = spec.argv.iter().any(|argument| argument == "--print");
+        let mut child = self.inner.spawn(spec).await?;
+        if is_turn {
+            child.control = Arc::new(UnredactedTailControl {
+                inner: child.control,
+                tail: self.tail,
+            });
+        }
+        Ok(child)
+    }
+}
+
+/// The scripted child's control, with its stderr tail swapped for raw text.
+struct UnredactedTailControl {
+    inner: Arc<dyn ProcessControl>,
+    tail: &'static str,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for UnredactedTailControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.tail.to_owned()
+    }
+
+    async fn wait(&self) -> Result<mango_external_agents::ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn interrupt(
+        &self,
+        reason: CancelReason,
+    ) -> Result<mango_external_agents::InterruptOutcome> {
+        self.inner.interrupt(reason).await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> Result<()> {
+        self.inner.kill(reason).await
+    }
+}
+
 /// Makes a probe's failed native cleanup visible to the harness caller.
 struct CleanupRequiredProbeLauncher {
     inner: Arc<FakeClaudeCli>,
@@ -2455,6 +2509,48 @@ mod a_turn {
         assert!(
             error.message.contains("something went wrong"),
             "expected the stderr tail, received {:?}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_result_redacts_a_stderr_tail_the_host_did_not() {
+        let fake = Arc::new(FakeClaudeCli::new().with_turn(Run::Transcript {
+            lines: Vec::new(),
+            exit: mango_external_agents::ExitStatus {
+                code: Some(1),
+                signal: None,
+            },
+        }));
+        let launcher = Arc::new(UnredactedTailLauncher {
+            inner: fake,
+            tail: "error: API_KEY=sk-host-unredacted\nAuthorization: Bearer host-bearer-secret",
+        });
+        let host = host_under(launcher, Limits::default());
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "run it"))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!("expected the turn to end with an error | received: {events:?}");
+        };
+        assert_eq!(error.code.as_str(), "claude-no-result");
+        for secret in ["sk-host-unredacted", "host-bearer-secret"] {
+            assert!(
+                !error.message.contains(secret),
+                "expected a tail the host did not redact to be redacted before it is reported | received {:?}",
+                error.message
+            );
+        }
+        assert!(
+            error.message.contains("error: API_KEY=[REDACTED]"),
+            "expected the redacted stderr in the failure | received {:?}",
             error.message
         );
     }
