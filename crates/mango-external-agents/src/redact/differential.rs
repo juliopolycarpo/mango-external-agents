@@ -2,19 +2,99 @@
 //!
 //! [`stderr_text`](super::stderr_text) copies clean text whole and tries a rule only where
 //! [`Candidates`](super::scan::Candidates) says it can match. The scan it replaced read every
-//! character and tried each rule at every word. That scan is kept here, over the 0.4.1 rules in
-//! `reference`, as the definition of the right answer: each stage has to return it byte for byte,
-//! for every input below, and so does the 0.4.1 pipeline as shipped. A difference is a credential
-//! left in a diagnostic, so the failure names the input.
+//! character and tried each rule at every word. That scan is kept here as the definition of the
+//! right answer for where a rule is tried: each stage has to return what it returns, byte for
+//! byte, for every input below. The bearer rule is tried by the 0.4.1 rule in `reference`, which
+//! it still is. The assignment and URL rules are tried by the rules under test, because a
+//! removed byte no longer parts a name from its separator in them (see `redact::boundaries`) and
+//! the 0.4.1 rules do not read it that way.
+//!
+//! The whole redactor is held to the 0.4.1 pipeline as shipped, with one narrow exception: where a
+//! removed byte stands in a name or a scheme it may differ, because 0.4.1 stopped a name at
+//! the marker the stripper leaves there and let the credential after it through. That is checked,
+//! not listed (see [`Agreement`]): for every input where the two differ, the text must hold a
+//! marker, and the answer must be the one 0.4.1's rules give with the marker read as a hyphen,
+//! with the hyphens of both taken out. A difference anywhere else is a credential left in a
+//! diagnostic, or text altered for nothing, and the failure names the input.
 
 use super::reference::{
-    self, Rewrite, assignment_rule, bearer_rule, remove_boundaries, starts_a_word,
-    strip_every_character, url_password_rule,
+    self, Rewrite, bearer_rule, remove_boundaries, starts_a_word, strip_every_character,
 };
 use super::strip::strip_control_characters;
 use super::{
-    ends_awaiting_value, redact_assignments, redact_bearer, redact_url_passwords, stderr_text,
+    REDACTED, as_text, ends_awaiting_value, redact_assignments, redact_bearer,
+    redact_url_passwords, stderr_text,
 };
+
+/// A rule under test, described the way the replaced scan wants it: where the match ends and the
+/// text that stands in its place.
+fn described(
+    rule: impl Fn(&[u8], usize) -> Option<super::Rewrite>,
+) -> impl Fn(&[u8], usize) -> Option<Rewrite> {
+    move |bytes, at| {
+        let found = rule(bytes, at)?;
+        let kept = as_text(bytes, at, found.kept_end);
+        Some(Rewrite {
+            end: found.end,
+            replacement: format!("{kept}{}{REDACTED}", found.joiner),
+        })
+    }
+}
+
+/// How this redactor's answer relates to the one 0.4.1 shipped.
+#[derive(Debug, PartialEq, Eq)]
+enum Agreement {
+    /// The same bytes.
+    Same,
+    /// Different, because a removed byte stands in a name or a scheme and this redactor
+    /// reads it as part of the run it interrupts. See [`as_a_hyphen`].
+    ReadsAMarkerAsPartOfAName,
+}
+
+/// What 0.4.1's own rules return when the marker in a name or a scheme is a hyphen, with
+/// every hyphen taken out.
+///
+/// The marker is a byte that is not a letter, so a name after it starts a word, and not a space,
+/// so it does not end a value. A hyphen is the one ASCII byte with those properties that 0.4.1's
+/// name, scheme and value runs also step over. So this is what it means for a marker to be part of
+/// the run it interrupts, said in 0.4.1's code and not in this redactor's: the bearer rule runs
+/// first with the markers as they are, since it reads them as a gap and still does, and the
+/// assignment and URL rules then run over the same text with each marker a hyphen.
+///
+/// A hyphen of the text's own cannot be told from one that stood for a marker afterwards, so all
+/// of them are taken out, and a caller compares against text that has had the same done to it. A
+/// difference that is only hyphens is the one thing this cannot see; any other, such as a value
+/// that runs further than 0.4.1's rules would run it, is seen.
+fn as_a_hyphen(raw: &str) -> String {
+    let plain = reference::strip_control_characters(raw);
+    let bearer = reference::redact_bearer(&plain).replace('\u{1}', "-");
+    let assignments = reference::redact_assignments(&bearer);
+    reference::redact_url_passwords(&assignments).replace('-', "")
+}
+
+/// The relation, or the reason there is none, for `raw`.
+///
+/// The two may differ only when the stripped text holds a marker: without a removed byte the rules
+/// read what they always did, and the answer has to be 0.4.1's own. Where there is one, the answer
+/// has to be the one 0.4.1's rules give with the marker read as a hyphen, compared with the hyphens
+/// of both taken out.
+fn agreement_with_0_4_1(raw: &str) -> Result<Agreement, String> {
+    let (shipped, head) = (reference::stderr_text(raw), stderr_text(raw));
+    if shipped == head {
+        return Ok(Agreement::Same);
+    }
+    let marked = reference::strip_control_characters(raw).contains('\u{1}');
+    let hyphen = as_a_hyphen(raw);
+    if marked && hyphen == head.replace('-', "") {
+        return Ok(Agreement::ReadsAMarkerAsPartOfAName);
+    }
+    Err(format!(
+        "expected the whole redactor to return what 0.4.1 shipped, or, where a removed byte stands \
+         in the text, what 0.4.1's rules return with that byte read as a hyphen, hyphens taken out \
+         of both | input {raw:?} 0.4.1 returned {shipped:?}, read as a hyphen {hyphen:?}, a marker \
+         in the text: {marked}, received {head:?}"
+    ))
+}
 
 /// `rewrite` as it was first written: `rule` tried at every word boundary, the text pushed a
 /// character at a time.
@@ -45,11 +125,27 @@ fn next_char_boundary(raw: &str, at: usize) -> usize {
     next.min(raw.len())
 }
 
+/// Fails, naming `raw`, unless redacting what one pass returned changes nothing.
+///
+/// A host that redacts again, as the harnesses do with a tail from a control that may not have
+/// redacted it, must find nothing more to take out of text this redactor already handled. Where a
+/// second pass redacts more, the first one left a credential in the clear.
+fn assert_one_pass_is_a_fixed_point(raw: &str) {
+    let once = stderr_text(raw);
+    let twice = stderr_text(&once);
+    assert!(
+        once == twice,
+        "expected one pass of the redactor to be a fixed point | input {raw:?} first pass \
+         {once:?}, second pass {twice:?}"
+    );
+}
+
 /// Fails, naming `raw` and the stage, unless every stage returns what the replaced scan returns.
 ///
 /// Each rule is also run on `raw` itself, not only on what the stage before it left: a rule then
 /// sees the control characters and markers the stripper would have taken out.
 fn assert_matches_the_replaced_scan(raw: &str) {
+    assert_one_pass_is_a_fixed_point(raw);
     let expect = |stage: &str, input: &str, run: fn(&str) -> String, expected: String| {
         // Caught, so a stage that panics is reported with the input that made it.
         let received = match std::panic::catch_unwind(|| run(input)) {
@@ -70,8 +166,8 @@ fn assert_matches_the_replaced_scan(raw: &str) {
         plain.clone(),
     );
     let bearer = rewrite_every_word(&plain, bearer_rule);
-    let assignments = rewrite_every_word(&bearer, assignment_rule);
-    let urls = rewrite_every_word(&assignments, url_password_rule);
+    let assignments = rewrite_every_word(&bearer, described(super::assignment_rule));
+    let urls = rewrite_every_word(&assignments, described(super::url_password_rule));
     for input in [raw, plain.as_str()] {
         expect(
             "the bearer rule",
@@ -85,7 +181,7 @@ fn assert_matches_the_replaced_scan(raw: &str) {
             "the assignment rule",
             input,
             redact_assignments,
-            rewrite_every_word(input, assignment_rule),
+            rewrite_every_word(input, described(super::assignment_rule)),
         );
     }
     for input in [raw, assignments.as_str()] {
@@ -93,7 +189,7 @@ fn assert_matches_the_replaced_scan(raw: &str) {
             "the URL password rule",
             input,
             redact_url_passwords,
-            rewrite_every_word(input, url_password_rule),
+            rewrite_every_word(input, described(super::url_password_rule)),
         );
     }
     expect(
@@ -102,20 +198,32 @@ fn assert_matches_the_replaced_scan(raw: &str) {
         stderr_text,
         remove_boundaries(urls),
     );
-    expect(
-        "the whole redactor as 0.4.1 shipped it",
-        raw,
-        stderr_text,
-        reference::stderr_text(raw),
-    );
+    if let Err(why) = agreement_with_0_4_1(raw) {
+        panic!("{why}");
+    }
+    assert_awaiting_agrees_with_0_4_1(raw);
+}
+
+/// Whether a cut after `raw` awaits a value, held to what 0.4.1 answered.
+///
+/// Awaiting more than 0.4.1 did is always allowed: it drops one more line and leaks nothing. Not
+/// awaiting what 0.4.1 awaited is allowed only where the whole redactor also differs, because then
+/// a rule reads the text differently and the answer follows it. `apikeybearer<VT>=password` is
+/// the example: 0.4.1 saw no name before the `=`, so it took the trailing `password` for a name
+/// still waiting for its value, where this reads `password` as the value of `apikeybearer` and the
+/// line as complete, as it does for the same text with nothing removed.
+fn assert_awaiting_agrees_with_0_4_1(raw: &str) {
     let (shipped, received) = (
         reference::ends_awaiting_value(raw),
         ends_awaiting_value(raw),
     );
+    if shipped == received || (received && !shipped) {
+        return;
+    }
     assert!(
-        shipped == received,
-        "expected ends_awaiting_value to return {shipped} as 0.4.1 did | input {raw:?} received \
-         {received}"
+        agreement_with_0_4_1(raw) == Ok(Agreement::ReadsAMarkerAsPartOfAName),
+        "expected ends_awaiting_value to return {shipped} as 0.4.1 did, unless the redactor also \
+         differs from 0.4.1 | input {raw:?} received {received}"
     );
 }
 
@@ -233,6 +341,10 @@ const SHAPES: &[&str] = &[
     "redis://:hunter2@db/main",
     "git+ssh://u.v-w:pw@h",
     "https://example.com/x:y",
+    "basic\u{1b}[0m://user:hunter2@host/x",
+    "Bearer\r://:hunter2@db/main",
+    "BASIC\0://u:p@h",
+    "x\u{1b}[0mbasic\u{1b}[0m://u:p@h",
     "\u{1b}[31mAPI_KEY\u{1b}[0m=v",
     "x\u{1b}[31mTOKEN=v",
     "sec\rret=v",
@@ -474,5 +586,39 @@ fn generated_runs_of_repeated_units_match_the_replaced_scan() {
             raw.push_str(sequence.pick(&["", "", " ", "\n", ", ", "x"]));
         }
         assert_matches_the_replaced_scan(&raw);
+    }
+}
+
+/// The shapes the exception exists for, each of which 0.4.1 left in the clear, beside text it must
+/// not touch.
+#[test]
+fn the_exception_is_taken_only_where_0_4_1_left_a_credential_in_the_clear() {
+    for raw in [
+        "SECRET_BASIC\u{1b}[0m=hunter2",
+        "TOKEN_BEARER\r: sk-live-42",
+        "auth_token_bearer\0 = sk-live-42",
+        "password_basic\u{1b}[0m: hunter2",
+        "client_secret\u{1b}[0mauthorization=hunter2",
+        "basic\u{1b}[0m://user:hunter2@host/x",
+    ] {
+        assert_eq!(
+            agreement_with_0_4_1(raw),
+            Ok(Agreement::ReadsAMarkerAsPartOfAName),
+            "expected this input to differ from 0.4.1 only by redacting what it left | input {raw:?}"
+        );
+    }
+    for raw in [
+        "Authorization: Bearer\u{1b}[0m sk-live-42",
+        "Authorization: Basic\rdXNlcjpwdw==",
+        "x\u{1b}[0mAuthorization: Bearer sk-live-42",
+        "tok\u{1b}[1men=sk-live-42",
+        "SECRET_OTHER\u{1b}[0m=hunter2",
+        "plain diagnostic text",
+    ] {
+        assert_eq!(
+            agreement_with_0_4_1(raw),
+            Ok(Agreement::Same),
+            "expected this input to match 0.4.1 byte for byte | input {raw:?}"
+        );
     }
 }

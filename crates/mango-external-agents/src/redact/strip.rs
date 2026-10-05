@@ -16,6 +16,8 @@ use super::{AUTHORIZATION, is_unsafe_to_render, match_credential_keyword, match_
 /// Marks where a removed byte stood in front of a credential name. Every C0 control is stripped
 /// from the input, so it cannot already be in the text; it is not a letter, so a name after it
 /// starts a word, and it is not a space, so it does not end a value.
+/// It is not a name's end either: the rules read a name and a scheme across it, as the text
+/// reads with the removed byte gone (see `is_name_byte` in the parent module).
 const BOUNDARY: char = '\u{1}';
 
 /// [`BOUNDARY`] as a byte, for the rules that skip the gap between a scheme and its token.

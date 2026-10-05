@@ -15,6 +15,8 @@
 //! each start. The work tests in `redact::work` count the bytes read and hold that to the length.
 
 #[cfg(test)]
+mod boundaries;
+#[cfg(test)]
 mod differential;
 #[cfg(test)]
 mod reference;
@@ -307,9 +309,14 @@ fn url_password(bytes: &[u8], after_scheme: usize) -> Option<Range<usize>> {
     Some(password_start..password_end)
 }
 
-/// What a URL's scheme is made of after its first letter.
+/// What a URL's scheme is made of after its first letter, and the marker a removed byte left in
+/// it, which parts nothing: see [`is_name_byte`].
 fn is_scheme_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-')
+    byte.is_ascii_alphanumeric()
+        | (byte == b'+')
+        | (byte == b'.')
+        | (byte == b'-')
+        | (byte == strip::BOUNDARY_BYTE)
 }
 
 /// The next `:` and the places [`url_password_rule`] can start to reach it.
@@ -447,8 +454,20 @@ fn take_while(bytes: &[u8], at: usize, keep: impl Fn(u8) -> bool) -> usize {
 }
 
 /// What the rest of a variable's name is made of, after the keyword that identified it.
+///
+/// The stripper leaves a [`BOUNDARY`](strip::BOUNDARY_BYTE) where a removed byte stood in front of
+/// a credential name or after `Bearer` or `Basic`, so that a header's token still reads as a word
+/// of its own. That is a decision about where a word starts, made for the rules that look for one.
+/// It says nothing about where a name ends: `SECRET_BASIC<ESC>[0m=v` is the name `SECRET_BASIC`
+/// whatever sits in the middle of it, and a name run that stopped at the marker saw no name before
+/// the `=` and let the value through. So a marker is part of the run it interrupts, here and in
+/// [`is_scheme_byte`], and [`remove_boundaries`] takes it out of the redacted text afterwards.
+///
+/// The stripper only puts a marker after a letter or a digit, so a marker between a name and its
+/// separator is always the end of the name run and the gap of spaces needs no case of its own.
 fn is_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+    // Comparisons joined with `|`, never a `match`: it is a branch per byte in the run loops.
+    byte.is_ascii_alphanumeric() | (byte == b'_') | (byte == b'-') | (byte == strip::BOUNDARY_BYTE)
 }
 
 /// The `[^\s,;]+` every value in these patterns is.
