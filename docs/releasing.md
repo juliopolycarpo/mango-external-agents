@@ -39,8 +39,11 @@ stored in the repository or in CI.
    ```
 
 4. Watch the `Release` workflow. It verifies the tag signature and that the manifests match the tag, runs `scripts/check.sh`,
-   publishes each crate that is not on crates.io yet, and creates the GitHub release with
-   git-cliff notes. A full rerun is safe: a crate already on crates.io and a GitHub release that
+   runs the isolated minimum-Rust feature check (`scripts/check-msrv-features.sh --locked`, on the
+   `rust-version` the script reads from `Cargo.toml`, one package at a time), publishes each crate
+   that is not on crates.io yet, and creates the GitHub release with git-cliff notes. The checks
+   run in the verify job, which the publish job needs, so a tag that fails the minimum-Rust check
+   publishes nothing. A full rerun is safe: a crate already on crates.io and a GitHub release that
    already exists are skipped, and the existing release keeps its notes.
 
 5. Bump the current registry consumer once the release is on crates.io. The consumer can only name
