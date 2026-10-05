@@ -277,7 +277,12 @@ async fn a_smaller_outbound_override_refuses_before_submission() {
 }
 
 /// A larger outgoing allowance submits valid capped attachments while defaults remain bounded.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// These two tests move frames of 5 to 12 MiB through a debug build, which is seconds of CPU work,
+/// not a wait. They run on a paused clock so that `drain`'s ten-second guard fires only when the
+/// runtime is idle with no terminal event, a turn that is stuck, and never because a loaded
+/// machine took long to encode a frame: virtual time does not advance while a task is running.
+#[tokio::test(start_paused = true)]
 async fn a_larger_outbound_override_submits_images_and_escaped_text_past_the_default_budget() {
     let outbound = 16 * 1024 * 1024;
     let (session, launcher) =
@@ -434,7 +439,9 @@ async fn one_capped_text_of_control_characters_is_refused_under_default_limits()
 }
 
 /// Refusing what would overflow must not refuse what fits: two capped images are sent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// On a paused clock for the reason given on the override test above.
+#[tokio::test(start_paused = true)]
 async fn two_images_at_the_attachment_cap_still_fit_under_default_limits() {
     let (session, launcher) = open_with(FakeAcpAgent::new(), Limits::default()).await;
     let budget = Limits::default().turn_buffer_bytes;
