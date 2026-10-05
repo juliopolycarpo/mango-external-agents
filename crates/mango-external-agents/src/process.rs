@@ -471,8 +471,26 @@ impl StderrTail {
     /// assert_eq!(tail.read(), "Authorization: Bearer [REDACTED]");
     /// ```
     pub fn read(&self) -> String {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        redact::stderr_text(&String::from_utf8_lossy(&state.buffer))
+        self.read_with(redact::stderr_text)
+    }
+
+    /// [`read`](Self::read) with the redactor injected, so a test can stand inside the window
+    /// where the tail is being redacted.
+    ///
+    /// Only the copy happens under the lock, so a large tail never holds up the stderr writer for
+    /// the length of a redaction. The copy is a local that goes straight into `redact`, and what
+    /// comes back is its result: no code path returns, stores or logs the unredacted bytes, and a
+    /// concurrent reader runs the same function on its own copy. A push that lands after the copy
+    /// is not part of this read and is part of the next, so the tail is read as one snapshot, in
+    /// push order.
+    fn read_with(&self, redact: impl FnOnce(&str) -> String) -> String {
+        let copy = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .buffer
+            .clone();
+        redact(&String::from_utf8_lossy(&copy))
     }
 }
 
@@ -1646,6 +1664,94 @@ mod tests {
             read.len() <= 32,
             "expected at most 32 bytes, received {}",
             read.len()
+        );
+    }
+
+    /// What a reader running alongside a redaction observed, recorded by [`MidRedaction`].
+    #[derive(Default)]
+    struct Observed {
+        lock_state: Option<&'static str>,
+        concurrent_read: Option<String>,
+        text_seen_by_redactor: Option<String>,
+    }
+
+    /// A redactor that stops the tail at the point where its text has been copied out and is being
+    /// redacted, and uses that window the way a stderr writer and a second reader would. The real
+    /// redactor then runs, so the result is what `read` would have returned.
+    struct MidRedaction<'a> {
+        tail: &'a StderrTail,
+        late_chunk: &'a [u8],
+        observed: std::cell::RefCell<Observed>,
+    }
+
+    impl<'a> MidRedaction<'a> {
+        fn new(tail: &'a StderrTail, late_chunk: &'a [u8]) -> Self {
+            Self {
+                tail,
+                late_chunk,
+                observed: std::cell::RefCell::default(),
+            }
+        }
+
+        fn redact(&self, text: &str) -> String {
+            let free = self.tail.state.try_lock().is_ok();
+            let mut observed = self.observed.borrow_mut();
+            observed.lock_state = Some(if free { "unlocked" } else { "locked" });
+            observed.text_seen_by_redactor = Some(text.to_owned());
+            // The writer and the second reader can only run here when the lock is free. Where it is
+            // held, calling them would deadlock instead of failing with a message.
+            if free {
+                self.tail.push(self.late_chunk);
+                observed.concurrent_read = Some(self.tail.read());
+            }
+            crate::redact::stderr_text(text)
+        }
+    }
+
+    #[test]
+    fn a_stderr_tail_is_redacted_after_the_lock_is_released() {
+        let tail = StderrTail::with_capacity(1024);
+        tail.push(b"first line\nAPI_KEY=first-secret\n");
+        let mid = MidRedaction::new(&tail, b"later line\nAPI_KEY=later-secret\n");
+
+        let read = tail.read_with(|text| mid.redact(text));
+
+        let observed = mid.observed.into_inner();
+        assert_eq!(
+            observed.lock_state,
+            Some("unlocked"),
+            "expected the tail lock released while the tail is redacted | received {:?}",
+            observed.lock_state
+        );
+        assert_eq!(
+            read, "first line\nAPI_KEY=[REDACTED]\n",
+            "expected the read to hold the tail as it was when it was copied | received {read:?}"
+        );
+        let concurrent = observed.concurrent_read.unwrap_or_default();
+        assert_eq!(
+            concurrent, "first line\nAPI_KEY=[REDACTED]\nlater line\nAPI_KEY=[REDACTED]\n",
+            "expected a reader during the redaction to see the push, redacted | received {concurrent:?}"
+        );
+        let after = tail.read();
+        assert_eq!(
+            after, concurrent,
+            "expected a later read to keep every byte in push order | received {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_stderr_tail_hands_the_redactor_the_text_it_copied() {
+        let tail = StderrTail::with_capacity(1024);
+        tail.push(b"first line\n");
+        let mid = MidRedaction::new(&tail, b"later line\n");
+
+        let _ = tail.read_with(|text| mid.redact(text));
+
+        let seen = mid.observed.into_inner().text_seen_by_redactor;
+        assert_eq!(
+            seen.as_deref(),
+            Some("first line\n"),
+            "expected the redactor to see the copied tail, not the later push | received {seen:?}"
         );
     }
 
