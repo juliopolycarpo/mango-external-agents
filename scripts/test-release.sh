@@ -437,7 +437,9 @@ esac
 write_readme tree/crates/demo/README 0.3 0.3
 mkdir -p "$readme_fixture/tree/crates/other"
 printf '[package]\nname = "mango-other"\nversion.workspace = true\n' > "$readme_fixture/tree/crates/other/Cargo.toml"
-sed -i 's|^\[workspace.dependencies\]|&\nmango-other = { path = "crates/other", version = "0.3.1" }|' "$readme_fixture/tree/Cargo.toml"
+# Rewritten whole with printf, not edited in place: `sed -i` needs a suffix argument on BSD sed and
+# BSD sed does not expand `\n` in a replacement, so no single sed line works on both.
+printf '[workspace.package]\nversion = "0.3.1"\n\n[workspace.dependencies]\nmango-other = { path = "crates/other", version = "0.3.1" }\nmango-demo = { path = "crates/demo", version = "0.3.1" }\n' > "$readme_fixture/tree/Cargo.toml"
 if output=$("$readme_fixture/tree/scripts/check-versions.sh" 2>&1); then
   echo 'expected check-versions.sh to refuse a crate without a README, received success' >&2
   exit 1
