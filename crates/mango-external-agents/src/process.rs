@@ -113,6 +113,12 @@ pub trait ProcessControl: Send + Sync {
     fn pid(&self) -> Option<u32>;
 
     /// Whatever the child wrote to stderr, bounded and credential-redacted.
+    ///
+    /// Both properties are the implementor's to provide: the library does not check the length or
+    /// the content of what this returns. A launcher satisfies the contract by keeping the child's
+    /// stderr in a [`StderrTail`] and returning its [`read`](StderrTail::read), which bounds it by
+    /// the capacity the host chose and redacts it. A harness that puts the text in a diagnostic
+    /// may redact it again, because it cannot know every host did.
     fn stderr_tail(&self) -> String;
 
     /// Waits for the child to exit.
@@ -380,6 +386,34 @@ impl Default for StderrTail {
 
 impl StderrTail {
     /// A tail that keeps at most `max_bytes` of the most recent output.
+    ///
+    /// The capacity is the host's to choose: the library imposes no upper bound, because no
+    /// documented limit in this crate could justify one. [`DEFAULT_STDERR_TAIL_BYTES`] is a
+    /// default, not a maximum, and `0` keeps nothing. What a larger value costs, per tail:
+    ///
+    /// - Memory. Up to `max_bytes` stay resident for as long as the tail lives, and
+    ///   [`push`](Self::push) appends a chunk before it trims, so the buffer briefly holds
+    ///   `max_bytes` plus that chunk. Each [`read`](Self::read) then copies the tail, and the text
+    ///   it returns is not bounded by `max_bytes`: a byte that is not valid UTF-8 becomes a 3-byte
+    ///   replacement character and a credential's value becomes `[REDACTED]`.
+    /// - Time. Redaction is linear in the tail, so a read costs in proportion to `max_bytes`. It
+    ///   runs after the tail's lock is released, so it delays the caller of `read` and never the
+    ///   writer calling `push`.
+    ///
+    /// A host that sets this from untrusted configuration should bound it first.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::StderrTail;
+    /// use mango_external_agents::process::DEFAULT_STDERR_TAIL_BYTES;
+    ///
+    /// // A host-owned bound: never more than four times the default.
+    /// let requested = usize::MAX;
+    /// let tail = StderrTail::with_capacity(requested.min(4 * DEFAULT_STDERR_TAIL_BYTES));
+    /// tail.push(b"diagnostic\n");
+    /// assert_eq!(tail.read(), "diagnostic\n");
+    /// ```
     pub fn with_capacity(max_bytes: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(TailState::default())),
