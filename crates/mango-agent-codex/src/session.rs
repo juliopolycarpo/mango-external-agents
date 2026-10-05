@@ -1572,8 +1572,8 @@ impl Shared {
             }
             // Redacted here even though `StderrTail::read` already redacts: the control is the
             // host's own `ProcessControl`, its tail is only asked to be redacted, and this text
-            // is about to cross into a failure the host logs. Redaction is idempotent, so a tail
-            // that arrives clean costs one more linear pass and a tail that does not is not leaked.
+            // is about to cross into a failure the host logs. The second pass never reveals
+            // anything and may redact more.
             let stderr = mango_external_agents::redact::stderr_text(&control.stderr_tail());
             if !stderr.is_empty() {
                 message.push_str(&format!("; stderr: {stderr}"));

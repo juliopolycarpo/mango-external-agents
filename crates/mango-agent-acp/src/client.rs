@@ -1986,7 +1986,7 @@ pub(crate) fn is_link_closure(error: &agent_client_protocol::Error) -> bool {
 /// The tail is redacted here, whatever the control did: one from the library's own launchers
 /// arrives redacted from [`StderrTail`](mango_external_agents::StderrTail), but a host's own
 /// `ProcessControl` is only asked to redact, and this text goes into an error the host logs.
-/// Redaction is idempotent, so a tail that arrives clean costs one linear pass.
+/// The second pass never reveals anything and may redact more.
 pub(crate) fn with_stderr(message: &str, control: &dyn ProcessControl) -> String {
     let tail = mango_external_agents::redact::stderr_text(&control.stderr_tail());
     let tail = tail.trim();
