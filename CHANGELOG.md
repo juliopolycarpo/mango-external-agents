@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.4.3] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- **(core)** Redact a credential whose name a removed byte interrupts (#134)
+- **(core)** Redact the stderr tail outside its lock (#133)
+
+### 🧪 Testing
+
+- **(core)** Pin the registry consumer to the published 0.4.2 (#131)
+
+### 👷 CI
+
+- Check isolated minimum-Rust features before a release publishes (#132)
+
 ## [0.4.2] - 2026-10-04
 
 ### 🐛 Bug Fixes
