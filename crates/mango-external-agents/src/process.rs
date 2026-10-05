@@ -1773,21 +1773,10 @@ mod tests {
             after, concurrent,
             "expected a later read to keep every byte in push order | received {after:?}"
         );
-    }
-
-    #[test]
-    fn a_stderr_tail_hands_the_redactor_the_text_it_copied() {
-        let tail = StderrTail::with_capacity(1024);
-        tail.push(b"first line\n");
-        let mid = MidRedaction::new(&tail, b"later line\n");
-
-        let _ = tail.read_with(|text| mid.redact(text));
-
-        let seen = mid.observed.into_inner().text_seen_by_redactor;
+        let seen = observed.text_seen_by_redactor.unwrap_or_default();
         assert_eq!(
-            seen.as_deref(),
-            Some("first line\n"),
-            "expected the redactor to see the copied tail, not the later push | received {seen:?}"
+            seen, "first line\nAPI_KEY=first-secret\n",
+            "expected the redactor to be handed the copied tail, not the later push | received {seen:?}"
         );
     }
 
