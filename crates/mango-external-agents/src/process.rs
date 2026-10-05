@@ -391,13 +391,17 @@ impl StderrTail {
     ///
     /// The capacity is the host's to choose: the library imposes no upper bound, because no
     /// documented limit in this crate could justify one. [`DEFAULT_STDERR_TAIL_BYTES`] is a
-    /// default, not a maximum, and `0` keeps nothing. What a larger value costs, per tail:
+    /// default, not a maximum, and `0` retains nothing for `read` to return. What a larger value
+    /// costs, per tail:
     ///
     /// - Memory. Up to `max_bytes` stay resident for as long as the tail lives, and
     ///   [`push`](Self::push) appends a chunk before it trims, so the buffer briefly holds
     ///   `max_bytes` plus that chunk. Each [`read`](Self::read) then copies the tail, and the text
     ///   it returns is not bounded by `max_bytes`: a byte that is not valid UTF-8 becomes a 3-byte
-    ///   replacement character and a credential's value becomes `[REDACTED]`.
+    ///   replacement character and a credential's value becomes `[REDACTED]`. A cut that is still
+    ///   open also keeps a window of the stderr it dropped, so the next bytes can be judged
+    ///   against the name that preceded them: a few KiB at most, whatever the capacity,
+    ///   so `0` returns nothing from `read` but does not hold nothing.
     /// - Time. Redaction is linear in the tail, so a read costs in proportion to `max_bytes`. It
     ///   runs after the tail's lock is released, so it delays the caller of `read` and never the
     ///   writer calling `push`.
