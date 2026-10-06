@@ -15,16 +15,16 @@ default = []
 bundled-launcher = ["mango-external-agents/launcher-tokio", "tokio/signal"]
 
 [dependencies]
-mango-agent-acp = { version = "=0.4.2", default-features = false }
-mango-agent-claude = { version = "=0.4.2", default-features = false }
-mango-agent-codex = { version = "=0.4.2", default-features = false }
-mango-external-agents = { version = "=0.4.2", default-features = false, features = ["stdio"] }
+mango-agent-acp = { version = "=0.4.3", default-features = false }
+mango-agent-claude = { version = "=0.4.3", default-features = false }
+mango-agent-codex = { version = "=0.4.3", default-features = false }
+mango-external-agents = { version = "=0.4.3", default-features = false, features = ["stdio"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
-mango-agent-acp = { version = "=0.4.2", default-features = false, features = ["testing"] }
-mango-external-agents = { version = "=0.4.2", default-features = false, features = ["testing"] }
+mango-agent-acp = { version = "=0.4.3", default-features = false, features = ["testing"] }
+mango-external-agents = { version = "=0.4.3", default-features = false, features = ["testing"] }
 serde_json = "1.0.151"
 
 [[bin]]

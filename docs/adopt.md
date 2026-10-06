@@ -7,7 +7,7 @@ Mango Protocol, HTTP server, database or recovery loop is required.
 
 [`tests/standalone-current`](../tests/standalone-current/README.md) is a small consumer with its own
 workspace and lockfile. Its four SDK dependencies are exact registry pins at the current published
-release (`=0.4.2`), with no path override. Copy that directory anywhere and run:
+release (`=0.4.3`), with no path override. Copy that directory anywhere and run:
 
 ```sh
 cargo test --locked
