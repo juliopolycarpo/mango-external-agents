@@ -54,8 +54,8 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
   credential-shaped text.
 - **No dependency on `mango-protocol` or on mangostudio.** The runtime binary is where they meet.
 - **TLS is `ring` everywhere.** `deny.toml` bans `aws-lc-rs` and `openssl`; `scripts/check-tls.sh`
-  proves the tree is clean. `agent-client-protocol` and the smol family stay inside
-  `mango-agent-acp`.
+  proves the tree is clean. `agent-client-protocol` stays inside `mango-agent-acp` with its
+  `process`, `stdio` and `schemars` features off; `deny.toml` bans the smol family they pull.
 - **Vendor fixtures are captured by `mea capture`, never hand-edited.** In a capture directory that
   carries a `manifest.json`, that rule is enforced: the manifest holds a SHA-256 digest per file
   beside it and `mea`'s test suite recomputes them, so an edited file there fails `scripts/check.sh`.

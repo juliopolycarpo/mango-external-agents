@@ -106,9 +106,8 @@ jobs:
       - run: cargo +1.96.0 check --manifest-path tests/standalone-historical/Cargo.toml --all-targets --all-features --locked
 
   # The `cfg(windows)` dependency edges are compiled by no Linux lane: `process-wrap`, `win32job` and
-  # `windows` behind the core's `launcher-tokio`, and `agent-client-protocol`'s `windows-sys` and
-  # async-io edges behind `mango-agent-acp`. A workspace `check` at the minimum reaches all of them;
-  # the per-package feature matrix runs once on Linux above.
+  # `windows` behind the core's `launcher-tokio`. A workspace `check` at the minimum reaches all of
+  # them; the per-package feature matrix runs once on Linux above.
   msrv-windows:
     name: MSRV (1.97, windows-latest)
     runs-on: windows-latest

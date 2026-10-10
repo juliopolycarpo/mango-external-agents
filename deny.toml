@@ -58,6 +58,11 @@ deny = [
   { crate = "openssl-sys", reason = "TLS is ring; no system OpenSSL" },
   { crate = "aws-lc-rs", reason = "TLS is ring; aws-lc-rs fails on aarch64-pc-windows-msvc" },
   { crate = "aws-lc-sys", reason = "TLS is ring; aws-lc-rs fails on aarch64-pc-windows-msvc" },
+  # `agent-client-protocol` 3.x keeps its process spawner and stdio adapter behind the `process`
+  # and `stdio` features. The host owns the process and the runtime, so neither is enabled.
+  { crate = "async-io", reason = "agent-client-protocol's `process` feature stays off; the host owns the runtime" },
+  { crate = "async-process", reason = "agent-client-protocol's `process` feature stays off; the host owns the process" },
+  { crate = "blocking", reason = "agent-client-protocol's `stdio` feature stays off; the host owns the pipes" },
 ]
 skip = []
 skip-tree = []
