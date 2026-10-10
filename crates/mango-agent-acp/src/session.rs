@@ -1548,7 +1548,8 @@ struct TurnRecord {
 /// cancelled is read from what was recorded and never from which one the task happened to see
 /// first:
 ///
-/// - an answer from the agent ends the turn as the agent said;
+/// - a stop reason from the agent ends the turn as the agent said, and the agent's own error
+///   fails it unless a stop was recorded;
 /// - a stop somebody asked for, recorded before this is decided, ends it as `Cancelled` with
 ///   that reason, including when the agent died instead of answering the stop;
 /// - a connection that went away with no stop recorded is the closed link, carrying the agent's

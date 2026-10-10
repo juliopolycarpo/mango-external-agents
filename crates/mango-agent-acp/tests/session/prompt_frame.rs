@@ -2,8 +2,8 @@
 //!
 //! `start_turn` measures the prompt against the effective `HostContext::outbound_buffer_bytes()`
 //! budget and refuses one that cannot fit as `LimitExceeded` with `Dispatch::NotSubmitted`:
-//! nothing was written, no turn started and the session stays usable. That is the outcome these
-//! tests assert.
+//! nothing was written, no turn started and the session stays usable. That is the refusal these
+//! tests assert, beside the prompts at and under the budget that are submitted.
 //!
 //! The check exists because the transport enforces the same budget on every outgoing frame, and
 //! a prompt refused only there would be refused too late: the turn has already started, the
