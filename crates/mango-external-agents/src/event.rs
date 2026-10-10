@@ -246,6 +246,28 @@ pub enum EventKind {
         /// What it reported.
         limits: AccountLimits,
     },
+    /// Something the vendor wants the person at the host to know, outside the answer itself.
+    ///
+    /// Vendor-neutral on purpose: a rate-limit warning, a retry the vendor is about to make, a
+    /// degraded mode. ACP's `notice` session update fills it today; a vendor's "retrying" frame is
+    /// the same kind of information and may fill it later.
+    ///
+    /// **Display only.** A notice is vendor-written text for a banner or a status line. It is not
+    /// part of the transcript, it asks nothing and authorises nothing, it does not end or fail the
+    /// turn whatever its severity says, and a host must not feed it to its own model as an
+    /// instruction. Delivery is best effort: a vendor may not rely on a notice being shown, and
+    /// one that arrives with no turn in flight has no stream to travel on and is dropped.
+    ///
+    /// Build one with [`EventKind::notice`], which refuses a title that has nothing to show.
+    Notice {
+        /// How prominent the vendor suggests it is. A hint, not a state.
+        severity: NoticeSeverity,
+        /// One line that stands on its own, bounded like an activity title.
+        title: String,
+        /// More, when the vendor said more, bounded like an activity detail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
     /// The turn stopped before it finished.
     ///
     /// A marker, not a terminal: [`EventKind::Completed`] still follows.
@@ -319,6 +341,16 @@ impl fmt::Debug for EventKind {
                 .debug_struct("AccountLimits")
                 .field("window_count", &limits.windows.len())
                 .finish(),
+            Self::Notice {
+                severity,
+                title,
+                description,
+            } => formatter
+                .debug_struct("Notice")
+                .field("severity", severity)
+                .field("title_bytes", &title.len())
+                .field("has_description", &description.is_some())
+                .finish(),
             Self::Cancelled { reason } => formatter
                 .debug_struct("Cancelled")
                 .field("reason", reason)
@@ -333,6 +365,45 @@ impl fmt::Debug for EventKind {
 }
 
 impl EventKind {
+    /// A [`EventKind::Notice`] with its text bounded, or nothing when the title has nothing to show.
+    ///
+    /// The one place that decides whether a vendor's notice is usable, so a harness can drop an
+    /// unusable one before emitting it. [`Self::normalized`] applies the same rule and refuses
+    /// what this returns `None` for; a harness that emitted such a notice anyway would be handing
+    /// its sink an error for something that is only a banner with no words on it.
+    ///
+    /// The title is sanitised and cut to [`TextLimit::Title`], the description to
+    /// [`TextLimit::Detail`]. A description left with nothing but whitespace is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::{EventKind, NoticeSeverity};
+    ///
+    /// let notice = EventKind::notice(NoticeSeverity::Warning, "Rate limit close", None);
+    /// assert!(matches!(notice, Some(EventKind::Notice { title, .. }) if title == "Rate limit close"));
+    /// assert!(EventKind::notice(NoticeSeverity::Info, " \u{1b} ", None).is_none());
+    /// ```
+    #[must_use]
+    pub fn notice(
+        severity: NoticeSeverity,
+        title: &str,
+        description: Option<&str>,
+    ) -> Option<Self> {
+        let title = normalize::bound_text(title, TextLimit::Title).text;
+        if title.trim().is_empty() {
+            return None;
+        }
+        let description = description
+            .map(|description| normalize::bound_text(description, TextLimit::Detail).text)
+            .filter(|description| !description.trim().is_empty());
+        Some(Self::Notice {
+            severity: severity.normalized(),
+            title,
+            description,
+        })
+    }
+
     /// This event with every vendor-supplied value bounded.
     ///
     /// Applied by [`EventSink`](crate::EventSink) so a harness cannot emit an unbounded event by
@@ -342,7 +413,9 @@ impl EventKind {
     ///
     /// [`Error::InvalidVendorValue`](crate::Error::InvalidVendorValue) when an opaque id does not
     /// survive bounding. Such an id is refused rather than shortened: a truncated id echoed back
-    /// to the vendor would name a different object.
+    /// to the vendor would name a different object. A [`EventKind::Notice`] whose title has
+    /// nothing to show once sanitised is refused the same way; [`Self::notice`] is how a harness
+    /// finds that out first.
     pub fn normalized(self) -> Result<Self> {
         Ok(match self {
             Self::TurnStarted { native_turn_id } => Self::TurnStarted {
@@ -392,6 +465,19 @@ impl EventKind {
             Self::AccountLimits { limits } => Self::AccountLimits {
                 limits: limits.normalized(),
             },
+            Self::Notice {
+                severity,
+                title,
+                description,
+            } => match Self::notice(severity, &title, description.as_deref()) {
+                Some(notice) => notice,
+                None => {
+                    return Err(crate::Error::InvalidVendorValue {
+                        field: "notice title",
+                        received: normalize::bound_text(&title, TextLimit::Title).text,
+                    });
+                }
+            },
             Self::Error { error } => Self::Error {
                 error: normalize_error(error),
             },
@@ -403,6 +489,75 @@ impl EventKind {
             | Self::Cancelled { .. }
             | Self::Completed) => unchanged,
         })
+    }
+}
+
+/// How prominent a vendor suggests a [`EventKind::Notice`] is.
+///
+/// A presentation hint and nothing more: [`NoticeSeverity::Error`] does not mean the turn failed,
+/// which only [`EventKind::Error`] says.
+///
+/// Open on purpose, like [`ConfigurationCategory`](crate::ConfigurationCategory): a severity this
+/// crate has no arm for arrives as [`NoticeSeverity::Other`] under the vendor's own spelling, so
+/// a host can show a generic banner without the word being lost. A host must not read salience
+/// or lifetime into a spelling it does not know.
+///
+/// On the wire the three known severities are the strings `"info"`, `"warning"` and `"error"`,
+/// and the open one is `{"other": "<the vendor's word>"}`.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::NoticeSeverity;
+///
+/// let wire = serde_json::to_value(NoticeSeverity::Warning).expect("a severity serialises");
+/// assert_eq!(wire, serde_json::json!("warning"));
+/// let open = serde_json::to_value(NoticeSeverity::Other(String::from("_debug")))
+///     .expect("a severity serialises");
+/// assert_eq!(open, serde_json::json!({ "other": "_debug" }));
+/// ```
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum NoticeSeverity {
+    /// For information.
+    Info,
+    /// Something the person may want to act on.
+    Warning,
+    /// Something went wrong that the vendor chose to report without failing the turn.
+    Error,
+    /// A severity this crate has no arm for, under the vendor's own name.
+    Other(String),
+}
+
+impl fmt::Debug for NoticeSeverity {
+    /// Names a severity without logging a vendor-defined severity name.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Info => "Info",
+            Self::Warning => "Warning",
+            Self::Error => "Error",
+            Self::Other(_) => "Other",
+        })
+    }
+}
+
+impl NoticeSeverity {
+    /// This severity with a vendor's own spelling bounded like a label.
+    ///
+    /// A spelling with nothing left once sanitised names no severity, so it becomes
+    /// [`NoticeSeverity::Info`], the least a host can make of it.
+    fn normalized(self) -> Self {
+        match self {
+            Self::Other(name) => {
+                let name = normalize::bound_text(&name, TextLimit::ActivityName).text;
+                match name.trim().is_empty() {
+                    true => Self::Info,
+                    false => Self::Other(name),
+                }
+            }
+            known => known,
+        }
     }
 }
 
@@ -1475,7 +1630,8 @@ fn normalize_error(error: VendorError) -> VendorError {
 mod tests {
     use super::{
         AccountLimits, Activity, ActivityKind, ActivityResult, ActivityStatus, ActivityUpdate,
-        Command, Credits, EventKind, RateLimitWindow, ResetCredit, ResetCredits, SpendControl,
+        Command, Credits, EventKind, NoticeSeverity, RateLimitWindow, ResetCredit, ResetCredits,
+        SpendControl,
     };
     use crate::content::{ActivityContent, FileChange, PlanStep, PlanStepStatus};
     use crate::error::{Error, ErrorCode, VendorError};
@@ -2272,6 +2428,210 @@ mod tests {
         assert!(
             written["credits"].get("hasCredits").is_none(),
             "expected absence to stay absent"
+        );
+    }
+
+    #[test]
+    fn a_notice_is_written_as_a_tagged_object_with_its_severity_title_and_description() {
+        let notice = EventKind::notice(
+            NoticeSeverity::Warning,
+            "Rate limit close",
+            Some("80% of the hourly budget is used"),
+        )
+        .expect("expected a notice with a title to be usable");
+        let written = serde_json::to_value(&notice).expect("expected a writable notice");
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "type": "notice",
+                "severity": "warning",
+                "title": "Rate limit close",
+                "description": "80% of the hourly budget is used",
+            }),
+            "expected notice wire shape: tagged object | received: {written}"
+        );
+        let read: EventKind = serde_json::from_value(written).expect("expected a readable notice");
+        assert_eq!(read, notice);
+    }
+
+    #[test]
+    fn a_notice_without_a_description_omits_the_key() {
+        let notice = EventKind::notice(NoticeSeverity::Info, "Heads up", None)
+            .expect("expected a notice with a title to be usable");
+        let written = serde_json::to_value(&notice).expect("expected a writable notice");
+        assert_eq!(
+            written,
+            serde_json::json!({ "type": "notice", "severity": "info", "title": "Heads up" }),
+            "expected an absent description to stay absent | received: {written}"
+        );
+    }
+
+    #[test]
+    fn every_known_severity_is_one_word_and_an_unknown_one_keeps_the_vendors_spelling() {
+        let cases = [
+            (NoticeSeverity::Info, serde_json::json!("info")),
+            (NoticeSeverity::Warning, serde_json::json!("warning")),
+            (NoticeSeverity::Error, serde_json::json!("error")),
+            (
+                NoticeSeverity::Other(String::from("_debug")),
+                serde_json::json!({ "other": "_debug" }),
+            ),
+        ];
+        for (severity, expected) in cases {
+            let written = serde_json::to_value(&severity).expect("expected a writable severity");
+            assert_eq!(
+                written, expected,
+                "expected severity wire shape: {expected} | received: {written}"
+            );
+            let read: NoticeSeverity =
+                serde_json::from_value(written).expect("expected a readable severity");
+            assert_eq!(read, severity);
+        }
+    }
+
+    #[test]
+    fn a_notice_bounds_and_sanitises_every_string_a_vendor_wrote() {
+        let notice = EventKind::notice(
+            NoticeSeverity::Other(format!("\u{1b}[31m{}", "s".repeat(500))),
+            &format!("\u{202e}{}", "t".repeat(500)),
+            Some(&format!("\u{7}{}", "d".repeat(5_000))),
+        )
+        .expect("expected a long title to be cut, not refused");
+        let EventKind::Notice {
+            severity: NoticeSeverity::Other(severity),
+            title,
+            description: Some(description),
+        } = notice
+        else {
+            panic!("expected a notice with an open severity and a description");
+        };
+        let received = (
+            severity.chars().count(),
+            title.chars().count(),
+            description.chars().count(),
+        );
+        assert_eq!(
+            received,
+            (
+                TextLimit::ActivityName.max_code_points(),
+                TextLimit::Title.max_code_points(),
+                TextLimit::Detail.max_code_points()
+            ),
+            "expected (severity, title, description) code points at their bounds | received: {received:?}"
+        );
+        for text in [&severity, &title, &description] {
+            assert!(
+                !text.contains(['\u{1b}', '\u{202e}', '\u{7}']),
+                "expected no control or bidi character to survive | received: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_severity_spelling_with_nothing_to_show_is_read_as_info() {
+        for spelling in ["", "  ", "\u{1b}\u{202e}"] {
+            let notice =
+                EventKind::notice(NoticeSeverity::Other(spelling.to_owned()), "Heads up", None);
+            assert!(
+                matches!(
+                    &notice,
+                    Some(EventKind::Notice {
+                        severity: NoticeSeverity::Info,
+                        ..
+                    })
+                ),
+                "expected severity for spelling {spelling:?}: Info | received: {notice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_whose_title_has_nothing_to_show_is_not_a_notice() {
+        for title in ["", "   ", "\u{1b}\u{202e}", " \u{7}\t"] {
+            let received = EventKind::notice(NoticeSeverity::Error, title, Some("detail"));
+            assert_eq!(
+                received, None,
+                "expected notice for title {title:?}: none | received: {received:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_drops_a_description_that_has_nothing_to_show() {
+        let notice = EventKind::notice(NoticeSeverity::Info, "Heads up", Some(" \u{1b} "))
+            .expect("expected the title alone to make the notice usable");
+        assert!(
+            matches!(
+                &notice,
+                EventKind::Notice {
+                    description: None,
+                    ..
+                }
+            ),
+            "expected description: none | received: {}",
+            serde_json::to_value(&notice).expect("expected a writable notice")
+        );
+    }
+
+    #[test]
+    fn normalising_refuses_a_notice_no_constructor_would_have_built() {
+        let blank = EventKind::Notice {
+            severity: NoticeSeverity::Info,
+            title: String::from(" \u{1b} "),
+            description: None,
+        };
+        let received = blank.normalized();
+        assert!(
+            matches!(
+                &received,
+                Err(Error::InvalidVendorValue {
+                    field: "notice title",
+                    ..
+                })
+            ),
+            "expected normalised blank notice: InvalidVendorValue for the notice title | received: {received:?}"
+        );
+    }
+
+    #[test]
+    fn normalising_a_notice_bounds_it_the_way_the_constructor_does() {
+        let long = "t".repeat(500);
+        let raw = EventKind::Notice {
+            severity: NoticeSeverity::Warning,
+            title: long.clone(),
+            description: Some(String::from("why")),
+        };
+        let received = raw.normalized().expect("expected a usable notice");
+        let expected = EventKind::notice(NoticeSeverity::Warning, &long, Some("why"))
+            .expect("expected a usable notice");
+        assert_eq!(received, expected);
+        assert_eq!(
+            received
+                .clone()
+                .normalized()
+                .expect("expected a usable notice"),
+            received,
+            "expected normalising twice to change nothing"
+        );
+    }
+
+    #[test]
+    fn a_notices_debug_output_names_no_vendor_text() {
+        let notice = EventKind::Notice {
+            severity: NoticeSeverity::Other(String::from("severity-secret")),
+            title: String::from("title-secret"),
+            description: Some(String::from("description-secret")),
+        };
+        let rendered = format!("{notice:?}");
+        for secret in ["severity-secret", "title-secret", "description-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "expected no notice payload in debug output | received: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("Notice") && rendered.contains("Other"),
+            "expected the kind and severity class to be named | received: {rendered}"
         );
     }
 }

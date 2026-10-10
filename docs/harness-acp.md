@@ -160,7 +160,9 @@ arrives only if the agent answers. The cost is that this id appears in no captur
 the harness's own counter, not something a vendor said.
 
 `Limits::idle_timeout` bounds how long a turn may stay silent. Every `session/update` the agent
-sends restarts it, and so does every change to the pending questions. While a
+sends restarts it except a `notice`, and so does every change to the pending questions. A notice is
+an aside for the person at the host, not the agent working: an agent that announces a retry every
+second cannot hold a turn open past the deadline with those announcements. While a
 `session/request_permission` is waiting on an answer the deadline is paused, not consumed: the
 approval has its own `Limits::approval_timeout`, and waiting for a person is not the agent going
 quiet. Once that question is answered, withdrawn or expires, the deadline restarts from that moment,
@@ -196,18 +198,20 @@ already running.
 
 ### What a `session/update` becomes
 
-| ACP                                          | Event                                                                                 |
-| -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `agent_message_chunk` (text)                 | `TextDelta`                                                                           |
-| `agent_thought_chunk`                        | `ReasoningStarted` / `ReasoningDelta` / `ReasoningEnded`                              |
-| `user_message_chunk`                         | dropped — it is the host's own prompt echoed back                                     |
-| `tool_call`                                  | `ActivityStarted`, plus `ActivityCompleted` when it already carries a terminal status |
-| `tool_call_update`                           | `ActivityUpdated`, or `ActivityCompleted` on `completed`/`failed`                     |
-| `plan`                                       | `ActivityStarted`/`ActivityUpdated` under one synthetic call id                       |
-| `available_commands_update`                  | session state, not a turn event — the snapshot's `commands`, names bare               |
-| `usage_update`                               | `ThreadUsage`, with `size` as the context window                                      |
-| `current_mode_update`, `session_info_update` | dropped — session state, not transcript                                               |
-| `config_option_update`                       | replaces the live configuration catalog and observed values                           |
+| ACP                                             | Event                                                                                 |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `agent_message_chunk` (text)                    | `TextDelta`                                                                           |
+| `agent_thought_chunk`                           | `ReasoningStarted` / `ReasoningDelta` / `ReasoningEnded`                              |
+| `user_message_chunk`                            | dropped — it is the host's own prompt echoed back                                     |
+| `tool_call`                                     | `ActivityStarted`, plus `ActivityCompleted` when it already carries a terminal status |
+| `tool_call_update`                              | `ActivityUpdated`, or `ActivityCompleted` on `completed`/`failed`                     |
+| `plan`                                          | `ActivityStarted`/`ActivityUpdated` under one synthetic call id                       |
+| `available_commands_update`                     | session state, not a turn event — the snapshot's `commands`, names bare               |
+| `usage_update`                                  | `ThreadUsage`, with `size` as the context window                                      |
+| `current_mode_update`, `session_info_update`    | dropped — session state, not transcript                                               |
+| `config_option_update`                          | replaces the live configuration catalog and observed values                           |
+| `notice`                                        | `Notice`, for display only; not progress                                              |
+| `compaction_update`, `compaction_summary_chunk` | `ActivityStarted` / `ActivityUpdated` / `ActivityCompleted` of kind `Compaction`      |
 
 ACP calls them tool calls; they arrive as *activity* because nothing in this library may reach a host's
 tool registry. The reasoning pair is synthesised: ACP streams thought chunks with no start or end
@@ -258,6 +262,81 @@ Two deliberate limits, each with a test pinning it:
   as `ThreadUsage.total` with `context_window_tokens` set, which is the only denominator that makes a
   percentage honest; there is no per-turn figure, because `PromptResponse.usage` is behind the SDK's
   `unstable_end_turn_token_usage` feature.
+
+### Notices and compaction
+
+Both became stable in v1 with schema 1.11 and are sent only to a client that advertised them, which
+this one does (see [Client capabilities](#client-capabilities)). Neither has a `/protocol/v1` page
+yet; the references are the RFDs for [session notices](https://agentclientprotocol.com/rfds/session-notices)
+and [session compaction](https://agentclientprotocol.com/rfds/session-compaction), and the
+`Notice`, `CompactionUpdate` and `CompactionSummaryChunk` types of `agent-client-protocol-schema`
+1.11.0. Both pages were read on 2026-10-10.
+
+**Both are vendor-written text for display only.** A notice and a compaction summary are words the
+agent produced. A host shows them and never feeds them to its own model as instructions; see
+[compliance.md](compliance.md).
+
+A `notice` becomes `EventKind::Notice { severity, title, description }`:
+
+```json
+{ "type": "notice", "severity": "warning", "title": "Rate limit close", "description": "80% of the hourly budget is used" }
+```
+
+- `severity` is `"info"`, `"warning"` or `"error"`. Any other string the agent sent is kept as
+  `{"other": "<its spelling>"}`, to be shown generically; a spelling with nothing left once
+  sanitised is read as `"info"`. It is a presentation hint: an `error` notice does not fail the
+  turn, and only the prompt's own answer ends one.
+- `title` is cut to a title's length and `description` to a detail's, both sanitised. `_meta` is not
+  carried.
+- A notice whose title has nothing to show once sanitised is dropped, and the turn goes on. Nothing
+  is logged for it, as for any other frame the reducer has no use for.
+- A notice is turn-scoped. One that arrives with no turn in flight (between turns, or replayed by
+  `session/load`) has no stream to travel on and is dropped; the RFD already tells agents not to rely
+  on delivery.
+- A notice does not restart idle accounting and does not close an open reasoning block.
+
+A compaction becomes one activity, the same shape the Codex harness gives its own
+`contextCompaction` item so a host renders both alike: name `compact`, kind `compaction`, title
+`Compacting the conversation`.
+
+```json
+{ "type": "activity_started", "call_id": "acp:compaction:c1", "activity": { "name": "compact", "kind": "compaction", "title": "Compacting the conversation", "itemId": "c1", "truncated": false } }
+{ "type": "activity_updated", "call_id": "acp:compaction:c1", "update": { "content": { "type": "output", "text": "Summary so far" }, "truncated": false } }
+{ "type": "activity_completed", "call_id": "acp:compaction:c1", "result": { "status": "completed", "truncated": false } }
+```
+
+- **Identity.** The call id is `acp:compaction:` followed by the agent's `compactionId`, and the
+  agent's own id is `itemId`. The two id spaces are separate on the wire, so without the prefix a
+  compaction and a tool call that happen to share a string would share an activity. The prefix
+  counts against the 128 code points the core publishes for an id: an id over 113 code points, a
+  blank one or one carrying characters the core strips is refused, and the turn fails with
+  `acp-refused-event` exactly as for a tool call id.
+- **Start.** The first frame for an id, whichever kind it is, emits `ActivityStarted` at that point
+  in the stream. A `compaction_summary_chunk` for an id nothing announced opens an in-progress
+  compaction.
+- **Status.** `completed`, `failed` and `cancelled` emit `ActivityCompleted` with the matching
+  status. `in_progress` and any status this build does not know leave it running and do not fail
+  the turn: the RFD reserves unknown statuses and forbids inferring a lifecycle from one. A frame for
+  a compaction that already ended is dropped, because a completed activity cannot be updated: an
+  agent that reports `completed` and sends the summary afterwards loses that summary here.
+- **Summary.** Carried as `ActivityContent::Output`, the same slot a text-only tool call uses. It is
+  the text of the summary's text blocks joined in order with nothing between them. An image, audio
+  or resource block is dropped, as in an agent message. A chunk appends; a `summary` on an update
+  replaces everything so far; `null`, `[]` and a replacement with no text block clear it
+  (`ActivityContent::Empty`); an omitted `summary` changes nothing. Every update carries the whole
+  summary so far, sanitised and cut to a detail's length as it accumulates (`truncated` says when),
+  and updates are coalesced on the tool calls' own five-second interval, with whatever is held
+  delivered ahead of the completion.
+- **Error.** Patched the same way and carried as the activity's `detail`, on an update while the
+  compaction runs and on the result when it ends, which is where a failed tool call's words go. A
+  cleared error is an empty `detail`.
+- **Left open.** A compaction the agent never ends is closed with the turn like a tool call left
+  running, with the status that agrees with the turn's terminal.
+- **Outside a turn.** A compaction frame with no turn in flight is dropped like any other turn
+  event. If the compaction is still running when the next turn starts, its next frame opens it
+  there, and the summary text sent in between is not recovered unless the agent re-sends it as a
+  `summary` replacement.
+- Compaction frames restart idle accounting and close an open reasoning block, like any activity.
 
 A `stop_reason` of `cancelled` ends the turn as a cancellation carrying the reason the *host* gave —
 ACP supplies none of its own, and flattening it would report a shutdown as "you stopped this turn".
@@ -522,13 +601,20 @@ install locations without editing the profile or changing a user's `PATH`.
 
 ## Client capabilities
 
-Everything declined: `fs.readTextFile`, `fs.writeTextFile` and `terminal` are all `false`. The host owns
+Everything that would let an agent act through this client is declined: `fs.readTextFile`, `fs.writeTextFile` and `terminal` are all `false`. The host owns
 files and terminals, so an agent asking this client to write one would be asking the library to act on
 the host's filesystem on a third party's instruction. This is not a gap — every agent here has its own
 file and shell tools and uses them, which is what the activity events describe.
 
 The client also advertises `session.configOptions.boolean`, the ACP v1 capability needed for agents to
 offer boolean live configuration options. See [session configuration options](https://agentclientprotocol.com/protocol/v1/session-config-options).
+
+It advertises `session.notices` and `session.compaction` too, each as an empty object. A v1 agent
+may send a `notice`, a `compaction_update` or a `compaction_summary_chunk` only to a client that
+advertised the matching capability. Both only let an agent say more: neither is a request, and what
+they carry reaches a host as observational turn events (see
+[Notices and compaction](#notices-and-compaction)). An agent may therefore send frames it previously
+held back.
 
 ## Profiles
 

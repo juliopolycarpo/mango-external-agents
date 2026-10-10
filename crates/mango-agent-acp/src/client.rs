@@ -1076,20 +1076,16 @@ impl SessionState {
     }
 }
 
-/// Whether `update` is a kind an agent may send only to a client that advertised it, which this
-/// one never does (`ClientSessionCapabilities::notices` and `::compaction` stay unset).
+/// Whether `update` is the agent making progress on the turn, and so restarts idle accounting.
 ///
-/// These kinds became stable after schema 1.9.1. Before that they failed to parse and fell to the catch-all
-/// dispatch handler, so they were neither transcript nor progress. They stay that way: an agent
-/// breaking the rule cannot hold a turn past its idle deadline with them. For example, a `notice`
-/// frame every second does not restart idle accounting.
-fn needs_an_unadvertised_capability(update: &SessionUpdate) -> bool {
-    matches!(
-        update,
-        SessionUpdate::Notice(_)
-            | SessionUpdate::CompactionUpdate(_)
-            | SessionUpdate::CompactionSummaryChunk(_)
-    )
+/// Every update is, except a `notice`. A notice is a live aside for the person at the host: it
+/// reaches the turn stream as [`EventKind::Notice`], and it says nothing about whether the agent
+/// is still working. An agent stuck in a retry loop that announces each attempt would otherwise
+/// hold a turn open past the host's idle deadline for as long as it kept announcing. For example,
+/// a `notice` frame every second does not restart idle accounting, while a compaction update does:
+/// compacting is work.
+fn is_progress(update: &SessionUpdate) -> bool {
+    !matches!(update, SessionUpdate::Notice(_))
 }
 
 /// One `session/update` notification, reduced and emitted.
@@ -1102,16 +1098,18 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     if !state.serves(&notification.session_id) {
         return;
     }
-    if needs_an_unadvertised_capability(&notification.update) {
-        return;
-    }
     // Capture the current owner before anything is reduced. Facts may arrive between turns; their
     // publication must not attach turn events to a newly admitted generation.
     let turn = state.turn();
-    state.touch();
+    if is_progress(&notification.update) {
+        state.touch();
+    }
     // No turn owns this frame (a `session/load` replay, or a frame between turns): its events would
     // be dropped, so only its session facts are read and the turn reducer is not fed, which keeps a
-    // long history from leaving open calls behind for the next turn to reset.
+    // long history from leaving open calls behind for the next turn to reset. A notice or a
+    // compaction update that arrives here is therefore dropped whole: a notice is live and the
+    // agent may not rely on it being shown, and a compaction that is still running when the next
+    // turn starts opens there on its next frame, without the summary sent in between.
     let Some(turn) = turn else {
         for fact in Reducer::session_facts(notification.update) {
             state.apply_fact(fact);
