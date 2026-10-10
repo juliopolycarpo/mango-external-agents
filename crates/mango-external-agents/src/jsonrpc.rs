@@ -219,8 +219,12 @@ fn json_value_type(value: &Value) -> &'static str {
 pub trait PeerHandler: Send + Sync {
     /// The peer announced something.
     ///
-    /// Dispatched in arrival order and awaited, so a handler that pushes into a full event sink
-    /// applies backpressure to the peer instead of letting events pile up here.
+    /// Dispatched in arrival order and awaited on a task apart from the reader, which keeps
+    /// reading and hands each frame over through a bounded queue. A handler that is slow to return
+    /// therefore does not slow the peer down: later frames wait in that queue, and when its
+    /// message or byte budget is spent the connection ends with
+    /// [`PeerTermination::NotificationBackpressure`] or
+    /// [`PeerTermination::NotificationByteBackpressure`].
     async fn on_notification(&self, method: String, params: Value);
 
     /// The peer asked something and is waiting.

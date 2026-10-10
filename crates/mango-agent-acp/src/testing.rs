@@ -97,6 +97,8 @@ pub struct FakeAcpAgent {
     /// `session/update` payloads `session/load` sends, naming the requested session, before it
     /// answers — whether it then loads or refuses.
     load_replay: Vec<serde_json::Value>,
+    /// Lines written verbatim during a turn, each after this many of the turn's update lines.
+    mid_turn_lines: Vec<(usize, String)>,
 }
 
 impl Default for FakeAcpAgent {
@@ -159,6 +161,7 @@ impl FakeAcpAgent {
             version_output: String::from("fake-acp 1.2.3"),
             capabilities_override: None,
             load_replay: Vec::new(),
+            mid_turn_lines: Vec::new(),
         }
     }
 
@@ -341,6 +344,34 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn batching_updates(mut self) -> Self {
         self.batch_updates = true;
+        self
+    }
+
+    /// Writes `line` verbatim on stdout during every turn, after the first `after_updates` of the
+    /// turn's `session/update` lines and ahead of whatever ends or holds the turn.
+    ///
+    /// The line is not composed, wrapped or checked, so it can be what a scripted update cannot:
+    /// text that is not JSON at all, or a request of the agent's own such as `fs/read_text_file`.
+    /// A position past the last update line is the last one, and lines given the same position
+    /// keep the order they were added in. Under [`batching_updates`](Self::batching_updates) the
+    /// whole batch is one line, so position `0` is ahead of it and any other is behind it.
+    ///
+    /// The fake does not interpret what the client answers to a request written this way: it
+    /// only ever expects an answer to its own `session/request_permission`. Combine the two and
+    /// the first answer to arrive ends the turn; read the client's reply from
+    /// `FakeLauncher::written` instead.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let _process = FakeAcpAgent::new()
+    ///     .writing_mid_turn(1, "warning: this line is not JSON-RPC")
+    ///     .process();
+    /// ```
+    #[must_use]
+    pub fn writing_mid_turn(mut self, after_updates: usize, line: impl Into<String>) -> Self {
+        self.mid_turn_lines.push((after_updates, line.into()));
         self
     }
 
@@ -656,6 +687,7 @@ impl FakeAcpAgent {
         if self.batch_updates && !lines.is_empty() {
             lines = vec![format!("[{}]", lines.join(","))];
         }
+        let mut lines = interleave(lines, &self.mid_turn_lines);
 
         if self.never_finishes {
             return lines;
@@ -874,6 +906,29 @@ impl PendingTurn {
     }
 }
 
+/// Places each of `extra` after the number of `lines` it names, clamped to the last of them.
+///
+/// Stable: entries naming the same position stay in the order they were given.
+fn interleave(lines: Vec<String>, extra: &[(usize, String)]) -> Vec<String> {
+    if extra.is_empty() {
+        return lines;
+    }
+    let last = lines.len();
+    let at = |position: usize| {
+        extra
+            .iter()
+            .filter(move |(after, _)| (*after).min(last) == position)
+            .map(|(_, line)| line.clone())
+    };
+    let mut woven = Vec::with_capacity(lines.len() + extra.len());
+    for (position, line) in lines.into_iter().enumerate() {
+        woven.extend(at(position));
+        woven.push(line);
+    }
+    woven.extend(at(last));
+    woven
+}
+
 fn result(id: serde_json::Value, result: serde_json::Value) -> String {
     serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
@@ -894,4 +949,84 @@ fn notification(method: &str, params: serde_json::Value) -> String {
 fn request(id: i64, method: &str, params: serde_json::Value) -> String {
     serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FakeAcpAgent, interleave};
+
+    fn lines(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| String::from(*item)).collect()
+    }
+
+    #[test]
+    fn interleave_places_each_extra_line_after_the_lines_it_names() {
+        let extra = [
+            (2, String::from("x")),
+            (0, String::from("y")),
+            (9, String::from("z")),
+            (2, String::from("w")),
+        ];
+        let woven = interleave(lines(&["a", "b", "c"]), &extra);
+        let expected = lines(&["y", "a", "b", "x", "w", "c", "z"]);
+        assert_eq!(
+            woven, expected,
+            "expected extras after 0, 2, 2 and the clamped end: {expected:?} | received: {woven:?}"
+        );
+    }
+
+    #[test]
+    fn interleave_leaves_a_turn_with_no_extra_lines_untouched() {
+        let woven = interleave(lines(&["a", "b"]), &[]);
+        assert_eq!(
+            woven,
+            lines(&["a", "b"]),
+            "expected the lines unchanged: [\"a\", \"b\"] | received: {woven:?}"
+        );
+    }
+
+    /// What kind of line each of a prompt's answers is, for a fake streaming two text chunks.
+    fn prompt_line_kinds(agent: FakeAcpAgent) -> Vec<&'static str> {
+        let update = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "hello" }
+        });
+        let pending = std::sync::Arc::default();
+        agent
+            .with_updates(vec![update.clone(), update])
+            .prompt(serde_json::json!(7), &pending)
+            .iter()
+            .map(|line| match line.as_str() {
+                "raw" => "raw",
+                line if line.starts_with('[') => "batch",
+                line if line.contains("\"session/update\"") => "update",
+                line if line.contains("\"stopReason\"") => "end",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn writing_mid_turn_puts_the_line_between_updates_and_ahead_of_the_turns_end() {
+        let kinds = prompt_line_kinds(FakeAcpAgent::new().writing_mid_turn(1, "raw"));
+        assert_eq!(
+            kinds,
+            ["update", "raw", "update", "end"],
+            "expected lines: [update, raw, update, end] | received: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn writing_mid_turn_treats_a_batch_as_one_line() {
+        let kinds = prompt_line_kinds(
+            FakeAcpAgent::new()
+                .batching_updates()
+                .writing_mid_turn(1, "raw"),
+        );
+        assert_eq!(
+            kinds,
+            ["batch", "raw", "end"],
+            "expected lines: [batch, raw, end] | received: {kinds:?}"
+        );
+    }
 }
