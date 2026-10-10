@@ -4572,6 +4572,9 @@ mod host_cancel;
 #[path = "session/drop_session.rs"]
 mod drop_session;
 
+#[path = "session/tool_name.rs"]
+mod tool_name;
+
 /// The `tool_call` frame for a call the agent reports as running and never ends.
 fn running_call(call_id: &str) -> serde_json::Value {
     serde_json::json!({
