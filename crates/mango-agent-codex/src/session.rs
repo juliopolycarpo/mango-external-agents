@@ -1253,8 +1253,10 @@ impl Shared {
             return;
         };
         let shared = Arc::clone(self);
-        // Detached: the notification handler runs on the connection's reader, which has to keep
-        // reading for this request to be answered at all.
+        // Detached: the notification handler runs on the connection's peer-work task, one frame
+        // at a time. The reader would still settle this request's answer, but awaiting it here
+        // would hold every later notification and question in the bounded queue behind it, and
+        // a slow answer could fill that queue, which ends the connection.
         tokio::spawn(async move {
             let sequence = shared.begin_quota_read().await;
             let read = client
