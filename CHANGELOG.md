@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.0] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- **(ci)** Run the feature powerset in check.sh (#137)
+
+### 🧪 Testing
+
+- **(acp)** Pin that a burst's last update precedes its terminal (#138)
+- **(core)** Pin the registry consumer to the published 0.4.3 (#136)
+
+### 🏗️ Build
+
+- [**breaking**] **(acp)** Bump agent-client-protocol to 3.3.0 (#139)
+
 ## [0.4.3] - 2026-10-05
 
 ### 🐛 Bug Fixes
