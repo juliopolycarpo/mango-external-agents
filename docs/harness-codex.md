@@ -231,7 +231,8 @@ once, with no settle wait and no kill: Codex never saw the request, so no native
 The stages add up. At worst a stop takes up to `request_timeout` waiting for the start, then
 `request_timeout` for the interrupt, then `cancel_settle_timeout`, then `kill_grace` plus the
 `shutdown_timeout` teardown stages. At the defaults that is about five minutes (120 + 120 + 60 +
-2 + a few 5 s stages). A start whose answer was lost but that a notification later names pays one
+2 + a few 5 s stages). A stop whose connection ends under it adds at most one `shutdown_timeout`
+before that teardown. A start whose answer was lost but that a notification later names pays one
 more interrupt and settle round. For that whole time the session stays busy. A `cancel` call waits
 only when the turn is already named: then it covers the interrupt, the settle deadline and any
 shutdown. A cancel that arrives before the start answer returns once the stop is recorded. `close`
@@ -248,6 +249,44 @@ interrupt when the answer names the turn. The turn's terminal arrives on the sta
 stream. If escalation cannot reap the child, `close` returns the resulting `CleanupRequired` and
 its control, so nothing is lost by not waiting. A cancel on a named turn waits for the worker and
 returns its error whole, including a `CleanupRequired`.
+
+The stop worker reads the `turn/interrupt` answer in order. The JSON-RPC client settles a response
+as soon as it reads it and runs notifications on a separate task (`docs/lifecycle.md`), so an
+answer can reach its caller before a notification the app-server wrote ahead of it. When a turn
+ends on its own while the interrupt is in flight, an error answer written after that turn's
+`turn/completed` used to find the turn still admitted: the cancel returned the error and the stop
+escalated to process shutdown, for a turn that had completed. The worker now sends the interrupt
+with `RequestOptions::after_earlier_notifications`, so the answer is judged only once the handler
+has returned from everything read before it. A turn that completed first makes the cancel succeed,
+and a refusal for a turn that is still running is reported as before. This is client-side timing
+only: the method, its parameters and the bytes on the wire are unchanged.
+
+It is the only ordered request in this harness, and three things follow from it:
+
+- The interrupt's `request_timeout` keeps running while its answer waits behind the handler. The
+  handler never waits for the host: publication is nonblocking, and an overflow poisons the
+  session. A host that stopped reading its stream therefore cannot delay the answer. An answer
+  that does wait out the deadline is the "Interrupt ack" expiry above: the cancel returns the
+  timeout after the process shutdown.
+- When the app-server exits or the link fails, the unanswered interrupt fails after the frames
+  already read have been handled, within `shutdown_timeout`. A `turn/completed` read before the
+  exit therefore still makes the cancel succeed. With no completion read, or when the dead
+  process's pipe refused the interrupt outright, the stop waits up to one more `shutdown_timeout`
+  for the connection's end to fail the turn before it judges the interrupt. The stream then ends
+  with the connection failure, and the cancel reports the teardown's result, not the interrupt's
+  error: it returns once the child is reaped, or with that teardown's `CleanupRequired`. Before,
+  the host saw either that or a `Cancelled` terminal with the interrupt's error, depending on
+  task order. A session poisoned at the same moment as a cancel is still such a race: the cancel
+  can return before the teardown the poison starts.
+- Two interrupts stay unordered, because their answer is discarded and the caller is already
+  ending the turn itself: a poisoned session's, which can be sent from inside the notification
+  handler, where the client refuses an ordered request before writing it, and the teardown
+  worker's, which must not wait on a handler it is about to stop.
+
+One case is not covered. While a `turn/steer` is in flight, and until the frames it held have
+been replayed, notifications are held (see above) and routed later on the replay's own task. The
+handler returns from a held `turn/completed` without having routed it, so a cancel issued in that
+window can still report the interrupt's error for a turn that completed.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.

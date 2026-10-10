@@ -24,7 +24,8 @@ use mango_external_agents::interaction::{
     UnsupportedQuestion,
 };
 use mango_external_agents::jsonrpc::{
-    Client, JsonRpcError, PeerHandler, PeerTermination, RequestId, ServerRequestOutcome,
+    Client, JsonRpcError, PeerHandler, PeerTermination, RequestId, RequestOptions,
+    ServerRequestOutcome,
 };
 use mango_external_agents::operation::{AttemptId, Dispatch, OperationRef};
 use mango_external_agents::permission::{
@@ -459,11 +460,17 @@ impl Shared {
     }
 
     /// Asks Codex to stop one owned turn without ever naming a replacement turn.
+    ///
+    /// `answer` says when the `turn/interrupt` answer may be read. A caller that reports the
+    /// answer to the host passes [`InterruptAnswer::AfterEarlierNotifications`], so a refusal
+    /// Codex wrote behind the turn's own `turn/completed` is judged against a turn this session
+    /// already knows is over.
     async fn cancel_owner(
         &self,
         client: &Client,
         owner: Option<&Arc<()>>,
         reason: CancelReason,
+        answer: InterruptAnswer,
     ) -> Result<bool> {
         let Some((route, thread_id, native_turn_id, no_dispatch)) = ({
             let mut turn = self.turn.lock().await;
@@ -503,19 +510,47 @@ impl Shared {
         }
 
         let interrupt: Result<Value> = client
-            .request(
+            .request_with(
                 method::TURN_INTERRUPT,
                 TurnInterruptParams {
                     thread_id,
                     turn_id: native_turn_id,
                 },
+                answer.options(),
             )
             .await;
-        match interrupt {
-            Ok(_) => Ok(true),
-            Err(error) if self.owns_active_turn(&route).await => Err(error),
-            Err(_) => Ok(true),
+        let error = match interrupt {
+            Ok(_) => return Ok(true),
+            Err(error) => error,
+        };
+        // Judged by the error as well as the flag: a write the dead peer's pipe refused comes
+        // back before the client has marked itself closed.
+        let connection_ending =
+            client.is_closed() || matches!(error, Error::Link { .. } | Error::Closed { .. });
+        if answer == InterruptAnswer::AfterEarlierNotifications && connection_ending {
+            self.wait_for_connection_terminal(&route.owner).await;
         }
+        // Read only now: with an ordered answer every notification Codex wrote ahead of it has
+        // been handled, so a turn that completed first no longer owns the slot here.
+        if self.owns_active_turn(&route).await {
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Waits, within `shutdown_timeout`, for the turn a closed connection is about to end.
+    ///
+    /// An ordered request the peer never answered fails once the frames already read have been
+    /// handled, a few steps before the client reports the connection's end to this session. A
+    /// request the dead peer's pipe refused fails earlier still. That report is what fails the
+    /// turn. Sampling admission in between would make the stop's result depend on which task ran
+    /// first.
+    async fn wait_for_connection_terminal(&self, owner: &Arc<()>) {
+        let _ = tokio::time::timeout(
+            self.host.limits().shutdown_timeout,
+            self.wait_for_turn_end(owner),
+        )
+        .await;
     }
 
     async fn recently_completed(&self, native_turn_id: &str) -> bool {
@@ -535,6 +570,38 @@ impl Shared {
         completed.push_back(native_turn_id.to_owned());
         if completed.len() > RECENT_COMPLETED_TURNS {
             completed.pop_front();
+        }
+    }
+}
+
+/// When the answer to a `turn/interrupt` may reach the task that sent it.
+///
+/// The JSON-RPC client settles a response the moment it reads it, while the notifications read
+/// before it wait their turn on the handler's task. Codex answers an interrupt for a turn that is
+/// already over with an error, written after that turn's `turn/completed`; read at once, the
+/// error finds the turn still admitted and is reported as a failed stop of a live turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterruptAnswer {
+    /// After the handler has returned from every notification Codex wrote ahead of the answer.
+    ///
+    /// For the stop worker, whose result is what `Session::cancel` returns. Never from inside
+    /// the notification handler: the answer would wait for the call that is waiting for it, and
+    /// the client refuses such a request before writing it.
+    AfterEarlierNotifications,
+    /// As soon as it is read.
+    ///
+    /// For a caller that discards the answer and is already ending the turn itself: a poisoned
+    /// session, which can be inside the notification handler, and the teardown worker, which
+    /// must not wait on a handler it is about to stop.
+    AsRead,
+}
+
+impl InterruptAnswer {
+    /// The request options that ask the client for this delivery.
+    fn options(self) -> RequestOptions {
+        match self {
+            Self::AfterEarlierNotifications => RequestOptions::new().after_earlier_notifications(),
+            Self::AsRead => RequestOptions::new(),
         }
     }
 }
@@ -1598,7 +1665,12 @@ impl Shared {
         if let Some(client) = self.client.get() {
             let _ = tokio::time::timeout(
                 self.host.limits().kill_grace,
-                self.cancel_owner(client, None, CancelReason::Shutdown),
+                self.cancel_owner(
+                    client,
+                    None,
+                    CancelReason::Shutdown,
+                    InterruptAnswer::AsRead,
+                ),
             )
             .await;
         }
@@ -3145,7 +3217,14 @@ impl CodexSession {
         owner: &Arc<()>,
         reason: CancelReason,
     ) -> Result<()> {
-        shared.cancel_owner(client, Some(owner), reason).await?;
+        shared
+            .cancel_owner(
+                client,
+                Some(owner),
+                reason,
+                InterruptAnswer::AfterEarlierNotifications,
+            )
+            .await?;
         // The start future belongs to the host, which may keep it alive without polling it; then
         // neither its request deadline nor its drop guard ever resolves the start. Bound the wait
         // here too, from when the stop began, and treat expiry as a lost answer. A notification
@@ -3157,7 +3236,14 @@ impl CodexSession {
         {
             shared.mark_start_unanswerable(owner).await;
         }
-        shared.cancel_owner(client, Some(owner), reason).await?;
+        shared
+            .cancel_owner(
+                client,
+                Some(owner),
+                reason,
+                InterruptAnswer::AfterEarlierNotifications,
+            )
+            .await?;
         Ok(())
     }
 
@@ -3179,7 +3265,7 @@ impl CodexSession {
             Err(error) => Settled::InterruptFailed(error),
         };
         match settled {
-            Settled::Ended => Self::after_turn_gone(&shared).await,
+            Settled::Ended => Self::after_turn_gone(shared, client, control, state).await,
             Settled::InterruptFailed(error) => {
                 // Codex refused, or never acknowledged, the interrupt while the turn is live.
                 if shared.seal_owner_for_shutdown(&owner).await {
@@ -3188,14 +3274,14 @@ impl CodexSession {
                     // its `CleanupRequired` carries the control the host needs to reconcile.
                     return Self::wait_for_shutdown(&shared).await.and(Err(error));
                 }
-                Self::after_turn_gone(&shared).await
+                Self::after_turn_gone(shared, client, control, state).await
             }
             Settled::Expired => {
                 if shared.seal_owner_for_shutdown(&owner).await {
                     Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
                     return Self::wait_for_shutdown(&shared).await;
                 }
-                Self::after_turn_gone(&shared).await
+                Self::after_turn_gone(shared, client, control, state).await
             }
         }
     }
@@ -3219,7 +3305,15 @@ impl CodexSession {
                 () = shared.wait_for_turn_end(owner) => return Settled::Ended,
                 () = tokio::time::sleep(settle) => return Settled::Expired,
                 () = shared.wait_for_named(owner), if awaiting_name => {
-                    if let Err(error) = shared.cancel_owner(client, Some(owner), reason).await {
+                    let interrupted = shared
+                        .cancel_owner(
+                            client,
+                            Some(owner),
+                            reason,
+                            InterruptAnswer::AfterEarlierNotifications,
+                        )
+                        .await;
+                    if let Err(error) = interrupted {
                         return Settled::InterruptFailed(error);
                     }
                 }
@@ -3231,9 +3325,30 @@ impl CodexSession {
     ///
     /// A racing `close` may have ended the turn and then failed to reap the child. The stop waiter
     /// shares that teardown's outcome, so its `CleanupRequired` is not reported as success.
-    async fn after_turn_gone(shared: &Shared) -> Result<()> {
+    ///
+    /// A connection that ended the turn is the same case one step earlier. The session's watcher
+    /// starts that teardown on a task of its own, so reading `teardown_started` alone would let
+    /// the stop return before the reap had even begun, depending on which task ran first. The
+    /// teardown has one owner, so asking for it here either starts it or joins the one running.
+    async fn after_turn_gone(
+        shared: Arc<Shared>,
+        client: Arc<Client>,
+        control: Arc<dyn ProcessControl>,
+        state: SessionState,
+    ) -> Result<()> {
+        // The client marks itself closed before it drains what it had read, so a turn that
+        // completed in that drain is seen here ahead of `terminated`.
+        if shared.terminated.is_cancelled() || client.is_closed() {
+            Self::request_shutdown(
+                Arc::clone(&shared),
+                client,
+                control,
+                state,
+                CancelReason::Shutdown,
+            );
+        }
         if shared.teardown_started.load(Ordering::Acquire) {
-            return Self::wait_for_shutdown(shared).await;
+            return Self::wait_for_shutdown(&shared).await;
         }
         Ok(())
     }
@@ -3251,7 +3366,7 @@ impl CodexSession {
         let limits = *shared.host.limits();
         let _ = tokio::time::timeout(
             limits.kill_grace,
-            shared.cancel_owner(&client, None, reason),
+            shared.cancel_owner(&client, None, reason, InterruptAnswer::AsRead),
         )
         .await;
         shared
@@ -6426,6 +6541,488 @@ mod tests {
             interrupts, 1,
             "expected turn/interrupt dispatches: 1 | received: {interrupts}"
         );
+    }
+
+    /// When the answer to `turn/interrupt` is read against the notifications written before it.
+    ///
+    /// The client settles a response as it reads it and hands notifications to another task, so
+    /// none of these can rely on which task the scheduler runs first. Each one parks the handler
+    /// inside `turn/completed` on a lock the stop path does not need after its interrupt is
+    /// written, which is the order a busy runtime produces on its own.
+    mod interrupt_answers {
+        use super::*;
+        use mango_external_agents::Error;
+        use mango_external_agents::session::CancelReason;
+        use mango_external_agents::stream::TurnStream;
+
+        /// Long enough, on a paused clock, for every task that can run to have run.
+        const SETTLED: std::time::Duration = std::time::Duration::from_millis(1);
+
+        /// A named turn whose stop worker has written its one `turn/interrupt`.
+        struct Interrupting {
+            shared: Arc<Shared>,
+            link: ScriptedLink,
+            /// Kept so the connection outlives a stop that returns before the turn ends.
+            client: Arc<Client>,
+            stream: TurnStream,
+            stopping: tokio::task::JoinHandle<mango_external_agents::Result<()>>,
+            interrupt_id: serde_json::Value,
+        }
+
+        async fn interrupting() -> Interrupting {
+            let shared = shared();
+            shared.adopt_thread(String::from("thread-1"));
+            let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
+            let owner = Arc::clone(
+                &shared
+                    .turn
+                    .lock()
+                    .await
+                    .as_ref()
+                    .expect("expected the installed turn")
+                    .owner,
+            );
+            let link = ScriptedLink::new();
+            let client = Arc::new(Client::connect(
+                link.clone().into_link(),
+                super::super::CodexSession::handler(Arc::clone(&shared)),
+                ClientOptions::new("Codex app-server"),
+            ));
+            let stop_shared = Arc::clone(&shared);
+            let stop_client = Arc::clone(&client);
+            let stopping = tokio::spawn(async move {
+                super::super::CodexSession::dispatch_stop(
+                    &stop_shared,
+                    &stop_client,
+                    &owner,
+                    CancelReason::Requested,
+                )
+                .await
+            });
+            link.wait_for_sent(1).await;
+            let sent: serde_json::Value = serde_json::from_str(&link.sent()[0])
+                .expect("expected the stop worker to write a JSON frame");
+            assert_eq!(
+                sent["method"], "turn/interrupt",
+                "expected the first frame written: turn/interrupt | received: {sent}"
+            );
+            Interrupting {
+                shared,
+                link,
+                client,
+                stream,
+                stopping,
+                interrupt_id: sent["id"].clone(),
+            }
+        }
+
+        fn turn_completed(status: &str) -> String {
+            serde_json::json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "vendor-turn-1", "status": status},
+                },
+            })
+            .to_string()
+        }
+
+        /// What Codex answers an interrupt that names a turn it has already ended.
+        fn interrupt_refused(id: &serde_json::Value) -> String {
+            serde_json::json!({
+                "id": id,
+                "error": {"code": -32603, "message": "interrupted owner was already closed"},
+            })
+            .to_string()
+        }
+
+        /// Waits until the handler is inside `turn/completed`, parked on the lock the test holds.
+        ///
+        /// It takes the question-settlement lock first, so that lock being taken is the sign.
+        async fn handler_parked_in_completion(shared: &Shared) {
+            for _ in 0..10_000 {
+                if shared.question_settlements.try_lock().is_err() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("expected the handler: parked inside turn/completed | received: never reached");
+        }
+
+        async fn kinds(stream: &mut TurnStream) -> Vec<EventKind> {
+            let mut events = Vec::new();
+            while let Some(event) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+                    .await
+                    .expect("expected the stream to end within 5s of its terminal")
+            {
+                events.push(event.kind);
+            }
+            events
+        }
+
+        #[test]
+        fn each_delivery_asks_the_client_for_its_own_order() {
+            assert!(
+                super::super::InterruptAnswer::AfterEarlierNotifications
+                    .options()
+                    .waits_for_earlier_notifications(),
+                "expected the stop worker's interrupt: ordered | received: read at once"
+            );
+            assert!(
+                !super::super::InterruptAnswer::AsRead
+                    .options()
+                    .waits_for_earlier_notifications(),
+                "expected a discarded interrupt answer: read at once | received: ordered"
+            );
+        }
+
+        /// Codex ended the turn, then refused the interrupt that named it. The refusal is read
+        /// first; the stop must not judge it until the completion ahead of it has been handled.
+        #[tokio::test(start_paused = true)]
+        async fn an_interrupt_refused_behind_a_completion_waits_for_that_completion() {
+            let Interrupting {
+                shared,
+                link,
+                mut stream,
+                mut stopping,
+                interrupt_id,
+                client: _client,
+            } = interrupting().await;
+            let completion_held = shared.pending.lock().await;
+            link.push_line(turn_completed("completed"));
+            link.push_line(interrupt_refused(&interrupt_id));
+            handler_parked_in_completion(&shared).await;
+            tokio::time::sleep(SETTLED).await;
+
+            if stopping.is_finished() {
+                let early = (&mut stopping).await.expect("expected the stop task");
+                panic!(
+                    "expected the interrupt answer: held until turn/completed was handled | received: {early:?}"
+                );
+            }
+            drop(completion_held);
+
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                stopped.is_ok(),
+                "expected the stop of a turn that completed first: Ok(()) | received: {stopped:?}"
+            );
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Completed)),
+                "expected the turn's own terminal: Completed | received: {events:?}"
+            );
+        }
+
+        /// The same answer for a turn that is still running stays the caller's error.
+        #[tokio::test(start_paused = true)]
+        async fn an_interrupt_refused_for_a_running_turn_is_still_reported() {
+            let Interrupting {
+                shared,
+                link,
+                stopping,
+                interrupt_id,
+                stream: _stream,
+                client: _client,
+            } = interrupting().await;
+            link.push_line(interrupt_refused(&interrupt_id));
+
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                matches!(&stopped, Err(Error::Vendor(vendor))
+                    if vendor.message == "interrupted owner was already closed"),
+                "expected the refusal for a live turn: Err(Vendor) | received: {stopped:?}"
+            );
+            assert!(
+                shared.active_turn_route().await.is_some(),
+                "expected the refused turn: still admitted | received: released"
+            );
+        }
+
+        /// An accepted interrupt is unchanged: the stop succeeds and the turn stays admitted until
+        /// Codex reports it interrupted.
+        #[tokio::test(start_paused = true)]
+        async fn an_accepted_interrupt_succeeds_and_the_turn_ends_when_codex_says_so() {
+            let Interrupting {
+                shared,
+                link,
+                mut stream,
+                stopping,
+                interrupt_id,
+                client: _client,
+            } = interrupting().await;
+            link.push_line(serde_json::json!({"id": interrupt_id, "result": {}}).to_string());
+
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                stopped.is_ok(),
+                "expected an accepted interrupt: Ok(()) | received: {stopped:?}"
+            );
+            assert!(
+                shared.active_turn_route().await.is_some(),
+                "expected the interrupted turn: admitted until turn/completed | received: released"
+            );
+
+            link.push_line(turn_completed("interrupted"));
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [
+                        EventKind::Cancelled {
+                            reason: CancelReason::Requested
+                        },
+                        EventKind::Completed
+                    ]
+                ),
+                "expected the interrupted terminal: [Cancelled(Requested), Completed] | received: {events:?}"
+            );
+        }
+
+        /// Codex ended the turn and exited without answering the interrupt. The completion was
+        /// read, so it is handled before the unanswered interrupt is failed.
+        #[tokio::test(start_paused = true)]
+        async fn a_completion_read_before_the_peer_exits_is_handled_before_the_interrupt_fails() {
+            let Interrupting {
+                shared,
+                link,
+                mut stream,
+                mut stopping,
+                interrupt_id: _,
+                client: _client,
+            } = interrupting().await;
+            let completion_held = shared.pending.lock().await;
+            link.push_line(turn_completed("completed"));
+            link.end();
+            handler_parked_in_completion(&shared).await;
+            tokio::time::sleep(SETTLED).await;
+
+            if stopping.is_finished() {
+                let early = (&mut stopping).await.expect("expected the stop task");
+                panic!(
+                    "expected the unanswered interrupt: failed only after turn/completed was handled | received: {early:?}"
+                );
+            }
+            drop(completion_held);
+
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                stopped.is_ok(),
+                "expected the stop of a turn that completed before the exit: Ok(()) | received: {stopped:?}"
+            );
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Completed)),
+                "expected the turn's own terminal: Completed | received: {events:?}"
+            );
+        }
+
+        /// A connection whose end never reaches the session holds the stop for one
+        /// `shutdown_timeout` and no longer; the turn is then still admitted and the interrupt's
+        /// error stands.
+        #[tokio::test(start_paused = true)]
+        async fn a_connection_end_that_never_fails_the_turn_holds_the_stop_for_one_shutdown_timeout()
+         {
+            let Interrupting {
+                shared,
+                link,
+                mut stopping,
+                client: _client,
+                stream: _stream,
+                ..
+            } = interrupting().await;
+            let shutdown_timeout = shared.host.limits().shutdown_timeout;
+            let termination_held = shared.pending.lock().await;
+            link.end();
+
+            tokio::time::sleep(shutdown_timeout - SETTLED).await;
+            if stopping.is_finished() {
+                let early = (&mut stopping).await.expect("expected the stop task");
+                panic!(
+                    "expected the stop before the shutdown timeout: still waiting for the connection's terminal | received: {early:?}"
+                );
+            }
+            tokio::time::sleep(SETTLED * 2).await;
+            assert!(
+                stopping.is_finished(),
+                "expected the stop after the shutdown timeout: finished | received: still waiting"
+            );
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                matches!(&stopped, Err(Error::Vendor(_))),
+                "expected a turn still admitted after the wait: Err(Vendor) | received: {stopped:?}"
+            );
+            drop(termination_held);
+        }
+
+        /// A peer that exits with the turn still running fails the turn with the connection's
+        /// end, and the stop reads its unanswered interrupt against that terminal, not against a
+        /// turn the connection's own report has not reached yet. Parking that report on the
+        /// approvals lock is what would otherwise let the stop sample first.
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_that_exits_mid_turn_fails_the_turn_before_the_stop_is_judged() {
+            let Interrupting {
+                shared,
+                link,
+                mut stream,
+                mut stopping,
+                client: _client,
+                ..
+            } = interrupting().await;
+            let termination_held = shared.pending.lock().await;
+            link.end();
+            tokio::time::sleep(SETTLED).await;
+
+            if stopping.is_finished() {
+                let early = (&mut stopping).await.expect("expected the stop task");
+                panic!(
+                    "expected the unanswered interrupt: judged after the connection failed the turn | received: {early:?}"
+                );
+            }
+            drop(termination_held);
+
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                stopped.is_ok(),
+                "expected the stop of a turn the connection ended: Ok(()) | received: {stopped:?}"
+            );
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Error { error })
+                    if error.message.contains("connection ended while the turn was active")),
+                "expected the turn's terminal: the connection failure | received: {events:?}"
+            );
+        }
+
+        /// The app-server died before the interrupt could be written: the pipe refuses the frame
+        /// and the client has not marked itself closed yet. The stop still waits for the
+        /// connection to fail the turn, as it does when the exit is read first.
+        #[tokio::test(start_paused = true)]
+        async fn an_interrupt_the_dead_pipe_refuses_waits_for_the_connection_to_fail_the_turn() {
+            let shared = shared();
+            shared.adopt_thread(String::from("thread-1"));
+            let (_turn_id, mut stream) = running(&shared, "vendor-turn-1").await;
+            let owner = Arc::clone(
+                &shared
+                    .turn
+                    .lock()
+                    .await
+                    .as_ref()
+                    .expect("expected the installed turn")
+                    .owner,
+            );
+            let link = ScriptedLink::new();
+            link.fail_sends("EPIPE");
+            let client = Arc::new(Client::connect(
+                link.clone().into_link(),
+                super::super::CodexSession::handler(Arc::clone(&shared)),
+                ClientOptions::new("Codex app-server"),
+            ));
+            // Parks the connection's own report, so the stop reaches its error first.
+            let termination_held = shared.pending.lock().await;
+            let stop_shared = Arc::clone(&shared);
+            let stop_client = Arc::clone(&client);
+            let mut stopping = tokio::spawn(async move {
+                super::super::CodexSession::dispatch_stop(
+                    &stop_shared,
+                    &stop_client,
+                    &owner,
+                    CancelReason::Requested,
+                )
+                .await
+            });
+            tokio::time::sleep(SETTLED).await;
+
+            if stopping.is_finished() {
+                let early = (&mut stopping).await.expect("expected the stop task");
+                panic!(
+                    "expected the refused interrupt: judged after the connection failed the turn | received: {early:?}"
+                );
+            }
+            drop(termination_held);
+
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                stopped.is_ok(),
+                "expected the stop of a turn the connection ended: Ok(()) | received: {stopped:?}"
+            );
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Error { error })
+                    if error.message.contains("connection ended while the turn was active")),
+                "expected the turn's terminal: the connection failure | received: {events:?}"
+            );
+        }
+
+        /// The interrupt's own deadline keeps running while its answer waits behind the handler.
+        /// A handler stuck for that long is the "Interrupt ack" expiry: the stop reports the
+        /// timeout, which the stop worker escalates to process shutdown.
+        #[tokio::test(start_paused = true)]
+        async fn a_handler_held_past_the_request_deadline_times_the_interrupt_out() {
+            let Interrupting {
+                shared,
+                link,
+                mut stream,
+                stopping,
+                interrupt_id,
+                client: _client,
+            } = interrupting().await;
+            let request_timeout = ClientOptions::new("Codex app-server").request_timeout;
+            let completion_held = shared.pending.lock().await;
+            link.push_line(turn_completed("completed"));
+            link.push_line(interrupt_refused(&interrupt_id));
+            handler_parked_in_completion(&shared).await;
+
+            let stopped = tokio::time::timeout(request_timeout * 2, stopping)
+                .await
+                .expect("expected the stop to end at the interrupt's own deadline")
+                .expect("expected the stop task");
+            assert!(
+                matches!(&stopped, Err(Error::Timeout { after, .. }) if *after == request_timeout),
+                "expected a handler held past the deadline: Err(Timeout after {request_timeout:?}) | received: {stopped:?}"
+            );
+
+            drop(completion_held);
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Completed)),
+                "expected the held completion to still end the turn: Completed | received: {events:?}"
+            );
+        }
+
+        /// A poisoned session interrupts from inside the notification handler, where an ordered
+        /// request is refused before it is written. That interrupt has to stay an ordinary one.
+        #[tokio::test(start_paused = true)]
+        async fn a_session_poisoned_inside_the_handler_still_writes_its_interrupt() {
+            let shared = shared();
+            shared.adopt_thread(String::from("thread-1"));
+            let (_turn_id, _stream) = running(&shared, "vendor-turn-1").await;
+            let link = ScriptedLink::new();
+            let client = Arc::new(Client::connect(
+                link.clone().into_link(),
+                super::super::CodexSession::handler(Arc::clone(&shared)),
+                ClientOptions::new("Codex app-server"),
+            ));
+            assert!(
+                shared.client.set(Arc::clone(&client)).is_ok(),
+                "expected the session's client slot: empty | received: already set"
+            );
+            // A terminal that names no thread cannot be routed, which poisons the session.
+            link.push_line(
+                serde_json::json!({"method": "turn/completed", "params": {"unexpected": true}})
+                    .to_string(),
+            );
+
+            let written =
+                tokio::time::timeout(std::time::Duration::from_secs(1), link.wait_for_sent(1))
+                    .await;
+            let sent = link.sent();
+            assert!(
+                written.is_ok() && sent[0].contains("\"turn/interrupt\""),
+                "expected frames written by the poisoned handler: [turn/interrupt] | received: {sent:?}"
+            );
+        }
     }
 
     /// Every way a turn ends owes the host a close for what it left open.
