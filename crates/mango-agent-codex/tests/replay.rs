@@ -3940,7 +3940,11 @@ async fn a_pending_approval_pauses_the_native_idle_deadline() {
 
 /// Refusing a pending approval can complete the turn while cancellation's interrupt is in flight.
 /// That completion is already the requested end, so cancel must not report the stale RPC error.
-#[tokio::test]
+///
+/// Four workers on purpose. The client settles the interrupt's error on its reader and hands the
+/// `turn/completed` written before it to another task, so on one thread this passed on wake order
+/// alone; on several the error used to reach the stop first, and the cancel failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancellation_succeeds_when_approval_cleanup_completes_the_turn_first() {
     let (session, _launcher) =
         open_with_approval_cancellation_race(InterruptRace::CompletesOwner).await;
@@ -4549,6 +4553,63 @@ async fn a_dead_app_server_connection_publishes_the_session_terminal() {
         launcher.live_children(),
         0,
         "expected the watcher to reap the child it reported closed"
+    );
+}
+
+/// The app-server dies with the turn running and the cancel's interrupt unanswered. The turn ends
+/// with the connection failure, and the cancel reports neither the interrupt's error nor a
+/// result that depends on which task saw the exit first: the connection ended the turn, and the
+/// child was reaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_whose_interrupt_dies_with_the_app_server_ends_with_the_connection_failure() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let close_stdout = mango_external_agents::CancelToken::new();
+    let exit_on_interrupt = close_stdout.clone();
+    launcher.push(
+        Transcript::load("approval")
+            .as_process_intercepting(move |frame| {
+                let method = frame.get("method").and_then(serde_json::Value::as_str);
+                // The refusal of the pending approval is swallowed, so nothing ends the turn but
+                // the exit.
+                if method.is_none() {
+                    return Some(Vec::new());
+                }
+                if method == Some("turn/interrupt") {
+                    exit_on_interrupt.cancel();
+                    return Some(Vec::new());
+                }
+                None
+            })
+            .ending_stdout_when(close_stdout),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+    let session = CodexHarness::new()
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "create mango.txt"))
+        .await
+        .expect("expected a turn");
+    await_approval(&mut turn).await;
+
+    let cancelled = session.cancel(CancelReason::Requested).await;
+    let events = drain(&mut turn).await;
+
+    assert!(
+        matches!(events.last(), Some(EventKind::Error { error })
+            if error.message.contains("connection ended while the turn was active")),
+        "expected the turn's terminal: the connection failure | received: {events:?}"
+    );
+    assert!(
+        cancelled.is_ok(),
+        "expected the cancel of a turn the connection ended: Ok(()) | received: {cancelled:?}"
+    );
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected live children after the exit: 0 | received: {}",
+        launcher.live_children()
     );
 }
 
