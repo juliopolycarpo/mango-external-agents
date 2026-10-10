@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -595,6 +595,8 @@ impl QueuedAnswer {
 
 impl Drop for QueuedAnswer {
     fn drop(&mut self) {
+        // Out of the queue, whichever way it left.
+        self.state.queued_answers.fetch_sub(1, Ordering::AcqRel);
         if let Some(answer) = self.answer.take() {
             let _ = answer.send(Err(self.state.undelivered_failure()));
         }
@@ -632,10 +634,12 @@ struct ClientState {
     /// The task that awaits `on_notification`, so a call made from inside it can be recognised.
     notification_task: OnceLock<tokio::task::Id>,
     peer_bytes: Arc<Semaphore>,
-    /// How many notifications and peer questions may wait in the handoff queue. A permit is held
-    /// from the reader's enqueue to the worker's dequeue, which is the span a slot of a bounded
-    /// channel covers; the channel itself is larger by the reserve below.
-    peer_slots: Arc<Semaphore>,
+    /// How many notifications and peer questions may wait in the handoff queue. The channel is
+    /// larger than this by the reserve below, so the reader counts what is in it.
+    notification_capacity: usize,
+    /// How many of the queue's entries are ordered responses, which the count above leaves out.
+    /// Only an ordered request ever moves it, so a connection without one pays a read for it.
+    queued_answers: AtomicUsize,
     /// Places in the handoff queue reserved for ordered responses. Taken when the call is
     /// admitted and released when the worker has passed the queued response, so neither a
     /// notification burst nor a caller that gave up can crowd one out.
@@ -727,9 +731,12 @@ impl Client {
             .clamp(1, Semaphore::MAX_PERMITS);
         let ordered_capacity = options.max_pending_requests.min(Semaphore::MAX_PERMITS);
         // One queue carries both kinds so their arrival order is kept; each is admitted against
-        // its own count, so the sum is room neither can take from the other.
+        // its own count, so the sum is room neither can take from the other. The one more is for
+        // the notification the reader can admit while the worker holds a response it has taken
+        // out and not yet let go of: without it, the next ordered response could find no room.
         let queue_capacity = notification_capacity
             .saturating_add(ordered_capacity)
+            .saturating_add(1)
             .min(Semaphore::MAX_PERMITS);
         let peer_bytes = Arc::new(Semaphore::new(
             options.max_pending_bytes.min(Semaphore::MAX_PERMITS),
@@ -750,7 +757,8 @@ impl Client {
             notifications: StdMutex::new(None),
             notification_task: OnceLock::new(),
             peer_bytes,
-            peer_slots: Arc::new(Semaphore::new(notification_capacity)),
+            notification_capacity,
+            queued_answers: AtomicUsize::new(0),
             ordered_places: Arc::new(Semaphore::new(ordered_capacity)),
         });
         let (notifications, notification_receiver) = mpsc::channel(queue_capacity);
@@ -1416,6 +1424,7 @@ impl ClientState {
             }
             Delivery::Ordered(place) => place,
         };
+        state.queued_answers.fetch_add(1, Ordering::AcqRel);
         let queued = QueuedWork::Response(QueuedAnswer {
             state: Arc::clone(state),
             answer: Some(answer),
@@ -1585,9 +1594,16 @@ async fn dispatch(
             .map_err(|_| PeerTermination::NotificationByteBackpressure {
                 limit: state.options.max_pending_bytes,
             })?;
-        let slot = Arc::clone(&state.peer_slots)
-            .try_acquire_owned()
-            .map_err(|_| state.queue_full())?;
+        // The channel also has room reserved for ordered responses, so its own capacity no
+        // longer says when the peer's share is spent. What is in it, less the responses, does.
+        // The worker only ever lowers either number, and a response that left the channel a
+        // moment before its count dropped makes this read low by one, never high. The channel
+        // has a slot for that one.
+        let queued = notifications.max_capacity() - notifications.capacity();
+        let responses = state.queued_answers.load(Ordering::Acquire);
+        if queued.saturating_sub(responses) >= state.notification_capacity {
+            return Err(state.queue_full());
+        }
         let work = match id {
             Some(id) => PeerWork::Request { method, params, id },
             None => PeerWork::Notification { method, params },
@@ -1596,7 +1612,6 @@ async fn dispatch(
             .try_send(QueuedWork::Peer {
                 work,
                 bytes: permit,
-                slot,
             })
             .map_err(|_| state.queue_full());
     }
@@ -1628,8 +1643,6 @@ enum QueuedWork {
         work: PeerWork,
         /// The frame's share of the callback byte budget, held until the handler is done with it.
         bytes: OwnedSemaphorePermit,
-        /// The frame's place in the queue, given back when the worker takes it out.
-        slot: OwnedSemaphorePermit,
     },
     /// A response whose caller asked for it after the peer work read before it.
     Response(QueuedAnswer),
@@ -1660,10 +1673,7 @@ async fn peer_work_pump(
                 answer.deliver();
                 continue;
             }
-            QueuedWork::Peer { work, bytes, slot } => {
-                drop(slot);
-                (work, bytes)
-            }
+            QueuedWork::Peer { work, bytes } => (work, bytes),
         };
         match work {
             PeerWork::Notification { method, params } => {
