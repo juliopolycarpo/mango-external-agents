@@ -120,7 +120,14 @@ JSON-RPC separately caps outbound requests and in-flight incoming requests at
 8 MiB budget by default. Callback queue pressure fails the connection explicitly; response
 correlation continues on its own path until closure. Arrival order therefore holds among
 notifications and peer requests, not between them and responses: a response can reach its caller
-before the handler has seen a notification that arrived ahead of it. Request deadlines include
+before the handler has seen a notification that arrived ahead of it. A request made with
+`RequestOptions::after_earlier_notifications` opts out of that for its own answer: the response
+waits in the callback queue and reaches its caller once the handler has returned from every
+notification read before it, and when the peer exits or the link fails it is still delivered (or
+the call failed) only after that queued work has drained, within `shutdown_timeout`. Up to
+`max_pending_requests` such answers have places reserved in the queue apart from the callback
+budgets, so callback pressure cannot refuse one. `Client::close` and callback queue pressure fail
+such a call at once. Request deadlines include
 writes, and dropping a request removes its pending correlation entry. Approval deadlines remain
 separate from request and idle deadlines.
 
