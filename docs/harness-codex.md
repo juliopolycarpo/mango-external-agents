@@ -200,7 +200,12 @@ a host supervisor.
 
 Teardown has one owner per session. The host-shutdown and connection-loss watcher, `close`, an
 abandoned turn that will not settle, and a dropped session all request the same detached worker,
-which closes the JSON-RPC client once and stops the child once. A session dropped on a thread
+which closes the JSON-RPC client once and stops the child once. A connection that ends, like a
+poisoned session, fails and releases the turn whose terminal it claimed before it wakes that
+worker: closing the client stops the task that reports the connection's end, so waking the worker
+first could leave the turn claimed with no terminal for the host. For the same reason the worker
+itself, whoever requested it, gives a terminal that is being committed up to `shutdown_timeout`
+to land before it closes the client. A session dropped on a thread
 without a Tokio runtime hands that worker to the runtime it was opened on. Every `close` waits for
 the worker's result, so none reports success before the child is reaped. If the worker cannot reap
 the child, or panics inside the host's process control, each caller receives the same

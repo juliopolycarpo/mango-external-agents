@@ -210,6 +210,10 @@ pub(crate) struct Shared {
     /// the reaper, the point a racing stop has to be correct at.
     #[cfg(test)]
     poison_released: Mutex<()>,
+    /// Held by a test to park [`Shared::connection_terminated`] after it claimed the turn's
+    /// terminal and before it commits it.
+    #[cfg(test)]
+    termination_claimed: Mutex<()>,
     /// Wakes the session-owned process reaper after an unexpected link termination.
     terminated: mango_external_agents::CancelToken,
     /// Wakes an abandonment watcher after its owned native turn reaches a terminal outcome, and a
@@ -259,6 +263,8 @@ impl Shared {
             shutting_down: AtomicBool::new(false),
             #[cfg(test)]
             poison_released: Mutex::new(()),
+            #[cfg(test)]
+            termination_claimed: Mutex::new(()),
             terminated: mango_external_agents::CancelToken::new(),
             turn_finished: Notify::new(),
             idle_changes,
@@ -608,6 +614,26 @@ impl Shared {
             }
         };
         let _ = tokio::time::timeout(self.host.limits().request_timeout, settled).await;
+    }
+
+    /// Waits, within `shutdown_timeout`, for a terminal that another task has claimed and is
+    /// still committing.
+    ///
+    /// For the teardown, just before it closes the client. Closing stops the client's own tasks,
+    /// and one of them may be the committer: the report of a connection's end, or the handler
+    /// finishing a turn. Cut off between the claim and the commit, the turn would keep its slot
+    /// with no terminal for the host, and nothing could claim it again. Whatever is still in
+    /// the slot once the teardown has ended the turn it could claim is such a turn.
+    async fn wait_for_claimed_terminal(&self) {
+        let claimed = self
+            .turn
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| Arc::clone(&active.owner));
+        if let Some(owner) = claimed {
+            self.wait_for_ending_turn(&owner).await;
+        }
     }
 
     async fn recently_completed(&self, native_turn_id: &str) -> bool {
@@ -1674,6 +1700,11 @@ impl Shared {
     /// Fails the active stream after the peer disappears without a terminal notification.
     async fn connection_terminated(&self, termination: PeerTermination) {
         if !self.stop_new_work() {
+            // Whatever stopped new work first may have been cut off before it woke the reaper:
+            // a poisoned session's task can be stopped with the connection. The client's tasks
+            // are already stopped when this runs, so no commit is left for a teardown to cut
+            // short, and the teardown has one owner.
+            self.terminated.cancel();
             return;
         }
         self.release_pending_for(None, DecisionSource::Cancelled)
@@ -1711,12 +1742,19 @@ impl Shared {
                 message.push_str(&format!("; stderr: {stderr}"));
             }
         }
-        self.terminated.cancel();
+        #[cfg(test)]
+        drop(self.termination_claimed.lock().await);
         let failure =
             VendorError::new(CALL_FAILED, message).with_vendor_code("connection-terminated", true);
         claim.close_open(ActivityStatus::Failed).await;
         let _ = claim.sink.fail(failure).await;
         self.release_terminal(&claim.owner).await;
+        // Last, as in `poison`. The token wakes the watcher's teardown, which closes the client
+        // and with it stops the task running this very function. Cancelled before the commit,
+        // the turn could be left claimed and never released: no terminal for the host, and a
+        // slot nothing can claim again. Once the turn is released there is nothing left here
+        // for that teardown to cut short.
+        self.terminated.cancel();
     }
 
     /// Fails the active turn under a bound and wakes the reaper after an unrecoverable protocol
@@ -3448,6 +3486,7 @@ impl CodexSession {
             .release_pending_for(None, DecisionSource::Cancelled)
             .await;
         shared.cancel_active(reason).await;
+        shared.wait_for_claimed_terminal().await;
         let close = tokio::time::timeout(limits.shutdown_timeout, client.close())
             .await
             .map_err(|_| Error::Timeout {
@@ -3648,8 +3687,9 @@ impl CodexSession {
                     );
                 }
                 () = terminated.cancelled() => {
-                    // The connection is already gone; `connection_terminated` or `poison` failed
-                    // the active turn before cancelling this token.
+                    // The connection is already gone. When `connection_terminated` or `poison`
+                    // claimed the active turn's terminal, it failed and released that turn before
+                    // cancelling this token.
                     Self::request_shutdown(
                         watcher_shared,
                         watcher_client,
@@ -7276,6 +7316,198 @@ mod tests {
 
             drop(poison_parked);
             poisoning.await.expect("expected the poison task");
+        }
+
+        /// A session over a scripted link and a fake child, with one turn running: what a test
+        /// needs to watch the teardown and the reap.
+        async fn running_session() -> (
+            Arc<Shared>,
+            super::super::CodexSession,
+            ScriptedLink,
+            FakeLauncher,
+            TurnStream,
+        ) {
+            let shared = shared();
+            shared.adopt_thread(String::from("thread-1"));
+            let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
+            let link = ScriptedLink::new();
+            let client = Arc::new(Client::connect(
+                link.clone().into_link(),
+                super::super::CodexSession::handler(Arc::clone(&shared)),
+                ClientOptions::new("Codex app-server"),
+            ));
+            let launcher = FakeLauncher::new();
+            launcher.push(FakeProcess::responding(|_| Vec::new()));
+            let control = launcher
+                .spawn(LaunchSpec {
+                    argv: vec![String::from("codex")],
+                    cwd: std::path::PathBuf::from("/workspace"),
+                    env: BTreeMap::new(),
+                    stdin: false,
+                    hide_window: true,
+                })
+                .await
+                .expect("expected a persistent fake app-server")
+                .control;
+            let snapshot = SessionSnapshot::opening(
+                SessionIds {
+                    session_id: mango_external_agents::SessionId::new("chat-1"),
+                    native_session_id: String::from("thread-1"),
+                },
+                HarnessIdentity::codex(),
+                TransportSelection::new(None, TransportKind::Stdio),
+                shared.host.now(),
+            );
+            let state = SessionState::new(Arc::clone(shared.host.clock()), snapshot);
+            let session =
+                super::super::CodexSession::new(state, Arc::clone(&shared), client, control);
+            (shared, session, link, launcher, stream)
+        }
+
+        /// Reads the stream to its end, or says the host never got a terminal.
+        async fn kinds_or_no_terminal(stream: &mut TurnStream) -> Vec<EventKind> {
+            let mut events = Vec::new();
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                while let Some(event) = stream.recv().await {
+                    events.push(event.kind);
+                }
+            })
+            .await;
+            assert!(
+                ended.is_ok(),
+                "expected the turn's terminal: the connection failure | received: no terminal, after {events:?}"
+            );
+            events
+        }
+
+        /// The app-server exits mid-turn. The session's report of that claims the turn's terminal
+        /// and wakes the watcher's teardown, which closes the client and stops the task running
+        /// the report. Parked between the claim and the commit, the report must not have woken
+        /// that teardown yet, or the turn stays claimed and the host never gets its terminal.
+        #[tokio::test(start_paused = true)]
+        async fn a_connection_end_commits_the_turn_before_it_wakes_the_teardown() {
+            let (shared, session, link, launcher, mut stream) = running_session().await;
+
+            let commit_parked = shared.termination_claimed.lock().await;
+            link.end();
+            // Long enough for a teardown woken too early to run to its end.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let started = shared
+                .teardown_started
+                .load(std::sync::atomic::Ordering::Acquire);
+            let live = launcher.live_children();
+            assert!(
+                !started && live == 1,
+                "expected before the commit: teardown started false, live children 1 | received: teardown started {started}, live children {live}"
+            );
+            drop(commit_parked);
+
+            let events = kinds_or_no_terminal(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Error { error })
+                    if error.message.contains("connection ended while the turn was active")),
+                "expected the turn's terminal: the connection failure | received: {events:?}"
+            );
+            assert!(
+                shared.turn.lock().await.is_none(),
+                "expected the turn slot after the connection ended: released | received: still claimed"
+            );
+            let cancelled = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                session.cancel(CancelReason::Requested),
+            )
+            .await;
+            assert!(
+                matches!(cancelled, Ok(Ok(()))),
+                "expected a cancel after the connection ended: Ok(()) | received: {cancelled:?}"
+            );
+            let closed = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                session.close(mango_external_agents::session::CloseReason::Shutdown),
+            )
+            .await;
+            assert!(
+                matches!(closed, Ok(Ok(()))),
+                "expected a close after the connection ended: Ok(()) | received: {closed:?}"
+            );
+            let live = launcher.live_children();
+            assert_eq!(
+                live, 0,
+                "expected live children after the close: 0 | received: {live}"
+            );
+        }
+
+        /// The host closes the session while the report of a dead connection is between claiming
+        /// the turn's terminal and committing it. The teardown `close` starts would stop the task
+        /// running that report, so it waits for the commit first: the host still gets the
+        /// connection failure, and `close` returns with the child reaped.
+        #[tokio::test(start_paused = true)]
+        async fn a_close_that_races_a_connection_end_lets_the_turn_commit_first() {
+            let (shared, session, link, launcher, mut stream) = running_session().await;
+            let session = Arc::new(session);
+
+            let commit_parked = shared.termination_claimed.lock().await;
+            link.end();
+            tokio::time::sleep(SETTLED).await;
+            assert!(
+                shared
+                    .turn
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|active| active.finishing),
+                "expected the turn while the report is parked: claimed and not released | received: not claimed"
+            );
+            let closing = Arc::clone(&session);
+            let close = tokio::spawn(async move {
+                closing
+                    .close(mango_external_agents::session::CloseReason::Shutdown)
+                    .await
+            });
+            // Well inside the teardown's wait, and long enough for a close that did not wait.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            drop(commit_parked);
+
+            let events = kinds_or_no_terminal(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Error { error })
+                    if error.message.contains("connection ended while the turn was active")),
+                "expected the turn's terminal: the connection failure | received: {events:?}"
+            );
+            let closed = tokio::time::timeout(std::time::Duration::from_secs(60), close)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("expected the close: returned | received: still waiting after 60s")
+                })
+                .expect("expected the close task");
+            assert!(
+                closed.is_ok(),
+                "expected the close racing a connection end: Ok(()) | received: {closed:?}"
+            );
+            let live = launcher.live_children();
+            assert_eq!(
+                live, 0,
+                "expected live children after the close: 0 | received: {live}"
+            );
+        }
+
+        /// A poisoned session's task can be stopped with the connection before it wakes the
+        /// reaper. The connection's own report then finds work already stopped, and has to wake
+        /// the reaper itself or nothing would until the host closed the session.
+        #[tokio::test(start_paused = true)]
+        async fn a_connection_end_that_finds_work_stopped_still_wakes_the_reaper() {
+            let shared = shared();
+            assert!(
+                shared.stop_new_work(),
+                "expected a fresh session: taking work | received: already stopped"
+            );
+
+            shared.connection_terminated(PeerTermination::Exited).await;
+
+            assert!(
+                shared.terminated.is_cancelled(),
+                "expected the reaper's token after the connection ended: cancelled | received: not cancelled"
+            );
         }
 
         /// A poisoned session interrupts from inside the notification handler, where an ordered
