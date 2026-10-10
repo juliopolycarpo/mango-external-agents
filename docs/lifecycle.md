@@ -118,9 +118,11 @@ whether or not a close event arrived.
 JSON-RPC separately caps outbound requests and in-flight incoming requests at
 `max_pending_requests`, 64 by default. Queued and in-flight incoming callback payloads share an
 8 MiB budget by default. Callback queue pressure fails the connection explicitly; response
-correlation continues on its own path until closure. Request deadlines include writes, and
-dropping a request removes its pending correlation entry. Approval deadlines remain separate from
-request and idle deadlines.
+correlation continues on its own path until closure. Arrival order therefore holds among
+notifications and peer requests, not between them and responses: a response can reach its caller
+before the handler has seen a notification that arrived ahead of it. Request deadlines include
+writes, and dropping a request removes its pending correlation entry. Approval deadlines remain
+separate from request and idle deadlines.
 
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
