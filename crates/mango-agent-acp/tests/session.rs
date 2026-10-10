@@ -2251,10 +2251,17 @@ async fn a_question_raised_during_the_close_handshake_is_withdrawn_rather_than_g
         .await
         .expect("expected the close to land");
 
+    // The agent asks exactly once, on `session/close`, so exactly one answer is owed. Counted, not
+    // only inspected: `all` over an empty list would also pass when no answer was ever written.
     let answers = outcome_lines(&launcher);
+    let withdrawals = answers
+        .iter()
+        .filter(|line| line.contains("cancelled"))
+        .count();
     assert!(
-        answers.iter().all(|line| line.contains("cancelled")),
-        "expected every answer during teardown to be a withdrawal, received {answers:?}"
+        answers.len() == 1 && withdrawals == 1,
+        "expected answers during teardown: 1, a withdrawal | received: {} ({withdrawals} withdrawals) {answers:?}",
+        answers.len()
     );
     assert!(
         broker.requests().is_empty(),

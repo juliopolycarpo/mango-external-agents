@@ -1,9 +1,15 @@
 //! A prompt whose encoded request cannot leave the transport is refused before the turn starts.
 //!
-//! The transport refuses any outgoing frame over the effective `HostContext::outbound_buffer_bytes()` budget. Refused there, the
-//! turn has already started: the connection fails, the session closes and the host is left with
-//! `AcceptanceUnknown`. These tests drive the real outbound path (the SDK's own serialisation and
-//! the bounded transport's own check), so the boundary they pin is the one a host meets.
+//! `start_turn` measures the prompt against the effective `HostContext::outbound_buffer_bytes()`
+//! budget and refuses one that cannot fit as `LimitExceeded` with `Dispatch::NotSubmitted`:
+//! nothing was written, no turn started and the session stays usable. That is the refusal these
+//! tests assert, beside the prompts at and under the budget that are submitted.
+//!
+//! The check exists because the transport enforces the same budget on every outgoing frame, and
+//! a prompt refused only there would be refused too late: the turn has already started, the
+//! connection fails, the session closes and the host is left with `AcceptanceUnknown`. These
+//! tests drive the real outbound path (the SDK's own serialisation and the bounded transport's
+//! own check), so the boundary they pin is the one a host meets.
 
 use super::*;
 

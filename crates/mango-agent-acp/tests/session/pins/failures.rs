@@ -73,12 +73,16 @@ async fn turn_on_an_agent_that_just_died() -> (Box<dyn Session>, FakeLauncher, T
 /// What is left of a turn, after its partial answer, once the agent's stdout has ended.
 const DEAD_AGENT_TURN: [&str; 1] = ["Error(acp-link-closed)"];
 
+/// How the closed-link message of a turn on the `fake` profile begins, whichever way the prompt
+/// task learned the link was gone.
+const DEAD_PROMPT_PREFIX: &str = "fake: a transport that closed under session/prompt; ";
+
 /// An agent whose stdout ends while a prompt is in flight has not been cancelled by anyone: the
 /// turn fails as a closed link, with the agent's redacted stderr on the typed message, and the
 /// session ends `Closed` with its child reaped.
 ///
-/// Deterministic on the current-thread runtime this runs on. On a multi-thread runtime the same
-/// death is sometimes reported as a cancellation today; the ignored test below records that.
+/// The current-thread runtime this runs on always shows the prompt task the prompt's own failure
+/// first. The multi-thread tests below repeat the death where the other order also happens.
 #[tokio::test]
 async fn an_agent_whose_output_ends_mid_prompt_fails_the_turn_as_a_closed_link() {
     let (session, launcher, mut turn) = turn_on_an_agent_that_just_died().await;
@@ -89,7 +93,7 @@ async fn an_agent_whose_output_ends_mid_prompt_fails_the_turn_as_a_closed_link()
     let Some(EventKind::Error { error }) = rest.last() else {
         unreachable!("the events above end in an error");
     };
-    assert_closed_link_with_stderr(error, "fake: ");
+    assert_closed_link_with_stderr(error, DEAD_PROMPT_PREFIX);
 
     assert_status(
         "after the link closed",
@@ -110,31 +114,161 @@ async fn an_agent_whose_output_ends_mid_prompt_fails_the_turn_as_a_closed_link()
     );
 }
 
-/// The same death on a multi-thread runtime, repeated so the race it loses shows up in one run.
+/// How many times a multi-thread test repeats a death.
 ///
-/// The prompt task waits on the prompt's own failure and on the end of the dispatch loop with
-/// equal priority. When the lifecycle watcher has already wound the loop down by the time that
-/// task is polled, it can take the loop's end, finds no failure and no cancel reason, and ends
-/// the turn as `Cancelled(Requested)`: a host is told it stopped a turn whose agent died.
+/// A smoke test, not the gate. Before the fix, 11 of 50 runs of 200 rounds reported a
+/// cancellation when run alone, and fewer under a loaded machine, so one run of this count
+/// catches the race about one time in five. The gates that do not depend on scheduling are the
+/// unit tests beside `prompt_ending`, which pin the decision for every order, and
+/// `a_request_past_its_deadline_fails_the_turn_in_flight_as_a_closed_link` below, which reaches
+/// the same decision on a current-thread runtime.
+const DEATH_ROUNDS: usize = 200;
+
+/// Asserts `events` end a turn as the closed link carrying the stderr tail, after `before`.
+fn assert_turn_died_as_a_closed_link(what: &str, events: &[EventKind], before: &[&str]) {
+    let expected: Vec<&str> = before.iter().chain(&DEAD_AGENT_TURN).copied().collect();
+    assert_events(what, events, &expected);
+    let Some(EventKind::Error { error }) = events.last() else {
+        unreachable!("the events above end in an error");
+    };
+    assert_closed_link_with_stderr(error, DEAD_PROMPT_PREFIX);
+}
+
+/// The same death on a multi-thread runtime, repeated so every order the prompt task can observe
+/// it in shows up in one run.
+///
+/// The prompt task waits on the prompt's own failure and on the end of the dispatch loop. The
+/// lifecycle watcher can wind the loop down before that task is polled, so either may be seen
+/// first. Nobody asked for a cancel, so both orders end the turn as the closed link, with the
+/// agent's stderr: a host is never told it stopped a turn whose agent died.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "an agent death that races the lifecycle watcher is reported as Cancelled(Requested) on a multi-thread runtime"]
 async fn an_agent_death_mid_prompt_is_never_reported_as_a_cancellation() {
-    for round in 0..200 {
+    for round in 0..DEATH_ROUNDS {
         let (_session, _launcher, mut turn) = turn_on_an_agent_that_just_died().await;
-        assert_events(
+        assert_turn_died_as_a_closed_link(
             &format!("the rest of the turn in round {round}"),
             &drain(&mut turn).await,
-            &DEAD_AGENT_TURN,
+            &[],
         );
     }
+}
+
+/// An agent that dies the moment it reads the prompt, before it reports anything, ends the turn
+/// the same way: the dispatch loop can be over before the prompt task first looks at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_death_under_the_prompt_it_just_read_is_never_reported_as_a_cancellation() {
+    for round in 0..DEATH_ROUNDS {
+        let (session, _launcher) =
+            open_under(dying_under("session/prompt"), Limits::default()).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "start working"))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("expected a turn in round {round} | received: {error:?}")
+            });
+        assert_turn_died_as_a_closed_link(
+            &format!("the turn in round {round}"),
+            &drain(&mut turn).await,
+            &["TurnStarted"],
+        );
+    }
+}
+
+/// A request that is not a prompt waits on its own reply alone, with nothing racing it, so an
+/// agent that died under `session/list` fails the call as a closed link naming that request, with
+/// the agent's stderr, and never as the agent's own refusal. The reply is failed at EOF before
+/// anything can wind the connection down, so there is one order here and one round covers it.
+#[tokio::test]
+async fn an_agent_death_under_a_request_is_never_reported_as_the_agents_refusal() {
+    let (session, _launcher) = open_under(
+        dying_peer("session/list", serde_json::json!({ "list": {} })),
+        Limits::default(),
+    )
+    .await;
+    let error = refusal(session.list_sessions(Default::default()).await);
+    let Error::Vendor(failure) = error.cause() else {
+        panic!("expected Error::Vendor | received: {error:?}");
+    };
+    assert_closed_link_with_stderr(failure, "a transport that closed under session/list");
+}
+
+/// A request still waiting when the connection is wound down under it loses its reply with the
+/// dispatch loop rather than at EOF. The agent refused nothing, so that is the closed link naming
+/// the request too, and never `acp-request-failed`. Here the connection ends because the host
+/// dropped another request it had sent.
+#[tokio::test(start_paused = true)]
+async fn a_request_whose_reply_is_dropped_with_the_connection_fails_as_a_closed_link() {
+    let (session, _launcher) = open_under(
+        FakeAcpAgent::new().holding_listing().process(),
+        Limits::default(),
+    )
+    .await;
+    let kept = session.list_sessions(Default::default());
+    let dropped = session.list_sessions(Default::default());
+    tokio::pin!(kept);
+    let first = tokio::time::timeout(Duration::from_millis(1), async {
+        tokio::select! {
+            biased;
+            kept = &mut kept => Some(kept),
+            _ = dropped => None,
+        }
+    })
+    .await;
+    assert!(
+        first.is_err(),
+        "expected both requests still pending | received: {first:?}"
+    );
+
+    let error = refusal(kept.await);
+    let Error::Vendor(failure) = error.cause() else {
+        panic!("expected Error::Vendor | received: {error:?}");
+    };
+    let received = (failure.code.as_str(), failure.message.as_str());
+    let expected = (
+        "acp-link-closed",
+        "a transport that closed under session/list",
+    );
+    assert_eq!(
+        received, expected,
+        "expected (code, message): {expected:?} | received: {received:?}"
+    );
+}
+
+/// A host that asked to stop the turn before the agent died is told the turn was cancelled, with
+/// its own reason. The request is recorded when `cancel` is called, so it is in place whichever
+/// way the prompt task then learns the agent is gone.
+#[tokio::test]
+async fn a_cancel_requested_before_the_agent_died_ends_the_turn_as_cancelled() {
+    let (session, launcher) = open_under(dying_under("session/cancel"), Limits::default()).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "start working"))
+        .await
+        .expect("expected a turn");
+
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to be queued");
+
+    assert_events(
+        "the turn",
+        &drain(&mut turn).await,
+        &["TurnStarted", "Cancelled(Requested)", "Completed"],
+    );
+    assert_wire_after(&launcher, "session/prompt", &["session/cancel"]);
 }
 
 /// A peer that answers the handshake up to `dies_under` and closes its stdout when it reads
 /// that request, leaving [`STDERR`] behind.
 fn dying_under(dies_under: &'static str) -> FakeProcess {
+    dying_peer(dies_under, serde_json::json!({}))
+}
+
+/// [`dying_under`], for a peer that advertises these `sessionCapabilities` first.
+fn dying_peer(dies_under: &'static str, capabilities: serde_json::Value) -> FakeProcess {
     let gone = CancelToken::new();
     let dying = gone.clone();
-    let peer = ScriptedPeer::new(|_| Vec::new());
+    let peer = ScriptedPeer::new(|_| Vec::new()).with_session_capabilities(capabilities);
     FakeProcess::responding(move |line| {
         let method = serde_json::from_str::<serde_json::Value>(line)
             .ok()
@@ -305,6 +439,53 @@ async fn a_request_past_its_deadline_times_out_and_ends_the_connection() {
     );
     assert_no_live_children("after a timed-out request", &launcher);
     assert_first_frame_after(&launcher, "session/new", "session/list");
+}
+
+/// A request that passed its deadline ends the connection under a turn that was still running.
+/// Nobody asked to stop that turn, so it ends as the closed link and not as a cancellation the
+/// host never requested.
+#[tokio::test(start_paused = true)]
+async fn a_request_past_its_deadline_fails_the_turn_in_flight_as_a_closed_link() {
+    let deadline = Duration::from_secs(5);
+    let (session, launcher) = open_under(
+        FakeAcpAgent::new()
+            .holding_listing()
+            .with_updates(Vec::new())
+            .staying_silent()
+            .process(),
+        Limits {
+            request_timeout: deadline,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "think for a while"))
+        .await
+        .expect("expected a turn");
+
+    let error = refusal(session.list_sessions(Default::default()).await);
+    assert!(
+        matches!(error.cause(), Error::Timeout { .. }),
+        "expected the listing: Error::Timeout | received: {error:?}"
+    );
+
+    let events = drain_within(&mut turn, 10 * deadline).await;
+    assert_events(
+        "the turn in flight",
+        &events,
+        &["TurnStarted", "Error(acp-link-closed)"],
+    );
+    let Some(EventKind::Error { error }) = events.last() else {
+        unreachable!("the events above end in an error");
+    };
+    let expected = "fake: a transport that closed under session/prompt";
+    assert_eq!(
+        error.message, expected,
+        "expected the failure message: {expected:?} | received: {:?}",
+        error.message
+    );
+    assert_no_live_children("after a timed-out request", &launcher);
 }
 
 /// `session/prompt` has no deadline of its own. A turn that reports nothing for longer than

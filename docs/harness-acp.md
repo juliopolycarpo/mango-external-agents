@@ -173,6 +173,26 @@ answers with `stop_reason: cancelled`, or after `Limits::kill_grace` and a reap 
 There is no floor, unlike the Claude harness's ten minutes: an ACP agent reports a running tool call
 through `tool_call_update`, so a silent one is not a working one.
 
+A turn ends as `Cancelled` in two cases. The agent answered its prompt with
+`stop_reason: cancelled`, which is believed and reported as `Requested` when no reason was
+recorded. Or a stop was recorded for the turn: a host `cancel`, a dropped stream or session, the
+idle deadline, a permission question that expired with no option to refuse, a host shutdown or a
+`close`. A connection that goes away under a turn nobody asked to stop ends that turn with one
+`EventKind::Error` whose code is `acp-link-closed` and whose message is
+`<profile id>: a transport that closed under session/prompt`, followed by the agent's redacted
+stderr tail when it wrote any. That covers an agent that exited mid-turn and a connection the
+harness itself ended because another request on it passed `Limits::request_timeout` or was
+dropped by its caller. The outcome does not depend on which of the prompt's failure and the end
+of the dispatch loop is observed first. When both a stop and the agent's death apply, the stop
+wins if it was recorded before the turn's terminal was decided: the turn ends as `Cancelled` with
+that reason, without the stderr tail. A `session/cancel` that could not be written can instead
+end the turn with `acp-link-closed` naming that write.
+
+A request other than the prompt that was still waiting when the connection went away fails the
+same way, as `acp-link-closed` with `a transport that closed under <method>` and the stderr tail,
+whether its reply was failed at EOF or dropped with the dispatch loop. It is never reported as the
+agent's own refusal.
+
 Steering is `Error::NotSupported` on every profile: ACP v1 has no surface for adding to a turn that is
 already running.
 
