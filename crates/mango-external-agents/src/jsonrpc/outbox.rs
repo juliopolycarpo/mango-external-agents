@@ -142,7 +142,9 @@ impl WireOptions {
     /// [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) counts bytes.
     ///
     /// Passing it ends the connection the way
-    /// [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) describes.
+    /// [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) describes. A
+    /// bound of zero is not passed by anything the peer did: it refuses every queued frame
+    /// alone, and leaves the connection to callers that wait for their own writes.
     ///
     /// # Example
     ///

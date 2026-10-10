@@ -140,16 +140,17 @@ callers already waiting on the lock, so frames reach the wire in the order their
 them; a caller that waits for its own write then takes the free link at once when nothing is
 queued, and a turn in the queue otherwise. A queueing caller is slowed by nothing but
 `WireOptions`, which `Client::connect_with` takes and which bounds nothing by default. One frame
-larger than its per-frame bound, or than the whole queue may ever hold (which is every frame when
-a queue bound is zero), is refused alone, with `Dispatch::NotSubmitted` and nothing written; an
-answer to the peer refused that way is replaced by a `-32603` reply, and when even that cannot
-fit, because the peer's own id passes the bound, the connection ends as a failed link. Passing the
-bounds on queued frames or queued bytes, which count the frame being written, means the peer
-stopped reading: the connection ends with `PeerTermination::OutboundBackpressure` and the call
+larger than the per-frame bound is refused alone, with `Dispatch::NotSubmitted` and nothing
+written, whoever sends it; an answer to the peer refused that way is replaced by a `-32603` reply,
+and when even that cannot fit, because the peer's own id passes the bound, the connection ends as
+a failed link. A frame queued with `submit_*` is refused alone in the same way when it is larger
+than the queue could hold even when empty, which is every such frame under a queue bound of zero.
+Passing the bounds on queued frames or queued bytes with what the queue already holds, which
+counts the frame being written, means the peer stopped reading: the connection ends with `PeerTermination::OutboundBackpressure` and the call
 receives the same `LimitExceeded`. A queued request's `Reply` resolves to a `CallFailure` that
 tells the peer's own error from an ended connection (`Client::ended` gives the same
 `ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type. `Client::close`
-writes the notifications queued before it and refuses the requests: a host that needs a last
+writes the notifications queued before it and refuses the requests still queued: a host that needs a last
 request answered waits for its reply first. A close that times out or is dropped before it
 reaches the link leaves the link unusable, so nothing queued is written afterwards. A `Reply` that
 is kept keeps the link's sender alive after the `Client` is dropped; drop replies before relying

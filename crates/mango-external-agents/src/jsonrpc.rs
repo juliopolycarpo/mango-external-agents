@@ -666,8 +666,8 @@ pub enum ConnectionEnd {
 /// Why a call queued with [`Client::submit_request`] has no answer.
 ///
 /// [`cause`](Self::cause) says which side failed it and how, as a type.
-/// [`into_error`](Self::into_error) is the [`Error`] that [`Client::request`] returns for the
-/// same failure, for a caller that only reports it.
+/// [`into_error`](Self::into_error) is the failure as an [`Error`], for a caller that only
+/// reports it.
 ///
 /// ```no_run
 /// # async fn example(reply: mango_external_agents::jsonrpc::Reply) {
@@ -731,7 +731,12 @@ impl CallFailure {
         &self.parts.0
     }
 
-    /// The error [`Client::request`] returns for this failure, text and codes included.
+    /// This failure as an [`Error`].
+    ///
+    /// For the peer's own error, an ended connection, a stopped handler and a deadline it is
+    /// the error [`Client::request`] returns for the same failure, text and codes included. For
+    /// an unwritten frame it only says so; the write's own error is what [`Written`] resolves
+    /// to.
     ///
     /// ```no_run
     /// # fn example(failure: mango_external_agents::jsonrpc::CallFailure) -> mango_external_agents::Error {
@@ -770,6 +775,18 @@ impl From<CallFailure> for Error {
 struct Failed {
     body: JsonRpcError,
     cause: FailedCause,
+}
+
+impl Failed {
+    /// The reason the handler is told for the end this records: the one on record when the
+    /// connection ended under this side, so the handler, [`Client::ended`] and every failed
+    /// reply name the same one however the causes raced. Otherwise `found`, what the pump saw.
+    fn termination(&self, found: PeerTermination) -> PeerTermination {
+        match &self.cause {
+            FailedCause::Ended(ConnectionEnd::Peer(recorded)) => recorded.clone(),
+            _ => found,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -857,6 +874,8 @@ struct ClientState {
     writer_abort: OnceLock<tokio::task::AbortHandle>,
     /// The typed reason, when what ended the connection was this side's own outbound budget.
     outbound_overflow: StdMutex<Option<PeerTermination>>,
+    /// Whether a `close` has begun. The first one answers for whether the link was reached.
+    close_begun: AtomicBool,
     /// Runs once when the writer has taken a queued frame and before it sends, so a test can
     /// place a caller's withdrawal exactly there.
     #[cfg(test)]
@@ -1093,9 +1112,8 @@ impl SubmittedRequest {
 /// The peer's answer to a request queued with [`Client::submit_request`].
 ///
 /// Resolves to the answer, still as JSON, or to a [`CallFailure`]: the peer's own error, or what
-/// ended the wait on this side, told apart by type. [`CallFailure::into_error`] is what
-/// [`Client::request`] would have returned. The deadline the request asked for is counted from
-/// when it was queued.
+/// ended the wait on this side, told apart by type. [`CallFailure::into_error`] turns either
+/// into an [`Error`]. The deadline the request asked for is counted from when it was queued.
 ///
 /// Dropping it gives the call up. If the request frame is still queued it is taken out and never
 /// written; if its write has begun it is left to finish and the answer, when it comes, is
@@ -1222,6 +1240,7 @@ impl Client {
             outbox,
             writer_abort: OnceLock::new(),
             outbound_overflow: StdMutex::new(None),
+            close_begun: AtomicBool::new(false),
             #[cfg(test)]
             after_write_began: StdMutex::new(None),
             #[cfg(test)]
@@ -1448,9 +1467,11 @@ impl Client {
     /// ordered-response reserve; [`Error::HostConfiguration`] for an ordered request from inside
     /// `on_notification`; [`Error::Protocol`] for params that do not serialise;
     /// [`Error::LimitExceeded`] with [`Dispatch::NotSubmitted`]
-    /// when the frame is larger than [`WireOptions::with_max_outbound_frame_bytes`] allows, which
-    /// refuses this call alone, or when the queue's own bounds are passed, which also ends the
-    /// connection; and [`Error::Link`] when an earlier write left the link unusable.
+    /// when the frame is larger than [`WireOptions::with_max_outbound_frame_bytes`] allows or
+    /// than the queue could hold even when empty (any frame, under a queue bound of zero), which
+    /// refuses this call alone, or when the queue's bounds are passed by what it already holds,
+    /// which also ends the connection; and [`Error::Link`] when an earlier write left the link
+    /// unusable.
     ///
     /// [`ClientOptions::max_pending_requests`] is applied when the frame's turn to be written
     /// comes, not here: a request past it is not written, its [`Written`] resolves to that
@@ -1567,10 +1588,11 @@ impl Client {
     ///
     /// Of the frames queued with [`Client::submit_notification`] and
     /// [`Client::submit_request`] before the close, notifications are written before the link
-    /// goes. Requests are not: a request is entered among the calls awaiting an answer when its
-    /// turn to be written comes, and a closing client enters none, so its [`Written`] resolves
-    /// to [`Error::Closed`] and its [`Reply`] fails with [`ConnectionEnd::Closed`]. A host that
-    /// needs a last request answered waits for its reply and closes afterwards.
+    /// goes. Requests whose turn to be written has not come are not: a request is entered among
+    /// the calls awaiting an answer when that turn comes, and a closing client enters none, so
+    /// its [`Written`] resolves to [`Error::Closed`] and its [`Reply`] fails with
+    /// [`ConnectionEnd::Closed`], as does the reply of one already written. A host that needs a
+    /// last request answered waits for its reply and closes afterwards.
     ///
     /// A close that does not reach the link leaves it unusable: nothing still queued is written
     /// afterwards. That is so when the close runs out of `shutdown_timeout` behind a write the
@@ -1592,9 +1614,12 @@ impl Client {
         self.state.shutdown.cancel();
         // A close that does not get as far as the link, because its grace ran out or because its
         // caller stopped waiting, must not leave queued frames to be written behind it.
+        // Only the first close answers for the link: a later one, dropped while the first is
+        // still writing what was queued, must not take the link from under it.
+        let first = !self.state.close_begun.swap(true, Ordering::AcqRel);
         let mut giving_up = PoisonUnlessClosed {
             state: &self.state,
-            reached_the_link: false,
+            reached_the_link: !first,
         };
         self.state.fail_pending(failure).await;
         self.state.stop_notifications().await;
@@ -1619,7 +1644,7 @@ impl Client {
             operation: String::from("JSON-RPC link shutdown"),
             after: self.state.options.shutdown_timeout,
         });
-        giving_up.reached_the_link = closed.is_ok();
+        giving_up.reached_the_link |= closed.is_ok();
         drop(giving_up);
         let closed = closed.and_then(std::convert::identity);
         if let Some(pump) = self.pump.lock().await.take() {
@@ -1637,11 +1662,14 @@ impl Client {
         self.state.closed.load(Ordering::Acquire)
     }
 
-    /// How the connection ended, or `None` while it has not.
+    /// How the connection ended, or `None` while nothing has ended it.
     ///
     /// The reason is on record before any call is failed with it, and before a
     /// [`Client::submit_request`] that passed the outbound budget returns its error, so a caller
-    /// holding a failure can ask this for the cause.
+    /// holding a failure can ask this for the cause. That is a moment before
+    /// [`is_closed`](Self::is_closed) turns true. It is the reason the handler's
+    /// [`on_terminated`](PeerHandler::on_terminated) is given when the end came from under this
+    /// side.
     ///
     /// ```no_run
     /// # fn example(client: &mango_external_agents::jsonrpc::Client) {
@@ -1652,6 +1680,7 @@ impl Client {
     /// }
     /// # }
     /// ```
+    #[must_use]
     pub fn ended(&self) -> Option<ConnectionEnd> {
         self.state.ended()
     }
@@ -1976,10 +2005,12 @@ impl ClientState {
                 },
                 self.call_failed(body, id),
             )),
-            // The entry was dropped unsettled: its frame went with a writer that was taken down,
-            // which is the client being dropped.
+            // The entry was dropped unsettled, which is its frame going with a writer that was
+            // taken down while the frame was still queued. A dropped client is on record as the
+            // end; anything else that stops the writer has only left the frame unwritten.
             Err(_) => Err(CallFailure::new(
-                CallFailureCause::Ended(self.ended().unwrap_or(ConnectionEnd::Closed)),
+                self.ended()
+                    .map_or(CallFailureCause::Unwritten, CallFailureCause::Ended),
                 self.went_away(),
             )),
         }
@@ -2499,6 +2530,7 @@ async fn pump(
                         ConnectionEnd::Peer(termination.clone()),
                         state.closed_error(),
                     );
+                    let termination = failure.termination(termination);
                     connection_failed(&state, &handler, notifications, termination, failure)
                         .await;
                     break;
@@ -2519,6 +2551,7 @@ async fn pump(
                         ConnectionEnd::Peer(termination.clone()),
                         state.overflow_failure(),
                     );
+                    let termination = failure.termination(termination);
                     state.closed.store(true, Ordering::Release);
                     state.fail_pending(failure).await;
                     state.stop_notifications().await;
@@ -2537,11 +2570,12 @@ async fn pump(
                         data: None,
                     },
                 );
+                let termination = failure.termination(PeerTermination::Exited);
                 state.closed.store(true, Ordering::Release);
                 fail_pending_around_drain(&state, notifications, failure).await;
                 state.shutdown.cancel();
                 state.drain_in_flight().await;
-                handler.on_terminated(PeerTermination::Exited).await;
+                handler.on_terminated(termination).await;
                 break;
             }
             Err(error) => {
@@ -2569,6 +2603,7 @@ async fn link_failed(
             data: None,
         },
     );
+    let termination = failure.termination(termination);
     connection_failed(state, handler, notifications, termination, failure).await;
 }
 

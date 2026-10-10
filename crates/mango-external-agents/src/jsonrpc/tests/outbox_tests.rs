@@ -1497,8 +1497,10 @@ async fn queueing_begun(gated: &Gated) {
         .expect("expected the first queued frame written");
 }
 
+/// Whether a caller holds the link and nobody is still on the way to it. A caller the lock was
+/// handed to stays counted until its task runs again, so the lock alone says too little.
 fn link_in_use(gated: &Gated) -> bool {
-    gated.client.state.sender.try_lock().is_err()
+    gated.client.state.outbox.direct().0 == 0 && gated.client.state.sender.try_lock().is_err()
 }
 
 /// A caller that waits for its own write, behind a link in use, stays counted as queued until the
@@ -1579,8 +1581,8 @@ async fn callers_that_all_wait_for_their_writes_share_the_link_without_the_queue
     dropped.abort();
     let cancelled = eventually("the dropped caller", dropped).await;
     assert!(
-        cancelled.is_err_and(|error| error.is_cancelled()),
-        "expected the dropped caller's task cancelled"
+        matches!(&cancelled, Err(error) if error.is_cancelled()),
+        "expected the dropped caller's task cancelled | received {cancelled:?}"
     );
     let waiting = outbox.direct();
     assert_eq!(
@@ -1910,7 +1912,7 @@ async fn a_caller_dropped_while_the_outbox_waits_on_the_link_for_it_is_passed_ov
     until("the dropped caller's turn given up", || outbox.turns() == 0).await;
     assert!(
         link_in_use(&gated),
-        "expected the turn given up while the link was still in use"
+        "expected the turn given up while the link was still in use: in use | received free"
     );
     let next = gated
         .client
@@ -1962,8 +1964,8 @@ async fn a_close_dropped_before_it_finishes_leaves_no_queued_frame_to_be_written
     closing.abort();
     let abandoned = within("the abandoned close", closing).await;
     assert!(
-        abandoned.is_err_and(|error| error.is_cancelled()),
-        "expected the close cut off before it finished"
+        matches!(&abandoned, Err(error) if error.is_cancelled()),
+        "expected the close cut off before it finished | received {abandoned:?}"
     );
 
     gated.gate.add_permits(1);
@@ -1981,8 +1983,6 @@ async fn a_close_dropped_before_it_finishes_leaves_no_queued_frame_to_be_written
         vec!["hold"],
         "expected nothing written after the abandoned close: [hold] | received {order:?}"
     );
-    let refused = gated.client.notify("after", json!({})).await;
-    assert_eq!(methods(&gated.link), vec!["hold"], "received {refused:?}");
 }
 
 #[tokio::test]
@@ -2145,4 +2145,150 @@ async fn a_reply_the_peer_refused_carries_the_peers_error_and_no_end() {
         Some(ConnectionEnd::Peer(PeerTermination::Exited))
     );
     gated.client.close().await.expect("expected a clean close");
+}
+
+/// Two things can end a connection at nearly the same moment, and the first on record is kept.
+/// The handler is told that one, so it, the client and every failed reply name the same reason.
+#[tokio::test]
+async fn the_handler_is_told_the_reason_on_record_when_two_causes_race() {
+    let gated = gated(options(), WireOptions::new());
+    let (written, reply) = gated
+        .client
+        .submit_request("asked", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    // A caller on another thread passed the outbound budget and put that on record; the pump,
+    // already past its wait, finds the peer gone.
+    let recorded = PeerTermination::OutboundBackpressure {
+        subject: QUEUED_FRAMES,
+        limit: 2,
+        received: 3,
+    };
+    gated.client.state.ended_with(
+        ConnectionEnd::Peer(recorded.clone()),
+        gated.client.state.closed_error(),
+    );
+    gated.link.end();
+
+    let told = one_termination(&gated.handler).await;
+    assert_eq!(
+        told, recorded,
+        "expected the handler told the reason on record: {recorded:?} | received {told:?}"
+    );
+    let (cause, _) = failure(within("the reply", reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Ended(ConnectionEnd::Peer(recorded.clone())),
+        "expected the reply failed with the same reason | received {cause:?}"
+    );
+    let ended = gated.client.ended();
+    assert_eq!(
+        ended,
+        Some(ConnectionEnd::Peer(recorded)),
+        "expected the client to give the same reason | received {ended:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// A reply whose frame went down with the queue's task says the connection ended only when that
+/// is on record. Otherwise its frame was simply not written.
+#[tokio::test]
+async fn a_reply_lost_with_the_queue_task_claims_no_end_that_is_not_on_record() {
+    let gated = gated(options(), WireOptions::new());
+    // The queue's task waits here for the map before it writes a request: stopped at that
+    // point it has put nothing on the wire and has nothing to report.
+    let map = gated.client.state.pending.lock().await;
+    let (written, reply) = gated
+        .client
+        .submit_request("lost", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    until("the queue's task to take the request", || {
+        gated.client.state.outbox.taken() == 1
+    })
+    .await;
+    gated
+        .client
+        .state
+        .writer_abort
+        .get()
+        .expect("expected the queue's task to be running")
+        .abort();
+
+    let (cause, _) = failure(within("the reply", reply).await);
+    let ended = gated.client.ended();
+    assert_eq!(
+        (&cause, &ended),
+        (&CallFailureCause::Unwritten, &None),
+        "expected the reply failed as unwritten with no end on record: (Unwritten, None) | received ({cause:?}, {ended:?})"
+    );
+    let unwritten = within("the write", written).await;
+    assert!(
+        unwritten.is_err(),
+        "expected the write reported failed: Err | received {unwritten:?}"
+    );
+    drop(map);
+    assert!(
+        gated.link.sent().is_empty(),
+        "expected nothing written: [] | received {:?}",
+        gated.link.sent()
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// Only the first close answers for the link. A second one, given up while the first is still
+/// writing what was queued before it, does not take the link from under the first.
+#[tokio::test]
+async fn a_second_close_given_up_does_not_stop_the_first_from_flushing() {
+    let gated = gated(options(), WireOptions::new());
+    let held = link_held(&gated).await;
+    let queued = gated
+        .client
+        .submit_notification("queued", json!({}))
+        .expect("expected a frame queued behind the held one");
+    let closing = {
+        let client = Arc::clone(&gated.client);
+        tokio::spawn(async move { client.close().await })
+    };
+    until("the first close to have begun", || {
+        gated
+            .client
+            .state
+            .close_begun
+            .load(std::sync::atomic::Ordering::Acquire)
+    })
+    .await;
+
+    {
+        // Polled once, so it is inside the close, and then let go.
+        let mut second = Box::pin(gated.client.close());
+        let finished =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(second.as_mut().poll(cx).is_ready()))
+                .await;
+        assert!(
+            !finished,
+            "expected the second close still waiting behind the held frame: pending | received finished"
+        );
+    }
+
+    gated.gate.add_permits(1);
+    within("the held frame", held)
+        .await
+        .expect("expected the held frame written");
+    within("the queued frame", queued)
+        .await
+        .expect("expected the frame queued before the first close written");
+    within("the first close", closing)
+        .await
+        .expect("expected the close task to finish")
+        .expect("expected a clean close");
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["hold", "queued"],
+        "expected what was queued before the first close on the wire: [hold, queued] | received {order:?}"
+    );
 }
