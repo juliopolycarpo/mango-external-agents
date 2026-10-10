@@ -1304,6 +1304,7 @@ mod tests {
     /// A handler that records what it was told and answers questions from a script.
     struct RecordingHandler {
         notifications: Mutex<Vec<(String, Value)>>,
+        recorded: Notify,
         terminations: Mutex<Vec<PeerTermination>>,
         answer: Option<ServerRequestOutcome>,
     }
@@ -1312,9 +1313,41 @@ mod tests {
         fn arc(answer: Option<ServerRequestOutcome>) -> Arc<Self> {
             Arc::new(Self {
                 notifications: Mutex::new(Vec::new()),
+                recorded: Notify::new(),
                 terminations: Mutex::new(Vec::new()),
                 answer,
             })
+        }
+
+        /// Waits until the handler has recorded at least `count` notifications, then returns
+        /// them in the order it recorded them.
+        ///
+        /// Notifications are handled on a task apart from the reader, so nothing else a test can
+        /// await (a response least of all) says the handler has run. Bounded, so a notification
+        /// that never arrives fails by name instead of hanging.
+        ///
+        /// ```ignore
+        /// link.push_line(r#"{"method":"item/started"}"#);
+        /// let seen = handler.wait_for_notifications(1).await;
+        /// ```
+        async fn wait_for_notifications(&self, count: usize) -> Vec<(String, Value)> {
+            let wait = async {
+                loop {
+                    let recorded = self.recorded.notified();
+                    let seen = self.notifications.lock().await.clone();
+                    if seen.len() >= count {
+                        return seen;
+                    }
+                    recorded.await;
+                }
+            };
+            match tokio::time::timeout(Duration::from_secs(5), wait).await {
+                Ok(seen) => seen,
+                Err(_) => panic!(
+                    "expected {count} notifications handled within 5s | received {:?}",
+                    self.notifications.lock().await
+                ),
+            }
         }
     }
 
@@ -1322,6 +1355,7 @@ mod tests {
     impl PeerHandler for RecordingHandler {
         async fn on_notification(&self, method: String, params: Value) {
             self.notifications.lock().await.push((method, params));
+            self.recorded.notify_waiters();
         }
 
         async fn on_request(
@@ -1695,19 +1729,151 @@ mod tests {
 
         link.push_line(r#"{"jsonrpc":"2.0","method":"item/started","params":{"n":1}}"#);
         link.push_line(r#"{"jsonrpc":"2.0","method":"item/completed","params":{"n":2}}"#);
-        link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":null}"#);
-        client
-            .request::<_, Value>("ping", json!({}))
-            .await
-            .expect("expected an answer");
 
-        let seen = handler.notifications.lock().await;
+        // No response stands in for "the handler is done": one is settled by the reader and can
+        // reach its caller before either notification has been handled.
+        let seen = handler.wait_for_notifications(2).await;
+        let methods: Vec<&str> = seen.iter().map(|(method, _)| method.as_str()).collect();
         assert_eq!(
-            seen.iter()
-                .map(|(method, _)| method.as_str())
-                .collect::<Vec<_>>(),
-            vec!["item/started", "item/completed"]
+            methods,
+            vec!["item/started", "item/completed"],
+            "expected notifications in arrival order: [item/started, item/completed] | received {methods:?}"
         );
+
+        client.close().await.expect("expected a clean close");
+    }
+
+    /// A handler that holds every notification at a gate before recording it, the way a host
+    /// that is slow to read its turn stream does, and lets them through once the test opens it.
+    struct GatedRecorder {
+        entered: Notify,
+        gate: tokio::sync::Semaphore,
+        notifications: Mutex<Vec<String>>,
+        recorded: Notify,
+    }
+
+    impl GatedRecorder {
+        fn arc() -> Arc<Self> {
+            Arc::new(Self {
+                entered: Notify::new(),
+                gate: tokio::sync::Semaphore::new(0),
+                notifications: Mutex::new(Vec::new()),
+                recorded: Notify::new(),
+            })
+        }
+
+        /// Lets `count` held or future notifications through the gate.
+        ///
+        /// ```ignore
+        /// handler.open_for(2);
+        /// ```
+        fn open_for(&self, count: usize) {
+            self.gate.add_permits(count);
+        }
+
+        /// The methods recorded so far, in the order they passed the gate.
+        ///
+        /// ```ignore
+        /// assert!(handler.recorded().await.is_empty());
+        /// ```
+        async fn recorded(&self) -> Vec<String> {
+            self.notifications.lock().await.clone()
+        }
+
+        /// Waits until `count` notifications have passed the gate, then returns their methods in
+        /// order. Bounded, so a notification still held fails by name instead of hanging.
+        ///
+        /// ```ignore
+        /// handler.open_for(2);
+        /// let methods = handler.wait_for_recorded(2).await;
+        /// ```
+        async fn wait_for_recorded(&self, count: usize) -> Vec<String> {
+            let wait = async {
+                loop {
+                    let recorded = self.recorded.notified();
+                    let seen = self.recorded().await;
+                    if seen.len() >= count {
+                        return seen;
+                    }
+                    recorded.await;
+                }
+            };
+            match tokio::time::timeout(Duration::from_secs(5), wait).await {
+                Ok(seen) => seen,
+                Err(_) => panic!(
+                    "expected {count} notifications past the gate within 5s | received {:?}",
+                    self.recorded().await
+                ),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandler for GatedRecorder {
+        async fn on_notification(&self, method: String, _params: Value) {
+            self.entered.notify_one();
+            self.gate
+                .acquire()
+                .await
+                .expect("expected the gate to stay open for the whole test")
+                .forget();
+            self.notifications.lock().await.push(method);
+            self.recorded.notify_waiters();
+        }
+
+        async fn on_request(
+            &self,
+            _method: String,
+            _params: Value,
+            _id: RequestId,
+        ) -> ServerRequestOutcome {
+            ServerRequestOutcome::Answer(Value::Null)
+        }
+    }
+
+    /// Arrival order holds among notifications, not between a notification and a response. The
+    /// reader settles a response itself and only queues a notification for the handler's task,
+    /// so an answer reaches its caller while notifications the peer sent before it still wait.
+    #[tokio::test]
+    async fn a_response_reaches_its_caller_while_earlier_notifications_wait_on_the_handler() {
+        let link = ScriptedLink::new();
+        let handler = GatedRecorder::arc();
+        let client = Client::connect(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            ClientOptions::new("Codex app-server").with_request_timeout(Duration::from_secs(5)),
+        );
+
+        // The peer writes two notifications and then the answer, once the question is on the wire.
+        let peer = async {
+            link.wait_for_sent(1).await;
+            link.push_line(r#"{"jsonrpc":"2.0","method":"item/started","params":{"n":1}}"#);
+            link.push_line(r#"{"jsonrpc":"2.0","method":"item/completed","params":{"n":2}}"#);
+            link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"pong"}"#);
+        };
+        let (answer, ()) = tokio::join!(client.request::<_, Value>("ping", json!({})), peer);
+
+        let answer = answer.expect("expected the answer while the handler held the gate");
+        assert_eq!(answer, json!("pong"), "received {answer}");
+        // The handler is inside the first notification and has finished neither.
+        tokio::time::timeout(Duration::from_secs(5), handler.entered.notified())
+            .await
+            .expect("expected the first notification to have reached the handler");
+        let held = handler.recorded().await;
+        assert!(
+            held.is_empty(),
+            "expected no notification handled before the gate opened: [] | received {held:?}"
+        );
+
+        handler.open_for(2);
+        let methods = handler.wait_for_recorded(2).await;
+        assert_eq!(
+            methods,
+            vec!["item/started", "item/completed"],
+            "expected notifications in arrival order: [item/started, item/completed] | received {methods:?}"
+        );
+
+        client.close().await.expect("expected a clean close");
     }
 
     #[tokio::test]
@@ -1806,23 +1972,21 @@ mod tests {
             r#"{"method":"item/patch","params":{"changes":[{"path":"a.rs","kind":null}],"n":1.5}}"#,
         );
         link.push_line(r#"{"method":"item/bare"}"#);
-        link.push_line(r#"{"id":"1","result":null}"#);
-        client
-            .request::<_, Value>("ping", json!({}))
-            .await
-            .expect("expected an answer");
 
-        let seen = handler.notifications.lock().await;
+        let seen = handler.wait_for_notifications(2).await;
+        let expected = vec![
+            (
+                String::from("item/patch"),
+                json!({ "changes": [{ "path": "a.rs", "kind": null }], "n": 1.5 }),
+            ),
+            (String::from("item/bare"), Value::Null),
+        ];
         assert_eq!(
-            *seen,
-            vec![
-                (
-                    String::from("item/patch"),
-                    json!({ "changes": [{ "path": "a.rs", "kind": null }], "n": 1.5 })
-                ),
-                (String::from("item/bare"), Value::Null),
-            ]
+            seen, expected,
+            "expected notifications with their params intact: {expected:?} | received {seen:?}"
         );
+
+        client.close().await.expect("expected a clean close");
     }
 
     #[tokio::test]
