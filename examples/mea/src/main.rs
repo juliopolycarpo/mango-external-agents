@@ -131,7 +131,7 @@ fn print_banner() {
         "usage: mea discover|doctor [--harness claude|codex|acp:<profile>] [--json] [--cwd DIR]"
     );
     println!(
-        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|acp] [--cwd DIR] [--json] [--level read-only|default|full-access] <prompt>"
+        "       mea turn [--harness claude|codex|acp:<profile>] [--profile ID] [--transport stdio|websocket|acp] [--cwd DIR] [--json] [--level read-only|default|full-access] [--cancel-after SECONDS] <prompt>"
     );
     println!(
         "       mea capture --harness claude|codex|acp[:profile] [--profile ID] [--out DIR] [--workspace DIR] [--transcripts]"
@@ -356,7 +356,10 @@ async fn turn(options: &Options) -> Result<(), String> {
     turn::run_with_format(
         session.as_ref(),
         TurnRequest::new("mea-turn-1", options.prompt.clone()),
-        options.json,
+        turn::TurnOptions {
+            json: options.json,
+            cancel_after: options.cancel_after,
+        },
     )
     .await
     .map_err(|e| e.to_string())
