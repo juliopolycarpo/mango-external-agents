@@ -200,7 +200,21 @@ a host supervisor.
 
 Teardown has one owner per session. The host-shutdown and connection-loss watcher, `close`, an
 abandoned turn that will not settle, and a dropped session all request the same detached worker,
-which closes the JSON-RPC client once and stops the child once. A session dropped on a thread
+which closes the JSON-RPC client once and stops the child once. A connection that ends, like a
+poisoned session, fails and releases the turn whose terminal it claimed before it wakes that
+worker: closing the client stops the task that reports the connection's end, so waking the worker
+first could leave the turn claimed with no terminal for the host. The wake itself is not lost when
+that task is stopped or unwinds, as it does if the host's process control panics under it. For the
+same reason the worker, whoever requested it, gives a terminal that is being committed up to
+`shutdown_timeout` to land before it closes the client. A committer that is gone cannot land it,
+so when that wait expires the worker fails the turn itself, with the vendor code
+`terminal-abandoned` and not retryable: the turn's real outcome is unknown. A connection's end
+that finds a poisoned session already ending the turn leaves both the turn and the wake to it. A
+teardown acts for the reason a host's `close` gave when that close stopped work before the
+teardown began, even if a stop worker asked for it first; a close that arrives later joins the
+teardown already running for its requester's reason. The failure the worker commits in a
+committer's place carries no closes for what the turn left open: those went with the claim, and a
+terminal ends them for the host all the same. A session dropped on a thread
 without a Tokio runtime hands that worker to the runtime it was opened on. Every `close` waits for
 the worker's result, so none reports success before the child is reaped. If the worker cannot reap
 the child, or panics inside the host's process control, each caller receives the same
@@ -212,12 +226,13 @@ Stopping a turn has four deadlines, and none of them borrows another's meaning. 
 answers `turn/interrupt` with an empty result and later ends the turn with `turn/completed` status
 `interrupted`; neither step has a vendor deadline, so each is bounded by the host's `Limits`:
 
-| Stage                 | Bound                                                            | On expiry                                                    |
-| --------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------ |
-| Pending start         | `request_timeout`, from the start request or from the stop       | Start treated as unanswered; the settle stage begins         |
-| Interrupt ack         | The `turn/interrupt` request's own `request_timeout`             | Process shutdown, as for a refused interrupt                 |
-| Turn settle after ack | `cancel_settle_timeout` (60 s default), from the acknowledgement | Process shutdown                                             |
-| Shutdown escalation   | `kill_grace`, then `shutdown_timeout` per teardown stage         | `Error::CleanupRequired` carrying the host's process control |
+| Stage                        | Bound                                                            | On expiry                                                                        |
+| ---------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Pending start                | `request_timeout`, from the start request or from the stop       | Start treated as unanswered; the settle stage begins                             |
+| Interrupt ack                | The `turn/interrupt` request's own `request_timeout`             | Process shutdown, as for a refused interrupt                                     |
+| Interrupt error during steer | `request_timeout`, from the interrupt's failure                  | The error is judged as it stands: process shutdown if the turn is still admitted |
+| Turn settle after ack        | `cancel_settle_timeout` (60 s default), from the acknowledgement | Process shutdown                                                                 |
+| Shutdown escalation          | `kill_grace`, then `shutdown_timeout` per teardown stage         | `Error::CleanupRequired` carrying the host's process control                     |
 
 The pending-start bound has two clocks. The start request's own deadline returns
 `Dispatch::AcceptanceUnknown` to its caller. The stop worker also bounds its own wait by
@@ -228,12 +243,24 @@ fire.
 A start future dropped before any byte of its `turn/start` reached the link releases the slot at
 once, with no settle wait and no kill: Codex never saw the request, so no native turn can exist.
 
-The stages add up. At worst a stop takes up to `request_timeout` waiting for the start, then
-`request_timeout` for the interrupt, then `cancel_settle_timeout`, then `kill_grace` plus the
-`shutdown_timeout` teardown stages. At the defaults that is about five minutes (120 + 120 + 60 +
-2 + a few 5 s stages). A stop whose connection ends under it adds at most one `shutdown_timeout`
-before that teardown. A start whose answer was lost but that a notification later names pays one
-more interrupt and settle round. For that whole time the session stays busy. A `cancel` call waits
+The stages add up. With `rt` for `request_timeout`, `st` for `shutdown_timeout` and `kg` for
+`kill_grace`, the worst cases are:
+
+| Path                       | Worst case                                       | At the defaults |
+| -------------------------- | ------------------------------------------------ | --------------- |
+| Teardown `T`               | `kg` + `st` + `st` + (`kg` + `kg` + `st` + `st`) | 26 s            |
+| Cancel, interrupt accepted | `rt` + `rt` + `cancel_settle_timeout` + `T`      | about 5.5 min   |
+| Cancel, interrupt failed   | `rt` + `rt` + `rt` + `st` + `T`                  | about 6.5 min   |
+
+The teardown's terms are, in order: the discarded protocol interrupt, the wait for a terminal
+another task claimed (only when there is one), the client's close, and the process stop (a
+graceful interrupt and its wait, then the kill and its wait). A cancel's first `rt` is the pending
+start and its second the interrupt. In the failed case the third `rt` is the steer hold, paid only
+while a `turn/steer` is in flight, and the `st` is the wait for a closing connection to fail the
+turn, paid only when the connection is ending; a refused interrupt on a healthy connection with no
+steer goes straight to `T`. A start whose answer was lost but that a notification later names pays one
+more interrupt and settle round; if that late interrupt fails, its steer and connection waits come
+on top, outside `cancel_settle_timeout`. For that whole time the session stays busy. A `cancel` call waits
 only when the turn is already named: then it covers the interrupt, the settle deadline and any
 shutdown. A cancel that arrives before the start answer returns once the stop is recorded. `close`
 does not wait for this: it goes straight to process shutdown, bounded by `kill_grace` and
@@ -276,17 +303,22 @@ It is the only ordered request in this harness, and three things follow from it:
   with the connection failure, and the cancel reports the teardown's result, not the interrupt's
   error: it returns once the child is reaped, or with that teardown's `CleanupRequired`. Before,
   the host saw either that or a `Cancelled` terminal with the interrupt's error, depending on
-  task order. A session poisoned at the same moment as a cancel is still such a race: the cancel
-  can return before the teardown the poison starts.
+  task order. A session poisoned while a cancel waits is treated the same way: the stop joins
+  the teardown the poison leads to, so the cancel returns once the child is reaped.
 - Two interrupts stay unordered, because their answer is discarded and the caller is already
   ending the turn itself: a poisoned session's, which can be sent from inside the notification
   handler, where the client refuses an ordered request before writing it, and the teardown
   worker's, which must not wait on a handler it is about to stop.
 
-One case is not covered. While a `turn/steer` is in flight, and until the frames it held have
-been replayed, notifications are held (see above) and routed later on the replay's own task. The
-handler returns from a held `turn/completed` without having routed it, so a cancel issued in that
-window can still report the interrupt's error for a turn that completed.
+A steer needs one more wait. While a `turn/steer` is in flight, and until the frames it held have
+been replayed, notifications are held (see above) and routed later on the replay's own task, so
+the handler returns from a held `turn/completed` without having routed it. A stop whose interrupt
+fails, whether refused, unacknowledged or cut off, therefore waits for the hold to empty before it
+judges the error. The wait has its own bound, `request_timeout`, because the hold has none this
+side can rely on: a host can keep a steer future alive without polling it. A failed interrupt can
+thus wait behind a slow steer answer, for that long and no longer. The wait also ends as soon as
+the turn is gone, since a connection's end or a poisoned session ends the turn without going
+through the hold. An accepted interrupt does not wait.
 
 Malformed terminal frames fail their addressed turn; an unrouteable terminal closes the session.
 Connection loss and host shutdown terminate active streams, release approvals and reap the process.
