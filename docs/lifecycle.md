@@ -131,16 +131,29 @@ such a call at once. Request deadlines include
 writes, and dropping a request removes its pending correlation entry. Approval deadlines remain
 separate from request and idle deadlines.
 
-Every outgoing JSON-RPC frame takes its place in one queue, so frames reach the wire in the order
-their callers sent them. `Client::request` and `Client::notify` wait for their own write, as
-before. `Client::submit_request` and `Client::submit_notification` queue the frame and return at
-once with the write and the answer to wait for, which lets a caller under its own lock fix the
-order of two frames. Such a caller is slowed by nothing but `WireOptions`, which
-`Client::connect_with` takes and which bounds nothing by default. One frame larger than its
-per-frame bound is refused alone, with `Dispatch::NotSubmitted` and nothing written. Passing its
+`Client::request` and `Client::notify` wait for their own write. On a connection that only ever
+uses those, callers share the link's lock and nothing else, as before. `Client::submit_request`
+and `Client::submit_notification` queue the frame and return at once with the write and the answer
+to wait for, which lets a caller under its own lock fix the order of two frames. From the first
+frame queued on a connection, every outgoing frame takes its place in one queue, behind the
+callers already waiting on the lock, so frames reach the wire in the order their callers sent
+them; a caller that waits for its own write then takes the free link at once when nothing is
+queued, and a turn in the queue otherwise. A queueing caller is slowed by nothing but
+`WireOptions`, which `Client::connect_with` takes and which bounds nothing by default. One frame
+larger than its per-frame bound, or than the whole queue may ever hold (which is every frame when
+a queue bound is zero), is refused alone, with `Dispatch::NotSubmitted` and nothing written; an
+answer to the peer refused that way is replaced by a `-32603` reply, and when even that cannot
+fit, because the peer's own id passes the bound, the connection ends as a failed link. Passing the
 bounds on queued frames or queued bytes, which count the frame being written, means the peer
 stopped reading: the connection ends with `PeerTermination::OutboundBackpressure` and the call
-receives the same `LimitExceeded`.
+receives the same `LimitExceeded`. A queued request's `Reply` resolves to a `CallFailure` that
+tells the peer's own error from an ended connection (`Client::ended` gives the same
+`ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type. `Client::close`
+writes the notifications queued before it and refuses the requests: a host that needs a last
+request answered waits for its reply first. A close that times out or is dropped before it
+reaches the link leaves the link unusable, so nothing queued is written afterwards. A `Reply` that
+is kept keeps the link's sender alive after the `Client` is dropped; drop replies before relying
+on a child seeing end-of-input.
 
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted

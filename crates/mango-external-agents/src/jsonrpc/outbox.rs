@@ -4,8 +4,14 @@
 //! their callers queued them, whatever task or lock each caller was under. One task takes the
 //! queue's entries off in that order. A frame queued by a caller that does not wait is written by
 //! that task. A caller that does wait for its own write queues a turn instead, is handed the link
-//! when the turn comes up, and writes on its own task as it always has; when nothing is queued
-//! and the link is free it takes the link without queueing at all.
+//! when the turn comes up, and writes on its own task; when nothing is queued and the link is
+//! free it takes the link without queueing at all.
+//!
+//! None of that starts until a frame has been queued. A connection whose callers have all waited
+//! for their own writes takes the link's lock directly, contended or not, and this queue and its
+//! task have no part in it: those callers wait on each other exactly as they did before there
+//! was a queue. The first queued frame switches the connection over, once, behind the callers
+//! already waiting on the lock.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -13,7 +19,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::task::{Context, Poll};
 
-use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, mpsc, oneshot};
 use tokio::time::Instant;
 
 use super::{ClientState, MidSend, Registration};
@@ -206,6 +212,12 @@ pub(super) enum Refusal {
         limit: usize,
         received: usize,
     },
+    /// The queue could never take it, empty or not: its bound is zero. Nothing about the peer.
+    NoRoomAtAll {
+        subject: &'static str,
+        limit: usize,
+        received: usize,
+    },
     /// The writer has gone, with the connection.
     Stopped,
 }
@@ -218,11 +230,19 @@ struct Held {
     /// Turns queued for callers that write for themselves. Not bounded here: each is a caller
     /// waiting, and holds no frame of its own in the queue.
     turns: usize,
+    /// Whether a frame has ever been queued. Until then callers that write for themselves share
+    /// the link's lock directly and nothing here orders them.
+    queueing: bool,
+    /// Callers that went for the link's lock directly, before queueing began, and do not hold it
+    /// yet. The first queued frame waits for them: they called first.
+    direct: usize,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct Budget {
     held: StdMutex<Held>,
+    /// Told when the last caller counted in `Held::direct` has the link or has given up.
+    direct_done: Notify,
 }
 
 impl Budget {
@@ -236,7 +256,8 @@ impl Budget {
 /// Whether a frame of `bytes` may join `frames` frames holding `held_bytes`, under `limits`.
 ///
 /// A frame larger than any frame may be, or than the whole queue may hold, is refused on that
-/// alone, before the queue is looked at: it says nothing about the peer. The queue's own bounds count the frame being added, so each is
+/// alone, before the queue is looked at: it says nothing about the peer. So is any frame when
+/// the queue may hold none. The queue's own bounds count the frame being added, so each is
 /// the most the queue ever holds.
 pub(super) fn admission(
     limits: &WireOptions,
@@ -255,10 +276,17 @@ pub(super) fn admission(
             received: bytes,
         });
     }
+    if limits.max_outbound_queued_frames == 0 {
+        return Err(Refusal::NoRoomAtAll {
+            subject: QUEUED_FRAMES,
+            limit: 0,
+            received: 1,
+        });
+    }
     let frames = frames.saturating_add(1);
     if frames > limits.max_outbound_queued_frames {
         return Err(Refusal::QueueFull {
-            subject: "outgoing JSON-RPC frames awaiting their write",
+            subject: QUEUED_FRAMES,
             limit: limits.max_outbound_queued_frames,
             received: frames,
         });
@@ -273,6 +301,8 @@ pub(super) fn admission(
     }
     Ok(())
 }
+
+const QUEUED_FRAMES: &str = "outgoing JSON-RPC frames awaiting their write";
 
 const QUEUED: u8 = 0;
 const WRITING: u8 = 1;
@@ -381,8 +411,31 @@ pub(super) struct Ticket {
     pub(super) ack: oneshot::Receiver<Result<()>>,
 }
 
+/// A caller on its way to the link's lock, from before queueing began.
+pub(super) struct Direct {
+    budget: Arc<Budget>,
+}
+
+impl Drop for Direct {
+    /// The caller has the lock, or gave up waiting for it.
+    fn drop(&mut self) {
+        let mut held = self
+            .budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        held.direct = held.direct.saturating_sub(1);
+        // Nobody waits for this until a frame has been queued.
+        if held.direct == 0 && held.queueing {
+            self.budget.direct_done.notify_waiters();
+        }
+    }
+}
+
 /// How a caller that writes for itself gets the link.
 pub(super) enum Turn {
+    /// By waiting on the link's lock itself. Dropped once the caller holds it.
+    Direct(Direct),
     /// The link, now.
     Now(SenderGuard),
     /// The link, when the writer has worked through what was queued first.
@@ -396,6 +449,10 @@ pub(super) struct Outbox {
     limits: WireOptions,
     budget: Arc<Budget>,
     queue: mpsc::UnboundedSender<Entry>,
+    #[cfg(test)]
+    taken: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    waited_for_direct: std::sync::atomic::AtomicUsize,
 }
 
 impl Outbox {
@@ -406,6 +463,10 @@ impl Outbox {
                 limits,
                 budget: Arc::new(Budget::default()),
                 queue,
+                #[cfg(test)]
+                taken: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                waited_for_direct: std::sync::atomic::AtomicUsize::new(0),
             },
             frames,
         )
@@ -428,6 +489,8 @@ impl Outbox {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         admission(&self.limits, held.frames, held.bytes, bytes)?;
+        // From the first queued frame on, every write takes its turn here.
+        held.queueing = true;
         let ctl = Arc::new(FrameCtl {
             phase: AtomicU8::new(QUEUED),
             bytes,
@@ -456,19 +519,28 @@ impl Outbox {
         })
     }
 
-    /// The link for a caller that writes its own frame, in its turn.
+    /// How a caller that writes its own frame gets the link.
     ///
-    /// At once when nothing is queued and nothing is being written: the caller is then first in
-    /// line by any ordering, and a connection whose callers all wait for their writes never
-    /// involves the writer's task. Otherwise a turn is queued behind what is there. The check
-    /// and the queueing happen under the lock frames are admitted under, so a turn and a frame
-    /// cannot each be told it came first.
+    /// Before any frame has been queued: by waiting on the link's lock itself, as such callers
+    /// always have. The caller is counted until it holds the lock, so the first queued frame
+    /// can let everyone who called before it go first.
+    ///
+    /// Once frames are queued: at once when nothing is queued, nobody is ahead and the link is
+    /// free, since the caller is then first in line by any ordering; otherwise by a turn queued
+    /// behind what is there. The check and the queueing happen under the lock frames are
+    /// admitted under, so a turn and a frame cannot each be told it came first.
     pub(super) fn turn(&self, sender: &Arc<Mutex<Box<dyn LinkSender>>>) -> Turn {
         let mut held = self
             .budget
             .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        if !held.queueing {
+            held.direct += 1;
+            return Turn::Direct(Direct {
+                budget: Arc::clone(&self.budget),
+            });
+        }
         if held.frames == 0
             && held.turns == 0
             && let Ok(sender) = Arc::clone(sender).try_lock_owned()
@@ -506,11 +578,66 @@ impl Outbox {
         Ok(())
     }
 
-    /// Queues a barrier behind every frame queued so far. `None` when the writer has gone.
+    /// Waits until every caller that went for the link directly, before queueing began, has it
+    /// or has given up. None can be added once queueing has begun, so this ends.
+    async fn direct_callers_served(&self) {
+        loop {
+            let done = self.budget.direct_done.notified();
+            if self
+                .budget
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .direct
+                == 0
+            {
+                return;
+            }
+            #[cfg(test)]
+            self.waited_for_direct.fetch_add(1, Ordering::AcqRel);
+            done.await;
+        }
+    }
+
+    /// Queues a barrier behind every frame queued so far. `None` when there is no queue to wait
+    /// behind: nothing was ever queued, or the writer has gone.
     pub(super) fn barrier(&self) -> Option<oneshot::Receiver<()>> {
+        if !self
+            .budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .queueing
+        {
+            return None;
+        }
         let (reached, waiting) = oneshot::channel();
         self.queue.send(Entry::Barrier(reached)).ok()?;
         Some(waiting)
+    }
+
+    /// How many entries the outbox task has taken off the queue, for a test that has to know
+    /// the task has reached one.
+    #[cfg(test)]
+    pub(super) fn taken(&self) -> usize {
+        self.taken.load(Ordering::Acquire)
+    }
+
+    /// How many times the outbox task has stopped to let a direct caller go first.
+    #[cfg(test)]
+    pub(super) fn waited_for_direct(&self) -> usize {
+        self.waited_for_direct.load(Ordering::Acquire)
+    }
+
+    /// Callers on their way to the link's lock directly, and whether queueing has begun.
+    #[cfg(test)]
+    pub(super) fn direct(&self) -> (usize, bool) {
+        let held = self
+            .budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (held.direct, held.queueing)
     }
 
     #[cfg(test)]
@@ -537,18 +664,28 @@ impl Outbox {
 /// writes for itself, waiting for it to give the link back before going on.
 pub(super) async fn run(state: Arc<ClientState>, mut entries: mpsc::UnboundedReceiver<Entry>) {
     while let Some(entry) = entries.recv().await {
+        #[cfg(test)]
+        state.outbox.taken.fetch_add(1, Ordering::AcqRel);
+        // Callers that went for the link before the first frame was queued called first.
+        state.outbox.direct_callers_served().await;
         match entry {
             Entry::Barrier(reached) => {
                 let _ = reached.send(());
             }
-            Entry::Turn(grant) => {
+            Entry::Turn(mut grant) => {
                 // Waiting for the lock is waiting for whoever writes now to finish. The turn stays
                 // counted until this holds the link, so a caller arriving meanwhile queues behind
-                // it and cannot take the link from under it. A caller that stopped waiting gets
-                // nothing: the guard comes back and is dropped.
-                let sender = Arc::clone(&state.sender).lock_owned().await;
+                // it and cannot take the link from under it. A caller that stopped waiting is
+                // not waited for: its turn is over the moment it lets go.
+                let sender = tokio::select! {
+                    biased;
+                    () = grant.closed() => None,
+                    sender = Arc::clone(&state.sender).lock_owned() => Some(sender),
+                };
                 state.outbox.turn_reached();
-                let _ = grant.send(sender);
+                if let Some(sender) = sender {
+                    let _ = grant.send(sender);
+                }
             }
             Entry::Frame(outgoing) => frame(&state, outgoing).await,
         }

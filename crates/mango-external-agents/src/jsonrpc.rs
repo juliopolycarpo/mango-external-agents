@@ -150,8 +150,9 @@ impl std::fmt::Debug for ServerRequestOutcome {
 
 /// Why the connection ended without this client closing it first.
 ///
-/// More reasons may be added, and the reasons that carry numbers may carry more of them, so a
-/// `match` on this needs a wildcard arm and a pattern on one of those needs `..`.
+/// More reasons may be added, and every reason but [`Exited`](Self::Exited) may come to carry
+/// more than it does, so a `match` on this needs a wildcard arm and a pattern on one of those
+/// needs `..`.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PeerTermination {
@@ -160,6 +161,7 @@ pub enum PeerTermination {
     /// The link failed: reading or writing the peer failed, a reply to one of its questions could
     /// not be written, or a write was abandoned mid-send (timed out or dropped) with its frame
     /// possibly half on the wire.
+    #[non_exhaustive]
     LinkFailed(String),
     /// Peer work filled the bounded handoff queue before the handler could consume it.
     #[non_exhaustive]
@@ -635,8 +637,155 @@ pub struct Client {
     pump: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// What a call is settled with: the peer's result, or an error frame's body.
-type Answer = std::result::Result<Value, JsonRpcError>;
+/// How a connection came to its end.
+///
+/// What [`Client::ended`] returns and what a failed [`Reply`] carries, so a caller can tell a
+/// peer that exited from a link that failed from a budget that was passed, without reading text.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::jsonrpc::{ConnectionEnd, PeerTermination};
+///
+/// fn peer_exited(end: &ConnectionEnd) -> bool {
+///     matches!(end, ConnectionEnd::Peer(PeerTermination::Exited))
+/// }
+/// assert!(!peer_exited(&ConnectionEnd::Closed));
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectionEnd {
+    /// This side ended it: [`Client::close`] was called, or the client was dropped.
+    Closed,
+    /// It ended under this side, for the reason the handler's
+    /// [`on_terminated`](PeerHandler::on_terminated) is given: the peer exited, the link failed,
+    /// or a budget in either direction was passed.
+    Peer(PeerTermination),
+}
+
+/// Why a call queued with [`Client::submit_request`] has no answer.
+///
+/// [`cause`](Self::cause) says which side failed it and how, as a type.
+/// [`into_error`](Self::into_error) is the [`Error`] that [`Client::request`] returns for the
+/// same failure, for a caller that only reports it.
+///
+/// ```no_run
+/// # async fn example(reply: mango_external_agents::jsonrpc::Reply) {
+/// use mango_external_agents::jsonrpc::{CallFailureCause, ConnectionEnd, PeerTermination};
+///
+/// if let Err(failure) = reply.await {
+///     match failure.cause() {
+///         CallFailureCause::Peer(error) => eprintln!("the peer refused with {}", error.code),
+///         CallFailureCause::Ended(ConnectionEnd::Peer(PeerTermination::Exited)) => {
+///             eprintln!("the peer exited")
+///         }
+///         _ => eprintln!("{}", failure.into_error()),
+///     }
+/// }
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct CallFailure {
+    // Boxed so that a reply's `Result` stays the size of its answer.
+    parts: Box<(CallFailureCause, Error)>,
+}
+
+/// Which side failed a call, and how.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CallFailureCause {
+    /// The peer answered with an error frame. Its code, message and data are here as it sent
+    /// them; nothing this side says about itself ever appears in this variant.
+    Peer(JsonRpcError),
+    /// The connection ended before an answer came. [`Client::ended`] returns the same reason.
+    Ended(ConnectionEnd),
+    /// The task that runs [`PeerHandler::on_notification`] stopped (a handler panicked), so an
+    /// answer that had to wait its turn behind earlier notifications could not be delivered.
+    /// Says nothing about the connection.
+    HandlerStopped,
+    /// No answer came within the deadline the request asked for.
+    #[non_exhaustive]
+    TimedOut {
+        /// The deadline that passed, counted from when the request was queued.
+        after: Duration,
+    },
+    /// The request's frame did not reach the wire whole, so no answer could come. Its
+    /// [`Written`] resolves to the reason, and when that reason is the link's own failure the
+    /// connection ends next.
+    Unwritten,
+}
+
+impl CallFailure {
+    /// Which side failed the call, and how.
+    ///
+    /// ```no_run
+    /// # fn example(failure: &mango_external_agents::jsonrpc::CallFailure) {
+    /// use mango_external_agents::jsonrpc::CallFailureCause;
+    ///
+    /// let answered_by_the_peer = matches!(failure.cause(), CallFailureCause::Peer(_));
+    /// # let _ = answered_by_the_peer;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn cause(&self) -> &CallFailureCause {
+        &self.parts.0
+    }
+
+    /// The error [`Client::request`] returns for this failure, text and codes included.
+    ///
+    /// ```no_run
+    /// # fn example(failure: mango_external_agents::jsonrpc::CallFailure) -> mango_external_agents::Error {
+    /// failure.into_error()
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        self.parts.1
+    }
+
+    fn new(cause: CallFailureCause, error: Error) -> Self {
+        Self {
+            parts: Box::new((cause, error)),
+        }
+    }
+}
+
+impl std::fmt::Display for CallFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.parts.1.fmt(formatter)
+    }
+}
+
+impl std::error::Error for CallFailure {}
+
+impl From<CallFailure> for Error {
+    fn from(failure: CallFailure) -> Self {
+        failure.parts.1
+    }
+}
+
+/// What a call that has no answer is settled with: the error body its caller has always been
+/// given, and which side it came from.
+#[derive(Clone, Debug)]
+struct Failed {
+    body: JsonRpcError,
+    cause: FailedCause,
+}
+
+#[derive(Clone, Debug)]
+enum FailedCause {
+    /// The peer's own error frame.
+    Peer,
+    /// The connection ended.
+    Ended(ConnectionEnd),
+    /// The notification handler's task stopped under a live connection.
+    HandlerStopped,
+    /// The request's frame was not written.
+    Unwritten,
+}
+
+/// What a call is settled with: the peer's result, or why there is none.
+type Answer = std::result::Result<Value, Failed>;
 
 /// One call waiting for its answer.
 struct PendingAnswer {
@@ -712,6 +861,10 @@ struct ClientState {
     /// place a caller's withdrawal exactly there.
     #[cfg(test)]
     after_write_began: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when a caller that writes for itself has been told how it gets the link and
+    /// before it acts on that, so a test can queue a frame exactly there.
+    #[cfg(test)]
+    after_turn_decided: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The connection's runtime also owns cleanup when a request is dropped on another thread.
     runtime: tokio::runtime::Handle,
     options: ClientOptions,
@@ -729,7 +882,7 @@ struct ClientState {
     write_failed: Notify,
     /// What ended the connection, recorded before any waiting call is failed with it, so a
     /// response dropped from the handoff queue fails its caller with the same words.
-    ended: StdMutex<Option<JsonRpcError>>,
+    ended: StdMutex<Option<Failed>>,
     /// Set synchronously, before the sender is released, by a transport failure or abandoned
     /// mid-frame send, so a queued writer refuses instead of using the broken physical link.
     /// The pump ends the connection later, on its own task.
@@ -794,6 +947,24 @@ impl Drop for MidSend<'_> {
             peer: self.state.options.peer_name.clone(),
             message: String::from("a JSON-RPC frame write was abandoned mid-send"),
         });
+    }
+}
+
+/// Leaves the link unusable when a close ends without having reached it.
+///
+/// Whether the close's own grace ran out or its caller dropped it mid-wait, what was queued
+/// behind a write that would not finish is refused from then on, not written into a connection
+/// its host has walked away from.
+struct PoisonUnlessClosed<'a> {
+    state: &'a ClientState,
+    reached_the_link: bool,
+}
+
+impl Drop for PoisonUnlessClosed<'_> {
+    fn drop(&mut self) {
+        if !self.reached_the_link {
+            self.state.link_poisoned.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -921,9 +1092,10 @@ impl SubmittedRequest {
 
 /// The peer's answer to a request queued with [`Client::submit_request`].
 ///
-/// Resolves as [`Client::request`] returns, with the result still as JSON: the answer, the
-/// peer's own error, or what ended the wait on this side. The deadline the request asked for is
-/// counted from when it was queued.
+/// Resolves to the answer, still as JSON, or to a [`CallFailure`]: the peer's own error, or what
+/// ended the wait on this side, told apart by type. [`CallFailure::into_error`] is what
+/// [`Client::request`] would have returned. The deadline the request asked for is counted from
+/// when it was queued.
 ///
 /// Dropping it gives the call up. If the request frame is still queued it is taken out and never
 /// written; if its write has begun it is left to finish and the answer, when it comes, is
@@ -965,11 +1137,11 @@ impl std::fmt::Debug for Reply {
 }
 
 impl Future for Reply {
-    type Output = Result<Value>;
+    type Output = std::result::Result<Value, CallFailure>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Poll::Ready(answered) = Pin::new(&mut self.waiting).poll(cx) {
-            return Poll::Ready(self.state.answered(answered, &self.pending.id));
+            return Poll::Ready(self.state.replied(answered, &self.pending.id));
         }
         let deadline = self.deadline;
         let timer = self
@@ -978,10 +1150,15 @@ impl Future for Reply {
         if timer.as_mut().poll(cx).is_pending() {
             return Poll::Pending;
         }
-        Poll::Ready(Err(Error::Timeout {
-            operation: String::from("a JSON-RPC request"),
-            after: self.timeout,
-        }))
+        Poll::Ready(Err(CallFailure::new(
+            CallFailureCause::TimedOut {
+                after: self.timeout,
+            },
+            Error::Timeout {
+                operation: String::from("a JSON-RPC request"),
+                after: self.timeout,
+            },
+        )))
     }
 }
 
@@ -1047,6 +1224,8 @@ impl Client {
             outbound_overflow: StdMutex::new(None),
             #[cfg(test)]
             after_write_began: StdMutex::new(None),
+            #[cfg(test)]
+            after_turn_decided: StdMutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
@@ -1256,7 +1435,8 @@ impl Client {
     /// frame goes through before this returns, so frames reach the wire in the order their
     /// callers made these calls: a caller that holds its own lock across a request and the
     /// notification that must follow it (a prompt, then its cancel) gets that order on the wire.
-    /// [`Client::request`] and [`Client::notify`] take their turn in the same queue.
+    /// From the first frame queued on a connection, [`Client::request`] and [`Client::notify`]
+    /// take their turn in the same queue; a connection that never queues one is unchanged.
     ///
     /// Nothing here waits for the peer, so nothing slows a caller down but the bounds in
     /// [`WireOptions`]: with the default, which bounds nothing, a caller that queues faster than
@@ -1385,17 +1565,37 @@ impl Client {
     /// The process or socket underneath is the caller's to reap: this client did not open it.
     /// Idempotent.
     ///
+    /// Of the frames queued with [`Client::submit_notification`] and
+    /// [`Client::submit_request`] before the close, notifications are written before the link
+    /// goes. Requests are not: a request is entered among the calls awaiting an answer when its
+    /// turn to be written comes, and a closing client enters none, so its [`Written`] resolves
+    /// to [`Error::Closed`] and its [`Reply`] fails with [`ConnectionEnd::Closed`]. A host that
+    /// needs a last request answered waits for its reply and closes afterwards.
+    ///
+    /// A close that does not reach the link leaves it unusable: nothing still queued is written
+    /// afterwards. That is so when the close runs out of `shutdown_timeout` behind a write the
+    /// peer never reads, and when the future returned here is dropped before it finishes.
+    ///
     /// # Errors
     ///
-    /// [`Error::Link`] when closing the link itself failed.
+    /// [`Error::Link`] when closing the link itself failed, [`Error::Timeout`] when the link
+    /// could not be reached within `shutdown_timeout`.
     pub async fn close(&self) -> Result<()> {
         // Stored before the drain rather than inside it, and that order is the contract `call`
         // reads: a caller that finds the map open has, by that fact, arrived before this store,
         // and the drain below cannot run until that caller's entry is in the map.
         // The cause goes on record first, so whoever sees the flag finds the cause with it.
-        let failure = self.state.ended_with(self.state.closed_error());
+        let failure = self
+            .state
+            .ended_with(ConnectionEnd::Closed, self.state.closed_error());
         self.state.closed.store(true, Ordering::Release);
         self.state.shutdown.cancel();
+        // A close that does not get as far as the link, because its grace ran out or because its
+        // caller stopped waiting, must not leave queued frames to be written behind it.
+        let mut giving_up = PoisonUnlessClosed {
+            state: &self.state,
+            reached_the_link: false,
+        };
         self.state.fail_pending(failure).await;
         self.state.stop_notifications().await;
         // The peer's own questions are answered on tasks of their own, and one waiting for a
@@ -1407,24 +1607,21 @@ impl Client {
 
         let closed = tokio::time::timeout(self.state.options.shutdown_timeout, async {
             // Behind whatever is already queued, as a close has always waited its turn behind
-            // the writes ahead of it: a frame queued before the close is written before the link
-            // goes, or the close runs out of its grace waiting.
+            // the writes ahead of it: a notification queued before the close is written before
+            // the link goes, or the close runs out of its grace waiting.
             if let Some(flushed) = self.state.outbox.barrier() {
                 let _ = flushed.await;
             }
             self.state.sender.lock().await.close().await
         })
         .await
-        .map_err(|_| {
-            // The link was not closed, and frames may still be queued behind the write that
-            // would not finish. None of them is to be written after a close that gave up.
-            self.state.link_poisoned.store(true, Ordering::Release);
-            Error::Timeout {
-                operation: String::from("JSON-RPC link shutdown"),
-                after: self.state.options.shutdown_timeout,
-            }
-        })
-        .and_then(std::convert::identity);
+        .map_err(|_| Error::Timeout {
+            operation: String::from("JSON-RPC link shutdown"),
+            after: self.state.options.shutdown_timeout,
+        });
+        giving_up.reached_the_link = closed.is_ok();
+        drop(giving_up);
+        let closed = closed.and_then(std::convert::identity);
         if let Some(pump) = self.pump.lock().await.take() {
             // Taken down rather than waited out: the shutdown flag is only read between messages,
             // so a pump parked inside a handler — which is where a host that stopped reading its
@@ -1438,6 +1635,25 @@ impl Client {
     /// Whether this client has been closed or the peer has gone.
     pub fn is_closed(&self) -> bool {
         self.state.closed.load(Ordering::Acquire)
+    }
+
+    /// How the connection ended, or `None` while it has not.
+    ///
+    /// The reason is on record before any call is failed with it, and before a
+    /// [`Client::submit_request`] that passed the outbound budget returns its error, so a caller
+    /// holding a failure can ask this for the cause.
+    ///
+    /// ```no_run
+    /// # fn example(client: &mango_external_agents::jsonrpc::Client) {
+    /// use mango_external_agents::jsonrpc::{ConnectionEnd, PeerTermination};
+    ///
+    /// if let Some(ConnectionEnd::Peer(PeerTermination::Exited)) = client.ended() {
+    ///     eprintln!("the peer exited");
+    /// }
+    /// # }
+    /// ```
+    pub fn ended(&self) -> Option<ConnectionEnd> {
+        self.state.ended()
     }
 
     /// The peer as a person would name it.
@@ -1542,9 +1758,14 @@ impl Drop for Client {
     /// What is left is the end of the link. The pump, the writer and the answers in flight are
     /// taken down, frames still queued are dropped unwritten, and the sender goes with the last
     /// handle to this client's state — which on a child's stdin is the end-of-input a print-mode
-    /// vendor waits for.
+    /// vendor waits for. A [`Reply`] is such a handle: it has resolved by then, but a host that
+    /// keeps one without polling it keeps the sender, and so the child's stdin, open until it
+    /// lets the reply go. A host that reaps the child after dropping the client should drop its
+    /// replies first, or kill instead of waiting for the child to see end-of-input.
     fn drop(&mut self) {
-        let failure = self.state.ended_with(self.state.closed_error());
+        let failure = self
+            .state
+            .ended_with(ConnectionEnd::Closed, self.state.closed_error());
         self.state.closed.store(true, Ordering::Release);
         self.state.shutdown.cancel();
         // Nothing holds the map across a wait, so this misses only against a thread inside it at
@@ -1733,14 +1954,58 @@ impl ClientState {
     ) -> Result<Value> {
         match answered {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(failure)) => Err(Error::Vendor(failure.into_vendor_error(
-                ErrorCode::new(format!("{}-call-failed", self.options.code_prefix)),
-                Some(id.to_owned()),
-            ))),
-            Err(_) => Err(Error::Link {
-                peer: self.options.peer_name.clone(),
-                message: String::from("a peer that went away before answering a JSON-RPC request"),
-            }),
+            Ok(Err(failure)) => Err(self.call_failed(failure.body, id)),
+            Err(_) => Err(self.went_away()),
+        }
+    }
+
+    /// The same, for a caller that is told which side failed the call.
+    fn replied(
+        &self,
+        answered: std::result::Result<Answer, oneshot::error::RecvError>,
+        id: &str,
+    ) -> std::result::Result<Value, CallFailure> {
+        match answered {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(Failed { body, cause })) => Err(CallFailure::new(
+                match cause {
+                    FailedCause::Peer => CallFailureCause::Peer(body.clone()),
+                    FailedCause::Ended(end) => CallFailureCause::Ended(end),
+                    FailedCause::HandlerStopped => CallFailureCause::HandlerStopped,
+                    FailedCause::Unwritten => CallFailureCause::Unwritten,
+                },
+                self.call_failed(body, id),
+            )),
+            // The entry was dropped unsettled: its frame went with a writer that was taken down,
+            // which is the client being dropped.
+            Err(_) => Err(CallFailure::new(
+                CallFailureCause::Ended(self.ended().unwrap_or(ConnectionEnd::Closed)),
+                self.went_away(),
+            )),
+        }
+    }
+
+    /// The error a failed call has always returned: the body, under this client's code.
+    fn call_failed(&self, body: JsonRpcError, id: &str) -> Error {
+        Error::Vendor(body.into_vendor_error(
+            ErrorCode::new(format!("{}-call-failed", self.options.code_prefix)),
+            Some(id.to_owned()),
+        ))
+    }
+
+    fn went_away(&self) -> Error {
+        Error::Link {
+            peer: self.options.peer_name.clone(),
+            message: String::from("a peer that went away before answering a JSON-RPC request"),
+        }
+    }
+
+    /// How the connection ended, once it has.
+    fn ended(&self) -> Option<ConnectionEnd> {
+        let ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        match &ended.as_ref()?.cause {
+            FailedCause::Ended(end) => Some(end.clone()),
+            FailedCause::Peer | FailedCause::HandlerStopped | FailedCause::Unwritten => None,
         }
     }
 
@@ -1773,6 +2038,16 @@ impl ClientState {
                 limit,
                 received,
             } => self.outbound_overflow(subject, limit, received),
+            outbox::Refusal::NoRoomAtAll {
+                subject,
+                limit,
+                received,
+            } => Error::LimitExceeded {
+                subject,
+                limit,
+                received,
+            }
+            .with_dispatch(Dispatch::NotSubmitted),
             outbox::Refusal::Stopped => self.writer_stopped(),
         }
     }
@@ -1784,23 +2059,27 @@ impl ClientState {
     /// use. The pump does the ending, as for any failed write.
     fn outbound_overflow(&self, subject: &'static str, limit: usize, received: usize) -> Error {
         self.link_poisoned.store(true, Ordering::Release);
-        self.ended_with(JsonRpcError {
-            code: -32000,
-            message: format!(
-                "the {} outbound queue reached its limit",
-                self.options.peer_name
-            ),
-            data: None,
-        });
+        let termination = PeerTermination::OutboundBackpressure {
+            subject,
+            limit,
+            received,
+        };
+        self.ended_with(
+            ConnectionEnd::Peer(termination.clone()),
+            JsonRpcError {
+                code: -32000,
+                message: format!(
+                    "the {} outbound queue reached its limit",
+                    self.options.peer_name
+                ),
+                data: None,
+            },
+        );
         if !self.closed.load(Ordering::Acquire) {
             self.outbound_overflow
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .get_or_insert(PeerTermination::OutboundBackpressure {
-                    subject,
-                    limit,
-                    received,
-                });
+                .get_or_insert(termination);
             self.write_failed.notify_one();
         }
         Error::LimitExceeded {
@@ -1855,7 +2134,7 @@ impl ClientState {
         if pending.len() >= self.options.max_pending_requests {
             let received = pending.len().saturating_add(1);
             drop(pending);
-            let _ = answer.send(Err(self.unwritten_failure()));
+            let _ = answer.send(Err(self.unwritten()));
             return Err(Error::LimitExceeded {
                 subject: "pending JSON-RPC requests",
                 limit: self.options.max_pending_requests,
@@ -1867,14 +2146,17 @@ impl ClientState {
         Ok(id)
     }
 
-    fn unwritten_failure(&self) -> JsonRpcError {
-        JsonRpcError {
-            code: -32000,
-            message: format!(
-                "the {} request frame was not written",
-                self.options.peer_name
-            ),
-            data: None,
+    fn unwritten(&self) -> Failed {
+        Failed {
+            body: JsonRpcError {
+                code: -32000,
+                message: format!(
+                    "the {} request frame was not written",
+                    self.options.peer_name
+                ),
+                data: None,
+            },
+            cause: FailedCause::Unwritten,
         }
     }
 
@@ -1889,26 +2171,37 @@ impl ClientState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .unwrap_or_else(|| self.unwritten_failure());
+            .unwrap_or_else(|| self.unwritten());
         let _ = waiting.answer.send(Err(failure));
     }
 
     #[cfg(test)]
     fn run_after_write_began(&self) {
-        let hook = self
-            .after_write_began
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        Self::run_hook(&self.after_write_began);
+    }
+
+    #[cfg(test)]
+    fn run_hook(hook: &StdMutex<Option<Box<dyn FnOnce() + Send>>>) {
+        let hook = hook.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(hook) = hook {
             hook();
         }
     }
 
-    /// The link, for a caller that writes its own frame: at once when nothing is ahead of it,
+    /// The link, for a caller that writes its own frame. On a connection that has never queued a
+    /// frame, by the link's lock alone. On one that has: at once when nothing is ahead of it,
     /// otherwise when the outbox has worked through what was queued first.
     async fn writer_turn(&self) -> Result<outbox::SenderGuard> {
-        match self.outbox.turn(&self.sender) {
+        let turn = self.outbox.turn(&self.sender);
+        #[cfg(test)]
+        Self::run_hook(&self.after_turn_decided);
+        match turn {
+            outbox::Turn::Direct(waiting) => {
+                // As before there was a queue: wait on the lock, in the lock's own order.
+                let sender = Arc::clone(&self.sender).lock_owned().await;
+                drop(waiting);
+                Ok(sender)
+            }
             outbox::Turn::Now(sender) => Ok(sender),
             outbox::Turn::Queued(granted) => granted.await.map_err(|_| self.writer_stopped()),
             outbox::Turn::Stopped => Err(self.writer_stopped()),
@@ -2049,11 +2342,14 @@ impl ClientState {
     }
 
     /// Records what ended the connection and returns it. The first cause is kept.
-    fn ended_with(&self, failure: JsonRpcError) -> JsonRpcError {
+    fn ended_with(&self, end: ConnectionEnd, body: JsonRpcError) -> Failed {
         self.ended
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert(failure)
+            .get_or_insert(Failed {
+                body,
+                cause: FailedCause::Ended(end),
+            })
             .clone()
     }
 
@@ -2062,22 +2358,25 @@ impl ClientState {
     /// Whatever ended the connection, when something did. Otherwise the queue went away under a
     /// live connection, which only a handler that panicked does: the answer was read and can no
     /// longer be delivered in order, so the caller is told now instead of at its deadline.
-    fn undelivered_failure(&self) -> JsonRpcError {
+    fn undelivered_failure(&self) -> Failed {
         self.ended
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .unwrap_or_else(|| JsonRpcError {
-                code: -32000,
-                message: format!(
-                    "the {} notification handler stopped before the answer was delivered",
-                    self.options.peer_name
-                ),
-                data: None,
+            .unwrap_or_else(|| Failed {
+                body: JsonRpcError {
+                    code: -32000,
+                    message: format!(
+                        "the {} notification handler stopped before the answer was delivered",
+                        self.options.peer_name
+                    ),
+                    data: None,
+                },
+                cause: FailedCause::HandlerStopped,
             })
     }
 
-    async fn fail_pending(&self, failure: JsonRpcError) {
+    async fn fail_pending(&self, failure: Failed) {
         let waiting: Vec<_> = self.pending.lock().await.drain().collect();
         for (_, waiting) in waiting {
             let _ = waiting.answer.send(Err(failure.clone()));
@@ -2089,7 +2388,7 @@ impl ClientState {
     /// The first half of ending a connection whose queued work is still to be drained: an
     /// ordered call learns the connection ended only after the notifications read before that
     /// have been handled. One whose response is already queued is no longer in this map at all.
-    async fn fail_unordered(&self, failure: &JsonRpcError) {
+    async fn fail_unordered(&self, failure: &Failed) {
         let mut pending = self.pending.lock().await;
         let (failing, waiting): (Vec<_>, Vec<_>) = pending
             .drain()
@@ -2140,7 +2439,10 @@ impl ClientState {
             // Unreachable while the reserve is counted correctly. Fails closed all the same. The
             // cause is recorded before the entry is dropped, so its caller is told the truth.
             Err(mpsc::error::TrySendError::Full(queued)) => {
-                state.ended_with(state.overflow_failure());
+                state.ended_with(
+                    ConnectionEnd::Peer(state.queue_full()),
+                    state.overflow_failure(),
+                );
                 drop(queued);
                 Err(state.queue_full())
             }
@@ -2193,7 +2495,10 @@ async fn pump(
                     .take();
                 if let Some(termination) = overflow {
                     // The cause was recorded where the budget was passed; this returns it.
-                    let failure = state.ended_with(state.closed_error());
+                    let failure = state.ended_with(
+                        ConnectionEnd::Peer(termination.clone()),
+                        state.closed_error(),
+                    );
                     connection_failed(&state, &handler, notifications, termination, failure)
                         .await;
                     break;
@@ -2210,7 +2515,10 @@ async fn pump(
         match message {
             Ok(Some(message)) => {
                 if let Err(termination) = dispatch(&state, &notifications, message).await {
-                    let failure = state.ended_with(state.overflow_failure());
+                    let failure = state.ended_with(
+                        ConnectionEnd::Peer(termination.clone()),
+                        state.overflow_failure(),
+                    );
                     state.closed.store(true, Ordering::Release);
                     state.fail_pending(failure).await;
                     state.stop_notifications().await;
@@ -2221,11 +2529,14 @@ async fn pump(
                 }
             }
             Ok(None) => {
-                let failure = state.ended_with(JsonRpcError {
-                    code: -32000,
-                    message: format!("the {} exited", state.options.peer_name),
-                    data: None,
-                });
+                let failure = state.ended_with(
+                    ConnectionEnd::Peer(PeerTermination::Exited),
+                    JsonRpcError {
+                        code: -32000,
+                        message: format!("the {} exited", state.options.peer_name),
+                        data: None,
+                    },
+                );
                 state.closed.store(true, Ordering::Release);
                 fail_pending_around_drain(&state, notifications, failure).await;
                 state.shutdown.cancel();
@@ -2249,12 +2560,15 @@ async fn link_failed(
     notifications: mpsc::Sender<QueuedWork>,
     cause: String,
 ) {
-    let failure = state.ended_with(JsonRpcError {
-        code: -32000,
-        message: format!("the {} link failed: {cause}", state.options.peer_name),
-        data: None,
-    });
-    let termination = PeerTermination::LinkFailed(cause);
+    let termination = PeerTermination::LinkFailed(cause.clone());
+    let failure = state.ended_with(
+        ConnectionEnd::Peer(termination.clone()),
+        JsonRpcError {
+            code: -32000,
+            message: format!("the {} link failed: {cause}", state.options.peer_name),
+            data: None,
+        },
+    );
     connection_failed(state, handler, notifications, termination, failure).await;
 }
 
@@ -2264,7 +2578,7 @@ async fn connection_failed(
     handler: &Arc<dyn PeerHandler>,
     notifications: mpsc::Sender<QueuedWork>,
     termination: PeerTermination,
-    failure: JsonRpcError,
+    failure: Failed,
 ) {
     state.closed.store(true, Ordering::Release);
     fail_pending_around_drain(state, notifications, failure).await;
@@ -2284,7 +2598,7 @@ async fn connection_failed(
 async fn fail_pending_around_drain(
     state: &Arc<ClientState>,
     notifications: mpsc::Sender<QueuedWork>,
-    failure: JsonRpcError,
+    failure: Failed,
 ) {
     state.fail_unordered(&failure).await;
     drop(notifications);
@@ -2337,15 +2651,14 @@ async fn dispatch(
         let outcome = match frame.remove("error") {
             // Deserialised from a reference so the raw value survives for the fallback, which is
             // only rendered when the body is malformed.
-            Some(error) => {
-                Err(
-                    JsonRpcError::deserialize(&error).unwrap_or_else(|_| JsonRpcError {
-                        code: -32603,
-                        message: error.to_string(),
-                        data: None,
-                    }),
-                )
-            }
+            Some(error) => Err(Failed {
+                body: JsonRpcError::deserialize(&error).unwrap_or_else(|_| JsonRpcError {
+                    code: -32603,
+                    message: error.to_string(),
+                    data: None,
+                }),
+                cause: FailedCause::Peer,
+            }),
             None => Ok(frame.remove("result").unwrap_or(Value::Null)),
         };
         return ClientState::deliver(state, notifications, RequestId::new(id).key(), outcome).await;
@@ -2509,7 +2822,9 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
     }
     // Nothing was written and the link is as good as it was: the answer was only too large for
     // the bound this client sends under. The peer still has to hear something, or it waits on
-    // this question for good.
+    // this question for good. The replacement carries the peer's own id, so a peer that chose an
+    // id as large as the bound gets no reply that fits at all; that connection cannot answer the
+    // question in any form and ends as a failed link, naming the bound.
     let mut refusal = Map::new();
     if state.options.include_version_header {
         refusal.insert(String::from("jsonrpc"), json!("2.0"));

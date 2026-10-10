@@ -4,7 +4,9 @@
 use super::*;
 use crate::Dispatch;
 use crate::jsonrpc::outbox::{Refusal, admission};
-use crate::jsonrpc::{Reply, WireOptions, Written};
+use crate::jsonrpc::{
+    CallFailure, CallFailureCause, ConnectionEnd, JsonRpcError, Reply, WireOptions, Written,
+};
 use std::sync::PoisonError;
 
 const FRAME_SUBJECT: &str = "bytes of one outgoing JSON-RPC frame";
@@ -181,6 +183,12 @@ async fn link_held(gated: &Gated) -> Written {
         tokio::task::yield_now().await;
     }
     held
+}
+
+/// What a failed reply says: which side failed it, and the error `request` returns for it.
+fn failure(outcome: std::result::Result<Value, CallFailure>) -> (CallFailureCause, Error) {
+    let failure = outcome.expect_err("expected the reply to fail");
+    (failure.cause().clone(), failure.into_error())
 }
 
 fn outbox_holds(client: &Client) -> (usize, usize) {
@@ -446,7 +454,7 @@ async fn a_frame_past_the_queued_frame_limit_ends_the_connection() {
     assert_eq!(error.dispatch(), Dispatch::NotSubmitted);
     assert!(
         recorded.is_some_and(
-            |failure| failure.message == "the ACP agent outbound queue reached its limit"
+            |failure| failure.body.message == "the ACP agent outbound queue reached its limit"
         ),
         "expected the cause recorded before the refusal returned"
     );
@@ -477,10 +485,20 @@ async fn a_frame_past_the_queued_frame_limit_ends_the_connection() {
         unwritten.is_err(),
         "expected the queued frame refused on the ended connection | received {unwritten:?}"
     );
-    let failed = within("the queued request's reply", queued_reply).await;
+    let (cause, error) = failure(within("the queued request's reply", queued_reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Ended(ConnectionEnd::Peer(termination.clone())),
+        "expected the queued request failed with what ended the connection | received {cause:?}"
+    );
+    assert_eq!(
+        gated.client.ended(),
+        Some(ConnectionEnd::Peer(termination)),
+        "expected the client to give the same reason"
+    );
     assert!(
-        matches!(&failed, Err(Error::Vendor(vendor)) if vendor.message == "the ACP agent outbound queue reached its limit"),
-        "expected the queued request failed with what ended the connection | received {failed:?}"
+        matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent outbound queue reached its limit"),
+        "expected the error `request` returns for it | received {error:?}"
     );
     let order = methods(&gated.link);
     assert_eq!(
@@ -696,11 +714,17 @@ async fn a_queued_request_past_the_pending_budget_is_refused_when_its_turn_comes
         ),
         "expected LimitExceeded {{ pending JSON-RPC requests, limit: 1, received: 2 }} | received {refused:?}"
     );
-    let failed = within("the second reply", second_reply).await;
-    assert!(
-        matches!(&failed, Err(Error::Vendor(vendor)) if vendor.message == "the ACP agent request frame was not written"),
-        "expected the reply failed as unwritten | received {failed:?}"
+    let (cause, error) = failure(within("the second reply", second_reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Unwritten,
+        "expected the reply failed as unwritten | received {cause:?}"
     );
+    assert!(
+        matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent request frame was not written"),
+        "expected the error `request` returns for it | received {error:?}"
+    );
+    assert_eq!(gated.client.ended(), None);
     let order = methods(&gated.link);
     assert_eq!(order, vec!["first"], "received {order:?}");
     assert!(!gated.client.is_closed());
@@ -762,8 +786,14 @@ async fn a_queued_frame_the_link_refuses_ends_the_connection_and_reports_its_wri
         matches!(&termination, PeerTermination::LinkFailed(cause) if cause.contains("EPIPE")),
         "received {termination:?}"
     );
-    let failed = within("the reply", reply).await;
-    assert!(failed.is_err(), "received {failed:?}");
+    // The reply failed with the write, before the connection had ended over it.
+    let (cause, _) = failure(within("the reply", reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Unwritten,
+        "expected the reply failed with its write | received {cause:?}"
+    );
+    assert_eq!(client.ended(), Some(ConnectionEnd::Peer(termination)));
     client.close().await.expect("expected a clean close");
 }
 
@@ -811,10 +841,16 @@ async fn frames_queued_before_a_close_are_dealt_with_before_the_link_closes() {
         matches!(refused, Err(Error::Closed { subject: "link" })),
         "expected the queued request refused by the close | received {refused:?}"
     );
-    let failed = within("the queued request's reply", list_reply).await;
+    let (cause, error) = failure(within("the queued request's reply", list_reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Ended(ConnectionEnd::Closed),
+        "expected the reply failed by the close | received {cause:?}"
+    );
+    assert_eq!(gated.client.ended(), Some(ConnectionEnd::Closed));
     assert!(
-        matches!(&failed, Err(Error::Vendor(vendor)) if vendor.message == "the ACP agent connection was closed"),
-        "expected the reply failed by the close | received {failed:?}"
+        matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent connection was closed"),
+        "expected the error `request` returns for it | received {error:?}"
     );
     within("the close", closing)
         .await
@@ -855,13 +891,22 @@ async fn dropping_the_client_fails_replies_still_waiting() {
     let Gated { client, .. } = gated;
     drop(Arc::into_inner(client).expect("expected the test to own the client"));
 
-    let asked = eventually("the written request's reply", asked_reply).await;
-    assert!(
-        matches!(&asked, Err(Error::Vendor(vendor)) if vendor.message == "the ACP agent connection was closed"),
-        "expected the written request failed by the drop | received {asked:?}"
+    let (cause, error) = failure(eventually("the written request's reply", asked_reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Ended(ConnectionEnd::Closed),
+        "expected the written request failed by the drop | received {cause:?}"
     );
-    let queued = eventually("the queued request's reply", queued_reply).await;
-    assert!(queued.is_err(), "received {queued:?}");
+    assert!(
+        matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent connection was closed"),
+        "expected the error `request` returns for it | received {error:?}"
+    );
+    let (cause, _) = failure(eventually("the queued request's reply", queued_reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Ended(ConnectionEnd::Closed),
+        "expected the queued request failed by the drop | received {cause:?}"
+    );
     let unwritten = eventually("the queued request's write", queued_written).await;
     assert!(unwritten.is_err(), "received {unwritten:?}");
     let waited = began.elapsed();
@@ -889,11 +934,16 @@ async fn a_submitted_request_times_out_from_when_it_was_queued() {
         .await
         .expect("expected the request written");
 
-    let outcome = eventually("the reply", reply).await;
+    let (cause, error) = failure(eventually("the reply", reply).await);
     assert!(
-        matches!(&outcome, Err(Error::Timeout { after, .. }) if *after == Duration::from_secs(2)),
-        "expected the reply to time out: Timeout after 2s | received {outcome:?}"
+        matches!(&cause, CallFailureCause::TimedOut { after } if *after == Duration::from_secs(2)),
+        "expected the reply to time out: TimedOut after 2s | received {cause:?}"
     );
+    assert!(
+        matches!(&error, Error::Timeout { after, .. } if *after == Duration::from_secs(2)),
+        "expected the error `request` returns for it: Timeout after 2s | received {error:?}"
+    );
+    assert_eq!(gated.client.ended(), None);
     assert_eq!(began.elapsed(), Duration::from_secs(2));
     // The reply is gone, and with it the call's entry. The drop may have had to defer that.
     let mut yields = 0;
@@ -1136,66 +1186,6 @@ async fn requests_given_up_under_the_writer_are_written_whole_or_not_at_all() {
     client.close().await.expect("expected a clean close");
 }
 
-/// A caller that waits for its own write, behind a link in use, stays counted as queued until the
-/// outbox holds the link for it. Counted only until the outbox took its entry, a later caller
-/// could find the queue looking empty and the link free, and write ahead of it.
-#[tokio::test]
-async fn a_queued_turn_stays_counted_until_the_link_is_held_for_it() {
-    let gated = gated(options(), WireOptions::new());
-    let first = {
-        let client = Arc::clone(&gated.client);
-        tokio::spawn(async move { client.notify("hold", json!({})).await })
-    };
-    // The first caller found the link free and holds it inside the gated send.
-    let mut yields = 0;
-    while gated.client.state.sender.try_lock().is_ok() {
-        yields += 1;
-        assert!(
-            yields < 10_000,
-            "expected the first caller to hold the link"
-        );
-        tokio::task::yield_now().await;
-    }
-    let second = {
-        let client = Arc::clone(&gated.client);
-        tokio::spawn(async move { client.notify("second", json!({})).await })
-    };
-    let mut yields = 0;
-    while gated.client.state.outbox.turns() == 0 {
-        yields += 1;
-        assert!(yields < 10_000, "expected the second caller's turn queued");
-        tokio::task::yield_now().await;
-    }
-    // Enough turns of the scheduler for the outbox to have taken the entry and parked on the
-    // link. The turn is still owed, so it is still counted.
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
-    let owed = gated.client.state.outbox.turns();
-    assert_eq!(
-        owed, 1,
-        "expected the waiting caller's turn counted while the link is in use: 1 | received {owed}"
-    );
-
-    gated.gate.add_permits(1);
-    within("the first caller", first)
-        .await
-        .expect("expected the first task to finish")
-        .expect("expected the first frame written");
-    within("the second caller", second)
-        .await
-        .expect("expected the second task to finish")
-        .expect("expected the second frame written");
-    let owed = gated.client.state.outbox.turns();
-    assert_eq!(
-        owed, 0,
-        "expected no turn owed once it was served: 0 | received {owed}"
-    );
-    let order = methods(&gated.link);
-    assert_eq!(order, vec!["hold", "second"], "received {order:?}");
-    gated.client.close().await.expect("expected a clean close");
-}
-
 /// A queued frame that waited out its whole deadline before the writer could begin it has put
 /// nothing on the wire. It fails alone, as timed out, and the link carries the next frame.
 #[tokio::test(start_paused = true)]
@@ -1221,10 +1211,15 @@ async fn a_queued_frame_that_expires_before_its_write_begins_fails_alone() {
         matches!(&outcome, Err(Error::Timeout { operation, .. }) if operation == "JSON-RPC frame write"),
         "expected the frame timed out unwritten: Timeout(JSON-RPC frame write) | received {outcome:?}"
     );
-    let failed = eventually("the expired request's reply", reply).await;
+    let (cause, error) = failure(eventually("the expired request's reply", reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Unwritten,
+        "expected the reply failed as unwritten | received {cause:?}"
+    );
     assert!(
-        matches!(&failed, Err(Error::Vendor(vendor)) if vendor.message == "the ACP agent request frame was not written"),
-        "expected the reply failed as unwritten | received {failed:?}"
+        matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent request frame was not written"),
+        "expected the error `request` returns for it | received {error:?}"
     );
     assert!(
         gated.link.sent().is_empty(),
@@ -1482,5 +1477,684 @@ async fn a_waiting_callers_frame_is_not_measured_against_the_queue_bounds() {
         .expect("expected a waiting caller's frame written whatever the queue's bounds");
     assert_eq!(gated.link.sent().len(), 1);
     assert!(!gated.client.is_closed());
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// Yields until `reached` holds, which a step of another task makes true. Counted, not timed.
+async fn until(what: &str, mut reached: impl FnMut() -> bool) {
+    let mut yields = 0;
+    while !reached() {
+        yields += 1;
+        assert!(
+            yields < 100_000,
+            "expected {what} | received not yet after {yields} yields"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+fn spawn_notify(gated: &Gated, method: &'static str) -> tokio::task::JoinHandle<crate::Result<()>> {
+    let client = Arc::clone(&gated.client);
+    tokio::spawn(async move { client.notify(method, json!({})).await })
+}
+
+/// Puts the connection on its queue for good, with nothing left in it.
+async fn queueing_begun(gated: &Gated) {
+    let first = gated
+        .client
+        .submit_notification("begin", json!({}))
+        .expect("expected the first frame queued");
+    within("the first queued frame", first)
+        .await
+        .expect("expected the first queued frame written");
+}
+
+fn link_in_use(gated: &Gated) -> bool {
+    gated.client.state.sender.try_lock().is_err()
+}
+
+/// A caller that waits for its own write, behind a link in use, stays counted as queued until the
+/// outbox holds the link for it. Counted only until the outbox took its entry, a later caller
+/// could find the queue looking empty and the link free, and write ahead of it.
+async fn a_queued_turn_stays_counted_until_the_link_is_held_for_it() {
+    let gated = gated(options(), WireOptions::new());
+    queueing_begun(&gated).await;
+    let first = spawn_notify(&gated, "hold");
+    // The first caller found the link free and holds it inside the gated send.
+    until("the first caller to hold the link", || link_in_use(&gated)).await;
+    let taken = gated.client.state.outbox.taken();
+    let second = spawn_notify(&gated, "second");
+    // The outbox has taken the second caller's entry off the queue and waits for the link.
+    until("the outbox to reach the queued turn", || {
+        gated.client.state.outbox.taken() > taken
+    })
+    .await;
+    let owed = gated.client.state.outbox.turns();
+    assert_eq!(
+        owed, 1,
+        "expected the turn counted after the outbox took its entry, while the link is in use: 1 | received {owed}"
+    );
+
+    gated.gate.add_permits(1);
+    within("the first caller", first)
+        .await
+        .expect("expected the first task to finish")
+        .expect("expected the first frame written");
+    within("the second caller", second)
+        .await
+        .expect("expected the second task to finish")
+        .expect("expected the second frame written");
+    let owed = gated.client.state.outbox.turns();
+    assert_eq!(
+        owed, 0,
+        "expected no turn owed once it was served: 0 | received {owed}"
+    );
+    let order = methods(&gated.link);
+    assert_eq!(order, vec!["begin", "hold", "second"], "received {order:?}");
+    gated.client.close().await.expect("expected a clean close");
+}
+
+#[tokio::test]
+async fn a_queued_turn_stays_counted_until_the_link_is_held_for_it_on_one_thread() {
+    a_queued_turn_stays_counted_until_the_link_is_held_for_it().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_turn_stays_counted_until_the_link_is_held_for_it_on_four_threads() {
+    a_queued_turn_stays_counted_until_the_link_is_held_for_it().await;
+}
+
+/// A connection that never queues a frame never involves the queue: callers that wait for their
+/// own writes wait on the link's lock and nothing else, contended or not. One that gives up
+/// waiting, by its deadline or by being dropped, leaves nothing behind and the next goes on.
+#[tokio::test(start_paused = true)]
+async fn callers_that_all_wait_for_their_writes_share_the_link_without_the_queue() {
+    let gated = gated(options(), WireOptions::new());
+    let outbox = &gated.client.state.outbox;
+    let first = spawn_notify(&gated, "hold");
+    until("the first caller to hold the link", || link_in_use(&gated)).await;
+
+    let timed_out = {
+        let client = Arc::clone(&gated.client);
+        tokio::spawn(async move {
+            let brief = RequestOptions::new().with_timeout(Duration::from_secs(1));
+            client
+                .request_with::<_, Value>("timed-out", json!({}), brief)
+                .await
+        })
+    };
+    let dropped = spawn_notify(&gated, "dropped");
+    until("both callers waiting on the link", || {
+        outbox.direct().0 == 2
+    })
+    .await;
+    dropped.abort();
+    let cancelled = eventually("the dropped caller", dropped).await;
+    assert!(
+        cancelled.is_err_and(|error| error.is_cancelled()),
+        "expected the dropped caller's task cancelled"
+    );
+    let waiting = outbox.direct();
+    assert_eq!(
+        waiting,
+        (1, false),
+        "expected the dropped caller no longer counted: (1, false) | received {waiting:?}"
+    );
+    // The other waits out its whole deadline behind the write that has not finished.
+    let outcome = eventually("the caller that timed out", timed_out)
+        .await
+        .expect("expected the caller's task to finish");
+    assert!(
+        matches!(&outcome, Err(Error::Timeout { after, .. }) if *after == Duration::from_secs(1)),
+        "expected the waiting caller timed out: Timeout after 1s | received {outcome:?}"
+    );
+    let waiting = outbox.direct();
+    assert_eq!(
+        waiting,
+        (0, false),
+        "expected nobody counted as waiting once both gave up: (0, false) | received {waiting:?}"
+    );
+    gated.gate.add_permits(1);
+    eventually("the first caller", first)
+        .await
+        .expect("expected the first task to finish")
+        .expect("expected the first caller's frame written");
+    gated
+        .client
+        .notify("next", json!({}))
+        .await
+        .expect("expected the next caller served");
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["hold", "next"],
+        "expected only the callers that stayed on the wire: [hold, next] | received {order:?}"
+    );
+    let untouched = (outbox.taken(), outbox.turns(), outbox.held());
+    assert_eq!(
+        untouched,
+        (0, 0, (0, 0)),
+        "expected the queue never used: (0, 0, (0, 0)) | received {untouched:?}"
+    );
+}
+
+/// The same contention without anybody running out of time: the callers are served in the order
+/// they asked for the lock, and the queue's task takes nothing.
+#[tokio::test]
+async fn contended_waiting_callers_write_in_the_order_they_asked() {
+    let gated = gated(options(), WireOptions::new());
+    let outbox = &gated.client.state.outbox;
+    let first = spawn_notify(&gated, "hold");
+    until("the first caller to hold the link", || link_in_use(&gated)).await;
+    let second = spawn_notify(&gated, "second");
+    until("the second caller waiting", || outbox.direct().0 == 1).await;
+    let gone = spawn_notify(&gated, "gone");
+    until("the third caller waiting", || outbox.direct().0 == 2).await;
+    let fourth = spawn_notify(&gated, "fourth");
+    until("the fourth caller waiting", || outbox.direct().0 == 3).await;
+    gone.abort();
+    let _ = within("the dropped caller", gone).await;
+
+    gated.gate.add_permits(1);
+    for (name, caller) in [("first", first), ("second", second), ("fourth", fourth)] {
+        within(name, caller)
+            .await
+            .expect("expected the caller's task to finish")
+            .expect("expected the caller's frame written");
+    }
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["hold", "second", "fourth"],
+        "expected the callers served in the order they asked, without the one that left: [hold, second, fourth] | received {order:?}"
+    );
+    let untouched = (outbox.taken(), outbox.direct());
+    assert_eq!(
+        untouched,
+        (0, (0, false)),
+        "expected the queue never used: (0, (0, false)) | received {untouched:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// The first frame queued on a connection goes behind the callers already waiting on the link,
+/// and ahead of every caller that comes after it.
+async fn the_first_queued_frame_goes_behind_callers_already_waiting() {
+    let gated = gated(options(), WireOptions::new());
+    let outbox = &gated.client.state.outbox;
+    let first = spawn_notify(&gated, "hold");
+    until("the first caller to hold the link", || link_in_use(&gated)).await;
+    let second = spawn_notify(&gated, "second");
+    until("the second caller waiting", || outbox.direct().0 == 1).await;
+    let gone = spawn_notify(&gated, "gone");
+    until("the third caller waiting", || outbox.direct().0 == 2).await;
+
+    let third = gated
+        .client
+        .submit_notification("third", json!({}))
+        .expect("expected the first queued frame");
+    let fourth = spawn_notify(&gated, "fourth");
+    until("the later caller's turn queued", || outbox.turns() == 1).await;
+    gone.abort();
+    let _ = within("the dropped caller", gone).await;
+
+    gated.gate.add_permits(1);
+    for (name, caller) in [("first", first), ("second", second)] {
+        within(name, caller)
+            .await
+            .expect("expected the caller's task to finish")
+            .expect("expected the caller's frame written");
+    }
+    within("the queued frame", third)
+        .await
+        .expect("expected the queued frame written");
+    within("the later caller", fourth)
+        .await
+        .expect("expected the caller's task to finish")
+        .expect("expected the later caller's frame written");
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["hold", "second", "third", "fourth"],
+        "expected call order across the first queued frame: [hold, second, third, fourth] | received {order:?}"
+    );
+    let left = (outbox.direct().0, outbox.turns(), outbox.held());
+    assert_eq!(
+        left,
+        (0, 0, (0, 0)),
+        "expected nothing counted afterwards: (0, 0, (0, 0)) | received {left:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+#[tokio::test]
+async fn the_first_queued_frame_goes_behind_callers_already_waiting_on_one_thread() {
+    the_first_queued_frame_goes_behind_callers_already_waiting().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_queued_frame_goes_behind_callers_already_waiting_on_four_threads() {
+    the_first_queued_frame_goes_behind_callers_already_waiting().await;
+}
+
+/// Sets what runs the next time a waiting caller has been told how it gets the link.
+fn when_a_turn_is_decided(gated: &Gated, hook: impl FnOnce() + Send + 'static) {
+    *gated
+        .client
+        .state
+        .after_turn_decided
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+}
+
+/// The narrowest version of that: a caller has been sent to the link's lock and has not asked
+/// for it yet when the first frame is queued, on another thread free to run. The queue's task
+/// stops for the caller, which called first, and does not take the idle link from under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_queued_as_a_caller_goes_for_the_lock_waits_for_that_caller() {
+    let gated = gated(options(), WireOptions::new());
+    let stopped_for_the_caller = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let queued = Arc::new(std::sync::Mutex::new(None));
+    {
+        let client = Arc::clone(&gated.client);
+        let stopped = Arc::clone(&stopped_for_the_caller);
+        let queued = Arc::clone(&queued);
+        when_a_turn_is_decided(&gated, move || {
+            let written = client.submit_notification("queued", json!({}));
+            *queued.lock().unwrap_or_else(PoisonError::into_inner) = Some(written);
+            // The caller's own thread stands still here; the queue's task runs on another.
+            let began = std::time::Instant::now();
+            while client.state.outbox.waited_for_direct() == 0 {
+                if began.elapsed() > Duration::from_secs(5) {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+            stopped.store(true, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    gated
+        .client
+        .notify("waited", json!({}))
+        .await
+        .expect("expected the waiting caller's frame written");
+    assert!(
+        stopped_for_the_caller.load(std::sync::atomic::Ordering::Acquire),
+        "expected the queue's task to stop for the caller on its way to the lock: stopped | received it went on within 5s"
+    );
+    let written = queued
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .expect("expected the hook to have run")
+        .expect("expected the frame queued");
+    within("the queued frame", written)
+        .await
+        .expect("expected the queued frame written");
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["waited", "queued"],
+        "expected the caller that asked first on the wire first: [waited, queued] | received {order:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// On a connection that queues, a caller handed the free link there and then has it: a frame
+/// queued the instant after goes behind it, and the queue's task waits for the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_queued_as_a_caller_is_handed_the_free_link_goes_behind_it() {
+    let gated = gated(options(), WireOptions::new());
+    queueing_begun(&gated).await;
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let queued = Arc::new(std::sync::Mutex::new(None));
+    {
+        let client = Arc::clone(&gated.client);
+        let reached = Arc::clone(&reached);
+        let queued = Arc::clone(&queued);
+        when_a_turn_is_decided(&gated, move || {
+            let taken = client.state.outbox.taken();
+            let written = client.submit_notification("queued", json!({}));
+            *queued.lock().unwrap_or_else(PoisonError::into_inner) = Some(written);
+            // Stand still until the queue's task, on another thread, has the frame in hand.
+            let began = std::time::Instant::now();
+            while client.state.outbox.taken() == taken {
+                if began.elapsed() > Duration::from_secs(5) {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+            reached.store(true, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    gated
+        .client
+        .notify("waited", json!({}))
+        .await
+        .expect("expected the waiting caller's frame written");
+    assert!(
+        reached.load(std::sync::atomic::Ordering::Acquire),
+        "expected the queue's task to take the frame while the caller held the link: taken | received not within 5s"
+    );
+    let written = queued
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .expect("expected the hook to have run")
+        .expect("expected the frame queued");
+    within("the queued frame", written)
+        .await
+        .expect("expected the queued frame written");
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["begin", "waited", "queued"],
+        "expected the caller handed the link on the wire first: [begin, waited, queued] | received {order:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// A caller dropped while its turn is still in the queue, behind a frame being written, leaves
+/// no turn owed: the outbox passes over it and the next caller goes on.
+async fn a_caller_dropped_while_its_turn_is_queued_leaves_no_turn_owed() {
+    let gated = gated(options(), WireOptions::new());
+    let outbox = &gated.client.state.outbox;
+    let held = link_held(&gated).await;
+    let dropped = spawn_notify(&gated, "dropped");
+    until("the caller's turn queued", || outbox.turns() == 1).await;
+    dropped.abort();
+    let _ = within("the dropped caller", dropped).await;
+    let next = spawn_notify(&gated, "next");
+    until("the next caller's turn queued", || outbox.turns() == 2).await;
+
+    gated.gate.add_permits(1);
+    within("the held frame", held)
+        .await
+        .expect("expected the held frame written");
+    within("the next caller", next)
+        .await
+        .expect("expected the caller's task to finish")
+        .expect("expected the next caller's frame written");
+    let owed = outbox.turns();
+    assert_eq!(
+        owed, 0,
+        "expected no turn owed after a caller left the queue: 0 | received {owed}"
+    );
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["hold", "next"],
+        "expected the dropped caller absent from the wire: [hold, next] | received {order:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+#[tokio::test]
+async fn a_caller_dropped_while_its_turn_is_queued_leaves_no_turn_owed_on_one_thread() {
+    a_caller_dropped_while_its_turn_is_queued_leaves_no_turn_owed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_dropped_while_its_turn_is_queued_leaves_no_turn_owed_on_four_threads() {
+    a_caller_dropped_while_its_turn_is_queued_leaves_no_turn_owed().await;
+}
+
+/// A caller dropped after the outbox reached its turn, while the outbox waits for a link another
+/// caller is writing on, is not waited for: its turn is over before the link comes free.
+async fn a_caller_dropped_while_the_outbox_waits_on_the_link_for_it_is_passed_over() {
+    let gated = gated(options(), WireOptions::new());
+    let outbox = &gated.client.state.outbox;
+    queueing_begun(&gated).await;
+    let first = spawn_notify(&gated, "hold");
+    until("the first caller to hold the link", || link_in_use(&gated)).await;
+    let taken = outbox.taken();
+    let dropped = spawn_notify(&gated, "dropped");
+    until("the outbox to reach the queued turn", || {
+        outbox.taken() > taken
+    })
+    .await;
+    dropped.abort();
+    let _ = within("the dropped caller", dropped).await;
+
+    // The link is still in use: nothing has been released.
+    until("the dropped caller's turn given up", || outbox.turns() == 0).await;
+    assert!(
+        link_in_use(&gated),
+        "expected the turn given up while the link was still in use"
+    );
+    let next = gated
+        .client
+        .submit_notification("next", json!({}))
+        .expect("expected a frame queued behind the abandoned turn");
+    gated.gate.add_permits(1);
+    within("the first caller", first)
+        .await
+        .expect("expected the first task to finish")
+        .expect("expected the first frame written");
+    within("the next frame", next)
+        .await
+        .expect("expected the next frame written");
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["begin", "hold", "next"],
+        "expected the dropped caller absent from the wire: [begin, hold, next] | received {order:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+#[tokio::test]
+async fn a_caller_dropped_while_the_outbox_waits_on_the_link_for_it_is_passed_over_on_one_thread() {
+    a_caller_dropped_while_the_outbox_waits_on_the_link_for_it_is_passed_over().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_dropped_while_the_outbox_waits_on_the_link_for_it_is_passed_over_on_four_threads()
+{
+    a_caller_dropped_while_the_outbox_waits_on_the_link_for_it_is_passed_over().await;
+}
+
+/// A close whose caller stops waiting has not closed the link. What was queued behind the write
+/// it was waiting on must not be written afterwards.
+async fn a_close_dropped_before_it_finishes_leaves_no_queued_frame_to_be_written() {
+    let gated = gated(options(), WireOptions::new());
+    let held = link_held(&gated).await;
+    let queued = gated
+        .client
+        .submit_notification("queued", json!({}))
+        .expect("expected a frame queued behind the held one");
+
+    let closing = {
+        let client = Arc::clone(&gated.client);
+        tokio::spawn(async move { client.close().await })
+    };
+    until("the close to have begun", || gated.client.is_closed()).await;
+    closing.abort();
+    let abandoned = within("the abandoned close", closing).await;
+    assert!(
+        abandoned.is_err_and(|error| error.is_cancelled()),
+        "expected the close cut off before it finished"
+    );
+
+    gated.gate.add_permits(1);
+    within("the held frame", held)
+        .await
+        .expect("expected the write already in progress to finish");
+    let unwritten = within("the queued frame", queued).await;
+    assert!(
+        matches!(unwritten, Err(Error::Link { .. })),
+        "expected the queued frame refused after the close was abandoned: Err(Link) | received {unwritten:?}"
+    );
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["hold"],
+        "expected nothing written after the abandoned close: [hold] | received {order:?}"
+    );
+    let refused = gated.client.notify("after", json!({})).await;
+    assert_eq!(methods(&gated.link), vec!["hold"], "received {refused:?}");
+}
+
+#[tokio::test]
+async fn a_close_dropped_before_it_finishes_leaves_no_queued_frame_to_be_written_on_one_thread() {
+    a_close_dropped_before_it_finishes_leaves_no_queued_frame_to_be_written().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_dropped_before_it_finishes_leaves_no_queued_frame_to_be_written_on_four_threads() {
+    a_close_dropped_before_it_finishes_leaves_no_queued_frame_to_be_written().await;
+}
+
+/// A queue that may hold nothing refuses every frame the way it refuses one too large for it:
+/// that call only. Nothing about the peer made the frame not fit, so the connection goes on,
+/// for callers that wait for their own writes.
+#[tokio::test]
+async fn a_queue_bounded_to_nothing_refuses_each_frame_alone() {
+    for (bounds, subject) in [
+        (limits(usize::MAX, usize::MAX, 0), QUEUED_FRAMES),
+        (limits(usize::MAX, 0, usize::MAX), FRAME_SUBJECT),
+    ] {
+        let gated = gated(options(), bounds);
+        let notification = gated.client.submit_notification("queued", json!({}));
+        let request = gated
+            .client
+            .submit_request("asked", json!({}), ordered_options());
+        for refused in [notification.map(drop), request.map(drop)] {
+            let error = refused.expect_err("expected the frame refused");
+            assert!(
+                matches!(
+                    error.cause(),
+                    Error::LimitExceeded { subject: counted, limit: 0, received }
+                        if *counted == subject && *received > 0
+                ),
+                "expected LimitExceeded {{ {subject}, limit: 0 }} | received {error:?}"
+            );
+            assert_eq!(
+                error.dispatch(),
+                Dispatch::NotSubmitted,
+                "expected the refused frame reported as never submitted | received {:?}",
+                error.dispatch()
+            );
+        }
+        let state = (gated.client.is_closed(), gated.client.ended());
+        assert_eq!(
+            state,
+            (false, None),
+            "expected the connection untouched by a bound of nothing: (false, None) | received {state:?}"
+        );
+        let places = gated.client.state.ordered_places.available_permits();
+        assert_eq!(
+            places, 64,
+            "expected the refused request's ordered place given back: 64 | received {places}"
+        );
+        gated
+            .client
+            .notify("waited", json!({}))
+            .await
+            .expect("expected a caller that waits for its write still served");
+        let switched = gated.client.state.outbox.direct();
+        assert_eq!(
+            switched,
+            (0, false),
+            "expected a refused frame not to start the queue: (0, false) | received {switched:?}"
+        );
+        assert_eq!(methods(&gated.link), vec!["waited"]);
+        assert!(gated.handler.terminations.lock().await.is_empty());
+        gated.client.close().await.expect("expected a clean close");
+    }
+}
+
+/// The reply that stands in for an answer too large carries the peer's own id. A peer whose id
+/// alone passes the bound cannot be answered in any form: the connection ends, naming the bound.
+#[tokio::test]
+async fn an_id_too_large_for_any_reply_ends_the_connection() {
+    let link = ScriptedLink::new();
+    let handler = RecordingHandler::arc(Some(ServerRequestOutcome::Answer(json!("ok"))));
+    let client = Client::connect_with(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+        limits(120, usize::MAX, usize::MAX),
+    );
+
+    let id = "i".repeat(200);
+    link.push_line(json!({"jsonrpc": "2.0", "id": id, "method": "fs/read_text_file"}).to_string());
+    let termination = one_termination(&handler).await;
+    assert!(
+        matches!(&termination, PeerTermination::LinkFailed(cause) if cause.contains(FRAME_SUBJECT) && cause.contains("120")),
+        "expected the link failed naming the bound: LinkFailed(.. {FRAME_SUBJECT} .. 120 ..) | received {termination:?}"
+    );
+    assert!(
+        link.sent().is_empty(),
+        "expected nothing written: [] | received {:?}",
+        link.sent()
+    );
+    assert!(client.is_closed());
+    assert_eq!(client.ended(), Some(ConnectionEnd::Peer(termination)));
+    client.close().await.expect("expected a clean close");
+}
+
+/// A failed reply says which side failed it. The peer's own error arrives as the peer sent it,
+/// whatever its code, and never stands for something this side did.
+#[tokio::test]
+async fn a_reply_the_peer_refused_carries_the_peers_error_and_no_end() {
+    let gated = gated(options(), WireOptions::new());
+    let submitted = gated
+        .client
+        .submit_request("session/new", json!({}), RequestOptions::new())
+        .expect("expected the request queued");
+    let id = submitted.id().as_json().clone();
+    let (written, reply) = submitted.into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    gated.link.push_line(
+        json!({"id": id, "error": {"code": -32000, "message": "auth required", "data": {"a": 1}}})
+            .to_string(),
+    );
+
+    let (cause, error) = failure(within("the reply", reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Peer(JsonRpcError {
+            code: -32000,
+            message: String::from("auth required"),
+            data: Some(json!({"a": 1})),
+        }),
+        "expected the peer's error as it sent it | received {cause:?}"
+    );
+    assert!(
+        matches!(&error, Error::Vendor(vendor) if vendor.message == "auth required"),
+        "expected the error `request` returns for it | received {error:?}"
+    );
+    assert_eq!(gated.client.ended(), None);
+
+    // A peer that exits fails the next one from this side, with the same code in the error
+    // `request` returns and a cause that tells the two apart.
+    let (written, reply) = gated
+        .client
+        .submit_request("session/prompt", json!({}), RequestOptions::new())
+        .expect("expected the second request queued")
+        .into_parts();
+    within("the second request written", written)
+        .await
+        .expect("expected the second request written");
+    gated.link.end();
+    let (cause, error) = failure(within("the second reply", reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Ended(ConnectionEnd::Peer(PeerTermination::Exited)),
+        "expected the reply failed by the peer's exit | received {cause:?}"
+    );
+    assert!(
+        matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent exited"),
+        "expected the error `request` returns for it | received {error:?}"
+    );
+    assert_eq!(
+        gated.client.ended(),
+        Some(ConnectionEnd::Peer(PeerTermination::Exited))
+    );
     gated.client.close().await.expect("expected a clean close");
 }
