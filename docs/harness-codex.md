@@ -203,9 +203,14 @@ abandoned turn that will not settle, and a dropped session all request the same 
 which closes the JSON-RPC client once and stops the child once. A connection that ends, like a
 poisoned session, fails and releases the turn whose terminal it claimed before it wakes that
 worker: closing the client stops the task that reports the connection's end, so waking the worker
-first could leave the turn claimed with no terminal for the host. For the same reason the worker
-itself, whoever requested it, gives a terminal that is being committed up to `shutdown_timeout`
-to land before it closes the client. A session dropped on a thread
+first could leave the turn claimed with no terminal for the host. The wake itself is not lost when
+that task is stopped or unwinds, as it does if the host's process control panics under it. For the
+same reason the worker, whoever requested it, gives a terminal that is being committed up to
+`shutdown_timeout` to land before it closes the client. A committer that is gone cannot land it,
+so when that wait expires the worker fails the turn itself, with the vendor code
+`terminal-abandoned` and not retryable: the turn's real outcome is unknown. A connection's end
+that finds a poisoned session already ending the turn leaves both the turn and the wake to it. A
+teardown acts for the reason a host's `close` gave, even when a stop worker asked for it first. A session dropped on a thread
 without a Tokio runtime hands that worker to the runtime it was opened on. Every `close` waits for
 the worker's result, so none reports success before the child is reaped. If the worker cannot reap
 the child, or panics inside the host's process control, each caller receives the same
@@ -234,14 +239,24 @@ fire.
 A start future dropped before any byte of its `turn/start` reached the link releases the slot at
 once, with no settle wait and no kill: Codex never saw the request, so no native turn can exist.
 
-The stages add up. At worst a stop takes up to `request_timeout` waiting for the start, then
-`request_timeout` for the interrupt, then `cancel_settle_timeout`, then `kill_grace` plus the
-`shutdown_timeout` teardown stages. At the defaults that is about five minutes (120 + 120 + 60 +
-2 + a few 5 s stages). A stop that finds its turn already being ended, by a
-closing connection or a session that stopped taking work, waits up to one `shutdown_timeout` for
-that at each of the two points it checks, and an interrupt that fails while a `turn/steer` is in
-flight adds at most one more `request_timeout`. A start whose answer was lost but that a notification later names pays one
-more interrupt and settle round. For that whole time the session stays busy. A `cancel` call waits
+The stages add up. With `rt` for `request_timeout`, `st` for `shutdown_timeout` and `kg` for
+`kill_grace`, the worst cases are:
+
+| Path                       | Worst case                                       | At the defaults |
+| -------------------------- | ------------------------------------------------ | --------------- |
+| Teardown `T`               | `kg` + `st` + `st` + (`kg` + `kg` + `st` + `st`) | 26 s            |
+| Cancel, interrupt accepted | `rt` + `rt` + `cancel_settle_timeout` + `T`      | about 5.5 min   |
+| Cancel, interrupt failed   | `rt` + `rt` + `rt` + `st` + `T`                  | about 6.5 min   |
+
+The teardown's terms are, in order: the discarded protocol interrupt, the wait for a terminal
+another task claimed (only when there is one), the client's close, and the process stop (a
+graceful interrupt and its wait, then the kill and its wait). A cancel's first `rt` is the pending
+start and its second the interrupt. In the failed case the third `rt` is the steer hold, paid only
+while a `turn/steer` is in flight, and the `st` is the wait for a closing connection to fail the
+turn, paid only when the connection is ending; a refused interrupt on a healthy connection with no
+steer goes straight to `T`. A start whose answer was lost but that a notification later names pays one
+more interrupt and settle round; if that late interrupt fails, its steer and connection waits come
+on top, outside `cancel_settle_timeout`. For that whole time the session stays busy. A `cancel` call waits
 only when the turn is already named: then it covers the interrupt, the settle deadline and any
 shutdown. A cancel that arrives before the start answer returns once the stop is recorded. `close`
 does not wait for this: it goes straight to process shutdown, bounded by `kill_grace` and

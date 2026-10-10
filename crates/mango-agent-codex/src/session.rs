@@ -576,8 +576,8 @@ impl Shared {
     }
 
     /// Waits, within `shutdown_timeout`, for a turn that something else is ending to leave
-    /// admission: a closed connection about to fail it, or a terminal claimed and not yet
-    /// committed.
+    /// admission: a closed connection about to fail it, or, for the teardown, a terminal
+    /// claimed and not yet committed.
     ///
     /// An ordered request the peer never answered fails once the frames already read have been
     /// handled, a few steps before the client reports the connection's end to this session. A
@@ -638,24 +638,54 @@ impl Shared {
         let _ = tokio::time::timeout(self.host.limits().request_timeout, settled).await;
     }
 
-    /// Waits, within `shutdown_timeout`, for a terminal that another task has claimed and is
-    /// still committing.
+    /// Gives a terminal that another task has claimed `shutdown_timeout` to be committed, then
+    /// commits a failure in its place.
     ///
     /// For the teardown, just before it closes the client. Closing stops the client's own tasks,
     /// and one of them may be the committer: the report of a connection's end, or the handler
     /// finishing a turn. Cut off between the claim and the commit, the turn would keep its slot
     /// with no terminal for the host, and nothing could claim it again. Whatever is still in
     /// the slot once the teardown has ended the turn it could claim is such a turn.
-    async fn wait_for_claimed_terminal(&self) {
+    ///
+    /// The committer may also be gone already: stopped with the connection, or unwound by a
+    /// panic in the host's process control. Then the wait can only expire, and the turn still
+    /// has to end, so the teardown fails it itself. A committer that was merely slow finds its
+    /// own terminal refused, since a stream commits one, and its release finds nothing to
+    /// release.
+    async fn settle_claimed_terminal(&self) {
         let claimed = self
             .turn
             .lock()
             .await
             .as_ref()
             .map(|active| Arc::clone(&active.owner));
-        if let Some(owner) = claimed {
-            self.wait_for_ending_turn(&owner).await;
-        }
+        let Some(owner) = claimed else {
+            return;
+        };
+        self.wait_for_ending_turn(&owner).await;
+        let abandoned = self
+            .turn
+            .lock()
+            .await
+            .as_ref()
+            .filter(|active| active.finishing && Arc::ptr_eq(&active.owner, &owner))
+            .map(|active| active.sink.clone());
+        let Some(sink) = abandoned else {
+            return;
+        };
+        let after = self.host.limits().shutdown_timeout;
+        let _ = sink
+            .fail(
+                VendorError::new(
+                    CALL_FAILED,
+                    format!(
+                        "expected the turn's ending to be committed before the Codex session shut down | received: none within {after:?}, so its outcome is unknown"
+                    ),
+                )
+                .with_vendor_code(TERMINAL_ABANDONED, false),
+            )
+            .await;
+        self.release_terminal(&owner).await;
     }
 
     async fn recently_completed(&self, native_turn_id: &str) -> bool {
@@ -962,6 +992,26 @@ struct ActiveTurn {
     stop: Arc<StopState>,
     /// A terminal is being committed. Admission remains held until it is visible to the host.
     finishing: bool,
+}
+
+/// The vendor code of the failure the teardown commits for a turn whose own terminal was claimed
+/// and never committed.
+const TERMINAL_ABANDONED: &str = "terminal-abandoned";
+
+/// Wakes the session's reaper when dropped.
+///
+/// Held for the whole of a path that ends the session from inside, so the reaper is woken when
+/// the path returns, when its task is stopped with the connection, and when it unwinds: the
+/// host's process control is called on these paths and may panic. Dropped last, which keeps the
+/// wake behind the commit and release of the turn's terminal on the ordinary path. The teardown
+/// the wake starts closes the client, and that stops the task a connection's end is reported
+/// on; woken before the commit, it could leave the turn claimed with no terminal for the host.
+struct WakeReaper<'a>(&'a mango_external_agents::CancelToken);
+
+impl Drop for WakeReaper<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// The data needed to commit one terminal without holding the admission lock.
@@ -1722,17 +1772,16 @@ impl Shared {
     /// Fails the active stream after the peer disappears without a terminal notification.
     async fn connection_terminated(&self, termination: PeerTermination) {
         if !self.stop_new_work() {
-            // Whatever stopped new work first may have been cut off before it woke the reaper:
-            // a poisoned session's task can be stopped with the connection. The client's tasks
-            // are already stopped when this runs, so no commit is left for a teardown to cut
-            // short, and the teardown has one owner.
-            self.terminated.cancel();
+            // Whatever stopped new work first owns the turn's ending and the reaper's wake. A
+            // poisoned session may still be on its way to failing the turn, on the steer replay's
+            // task for one, and waking the reaper here would let the teardown end that turn as
+            // cancelled first.
             return;
         }
+        let _reaper = WakeReaper(&self.terminated);
         self.release_pending_for(None, DecisionSource::Cancelled)
             .await;
         let Some(mut claim) = self.claim_terminal(None).await else {
-            self.terminated.cancel();
             return;
         };
         let mut message =
@@ -1771,12 +1820,7 @@ impl Shared {
         claim.close_open(ActivityStatus::Failed).await;
         let _ = claim.sink.fail(failure).await;
         self.release_terminal(&claim.owner).await;
-        // Last, as in `poison`. The token wakes the watcher's teardown, which closes the client
-        // and with it stops the task running this very function. Cancelled before the commit,
-        // the turn could be left claimed and never released: no terminal for the host, and a
-        // slot nothing can claim again. Once the turn is released there is nothing left here
-        // for that teardown to cut short.
-        self.terminated.cancel();
+        // The reaper is woken as `_reaper` drops, after the release, as in `poison`.
     }
 
     /// Fails the active turn under a bound and wakes the reaper after an unrecoverable protocol
@@ -1785,6 +1829,7 @@ impl Shared {
         if !self.stop_new_work() {
             return;
         }
+        let _reaper = WakeReaper(&self.terminated);
         if let Some(client) = self.client.get() {
             let _ = tokio::time::timeout(
                 self.host.limits().kill_grace,
@@ -1806,7 +1851,7 @@ impl Shared {
         }
         #[cfg(test)]
         drop(self.poison_released.lock().await);
-        self.terminated.cancel();
+        // The reaper is woken as `_reaper` drops.
     }
 
     /// Settles every question the server is still waiting on.
@@ -3390,7 +3435,7 @@ impl CodexSession {
             Err(error) => Settled::InterruptFailed(error),
         };
         match settled {
-            Settled::Ended => Self::after_turn_gone(shared, client, control, state, &owner).await,
+            Settled::Ended => Self::after_turn_gone(shared, client, control, state).await,
             Settled::InterruptFailed(error) => {
                 // Codex refused, or never acknowledged, the interrupt while the turn is live.
                 if shared.seal_owner_for_shutdown(&owner).await {
@@ -3399,14 +3444,14 @@ impl CodexSession {
                     // its `CleanupRequired` carries the control the host needs to reconcile.
                     return Self::wait_for_shutdown(&shared).await.and(Err(error));
                 }
-                Self::after_turn_gone(shared, client, control, state, &owner).await
+                Self::after_turn_gone(shared, client, control, state).await
             }
             Settled::Expired => {
                 if shared.seal_owner_for_shutdown(&owner).await {
                     Self::request_shutdown(Arc::clone(&shared), client, control, state, reason);
                     return Self::wait_for_shutdown(&shared).await;
                 }
-                Self::after_turn_gone(shared, client, control, state, &owner).await
+                Self::after_turn_gone(shared, client, control, state).await
             }
         }
     }
@@ -3459,21 +3504,19 @@ impl CodexSession {
     /// has one owner, so asking for it here either starts it or joins the one running.
     ///
     /// The turn may still be finishing when this worker gets here through a refused seal: its
-    /// terminal claimed, not yet committed. The teardown closes the client, which stops the task
-    /// that may be committing it, so the turn is given `shutdown_timeout` to leave first.
+    /// terminal claimed, not yet committed. The teardown waits for that itself before it closes
+    /// the client, so nothing waits for it here.
     async fn after_turn_gone(
         shared: Arc<Shared>,
         client: Arc<Client>,
         control: Arc<dyn ProcessControl>,
         state: SessionState,
-        owner: &Arc<()>,
     ) -> Result<()> {
         // The client marks itself closed before it drains what it had read, so a turn that
         // completed in that drain is seen here ahead of `terminated`.
         let session_ending =
             shared.is_shutting_down() || shared.terminated.is_cancelled() || client.is_closed();
         if session_ending {
-            shared.wait_for_ending_turn(owner).await;
             Self::request_shutdown(
                 Arc::clone(&shared),
                 client,
@@ -3509,7 +3552,7 @@ impl CodexSession {
             .release_pending_for(None, DecisionSource::Cancelled)
             .await;
         shared.cancel_active(reason).await;
-        shared.wait_for_claimed_terminal().await;
+        shared.settle_claimed_terminal().await;
         let close = tokio::time::timeout(limits.shutdown_timeout, client.close())
             .await
             .map_err(|_| Error::Timeout {
@@ -6690,6 +6733,7 @@ mod tests {
     mod interrupt_answers {
         use super::*;
         use mango_external_agents::Error;
+        use mango_external_agents::process::ProcessControl;
         use mango_external_agents::session::CancelReason;
         use mango_external_agents::stream::TurnStream;
 
@@ -6707,8 +6751,42 @@ mod tests {
             interrupt_id: serde_json::Value,
         }
 
+        /// Limits short enough for a test on the real clock: a teardown takes well under a
+        /// second, and no request deadline is in reach.
+        fn real_clock_limits() -> Limits {
+            Limits {
+                request_timeout: std::time::Duration::from_secs(30),
+                shutdown_timeout: std::time::Duration::from_millis(100),
+                kill_grace: std::time::Duration::from_millis(20),
+                ..Limits::default()
+            }
+        }
+
+        /// How long a real-clock test lets a teardown woken too early, or a stop that did not
+        /// wait, run to its end before it looks.
+        const REAL_CLOCK_SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
+
+        /// A direct-handler host with these limits and this shutdown signal.
+        fn shared_with(limits: Limits, cancel: mango_external_agents::CancelToken) -> Arc<Shared> {
+            let host = HostContext::builder()
+                .launcher(Arc::new(FakeLauncher::new()))
+                .cwd("/workspace")
+                .client_info("mango-test", "0.0.1")
+                .limits(limits)
+                .cancel(cancel)
+                .build()
+                .expect("expected a host");
+            Arc::new(Shared::new(
+                host,
+                mango_external_agents::SessionId::new("chat-1"),
+            ))
+        }
+
         async fn interrupting() -> Interrupting {
-            let shared = shared();
+            interrupting_on(shared()).await
+        }
+
+        async fn interrupting_on(shared: Arc<Shared>) -> Interrupting {
             shared.adopt_thread(String::from("thread-1"));
             let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
             let owner = Arc::clone(
@@ -7350,7 +7428,21 @@ mod tests {
             FakeLauncher,
             TurnStream,
         ) {
-            let shared = shared();
+            running_session_on(shared(), |control| control).await
+        }
+
+        /// [`running_session`] on a given host, with the child's control passed through `wrap`
+        /// so a test can put a fake of its own in front of it.
+        async fn running_session_on(
+            shared: Arc<Shared>,
+            wrap: impl FnOnce(Arc<dyn ProcessControl>) -> Arc<dyn ProcessControl>,
+        ) -> (
+            Arc<Shared>,
+            super::super::CodexSession,
+            ScriptedLink,
+            FakeLauncher,
+            TurnStream,
+        ) {
             shared.adopt_thread(String::from("thread-1"));
             let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
             let link = ScriptedLink::new();
@@ -7383,8 +7475,57 @@ mod tests {
             );
             let state = SessionState::new(Arc::clone(shared.host.clock()), snapshot);
             let session =
-                super::super::CodexSession::new(state, Arc::clone(&shared), client, control);
+                super::super::CodexSession::new(state, Arc::clone(&shared), client, wrap(control));
             (shared, session, link, launcher, stream)
+        }
+
+        /// A child's control whose first `wait` panics, as a host's own implementation might.
+        /// Every later call reaches the real control, so the teardown can still reap.
+        struct PanicsOnFirstWait {
+            inner: Arc<dyn ProcessControl>,
+            armed: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl ProcessControl for PanicsOnFirstWait {
+            fn pid(&self) -> Option<u32> {
+                self.inner.pid()
+            }
+
+            fn stderr_tail(&self) -> String {
+                self.inner.stderr_tail()
+            }
+
+            async fn wait(
+                &self,
+            ) -> mango_external_agents::Result<mango_external_agents::ExitStatus> {
+                if self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    panic!("test process control panicked in wait");
+                }
+                self.inner.wait().await
+            }
+
+            async fn interrupt(
+                &self,
+                reason: CancelReason,
+            ) -> mango_external_agents::Result<mango_external_agents::process::InterruptOutcome>
+            {
+                self.inner.interrupt(reason).await
+            }
+
+            async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+                self.inner.kill(reason).await
+            }
+        }
+
+        fn is_connection_failure(events: &[EventKind]) -> bool {
+            matches!(events.last(), Some(EventKind::Error { error })
+                if error.message.contains("connection ended while the turn was active"))
+        }
+
+        fn is_abandoned_terminal(events: &[EventKind]) -> bool {
+            matches!(events.last(), Some(EventKind::Error { error })
+                if error.vendor_code.as_deref() == Some(super::super::TERMINAL_ABANDONED))
         }
 
         /// Reads the stream to its end, or says the host never got a terminal.
@@ -7488,7 +7629,7 @@ mod tests {
                     .await
             });
             // Well inside the teardown's wait, and long enough for a close that did not wait.
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(shared.host.limits().shutdown_timeout / 2).await;
             drop(commit_parked);
 
             let events = kinds_or_no_terminal(&mut stream).await;
@@ -7514,22 +7655,367 @@ mod tests {
             );
         }
 
-        /// A poisoned session's task can be stopped with the connection before it wakes the
-        /// reaper. The connection's own report then finds work already stopped, and has to wake
-        /// the reaper itself or nothing would until the host closed the session.
+        /// The task committing a claimed terminal is gone for good: here the report of a dead
+        /// connection, parked after its claim and then stopped by the teardown's close. The
+        /// teardown waits `shutdown_timeout` for a commit that cannot come, and must then end the
+        /// turn itself instead of leaving the host's stream open on a slot nothing can claim.
         #[tokio::test(start_paused = true)]
-        async fn a_connection_end_that_finds_work_stopped_still_wakes_the_reaper() {
-            let shared = shared();
+        async fn a_teardown_that_outlasts_a_dead_committer_fails_the_turn_itself() {
+            let (shared, session, link, launcher, mut stream) = running_session().await;
+            let shutdown_timeout = shared.host.limits().shutdown_timeout;
+
+            let commit_parked = shared.termination_claimed.lock().await;
+            link.end();
+            tokio::time::sleep(SETTLED).await;
+            let closing = tokio::spawn(async move {
+                session
+                    .close(mango_external_agents::session::CloseReason::Shutdown)
+                    .await
+            });
+            tokio::time::sleep(shutdown_timeout - SETTLED * 2).await;
             assert!(
-                shared.stop_new_work(),
-                "expected a fresh session: taking work | received: already stopped"
+                shared
+                    .turn
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|active| active.finishing),
+                "expected the turn before the teardown's wait expired: still claimed | received: released"
             );
 
-            shared.connection_terminated(PeerTermination::Exited).await;
+            // The committer is never let go: the teardown's close stops it where it is parked.
+            let events = kinds_or_no_terminal(&mut stream).await;
+            assert!(
+                is_abandoned_terminal(&events),
+                "expected the terminal of a turn whose committer died: Error(terminal-abandoned) | received: {events:?}"
+            );
+            assert!(
+                shared.turn.lock().await.is_none(),
+                "expected the turn slot after the teardown: released | received: still claimed"
+            );
+            let closed = tokio::time::timeout(std::time::Duration::from_secs(60), closing)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("expected the close: returned | received: still waiting after 60s")
+                })
+                .expect("expected the close task");
+            assert!(
+                closed.is_ok(),
+                "expected the close after a dead committer: Ok(()) | received: {closed:?}"
+            );
+            let live = launcher.live_children();
+            assert_eq!(
+                live, 0,
+                "expected live children after the close: 0 | received: {live}"
+            );
+            drop(commit_parked);
+        }
+
+        /// The host's process control panics inside the report of a dead connection, after the
+        /// turn's terminal was claimed. The task unwinds, so nothing commits that terminal; the
+        /// reaper still has to be woken and the turn still has to end.
+        #[tokio::test(start_paused = true)]
+        async fn a_process_control_that_panics_in_the_connection_report_still_ends_the_turn() {
+            let (shared, session, link, launcher, mut stream) =
+                running_session_on(shared(), |inner| {
+                    Arc::new(PanicsOnFirstWait {
+                        inner,
+                        armed: std::sync::atomic::AtomicBool::new(true),
+                    })
+                })
+                .await;
+
+            link.end();
+
+            let events = kinds_or_no_terminal(&mut stream).await;
+            assert!(
+                is_abandoned_terminal(&events),
+                "expected the terminal after the control panicked: Error(terminal-abandoned) | received: {events:?}"
+            );
+            assert!(
+                shared.terminated.is_cancelled(),
+                "expected the reaper's token after the control panicked: cancelled | received: not cancelled"
+            );
+            let closed = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                session.close(mango_external_agents::session::CloseReason::Shutdown),
+            )
+            .await;
+            assert!(
+                matches!(closed, Ok(Ok(()))),
+                "expected a close after the control panicked: Ok(()) | received: {closed:?}"
+            );
+            let live = launcher.live_children();
+            assert_eq!(
+                live, 0,
+                "expected live children after the close: 0 | received: {live}"
+            );
+        }
+
+        /// The connection ends while a poisoned session is still on its way to failing the turn,
+        /// as it can be on the steer replay's task. The poison owns that ending. The connection's
+        /// report must not wake the reaper under it, or the teardown could end the turn as
+        /// cancelled first.
+        #[tokio::test(start_paused = true)]
+        async fn a_connection_end_during_a_poison_leaves_the_turn_and_the_reaper_to_the_poison() {
+            let (shared, _session, link, _launcher, mut stream) = running_session().await;
+
+            // Parks the poison before its claim, on the lock it settles approvals under.
+            let poison_parked = shared.pending.lock().await;
+            let poisoned = Arc::clone(&shared);
+            let poisoning = tokio::spawn(async move {
+                poisoned
+                    .poison(VendorError::new(
+                        super::super::CALL_FAILED,
+                        "expected a routable frame, received one that named no thread",
+                    ))
+                    .await;
+            });
+            tokio::time::sleep(SETTLED).await;
+            link.end();
+            tokio::time::sleep(SETTLED).await;
+
+            assert!(
+                !shared.terminated.is_cancelled(),
+                "expected the reaper while the poison still owns the turn: not woken | received: woken"
+            );
+            drop(poison_parked);
+            poisoning.await.expect("expected the poison task");
+
+            let events = kinds_or_no_terminal(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Error { error })
+                    if error.message.contains("named no thread")),
+                "expected the poisoned turn's terminal: the poison's failure | received: {events:?}"
+            );
+            assert!(
+                shared.terminated.is_cancelled(),
+                "expected the reaper once the poison released the turn: woken | received: not woken"
+            );
+        }
+
+        /// A poisoned session's task can be stopped before it finishes, with the connection for
+        /// one. The reaper is woken all the same, as the task's state is dropped.
+        #[tokio::test(start_paused = true)]
+        async fn a_poison_that_is_stopped_midway_still_wakes_the_reaper() {
+            let shared = shared();
+            let poison_parked = shared.poison_released.lock().await;
+            let poisoned = Arc::clone(&shared);
+            let poisoning = tokio::spawn(async move {
+                poisoned
+                    .poison(VendorError::new(
+                        super::super::CALL_FAILED,
+                        "expected a routable frame, received one that named no thread",
+                    ))
+                    .await;
+            });
+            tokio::time::sleep(SETTLED).await;
+            assert!(
+                !shared.terminated.is_cancelled(),
+                "expected the reaper while the poison is parked: not woken | received: woken"
+            );
+
+            poisoning.abort();
+            let _ = poisoning.await;
 
             assert!(
                 shared.terminated.is_cancelled(),
-                "expected the reaper's token after the connection ended: cancelled | received: not cancelled"
+                "expected the reaper after the poison's task was stopped: woken | received: not woken"
+            );
+            drop(poison_parked);
+        }
+
+        /// The session is dropped while the report of a dead connection is between claiming the
+        /// turn's terminal and committing it. The drop starts the same teardown a close does, so
+        /// the commit lands first and the host gets the connection failure.
+        #[tokio::test(start_paused = true)]
+        async fn a_drop_that_races_a_connection_end_lets_the_turn_commit_first() {
+            let (shared, session, link, launcher, mut stream) = running_session().await;
+
+            let commit_parked = shared.termination_claimed.lock().await;
+            link.end();
+            tokio::time::sleep(SETTLED).await;
+            drop(session);
+            tokio::time::sleep(shared.host.limits().shutdown_timeout / 2).await;
+            drop(commit_parked);
+
+            let events = kinds_or_no_terminal(&mut stream).await;
+            assert!(
+                is_connection_failure(&events),
+                "expected the turn's terminal: the connection failure | received: {events:?}"
+            );
+            let reaped = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                super::super::CodexSession::wait_for_shutdown(&shared),
+            )
+            .await;
+            let live = launcher.live_children();
+            assert!(
+                matches!(reaped, Ok(Ok(()))) && live == 0,
+                "expected the dropped session's teardown: Ok(()) with live children 0 | received: {reaped:?} with live children {live}"
+            );
+        }
+
+        /// The host's shutdown signal fires while the report of a dead connection is between
+        /// claiming the turn's terminal and committing it. Same teardown, same wait.
+        #[tokio::test(start_paused = true)]
+        async fn a_host_shutdown_that_races_a_connection_end_lets_the_turn_commit_first() {
+            let host_shutdown = mango_external_agents::CancelToken::new();
+            let (shared, _session, link, launcher, mut stream) = running_session_on(
+                shared_with(Limits::default(), host_shutdown.clone()),
+                |control| control,
+            )
+            .await;
+
+            let commit_parked = shared.termination_claimed.lock().await;
+            link.end();
+            tokio::time::sleep(SETTLED).await;
+            host_shutdown.cancel();
+            tokio::time::sleep(shared.host.limits().shutdown_timeout / 2).await;
+            drop(commit_parked);
+
+            let events = kinds_or_no_terminal(&mut stream).await;
+            assert!(
+                is_connection_failure(&events),
+                "expected the turn's terminal: the connection failure | received: {events:?}"
+            );
+            let reaped = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                super::super::CodexSession::wait_for_shutdown(&shared),
+            )
+            .await;
+            let live = launcher.live_children();
+            assert!(
+                matches!(reaped, Ok(Ok(()))) && live == 0,
+                "expected the host shutdown's teardown: Ok(()) with live children 0 | received: {reaped:?} with live children {live}"
+            );
+        }
+
+        /// The steer race on four workers and the real clock: the completion sits in a steer's
+        /// hold when the refusal is delivered. The claim is held by the test, so a stop that does
+        /// not wait for it has returned its error long before the test looks.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn on_four_workers_a_refused_interrupt_waits_for_the_steer_replay() {
+            let Interrupting {
+                shared,
+                link,
+                mut stream,
+                mut stopping,
+                interrupt_id,
+                client: _client,
+            } = interrupting_on(shared_with(
+                real_clock_limits(),
+                mango_external_agents::CancelToken::new(),
+            ))
+            .await;
+            let steer = super::super::SteerHoldGuard::hold(&shared);
+            link.push_line(turn_completed("completed"));
+            link.push_line(interrupt_refused(&interrupt_id));
+            tokio::time::sleep(REAL_CLOCK_SETTLE).await;
+
+            if stopping.is_finished() {
+                let early = (&mut stopping).await.expect("expected the stop task");
+                panic!(
+                    "expected the interrupt answer during a steer: held until the held turn/completed was replayed | received: {early:?}"
+                );
+            }
+            steer.release().await;
+
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                stopped.is_ok(),
+                "expected the stop of a turn that completed during a steer: Ok(()) | received: {stopped:?}"
+            );
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Completed)),
+                "expected the turn's own terminal: Completed | received: {events:?}"
+            );
+        }
+
+        /// The poison race on four workers and the real clock: the poison is parked between
+        /// releasing the turn and waking the reaper, so a cancel that does not join the teardown
+        /// itself returns with the child still live.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn on_four_workers_a_cancel_that_races_a_poison_returns_after_the_reap() {
+            let (shared, session, link, launcher, _stream) = running_session_on(
+                shared_with(
+                    real_clock_limits(),
+                    mango_external_agents::CancelToken::new(),
+                ),
+                |control| control,
+            )
+            .await;
+            let session = Arc::new(session);
+
+            let cancelling = Arc::clone(&session);
+            let cancel =
+                tokio::spawn(async move { cancelling.cancel(CancelReason::Requested).await });
+            link.wait_for_sent(1).await;
+            let sent: serde_json::Value = serde_json::from_str(&link.sent()[0])
+                .expect("expected the stop worker to write a JSON frame");
+            link.push_line(serde_json::json!({"id": sent["id"], "result": {}}).to_string());
+
+            let poison_parked = shared.poison_released.lock().await;
+            let poisoned = Arc::clone(&shared);
+            let poisoning = tokio::spawn(async move {
+                poisoned
+                    .poison(VendorError::new(
+                        super::super::CALL_FAILED,
+                        "expected a routable frame, received one that named no thread",
+                    ))
+                    .await;
+            });
+
+            let cancelled = tokio::time::timeout(std::time::Duration::from_secs(20), cancel)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "expected the cancel racing a poisoned session: returned | received: still waiting after 20s"
+                    )
+                })
+                .expect("expected the cancel task");
+            let live = launcher.live_children();
+            assert_eq!(
+                live, 0,
+                "expected live children when the cancel returned: 0 | received: {live} (cancel: {cancelled:?})"
+            );
+
+            drop(poison_parked);
+            poisoning.await.expect("expected the poison task");
+        }
+
+        /// The connection-end race on four workers and the real clock: the report is parked
+        /// between its claim and its commit for long enough that a teardown woken before the
+        /// commit would have closed the client and stopped it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn on_four_workers_a_connection_end_commits_before_it_wakes_the_teardown() {
+            let (shared, _session, link, launcher, mut stream) = running_session_on(
+                shared_with(
+                    real_clock_limits(),
+                    mango_external_agents::CancelToken::new(),
+                ),
+                |control| control,
+            )
+            .await;
+
+            let commit_parked = shared.termination_claimed.lock().await;
+            link.end();
+            tokio::time::sleep(REAL_CLOCK_SETTLE).await;
+            let started = shared
+                .teardown_started
+                .load(std::sync::atomic::Ordering::Acquire);
+            let live = launcher.live_children();
+            assert!(
+                !started && live == 1,
+                "expected before the commit: teardown started false, live children 1 | received: teardown started {started}, live children {live}"
+            );
+            drop(commit_parked);
+
+            let events = kinds_or_no_terminal(&mut stream).await;
+            assert!(
+                is_connection_failure(&events),
+                "expected the turn's terminal: the connection failure | received: {events:?}"
             );
         }
 
