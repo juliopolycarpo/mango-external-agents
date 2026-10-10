@@ -1,7 +1,12 @@
 //! Owned messages on their way through the JSON-RPC client and the stdio link.
 //!
 //! `dispatch/*` feeds prebuilt frames to a [`Client`] and waits for the peer to end, so the timed
-//! part is parsing and routing (including the hand-off to the handler). `stdio-send/*` writes
+//! part is parsing and routing (including the hand-off to the handler). `client/*` sends through
+//! a [`Client`]: notifications into a sink that discards, and requests against a peer that
+//! answers each one as it is written, so the timed part is building the frame, its turn at the
+//! link, the write and, for a request, the answer finding its caller. `notify-contended` shares
+//! one link among eight callers that each wait for their own write, and `submit-*` queues each
+//! frame instead of waiting for the link. `stdio-send/*` writes
 //! prebuilt messages through the link a stdio transport returns, into a sink that discards, and
 //! times each send from the call to the end of its write: the link frees the message it was handed
 //! after that, and what a free costs belongs to the allocator, not to the send. Frames and
@@ -20,7 +25,8 @@ use std::time::{Duration, Instant};
 
 use mango_external_agents::host::HostContext;
 use mango_external_agents::jsonrpc::{
-    Client, ClientOptions, PeerHandler, PeerTermination, RequestId, ServerRequestOutcome,
+    Client, ClientOptions, PeerHandler, PeerTermination, RequestId, RequestOptions,
+    ServerRequestOutcome,
 };
 use mango_external_agents::process::{
     ByteSink, ByteSource, ExitStatus, LaunchSpec, ManagedProcess, ProcessControl, ProcessLauncher,
@@ -37,6 +43,9 @@ const MIB: usize = 1024 * 1024;
 
 /// Text deltas dispatched per sample.
 const DELTAS: usize = 1000;
+
+/// Callers sharing one link in the contended case.
+const CONTENDERS: usize = 8;
 
 /// Large frames dispatched per sample.
 const LARGE_FRAMES: usize = 20;
@@ -158,6 +167,220 @@ fn dispatch(rt: &tokio::runtime::Runtime, frames: VecDeque<String>, expected: us
             seen, expected,
             "expected {expected} notifications handled, received {seen}"
         );
+        drop(client);
+    });
+}
+
+/// A peer that never says anything and never goes away.
+struct SilentSource;
+
+#[async_trait::async_trait]
+impl LinkReceiver for SilentSource {
+    async fn recv(&mut self) -> Result<Option<String>> {
+        std::future::pending().await
+    }
+}
+
+/// Sends `params` as notifications, one after another, each awaited to its write.
+fn client_notify(rt: &tokio::runtime::Runtime, params: Vec<Value>) {
+    rt.block_on(async {
+        let link = Link::new(Box::new(DiscardSender), Box::new(SilentSource));
+        let client = Client::connect(
+            link,
+            Arc::new(CountingHandler::default()),
+            ClientOptions::new("bench peer"),
+        );
+        for params in params {
+            client
+                .notify("item/agentMessage/delta", params)
+                .await
+                .expect("expected the notification written");
+        }
+        drop(client);
+    });
+}
+
+/// A sink that gives way once before each write completes, as a pipe that has to be waited on
+/// does, so callers sharing it queue behind the one writing.
+struct YieldingSender;
+
+#[async_trait::async_trait]
+impl mango_external_agents::LinkSender for YieldingSender {
+    async fn send(&mut self, message: String) -> Result<()> {
+        tokio::task::yield_now().await;
+        std::hint::black_box(message);
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Sends `params` as notifications from `CONTENDERS` tasks at once, each awaiting its own write,
+/// so all but one are waiting for the link at any moment.
+fn client_notify_contended(rt: &tokio::runtime::Runtime, params: Vec<Value>) {
+    rt.block_on(async {
+        let link = Link::new(Box::new(YieldingSender), Box::new(SilentSource));
+        let client = Arc::new(Client::connect(
+            link,
+            Arc::new(CountingHandler::default()),
+            ClientOptions::new("bench peer"),
+        ));
+        let mut shares: Vec<Vec<Value>> = (0..CONTENDERS).map(|_| Vec::new()).collect();
+        for (index, params) in params.into_iter().enumerate() {
+            shares[index % CONTENDERS].push(params);
+        }
+        let callers: Vec<_> = shares
+            .into_iter()
+            .map(|share| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    for params in share {
+                        client
+                            .notify("item/agentMessage/delta", params)
+                            .await
+                            .expect("expected the notification written");
+                    }
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.await.expect("expected the caller to finish");
+        }
+        drop(client);
+    });
+}
+
+/// Queues `params` as notifications, each awaited to its write before the next is queued.
+fn client_submit_notification(rt: &tokio::runtime::Runtime, params: Vec<Value>) {
+    rt.block_on(async {
+        let link = Link::new(Box::new(DiscardSender), Box::new(SilentSource));
+        let client = Client::connect(
+            link,
+            Arc::new(CountingHandler::default()),
+            ClientOptions::new("bench peer"),
+        );
+        for params in params {
+            client
+                .submit_notification("item/agentMessage/delta", params)
+                .expect("expected the notification queued")
+                .await
+                .expect("expected the notification written");
+        }
+        drop(client);
+    });
+}
+
+/// Queues one request per `params`, each awaited to its answer before the next is queued.
+fn client_submit_request(rt: &tokio::runtime::Runtime, params: Vec<Value>) {
+    rt.block_on(async {
+        let (answers, incoming) = tokio::sync::mpsc::unbounded_channel();
+        let link = Link::new(
+            Box::new(AnsweringSender {
+                answers,
+                written: 0,
+            }),
+            Box::new(AnswerSource(incoming)),
+        );
+        let client = Client::connect(
+            link,
+            Arc::new(CountingHandler::default()),
+            ClientOptions::new("bench peer"),
+        );
+        for params in params {
+            let (_written, reply) = client
+                .submit_request("thread/read", params, RequestOptions::new())
+                .expect("expected the request queued")
+                .into_parts();
+            let answer = reply.await.expect("expected the request answered");
+            assert!(
+                answer.is_null(),
+                "expected a null result, received {answer}"
+            );
+        }
+        drop(client);
+    });
+}
+
+fn submit_cases(bench: &Bench, rt: &tokio::runtime::Runtime) {
+    let params = || {
+        (0..DELTAS)
+            .map(|_| json!({"threadId": "thread-1", "turnId": "turn-1", "delta": text(KIB)}))
+            .collect::<Vec<Value>>()
+    };
+    bench.run(
+        "client/submit-notification-1KiB",
+        Unit::new(DELTAS as u64, "frame"),
+        params,
+        |batch| client_submit_notification(rt, batch),
+    );
+    bench.run(
+        "client/submit-request-1KiB",
+        Unit::new(DELTAS as u64, "request"),
+        params,
+        |batch| client_submit_request(rt, batch),
+    );
+}
+
+/// Answers every request the moment it is written, with the id a client counts its requests by.
+struct AnsweringSender {
+    answers: tokio::sync::mpsc::UnboundedSender<String>,
+    written: u64,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::LinkSender for AnsweringSender {
+    async fn send(&mut self, _message: String) -> Result<()> {
+        self.written += 1;
+        let answer = format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","result":null}}"#,
+            self.written
+        );
+        let _ = self.answers.send(answer);
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct AnswerSource(tokio::sync::mpsc::UnboundedReceiver<String>);
+
+#[async_trait::async_trait]
+impl LinkReceiver for AnswerSource {
+    async fn recv(&mut self) -> Result<Option<String>> {
+        Ok(self.0.recv().await)
+    }
+}
+
+/// Makes one request per `params`, each awaited to its answer before the next.
+fn client_request(rt: &tokio::runtime::Runtime, params: Vec<Value>) {
+    rt.block_on(async {
+        let (answers, incoming) = tokio::sync::mpsc::unbounded_channel();
+        let link = Link::new(
+            Box::new(AnsweringSender {
+                answers,
+                written: 0,
+            }),
+            Box::new(AnswerSource(incoming)),
+        );
+        let client = Client::connect(
+            link,
+            Arc::new(CountingHandler::default()),
+            ClientOptions::new("bench peer"),
+        );
+        for params in params {
+            let answer: Value = client
+                .request("thread/read", params)
+                .await
+                .expect("expected the request answered");
+            assert!(
+                answer.is_null(),
+                "expected a null result, received {answer}"
+            );
+        }
         drop(client);
     });
 }
@@ -357,6 +580,33 @@ fn main() {
         frames(error_response, DELTAS),
         |queue| dispatch(&rt, queue, 0),
     );
+
+    let params = |count: usize| {
+        move || {
+            (0..count)
+                .map(|_| json!({"threadId": "thread-1", "turnId": "turn-1", "delta": text(KIB)}))
+                .collect::<Vec<Value>>()
+        }
+    };
+    bench.run(
+        "client/notify-1KiB",
+        Unit::new(DELTAS as u64, "frame"),
+        params(DELTAS),
+        |batch| client_notify(&rt, batch),
+    );
+    bench.run(
+        "client/request-1KiB",
+        Unit::new(DELTAS as u64, "request"),
+        params(DELTAS),
+        |batch| client_request(&rt, batch),
+    );
+    bench.run(
+        "client/notify-contended-1KiB",
+        Unit::new(DELTAS as u64, "frame"),
+        params(DELTAS),
+        |batch| client_notify_contended(&rt, batch),
+    );
+    submit_cases(&bench, &rt);
 
     // Built the way the client builds a request (`Value::to_string`), so the spare capacity a
     // real message carries is present.

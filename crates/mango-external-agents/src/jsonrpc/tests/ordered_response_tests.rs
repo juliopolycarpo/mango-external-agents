@@ -1162,3 +1162,41 @@ async fn an_ordered_request_the_peer_never_answered_fails_after_the_drain_when_t
         "expected the same -32000 failure an unordered call receives | received {outcome:?}"
     );
 }
+
+/// A reply failed because the handler's task stopped says exactly that, and does not claim the
+/// connection ended: the client reports no end.
+#[tokio::test(start_paused = true)]
+async fn a_reply_failed_by_a_stopped_handler_does_not_say_the_connection_ended() {
+    use crate::jsonrpc::CallFailureCause;
+
+    let link = ScriptedLink::new();
+    let (handler, client) = panicking_client(&link);
+    let (written, reply) = client
+        .submit_request("session/prompt", json!({}), ordered())
+        .expect("expected the request queued")
+        .into_parts();
+    written.await.expect("expected the request written");
+    link.push_line(STARTED);
+    handler.entered().await;
+    link.push_line(PONG);
+    reader_caught_up(&client, &link).await;
+    handler.gate.add_permits(1);
+
+    let failure = reply.await.expect_err("expected the reply to fail");
+    assert_eq!(
+        failure.cause(),
+        &CallFailureCause::HandlerStopped,
+        "expected the cause to be the stopped handler | received {:?}",
+        failure.cause()
+    );
+    let ended = client.ended();
+    assert_eq!(
+        ended, None,
+        "expected no end on record for a connection that did not end: None | received {ended:?}"
+    );
+    let error = failure.into_error();
+    assert!(
+        matches!(&error, Error::Vendor(vendor) if vendor.message == HANDLER_STOPPED),
+        "expected the error `request` returns for it: {HANDLER_STOPPED} | received {error:?}"
+    );
+}
