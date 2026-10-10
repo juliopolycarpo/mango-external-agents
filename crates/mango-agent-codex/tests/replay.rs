@@ -4613,6 +4613,130 @@ async fn a_cancel_whose_interrupt_dies_with_the_app_server_ends_with_the_connect
     );
 }
 
+/// A cancel issued while a steer is unanswered, for a turn that then completes on its own. The
+/// server writes the completion, refuses the interrupt and only then answers the steer, so the
+/// completion sits in the steer's hold when the refusal is delivered. The cancel must wait for the
+/// hold to replay it; on several workers it used to report the refusal and shut the session down.
+///
+/// Coverage on a real runtime, not the regression test: the steer can give up its hold before the
+/// completion is even queued, and then this passes without the wait. The paused-clock test that
+/// holds the claim is the one that fails every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_during_a_steer_waits_for_the_completion_the_steer_was_holding() {
+    let thread = Arc::new(std::sync::OnceLock::<String>::new());
+    let answer_thread = Arc::clone(&thread);
+    let steer_id = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), move |frame| {
+        let method = frame.get("method").and_then(serde_json::Value::as_str);
+        let id = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match method {
+            Some("turn/steer") => {
+                *steer_id.lock().expect("expected the steer id slot") = Some(id);
+                Some(Vec::new())
+            }
+            Some("turn/interrupt") => {
+                let steer = steer_id
+                    .lock()
+                    .expect("expected the steer id slot")
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null);
+                Some(vec![
+                    serde_json::json!({"method": "turn/completed", "params": {
+                        "threadId": answer_thread.get().cloned().unwrap_or_default(),
+                        "turn": {"id": AnnouncedTurn::NATIVE_TURN_ID, "status": "completed"}}})
+                    .to_string(),
+                    serde_json::json!({"id": id, "error": {
+                        "code": -32603, "message": "interrupted owner was already closed"}})
+                    .to_string(),
+                    serde_json::json!({"id": steer, "result": {
+                        "turnId": AnnouncedTurn::NATIVE_TURN_ID}})
+                    .to_string(),
+                ])
+            }
+            _ => None,
+        }
+    })
+    .await;
+    let _ = thread.set(running.thread_id.clone());
+
+    let (steered, cancelled) = tokio::join!(
+        running.session.steer(AnnouncedTurn::steer("also this")),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while running.steers().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("expected the steer to reach the fake server within 5s");
+            running.session.cancel(CancelReason::Requested).await
+        }
+    );
+
+    assert!(
+        cancelled.is_ok(),
+        "expected the cancel of a turn that completed during a steer: Ok(()) | received: {cancelled:?}"
+    );
+    assert!(
+        steered.is_ok(),
+        "expected the steer the server answered: Ok | received: {steered:?}"
+    );
+    let events = drain(&mut running.turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Completed))
+            && !events
+                .iter()
+                .any(|event| matches!(event, EventKind::Error { .. })),
+        "expected the turn's own terminal: Completed | received: {events:?}"
+    );
+    assert_eq!(
+        running.launcher.live_children(),
+        1,
+        "expected live children after a cancel that found the turn completed: 1 | received: {}",
+        running.launcher.live_children()
+    );
+}
+
+/// A session poisoned while a cancel waits for its interrupted turn to end: the server
+/// acknowledges the interrupt and then writes a terminal that names no thread. The poison ends
+/// the turn before it wakes the reaper, so the cancel has to join that teardown itself and return
+/// only once the child is reaped.
+///
+/// Coverage on a real runtime, not the regression test: it only catches the defect when the stop
+/// runs between the poison's release and its wake. The paused-clock test that parks the poison
+/// there is the one that fails every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_that_races_a_poisoned_session_returns_with_the_child_reaped() {
+    let mut running = AnnouncedTurn::open_answering(replay_limits(), |frame| {
+        if frame.get("method") != Some(&serde_json::json!("turn/interrupt")) {
+            return None;
+        }
+        Some(vec![
+            serde_json::json!({"id": frame["id"], "result": {}}).to_string(),
+            serde_json::json!({"method": "turn/completed", "params": {"unexpected": true}})
+                .to_string(),
+        ])
+    })
+    .await;
+
+    let cancelled = running.session.cancel(CancelReason::Requested).await;
+    let live = running.launcher.live_children();
+
+    assert_eq!(
+        live, 0,
+        "expected live children when the cancel returned: 0 | received: {live} (cancel: {cancelled:?})"
+    );
+    assert!(
+        cancelled.is_ok(),
+        "expected the cancel of a turn the poison ended: Ok(()) | received: {cancelled:?}"
+    );
+    let events = drain(&mut running.turn).await;
+    assert!(
+        matches!(events.last(), Some(EventKind::Error { .. })),
+        "expected the poisoned turn's terminal: Error | received: {events:?}"
+    );
+}
+
 /// Shutdown while an approval is waiting records cancellation rather than an expired deadline.
 #[tokio::test]
 async fn host_shutdown_marks_a_pending_approval_as_cancelled() {
