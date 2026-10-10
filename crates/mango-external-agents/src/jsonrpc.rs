@@ -412,19 +412,41 @@ impl ClientOptions {
 /// # Example
 ///
 /// ```
-/// use mango_external_agents::jsonrpc::RequestOptions;
+/// use mango_external_agents::jsonrpc::{RequestDeadline, RequestOptions};
 /// use std::time::Duration;
 ///
 /// let options = RequestOptions::new()
 ///     .with_timeout(Duration::from_secs(30))
 ///     .after_earlier_notifications();
-/// assert_eq!(options.timeout(), Some(Duration::from_secs(30)));
+/// assert_eq!(options.deadline(), RequestDeadline::After(Duration::from_secs(30)));
 /// assert!(options.waits_for_earlier_notifications());
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Deliberately neither `Clone` nor comparable: an option added later may own something that is
+/// neither, and a call site builds these where it uses them.
+#[derive(Debug, Default)]
 pub struct RequestOptions {
-    timeout: Option<Duration>,
+    deadline: RequestDeadline,
     after_earlier_notifications: bool,
+}
+
+/// How long a request waits for its answer.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::jsonrpc::{RequestDeadline, RequestOptions};
+///
+/// assert_eq!(RequestOptions::new().deadline(), RequestDeadline::Connection);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestDeadline {
+    /// [`ClientOptions::request_timeout`], the connection's own.
+    #[default]
+    Connection,
+    /// This long, whatever the connection's own is.
+    After(Duration),
 }
 
 impl RequestOptions {
@@ -434,10 +456,10 @@ impl RequestOptions {
     /// # Example
     ///
     /// ```
-    /// use mango_external_agents::jsonrpc::RequestOptions;
+    /// use mango_external_agents::jsonrpc::{RequestDeadline, RequestOptions};
     ///
     /// let options = RequestOptions::new();
-    /// assert_eq!(options.timeout(), None);
+    /// assert_eq!(options.deadline(), RequestDeadline::Connection);
     /// assert!(!options.waits_for_earlier_notifications());
     /// ```
     #[must_use]
@@ -452,15 +474,15 @@ impl RequestOptions {
     /// # Example
     ///
     /// ```
-    /// use mango_external_agents::jsonrpc::RequestOptions;
+    /// use mango_external_agents::jsonrpc::{RequestDeadline, RequestOptions};
     /// use std::time::Duration;
     ///
     /// let options = RequestOptions::new().with_timeout(Duration::from_secs(5));
-    /// assert_eq!(options.timeout(), Some(Duration::from_secs(5)));
+    /// assert_eq!(options.deadline(), RequestDeadline::After(Duration::from_secs(5)));
     /// ```
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
+        self.deadline = RequestDeadline::After(timeout);
         self
     }
 
@@ -485,7 +507,10 @@ impl RequestOptions {
     /// drain: they fail the call at once.
     ///
     /// The request's deadline keeps running while its answer waits in that queue, so a handler
-    /// that is slow to return can time the request out with the answer already read.
+    /// that is slow to return can time the request out with the answer already read. A
+    /// request that does so keeps its place in the queue, counted below, until the handler's
+    /// task has passed the abandoned answer; one that times out before its answer is read gives
+    /// the place back at once.
     ///
     /// At most [`ClientOptions::max_pending_requests`] of these may be awaiting delivery at once,
     /// counted apart from the notification budgets: a burst of notifications cannot refuse or
@@ -501,7 +526,7 @@ impl RequestOptions {
     /// it run to its deadline. It can only see a request made on the handler's own task: one made
     /// on a task the handler spawned and then awaits is the same deadlock and runs until the
     /// request times out. A request made from [`PeerHandler::on_request`] is safe, since nothing
-    /// in the queue waits for a question to be answered.
+    /// in the queue waits for a question to be answered, and so is one made to another client.
     ///
     /// # Example
     ///
@@ -517,18 +542,18 @@ impl RequestOptions {
         self
     }
 
-    /// The deadline this request asked for, or `None` for the connection's own.
+    /// The deadline this request asked for.
     ///
     /// # Example
     ///
     /// ```
-    /// use mango_external_agents::jsonrpc::RequestOptions;
+    /// use mango_external_agents::jsonrpc::{RequestDeadline, RequestOptions};
     ///
-    /// assert_eq!(RequestOptions::new().timeout(), None);
+    /// assert_eq!(RequestOptions::new().deadline(), RequestDeadline::Connection);
     /// ```
     #[must_use]
-    pub fn timeout(&self) -> Option<Duration> {
-        self.timeout
+    pub fn deadline(&self) -> RequestDeadline {
+        self.deadline
     }
 
     /// Whether the answer waits for the notifications that arrived before it.
@@ -544,6 +569,15 @@ impl RequestOptions {
     pub fn waits_for_earlier_notifications(&self) -> bool {
         self.after_earlier_notifications
     }
+}
+
+tokio::task_local! {
+    /// The client whose `on_notification` the current task is inside, as its state's address.
+    ///
+    /// Scoped around that one call, so it says nothing once the handler returned or panicked,
+    /// and nothing on any other task. A recorded task id would do neither: it outlives a worker
+    /// that panicked, and tokio may hand a finished task's id to a new one.
+    static HANDLING_NOTIFICATION_FOR: usize;
 }
 
 /// A JSON-RPC client that also answers.
@@ -631,8 +665,14 @@ struct ClientState {
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
     notifications: StdMutex<Option<JoinHandle<()>>>,
-    /// The task that awaits `on_notification`, so a call made from inside it can be recognised.
-    notification_task: OnceLock<tokio::task::Id>,
+    /// Takes the handler's task down whoever holds its join handle. A drain takes the handle out
+    /// of `notifications` to wait on it, and a close or a drop that lands in that drain still
+    /// has to stop the task, with whatever its queue holds.
+    worker_abort: OnceLock<tokio::task::AbortHandle>,
+    /// Runs once between the two reads the reader admits a notification on, so a test can place
+    /// the worker's dequeue exactly there.
+    #[cfg(test)]
+    after_queue_length_read: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     peer_bytes: Arc<Semaphore>,
     /// How many notifications and peer questions may wait in the handoff queue. The channel is
     /// larger than this by the reserve below, so the reader counts what is in it.
@@ -685,15 +725,6 @@ impl Drop for MidSend<'_> {
     }
 }
 
-/// Takes its task down when it is dropped, finished or not.
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// Removes correlation state when a request future is dropped at any await.
 struct PendingCall {
     state: Arc<ClientState>,
@@ -734,10 +765,7 @@ impl Client {
         // its own count, so the sum is room neither can take from the other. The one more is for
         // the notification the reader can admit while the worker holds a response it has taken
         // out and not yet let go of: without it, the next ordered response could find no room.
-        let queue_capacity = notification_capacity
-            .saturating_add(ordered_capacity)
-            .saturating_add(1)
-            .min(Semaphore::MAX_PERMITS);
+        let queue_capacity = handoff_capacity(notification_capacity, ordered_capacity);
         let peer_bytes = Arc::new(Semaphore::new(
             options.max_pending_bytes.min(Semaphore::MAX_PERMITS),
         ));
@@ -755,7 +783,9 @@ impl Client {
             link_poisoned: AtomicBool::new(false),
             in_flight: StdMutex::new(JoinSet::new()),
             notifications: StdMutex::new(None),
-            notification_task: OnceLock::new(),
+            worker_abort: OnceLock::new(),
+            #[cfg(test)]
+            after_queue_length_read: StdMutex::new(None),
             peer_bytes,
             notification_capacity,
             queued_answers: AtomicUsize::new(0),
@@ -767,8 +797,7 @@ impl Client {
             notification_receiver,
             Arc::clone(&handler),
         ));
-        // Set before the reader exists, so before any frame can reach the handler.
-        let _ = state.notification_task.set(worker.id());
+        let _ = state.worker_abort.set(worker.abort_handle());
         *state
             .notifications
             .lock()
@@ -848,9 +877,10 @@ impl Client {
         P: Serialize + Send,
         R: DeserializeOwned,
     {
-        let timeout = options
-            .timeout
-            .unwrap_or(self.state.options.request_timeout);
+        let timeout = match options.deadline {
+            RequestDeadline::Connection => self.state.options.request_timeout,
+            RequestDeadline::After(timeout) => timeout,
+        };
         self.answer_within(
             method,
             params,
@@ -1013,7 +1043,7 @@ impl Client {
         // An ordered answer is delivered by the task that awaits `on_notification`. Asked for
         // from inside that call, it would wait for the call to return while the call waits for
         // it. Refused before the frame exists, so the peer is never left running the request.
-        if ordered && self.state.on_notification_task() {
+        if ordered && self.state.handling_own_notification() {
             return Err(Error::HostConfiguration {
                 expected: "an ordered JSON-RPC request made outside this client's notification handler",
                 received: String::from(
@@ -1181,6 +1211,9 @@ impl ClientState {
     }
 
     async fn stop_notifications(&self) {
+        // Through the abort handle first: a drain may be holding the join handle, and the task
+        // has to stop now all the same, not when that drain's grace runs out.
+        self.abort_worker();
         let handle = self
             .notifications
             .lock()
@@ -1203,23 +1236,28 @@ impl ClientState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        let Some(handle) = handle else {
+        let Some(mut handle) = handle else {
             return;
         };
-        // The pump runs this drain and `Client::close` aborts the pump. Without the guard that
-        // would let go of the only handle to a worker parked in the handler, leaving it running
-        // with whatever it still holds, a queued answer's caller included.
-        let mut worker = AbortOnDrop(handle);
-        if tokio::time::timeout(self.options.shutdown_timeout, &mut worker.0)
+        // A close or a drop that lands here stops the worker through its abort handle, which
+        // ends this wait too.
+        if tokio::time::timeout(self.options.shutdown_timeout, &mut handle)
             .await
             .is_err()
         {
-            worker.0.abort();
-            let _ = (&mut worker.0).await;
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    fn abort_worker(&self) {
+        if let Some(worker) = self.worker_abort.get() {
+            worker.abort();
         }
     }
 
     fn abort_notifications(&self) {
+        self.abort_worker();
         if let Some(handle) = self
             .notifications
             .lock()
@@ -1309,12 +1347,56 @@ impl ClientState {
         })?
     }
 
-    /// Whether the caller is running on the task that awaits `on_notification`.
-    fn on_notification_task(&self) -> bool {
-        let Some(worker) = self.notification_task.get() else {
-            return false;
-        };
-        tokio::task::try_id().is_some_and(|current| current == *worker)
+    /// What names this client in [`HANDLING_NOTIFICATION_FOR`]. Stable while anything holds the
+    /// state, which the task inside the handler does.
+    fn address(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
+    /// Whether the caller is inside this client's `on_notification`, on the task that awaits it.
+    fn handling_own_notification(&self) -> bool {
+        HANDLING_NOTIFICATION_FOR
+            .try_with(|client| *client == self.address())
+            .unwrap_or(false)
+    }
+
+    /// How many notifications and peer questions the handoff channel holds.
+    ///
+    /// The channel's length less the ordered responses in it. The two are separate reads, and
+    /// the worker can take a response out between them: read the length first and the count
+    /// second, and a response that was counted in the length is gone from the count, which makes
+    /// the peer's share look one larger than it is and ends a healthy connection at the limit.
+    /// So the count is read on both sides of the length and the read repeated when it moved.
+    /// Only the worker lowers it during a read (this is the reader, the one task that raises
+    /// it), so it settles in as many rounds as there were responses.
+    ///
+    /// What is left is the other direction: the worker has taken a response out and not yet
+    /// dropped it, so the length is one short and the count is not. That reads one low, never
+    /// more with one worker, and the channel has a slot for the notification it lets through.
+    fn peer_work_queued(&self, queue: &mpsc::Sender<QueuedWork>) -> usize {
+        let mut responses = self.queued_answers.load(Ordering::Acquire);
+        loop {
+            let length = queue.max_capacity() - queue.capacity();
+            #[cfg(test)]
+            self.run_after_queue_length_read();
+            let settled = self.queued_answers.load(Ordering::Acquire);
+            if settled == responses {
+                return peer_share(length, responses);
+            }
+            responses = settled;
+        }
+    }
+
+    #[cfg(test)]
+    fn run_after_queue_length_read(&self) {
+        let hook = self
+            .after_queue_length_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// The termination a peer earns by sending more than the handoff queue may hold.
@@ -1595,13 +1677,8 @@ async fn dispatch(
                 limit: state.options.max_pending_bytes,
             })?;
         // The channel also has room reserved for ordered responses, so its own capacity no
-        // longer says when the peer's share is spent. What is in it, less the responses, does.
-        // The worker only ever lowers either number, and a response that left the channel a
-        // moment before its count dropped makes this read low by one, never high. The channel
-        // has a slot for that one.
-        let queued = notifications.max_capacity() - notifications.capacity();
-        let responses = state.queued_answers.load(Ordering::Acquire);
-        if queued.saturating_sub(responses) >= state.notification_capacity {
+        // longer says when the peer's share is spent.
+        if state.peer_work_queued(notifications) >= state.notification_capacity {
             return Err(state.queue_full());
         }
         let work = match id {
@@ -1634,6 +1711,26 @@ async fn dispatch(
         return ClientState::deliver(state, notifications, RequestId::new(id).key(), outcome).await;
     }
     Ok(())
+}
+
+/// How many entries the handoff channel has room for.
+///
+/// Every notification the peer may queue, every place reserved for an ordered response, and one
+/// more: the reader can admit one notification too many while the worker holds a response it has
+/// taken out and not yet dropped (see [`ClientState::peer_work_queued`]), and without a slot for
+/// it the next ordered response could find the channel full. Clamped, since the channel panics
+/// above `Semaphore::MAX_PERMITS` and a host may set a huge count to mean "no cap".
+fn handoff_capacity(notifications: usize, ordered: usize) -> usize {
+    notifications
+        .saturating_add(ordered)
+        .saturating_add(1)
+        .min(Semaphore::MAX_PERMITS)
+}
+
+/// The peer's share of a handoff channel holding `length` entries, `responses` of them ordered
+/// responses.
+fn peer_share(length: usize, responses: usize) -> usize {
+    length.saturating_sub(responses)
 }
 
 /// One entry of the handoff queue between the reader and the task that runs the handler.
@@ -1677,7 +1774,9 @@ async fn peer_work_pump(
         };
         match work {
             PeerWork::Notification { method, params } => {
-                handler.on_notification(method, params).await
+                HANDLING_NOTIFICATION_FOR
+                    .scope(state.address(), handler.on_notification(method, params))
+                    .await
             }
             PeerWork::Request { method, params, id } => {
                 // A question that waits for a person must not stop later events after it has
@@ -1747,6 +1846,7 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
 
 #[cfg(test)]
 mod tests {
+    mod handoff_queue_tests;
     mod ordered_response_tests;
     mod write_failure_tests;
 

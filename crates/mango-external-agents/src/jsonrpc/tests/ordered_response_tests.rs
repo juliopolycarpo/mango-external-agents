@@ -661,16 +661,16 @@ async fn a_second_response_to_a_queued_ordered_request_is_dropped() {
 /// Makes a request from inside the handler and records how it returned.
 struct ReentrantHandler {
     client: OnceLock<Arc<Client>>,
-    options: RequestOptions,
+    ordered: bool,
     outcomes: StdMutex<Vec<String>>,
     returned: Notify,
 }
 
 impl ReentrantHandler {
-    fn arc(options: RequestOptions) -> Arc<Self> {
+    fn arc(ordered: bool) -> Arc<Self> {
         Arc::new(Self {
             client: OnceLock::new(),
-            options,
+            ordered,
             outcomes: StdMutex::new(Vec::new()),
             returned: Notify::new(),
         })
@@ -688,8 +688,13 @@ impl ReentrantHandler {
 
     async fn ask(&self) -> crate::Result<Value> {
         let client = self.client.get().expect("expected a connected client");
+        let options = if self.ordered {
+            ordered()
+        } else {
+            RequestOptions::new()
+        };
         let outcome = client
-            .request_with::<_, Value>("session/load", json!({}), self.options.clone())
+            .request_with::<_, Value>("session/load", json!({}), options)
             .await;
         let described = match &outcome {
             Err(Error::HostConfiguration { .. }) => String::from("refused"),
@@ -740,7 +745,7 @@ impl PeerHandler for ReentrantHandler {
 #[tokio::test(start_paused = true)]
 async fn an_ordered_request_from_inside_the_notification_handler_is_refused() {
     let link = ScriptedLink::new();
-    let handler = ReentrantHandler::arc(ordered());
+    let handler = ReentrantHandler::arc(true);
     let client = handler.connect(&link);
 
     link.push_line(STARTED);
@@ -762,7 +767,7 @@ async fn an_ordered_request_from_inside_the_notification_handler_is_refused() {
 #[tokio::test]
 async fn an_unordered_request_from_inside_the_notification_handler_is_still_answered() {
     let link = ScriptedLink::new();
-    let handler = ReentrantHandler::arc(RequestOptions::new());
+    let handler = ReentrantHandler::arc(false);
     let client = handler.connect(&link);
 
     link.push_line(STARTED);
@@ -782,7 +787,7 @@ async fn an_unordered_request_from_inside_the_notification_handler_is_still_answ
 #[tokio::test]
 async fn an_ordered_request_from_inside_a_question_handler_is_answered() {
     let link = ScriptedLink::new();
-    let handler = ReentrantHandler::arc(ordered());
+    let handler = ReentrantHandler::arc(true);
     let client = handler.connect(&link);
 
     link.push_line(r#"{"jsonrpc":"2.0","id":"q-1","method":"session/request_permission"}"#);
@@ -942,32 +947,218 @@ async fn an_ordered_answer_read_after_the_handler_panicked_fails_at_once() {
     );
 }
 
-/// The reader drains the queue when the peer exits, and `Client::close` takes the reader down.
-/// A close that lands in that drain must take the handler's task with it, or an answer queued
-/// behind a handler that is not returning keeps its caller until the request deadline.
+/// Waits until the reader's drain has taken the worker's handle, which is when a close or a drop
+/// can no longer reach the worker through it. Counted, so it also holds on a paused clock.
+async fn drain_owns_the_worker(client: &Client) {
+    let mut yields = 0;
+    while client
+        .state
+        .notifications
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some()
+    {
+        yields += 1;
+        assert!(
+            yields < 10_000,
+            "expected the drain to have taken the worker: taken | received still held after {yields} yields"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Carries frames and never finishes closing, so a `Client::close` spends its whole grace there.
+struct NeverCloses(Box<dyn crate::link::LinkSender>);
+
+#[async_trait::async_trait]
+impl crate::link::LinkSender for NeverCloses {
+    async fn send(&mut self, message: String) -> crate::Result<()> {
+        self.0.send(message).await
+    }
+
+    async fn close(&mut self) -> crate::Result<()> {
+        std::future::pending().await
+    }
+}
+
+/// The reader drains the queue when the peer exits, and takes the worker's handle to wait on it.
+/// A close that lands in that drain must still stop the worker, and first: an answer queued
+/// behind a handler that is not returning is failed when the close begins, not after the stages
+/// of the close that can each take the shutdown grace.
+#[tokio::test(start_paused = true)]
+async fn closing_during_the_exit_drain_fails_a_queued_ordered_answer_at_once() {
+    let link = ScriptedLink::new();
+    let handler = Turnstile::arc();
+    let grace = Duration::from_secs(30);
+    let (sender, receiver) = link.clone().into_link().split();
+    let client = Arc::new(Client::connect(
+        crate::link::Link::new(Box::new(NeverCloses(sender)), receiver),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        ClientOptions::new("ACP agent")
+            .with_request_timeout(Duration::from_secs(600))
+            .with_shutdown_timeout_for_tests(grace),
+    ));
+
+    let prompt = ask_ordered(&client, &link, &handler, "session/prompt", ordered()).await;
+    let released = tokio::spawn(async move { (prompt.await, tokio::time::Instant::now()) });
+    link.push_line(STARTED);
+    link.push_line(PONG);
+    link.end();
+    drain_owns_the_worker(&client).await;
+
+    let began = tokio::time::Instant::now();
+    let closed = client.close().await;
+    assert!(
+        matches!(closed, Err(Error::Timeout { after, .. }) if after == grace),
+        "expected the close to spend its grace on the link: Timeout after {grace:?} | received {closed:?}"
+    );
+
+    let (outcome, at) = released.await.expect("expected the request task to finish");
+    let waited = at - began;
+    assert_eq!(
+        waited,
+        Duration::ZERO,
+        "expected the caller released as the close began: 0s | received {waited:?}"
+    );
+    let log = handler.log();
+    assert_eq!(
+        log,
+        vec!["failed:the ACP agent exited"],
+        "expected the exit that began the drain, and no notification past the gate: [failed:the ACP agent exited] | received {log:?}"
+    );
+    assert!(
+        matches!(outcome, Ok(Err(_))),
+        "expected the request failed | received {outcome:?}"
+    );
+}
+
+/// What the default path does with the same close: the notifications still queued when the peer
+/// exited are not handled once the client is closed. The drain is for a peer that went away
+/// under a host still listening, and a host that closes has stopped.
 #[tokio::test]
-async fn closing_during_the_exit_drain_fails_an_ordered_request_whose_answer_is_queued() {
+async fn closing_during_the_exit_drain_cuts_the_queued_notifications() {
     let link = ScriptedLink::new();
     let handler = Turnstile::arc();
     let client = connect(&link, &handler, options());
 
-    let prompt = ask_ordered(&client, &link, &handler, "session/prompt", ordered()).await;
     link.push_line(STARTED);
-    link.push_line(PONG);
+    link.push_line(UPDATED);
     link.end();
-    connection_ended(&client).await;
+    handler.entered().await;
+    drain_owns_the_worker(&client).await;
 
     tokio::time::timeout(Duration::from_secs(5), client.close())
         .await
         .expect("expected close to return during the drain")
         .expect("expected a clean close");
 
+    // The reader and the worker each held the handler; both are gone when only this test does.
+    let mut yields = 0;
+    while Arc::strong_count(&handler) > 1 {
+        yields += 1;
+        assert!(
+            yields < 10_000,
+            "expected the handler's task taken down by the close: 1 owner | received {} after {yields} yields",
+            Arc::strong_count(&handler)
+        );
+        tokio::task::yield_now().await;
+    }
+    handler.open_for(2);
+    let log = handler.log();
+    assert!(
+        log.is_empty(),
+        "expected neither queued notification handled after the close: [] | received {log:?}"
+    );
+}
+
+/// A caller that gives up before the peer answers gives its place back then, and the answer that
+/// arrives afterwards finds nobody: it is dropped without taking a place or releasing one twice.
+#[tokio::test(start_paused = true)]
+async fn an_ordered_request_that_times_out_unanswered_frees_its_place_and_a_late_answer_is_dropped()
+{
+    let link = ScriptedLink::new();
+    let handler = Turnstile::arc();
+    let mut limited = ClientOptions::new("ACP agent").with_request_timeout(Duration::from_secs(5));
+    limited.max_pending_requests = 1;
+    let client = connect(&link, &handler, limited);
+    let places = || client.state.ordered_places.available_permits();
+
+    let prompt = ask_ordered(
+        &client,
+        &link,
+        &handler,
+        "session/prompt",
+        ordered().with_timeout(Duration::from_secs(1)),
+    )
+    .await;
+    let outcome = joined(prompt).await;
+    assert!(
+        matches!(outcome, Err(Error::Timeout { .. })),
+        "expected the unanswered request to time out: Timeout | received {outcome:?}"
+    );
+    let free = places();
+    assert_eq!(
+        free, 1,
+        "expected the place given back with the timeout: 1 free | received {free}"
+    );
+
+    // The one place admits the next request. The late answer to the first is read ahead of the
+    // answer to the second, so by the time the second returns the first has been dropped.
+    let next = ask_ordered(&client, &link, &handler, "session/prompt", ordered()).await;
+    link.push_line(PONG);
+    link.push_line(r#"{"jsonrpc":"2.0","id":"2","result":"second"}"#);
+    let answer = joined(next).await.expect("expected the second answer");
+    assert_eq!(
+        answer,
+        json!("second"),
+        "expected the second request's own answer: \"second\" | received {answer}"
+    );
+    let free = places();
+    assert_eq!(
+        free, 1,
+        "expected one place free after a late answer and a delivered one: 1 free | received {free}"
+    );
+    assert!(!client.is_closed());
+
+    client.close().await.expect("expected a clean close");
+}
+
+#[tokio::test]
+async fn an_ordered_request_the_peer_never_answered_fails_after_the_drain_when_the_link_fails() {
+    let link = ScriptedLink::new();
+    let handler = Turnstile::arc();
+    let client = connect(&link, &handler, options());
+
+    let prompt = ask_ordered(&client, &link, &handler, "session/prompt", ordered()).await;
+    link.push_line(STARTED);
+    handler.entered().await;
+    link.fail_sends("EPIPE");
+    let refused = client.notify("session/cancel", json!({})).await;
+    assert!(
+        matches!(refused, Err(Error::Link { .. })),
+        "expected the write to fail the link | received {refused:?}"
+    );
+    connection_ended(&client).await;
+
+    let held = handler.log();
+    assert!(
+        held.is_empty(),
+        "expected the failure held behind the queued notification: [] | received {held:?}"
+    );
+
+    handler.open_for(1);
     let outcome = joined(prompt).await;
     let log = handler.log();
-    assert_eq!(
-        log,
-        vec!["failed:the ACP agent exited"],
-        "expected the caller released by the close with the exit that began the drain: [failed:the ACP agent exited] | received {log:?}"
+    assert!(
+        matches!(
+            &log[..],
+            [first, second] if first == "item/started"
+                && second.starts_with("failed:the ACP agent link failed: ")
+        ),
+        "expected the notification, then the link failure: [item/started, failed:the ACP agent link failed: ...] | received {log:?}"
     );
-    assert!(outcome.is_err(), "received {outcome:?}");
+    assert!(
+        matches!(&outcome, Err(Error::Vendor(vendor)) if vendor.vendor_code.as_deref() == Some("-32000")),
+        "expected the same -32000 failure an unordered call receives | received {outcome:?}"
+    );
 }
