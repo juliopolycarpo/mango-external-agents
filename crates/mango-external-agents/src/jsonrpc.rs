@@ -150,9 +150,8 @@ impl std::fmt::Debug for ServerRequestOutcome {
 
 /// Why the connection ended without this client closing it first.
 ///
-/// More reasons may be added, and every reason but [`Exited`](Self::Exited) may come to carry
-/// more than it does, so a `match` on this needs a wildcard arm and a pattern on one of those
-/// needs `..`.
+/// More reasons may be added, and the reasons that carry numbers may carry more of them, so a
+/// `match` on this needs a wildcard arm and a pattern on one of those needs `..`.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PeerTermination {
@@ -161,7 +160,6 @@ pub enum PeerTermination {
     /// The link failed: reading or writing the peer failed, a reply to one of its questions could
     /// not be written, or a write was abandoned mid-send (timed out or dropped) with its frame
     /// possibly half on the wire.
-    #[non_exhaustive]
     LinkFailed(String),
     /// Peer work filled the bounded handoff queue before the handler could consume it.
     #[non_exhaustive]
@@ -641,6 +639,7 @@ pub struct Client {
 ///
 /// What [`Client::ended`] returns and what a failed [`Reply`] carries, so a caller can tell a
 /// peer that exited from a link that failed from a budget that was passed, without reading text.
+/// More ends may be added, so a `match` needs a wildcard arm.
 ///
 /// # Example
 ///
@@ -691,7 +690,21 @@ pub struct CallFailure {
 }
 
 /// Which side failed a call, and how.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// More causes may be added, so a `match` on this needs a wildcard arm. What a cause carries
+/// is fixed; anything more a failure comes to know is read from [`CallFailure`] itself. It is
+/// not comparable: match on it.
+///
+/// ```
+/// use mango_external_agents::jsonrpc::{CallFailureCause, ConnectionEnd};
+///
+/// fn worth_a_new_connection(cause: &CallFailureCause) -> bool {
+///     matches!(cause, CallFailureCause::Ended(ConnectionEnd::Peer(_)))
+/// }
+/// assert!(!worth_a_new_connection(&CallFailureCause::Unwritten));
+/// ```
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 #[non_exhaustive]
 pub enum CallFailureCause {
     /// The peer answered with an error frame. Its code, message and data are here as it sent

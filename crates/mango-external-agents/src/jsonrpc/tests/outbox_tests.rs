@@ -227,6 +227,15 @@ fn failure(outcome: std::result::Result<Value, CallFailure>) -> (CallFailureCaus
     (failure.cause().clone(), failure.into_error())
 }
 
+/// The end the client has on record.
+fn assert_ended(client: &Client, expected: Option<ConnectionEnd>) {
+    let ended = client.ended();
+    assert_eq!(
+        ended, expected,
+        "expected the end on record: {expected:?} | received {ended:?}"
+    );
+}
+
 fn outbox_holds(client: &Client) -> (usize, usize) {
     client.state.outbox.held()
 }
@@ -755,7 +764,7 @@ async fn a_queued_request_past_the_pending_budget_is_refused_when_its_turn_comes
         matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent request frame was not written"),
         "expected the error `request` returns for it | received {error:?}"
     );
-    assert_eq!(gated.client.ended(), None);
+    assert_ended(&gated.client, None);
     let order = methods(&gated.link);
     assert_eq!(order, vec!["first"], "received {order:?}");
     assert!(!gated.client.is_closed());
@@ -824,7 +833,7 @@ async fn a_queued_frame_the_link_refuses_ends_the_connection_and_reports_its_wri
         CallFailureCause::Unwritten,
         "expected the reply failed with its write | received {cause:?}"
     );
-    assert_eq!(client.ended(), Some(ConnectionEnd::Peer(termination)));
+    assert_ended(&client, Some(ConnectionEnd::Peer(termination)));
     client.close().await.expect("expected a clean close");
 }
 
@@ -873,7 +882,7 @@ async fn frames_queued_before_a_close_are_dealt_with_before_the_link_closes() {
         CallFailureCause::Ended(ConnectionEnd::Closed),
         "expected the reply failed by the close | received {cause:?}"
     );
-    assert_eq!(gated.client.ended(), Some(ConnectionEnd::Closed));
+    assert_ended(&gated.client, Some(ConnectionEnd::Closed));
     assert!(
         matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent connection was closed"),
         "expected the error `request` returns for it | received {error:?}"
@@ -969,7 +978,7 @@ async fn a_submitted_request_times_out_from_when_it_was_queued() {
         matches!(&error, Error::Timeout { after, .. } if *after == Duration::from_secs(2)),
         "expected the error `request` returns for it: Timeout after 2s | received {error:?}"
     );
-    assert_eq!(gated.client.ended(), None);
+    assert_ended(&gated.client, None);
     assert_eq!(began.elapsed(), Duration::from_secs(2));
     // The reply is gone, and with it the call's entry. The drop may have had to defer that.
     until("the abandoned call cleaned up", || {
@@ -1570,7 +1579,11 @@ async fn a_queued_turn_stays_counted_until_the_link_is_held_for_it() {
         "expected no turn owed once it was served: 0 | received {owed}"
     );
     let order = methods(&gated.link);
-    assert_eq!(order, vec!["begin", "hold", "second"], "received {order:?}");
+    assert_eq!(
+        order,
+        vec!["begin", "hold", "second"],
+        "expected the wire in call order: [begin, hold, second] | received {order:?}"
+    );
     gated.client.close().await.expect("expected a clean close");
 }
 
@@ -2084,8 +2097,17 @@ async fn a_queue_bounded_to_nothing_refuses_each_frame_alone() {
             (0, false),
             "expected a refused frame not to start the queue: (0, false) | received {switched:?}"
         );
-        assert_eq!(methods(&gated.link), vec!["waited"]);
-        assert!(gated.handler.terminations.lock().await.is_empty());
+        let order = methods(&gated.link);
+        assert_eq!(
+            order,
+            vec!["waited"],
+            "expected only the waiting caller's frame on the wire: [waited] | received {order:?}"
+        );
+        let terminations = gated.handler.terminations.lock().await.clone();
+        assert!(
+            terminations.is_empty(),
+            "expected no termination: [] | received {terminations:?}"
+        );
         gated.client.close().await.expect("expected a clean close");
     }
 }
@@ -2115,8 +2137,8 @@ async fn an_id_too_large_for_any_reply_ends_the_connection() {
         "expected nothing written: [] | received {:?}",
         link.sent()
     );
-    assert!(client.is_closed());
-    assert_eq!(client.ended(), Some(ConnectionEnd::Peer(termination)));
+    assert!(client.is_closed(), "expected closed: true | received false");
+    assert_ended(&client, Some(ConnectionEnd::Peer(termination)));
     client.close().await.expect("expected a clean close");
 }
 
@@ -2153,7 +2175,7 @@ async fn a_reply_the_peer_refused_carries_the_peers_error_and_no_end() {
         matches!(&error, Error::Vendor(vendor) if vendor.message == "auth required"),
         "expected the error `request` returns for it | received {error:?}"
     );
-    assert_eq!(gated.client.ended(), None);
+    assert_ended(&gated.client, None);
 
     // A peer that exits fails the next one from this side, with the same code in the error
     // `request` returns and a cause that tells the two apart.
