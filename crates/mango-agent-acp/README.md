@@ -5,8 +5,8 @@ Agent Client Protocol harness for
 
 ```toml
 [dependencies]
-mango-external-agents = "0.4"
-mango-agent-acp = "0.4"
+mango-external-agents = "0.5"
+mango-agent-acp = "0.5"
 ```
 
 The harness drives only the vendor's official CLI through its documented programmatic surface.
