@@ -279,8 +279,8 @@ It is the only ordered request in this harness, and three things follow from it:
   with the connection failure, and the cancel reports the teardown's result, not the interrupt's
   error: it returns once the child is reaped, or with that teardown's `CleanupRequired`. Before,
   the host saw either that or a `Cancelled` terminal with the interrupt's error, depending on
-  task order. A session poisoned at the same moment as a cancel is still such a race: the cancel
-  can return before the teardown the poison starts.
+  task order. A session poisoned while a cancel waits is treated the same way: the stop joins
+  the teardown the poison leads to, so the cancel returns once the child is reaped.
 - Two interrupts stay unordered, because their answer is discarded and the caller is already
   ending the turn itself: a poisoned session's, which can be sent from inside the notification
   handler, where the client refuses an ordered request before writing it, and the teardown
