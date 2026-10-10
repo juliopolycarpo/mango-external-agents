@@ -4572,6 +4572,9 @@ mod host_cancel;
 #[path = "session/drop_session.rs"]
 mod drop_session;
 
+#[path = "session/pins.rs"]
+mod pins;
+
 #[path = "session/tool_name.rs"]
 mod tool_name;
 
