@@ -1012,6 +1012,70 @@ async fn each_update_restarts_the_idle_deadline() {
     session.close(CloseReason::Shutdown).await.expect("close");
 }
 
+/// Notices and compaction updates need a capability this client never advertises. Through schema
+/// 1.9.1 they did not parse and never reached the session, so they were not progress; now that
+/// they parse they still are not, exactly like an update kind no schema knows.
+#[tokio::test(start_paused = true)]
+async fn an_update_kind_this_client_never_asked_for_is_not_progress() {
+    let unadvertised = [
+        serde_json::json!({ "sessionUpdate": "brand_new_variant", "payload": { "x": 1 } }),
+        serde_json::json!({ "sessionUpdate": "notice", "severity": "info", "title": "heads up" }),
+        serde_json::json!({
+            "sessionUpdate": "compaction_update", "compactionId": "c1", "status": "in_progress"
+        }),
+        serde_json::json!({
+            "sessionUpdate": "compaction_summary_chunk", "compactionId": "c1",
+            "content": { "type": "text", "text": "summary" }
+        }),
+    ];
+    for update in unadvertised {
+        let idle = Duration::from_secs(5);
+        let announcer = mango_external_agents::testing::Announcer::new();
+        let (session, launcher) = open_idle(
+            FakeAcpAgent::new()
+                .with_updates(Vec::new())
+                .staying_silent()
+                .process()
+                .announcing(announcer.clone()),
+            idle,
+            Duration::from_secs(600),
+        )
+        .await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("idle", "keep talking"))
+            .await
+            .expect("expected a turn");
+        settle().await;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            announcer.announce(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "sessionId": "sess_fake", "update": update }
+                })
+                .to_string(),
+            );
+            settle().await;
+        }
+        // Read before draining: a drain lets the paused clock run on to the deadline regardless.
+        let received = match cancel_sent(&launcher) {
+            true => "idle timeout",
+            false => "a turn kept alive",
+        };
+        assert_eq!(
+            received, "idle timeout",
+            "expected turn state after 9s of {update} under a 5s idle deadline: idle timeout | received: {received}"
+        );
+        let events = drain(&mut turn).await;
+        assert!(
+            timed_out(&events),
+            "expected the timeout to be the turn's terminal | received {events:?}"
+        );
+        session.close(CloseReason::Shutdown).await.expect("close");
+    }
+}
+
 /// A pending approval has its own deadline. Waiting for a person is not the agent going quiet, so
 /// the idle deadline does not run while the question is open, and the turn finishes normally once
 /// it is answered.

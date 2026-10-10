@@ -11,7 +11,7 @@
 //! from the closure is what closes the connection, which is why [`ConnectionHandle::shutdown`] is the
 //! only thing that ends it.
 //!
-//! This works because 2.1.0's connection is `Send + Sync`: `ConnectTo` is `Send + 'static` and its
+//! This works because 3.3.0's connection is `Send + Sync`: `ConnectTo` is `Send + 'static` and its
 //! future is `Send`, so nothing here needs a `LocalSet` or a thread of its own, and a
 //! `ConnectionTo<Agent>` sits inside a `Session` trait object directly.
 //!
@@ -33,6 +33,7 @@ use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, RequestPermissionRequest, RequestPermissionResponse, SessionNotification,
+    SessionUpdate,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use mango_external_agents::approval::ApprovalDeadline;
@@ -1075,6 +1076,22 @@ impl SessionState {
     }
 }
 
+/// Whether `update` is a kind an agent may send only to a client that advertised it, which this
+/// one never does (`ClientSessionCapabilities::notices` and `::compaction` stay unset).
+///
+/// These kinds became stable after schema 1.9.1. Before that they failed to parse and fell to the catch-all
+/// dispatch handler, so they were neither transcript nor progress. They stay that way: an agent
+/// breaking the rule cannot hold a turn past its idle deadline with them. For example, a `notice`
+/// frame every second does not restart idle accounting.
+fn needs_an_unadvertised_capability(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::Notice(_)
+            | SessionUpdate::CompactionUpdate(_)
+            | SessionUpdate::CompactionSummaryChunk(_)
+    )
+}
+
 /// One `session/update` notification, reduced and emitted.
 ///
 /// Never fails the handler. A closed or overflowed sink wakes the prompt owner, which cancels native
@@ -1083,6 +1100,9 @@ impl SessionState {
 async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotification) {
     // Not this session's: neither transcript nor session state, and not progress either.
     if !state.serves(&notification.session_id) {
+        return;
+    }
+    if needs_an_unadvertised_capability(&notification.update) {
         return;
     }
     // Capture the current owner before anything is reduced. Facts may arrive between turns; their
@@ -1447,7 +1467,7 @@ impl Drop for RequestAbandonment {
         if !self.armed {
             return;
         }
-        // ACP 2.1 only sends a cancellation notification when a sent request is dropped; it keeps
+        // The SDK only sends a cancellation notification when a sent request is dropped; it keeps
         // that request's reply slot until a response or EOF. Close admission synchronously, then
         // let the connection's owned shutdown task force EOF and release the SDK's pending map.
         self.connection

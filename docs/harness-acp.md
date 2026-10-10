@@ -38,9 +38,11 @@ down would mean sending v1 messages to an agent that answered something else.
 `TransportKind::Acp` only, through `AcpSpec::ChildPipes`. The host's `ProcessLauncher` spawns the
 agent and the library receives the pipes; the SDK's own `AcpAgent` and `Stdio` carriers are unusable
 here because the first spawns the agent itself and the second takes over this process's stdio.
+Since SDK 3.0 both sit behind its `process` and `stdio` Cargo features, which this crate leaves off
+along with `schemars`, so neither they nor their async-io dependencies are compiled.
 
 The core's `LineStream` and `ByteSink` frame the pipes under `Limits::line`. `BoundedTransport`
-passes frames through the SDK's [`Channel` interface](https://docs.rs/agent-client-protocol/2.1.0/agent_client_protocol/struct.Channel.html),
+passes frames through the SDK's [`Channel` interface](https://docs.rs/agent-client-protocol/3.3.0/agent_client_protocol/struct.Channel.html),
 leaving JSON-RPC parsing and routing to the official SDK. Each direction has two bounds:
 
 | Bound                      | Limit                                                                    | Unit                                | Default           |
@@ -94,7 +96,7 @@ terminal is written, `Closed`.
 The SDK's `Lines` carrier uses unbounded internal queues; its `ByteStreams` carrier also frames input
 without the host's line cap. Neither provides the budgets this harness requires.
 
-`AcpSpec::Http` exists in the core and is **not implemented**: `agent-client-protocol-http` 2.1.0 pulls
+`AcpSpec::Http` exists in the core and is **not implemented**: `agent-client-protocol-http` 3.3.0 pulls
 `aws-lc-rs` through `reqwest` 0.13's `rustls` feature and through `async-tungstenite`'s
 `tokio-rustls-webpki-roots`, and this workspace's `deny.toml` bans it — TLS is `ring` everywhere.
 Asking for it is `Error::UnsupportedTransport`.
@@ -106,7 +108,7 @@ exactly as long as its closure, and the closure is the only place a `ConnectionT
 outlives any one call, so the closure hands a clone out through a channel and parks on a shutdown
 signal, with the whole thing on one spawned task per session.
 
-This works because 2.1.0's connection is `Send`: `ConnectTo` is `Send + 'static`, its future is `Send`,
+This works because 3.3.0's connection is `Send`: `ConnectTo` is `Send + 'static`, its future is `Send`,
 and `ConnectionTo<Agent>` is `Clone + Send + Sync`. No `LocalSet` and no thread per session.
 
 Handlers leave the dispatch loop promptly:
