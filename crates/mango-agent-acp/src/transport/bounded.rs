@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
-use agent_client_protocol::{Channel, ConnectTo, TransportFrame, role::Role};
+use agent_client_protocol::{Channel, ConnectTo, ConnectionDriver, TransportFrame, role::Role};
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use mango_external_agents::Limits;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -188,13 +188,16 @@ impl<R: Role> ConnectTo<R> for BoundedTransport {
         Ok(())
     }
 
-    fn into_channel_and_future(
-        self,
-    ) -> (
-        Channel,
-        BoxFuture<'static, agent_client_protocol::Result<()>>,
-    ) {
-        self.parts()
+    /// The SDK's `connect_with` takes this path, not [`ConnectTo::connect_to`].
+    ///
+    /// The driver is the opaque kind, with no finish hook, on purpose. A hook would make the SDK
+    /// wait, without a deadline, for the physical writer to drain once its foreground returns; an
+    /// agent that stopped reading its stdin would then hold teardown until the caller's own
+    /// timeout. Without one the SDK hands its accepted output to this transport and drops the
+    /// driver, which is what SDK 2.x did with the boxed future this method used to return.
+    fn into_channel_and_future(self) -> (Channel, Option<ConnectionDriver>) {
+        let (channel, transport) = self.parts();
+        (channel, Some(ConnectionDriver::new(transport)))
     }
 }
 

@@ -34,7 +34,7 @@ required-features = ["testing"]
 [dependencies]
 # ACP v1 only: `unstable_protocol_v2` and the other draft features stay off, so the wire this
 # crate speaks is the one agentclientprotocol.com documents as stable.
-agent-client-protocol = { version = "2.1.0", default-features = false }
+agent-client-protocol = { version = "3.3.0", default-features = false }
 async-trait = "0.1.92"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }

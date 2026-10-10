@@ -622,7 +622,8 @@ impl Reducer {
                 (Vec::new(), vec![configuration_fact(update)])
             }
             // Session state rather than transcript, and the `#[non_exhaustive]` tail: an agent that
-            // sends an update from a draft feature this build did not opt into is not a failed turn.
+            // sends an update this client never advertised support for (a notice, a compaction) or
+            // one from a draft feature this build did not opt into is not a failed turn.
             SessionUpdate::UserMessageChunk(_)
             | SessionUpdate::CurrentModeUpdate(_)
             | SessionUpdate::SessionInfoUpdate(_)
@@ -972,11 +973,11 @@ fn finished(status: ToolCallStatus) -> Option<ActivityResult> {
     Some(ActivityResult::new(status))
 }
 
-/// The agent's own tool name when it sent one, its title otherwise.
+/// The call's title, as the activity's name.
 ///
-/// `ToolCall::name` is behind the crate's `unstable_tool_call_name` feature, which this crate does
-/// not enable — so on the stable v1 wire the title is all there is, and
-/// [`Activity::name`](mango_external_agents::Activity) carries it rather than being left blank.
+/// `ToolCall::name` became stable in schema 1.9 and is deliberately not read yet: every host so
+/// far has seen the title here, so [`Activity::name`](mango_external_agents::Activity) keeps
+/// carrying it until switching is decided on its own.
 fn tool_name(call: &ToolCall) -> String {
     call.title.clone()
 }
@@ -1470,6 +1471,28 @@ mod tests {
             activity.item_id.as_deref(),
             Some("call_1"),
             "expected the call id carried as the item id too"
+        );
+    }
+
+    /// Schema 1.9 made `name` a stable field. It is not carried yet, so an agent that starts
+    /// sending one changes nothing a host sees.
+    #[test]
+    fn a_tool_calls_own_name_does_not_replace_the_title_as_the_activity_name() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_1",
+            "title": "Run `cargo test`",
+            "name": "shell",
+            "kind": "execute",
+            "status": "in_progress"
+        })]);
+        let Some(EventKind::ActivityStarted { activity, .. }) = events.first() else {
+            panic!("expected a started activity | received {events:?}");
+        };
+        assert_eq!(
+            activity.name, "Run `cargo test`",
+            "expected activity name: the title | received: {:?}",
+            activity.name
         );
     }
 

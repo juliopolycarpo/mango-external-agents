@@ -61,6 +61,66 @@ async fn a_finished_direct_peer_does_not_wait_for_physical_input_eof() {
     .expect("peer completed successfully");
 }
 
+/// `connect_with` reaches the transport through `into_channel_and_future`. SDK 3.x waits there,
+/// with no deadline of its own, on any driver that offers a finish hook; SDK 2.x dropped the
+/// transport as soon as its closure returned. An agent that stopped reading stdin must not hold
+/// the SDK's teardown, so the driver stays the opaque kind.
+#[tokio::test(start_paused = true)]
+async fn a_finished_sdk_connection_does_not_wait_for_a_stalled_writer() {
+    use agent_client_protocol::schema::v1::CancelNotification;
+    use agent_client_protocol::{Agent, Client, ConnectionTo};
+
+    let sink = GatedSink::default();
+    let transport = BoundedTransport::new(
+        output(sink.clone()),
+        Box::pin(futures::stream::pending()),
+        Limits::default(),
+    );
+    let stalled = sink.entered.clone();
+    let connection =
+        Client
+            .builder()
+            .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
+                connection.send_notification(CancelNotification::new("native-1"))?;
+                stalled.cancelled().await;
+                Ok(())
+            });
+    let finished = tokio::time::timeout(Duration::from_secs(1), connection).await;
+    let received = match &finished {
+        Ok(Ok(())) => String::from("finished"),
+        Ok(Err(error)) => format!("failed: {error}"),
+        Err(_) => String::from("still waiting on the stalled writer"),
+    };
+    assert_eq!(
+        received, "finished",
+        "expected connection state: finished | received: {received}"
+    );
+    assert!(
+        sink.writes.lock().expect("writes").is_empty(),
+        "expected the gated writer to still hold its frame | received a completed write"
+    );
+}
+
+/// The driver is `Some`: this transport owns reader and writer work the SDK has to poll.
+#[tokio::test]
+async fn the_sdk_receives_an_owned_driver_without_a_finish_hook() {
+    let transport = BoundedTransport::new(
+        output(GatedSink::default()),
+        Box::pin(futures::stream::pending()),
+        Limits::default(),
+    );
+    let (_channel, driver) =
+        <BoundedTransport as ConnectTo<agent_client_protocol::Client>>::into_channel_and_future(
+            transport,
+        );
+    let finishable = driver.map(|mut driver| driver.request_finish());
+    assert_eq!(
+        finishable,
+        Some(false),
+        "expected driver: Some(no finish hook) | received: {finishable:?}"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_unread_sdk_channel_hits_the_incoming_count_budget() {
     let transport = BoundedTransport::new(

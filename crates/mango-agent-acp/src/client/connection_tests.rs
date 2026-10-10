@@ -262,6 +262,96 @@ async fn an_agent_refusal_is_kept_even_when_the_connection_has_overflowed() {
     connection.wait_shutdown().await.expect("cleanup");
 }
 
+/// Refuses every request with its own code and an explicit `"data": null`.
+struct NullDataAgent;
+
+impl NullDataAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            let frame: serde_json::Value = serde_json::from_str(line).expect("SDK JSON frame");
+            vec![
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": frame["id"],
+                    "error": {"code": -31004, "message": "no workspace", "data": null}
+                })
+                .to_string(),
+            ]
+        })
+    }
+}
+
+/// SDK 3.x hands a wire `"data": null` to the typed error as `Some(Null)`; SDK 2.x read it as no
+/// data at all. A host must keep seeing the agent's message alone, not `no workspace (null)`.
+#[tokio::test]
+async fn an_agent_error_with_null_data_reads_as_one_without_data() {
+    let (connection, _) = drive_fake_agent(NullDataAgent::process()).await;
+    let profile = crate::profile::builtin_profile("opencode").expect("opencode profile");
+    let error = send(
+        &connection,
+        &profile,
+        Duration::from_secs(5),
+        "initialize",
+        agent_client_protocol::schema::v1::InitializeRequest::new(
+            agent_client_protocol::schema::ProtocolVersion::V1,
+        ),
+    )
+    .await
+    .expect_err("expected the agent's refusal");
+    let Error::Vendor(failure) = &error else {
+        panic!("expected a vendor failure | received {error:?}");
+    };
+    assert_eq!(
+        failure.message, "no workspace",
+        "expected vendor message: \"no workspace\" | received: {:?}",
+        failure.message
+    );
+    connection.begin_shutdown(CancelReason::Shutdown);
+    connection.wait_shutdown().await.expect("cleanup");
+}
+
+/// Answers every request with `"result": null`.
+struct NullResultAgent;
+
+impl NullResultAgent {
+    fn process() -> FakeProcess {
+        FakeProcess::responding(|line| {
+            let frame: serde_json::Value = serde_json::from_str(line).expect("SDK JSON frame");
+            vec![
+                serde_json::json!({ "jsonrpc": "2.0", "id": frame["id"], "result": null })
+                    .to_string(),
+            ]
+        })
+    }
+}
+
+/// Schema 1.11 reads a null result as the empty response for the methods whose response has no
+/// required field (`session/set_mode`, `session/load`, `session/close`). Schema 1.7 failed the
+/// request instead. This pins the newer reading so a later schema cannot move it unnoticed.
+#[tokio::test]
+async fn a_null_result_reads_as_an_empty_response_where_the_schema_allows_it() {
+    let (connection, _) = drive_fake_agent(NullResultAgent::process()).await;
+    let profile = crate::profile::builtin_profile("opencode").expect("opencode profile");
+    let answered = send(
+        &connection,
+        &profile,
+        Duration::from_secs(5),
+        "session/set_mode",
+        agent_client_protocol::schema::v1::SetSessionModeRequest::new("native-1", "plan"),
+    )
+    .await;
+    let received = answered
+        .as_ref()
+        .map(|_| "accepted")
+        .map_err(ToString::to_string);
+    assert_eq!(
+        received,
+        Ok("accepted"),
+        "expected session/set_mode with a null result: accepted | received: {received:?}"
+    );
+    connection.begin_shutdown(CancelReason::Shutdown);
+    connection.wait_shutdown().await.expect("cleanup");
+}
+
 #[test]
 fn only_the_sdk_link_closure_shapes_count_as_link_closure() {
     let mut closed = agent_client_protocol::Error::internal_error();

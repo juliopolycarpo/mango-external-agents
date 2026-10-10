@@ -74,10 +74,14 @@ pub fn request_error(
 /// `data` is where an agent explains itself — which file, which command, which limit — and dropping
 /// it is what makes "internal error" the only thing anyone can say afterwards. It is rendered
 /// compactly and the core bounds and sanitises it downstream like any other vendor text.
+///
+/// An explicit `"data": null` says nothing, so it reads as no data. SDK 3.x keeps that null as
+/// `Some(Null)` where 2.x dropped it while parsing; without this arm the message would grow a
+/// `(null)` suffix.
 fn message(error: &agent_client_protocol::Error) -> String {
     match &error.data {
-        Some(data) => format!("{} ({data})", error.message),
-        None => error.message.clone(),
+        Some(data) if !data.is_null() => format!("{} ({data})", error.message),
+        _ => error.message.clone(),
     }
 }
 
@@ -118,6 +122,19 @@ mod tests {
         assert!(
             failure.message.contains("/repo/x.rs"),
             "received {:?}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn null_data_adds_nothing_to_the_message() {
+        let failure = vendor_error(
+            "session/new",
+            &AcpError::new(-31_004, "no workspace").data(serde_json::Value::Null),
+        );
+        assert_eq!(
+            failure.message, "no workspace",
+            "expected vendor message: \"no workspace\" | received: {:?}",
             failure.message
         );
     }
