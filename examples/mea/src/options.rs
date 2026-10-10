@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use mango_external_agents::{HarnessId, PermissionLevel, ProfileId, TransportKind};
@@ -21,6 +22,10 @@ struct Arguments {
     cwd: Option<PathBuf>,
     #[arg(long)]
     json: bool,
+    // Hyphen values reach `cancel_after`, so `--cancel-after -1` is refused in this file's own
+    // words, with the value it received, rather than as a flag clap does not know.
+    #[arg(long, allow_hyphen_values = true)]
+    cancel_after: Option<String>,
     prompt: Vec<String>,
 }
 
@@ -61,6 +66,8 @@ pub(crate) struct Options {
     pub transport: Option<TransportKind>,
     pub cwd: Option<PathBuf>,
     pub json: bool,
+    /// How long after a turn starts `mea turn` asks its session to cancel it, when asked to.
+    pub cancel_after: Option<Duration>,
     pub prompt: String,
 }
 
@@ -77,6 +84,7 @@ impl Options {
             transport: args.transport.as_deref().map(transport).transpose()?,
             cwd: args.cwd,
             json: args.json,
+            cancel_after: args.cancel_after.as_deref().map(cancel_after).transpose()?,
             prompt: args.prompt.join(" "),
         })
     }
@@ -107,6 +115,26 @@ fn transport(named: &str) -> Result<TransportKind, String> {
             "expected `stdio`, `websocket` or `acp`, received {other:?}"
         )),
     }
+}
+
+/// The delay this number of seconds asks for. Example: `--cancel-after 1.5`.
+///
+/// Bounded by the turn deadline: a cancel scheduled at or past it can never be sent, because the
+/// deadline ends the turn first, so a larger value is a mistake rather than a long wait.
+fn cancel_after(seconds: &str) -> Result<Duration, String> {
+    let limit = crate::turn::TURN_DEADLINE;
+    seconds
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .and_then(|value| Duration::try_from_secs_f64(value).ok())
+        .filter(|delay| *delay < limit)
+        .ok_or_else(|| {
+            format!(
+                "expected --cancel-after as seconds from 0 to below {}, such as 1.5 | received {seconds:?}",
+                limit.as_secs()
+            )
+        })
 }
 
 fn kind(harness: Option<&str>, profile: Option<&str>) -> Result<Option<HarnessChoice>, String> {
@@ -161,7 +189,60 @@ mod tests {
         assert_eq!(options.cwd, Some(PathBuf::from(".")));
         assert_eq!(options.transport, Some(TransportKind::Acp));
         assert!(options.json);
+        assert_eq!(options.cancel_after, None);
         assert_eq!(options.prompt, "hello");
+    }
+
+    #[test]
+    fn reads_the_cancel_delay_as_decimal_seconds() {
+        let args = ["--cancel-after", "1.5", "count", "slowly"].map(String::from);
+        let options = Options::parse(&args).expect("valid turn arguments");
+        assert_eq!(options.cancel_after, Some(Duration::from_millis(1500)));
+        assert_eq!(options.prompt, "count slowly");
+
+        assert_eq!(cancel_after("0").expect("zero"), Duration::ZERO);
+        assert_eq!(cancel_after("2").expect("two"), Duration::from_secs(2));
+        assert_eq!(
+            cancel_after("299.5").expect("just below the deadline"),
+            Duration::from_millis(299_500)
+        );
+    }
+
+    #[test]
+    fn refuses_a_cancel_delay_that_is_not_a_reachable_number_of_seconds() {
+        for received in [
+            "-1", "-0.5", "NaN", "inf", "soon", "", "1s", "1e400", "300", "86400",
+        ] {
+            let error = cancel_after(received).expect_err("expected the delay to be refused");
+            assert_eq!(
+                error,
+                format!(
+                    "expected --cancel-after as seconds from 0 to below 300, such as 1.5 | received {received:?}"
+                ),
+                "expected {received:?} to be refused with the value and the accepted shape"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_cancel_delay_stops_the_parse_with_its_own_message() {
+        for received in ["-1", "soon", "--json"] {
+            let args = ["--cancel-after", received, "hello"].map(String::from);
+            let error = Options::parse(&args)
+                .err()
+                .expect("expected the arguments to be refused");
+            assert!(
+                error.ends_with(&format!("| received {received:?}")),
+                "expected the refusal to name {received:?}, received {error:?}"
+            );
+        }
+        let missing = Options::parse(&[String::from("--cancel-after")])
+            .err()
+            .expect("expected a flag without a value to be refused");
+        assert!(
+            missing.contains("--cancel-after"),
+            "expected the refusal to name the flag, received {missing:?}"
+        );
     }
 
     #[test]

@@ -203,6 +203,26 @@ update rather than a second start; an empty `content` or `locations` on it leave
 alone, because `tool_call` cannot say "unchanged" any other way. A frame for a call that already
 ended is dropped: the host closed that row.
 
+A tool call carries two labels, and each has its own field on the activity. ACP's
+[`title`](https://agentclientprotocol.com/protocol/tool-calls) is "a human-readable title describing
+what the tool is doing" and becomes `Activity::title`. Its `name`, stable since schema 1.9, is "the
+optional programmatic name of the invoked tool, such as `read_file`" and becomes `Activity::name`,
+which is where the Claude and Codex harnesses put the vendor's tool name too. The same page says
+names are "opaque, informational metadata: they do not advertise a capability or grant
+authorization", and this harness treats one as a label and nothing else: it selects no tool and
+answers no permission. Both are agent-controlled text, bounded by the core when the event is
+published (`TextLimit::ActivityName` for the name, `TextLimit::Title` for the title), stripped
+before they are cut.
+
+An agent that sends no name keeps the title in both fields, as every host has seen so far. ACP
+reads an omitted name and `null` alike as "no name is provided"; a name that is empty, blank, or
+nothing but characters the core strips is treated the same way, so a host never gets an empty
+label where a title was available. A call first seen through `tool_call_update` takes its name from
+that update. A name that arrives for a call already running is not carried: `ActivityUpdate` has a
+title, a detail and content but no name, so a running activity cannot be renamed, and the name is
+never delivered in the title's place. ACP expects this to be rare: agents "SHOULD include it in the
+first report when available" and "SHOULD NOT change it later except to correct metadata".
+
 ACP ends a turn with the `session/prompt` response, not with a frame per call, so a call the agent
 never reported as `completed` or `failed` is closed by the turn's own end, before its terminal and in
 the order the agent opened its calls. It closes with the status that agrees with that terminal:
