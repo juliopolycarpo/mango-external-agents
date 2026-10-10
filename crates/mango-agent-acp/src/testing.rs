@@ -65,6 +65,8 @@ pub struct FakeAcpAgent {
     /// `session/load` answers with this error code instead of a loaded session, while the agent
     /// still advertises the capability.
     load_session_error: Option<(i32, String)>,
+    /// `session/load` answers with `"result": null` instead of a result object.
+    load_session_null: bool,
     /// Streams a turn's updates and never answers its `session/prompt`.
     never_finishes: bool,
     /// Holds each turn open after its updates and after any permission answer, ending it only
@@ -123,6 +125,7 @@ impl FakeAcpAgent {
             approval: Approval::Never,
             new_session_error: None,
             load_session_error: None,
+            load_session_null: false,
             never_finishes: false,
             stays_silent: false,
             asks_when_closing: false,
@@ -330,6 +333,23 @@ impl FakeAcpAgent {
         self
     }
 
+    /// Answers `session/load` with `"result": null` rather than a result object.
+    ///
+    /// ACP's `LoadSessionResponse` has no required field, and schema 1.11 reads a null result as
+    /// that empty response: the session loads and announces no modes or configuration options.
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    ///
+    /// let process = FakeAcpAgent::new().answering_load_with_null().process();
+    /// # drop(process);
+    /// ```
+    #[must_use]
+    pub fn answering_load_with_null(mut self) -> Self {
+        self.load_session_null = true;
+        self
+    }
+
     /// Streams these `session/update` payloads for a turn instead of the default script.
     #[must_use]
     pub fn with_updates(mut self, updates: Vec<serde_json::Value>) -> Self {
@@ -496,6 +516,7 @@ impl FakeAcpAgent {
                 };
                 lines.push(match (self.load_session, &self.load_session_error) {
                     (true, Some((code, message))) => error(id, *code, message),
+                    (true, None) if self.load_session_null => result(id, serde_json::Value::Null),
                     (true, None) => self.load_session_result(id, config_options),
                     (false, _) => error(id, -32601, "method not found"),
                 });

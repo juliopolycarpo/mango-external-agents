@@ -38,8 +38,9 @@ down would mean sending v1 messages to an agent that answered something else.
 `TransportKind::Acp` only, through `AcpSpec::ChildPipes`. The host's `ProcessLauncher` spawns the
 agent and the library receives the pipes; the SDK's own `AcpAgent` and `Stdio` carriers are unusable
 here because the first spawns the agent itself and the second takes over this process's stdio.
-Since SDK 3.0 both sit behind its `process` and `stdio` Cargo features, which this crate leaves off
-along with `schemars`, so neither they nor their async-io dependencies are compiled.
+Since SDK 3.0 both sit behind its `process` and `stdio` Cargo features
+([rust-sdk#397](https://github.com/agentclientprotocol/rust-sdk/pull/397)), which this crate leaves
+off along with `schemars`, so neither they nor their async-io dependencies are compiled.
 
 The core's `LineStream` and `ByteSink` frame the pipes under `Limits::line`. `BoundedTransport`
 passes frames through the SDK's [`Channel` interface](https://docs.rs/agent-client-protocol/3.3.0/agent_client_protocol/struct.Channel.html),
@@ -307,6 +308,13 @@ contributes only its session facts (the command catalog and the configuration ca
 to reset. `current_mode_update` produces no fact on either path. A frame the client read for a turn
 that has since claimed its terminal is treated the same way, so it cannot leave a call open in the
 reducer of the turn that replaced it.
+
+A `session/load` answered with `"result": null` resumes the session with no modes and no
+configuration options: `LoadSessionResponse` has no required field, and the schema crate reads a
+null result as that empty response by 1.9.1, which the SDK moved to in 2.2.0
+([rust-sdk#366](https://github.com/agentclientprotocol/rust-sdk/pull/366)). SDK 2.1.0, on schema
+1.7.0, failed the same reply, which a strict resume reported as a vendor failure. `session/set_mode`
+and `session/close` read a null result the same way.
 
 ## Permissions
 

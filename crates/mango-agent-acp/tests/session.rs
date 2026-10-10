@@ -3787,6 +3787,44 @@ async fn opening_a_loaded_session_keeps_a_newer_catalog_notification() {
         .expect("expected cleanup");
 }
 
+/// ACP's `LoadSessionResponse` has no required field, and schema 1.11 reads `"result": null` as
+/// that empty response. Under schema 1.7 the same reply failed the resume. The newer reading is
+/// the schema's own, so it is pinned here rather than undone.
+#[tokio::test]
+async fn a_null_session_load_result_resumes_with_no_modes_or_options() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .with_modes(["plan", "build"])
+            .with_config_options(vec![InterleavingConfigAgent::model_option("small")])
+            .answering_load_with_null()
+            .process(),
+    );
+    let opened = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("null-load").resuming("resumed-session", ResumeMode::Strict),
+        )
+        .await;
+    let session = match opened {
+        Ok(session) => session,
+        Err(error) => panic!(
+            "expected session/load with a null result: resumed, no options | received: {error}"
+        ),
+    };
+    let snapshot = session.snapshot();
+    let received = (snapshot.resumed, snapshot.catalog.options().len());
+    assert_eq!(
+        received,
+        (true, 0),
+        "expected (resumed, catalog options): (true, 0) | received: {received:?}"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected cleanup");
+}
+
 /// A configuration request begun after close is refused before ACP receives an option change.
 #[tokio::test]
 async fn a_configuration_request_after_close_is_not_submitted() {
