@@ -172,6 +172,17 @@ ended, `request` returns `Error::Closed` and `notify` returns `Ok(())` having wr
 one that read the connection as open an instant before it ended reaches the link, which answers it
 (a closed link refuses the write, and the call returns that refusal).
 
+Two ends of a connection stop the handler's task without draining its queue: the peer passing an
+inbound budget, and `Client::close`. By default a call to `PeerHandler::on_notification` that is
+in progress then is cancelled at the await it had reached. A handler that holds something across
+an await returns `true` from `PeerHandler::finishes_notification_in_progress`, and the call in
+progress gets up to `shutdown_timeout` to return before it is cancelled. Nothing still queued
+once the end has been noticed is started or delivered either way, `on_terminated` still comes after the handler's task
+has stopped, and a close waits for the call while it waits for the answers it owes the peer, so
+its bound of twice `shutdown_timeout` stands. Dropping the `Client` cannot wait and cancels the
+call. The other ends (the peer's exit, a failed link, this side's outbound budget) drain the queue
+within `shutdown_timeout`, as before, for every handler.
+
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
 individually), and `turn_buffer_bytes` serialized incoming bytes. Outgoing frames and the writer
