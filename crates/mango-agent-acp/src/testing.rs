@@ -101,6 +101,8 @@ pub struct FakeAcpAgent {
     load_replay: Vec<serde_json::Value>,
     /// Lines written verbatim during a turn, each after this many of the turn's update lines.
     mid_turn_lines: Vec<(usize, String)>,
+    /// Sends a turn's updates and the `session/prompt` response as one JSON-RPC batch line.
+    batch_response: bool,
 }
 
 impl Default for FakeAcpAgent {
@@ -165,6 +167,7 @@ impl FakeAcpAgent {
             capabilities_override: None,
             load_replay: Vec::new(),
             mid_turn_lines: Vec::new(),
+            batch_response: false,
         }
     }
 
@@ -392,6 +395,30 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn writing_mid_turn(mut self, after_updates: usize, line: impl Into<String>) -> Self {
         self.mid_turn_lines.push((after_updates, line.into()));
+        self
+    }
+
+    /// Sends a turn's `session/update` notifications and the `session/prompt` response that ends
+    /// it as one JSON-RPC batch line, the response last.
+    ///
+    /// Models an agent that flushes a whole short turn in one frame: the client has to process
+    /// the batch member by member, or the turn ends ahead of updates that came before its end.
+    /// It applies to a turn this fake answers on its own, so it has no effect together with an
+    /// approval, [`never_finishing_turns`](Self::never_finishing_turns) or
+    /// [`staying_silent`](Self::staying_silent). Lines from
+    /// [`writing_mid_turn`](Self::writing_mid_turn) stay lines of their own, ahead of the batch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    /// let _process = FakeAcpAgent::new()
+    ///     .batching_the_response_with_updates()
+    ///     .process();
+    /// ```
+    #[must_use]
+    pub fn batching_the_response_with_updates(mut self) -> Self {
+        self.batch_response = true;
         self
     }
 
@@ -693,8 +720,41 @@ impl FakeAcpAgent {
         }))
     }
 
+    /// The whole turn as one batch line, when this fake was asked for one and ends the turn itself.
+    fn batched_turn(&self, id: &serde_json::Value) -> Option<Vec<String>> {
+        let answers_alone =
+            self.approval == Approval::Never && !self.never_finishes && !self.stays_silent;
+        if !self.batch_response || !answers_alone {
+            return None;
+        }
+        let mut members: Vec<String> = self
+            .updates
+            .iter()
+            .map(|update| {
+                notification(
+                    "session/update",
+                    serde_json::json!({ "sessionId": "sess_fake", "update": update }),
+                )
+            })
+            .collect();
+        members.push(result(
+            id.clone(),
+            serde_json::json!({ "stopReason": self.stop_reason }),
+        ));
+        let mut lines: Vec<String> = self
+            .mid_turn_lines
+            .iter()
+            .map(|(_, line)| line.clone())
+            .collect();
+        lines.push(format!("[{}]", members.join(",")));
+        Some(lines)
+    }
+
     /// The updates for one turn, then either a permission request or the turn's end.
     fn prompt(&self, id: serde_json::Value, pending: &Arc<Mutex<PendingTurn>>) -> Vec<String> {
+        if let Some(lines) = self.batched_turn(&id) {
+            return lines;
+        }
         let mut lines: Vec<String> = self
             .updates
             .iter()
@@ -1034,6 +1094,50 @@ mod tests {
             kinds,
             ["update", "raw", "update", "end"],
             "expected lines: [update, raw, update, end] | received: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn batching_the_response_puts_the_updates_and_the_turns_end_in_one_line() {
+        let pending = std::sync::Arc::default();
+        let lines = FakeAcpAgent::new()
+            .writing_mid_turn(1, "raw")
+            .batching_the_response_with_updates()
+            .prompt(serde_json::json!(7), &pending);
+        let batch: Vec<serde_json::Value> = lines
+            .last()
+            .and_then(|line| serde_json::from_str(line).ok())
+            .unwrap_or_default();
+        let shape: Vec<&str> = batch
+            .iter()
+            .map(|member| match member.get("method") {
+                Some(_) => "update",
+                None if member["id"] == 7 && member["result"]["stopReason"] == "end_turn" => "end",
+                None => "other",
+            })
+            .collect();
+        assert_eq!(
+            (lines.len(), lines[0].as_str(), shape.as_slice()),
+            (
+                2,
+                "raw",
+                &["update", "update", "update", "update", "update", "end"][..]
+            ),
+            "expected [raw, one batch of five updates then the end] | received: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn batching_the_response_leaves_a_turn_the_fake_does_not_end_alone_unbatched() {
+        let kinds = prompt_line_kinds(
+            FakeAcpAgent::new()
+                .never_finishing_turns()
+                .batching_the_response_with_updates(),
+        );
+        assert_eq!(
+            kinds,
+            ["update", "update"],
+            "expected lines: [update, update] | received: {kinds:?}"
         );
     }
 
