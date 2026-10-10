@@ -1,7 +1,10 @@
 //! Owned messages on their way through the JSON-RPC client and the stdio link.
 //!
 //! `dispatch/*` feeds prebuilt frames to a [`Client`] and waits for the peer to end, so the timed
-//! part is parsing and routing (including the hand-off to the handler). `stdio-send/*` writes
+//! part is parsing and routing (including the hand-off to the handler). `client/*` sends through
+//! a [`Client`]: notifications into a sink that discards, and requests against a peer that
+//! answers each one as it is written, so the timed part is building the frame, its turn at the
+//! link, the write and, for a request, the answer finding its caller. `stdio-send/*` writes
 //! prebuilt messages through the link a stdio transport returns, into a sink that discards, and
 //! times each send from the call to the end of its write: the link frees the message it was handed
 //! after that, and what a free costs belongs to the allocator, not to the send. Frames and
@@ -158,6 +161,97 @@ fn dispatch(rt: &tokio::runtime::Runtime, frames: VecDeque<String>, expected: us
             seen, expected,
             "expected {expected} notifications handled, received {seen}"
         );
+        drop(client);
+    });
+}
+
+/// A peer that never says anything and never goes away.
+struct SilentSource;
+
+#[async_trait::async_trait]
+impl LinkReceiver for SilentSource {
+    async fn recv(&mut self) -> Result<Option<String>> {
+        std::future::pending().await
+    }
+}
+
+/// Sends `params` as notifications, one after another, each awaited to its write.
+fn client_notify(rt: &tokio::runtime::Runtime, params: Vec<Value>) {
+    rt.block_on(async {
+        let link = Link::new(Box::new(DiscardSender), Box::new(SilentSource));
+        let client = Client::connect(
+            link,
+            Arc::new(CountingHandler::default()),
+            ClientOptions::new("bench peer"),
+        );
+        for params in params {
+            client
+                .notify("item/agentMessage/delta", params)
+                .await
+                .expect("expected the notification written");
+        }
+        drop(client);
+    });
+}
+
+/// Answers every request the moment it is written, with the id a client counts its requests by.
+struct AnsweringSender {
+    answers: tokio::sync::mpsc::UnboundedSender<String>,
+    written: u64,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::LinkSender for AnsweringSender {
+    async fn send(&mut self, _message: String) -> Result<()> {
+        self.written += 1;
+        let answer = format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","result":null}}"#,
+            self.written
+        );
+        let _ = self.answers.send(answer);
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct AnswerSource(tokio::sync::mpsc::UnboundedReceiver<String>);
+
+#[async_trait::async_trait]
+impl LinkReceiver for AnswerSource {
+    async fn recv(&mut self) -> Result<Option<String>> {
+        Ok(self.0.recv().await)
+    }
+}
+
+/// Makes one request per `params`, each awaited to its answer before the next.
+fn client_request(rt: &tokio::runtime::Runtime, params: Vec<Value>) {
+    rt.block_on(async {
+        let (answers, incoming) = tokio::sync::mpsc::unbounded_channel();
+        let link = Link::new(
+            Box::new(AnsweringSender {
+                answers,
+                written: 0,
+            }),
+            Box::new(AnswerSource(incoming)),
+        );
+        let client = Client::connect(
+            link,
+            Arc::new(CountingHandler::default()),
+            ClientOptions::new("bench peer"),
+        );
+        for params in params {
+            let answer: Value = client
+                .request("thread/read", params)
+                .await
+                .expect("expected the request answered");
+            assert!(
+                answer.is_null(),
+                "expected a null result, received {answer}"
+            );
+        }
         drop(client);
     });
 }
@@ -356,6 +450,26 @@ fn main() {
         Unit::new(DELTAS as u64, "frame"),
         frames(error_response, DELTAS),
         |queue| dispatch(&rt, queue, 0),
+    );
+
+    let params = |count: usize| {
+        move || {
+            (0..count)
+                .map(|_| json!({"threadId": "thread-1", "turnId": "turn-1", "delta": text(KIB)}))
+                .collect::<Vec<Value>>()
+        }
+    };
+    bench.run(
+        "client/notify-1KiB",
+        Unit::new(DELTAS as u64, "frame"),
+        params(DELTAS),
+        |batch| client_notify(&rt, batch),
+    );
+    bench.run(
+        "client/request-1KiB",
+        Unit::new(DELTAS as u64, "request"),
+        params(DELTAS),
+        |batch| client_request(&rt, batch),
     );
 
     // Built the way the client builds a request (`Value::to_string`), so the spare capacity a

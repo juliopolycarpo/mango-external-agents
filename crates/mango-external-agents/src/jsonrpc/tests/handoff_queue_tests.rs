@@ -146,9 +146,12 @@ async fn a_response_delivered_between_the_admission_reads_does_not_end_the_conne
     assert!(
         matches!(
             refused,
-            Err(PeerTermination::NotificationBackpressure { limit: 2 })
+            Err(PeerTermination::NotificationBackpressure {
+                limit: 2,
+                received: 3
+            })
         ),
-        "expected the third notification past the limit of two refused: NotificationBackpressure {{ limit: 2 }} | received {refused:?}"
+        "expected the third notification past the limit of two refused: NotificationBackpressure {{ limit: 2, received: 3 }} | received {refused:?}"
     );
 }
 
@@ -172,9 +175,12 @@ async fn a_queued_response_leaves_the_notification_limit_where_it_was() {
     assert!(
         matches!(
             refused,
-            Err(PeerTermination::NotificationBackpressure { limit: 2 })
+            Err(PeerTermination::NotificationBackpressure {
+                limit: 2,
+                received: 3
+            })
         ),
-        "expected the third notification refused: NotificationBackpressure {{ limit: 2 }} | received {refused:?}"
+        "expected the third notification refused: NotificationBackpressure {{ limit: 2, received: 3 }} | received {refused:?}"
     );
     bench.prompt.abort();
 }

@@ -13,10 +13,15 @@
 //! Framing, byte caps and process teardown all belong to the transport underneath; this speaks the
 //! protocol on top of them.
 
+mod outbox;
+
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, OnceLock, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -28,6 +33,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::error::{Error, ErrorCode, Result, VendorError, jsonrpc_code_is_retryable};
 use crate::host::{CancelToken, Limits};
 use crate::link::{Link, LinkSender};
+use crate::operation::Dispatch;
+
+pub use outbox::{WireOptions, Written};
 
 /// One request's id, exactly as it arrived.
 ///
@@ -141,7 +149,11 @@ impl std::fmt::Debug for ServerRequestOutcome {
 }
 
 /// Why the connection ended without this client closing it first.
+///
+/// More reasons may be added, and the reasons that carry numbers may carry more of them, so a
+/// `match` on this needs a wildcard arm and a pattern on one of those needs `..`.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PeerTermination {
     /// The peer closed its output.
     Exited,
@@ -150,14 +162,31 @@ pub enum PeerTermination {
     /// possibly half on the wire.
     LinkFailed(String),
     /// Peer work filled the bounded handoff queue before the handler could consume it.
+    #[non_exhaustive]
     NotificationByteBackpressure {
         /// The encoded byte budget for queued and in-flight peer callbacks.
         limit: usize,
+        /// The encoded bytes of the frame the budget had no room left for.
+        received: usize,
     },
     /// The event-count handoff budget was exhausted.
+    #[non_exhaustive]
     NotificationBackpressure {
         /// The number of peer messages the client can retain while the handler is busy.
         limit: usize,
+        /// How many there were with the message that did not fit.
+        received: usize,
+    },
+    /// This side queued more for the peer than [`WireOptions`] allows it to hold, which is a peer
+    /// that has stopped reading.
+    #[non_exhaustive]
+    OutboundBackpressure {
+        /// What was counted, unit included, as in [`Error::LimitExceeded`].
+        subject: &'static str,
+        /// The bound that was passed.
+        limit: usize,
+        /// What the queue would have held with the frame that did not fit.
+        received: usize,
     },
 }
 
@@ -170,13 +199,25 @@ impl std::fmt::Debug for PeerTermination {
                 .debug_struct("LinkFailed")
                 .field("message_bytes", &error.len())
                 .finish(),
-            Self::NotificationByteBackpressure { limit } => formatter
+            Self::NotificationByteBackpressure { limit, received } => formatter
                 .debug_struct("NotificationByteBackpressure")
                 .field("limit", limit)
+                .field("received", received)
                 .finish(),
-            Self::NotificationBackpressure { limit } => formatter
+            Self::NotificationBackpressure { limit, received } => formatter
                 .debug_struct("NotificationBackpressure")
                 .field("limit", limit)
+                .field("received", received)
+                .finish(),
+            Self::OutboundBackpressure {
+                subject,
+                limit,
+                received,
+            } => formatter
+                .debug_struct("OutboundBackpressure")
+                .field("subject", subject)
+                .field("limit", limit)
+                .field("received", received)
                 .finish(),
         }
     }
@@ -191,13 +232,21 @@ impl std::fmt::Display for PeerTermination {
                 "the peer link failed with an unstructured error ({} bytes)",
                 error.len()
             ),
-            Self::NotificationByteBackpressure { limit } => write!(
+            Self::NotificationByteBackpressure { limit, .. } => write!(
                 formatter,
                 "the peer exceeded the queued callback payload budget ({limit} bytes)"
             ),
-            Self::NotificationBackpressure { limit } => write!(
+            Self::NotificationBackpressure { limit, .. } => write!(
                 formatter,
                 "the peer sent more messages than the client could retain while its handler was busy (limit {limit})"
+            ),
+            Self::OutboundBackpressure {
+                subject,
+                limit,
+                received,
+            } => write!(
+                formatter,
+                "the peer stopped reading: expected at most {limit} {subject}, received {received}"
             ),
         }
     }
@@ -637,9 +686,32 @@ impl Drop for QueuedAnswer {
     }
 }
 
+/// A request queued without waiting, on its way to the calls awaiting an answer.
+///
+/// That map sits behind a lock a synchronous caller cannot wait for, so the entry travels with
+/// the request's frame and the writer enters it just before the frame goes out.
+struct Registration {
+    id: String,
+    answer: oneshot::Sender<Answer>,
+    delivery: Delivery,
+}
+
 struct ClientState {
-    sender: Mutex<Box<dyn LinkSender>>,
+    /// The link's sending half. Held for one frame at a time, in the order the outbox decides,
+    /// and by `close`.
+    sender: Arc<Mutex<Box<dyn LinkSender>>>,
     pending: Mutex<HashMap<String, PendingAnswer>>,
+    /// Where every outgoing frame, or its writer's turn, is queued. See [`outbox`].
+    outbox: outbox::Outbox,
+    /// Takes the outbox's task down with the client. Its join handle is not kept: nothing waits
+    /// for it.
+    writer_abort: OnceLock<tokio::task::AbortHandle>,
+    /// The typed reason, when what ended the connection was this side's own outbound budget.
+    outbound_overflow: StdMutex<Option<PeerTermination>>,
+    /// Runs once when the writer has taken a queued frame and before it sends, so a test can
+    /// place a caller's withdrawal exactly there.
+    #[cfg(test)]
+    after_write_began: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The connection's runtime also owns cleanup when a request is dropped on another thread.
     runtime: tokio::runtime::Handle,
     options: ClientOptions,
@@ -691,8 +763,8 @@ struct ClientState {
 /// A send dropped mid-frame, by its own write deadline, by a caller's shorter deadline or because
 /// the caller dropped the future, may have put half a frame on the wire, and every later frame
 /// would follow it. Whatever dropped it, this is the one place that notices, so the pump is
-/// told. A completed transport failure is handled by `write_marking` instead; local refusals do
-/// not damage the link.
+/// told. A completed transport failure is handled where the frame is written instead; local
+/// refusals do not damage the link.
 struct MidSend<'a> {
     state: &'a ClientState,
     finished: bool,
@@ -748,13 +820,211 @@ impl Drop for PendingCall {
     }
 }
 
+/// A request queued with [`Client::submit_request`].
+///
+/// The frame is already in the queue, behind every frame queued before it, by the time this
+/// exists. It splits into the two things a caller can wait for: the frame's write, and the
+/// peer's answer.
+///
+/// ```no_run
+/// # async fn example(client: &mango_external_agents::jsonrpc::Client) -> mango_external_agents::Result<()> {
+/// use mango_external_agents::jsonrpc::RequestOptions;
+///
+/// let submitted =
+///     client.submit_request("session/prompt", serde_json::json!({}), RequestOptions::new())?;
+/// let (written, reply) = submitted.into_parts();
+/// written.await?;
+/// let _answer = reply.await?;
+/// # Ok(())
+/// # }
+/// ```
+#[must_use = "dropping this gives the request up, and takes it out of the queue if it is still there"]
+pub struct SubmittedRequest {
+    id: RequestId,
+    written: Written,
+    reply: Reply,
+}
+
+impl std::fmt::Debug for SubmittedRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubmittedRequest")
+            .field("frame_bytes", &self.written.frame_bytes())
+            .field("write_started", &self.written.started())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SubmittedRequest {
+    /// The id the request went out under, for a caller that names the request to the peer later.
+    ///
+    /// ```no_run
+    /// # fn example(client: &mango_external_agents::jsonrpc::Client) -> mango_external_agents::Result<()> {
+    /// # use mango_external_agents::jsonrpc::RequestOptions;
+    /// let submitted = client.submit_request("ping", serde_json::json!({}), RequestOptions::new())?;
+    /// let _id = submitted.id().as_json();
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn id(&self) -> &RequestId {
+        &self.id
+    }
+
+    /// The size of the request frame as it was queued, in encoded bytes.
+    ///
+    /// ```no_run
+    /// # fn example(client: &mango_external_agents::jsonrpc::Client) -> mango_external_agents::Result<()> {
+    /// # use mango_external_agents::jsonrpc::RequestOptions;
+    /// let submitted = client.submit_request("ping", serde_json::json!({}), RequestOptions::new())?;
+    /// assert!(submitted.frame_bytes() > 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn frame_bytes(&self) -> usize {
+        self.written.frame_bytes()
+    }
+
+    /// Whether the write of the request frame has begun. See [`Written::started`].
+    ///
+    /// ```no_run
+    /// # fn example(client: &mango_external_agents::jsonrpc::Client) -> mango_external_agents::Result<()> {
+    /// # use mango_external_agents::jsonrpc::RequestOptions;
+    /// let submitted = client.submit_request("ping", serde_json::json!({}), RequestOptions::new())?;
+    /// let _possibly_delivered = submitted.write_started();
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn write_started(&self) -> bool {
+        self.written.started()
+    }
+
+    /// The write of the frame, and the peer's answer, to be waited for apart.
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mango_external_agents::jsonrpc::Client) -> mango_external_agents::Result<()> {
+    /// # use mango_external_agents::jsonrpc::RequestOptions;
+    /// let (written, reply) = client
+    ///     .submit_request("ping", serde_json::json!({}), RequestOptions::new())?
+    ///     .into_parts();
+    /// written.await?;
+    /// let _pong = reply.await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn into_parts(self) -> (Written, Reply) {
+        (self.written, self.reply)
+    }
+}
+
+/// The peer's answer to a request queued with [`Client::submit_request`].
+///
+/// Resolves as [`Client::request`] returns, with the result still as JSON: the answer, the
+/// peer's own error, or what ended the wait on this side. The deadline the request asked for is
+/// counted from when it was queued.
+///
+/// Dropping it gives the call up. If the request frame is still queued it is taken out and never
+/// written; if its write has begun it is left to finish and the answer, when it comes, is
+/// dropped. A request whose frame could not be written fails here as well; the reason is what
+/// its [`Written`] resolves to.
+///
+/// ```no_run
+/// # async fn example(client: &mango_external_agents::jsonrpc::Client) -> mango_external_agents::Result<()> {
+/// # use mango_external_agents::jsonrpc::RequestOptions;
+/// let (_written, reply) = client
+///     .submit_request("ping", serde_json::json!({}), RequestOptions::new())?
+///     .into_parts();
+/// let _pong: serde_json::Value = reply.await?;
+/// # Ok(())
+/// # }
+/// ```
+#[must_use = "dropping this gives the request up, and takes it out of the queue if it is still there"]
+pub struct Reply {
+    state: Arc<ClientState>,
+    waiting: oneshot::Receiver<Answer>,
+    /// When the wait for the answer is over, counted from when the request was queued.
+    deadline: tokio::time::Instant,
+    /// The timer for that, made on the first poll: a request may be queued from a thread that
+    /// has no runtime to make one on.
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    timeout: Duration,
+    ctl: Arc<outbox::FrameCtl>,
+    /// Takes the call back out from among those awaiting an answer when this is dropped.
+    pending: PendingCall,
+}
+
+impl std::fmt::Debug for Reply {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Reply")
+            .field("write_started", &self.ctl.began())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Future for Reply {
+    type Output = Result<Value>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Poll::Ready(answered) = Pin::new(&mut self.waiting).poll(cx) {
+            return Poll::Ready(self.state.answered(answered, &self.pending.id));
+        }
+        let deadline = self.deadline;
+        let timer = self
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        if timer.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        Poll::Ready(Err(Error::Timeout {
+            operation: String::from("a JSON-RPC request"),
+            after: self.timeout,
+        }))
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        // Nobody will hear the answer, so a frame the writer has not taken is not sent at all.
+        // One it has taken is left alone: cutting a write off is what breaks a link.
+        self.ctl.withdraw();
+    }
+}
+
 impl Client {
     /// Starts speaking, pumping the link on a task of its own.
     ///
     /// The pump stops when the peer goes away, when [`Client::close`] is called, or when the
     /// client is dropped.
     pub fn connect(link: Link, handler: Arc<dyn PeerHandler>, options: ClientOptions) -> Self {
+        Self::connect_with(link, handler, options, WireOptions::default())
+    }
+
+    /// Starts speaking as [`Client::connect`] does, under bounds on what is held for the peer.
+    ///
+    /// ```no_run
+    /// # fn example(
+    /// #     link: mango_external_agents::Link,
+    /// #     handler: std::sync::Arc<dyn mango_external_agents::jsonrpc::PeerHandler>,
+    /// # ) {
+    /// use mango_external_agents::jsonrpc::{Client, ClientOptions, WireOptions};
+    ///
+    /// let wire = WireOptions::new()
+    ///     .with_max_outbound_frame_bytes(1024 * 1024)
+    ///     .with_max_outbound_queued_bytes(8 * 1024 * 1024);
+    /// let _client = Client::connect_with(link, handler, ClientOptions::new("ACP agent"), wire);
+    /// # }
+    /// ```
+    pub fn connect_with(
+        link: Link,
+        handler: Arc<dyn PeerHandler>,
+        options: ClientOptions,
+        wire: WireOptions,
+    ) -> Self {
         let (sender, receiver) = link.split();
+        let (outbox, entries) = outbox::Outbox::new(wire);
         // `mpsc::channel` panics above `Semaphore::MAX_PERMITS`, and a host may set a huge count
         // to mean "no cap".
         let notification_capacity = options
@@ -770,8 +1040,13 @@ impl Client {
             options.max_pending_bytes.min(Semaphore::MAX_PERMITS),
         ));
         let state = Arc::new(ClientState {
-            sender: Mutex::new(sender),
+            sender: Arc::new(Mutex::new(sender)),
             pending: Mutex::new(HashMap::new()),
+            outbox,
+            writer_abort: OnceLock::new(),
+            outbound_overflow: StdMutex::new(None),
+            #[cfg(test)]
+            after_write_began: StdMutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
@@ -791,6 +1066,8 @@ impl Client {
             queued_answers: AtomicUsize::new(0),
             ordered_places: Arc::new(Semaphore::new(ordered_capacity)),
         });
+        let writer = tokio::spawn(outbox::run(Arc::clone(&state), entries));
+        let _ = state.writer_abort.set(writer.abort_handle());
         let (notifications, notification_receiver) = mpsc::channel(queue_capacity);
         let worker = tokio::spawn(peer_work_pump(
             Arc::clone(&state),
@@ -973,6 +1250,136 @@ impl Client {
         self.state.write(frame).await
     }
 
+    /// Queues a request without waiting, and returns what to wait for.
+    ///
+    /// Synchronous on purpose. The frame is admitted and placed in the one queue every outgoing
+    /// frame goes through before this returns, so frames reach the wire in the order their
+    /// callers made these calls: a caller that holds its own lock across a request and the
+    /// notification that must follow it (a prompt, then its cancel) gets that order on the wire.
+    /// [`Client::request`] and [`Client::notify`] take their turn in the same queue.
+    ///
+    /// Nothing here waits for the peer, so nothing slows a caller down but the bounds in
+    /// [`WireOptions`]: with the default, which bounds nothing, a caller that queues faster than
+    /// the peer reads holds every frame it queued.
+    ///
+    /// # Errors
+    ///
+    /// Refused here, with nothing queued: [`Error::Closed`]; [`Error::LimitExceeded`] for the
+    /// ordered-response reserve; [`Error::HostConfiguration`] for an ordered request from inside
+    /// `on_notification`; [`Error::Protocol`] for params that do not serialise;
+    /// [`Error::LimitExceeded`] with [`Dispatch::NotSubmitted`]
+    /// when the frame is larger than [`WireOptions::with_max_outbound_frame_bytes`] allows, which
+    /// refuses this call alone, or when the queue's own bounds are passed, which also ends the
+    /// connection; and [`Error::Link`] when an earlier write left the link unusable.
+    ///
+    /// [`ClientOptions::max_pending_requests`] is applied when the frame's turn to be written
+    /// comes, not here: a request past it is not written, its [`Written`] resolves to that
+    /// [`Error::LimitExceeded`], and its [`Reply`] fails.
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mango_external_agents::jsonrpc::Client) -> mango_external_agents::Result<()> {
+    /// use mango_external_agents::jsonrpc::RequestOptions;
+    ///
+    /// // Both are queued, in this order, before either is written.
+    /// let prompt =
+    ///     client.submit_request("session/prompt", serde_json::json!({}), RequestOptions::new())?;
+    /// let cancel = client.submit_notification("session/cancel", serde_json::json!({}))?;
+    /// let (written, reply) = prompt.into_parts();
+    /// written.await?;
+    /// cancel.await?;
+    /// let _stopped = reply.await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn submit_request<P>(
+        &self,
+        method: &str,
+        params: P,
+        options: RequestOptions,
+    ) -> Result<SubmittedRequest>
+    where
+        P: Serialize,
+    {
+        if self.is_closed() {
+            return Err(Error::Closed { subject: "link" });
+        }
+        let ordered = options.after_earlier_notifications;
+        if ordered && self.state.handling_own_notification() {
+            return Err(reentrant_ordered_request());
+        }
+        let timeout = match options.deadline {
+            RequestDeadline::Connection => self.state.options.request_timeout,
+            RequestDeadline::After(timeout) => timeout,
+        };
+        let id = self
+            .state
+            .next_id
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        let frame = self
+            .state
+            .frame(Some(Value::String(id.clone())), method, params)?;
+        let delivery = if ordered {
+            Delivery::Ordered(self.state.ordered_place()?)
+        } else {
+            Delivery::Immediate
+        };
+        let (answer, waiting) = oneshot::channel();
+        let registration = Registration {
+            id: id.clone(),
+            answer,
+            delivery,
+        };
+        let ticket = self.state.enqueue(frame, Some(registration))?;
+        let ctl = Arc::clone(&ticket.ctl);
+        Ok(SubmittedRequest {
+            id: RequestId::new(Value::String(id.clone())),
+            written: Written::new(ticket, self.state.options.peer_name.clone()),
+            reply: Reply {
+                state: Arc::clone(&self.state),
+                waiting,
+                deadline: deadline_after(timeout),
+                timer: None,
+                timeout,
+                ctl,
+                pending: PendingCall {
+                    state: Arc::clone(&self.state),
+                    id,
+                },
+            },
+        })
+    }
+
+    /// Queues a notification without waiting, and returns its write to wait for.
+    ///
+    /// The synchronous counterpart of [`Client::notify`], with the ordering
+    /// [`Client::submit_request`] describes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Closed`] on a closed client, where [`Client::notify`] drops the notification
+    /// silently: a caller that queues has asked what became of the frame. Otherwise the
+    /// serialisation, size and link refusals of [`Client::submit_request`].
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mango_external_agents::jsonrpc::Client) -> mango_external_agents::Result<()> {
+    /// let written = client.submit_notification("session/cancel", serde_json::json!({}))?;
+    /// written.await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn submit_notification<P>(&self, method: &str, params: P) -> Result<Written>
+    where
+        P: Serialize,
+    {
+        if self.is_closed() {
+            return Err(Error::Closed { subject: "link" });
+        }
+        let frame = self.state.frame(None, method, params)?;
+        let ticket = self.state.enqueue(frame, None)?;
+        Ok(Written::new(ticket, self.state.options.peer_name.clone()))
+    }
+
     /// Stops the pump, fails every call still waiting, and closes this side of the link.
     ///
     /// The process or socket underneath is the caller's to reap: this client did not open it.
@@ -985,9 +1392,10 @@ impl Client {
         // Stored before the drain rather than inside it, and that order is the contract `call`
         // reads: a caller that finds the map open has, by that fact, arrived before this store,
         // and the drain below cannot run until that caller's entry is in the map.
+        // The cause goes on record first, so whoever sees the flag finds the cause with it.
+        let failure = self.state.ended_with(self.state.closed_error());
         self.state.closed.store(true, Ordering::Release);
         self.state.shutdown.cancel();
-        let failure = self.state.ended_with(self.state.closed_error());
         self.state.fail_pending(failure).await;
         self.state.stop_notifications().await;
         // The peer's own questions are answered on tasks of their own, and one waiting for a
@@ -998,12 +1406,23 @@ impl Client {
         self.state.drain_in_flight().await;
 
         let closed = tokio::time::timeout(self.state.options.shutdown_timeout, async {
+            // Behind whatever is already queued, as a close has always waited its turn behind
+            // the writes ahead of it: a frame queued before the close is written before the link
+            // goes, or the close runs out of its grace waiting.
+            if let Some(flushed) = self.state.outbox.barrier() {
+                let _ = flushed.await;
+            }
             self.state.sender.lock().await.close().await
         })
         .await
-        .map_err(|_| Error::Timeout {
-            operation: String::from("JSON-RPC link shutdown"),
-            after: self.state.options.shutdown_timeout,
+        .map_err(|_| {
+            // The link was not closed, and frames may still be queued behind the write that
+            // would not finish. None of them is to be written after a close that gave up.
+            self.state.link_poisoned.store(true, Ordering::Release);
+            Error::Timeout {
+                operation: String::from("JSON-RPC link shutdown"),
+                after: self.state.options.shutdown_timeout,
+            }
         })
         .and_then(std::convert::identity);
         if let Some(pump) = self.pump.lock().await.take() {
@@ -1044,12 +1463,7 @@ impl Client {
         // from inside that call, it would wait for the call to return while the call waits for
         // it. Refused before the frame exists, so the peer is never left running the request.
         if ordered && self.state.handling_own_notification() {
-            return Err(Error::HostConfiguration {
-                expected: "an ordered JSON-RPC request made outside this client's notification handler",
-                received: String::from(
-                    "one made inside on_notification, whose return its answer would wait for",
-                ),
-            });
+            return Err(reentrant_ordered_request());
         }
         let id = self
             .state
@@ -1104,15 +1518,7 @@ impl Client {
         }
 
         match tokio::time::timeout(timeout, waiting).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(failure))) => Err(Error::Vendor(failure.into_vendor_error(
-                ErrorCode::new(format!("{}-call-failed", self.state.options.code_prefix)),
-                Some(id),
-            ))),
-            Ok(Err(_)) => Err(Error::Link {
-                peer: self.state.options.peer_name.clone(),
-                message: String::from("a peer that went away before answering a JSON-RPC request"),
-            }),
+            Ok(answered) => self.state.answered(answered, &id),
             Err(_) => {
                 self.state.pending.lock().await.remove(&id);
                 Err(Error::Timeout {
@@ -1129,16 +1535,34 @@ impl Drop for Client {
     ///
     /// [`Client::close`] is the supported shutdown: it fails every call still waiting, lets the
     /// answers in flight write their refusals, and closes the link. This runs when nobody called
-    /// it, and there is deliberately no drain here — a caller inside [`Client::request`] holds a
-    /// borrow of this client for the life of its future, so no pending call can outlive this, and
-    /// a map the last owner is dropping has nothing to fail.
+    /// it. A caller inside [`Client::request`] holds a borrow of this client for the life of its
+    /// future, so none of those can outlive this. A [`Reply`] can, and is failed here: with the
+    /// writer if its request is still queued, from the map otherwise.
     ///
-    /// What is left is the end of the link. The pump and the answers in flight are taken down, and
-    /// the sender goes with the last handle to this client's state — which on a child's stdin
-    /// is the end-of-input a print-mode vendor waits for.
+    /// What is left is the end of the link. The pump, the writer and the answers in flight are
+    /// taken down, frames still queued are dropped unwritten, and the sender goes with the last
+    /// handle to this client's state — which on a child's stdin is the end-of-input a print-mode
+    /// vendor waits for.
     fn drop(&mut self) {
+        let failure = self.state.ended_with(self.state.closed_error());
         self.state.closed.store(true, Ordering::Release);
         self.state.shutdown.cancel();
+        // Nothing holds the map across a wait, so this misses only against a thread inside it at
+        // this instant. That thread may be entering a call, so the map is emptied behind it on
+        // the connection's runtime, as a dropped call cleans up after itself.
+        if let Ok(mut pending) = self.state.pending.try_lock() {
+            for (_, waiting) in pending.drain() {
+                let _ = waiting.answer.send(Err(failure.clone()));
+            }
+        } else {
+            let state = Arc::clone(&self.state);
+            self.state.runtime.spawn(async move {
+                state.fail_pending(failure).await;
+            });
+        }
+        if let Some(writer) = self.state.writer_abort.get() {
+            writer.abort();
+        }
         self.state.abort_in_flight();
         self.state.abort_notifications();
         if let Ok(mut pump) = self.pump.try_lock()
@@ -1301,14 +1725,207 @@ impl ClientState {
         true
     }
 
+    /// What a settled call returns to its caller.
+    fn answered(
+        &self,
+        answered: std::result::Result<Answer, oneshot::error::RecvError>,
+        id: &str,
+    ) -> Result<Value> {
+        match answered {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(failure)) => Err(Error::Vendor(failure.into_vendor_error(
+                ErrorCode::new(format!("{}-call-failed", self.options.code_prefix)),
+                Some(id.to_owned()),
+            ))),
+            Err(_) => Err(Error::Link {
+                peer: self.options.peer_name.clone(),
+                message: String::from("a peer that went away before answering a JSON-RPC request"),
+            }),
+        }
+    }
+
+    /// Queues one frame for the writer, behind everything queued before it.
+    ///
+    /// Refuses a frame that is too large on its own without touching the connection, and ends
+    /// the connection when the queue itself has no room, which is a peer that stopped reading:
+    /// the cause is recorded before the error is returned.
+    fn enqueue(&self, frame: String, call: Option<Registration>) -> Result<outbox::Ticket> {
+        if self.link_poisoned.load(Ordering::Acquire) {
+            return Err(self.unusable_link());
+        }
+        let deadline = deadline_after(self.options.request_timeout);
+        self.outbox
+            .enqueue(frame, deadline, call)
+            .map_err(|refusal| self.refused(refusal))
+    }
+
+    /// The error for a frame the outbox would not take, with what a full queue sets off.
+    fn refused(&self, refusal: outbox::Refusal) -> Error {
+        match refusal {
+            outbox::Refusal::FrameTooLarge { limit, received } => Error::LimitExceeded {
+                subject: FRAME_BYTES,
+                limit,
+                received,
+            }
+            .with_dispatch(Dispatch::NotSubmitted),
+            outbox::Refusal::QueueFull {
+                subject,
+                limit,
+                received,
+            } => self.outbound_overflow(subject, limit, received),
+            outbox::Refusal::Stopped => self.writer_stopped(),
+        }
+    }
+
+    /// Ends the connection because this side holds more for the peer than it may.
+    ///
+    /// Callable from synchronous code, so it only records and signals: the cause every waiting
+    /// call is failed with, the typed reason the handler is told, and a link no later frame may
+    /// use. The pump does the ending, as for any failed write.
+    fn outbound_overflow(&self, subject: &'static str, limit: usize, received: usize) -> Error {
+        self.link_poisoned.store(true, Ordering::Release);
+        self.ended_with(JsonRpcError {
+            code: -32000,
+            message: format!(
+                "the {} outbound queue reached its limit",
+                self.options.peer_name
+            ),
+            data: None,
+        });
+        if !self.closed.load(Ordering::Acquire) {
+            self.outbound_overflow
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(PeerTermination::OutboundBackpressure {
+                    subject,
+                    limit,
+                    received,
+                });
+            self.write_failed.notify_one();
+        }
+        Error::LimitExceeded {
+            subject,
+            limit,
+            received,
+        }
+        .with_dispatch(Dispatch::NotSubmitted)
+    }
+
+    fn unusable_link(&self) -> Error {
+        Error::Link {
+            peer: self.options.peer_name.clone(),
+            message: String::from(
+                "the link became unusable during an earlier JSON-RPC frame write",
+            ),
+        }
+    }
+
+    fn writer_stopped(&self) -> Error {
+        Error::Link {
+            peer: self.options.peer_name.clone(),
+            message: String::from("a connection whose writer has stopped"),
+        }
+    }
+
+    fn write_timeout(&self) -> Error {
+        Error::Timeout {
+            operation: String::from("JSON-RPC frame write"),
+            after: self.options.request_timeout,
+        }
+    }
+
+    /// Enters a queued request among the calls awaiting an answer, as its frame's turn comes.
+    ///
+    /// Under the same lock and the same checks an asynchronous caller makes for itself: a
+    /// request that finds the connection closed is failed here, by this side, and one past the
+    /// pending budget is refused. Either way the frame is not written.
+    async fn register(&self, registration: Registration) -> Result<String> {
+        let Registration {
+            id,
+            answer,
+            delivery,
+        } = registration;
+        let mut pending = self.pending.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            drop(pending);
+            let _ = answer.send(Err(self.undelivered_failure()));
+            return Err(Error::Closed { subject: "link" });
+        }
+        pending.retain(|_, waiting| !waiting.answer.is_closed());
+        if pending.len() >= self.options.max_pending_requests {
+            let received = pending.len().saturating_add(1);
+            drop(pending);
+            let _ = answer.send(Err(self.unwritten_failure()));
+            return Err(Error::LimitExceeded {
+                subject: "pending JSON-RPC requests",
+                limit: self.options.max_pending_requests,
+                received,
+            }
+            .with_dispatch(Dispatch::NotSubmitted));
+        }
+        pending.insert(id.clone(), PendingAnswer { answer, delivery });
+        Ok(id)
+    }
+
+    fn unwritten_failure(&self) -> JsonRpcError {
+        JsonRpcError {
+            code: -32000,
+            message: format!(
+                "the {} request frame was not written",
+                self.options.peer_name
+            ),
+            data: None,
+        }
+    }
+
+    /// Fails the request whose frame was not written: no answer to it can come. With what ended
+    /// the connection, when that is why.
+    async fn fail_unwritten(&self, id: &str) {
+        let Some(waiting) = self.pending.lock().await.remove(id) else {
+            return;
+        };
+        let failure = self
+            .ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| self.unwritten_failure());
+        let _ = waiting.answer.send(Err(failure));
+    }
+
+    #[cfg(test)]
+    fn run_after_write_began(&self) {
+        let hook = self
+            .after_write_began
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// The link, for a caller that writes its own frame: at once when nothing is ahead of it,
+    /// otherwise when the outbox has worked through what was queued first.
+    async fn writer_turn(&self) -> Result<outbox::SenderGuard> {
+        match self.outbox.turn(&self.sender) {
+            outbox::Turn::Now(sender) => Ok(sender),
+            outbox::Turn::Queued(granted) => granted.await.map_err(|_| self.writer_stopped()),
+            outbox::Turn::Stopped => Err(self.writer_stopped()),
+        }
+    }
+
     async fn write(&self, frame: String) -> Result<()> {
         self.write_marking(frame, None).await
     }
 
     /// Writes one frame, setting `started` once this write holds the sender and begins.
     async fn write_marking(&self, frame: String, started: Option<&AtomicBool>) -> Result<()> {
+        self.outbox
+            .frame_fits(frame.len())
+            .map_err(|refusal| self.refused(refusal))?;
         tokio::time::timeout(self.options.request_timeout, async {
-            let mut sender = self.sender.lock().await;
+            let mut sender = self.writer_turn().await?;
             // Read again holding the sender: the write that held it before may have been
             // abandoned mid-frame or failed while this one waited, and the pump has not
             // necessarily ended the connection yet. `closed` is deliberately not the test:
@@ -1401,8 +2018,10 @@ impl ClientState {
 
     /// The termination a peer earns by sending more than the handoff queue may hold.
     fn queue_full(&self) -> PeerTermination {
+        let limit = self.options.max_pending_notifications.max(1);
         PeerTermination::NotificationBackpressure {
-            limit: self.options.max_pending_notifications.max(1),
+            limit,
+            received: limit.saturating_add(1),
         }
     }
 
@@ -1567,6 +2186,18 @@ async fn pump(
             // A transport failure, refused reply or abandoned send can leave the read side open.
             // End the connection here, on the one task that owns termination.
             () = state.write_failed.notified() => {
+                let overflow = state
+                    .outbound_overflow
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(termination) = overflow {
+                    // The cause was recorded where the budget was passed; this returns it.
+                    let failure = state.ended_with(state.closed_error());
+                    connection_failed(&state, &handler, notifications, termination, failure)
+                        .await;
+                    break;
+                }
                 let cause = state
                     .take_write_failure()
                     .unwrap_or_else(|| String::from("a frame could not be written"));
@@ -1579,8 +2210,8 @@ async fn pump(
         match message {
             Ok(Some(message)) => {
                 if let Err(termination) = dispatch(&state, &notifications, message).await {
-                    state.closed.store(true, Ordering::Release);
                     let failure = state.ended_with(state.overflow_failure());
+                    state.closed.store(true, Ordering::Release);
                     state.fail_pending(failure).await;
                     state.stop_notifications().await;
                     state.shutdown.cancel();
@@ -1590,12 +2221,12 @@ async fn pump(
                 }
             }
             Ok(None) => {
-                state.closed.store(true, Ordering::Release);
                 let failure = state.ended_with(JsonRpcError {
                     code: -32000,
                     message: format!("the {} exited", state.options.peer_name),
                     data: None,
                 });
+                state.closed.store(true, Ordering::Release);
                 fail_pending_around_drain(&state, notifications, failure).await;
                 state.shutdown.cancel();
                 state.drain_in_flight().await;
@@ -1618,13 +2249,24 @@ async fn link_failed(
     notifications: mpsc::Sender<QueuedWork>,
     cause: String,
 ) {
-    let termination = PeerTermination::LinkFailed(cause.clone());
-    state.closed.store(true, Ordering::Release);
     let failure = state.ended_with(JsonRpcError {
         code: -32000,
         message: format!("the {} link failed: {cause}", state.options.peer_name),
         data: None,
     });
+    let termination = PeerTermination::LinkFailed(cause);
+    connection_failed(state, handler, notifications, termination, failure).await;
+}
+
+/// Ends a connection that can no longer be written to, telling the handler why.
+async fn connection_failed(
+    state: &Arc<ClientState>,
+    handler: &Arc<dyn PeerHandler>,
+    notifications: mpsc::Sender<QueuedWork>,
+    termination: PeerTermination,
+    failure: JsonRpcError,
+) {
+    state.closed.store(true, Ordering::Release);
     fail_pending_around_drain(state, notifications, failure).await;
     state.shutdown.cancel();
     state.drain_in_flight().await;
@@ -1666,16 +2308,14 @@ async fn dispatch(
     let id = frame.remove("id");
     if let Some(Value::String(method)) = frame.remove("method") {
         let params = frame.remove("params").unwrap_or(Value::Null);
-        let bytes = u32::try_from(message.len()).map_err(|_| {
-            PeerTermination::NotificationByteBackpressure {
-                limit: state.options.max_pending_bytes,
-            }
-        })?;
+        let over_bytes = || PeerTermination::NotificationByteBackpressure {
+            limit: state.options.max_pending_bytes,
+            received: message.len(),
+        };
+        let bytes = u32::try_from(message.len()).map_err(|_| over_bytes())?;
         let permit = Arc::clone(&state.peer_bytes)
             .try_acquire_many_owned(bytes)
-            .map_err(|_| PeerTermination::NotificationByteBackpressure {
-                limit: state.options.max_pending_bytes,
-            })?;
+            .map_err(|_| over_bytes())?;
         // The channel also has room reserved for ordered responses, so its own capacity no
         // longer says when the peer's share is spent.
         if state.peer_work_queued(notifications) >= state.notification_capacity {
@@ -1711,6 +2351,26 @@ async fn dispatch(
         return ClientState::deliver(state, notifications, RequestId::new(id).key(), outcome).await;
     }
     Ok(())
+}
+
+/// What an ordered request made from inside its own client's `on_notification` is refused with.
+fn reentrant_ordered_request() -> Error {
+    Error::HostConfiguration {
+        expected: "an ordered JSON-RPC request made outside this client's notification handler",
+        received: String::from(
+            "one made inside on_notification, whose return its answer would wait for",
+        ),
+    }
+}
+
+/// When a wait of `after` that starts now is over.
+///
+/// A host may set a huge duration to mean "no deadline", and an instant that far out does not
+/// exist to add up to.
+fn deadline_after(after: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(after)
+        .unwrap_or_else(|| now + Duration::from_secs(60 * 60 * 24 * 365 * 30))
 }
 
 /// How many entries the handoff channel has room for.
@@ -1839,15 +2499,50 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
     // A reply that never lands leaves the peer blocked on a question this side believes it has
     // answered, and a timed-out write may have left half a frame on the link. Either way the link
     // is unusable, so the pump is told; it is the only place that ends a connection.
-    if let Err(error) = state.write(Value::Object(frame).to_string()).await {
+    let id = frame.get("id").cloned().unwrap_or(Value::Null);
+    let Err(error) = state.write(Value::Object(frame).to_string()).await else {
+        return;
+    };
+    if !oversized_frame(&error) {
+        state.signal_write_failure(&error);
+        return;
+    }
+    // Nothing was written and the link is as good as it was: the answer was only too large for
+    // the bound this client sends under. The peer still has to hear something, or it waits on
+    // this question for good.
+    let mut refusal = Map::new();
+    if state.options.include_version_header {
+        refusal.insert(String::from("jsonrpc"), json!("2.0"));
+    }
+    refusal.insert(String::from("id"), id);
+    refusal.insert(
+        String::from("error"),
+        json!({ "code": -32603, "message": "the answer was too large to send" }),
+    );
+    if let Err(error) = state.write(Value::Object(refusal).to_string()).await {
         state.signal_write_failure(&error);
     }
 }
+
+/// Whether `error` is this client's own refusal of one frame for its size.
+fn oversized_frame(error: &Error) -> bool {
+    matches!(
+        error.cause(),
+        Error::LimitExceeded {
+            subject: FRAME_BYTES,
+            ..
+        }
+    )
+}
+
+/// What the per-frame outbound bound counts, as [`Error::LimitExceeded`] names it.
+const FRAME_BYTES: &str = "bytes of one outgoing JSON-RPC frame";
 
 #[cfg(test)]
 mod tests {
     mod handoff_queue_tests;
     mod ordered_response_tests;
+    mod outbox_tests;
     mod write_failure_tests;
 
     use super::{

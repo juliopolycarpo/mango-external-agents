@@ -131,6 +131,17 @@ such a call at once. Request deadlines include
 writes, and dropping a request removes its pending correlation entry. Approval deadlines remain
 separate from request and idle deadlines.
 
+Every outgoing JSON-RPC frame takes its place in one queue, so frames reach the wire in the order
+their callers sent them. `Client::request` and `Client::notify` wait for their own write, as
+before. `Client::submit_request` and `Client::submit_notification` queue the frame and return at
+once with the write and the answer to wait for, which lets a caller under its own lock fix the
+order of two frames. Such a caller is slowed by nothing but `WireOptions`, which
+`Client::connect_with` takes and which bounds nothing by default. One frame larger than its
+per-frame bound is refused alone, with `Dispatch::NotSubmitted` and nothing written. Passing its
+bounds on queued frames or queued bytes, which count the frame being written, means the peer
+stopped reading: the connection ends with `PeerTermination::OutboundBackpressure` and the call
+receives the same `LimitExceeded`.
+
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
 individually), and `turn_buffer_bytes` serialized incoming bytes. Outgoing frames and the writer
