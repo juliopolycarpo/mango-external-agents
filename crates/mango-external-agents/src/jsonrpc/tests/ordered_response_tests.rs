@@ -803,6 +803,20 @@ struct PanickingHandler {
     gate: tokio::sync::Semaphore,
 }
 
+impl PanickingHandler {
+    /// Waits until a notification is inside the handler, held at the gate. Bounded.
+    ///
+    /// ```ignore
+    /// link.push_line(STARTED);
+    /// handler.entered().await;
+    /// ```
+    async fn entered(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
+            .await
+            .expect("expected a notification to reach the handler within 5s");
+    }
+}
+
 #[async_trait::async_trait]
 impl PeerHandler for PanickingHandler {
     async fn on_notification(&self, _method: String, _params: Value) {
@@ -868,7 +882,7 @@ async fn an_ordered_answer_queued_behind_a_handler_that_panics_fails_at_once() {
     let prompt = ask_prompt(&client);
     sent(&link, 1).await;
     link.push_line(STARTED);
-    handler.entered.notified().await;
+    handler.entered().await;
     link.push_line(PONG);
     reader_caught_up(&client, &link).await;
     let began = tokio::time::Instant::now();
@@ -893,17 +907,26 @@ async fn an_ordered_answer_read_after_the_handler_panicked_fails_at_once() {
     let prompt = ask_prompt(&client);
     sent(&link, 1).await;
     link.push_line(STARTED);
-    handler.entered.notified().await;
+    handler.entered().await;
     handler.gate.add_permits(1);
     // The worker's task has ended, and its end of the queue with it, once this is true.
-    while !client
-        .state
-        .notifications
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        .is_some_and(tokio::task::JoinHandle::is_finished)
-    {
+    // Counted, not timed: a task that keeps yielding never lets a paused clock advance.
+    let worker_ended = || {
+        client
+            .state
+            .notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    };
+    let mut yields = 0;
+    while !worker_ended() {
+        yields += 1;
+        assert!(
+            yields < 10_000,
+            "expected the handler's task to end with its panic: ended | received still running after {yields} yields"
+        );
         tokio::task::yield_now().await;
     }
     let began = tokio::time::Instant::now();
@@ -917,4 +940,34 @@ async fn an_ordered_answer_read_after_the_handler_panicked_fails_at_once() {
         Duration::ZERO,
         "expected no wait for the 60s deadline: 0s | received {waited:?}"
     );
+}
+
+/// The reader drains the queue when the peer exits, and `Client::close` takes the reader down.
+/// A close that lands in that drain must take the handler's task with it, or an answer queued
+/// behind a handler that is not returning keeps its caller until the request deadline.
+#[tokio::test]
+async fn closing_during_the_exit_drain_fails_an_ordered_request_whose_answer_is_queued() {
+    let link = ScriptedLink::new();
+    let handler = Turnstile::arc();
+    let client = connect(&link, &handler, options());
+
+    let prompt = ask_ordered(&client, &link, &handler, "session/prompt", ordered()).await;
+    link.push_line(STARTED);
+    link.push_line(PONG);
+    link.end();
+    connection_ended(&client).await;
+
+    tokio::time::timeout(Duration::from_secs(5), client.close())
+        .await
+        .expect("expected close to return during the drain")
+        .expect("expected a clean close");
+
+    let outcome = joined(prompt).await;
+    let log = handler.log();
+    assert_eq!(
+        log,
+        vec!["failed:the ACP agent exited"],
+        "expected the caller released by the close with the exit that began the drain: [failed:the ACP agent exited] | received {log:?}"
+    );
+    assert!(outcome.is_err(), "received {outcome:?}");
 }

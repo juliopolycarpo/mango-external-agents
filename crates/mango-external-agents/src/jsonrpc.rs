@@ -287,11 +287,13 @@ pub struct ClientOptions {
     pub max_in_flight_requests: usize,
     /// How many peer messages that need the handler can wait while responses keep settling.
     pub max_pending_notifications: usize,
-    /// Maximum outbound RPCs awaiting a response.
+    /// Maximum outbound RPCs whose response has not been read.
     ///
-    /// Also how many answers requested with [`RequestOptions::after_earlier_notifications`] may
-    /// be awaiting delivery, read or not: that many places are reserved for them in the handoff
-    /// queue, apart from [`max_pending_notifications`](ClientOptions::max_pending_notifications).
+    /// Also, counted on its own, how many answers requested with
+    /// [`RequestOptions::after_earlier_notifications`] may be awaiting delivery, read or not: that
+    /// many places are reserved for them in the handoff queue, apart from
+    /// [`max_pending_notifications`](ClientOptions::max_pending_notifications). Such an answer
+    /// that has been read and waits in that queue is counted by its place alone.
     pub max_pending_requests: usize,
     /// Maximum encoded bytes held by queued or in-flight peer callbacks.
     pub max_pending_bytes: usize,
@@ -676,6 +678,15 @@ impl Drop for MidSend<'_> {
             peer: self.state.options.peer_name.clone(),
             message: String::from("a JSON-RPC frame write was abandoned mid-send"),
         });
+    }
+}
+
+/// Takes its task down when it is dropped, finished or not.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1184,15 +1195,19 @@ impl ClientState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        let Some(mut handle) = handle else {
+        let Some(handle) = handle else {
             return;
         };
-        if tokio::time::timeout(self.options.shutdown_timeout, &mut handle)
+        // The pump runs this drain and `Client::close` aborts the pump. Without the guard that
+        // would let go of the only handle to a worker parked in the handler, leaving it running
+        // with whatever it still holds, a queued answer's caller included.
+        let mut worker = AbortOnDrop(handle);
+        if tokio::time::timeout(self.options.shutdown_timeout, &mut worker.0)
             .await
             .is_err()
         {
-            handle.abort();
-            let _ = handle.await;
+            worker.0.abort();
+            let _ = (&mut worker.0).await;
         }
     }
 
@@ -1301,6 +1316,18 @@ impl ClientState {
         }
     }
 
+    /// What a call still waiting is failed with when the peer overran the handoff queue.
+    fn overflow_failure(&self) -> JsonRpcError {
+        JsonRpcError {
+            code: -32000,
+            message: format!(
+                "the {} notification queue reached its limit",
+                self.options.peer_name
+            ),
+            data: None,
+        }
+    }
+
     /// Takes one of the places the handoff queue reserves for ordered responses.
     fn ordered_place(&self) -> Result<OwnedSemaphorePermit> {
         Arc::clone(&self.ordered_places)
@@ -1400,9 +1427,13 @@ impl ClientState {
             // The worker is gone: the connection is ending, or the handler panicked. The entry
             // came back in the error and fails its caller as it is dropped here.
             Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
-            // Unreachable while the reserve is counted correctly. Fails closed all the same, and
-            // the dropped entry fails its caller.
-            Err(mpsc::error::TrySendError::Full(_)) => Err(state.queue_full()),
+            // Unreachable while the reserve is counted correctly. Fails closed all the same. The
+            // cause is recorded before the entry is dropped, so its caller is told the truth.
+            Err(mpsc::error::TrySendError::Full(queued)) => {
+                state.ended_with(state.overflow_failure());
+                drop(queued);
+                Err(state.queue_full())
+            }
         }
     }
 
@@ -1458,14 +1489,7 @@ async fn pump(
             Ok(Some(message)) => {
                 if let Err(termination) = dispatch(&state, &notifications, message).await {
                     state.closed.store(true, Ordering::Release);
-                    let failure = state.ended_with(JsonRpcError {
-                        code: -32000,
-                        message: format!(
-                            "the {} notification queue reached its limit",
-                            state.options.peer_name
-                        ),
-                        data: None,
-                    });
+                    let failure = state.ended_with(state.overflow_failure());
                     state.fail_pending(failure).await;
                     state.stop_notifications().await;
                     state.shutdown.cancel();
