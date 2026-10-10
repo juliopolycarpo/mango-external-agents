@@ -523,6 +523,9 @@ impl Shared {
             Ok(_) => return Ok(true),
             Err(error) => error,
         };
+        if answer == InterruptAnswer::AfterEarlierNotifications {
+            self.wait_for_steer_hold(&route.owner).await;
+        }
         // Judged by the error as well as the flag: a write the dead peer's pipe refused comes
         // back before the client has marked itself closed.
         let connection_ending =
@@ -551,6 +554,52 @@ impl Shared {
             self.wait_for_turn_end(owner),
         )
         .await;
+    }
+
+    /// Waits, within `request_timeout`, until no steer is holding notifications back or the turn
+    /// has left admission.
+    ///
+    /// While a steer is in flight, and until the frames it held have been replayed, the handler
+    /// returns from a notification without routing it. An ordered answer is then delivered behind
+    /// a `turn/completed` nobody has acted on yet, and the turn still looks admitted.
+    ///
+    /// The hold itself has no deadline this side can rely on: a host can keep a steer future
+    /// alive without polling it, and its request deadline then never fires. So the wait carries
+    /// its own, `request_timeout`, the one a polled steer is bounded by, and on expiry the caller
+    /// judges the turn as it stands. It also ends as soon as the turn is gone, because a
+    /// connection's end or a poisoned session ends the turn without going through the hold.
+    ///
+    /// Only the stop worker waits here. It never holds a claim on the hold itself, and neither
+    /// the steer nor the replay waits for it.
+    async fn wait_for_steer_hold(&self, owner: &Arc<()>) {
+        let idle = Arc::clone(
+            &self
+                .steer_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .idle,
+        );
+        let released = async {
+            loop {
+                let changed = idle.notified();
+                if !self
+                    .steer_hold
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_holding()
+                {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        let settled = async {
+            tokio::select! {
+                () = released => {}
+                () = self.wait_for_turn_end(owner) => {}
+            }
+        };
+        let _ = tokio::time::timeout(self.host.limits().request_timeout, settled).await;
     }
 
     async fn recently_completed(&self, native_turn_id: &str) -> bool {
@@ -694,6 +743,9 @@ struct SteerHold {
     draining: bool,
     held: VecDeque<(String, Value, usize)>,
     held_bytes: usize,
+    /// Signalled each time the hold may have stopped holding: the last claim released with
+    /// nothing queued, or the replay finished. A waiter checks [`Self::is_holding`] again.
+    idle: Arc<Notify>,
 }
 
 impl SteerHold {
@@ -753,12 +805,14 @@ fn release_claim(shared: Arc<Shared>) -> Option<tokio::task::JoinHandle<()>> {
         return None;
     }
     if hold.held.is_empty() {
+        hold.idle.notify_waiters();
         return None;
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         // No runtime left to route on: the connection is going away with it.
         hold.held.clear();
         hold.held_bytes = 0;
+        hold.idle.notify_waiters();
         return None;
     };
     hold.draining = true;
@@ -791,6 +845,7 @@ async fn replay_steer_hold(shared: Arc<Shared>) {
                 }
                 None => {
                     hold.draining = false;
+                    hold.idle.notify_waiters();
                     return;
                 }
             }
@@ -6989,6 +7044,127 @@ mod tests {
                 matches!(events.last(), Some(EventKind::Completed)),
                 "expected the held completion to still end the turn: Completed | received: {events:?}"
             );
+        }
+
+        /// A steer in flight holds `turn/completed` back without routing it, so the handler has
+        /// returned from it and the ordered refusal is delivered. The stop must wait for the hold
+        /// to replay that completion before it judges the refusal.
+        #[tokio::test(start_paused = true)]
+        async fn an_interrupt_refused_behind_a_held_completion_waits_for_the_steer_replay() {
+            let Interrupting {
+                shared,
+                link,
+                mut stream,
+                mut stopping,
+                interrupt_id,
+                client: _client,
+            } = interrupting().await;
+            let steer = super::super::SteerHoldGuard::hold(&shared);
+            link.push_line(turn_completed("completed"));
+            link.push_line(interrupt_refused(&interrupt_id));
+            tokio::time::sleep(SETTLED).await;
+
+            if stopping.is_finished() {
+                let early = (&mut stopping).await.expect("expected the stop task");
+                panic!(
+                    "expected the interrupt answer during a steer: held until the held turn/completed was replayed | received: {early:?}"
+                );
+            }
+            steer.release().await;
+
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                stopped.is_ok(),
+                "expected the stop of a turn that completed during a steer: Ok(()) | received: {stopped:?}"
+            );
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Completed)),
+                "expected the turn's own terminal: Completed | received: {events:?}"
+            );
+        }
+
+        /// A steer whose hold is never released, as when a host keeps the steer future without
+        /// polling it, holds a refused stop for one `request_timeout` and no longer. The turn is
+        /// then judged as it stands: still admitted, so the refusal is reported.
+        #[tokio::test(start_paused = true)]
+        async fn a_steer_that_never_releases_holds_a_refused_stop_for_one_request_timeout() {
+            let Interrupting {
+                shared,
+                link,
+                mut stopping,
+                interrupt_id,
+                client: _client,
+                stream: _stream,
+            } = interrupting().await;
+            let request_timeout = shared.host.limits().request_timeout;
+            let steer = super::super::SteerHoldGuard::hold(&shared);
+            link.push_line(interrupt_refused(&interrupt_id));
+
+            tokio::time::sleep(request_timeout - SETTLED).await;
+            if stopping.is_finished() {
+                let early = (&mut stopping).await.expect("expected the stop task");
+                panic!(
+                    "expected the stop before the request timeout: still waiting for the steer hold | received: {early:?}"
+                );
+            }
+            tokio::time::sleep(SETTLED * 3).await;
+            assert!(
+                stopping.is_finished(),
+                "expected the stop after the request timeout: finished | received: still waiting"
+            );
+            let stopped = stopping.await.expect("expected the stop task");
+            assert!(
+                matches!(&stopped, Err(Error::Vendor(vendor))
+                    if vendor.message == "interrupted owner was already closed"),
+                "expected a turn still admitted after the wait: Err(Vendor) | received: {stopped:?}"
+            );
+            drop(steer);
+        }
+
+        /// The connection ends while the stop waits on a steer's hold, and the steer never gives
+        /// up its claim, as when a host keeps the steer future without polling it. The connection
+        /// fails the turn without going through the hold, so the stop ends with the turn and does
+        /// not wait out `request_timeout`.
+        #[tokio::test(start_paused = true)]
+        async fn a_connection_that_ends_while_a_stop_waits_on_a_steer_still_ends_the_stop() {
+            let Interrupting {
+                shared,
+                link,
+                mut stream,
+                mut stopping,
+                interrupt_id,
+                client: _client,
+            } = interrupting().await;
+            let steer = super::super::SteerHoldGuard::hold(&shared);
+            link.push_line(interrupt_refused(&interrupt_id));
+            tokio::time::sleep(SETTLED).await;
+            assert!(
+                !stopping.is_finished(),
+                "expected the stop during a steer: waiting on the hold | received: finished"
+            );
+
+            link.end();
+
+            let stopped = tokio::time::timeout(SETTLED, &mut stopping)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "expected the stop once the connection failed the turn: finished | received: still waiting on the steer hold"
+                    )
+                })
+                .expect("expected the stop task");
+            assert!(
+                stopped.is_ok(),
+                "expected the stop of a turn the connection ended: Ok(()) | received: {stopped:?}"
+            );
+            let events = kinds(&mut stream).await;
+            assert!(
+                matches!(events.last(), Some(EventKind::Error { error })
+                    if error.message.contains("connection ended while the turn was active")),
+                "expected the turn's terminal: the connection failure | received: {events:?}"
+            );
+            drop(steer);
         }
 
         /// A poisoned session interrupts from inside the notification handler, where an ordered
