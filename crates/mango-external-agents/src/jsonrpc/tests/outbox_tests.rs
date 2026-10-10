@@ -10,10 +10,10 @@ use crate::jsonrpc::{
 use std::sync::PoisonError;
 
 const FRAME_SUBJECT: &str = "bytes of one outgoing JSON-RPC frame";
-const QUEUED_FRAMES: &str = "outgoing JSON-RPC frames awaiting their write";
-const QUEUED_BYTES: &str = "bytes of outgoing JSON-RPC frames awaiting their write";
+pub(super) const QUEUED_FRAMES: &str = "outgoing JSON-RPC frames awaiting their write";
+pub(super) const QUEUED_BYTES: &str = "bytes of outgoing JSON-RPC frames awaiting their write";
 
-fn limits(frame: usize, bytes: usize, frames: usize) -> WireOptions {
+pub(super) fn limits(frame: usize, bytes: usize, frames: usize) -> WireOptions {
     WireOptions::new()
         .with_max_outbound_frame_bytes(frame)
         .with_max_outbound_queued_bytes(bytes)
@@ -118,16 +118,16 @@ impl crate::link::LinkSender for CountingHolds {
 }
 
 /// A link whose sends of frames naming `hold` wait at a gate, with a client over it.
-struct Gated {
-    link: ScriptedLink,
-    gate: Arc<tokio::sync::Semaphore>,
+pub(super) struct Gated {
+    pub(super) link: ScriptedLink,
+    pub(super) gate: Arc<tokio::sync::Semaphore>,
     /// How many `hold` frames are inside their send.
     holds: Arc<std::sync::atomic::AtomicUsize>,
-    handler: Arc<RecordingHandler>,
-    client: Arc<Client>,
+    pub(super) handler: Arc<RecordingHandler>,
+    pub(super) client: Arc<Client>,
 }
 
-fn gated(options: ClientOptions, wire: WireOptions) -> Gated {
+pub(super) fn gated(options: ClientOptions, wire: WireOptions) -> Gated {
     let link = ScriptedLink::new();
     let (sender, receiver) = link.clone().into_link().split();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -158,12 +158,12 @@ fn gated(options: ClientOptions, wire: WireOptions) -> Gated {
     }
 }
 
-fn options() -> ClientOptions {
+pub(super) fn options() -> ClientOptions {
     ClientOptions::new("ACP agent").with_request_timeout(Duration::from_secs(5))
 }
 
 /// The methods of the frames on the wire, in order.
-fn methods(link: &ScriptedLink) -> Vec<String> {
+pub(super) fn methods(link: &ScriptedLink) -> Vec<String> {
     link.sent()
         .iter()
         .map(|frame| {
@@ -173,7 +173,7 @@ fn methods(link: &ScriptedLink) -> Vec<String> {
         .collect()
 }
 
-async fn sent(link: &ScriptedLink, count: usize) {
+pub(super) async fn sent(link: &ScriptedLink, count: usize) {
     tokio::time::timeout(Duration::from_secs(5), link.wait_for_sent(count))
         .await
         .unwrap_or_else(|_| {
@@ -184,7 +184,7 @@ async fn sent(link: &ScriptedLink, count: usize) {
         });
 }
 
-async fn within<T>(what: &str, waiting: impl Future<Output = T>) -> T {
+pub(super) async fn within<T>(what: &str, waiting: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(5), waiting)
         .await
         .unwrap_or_else(|_| panic!("expected {what} within 5s | received nothing"))
@@ -192,7 +192,7 @@ async fn within<T>(what: &str, waiting: impl Future<Output = T>) -> T {
 
 /// `within` for a test on a paused clock, where the wait under test is itself measured in
 /// minutes of that clock: bounded well past any deadline the tests set.
-async fn eventually<T>(what: &str, waiting: impl Future<Output = T>) -> T {
+pub(super) async fn eventually<T>(what: &str, waiting: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(24 * 60 * 60), waiting)
         .await
         .unwrap_or_else(|_| {
@@ -205,7 +205,7 @@ async fn eventually<T>(what: &str, waiting: impl Future<Output = T>) -> T {
 /// Gives up after five seconds of the machine's own clock, not after a number of yields and not
 /// by the runtime's clock: how many yields another thread needs depends on the load, and a
 /// paused clock does not move while this task keeps yielding.
-async fn until(what: &str, mut reached: impl FnMut() -> bool) {
+pub(super) async fn until(what: &str, mut reached: impl FnMut() -> bool) {
     let began = std::time::Instant::now();
     while !reached() {
         assert!(
@@ -217,7 +217,7 @@ async fn until(what: &str, mut reached: impl FnMut() -> bool) {
 }
 
 /// Waits until the writer is inside the gated send, which is when the link is held.
-async fn link_held(gated: &Gated) -> Written {
+pub(super) async fn link_held(gated: &Gated) -> Written {
     let held = gated
         .client
         .submit_notification("hold", json!({}))
@@ -227,13 +227,15 @@ async fn link_held(gated: &Gated) -> Written {
 }
 
 /// What a failed reply says: which side failed it, and the error `request` returns for it.
-fn failure(outcome: std::result::Result<Value, CallFailure>) -> (CallFailureCause, Error) {
+pub(super) fn failure(
+    outcome: std::result::Result<Value, CallFailure>,
+) -> (CallFailureCause, Error) {
     let failure = outcome.expect_err("expected the reply to fail");
     (failure.cause().clone(), failure.into_error())
 }
 
 /// The end the client has on record.
-fn assert_ended(client: &Client, expected: Option<ConnectionEnd>) {
+pub(super) fn assert_ended(client: &Client, expected: Option<ConnectionEnd>) {
     let ended = client.ended();
     assert_eq!(
         ended, expected,
@@ -241,7 +243,7 @@ fn assert_ended(client: &Client, expected: Option<ConnectionEnd>) {
     );
 }
 
-fn outbox_holds(client: &Client) -> (usize, usize) {
+pub(super) fn outbox_holds(client: &Client) -> (usize, usize) {
     client.state.outbox.held()
 }
 
@@ -447,11 +449,11 @@ async fn a_frame_over_the_frame_limit_is_refused_without_touching_the_connection
     gated.client.close().await.expect("expected a clean close");
 }
 
-fn ordered_options() -> RequestOptions {
+pub(super) fn ordered_options() -> RequestOptions {
     RequestOptions::new().after_earlier_notifications()
 }
 
-async fn one_termination(handler: &RecordingHandler) -> PeerTermination {
+pub(super) async fn one_termination(handler: &RecordingHandler) -> PeerTermination {
     let terminations = within("one termination", terminations_after(handler, 1))
         .await
         .unwrap_or_else(|seen| panic!("expected terminations: 1 | received {seen}"));

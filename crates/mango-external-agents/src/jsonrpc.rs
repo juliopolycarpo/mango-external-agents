@@ -473,10 +473,28 @@ impl ClientOptions {
 ///
 /// Deliberately neither `Clone` nor comparable: an option added later may own something that is
 /// neither, and a call site builds these where it uses them.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct RequestOptions {
     deadline: RequestDeadline,
     after_earlier_notifications: bool,
+    outside_pending_budget: bool,
+    label: Option<&'static str>,
+}
+
+impl std::fmt::Debug for RequestOptions {
+    /// Without the request's name, which is host-written text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestOptions")
+            .field("deadline", &self.deadline)
+            .field(
+                "after_earlier_notifications",
+                &self.after_earlier_notifications,
+            )
+            .field("outside_pending_budget", &self.outside_pending_budget)
+            .field("labelled", &self.label.is_some())
+            .finish()
+    }
 }
 
 /// How long a request waits for its answer.
@@ -496,6 +514,9 @@ pub enum RequestDeadline {
     Connection,
     /// This long, whatever the connection's own is.
     After(Duration),
+    /// No deadline: the answer is waited for until it comes, the connection ends, or the
+    /// caller gives the request up.
+    Unbounded,
 }
 
 impl RequestOptions {
@@ -535,6 +556,90 @@ impl RequestOptions {
         self
     }
 
+    /// Waits for the answer for as long as the connection lasts.
+    ///
+    /// For a request whose answer is the end of something a person or a model is doing, such as
+    /// an ACP `session/prompt`, which no fixed time bounds. The wait ends with the answer, with
+    /// the connection, or when the caller gives the request up by dropping it.
+    ///
+    /// Only the wait for the answer loses its bound. The write of the request frame keeps
+    /// [`ClientOptions::request_timeout`], so a peer that stopped reading still fails the call,
+    /// and the write it left unfinished ends the connection.
+    ///
+    /// Such a request still holds a place among [`ClientOptions::max_pending_requests`] for as
+    /// long as it waits, unless it also asks for
+    /// [`outside_pending_budget`](Self::outside_pending_budget).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::{RequestDeadline, RequestOptions};
+    ///
+    /// let options = RequestOptions::new().without_deadline();
+    /// assert_eq!(options.deadline(), RequestDeadline::Unbounded);
+    /// ```
+    #[must_use]
+    pub fn without_deadline(mut self) -> Self {
+        self.deadline = RequestDeadline::Unbounded;
+        self
+    }
+
+    /// Does not count this request against [`ClientOptions::max_pending_requests`].
+    ///
+    /// That budget exists so a peer that stops answering cannot make this side hold calls
+    /// without limit. A request the host already bounds some other way (one running turn per
+    /// session, say) can stand outside it, so that short requests are not refused while it
+    /// runs and it is not refused because of them. It is neither counted nor checked: it is
+    /// admitted with the budget full, and requests that do count are admitted as if it were not
+    /// there. The host answers for how many of these it makes: nothing in this client bounds
+    /// the ones whose answers are delivered as they are read, beyond what [`WireOptions`]
+    /// bounds of their frames.
+    ///
+    /// The places [`after_earlier_notifications`](Self::after_earlier_notifications) reserves
+    /// are a budget of their own and still apply: an answer that waits its turn needs a place
+    /// to wait in, so at most [`ClientOptions::max_pending_requests`] such requests may be
+    /// awaiting delivery at once, inside this budget or outside it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::RequestOptions;
+    ///
+    /// let options = RequestOptions::new().outside_pending_budget();
+    /// assert!(!options.counts_against_pending_budget());
+    /// ```
+    #[must_use]
+    pub fn outside_pending_budget(mut self) -> Self {
+        self.outside_pending_budget = true;
+        self
+    }
+
+    /// Names this request, for whoever handles its failure.
+    ///
+    /// The name comes back from [`CallFailure::label`], so code that receives a failed
+    /// [`Reply`] can tell which of its requests it was without keeping a table of ids. It is a
+    /// `'static` string the host wrote, never the method sent on the wire, and it is not put
+    /// into any error's text, nor into the `Debug` form of the failure or of these options.
+    ///
+    /// Only a request queued with [`Client::submit_request`] has a [`CallFailure`] to carry it.
+    /// [`Client::request_with`] returns a plain [`Error`] and the name goes unused there: a
+    /// caller that wants the name, or the typed cause, queues the request and awaits its
+    /// [`Reply`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::RequestOptions;
+    ///
+    /// let options = RequestOptions::new().labelled("prompt");
+    /// assert_eq!(options.label(), Some("prompt"));
+    /// ```
+    #[must_use]
+    pub fn labelled(mut self, label: &'static str) -> Self {
+        self.label = Some(label);
+        self
+    }
+
     /// Delivers the answer only after [`PeerHandler::on_notification`] has returned for every
     /// notification the peer sent before it.
     ///
@@ -554,6 +659,10 @@ impl RequestOptions {
     /// been handled, and a request the peer never answered fails only after that drain, which
     /// [`ClientOptions::shutdown_timeout`] bounds. [`Client::close`] and a queue overflow do not
     /// drain: they fail the call at once.
+    ///
+    /// A request [`without_deadline`](Self::without_deadline) waits in that queue for as long
+    /// as the handler takes: an `on_notification` that never returns holds its answer back
+    /// until the connection ends or the caller gives the request up.
     ///
     /// The request's deadline keeps running while its answer waits in that queue, so a handler
     /// that is slow to return can time the request out with the answer already read. A
@@ -617,6 +726,34 @@ impl RequestOptions {
     #[must_use]
     pub fn waits_for_earlier_notifications(&self) -> bool {
         self.after_earlier_notifications
+    }
+
+    /// Whether this request holds a place among [`ClientOptions::max_pending_requests`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::RequestOptions;
+    ///
+    /// assert!(RequestOptions::new().counts_against_pending_budget());
+    /// ```
+    #[must_use]
+    pub fn counts_against_pending_budget(&self) -> bool {
+        !self.outside_pending_budget
+    }
+
+    /// The name this request was given with [`labelled`](Self::labelled).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::RequestOptions;
+    ///
+    /// assert_eq!(RequestOptions::new().label(), None);
+    /// ```
+    #[must_use]
+    pub fn label(&self) -> Option<&'static str> {
+        self.label
     }
 }
 
@@ -683,10 +820,10 @@ pub enum ConnectionEnd {
 /// }
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct CallFailure {
     // Boxed so that a reply's `Result` stays the size of its answer.
     parts: Box<(CallFailureCause, Error)>,
+    label: Option<&'static str>,
 }
 
 /// Which side failed a call, and how.
@@ -729,6 +866,18 @@ pub enum CallFailureCause {
     Unwritten,
 }
 
+impl std::fmt::Debug for CallFailure {
+    /// Without the request's name: that is host-written text, and this is an error.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CallFailure")
+            .field("cause", &self.parts.0)
+            .field("error", &self.parts.1)
+            .field("labelled", &self.label.is_some())
+            .finish()
+    }
+}
+
 impl CallFailure {
     /// Which side failed the call, and how.
     ///
@@ -762,10 +911,30 @@ impl CallFailure {
         self.parts.1
     }
 
+    /// The name the request was given with [`RequestOptions::labelled`], if it was given one.
+    ///
+    /// ```no_run
+    /// # fn example(failure: &mango_external_agents::jsonrpc::CallFailure) {
+    /// if failure.label() == Some("prompt") {
+    ///     eprintln!("the prompt failed: {failure}");
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn label(&self) -> Option<&'static str> {
+        self.label
+    }
+
     fn new(cause: CallFailureCause, error: Error) -> Self {
         Self {
             parts: Box::new((cause, error)),
+            label: None,
         }
+    }
+
+    fn labelled(mut self, label: Option<&'static str>) -> Self {
+        self.label = label;
+        self
     }
 }
 
@@ -822,6 +991,19 @@ type Answer = std::result::Result<Value, Failed>;
 struct PendingAnswer {
     answer: oneshot::Sender<Answer>,
     delivery: Delivery,
+    /// Whether it holds a place among `max_pending_requests`.
+    counted: bool,
+}
+
+/// Drops the entries nobody waits on any more and counts those that hold a place in the budget.
+fn counted_pending(pending: &mut HashMap<String, PendingAnswer>) -> usize {
+    let mut counted = 0;
+    pending.retain(|_, waiting| {
+        let live = !waiting.answer.is_closed();
+        counted += usize::from(live && waiting.counted);
+        live
+    });
+    counted
 }
 
 /// Who hands a response to its caller, and when.
@@ -874,6 +1056,7 @@ struct Registration {
     id: String,
     answer: oneshot::Sender<Answer>,
     delivery: Delivery,
+    counted: bool,
 }
 
 struct ClientState {
@@ -900,6 +1083,10 @@ struct ClientState {
     /// before it acts on that, so a test can queue a frame exactly there.
     #[cfg(test)]
     after_turn_decided: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when the queue has been sealed and before the closed flag goes up, so a test
+    /// can queue a frame exactly there.
+    #[cfg(test)]
+    after_seal: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The connection's runtime also owns cleanup when a request is dropped on another thread.
     runtime: tokio::runtime::Handle,
     options: ClientOptions,
@@ -1164,12 +1351,13 @@ impl SubmittedRequest {
 pub struct Reply {
     state: Arc<ClientState>,
     waiting: oneshot::Receiver<Answer>,
-    /// When the wait for the answer is over, counted from when the request was queued.
-    deadline: tokio::time::Instant,
+    /// How long the wait for the answer may be and when that is over, counted from when the
+    /// request was queued. `None` for a request without a deadline.
+    deadline: Option<(Duration, tokio::time::Instant)>,
     /// The timer for that, made on the first poll: a request may be queued from a thread that
     /// has no runtime to make one on.
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
-    timeout: Duration,
+    label: Option<&'static str>,
     ctl: Arc<outbox::FrameCtl>,
     /// Takes the call back out from among those awaiting an answer when this is dropped.
     pending: PendingCall,
@@ -1188,10 +1376,15 @@ impl Future for Reply {
     type Output = std::result::Result<Value, CallFailure>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let label = self.label;
         if let Poll::Ready(answered) = Pin::new(&mut self.waiting).poll(cx) {
-            return Poll::Ready(self.state.replied(answered, &self.pending.id));
+            let replied = self.state.replied(answered, &self.pending.id);
+            return Poll::Ready(replied.map_err(|failure| failure.labelled(label)));
         }
-        let deadline = self.deadline;
+        // Without a deadline only the answer, the connection's end or the caller ends the wait.
+        let Some((timeout, deadline)) = self.deadline else {
+            return Poll::Pending;
+        };
         let timer = self
             .timer
             .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
@@ -1199,14 +1392,13 @@ impl Future for Reply {
             return Poll::Pending;
         }
         Poll::Ready(Err(CallFailure::new(
-            CallFailureCause::TimedOut {
-                after: self.timeout,
-            },
+            CallFailureCause::TimedOut { after: timeout },
             Error::Timeout {
                 operation: String::from("a JSON-RPC request"),
-                after: self.timeout,
+                after: timeout,
             },
-        )))
+        )
+        .labelled(label)))
     }
 }
 
@@ -1276,6 +1468,8 @@ impl Client {
             after_write_began: StdMutex::new(None),
             #[cfg(test)]
             after_turn_decided: StdMutex::new(None),
+            #[cfg(test)]
+            after_seal: StdMutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
@@ -1383,18 +1577,18 @@ impl Client {
         P: Serialize + Send,
         R: DeserializeOwned,
     {
-        let timeout = match options.deadline {
-            RequestDeadline::Connection => self.state.options.request_timeout,
-            RequestDeadline::After(timeout) => timeout,
-        };
-        self.answer_within(
+        let call = self.call(
             method,
             params,
-            timeout,
+            self.state.answer_deadline(options.deadline),
             None,
             options.after_earlier_notifications,
-        )
-        .await
+            !options.outside_pending_budget,
+        );
+        serde_json::from_value(call.await?).map_err(|error| Error::Protocol {
+            expected: String::from("a JSON-RPC result"),
+            received: error.to_string(),
+        })
     }
 
     /// Calls a method like [`Client::request`] and records when its frame starts reaching the
@@ -1447,15 +1641,9 @@ impl Client {
         P: Serialize + Send,
         R: DeserializeOwned,
     {
-        let answer = tokio::time::timeout(
-            timeout,
-            self.call(method, params, timeout, write_started, ordered),
-        )
-        .await
-        .map_err(|_| Error::Timeout {
-            operation: String::from("a JSON-RPC request"),
-            after: timeout,
-        })??;
+        let answer = self
+            .call(method, params, Some(timeout), write_started, ordered, true)
+            .await?;
         serde_json::from_value(answer).map_err(|error| Error::Protocol {
             expected: String::from("a JSON-RPC result"),
             received: error.to_string(),
@@ -1535,14 +1723,29 @@ impl Client {
         if self.is_closed() {
             return Err(Error::Closed { subject: "link" });
         }
+        self.queue_request(method, params, options)
+    }
+
+    /// The rest of [`Client::submit_request`], for a caller that has read the client open.
+    fn queue_request<P>(
+        &self,
+        method: &str,
+        params: P,
+        options: RequestOptions,
+    ) -> Result<SubmittedRequest>
+    where
+        P: Serialize,
+    {
+        // Too late is said before anything else is asked of the request: with the ordered
+        // reserve full, a request that raced a close is refused for the close.
+        if self.state.outbox.is_sealed() {
+            return Err(Error::Closed { subject: "link" });
+        }
         let ordered = options.after_earlier_notifications;
         if ordered && self.state.handling_own_notification() {
             return Err(reentrant_ordered_request());
         }
-        let timeout = match options.deadline {
-            RequestDeadline::Connection => self.state.options.request_timeout,
-            RequestDeadline::After(timeout) => timeout,
-        };
+        let timeout = self.state.answer_deadline(options.deadline);
         let id = self
             .state
             .next_id
@@ -1561,6 +1764,7 @@ impl Client {
             id: id.clone(),
             answer,
             delivery,
+            counted: !options.outside_pending_budget,
         };
         let ticket = self.state.enqueue(frame, Some(registration))?;
         let ctl = Arc::clone(&ticket.ctl);
@@ -1570,9 +1774,9 @@ impl Client {
             reply: Reply {
                 state: Arc::clone(&self.state),
                 waiting,
-                deadline: deadline_after(timeout),
+                deadline: timeout.map(|timeout| (timeout, deadline_after(timeout))),
                 timer: None,
-                timeout,
+                label: options.label,
                 ctl,
                 pending: PendingCall {
                     state: Arc::clone(&self.state),
@@ -1607,6 +1811,14 @@ impl Client {
         if self.is_closed() {
             return Err(Error::Closed { subject: "link" });
         }
+        self.queue_notification(method, params)
+    }
+
+    /// The rest of [`Client::submit_notification`], for a caller that has read the client open.
+    fn queue_notification<P>(&self, method: &str, params: P) -> Result<Written>
+    where
+        P: Serialize,
+    {
         let frame = self.state.frame(None, method, params)?;
         let ticket = self.state.enqueue(frame, None)?;
         Ok(Written::new(ticket, self.state.options.peer_name.clone()))
@@ -1617,8 +1829,26 @@ impl Client {
     /// The process or socket underneath is the caller's to reap: this client did not open it.
     /// Idempotent.
     ///
-    /// Of the frames queued with [`Client::submit_notification`] and
-    /// [`Client::submit_request`] before the close, notifications are written before the link
+    /// # How long it takes
+    ///
+    /// At most twice [`ClientOptions::shutdown_timeout`]: once for the answers this side still
+    /// owes the peer to be written, and once for what was queued before the close to be written
+    /// and the link closed. Both waits are over at once on a link that takes its writes. The
+    /// handler's tasks are cancelled, not waited out, which takes no time unless a handler is
+    /// blocking its thread without yielding; nothing here can bound that. A caller that wants
+    /// a tighter bound puts its own timeout around this future or drops it: that is safe at any
+    /// point, and leaves the link as the last paragraph below describes.
+    ///
+    /// # What becomes of queued frames
+    ///
+    /// From the moment a close begins the queue takes nothing more: a
+    /// [`Client::submit_notification`] or [`Client::submit_request`] that comes after is refused
+    /// with [`Error::Closed`] (or with [`Error::Link`], on a link an earlier write had already
+    /// left unusable), and nothing of it is queued or written. One that raced the close
+    /// either got into the queue ahead of it, and is then a frame queued before the close, or
+    /// was refused the same way.
+    ///
+    /// Of the frames queued before the close, notifications are written before the link
     /// goes. Requests whose turn to be written has not come are not: a request is entered among
     /// the calls awaiting an answer when that turn comes, and a closing client enters none, so
     /// its [`Written`] resolves to [`Error::Closed`] and its [`Reply`] fails with
@@ -1642,7 +1872,7 @@ impl Client {
         let failure = self
             .state
             .ended_with(ConnectionEnd::Closed, self.state.closed_error());
-        self.state.closed.store(true, Ordering::Release);
+        self.state.mark_closed();
         self.state.shutdown.cancel();
         // A close that does not get as far as the link, because its grace ran out or because its
         // caller stopped waiting, must not leave queued frames to be written behind it.
@@ -1722,9 +1952,39 @@ impl Client {
         &self,
         method: &str,
         params: P,
-        timeout: Duration,
+        timeout: Option<Duration>,
         write_started: Option<&AtomicBool>,
         ordered: bool,
+        counted: bool,
+    ) -> Result<Value>
+    where
+        P: Serialize + Send,
+    {
+        let Some(timeout) = timeout else {
+            // No deadline on the answer. The frame's write is bounded where it is made.
+            return self
+                .call_unbounded(method, params, write_started, ordered, counted)
+                .await;
+        };
+        // The deadline covers the whole call, the wait for the link included.
+        tokio::time::timeout(
+            timeout,
+            self.call_unbounded(method, params, write_started, ordered, counted),
+        )
+        .await
+        .map_err(|_| Error::Timeout {
+            operation: String::from("a JSON-RPC request"),
+            after: timeout,
+        })?
+    }
+
+    async fn call_unbounded<P>(
+        &self,
+        method: &str,
+        params: P,
+        write_started: Option<&AtomicBool>,
+        ordered: bool,
+        counted: bool,
     ) -> Result<Value>
     where
         P: Serialize + Send,
@@ -1762,12 +2022,12 @@ impl Client {
             if self.state.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed { subject: "link" });
             }
-            pending.retain(|_, waiting| !waiting.answer.is_closed());
-            if pending.len() >= self.state.options.max_pending_requests {
+            let holding = counted_pending(&mut pending);
+            if counted && holding >= self.state.options.max_pending_requests {
                 return Err(Error::LimitExceeded {
                     subject: "pending JSON-RPC requests",
                     limit: self.state.options.max_pending_requests,
-                    received: pending.len().saturating_add(1),
+                    received: holding.saturating_add(1),
                 });
             }
             let delivery = if ordered {
@@ -1775,7 +2035,14 @@ impl Client {
             } else {
                 Delivery::Immediate
             };
-            pending.insert(id.clone(), PendingAnswer { answer, delivery });
+            pending.insert(
+                id.clone(),
+                PendingAnswer {
+                    answer,
+                    delivery,
+                    counted,
+                },
+            );
         }
         let _pending = PendingCall {
             state: Arc::clone(&self.state),
@@ -1790,16 +2057,9 @@ impl Client {
             return Err(error);
         }
 
-        match tokio::time::timeout(timeout, waiting).await {
-            Ok(answered) => self.state.answered(answered, &id),
-            Err(_) => {
-                self.state.pending.lock().await.remove(&id);
-                Err(Error::Timeout {
-                    operation: String::from("a JSON-RPC request"),
-                    after: timeout,
-                })
-            }
-        }
+        // A caller that stops waiting, by its deadline or by being dropped, takes its entry
+        // back out as `_pending` goes.
+        self.state.answered(waiting.await, &id)
     }
 }
 
@@ -1823,7 +2083,7 @@ impl Drop for Client {
         let failure = self
             .state
             .ended_with(ConnectionEnd::Closed, self.state.closed_error());
-        self.state.closed.store(true, Ordering::Release);
+        self.state.mark_closed();
         self.state.shutdown.cancel();
         // Nothing holds the map across a wait, so this misses only against a thread inside it at
         // this instant. That thread may be entering a call, so the map is emptied behind it on
@@ -2109,8 +2369,27 @@ impl ClientState {
                 received,
             }
             .with_dispatch(Dispatch::NotSubmitted),
+            outbox::Refusal::Sealed => Error::Closed { subject: "link" },
             outbox::Refusal::Stopped => self.writer_stopped(),
         }
+    }
+
+    /// Marks the connection closed, to the queue and to callers. Every end of a connection
+    /// comes through here.
+    ///
+    /// The flag turns callers away before they build a frame. The seal settles the caller that
+    /// read the flag a moment too early: its frame is in the queue ahead of this, to be dealt
+    /// with as any frame queued before the end, or it is refused as it is queued. No frame
+    /// arrives in the queue behind an end's back.
+    ///
+    /// The seal goes first. With the flag up and the queue still open, a late frame would be
+    /// measured against the queue's bounds, and one that found the queue full would be taken
+    /// for a peer that stopped reading and end a connection that is only closing.
+    fn mark_closed(&self) {
+        self.outbox.seal();
+        #[cfg(test)]
+        Self::run_hook(&self.after_seal);
+        self.closed.store(true, Ordering::Release);
     }
 
     /// Ends the connection because this side holds more for the peer than it may.
@@ -2184,6 +2463,7 @@ impl ClientState {
             id,
             answer,
             delivery,
+            counted,
         } = registration;
         let mut pending = self.pending.lock().await;
         if self.closed.load(Ordering::Acquire) {
@@ -2191,9 +2471,9 @@ impl ClientState {
             let _ = answer.send(Err(self.undelivered_failure()));
             return Err(Error::Closed { subject: "link" });
         }
-        pending.retain(|_, waiting| !waiting.answer.is_closed());
-        if pending.len() >= self.options.max_pending_requests {
-            let received = pending.len().saturating_add(1);
+        let holding = counted_pending(&mut pending);
+        if counted && holding >= self.options.max_pending_requests {
+            let received = holding.saturating_add(1);
             drop(pending);
             let _ = answer.send(Err(self.unwritten()));
             return Err(Error::LimitExceeded {
@@ -2203,8 +2483,24 @@ impl ClientState {
             }
             .with_dispatch(Dispatch::NotSubmitted));
         }
-        pending.insert(id.clone(), PendingAnswer { answer, delivery });
+        pending.insert(
+            id.clone(),
+            PendingAnswer {
+                answer,
+                delivery,
+                counted,
+            },
+        );
         Ok(id)
+    }
+
+    /// How long a request with this deadline waits for its answer. `None` is no bound.
+    fn answer_deadline(&self, deadline: RequestDeadline) -> Option<Duration> {
+        match deadline {
+            RequestDeadline::Connection => Some(self.options.request_timeout),
+            RequestDeadline::After(timeout) => Some(timeout),
+            RequestDeadline::Unbounded => None,
+        }
     }
 
     fn unwritten(&self) -> Failed {
@@ -2474,7 +2770,9 @@ impl ClientState {
     ) -> std::result::Result<(), PeerTermination> {
         // A response nobody is waiting for is dropped: the call timed out or was abandoned, or
         // this is a second response to a request whose first is already delivered or queued.
-        let Some(PendingAnswer { answer, delivery }) = state.pending.lock().await.remove(&id)
+        let Some(PendingAnswer {
+            answer, delivery, ..
+        }) = state.pending.lock().await.remove(&id)
         else {
             return Ok(());
         };
@@ -2582,7 +2880,7 @@ async fn pump(
                         state.overflow_failure(),
                     );
                     let termination = failure.termination(termination);
-                    state.closed.store(true, Ordering::Release);
+                    state.mark_closed();
                     state.fail_pending(failure).await;
                     state.stop_notifications().await;
                     state.shutdown.cancel();
@@ -2601,7 +2899,7 @@ async fn pump(
                     },
                 );
                 let termination = failure.termination(PeerTermination::Exited);
-                state.closed.store(true, Ordering::Release);
+                state.mark_closed();
                 fail_pending_around_drain(&state, notifications, failure).await;
                 state.shutdown.cancel();
                 state.drain_in_flight().await;
@@ -2645,7 +2943,7 @@ async fn connection_failed(
     termination: PeerTermination,
     failure: Failed,
 ) {
-    state.closed.store(true, Ordering::Release);
+    state.mark_closed();
     fail_pending_around_drain(state, notifications, failure).await;
     state.shutdown.cancel();
     state.drain_in_flight().await;
@@ -2923,6 +3221,7 @@ mod tests {
     mod handoff_queue_tests;
     mod ordered_response_tests;
     mod outbox_tests;
+    mod request_lifecycle_tests;
     mod write_failure_tests;
 
     use super::{

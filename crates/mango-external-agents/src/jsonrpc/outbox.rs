@@ -220,6 +220,8 @@ pub(super) enum Refusal {
         limit: usize,
         received: usize,
     },
+    /// The connection has closed or ended: the queue takes nothing more.
+    Sealed,
     /// The writer has gone, with the connection.
     Stopped,
 }
@@ -235,6 +237,9 @@ struct Held {
     /// Whether a frame has ever been queued. Until then callers that write for themselves share
     /// the link's lock directly and nothing here orders them.
     queueing: bool,
+    /// Whether the connection has closed or ended. Set under the lock frames are admitted
+    /// under, so a frame is either in the queue before this, or refused.
+    sealed: bool,
     /// Callers that went for the link's lock directly, before queueing began, and do not hold it
     /// yet. The first queued frame waits for them: they called first.
     direct: usize,
@@ -490,6 +495,10 @@ impl Outbox {
             .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // Before the bounds: a frame that comes too late says nothing about the peer.
+        if held.sealed {
+            return Err(Refusal::Sealed);
+        }
         admission(&self.limits, held.frames, held.bytes, bytes)?;
         // From the first queued frame on, every write takes its turn here.
         held.queueing = true;
@@ -607,6 +616,24 @@ impl Outbox {
             self.waited_for_direct.fetch_add(1, Ordering::AcqRel);
             done.await;
         }
+    }
+
+    /// Takes no more frames, from this call on. What is already queued stays queued.
+    pub(super) fn seal(&self) {
+        self.budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sealed = true;
+    }
+
+    /// Whether the queue has stopped taking frames.
+    pub(super) fn is_sealed(&self) -> bool {
+        self.budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sealed
     }
 
     /// Queues a barrier behind every frame queued so far. `None` when there is no queue to wait

@@ -156,6 +156,22 @@ reaches the link leaves the link unusable, so nothing queued is written afterwar
 is kept keeps the link's sender alive after the `Client` is dropped; drop replies before relying
 on a child seeing end-of-input.
 
+One request can differ from the connection's defaults through `RequestOptions`.
+`without_deadline` waits for the answer for as long as the connection lasts, for a request such as
+an ACP `session/prompt` that no fixed time bounds; the write of its frame keeps `request_timeout`,
+so a peer that stopped reading still fails it. `outside_pending_budget` neither counts the request
+against `max_pending_requests` nor refuses it there, for a request the host bounds some other way.
+`labelled` gives it a host-written name that `CallFailure::label` returns and no error text
+carries. `Client::close` takes at most twice `shutdown_timeout`, once for the answers this side
+still owes the peer and once for the queue and the link, and may be dropped at any point for a
+tighter bound. From the moment a close begins, or the connection ends, the queue takes nothing
+more: a `submit_*` that comes after is refused, with `Error::Closed` or, on a link an earlier write
+left unusable, `Error::Link`, and nothing of it is queued or written, and one that got in ahead is a frame queued before the close. `Client::request` and
+`Client::notify` do not pass through the queue and are as they were: on a connection that has
+ended, `request` returns `Error::Closed` and `notify` returns `Ok(())` having written nothing, and
+one that read the connection as open an instant before it ended reaches the link, which answers it
+(a closed link refuses the write, and the call returns that refusal).
+
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
 individually), and `turn_buffer_bytes` serialized incoming bytes. Outgoing frames and the writer
