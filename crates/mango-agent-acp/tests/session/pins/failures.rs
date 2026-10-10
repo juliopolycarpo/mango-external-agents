@@ -176,22 +176,62 @@ async fn an_agent_death_under_the_prompt_it_just_read_is_never_reported_as_a_can
 
 /// A request that is not a prompt waits on its own reply alone, with nothing racing it, so an
 /// agent that died under `session/list` fails the call as a closed link naming that request, with
-/// the agent's stderr, and never as the agent's own refusal. Repeated on a multi-thread runtime
-/// to hold that against the lifecycle watcher winding the connection down at the same moment.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// the agent's stderr, and never as the agent's own refusal. The reply is failed at EOF before
+/// anything can wind the connection down, so there is one order here and one round covers it.
+#[tokio::test]
 async fn an_agent_death_under_a_request_is_never_reported_as_the_agents_refusal() {
-    for round in 0..DEATH_ROUNDS {
-        let (session, _launcher) = open_under(
-            dying_peer("session/list", serde_json::json!({ "list": {} })),
-            Limits::default(),
-        )
-        .await;
-        let error = refusal(session.list_sessions(Default::default()).await);
-        let Error::Vendor(failure) = error.cause() else {
-            panic!("expected Error::Vendor in round {round} | received: {error:?}");
-        };
-        assert_closed_link_with_stderr(failure, "a transport that closed under session/list");
-    }
+    let (session, _launcher) = open_under(
+        dying_peer("session/list", serde_json::json!({ "list": {} })),
+        Limits::default(),
+    )
+    .await;
+    let error = refusal(session.list_sessions(Default::default()).await);
+    let Error::Vendor(failure) = error.cause() else {
+        panic!("expected Error::Vendor | received: {error:?}");
+    };
+    assert_closed_link_with_stderr(failure, "a transport that closed under session/list");
+}
+
+/// A request still waiting when the connection is wound down under it loses its reply with the
+/// dispatch loop rather than at EOF. The agent refused nothing, so that is the closed link naming
+/// the request too, and never `acp-request-failed`. Here the connection ends because the host
+/// dropped another request it had sent.
+#[tokio::test(start_paused = true)]
+async fn a_request_whose_reply_is_dropped_with_the_connection_fails_as_a_closed_link() {
+    let (session, _launcher) = open_under(
+        FakeAcpAgent::new().holding_listing().process(),
+        Limits::default(),
+    )
+    .await;
+    let kept = session.list_sessions(Default::default());
+    let dropped = session.list_sessions(Default::default());
+    tokio::pin!(kept);
+    let first = tokio::time::timeout(Duration::from_millis(1), async {
+        tokio::select! {
+            biased;
+            kept = &mut kept => Some(kept),
+            _ = dropped => None,
+        }
+    })
+    .await;
+    assert!(
+        first.is_err(),
+        "expected both requests still pending | received: {first:?}"
+    );
+
+    let error = refusal(kept.await);
+    let Error::Vendor(failure) = error.cause() else {
+        panic!("expected Error::Vendor | received: {error:?}");
+    };
+    let received = (failure.code.as_str(), failure.message.as_str());
+    let expected = (
+        "acp-link-closed",
+        "a transport that closed under session/list",
+    );
+    assert_eq!(
+        received, expected,
+        "expected (code, message): {expected:?} | received: {received:?}"
+    );
 }
 
 /// A host that asked to stop the turn before the agent died is told the turn was cancelled, with

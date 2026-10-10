@@ -1973,7 +1973,9 @@ where
         {
             return overflow.error();
         }
-        if agent_client_protocol::is_incoming_transport_closed(&error) {
+        // Both shapes, not only the EOF one: a reply dropped with the dispatch loop is the same
+        // closed link seen from the other side, and nothing the agent said.
+        if is_link_closure(&error) {
             return Error::Vendor(link_failure(with_stderr(
                 &format!("a transport that closed under {method}"),
                 connection.control().as_ref(),
