@@ -637,7 +637,8 @@ impl Reducer {
     /// sending it again for a call that is still running. A second [`EventKind::ActivityStarted`]
     /// under the same id would give a host two rows for one call, so the repeat arrives as an update
     /// carrying everything the new frame said, except an empty content or locations collection,
-    /// which leaves the host's copy alone. A call that already ended stays ended.
+    /// which leaves the host's copy alone, and except its `name`, which
+    /// [`ActivityUpdate`] has no field for. A call that already ended stays ended.
     fn tool_call(&mut self, call: ToolCall, now: Instant) -> Vec<EventKind> {
         let call_id = call.tool_call_id.to_string();
         // A call is never both open and finished, so a running call is recognised by its one map
@@ -693,6 +694,7 @@ impl Reducer {
                 .filter(|title| !title.trim().is_empty())
                 .unwrap_or_else(|| String::from(UNTITLED_TOOL_CALL));
             let mut call = ToolCall::new(update.tool_call_id, title)
+                .name(fields.name)
                 .kind(fields.kind.unwrap_or_default())
                 .status(fields.status.unwrap_or_default());
             if let Some(content) = fields.content {
@@ -890,10 +892,10 @@ fn tool_call(call: ToolCall) -> Vec<EventKind> {
     // `Activity::item_id`'s own doc, "distinct from the call", is real: ACP names no id for a tool
     // call's transcript item apart from `tool_call_id`. Carried anyway, so a host can route an
     // update by item id the same way across harnesses, even on the one where the two ids coincide.
-    // The name is a copy of the title (see `tool_name`) and the title itself is not read again, so
-    // it moves into the activity instead of being cloned a second time.
-    let activity = Activity::new(tool_name(&call), activity_kind(call.kind), call.title)
-        .with_item_id(call_id.clone());
+    // The title is not read again after the name is chosen, so it moves into the activity.
+    let name = tool_name(call.name, &call.title);
+    let activity =
+        Activity::new(name, activity_kind(call.kind), call.title).with_item_id(call_id.clone());
     // The detail reads the blocks by reference; the content then consumes them, so a diff's bodies
     // move into the event instead of being copied for it.
     let detail = content_detail(&call.content);
@@ -939,7 +941,9 @@ fn tool_call_update(update: ToolCallUpdate) -> Vec<EventKind> {
     };
     // `locations` on an update is left uncarried: unlike `Activity`, `ActivityUpdate` has no
     // extensions slot to put a count in, and `raw_input`/`raw_output` never go anywhere — both are
-    // unbounded vendor payloads this library forbids carrying.
+    // unbounded vendor payloads this library forbids carrying. `name` is left uncarried for the same
+    // reason as `locations`: `ActivityUpdate` cannot rename a running activity, and the name is
+    // never sent in the title's place.
     if let Some(result) = fields.status.and_then(finished) {
         let result = result.with_optional_detail(detail);
         let result = match content {
@@ -973,13 +977,33 @@ fn finished(status: ToolCallStatus) -> Option<ActivityResult> {
     Some(ActivityResult::new(status))
 }
 
-/// The call's title, as the activity's name.
+/// The activity's name: the tool's own `name` when the agent sent one, otherwise the call's title.
 ///
-/// `ToolCall::name` became stable in schema 1.9 and is deliberately not read yet: every host so
-/// far has seen the title here, so [`Activity::name`](mango_external_agents::Activity) keeps
-/// carrying it until switching is decided on its own.
-fn tool_name(call: &ToolCall) -> String {
-    call.title.clone()
+/// ACP's [`name`](https://agentclientprotocol.com/protocol/tool-calls) is "the optional
+/// programmatic name of the invoked tool, such as `read_file`", and its `title` says what this one
+/// call is doing. Those are [`Activity::name`] and [`Activity::title`], which is how the Claude and
+/// Codex harnesses already fill them. An agent that sends no name (every agent before schema 1.9,
+/// and `null` means the same) keeps the title in both, as a host has always seen it.
+///
+/// The name is returned as the agent sent it; the core strips and cuts it to
+/// [`TextLimit::ActivityName`] when the event is published, as it does a title used as the name.
+fn tool_name(name: Option<String>, title: &str) -> String {
+    match name {
+        Some(name) if names_a_tool(&name) => name,
+        _ => title.to_owned(),
+    }
+}
+
+/// Whether a host would have anything to show for this name once the core has bounded it.
+///
+/// Decided on the bounded text, not the raw one: a name made of escape characters, or blank for
+/// its first [`TextLimit::ActivityName`] code points, is published as an empty or blank label, and
+/// the title is the better label than that.
+fn names_a_tool(name: &str) -> bool {
+    !normalize::bound_text(name, TextLimit::ActivityName)
+        .text
+        .trim()
+        .is_empty()
 }
 
 /// Which neutral bucket an ACP tool kind falls in.
@@ -1234,8 +1258,9 @@ pub fn stop_failure(stop_reason: StopReason) -> Option<VendorError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CallDigest, PLAN_CALL_ID, Reducer, SessionFact, TURN_INCOMPLETE_CODE, activity_kind,
-        content_detail, stop_failure, tool_call_content, was_cancelled,
+        CallDigest, PLAN_CALL_ID, Reducer, SessionFact, TURN_INCOMPLETE_CODE, TextLimit,
+        UNTITLED_TOOL_CALL, activity_kind, content_detail, names_a_tool, stop_failure,
+        tool_call_content, tool_name, was_cancelled,
     };
     use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolCallContent, ToolKind};
     use mango_external_agents::event::{
@@ -1465,7 +1490,7 @@ mod tests {
         assert_eq!(activity.title, "Run `cargo test`");
         assert_eq!(
             activity.name, "Run `cargo test`",
-            "expected the name to carry the title on the stable v1 wire"
+            "expected the name to carry the title when the agent sends no name"
         );
         assert_eq!(
             activity.item_id.as_deref(),
@@ -1474,10 +1499,19 @@ mod tests {
         );
     }
 
-    /// Schema 1.9 made `name` a stable field. It is not carried yet, so an agent that starts
-    /// sending one changes nothing a host sees.
+    /// The first started activity's name and title, as the reducer emitted them.
+    fn started_name_and_title(events: &[EventKind]) -> (String, String) {
+        let Some(EventKind::ActivityStarted { activity, .. }) = events.first() else {
+            panic!("expected a started activity | received {events:?}");
+        };
+        (activity.name.clone(), activity.title.clone())
+    }
+
+    /// `name` is a stable field of the v1 schema since 1.9: the tool's own identifier, apart from
+    /// the title that says what this one call is doing. Each has a slot of its own, so neither
+    /// replaces the other.
     #[test]
-    fn a_tool_calls_own_name_does_not_replace_the_title_as_the_activity_name() {
+    fn a_tool_calls_own_name_is_the_activity_name_beside_its_title() {
         let events = reduce(vec![json!({
             "sessionUpdate": "tool_call",
             "toolCallId": "call_1",
@@ -1486,13 +1520,210 @@ mod tests {
             "kind": "execute",
             "status": "in_progress"
         })]);
+        let (name, title) = started_name_and_title(&events);
+        assert_eq!(
+            name, "shell",
+            "expected activity name: \"shell\" | received: {name:?}"
+        );
+        assert_eq!(
+            title, "Run `cargo test`",
+            "expected activity title: \"Run `cargo test`\" | received: {title:?}"
+        );
+    }
+
+    /// No name is what every agent sent before 1.9, and ACP reads `null` as the same thing. A name
+    /// a host could not show (empty, blank, or nothing but characters the core strips) is no name
+    /// either: the title keeps the label instead of leaving it empty.
+    #[test]
+    fn a_tool_call_with_no_usable_name_keeps_the_title_as_the_activity_name() {
+        let blank_up_to_the_bound = " ".repeat(TextLimit::ActivityName.max_code_points()) + "shell";
+        for (case, name) in [
+            ("absent", None),
+            ("null", Some(serde_json::Value::Null)),
+            ("empty", Some(json!(""))),
+            ("blank", Some(json!(" \t\n"))),
+            ("only control characters", Some(json!("\u{1b}\u{7}\u{0}"))),
+            ("only an override and spaces", Some(json!(" \u{202e} "))),
+            ("blank up to the bound", Some(json!(blank_up_to_the_bound))),
+            ("not a string", Some(json!(7))),
+        ] {
+            let mut frame = json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1",
+                "title": "Run `cargo test`",
+                "kind": "execute"
+            });
+            if let Some(name) = name {
+                frame["name"] = name;
+            }
+            let (name, title) = started_name_and_title(&reduce(vec![frame]));
+            assert_eq!(
+                name, "Run `cargo test`",
+                "expected activity name for a name that is {case}: the title | received: {name:?}"
+            );
+            assert_eq!(
+                title, "Run `cargo test`",
+                "expected activity title for a name that is {case}: unchanged | received: {title:?}"
+            );
+        }
+    }
+
+    /// The choice itself, apart from any frame: a name is kept exactly as sent, and the title is
+    /// the answer whenever the bounded name would be an empty or blank label.
+    #[test]
+    fn tool_name_keeps_a_showable_name_verbatim_and_otherwise_answers_the_title() {
+        for (name, expected) in [
+            (Some("mcp__server__read_file"), "mcp__server__read_file"),
+            (Some(" padded "), " padded "),
+            (Some("\u{1b}[1mls"), "\u{1b}[1mls"),
+            (Some("\u{1b}"), "Title"),
+            (Some(""), "Title"),
+            (None, "Title"),
+        ] {
+            let received = tool_name(name.map(String::from), "Title");
+            assert_eq!(
+                received, expected,
+                "expected tool_name({name:?}, \"Title\"): {expected:?} | received: {received:?}"
+            );
+            let showable = name.is_some_and(names_a_tool);
+            assert_eq!(
+                showable,
+                expected != "Title",
+                "expected names_a_tool({name:?}): {} | received: {showable}",
+                expected != "Title"
+            );
+        }
+    }
+
+    /// A call first seen through `tool_call_update` is announced from that update, its name included.
+    #[test]
+    fn a_name_on_the_update_that_opens_a_call_is_the_activity_name() {
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_late",
+            "title": "Read src/lib.rs",
+            "name": "read_file",
+            "status": "in_progress"
+        })]);
+        let (name, title) = started_name_and_title(&events);
+        assert_eq!(
+            name, "read_file",
+            "expected activity name: \"read_file\" | received: {name:?}"
+        );
+        assert_eq!(
+            title, "Read src/lib.rs",
+            "expected activity title: \"Read src/lib.rs\" | received: {title:?}"
+        );
+
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_blind",
+            "name": "read_file"
+        })]);
+        let (name, title) = started_name_and_title(&events);
+        assert_eq!(
+            (name.as_str(), title.as_str()),
+            ("read_file", UNTITLED_TOOL_CALL),
+            "expected an untitled update-first call named \"read_file\" and titled \"tool\" | \
+             received: name {name:?}, title {title:?}"
+        );
+    }
+
+    /// One frame for the running `call_1`, reduced with no coalescing delay.
+    fn revise(reducer: &mut Reducer, frame: serde_json::Value) -> Vec<EventKind> {
+        reducer.update_at(update(frame), Instant::now()).0
+    }
+
+    /// [`ActivityUpdate`] has no name, so a running activity cannot be renamed. A name that arrives
+    /// after the start changes nothing, and above all it is not delivered as a title.
+    #[test]
+    fn a_name_that_arrives_after_a_call_started_does_not_rename_it() {
+        let mut reducer = Reducer::new().with_update_interval(Duration::ZERO);
+        let started = revise(
+            &mut reducer,
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1",
+                "title": "Run `cargo test`",
+                "kind": "execute"
+            }),
+        );
+        let (name, _) = started_name_and_title(&started);
+        assert_eq!(
+            name, "Run `cargo test`",
+            "expected activity name: the title | received: {name:?}"
+        );
+
+        let name_only = revise(
+            &mut reducer,
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "call_1", "name": "shell" }),
+        );
+        assert!(
+            name_only.is_empty(),
+            "expected no event for a name-only update of a running call | received: {name_only:?}"
+        );
+
+        for (frame_kind, sent_title) in [
+            ("tool_call_update", "Running `cargo test`"),
+            ("tool_call", "Run `cargo test` again"),
+        ] {
+            let events = revise(
+                &mut reducer,
+                json!({
+                    "sessionUpdate": frame_kind,
+                    "toolCallId": "call_1",
+                    "name": "shell",
+                    "title": sent_title
+                }),
+            );
+            let [EventKind::ActivityUpdated { update, .. }] = events.as_slice() else {
+                panic!("expected one update for a later {frame_kind} | received: {events:?}");
+            };
+            assert_eq!(
+                update.title.as_deref(),
+                Some(sent_title),
+                "expected update title after a later {frame_kind}: {sent_title:?} | received: {:?}",
+                update.title
+            );
+        }
+    }
+
+    /// The name is agent-controlled text like the title, and the core bounds it the same way when
+    /// the event is published: stripped of control characters and overrides, then cut.
+    #[test]
+    fn a_hostile_name_is_stripped_and_cut_by_the_core_like_a_title() {
+        let hostile = format!(
+            "\u{1b}[31mrm\u{0}\u{7} -rf\u{202e}\u{1b}]0;owned\u{7}{}",
+            "x".repeat(100_000)
+        );
+        let events = reduce(vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_1",
+            "title": "Delete",
+            "name": hostile
+        })]);
         let Some(EventKind::ActivityStarted { activity, .. }) = events.first() else {
             panic!("expected a started activity | received {events:?}");
         };
+        let published = activity.clone().normalized();
+        let limit = TextLimit::ActivityName.max_code_points();
+        let expected: String = format!("[31mrm -rf]0;owned{}", "x".repeat(limit))
+            .chars()
+            .take(limit)
+            .collect();
         assert_eq!(
-            activity.name, "Run `cargo test`",
-            "expected activity name: the title | received: {:?}",
-            activity.name
+            published.name, expected,
+            "expected published name: {limit} code points, no control character | received: {:?}",
+            published.name
+        );
+        assert!(
+            published.truncated,
+            "expected truncated: true for a cut name | received: false"
+        );
+        assert_eq!(
+            published.title, "Delete",
+            "expected published title: \"Delete\" | received: {:?}",
+            published.title
         );
     }
 
