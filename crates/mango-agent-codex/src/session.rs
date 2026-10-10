@@ -6751,13 +6751,12 @@ mod tests {
             interrupt_id: serde_json::Value,
         }
 
-        /// Limits short enough for a test on the real clock: a teardown takes well under a
-        /// second, and no request deadline is in reach.
+        /// Limits for a test on the real clock. Every deadline stays far out of reach, so a
+        /// stalled runner cannot turn a wait or a reap into a timeout; the fake child and link
+        /// answer at once, so nothing waits for one either.
         fn real_clock_limits() -> Limits {
             Limits {
                 request_timeout: std::time::Duration::from_secs(30),
-                shutdown_timeout: std::time::Duration::from_millis(100),
-                kill_grace: std::time::Duration::from_millis(20),
                 ..Limits::default()
             }
         }
@@ -7655,12 +7654,12 @@ mod tests {
             );
         }
 
-        /// The task committing a claimed terminal is gone for good: here the report of a dead
-        /// connection, parked after its claim and then stopped by the teardown's close. The
-        /// teardown waits `shutdown_timeout` for a commit that cannot come, and must then end the
-        /// turn itself instead of leaving the host's stream open on a slot nothing can claim.
+        /// A claimed terminal is never committed: here the report of a dead connection stays
+        /// parked after its claim, as a committer that is gone for good would leave things. The
+        /// teardown waits `shutdown_timeout` for the commit, and must then end the turn itself
+        /// instead of leaving the host's stream open on a slot nothing can claim.
         #[tokio::test(start_paused = true)]
-        async fn a_teardown_that_outlasts_a_dead_committer_fails_the_turn_itself() {
+        async fn a_teardown_that_outlasts_a_claimed_commit_fails_the_turn_itself() {
             let (shared, session, link, launcher, mut stream) = running_session().await;
             let shutdown_timeout = shared.host.limits().shutdown_timeout;
 
@@ -7683,11 +7682,12 @@ mod tests {
                 "expected the turn before the teardown's wait expired: still claimed | received: released"
             );
 
-            // The committer is never let go: the teardown's close stops it where it is parked.
+            // The committer is never let go: the teardown fails the turn, then its close stops
+            // the committer where it is parked.
             let events = kinds_or_no_terminal(&mut stream).await;
             assert!(
                 is_abandoned_terminal(&events),
-                "expected the terminal of a turn whose committer died: Error(terminal-abandoned) | received: {events:?}"
+                "expected the terminal of a turn nobody committed: Error(terminal-abandoned) | received: {events:?}"
             );
             assert!(
                 shared.turn.lock().await.is_none(),
@@ -7701,7 +7701,7 @@ mod tests {
                 .expect("expected the close task");
             assert!(
                 closed.is_ok(),
-                "expected the close after a dead committer: Ok(()) | received: {closed:?}"
+                "expected the close after the teardown failed the turn: Ok(()) | received: {closed:?}"
             );
             let live = launcher.live_children();
             assert_eq!(
@@ -8020,8 +8020,8 @@ mod tests {
         }
 
         /// A stop worker that sees work stopped can ask for the teardown between a `close` stopping
-        /// work and requesting it. The teardown still acts for the reason the host closed with,
-        /// which is what the turn's terminal and the host's process control are told.
+        /// work and requesting it. The two steps are made by hand here, in that order; the
+        /// teardown still acts for the reason the host closed with, read off the turn's terminal.
         #[tokio::test(start_paused = true)]
         async fn a_teardown_a_stop_asked_for_first_keeps_the_reason_the_host_closed_with() {
             use mango_external_agents::session::CloseReason;
