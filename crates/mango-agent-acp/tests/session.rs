@@ -4522,6 +4522,9 @@ mod burst;
 #[path = "session/edges.rs"]
 mod edges;
 
+#[path = "session/stray_lines.rs"]
+mod stray_lines;
+
 #[path = "session/prompt_frame.rs"]
 mod prompt_frame;
 

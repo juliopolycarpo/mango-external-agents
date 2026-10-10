@@ -11,6 +11,51 @@ fn chunks(count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The text of every `TextDelta`, in the order the host received them.
+fn delta_texts(events: &[EventKind]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|kind| match kind {
+            EventKind::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Asserts that a turn fed [`chunks`]`(expected)` delivered every one of them once, in the order
+/// the agent sent them, with the last one directly ahead of `Completed` and nothing after it.
+///
+/// A dropped tail and a terminal that overtook the last update both fail here: the first as a
+/// count, the second as the event found where the last chunk belongs.
+fn assert_every_chunk_precedes_completion(events: &[EventKind], expected: usize) {
+    let received = delta_texts(events);
+    let tail: Vec<&str> = received.iter().rev().take(3).rev().copied().collect();
+    assert_eq!(
+        received.len(),
+        expected,
+        "expected {expected} text deltas before the terminal | received {} ending with {tail:?}",
+        received.len()
+    );
+    for (index, text) in received.iter().enumerate() {
+        let wanted = format!("chunk {index}");
+        assert_eq!(
+            *text, wanted,
+            "expected text delta {index}: {wanted:?} | received: {text:?}"
+        );
+    }
+    let summary = |kind: &EventKind| match kind {
+        EventKind::TextDelta { text } => format!("TextDelta({text:?})"),
+        other => format!("{other:?}").chars().take(120).collect(),
+    };
+    let closing: Vec<String> = events.iter().rev().take(2).rev().map(summary).collect();
+    let last_chunk = format!("TextDelta({:?})", format!("chunk {}", expected - 1));
+    assert_eq!(
+        closing,
+        [last_chunk.clone(), String::from("Completed")],
+        "expected the turn to close with [{last_chunk}, Completed] | received {closing:?}"
+    );
+}
+
 async fn open_with(agent: FakeAcpAgent, limits: Limits) -> (Box<dyn Session>, FakeLauncher) {
     let launcher = FakeLauncher::new();
     launcher.push(agent.process());
@@ -50,20 +95,7 @@ async fn a_notification_burst_larger_than_the_request_cap_completes_the_turn() {
     }
 
     let events = drain(&mut turn).await;
-    let summary: Vec<String> = events
-        .iter()
-        .map(|kind| format!("{kind:?}").chars().take(80).collect())
-        .collect();
-    assert!(
-        matches!(events.last(), Some(EventKind::Completed))
-            && events
-                .iter()
-                .any(|kind| matches!(kind, EventKind::TextDelta { .. }))
-            && !events
-                .iter()
-                .any(|kind| matches!(kind, EventKind::Cancelled { .. })),
-        "expected streamed text then completion for a 400-notification batch under the default 64-request cap, received {summary:?}"
-    );
+    assert_every_chunk_precedes_completion(&events, 400);
     assert_eq!(
         session.snapshot().status,
         SessionStatus::Ready,
@@ -81,6 +113,86 @@ async fn a_notification_burst_larger_than_the_request_cap_completes_the_turn() {
         launcher.live_children(),
         0,
         "expected no live child after close"
+    );
+}
+
+/// How many updates the stalled-host turn streams, one frame each, ahead of its prompt response.
+///
+/// Under the default 64-message cap together with that response, so the whole turn can sit queued
+/// at the SDK boundary without tripping the transport budget.
+const STALLED_BURST: usize = 48;
+
+/// Waits for the turn's terminal to be committed without reading a single event of it.
+///
+/// The stall is this condition, not a number of yields: the host takes nothing off its stream
+/// until the library has finished the turn behind it.
+async fn terminal_committed_while_unread(
+    turn: &TurnStream,
+) -> mango_external_agents::TerminalStatus {
+    let waited = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = turn.terminal_status() {
+                return status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    waited.unwrap_or_else(|_| {
+        panic!(
+            "expected a committed terminal while the host is not reading | received: none within 5s"
+        )
+    })
+}
+
+/// A burst of updates directly followed by the prompt response, to a host that has stopped reading:
+/// the response ends the turn, so a terminal committed ahead of an update still in dispatch would
+/// silently drop that update rather than reorder it. Every update must be buffered, the last one
+/// included, before the terminal is.
+///
+/// The channel holds exactly what the turn emits, so it is full and unread when the response
+/// lands. One slot fewer ends the turn as `stream-overflow` instead, which the terminal assertion
+/// names, so a host that was in fact reading could not pass this by accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_ending_in_the_prompt_response_reaches_a_stalled_host_whole_and_in_order() {
+    let (session, launcher) = open_with(
+        FakeAcpAgent::new().with_updates(chunks(STALLED_BURST)),
+        Limits {
+            // `TurnStarted` and every chunk; the terminal has a reserve of its own.
+            turn_channel_capacity: STALLED_BURST + 1,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "stream to nobody"))
+        .await
+        .expect("expected a turn");
+
+    let status = terminal_committed_while_unread(&turn).await;
+    assert_eq!(
+        status,
+        mango_external_agents::TerminalStatus::Completed,
+        "expected the unread turn's terminal: Completed | received: {status:?}"
+    );
+
+    let events = drain(&mut turn).await;
+    assert_every_chunk_precedes_completion(&events, STALLED_BURST);
+    let status = session.snapshot().status;
+    assert_eq!(
+        status,
+        SessionStatus::Ready,
+        "expected session status after the stalled turn: Ready | received: {status:?}"
+    );
+    session
+        .close(CloseReason::Requested)
+        .await
+        .expect("expected a clean close");
+    assert_eq!(
+        launcher.live_children(),
+        0,
+        "expected live children after close: 0 | received: {}",
+        launcher.live_children()
     );
 }
 
