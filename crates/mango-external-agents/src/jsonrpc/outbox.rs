@@ -412,11 +412,11 @@ pub(super) struct Ticket {
 }
 
 /// A caller on its way to the link's lock, from before queueing began.
-pub(super) struct Direct {
-    budget: Arc<Budget>,
+pub(super) struct Direct<'a> {
+    budget: &'a Budget,
 }
 
-impl Drop for Direct {
+impl Drop for Direct<'_> {
     /// The caller has the lock, or gave up waiting for it.
     fn drop(&mut self) {
         let mut held = self
@@ -433,9 +433,9 @@ impl Drop for Direct {
 }
 
 /// How a caller that writes for itself gets the link.
-pub(super) enum Turn {
+pub(super) enum Turn<'a> {
     /// By waiting on the link's lock itself. Dropped once the caller holds it.
-    Direct(Direct),
+    Direct(Direct<'a>),
     /// The link, now.
     Now(SenderGuard),
     /// The link, when the writer has worked through what was queued first.
@@ -529,7 +529,7 @@ impl Outbox {
     /// free, since the caller is then first in line by any ordering; otherwise by a turn queued
     /// behind what is there. The check and the queueing happen under the lock frames are
     /// admitted under, so a turn and a frame cannot each be told it came first.
-    pub(super) fn turn(&self, sender: &Arc<Mutex<Box<dyn LinkSender>>>) -> Turn {
+    pub(super) fn turn(&self, sender: &Arc<Mutex<Box<dyn LinkSender>>>) -> Turn<'_> {
         let mut held = self
             .budget
             .held
@@ -538,7 +538,7 @@ impl Outbox {
         if !held.queueing {
             held.direct += 1;
             return Turn::Direct(Direct {
-                budget: Arc::clone(&self.budget),
+                budget: &self.budget,
             });
         }
         if held.frames == 0

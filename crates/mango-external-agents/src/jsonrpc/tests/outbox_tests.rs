@@ -167,21 +167,29 @@ async fn eventually<T>(what: &str, waiting: impl Future<Output = T>) -> T {
         })
 }
 
+/// Yields until `reached` holds, which a step of another task makes true.
+///
+/// Gives up after five seconds of the machine's own clock, not after a number of yields and not
+/// by the runtime's clock: how many yields another thread needs depends on the load, and a
+/// paused clock does not move while this task keeps yielding.
+async fn until(what: &str, mut reached: impl FnMut() -> bool) {
+    let began = std::time::Instant::now();
+    while !reached() {
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "expected {what} within 5s | received not yet"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Waits until the writer is inside the gated send, which is when the link is held.
 async fn link_held(gated: &Gated) -> Written {
     let held = gated
         .client
         .submit_notification("hold", json!({}))
         .expect("expected the held frame queued");
-    let mut yields = 0;
-    while !held.started() {
-        yields += 1;
-        assert!(
-            yields < 10_000,
-            "expected the writer to take the held frame: started | received still queued after {yields} yields"
-        );
-        tokio::task::yield_now().await;
-    }
+    until("the writer to take the held frame", || held.started()).await;
     held
 }
 
@@ -248,15 +256,10 @@ async fn a_waiting_caller_takes_its_turn_among_queued_frames() {
         tokio::spawn(async move { client.notify("second", json!({})).await })
     };
     // The waiting caller has queued its turn once the outbox counts it.
-    let mut yields = 0;
-    while !second.is_finished() && gated.client.state.outbox.turns() == 0 {
-        yields += 1;
-        assert!(
-            yields < 10_000,
-            "expected the waiting caller's turn queued: 1 | received 0 after {yields} yields"
-        );
-        tokio::task::yield_now().await;
-    }
+    until("the waiting caller's turn queued", || {
+        second.is_finished() || gated.client.state.outbox.turns() == 1
+    })
+    .await;
     let third = gated
         .client
         .submit_notification("third", json!({}))
@@ -817,12 +820,7 @@ async fn frames_queued_before_a_close_are_dealt_with_before_the_link_closes() {
         let client = Arc::clone(&gated.client);
         tokio::spawn(async move { client.close().await })
     };
-    let mut yields = 0;
-    while !gated.client.is_closed() {
-        yields += 1;
-        assert!(yields < 10_000, "expected the close to have begun");
-        tokio::task::yield_now().await;
-    }
+    until("the close to have begun", || gated.client.is_closed()).await;
     let late = gated.client.submit_notification("late", json!({}));
     assert!(
         matches!(late, Err(Error::Closed { subject: "link" })),
@@ -946,12 +944,15 @@ async fn a_submitted_request_times_out_from_when_it_was_queued() {
     assert_eq!(gated.client.ended(), None);
     assert_eq!(began.elapsed(), Duration::from_secs(2));
     // The reply is gone, and with it the call's entry. The drop may have had to defer that.
-    let mut yields = 0;
-    while !gated.client.state.pending.lock().await.is_empty() {
-        yields += 1;
-        assert!(yields < 10_000, "expected the abandoned call cleaned up");
-        tokio::task::yield_now().await;
-    }
+    until("the abandoned call cleaned up", || {
+        gated
+            .client
+            .state
+            .pending
+            .try_lock()
+            .is_ok_and(|pending| pending.is_empty())
+    })
+    .await;
     gated.client.close().await.expect("expected a clean close");
 }
 
@@ -1478,19 +1479,6 @@ async fn a_waiting_callers_frame_is_not_measured_against_the_queue_bounds() {
     assert_eq!(gated.link.sent().len(), 1);
     assert!(!gated.client.is_closed());
     gated.client.close().await.expect("expected a clean close");
-}
-
-/// Yields until `reached` holds, which a step of another task makes true. Counted, not timed.
-async fn until(what: &str, mut reached: impl FnMut() -> bool) {
-    let mut yields = 0;
-    while !reached() {
-        yields += 1;
-        assert!(
-            yields < 100_000,
-            "expected {what} | received not yet after {yields} yields"
-        );
-        tokio::task::yield_now().await;
-    }
 }
 
 fn spawn_notify(gated: &Gated, method: &'static str) -> tokio::task::JoinHandle<crate::Result<()>> {
