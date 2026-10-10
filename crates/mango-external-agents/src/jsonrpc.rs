@@ -294,6 +294,58 @@ pub trait PeerHandler: Send + Sync {
     /// A handler can release state that only a complete vendor turn would otherwise clear. This
     /// callback is never made for [`Client::close`], whose caller already owns that shutdown.
     async fn on_terminated(&self, _termination: PeerTermination) {}
+
+    /// Whether a call to [`on_notification`](Self::on_notification) that is in progress when
+    /// the connection is cut short is let finish. `false` unless a handler says otherwise.
+    ///
+    /// Two ends of a connection stop the handler's task without draining its queue: the peer
+    /// passing a budget, and [`Client::close`]. By default the call in progress is cancelled
+    /// where it stands, at whichever of its awaits it had reached, which is safe only for a
+    /// handler that keeps nothing half-done across an await. A handler that does (one that has
+    /// claimed something it releases further down) returns `true` here. The call in progress
+    /// then gets up to [`ClientOptions::shutdown_timeout`] to return, and is cancelled only
+    /// after that; a host that stopped reading cannot hold the connection's end for longer.
+    ///
+    /// For such a handler, what is still queued once the end has been noticed is neither
+    /// started nor delivered, beyond at most the one item its task had already taken up.
+    /// [`on_terminated`](Self::on_terminated) comes after the handler's task has stopped, as
+    /// for any handler.
+    ///
+    /// The call is not waited for in three cases. Dropping the [`Client`] cannot wait and
+    /// cancels it. A [`Client::close`] made from inside the call cannot wait for the call it
+    /// is made from, and cancels it as it always did; one made on another task that the call
+    /// then awaits is waited out for the whole grace, each waiting for the other, so do not
+    /// write that. And a close whose caller gives it up during the grace, by dropping it or
+    /// timing it out, stops the task there and then, even when the reader or another close is
+    /// still waiting for the same call. A close waits for the call while it waits for the answers this side still owes
+    /// the peer, so it takes no longer than [`Client::close`] documents.
+    ///
+    /// Read once, when the client connects.
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::{PeerHandler, RequestId, ServerRequestOutcome};
+    /// use serde_json::Value;
+    ///
+    /// struct Careful;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl PeerHandler for Careful {
+    ///     async fn on_notification(&self, _method: String, _params: Value) {}
+    ///
+    ///     async fn on_request(&self, _: String, _: Value, _: RequestId) -> ServerRequestOutcome {
+    ///         ServerRequestOutcome::Answer(Value::Null)
+    ///     }
+    ///
+    ///     fn finishes_notification_in_progress(&self) -> bool {
+    ///         true
+    ///     }
+    /// }
+    ///
+    /// assert!(Careful.finishes_notification_in_progress());
+    /// ```
+    fn finishes_notification_in_progress(&self) -> bool {
+        false
+    }
 }
 
 /// How this client speaks.
@@ -658,7 +710,9 @@ impl RequestOptions {
     /// exited or the link failed still reaches its caller once the notifications ahead of it have
     /// been handled, and a request the peer never answered fails only after that drain, which
     /// [`ClientOptions::shutdown_timeout`] bounds. [`Client::close`] and a queue overflow do not
-    /// drain: they fail the call at once.
+    /// drain. They fail the call at once, or, when its answer was already queued behind a
+    /// notification call that [`PeerHandler::finishes_notification_in_progress`] lets finish,
+    /// when that call returns or its grace runs out.
     ///
     /// A request [`without_deadline`](Self::without_deadline) waits in that queue for as long
     /// as the handler takes: an `on_notification` that never returns holds its answer back
@@ -1087,6 +1141,14 @@ struct ClientState {
     /// can queue a frame exactly there.
     #[cfg(test)]
     after_seal: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when a stop has found the handler's task outside a call and before it cancels
+    /// the task, so a test can give the task time to begin one if it wrongly would.
+    #[cfg(test)]
+    after_no_call_found: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when the handler's task has taken a notification and before it says it is in
+    /// a call, so a test can have a stop land exactly there.
+    #[cfg(test)]
+    before_call_claimed: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The connection's runtime also owns cleanup when a request is dropped on another thread.
     runtime: tokio::runtime::Handle,
     options: ClientOptions,
@@ -1116,6 +1178,18 @@ struct ClientState {
     /// of `notifications` to wait on it, and a close or a drop that lands in that drain still
     /// has to stop the task, with whatever its queue holds.
     worker_abort: OnceLock<tokio::task::AbortHandle>,
+    /// What the handler said of itself: a notification call in progress is let finish, within
+    /// the shutdown grace, when the connection is cut short.
+    finishes_notification: bool,
+    /// Raised when the handler's task is to stop once the call it is in has returned.
+    worker_stopping: AtomicBool,
+    /// Cancelled when the handler's task has stopped, however it stopped.
+    worker_stopped: CancelToken,
+    /// Whether the handler's task is inside `on_notification`, or about to be. Raised before
+    /// the task reads `worker_stopping` and read after that flag is raised, so one side always
+    /// sees the other: a task found outside a call is not cancelled inside one it went on to
+    /// begin.
+    in_notification: AtomicBool,
     /// Runs once between the two reads the reader admits a notification on, so a test can place
     /// the worker's dequeue exactly there.
     #[cfg(test)]
@@ -1201,6 +1275,15 @@ impl Drop for PoisonUnlessClosed<'_> {
         if last && !self.state.close_reached_link.load(Ordering::Acquire) {
             self.state.link_poisoned.store(true, Ordering::Release);
         }
+    }
+}
+
+/// Says the handler's task has stopped, when it is dropped with that task.
+struct WorkerStopped(CancelToken);
+
+impl Drop for WorkerStopped {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -1470,6 +1553,10 @@ impl Client {
             after_turn_decided: StdMutex::new(None),
             #[cfg(test)]
             after_seal: StdMutex::new(None),
+            #[cfg(test)]
+            after_no_call_found: StdMutex::new(None),
+            #[cfg(test)]
+            before_call_claimed: StdMutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
@@ -1482,6 +1569,10 @@ impl Client {
             in_flight: StdMutex::new(JoinSet::new()),
             notifications: StdMutex::new(None),
             worker_abort: OnceLock::new(),
+            finishes_notification: handler.finishes_notification_in_progress(),
+            worker_stopping: AtomicBool::new(false),
+            worker_stopped: CancelToken::new(),
+            in_notification: AtomicBool::new(false),
             #[cfg(test)]
             after_queue_length_read: StdMutex::new(None),
             peer_bytes,
@@ -1492,11 +1583,18 @@ impl Client {
         let writer = tokio::spawn(outbox::run(Arc::clone(&state), entries));
         let _ = state.writer_abort.set(writer.abort_handle());
         let (notifications, notification_receiver) = mpsc::channel(queue_capacity);
-        let worker = tokio::spawn(peer_work_pump(
+        // Held by the task's future from the moment it exists, so it is dropped with the task
+        // however the task ends: returned, cancelled mid-call, or cancelled before it ever ran.
+        let stopped = WorkerStopped(state.worker_stopped.clone());
+        let work = peer_work_pump(
             Arc::clone(&state),
             notification_receiver,
             Arc::clone(&handler),
-        ));
+        );
+        let worker = tokio::spawn(async move {
+            let _stopped = stopped;
+            work.await;
+        });
         let _ = state.worker_abort.set(worker.abort_handle());
         *state
             .notifications
@@ -1835,7 +1933,10 @@ impl Client {
     /// owes the peer to be written, and once for what was queued before the close to be written
     /// and the link closed. Both waits are over at once on a link that takes its writes. The
     /// handler's tasks are cancelled, not waited out, which takes no time unless a handler is
-    /// blocking its thread without yielding; nothing here can bound that. A caller that wants
+    /// blocking its thread without yielding; nothing here can bound that. The one exception is
+    /// a notification call in progress whose handler asked for it to finish
+    /// ([`PeerHandler::finishes_notification_in_progress`]): it is waited for during the first
+    /// of the two waits, so the bound is the same. A caller that wants
     /// a tighter bound puts its own timeout around this future or drops it: that is safe at any
     /// point, and leaves the link as the last paragraph below describes.
     ///
@@ -1879,14 +1980,22 @@ impl Client {
         // Closes running at once answer for the link together: one that gives up while another
         // is still writing what was queued does not take the link from under it.
         let mut giving_up = PoisonUnlessClosed::begin(&self.state);
+        self.state.ask_handler_task_to_stop();
         self.state.fail_pending(failure).await;
-        self.state.stop_notifications().await;
         // The peer's own questions are answered on tasks of their own, and one waiting for a
         // person would otherwise outlive the client that spawned it — holding its share of the
         // state for the rest of the process, and replying into a link that is already gone. The
         // shutdown flag has already reached them, so this is the moment they need to write the
         // refusal, and it happens before the link is closed under them.
-        self.state.drain_in_flight().await;
+        //
+        // A notification call its handler asked to finish gets the same grace, at the same
+        // time: the two waits overlap, so the close takes no longer for it.
+        if self.state.finishes_notification {
+            self.state.finish_notification_and_drain_in_flight().await;
+        } else {
+            self.state.stop_notifications().await;
+            self.state.drain_in_flight().await;
+        }
 
         let closed = tokio::time::timeout(self.state.options.shutdown_timeout, async {
             // Behind whatever is already queued, as a close has always waited its turn behind
@@ -2184,6 +2293,74 @@ impl ClientState {
         if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
+        }
+    }
+
+    /// Tells the handler's task to take up nothing more, for a handler that asked to finish
+    /// its calls. Raised as soon as the connection is known to be cut short, so that what is
+    /// queued from then on is neither started nor delivered.
+    fn ask_handler_task_to_stop(&self) {
+        if self.finishes_notification {
+            self.worker_stopping.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether a notification call is in progress that is to be waited for. Read after the
+    /// stop was asked for; the task says it is in a call before it looks for a stop. Whichever
+    /// the interleaving, a task this finds outside a call will see the stop before it begins
+    /// one.
+    fn notification_call_to_wait_for(&self) -> bool {
+        self.ask_handler_task_to_stop();
+        // A call that asks for the stop itself cannot be waited for by the stop.
+        let waited_for =
+            self.in_notification.load(Ordering::SeqCst) && !self.handling_own_notification();
+        #[cfg(test)]
+        if !waited_for {
+            Self::run_hook(&self.after_no_call_found);
+        }
+        waited_for
+    }
+
+    /// Waits for the notification call in progress to return, for as long as the shutdown
+    /// grace, and stops the handler's task.
+    async fn wait_for_notification_call(&self) {
+        // Whoever gives this wait up, a close that was dropped or timed out by its caller,
+        // must not leave the task running a call nobody is waiting for any more.
+        struct StopUnlessWaitedOut<'a>(&'a ClientState, bool);
+        impl Drop for StopUnlessWaitedOut<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.abort_worker();
+                }
+            }
+        }
+        let mut stop = StopUnlessWaitedOut(self, false);
+        // Waited for through the task's own signal and not its join handle: a close and the
+        // reader can both be here, and each has to see the task stopped before it goes on.
+        let _ = tokio::time::timeout(
+            self.options.shutdown_timeout,
+            self.worker_stopped.cancelled(),
+        )
+        .await;
+        // Still there: out of grace.
+        self.stop_notifications().await;
+        self.worker_stopped.cancelled().await;
+        stop.1 = true;
+    }
+
+    /// Stops the handler's task once the call it is in has returned, or when the shutdown grace
+    /// runs out, while the answers this side still owes the peer are written.
+    ///
+    /// The two waits overlap only when there is a call to wait for. With none, the task is
+    /// stopped first, as for a handler that did not ask: an answer task it might still have
+    /// spawned is then among those waited for.
+    async fn finish_notification_and_drain_in_flight(&self) {
+        if self.notification_call_to_wait_for() {
+            tokio::join!(self.wait_for_notification_call(), self.drain_in_flight());
+        } else {
+            self.stop_notifications().await;
+            self.worker_stopped.cancelled().await;
+            self.drain_in_flight().await;
         }
     }
 
@@ -2881,10 +3058,19 @@ async fn pump(
                     );
                     let termination = failure.termination(termination);
                     state.mark_closed();
+                    state.ask_handler_task_to_stop();
                     state.fail_pending(failure).await;
-                    state.stop_notifications().await;
-                    state.shutdown.cancel();
-                    state.drain_in_flight().await;
+                    if state.finishes_notification {
+                        // As a close does it: the shutdown flag first, so whatever the call in
+                        // progress is waiting on that the flag releases lets it return, and the
+                        // two waits at once, so the handler is told within one grace.
+                        state.shutdown.cancel();
+                        state.finish_notification_and_drain_in_flight().await;
+                    } else {
+                        state.stop_notifications().await;
+                        state.shutdown.cancel();
+                        state.drain_in_flight().await;
+                    }
                     handler.on_terminated(termination).await;
                     break;
                 }
@@ -3098,7 +3284,14 @@ async fn peer_work_pump(
     mut notifications: mpsc::Receiver<QueuedWork>,
     handler: Arc<dyn PeerHandler>,
 ) {
+    // Read once: a handler that did not ask to finish its calls pays for none of this.
+    let finishes = state.finishes_notification;
     while let Some(queued) = notifications.recv().await {
+        // Asked to stop: nothing more is taken up, whatever kind of work it is. An answer
+        // that was waiting its turn is failed as the queue is dropped.
+        if finishes && state.worker_stopping.load(Ordering::SeqCst) {
+            break;
+        }
         let (work, _permit) = match queued {
             QueuedWork::Response(answer) => {
                 // Everything read before this response has been handed to the handler and, for a
@@ -3110,9 +3303,27 @@ async fn peer_work_pump(
         };
         match work {
             PeerWork::Notification { method, params } => {
+                if finishes {
+                    #[cfg(test)]
+                    ClientState::run_hook(&state.before_call_claimed);
+                    // Raised before the stop flag is read, as the stopper raises that flag
+                    // before it reads this one.
+                    state.in_notification.store(true, Ordering::SeqCst);
+                    if state.worker_stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
                 HANDLING_NOTIFICATION_FOR
                     .scope(state.address(), handler.on_notification(method, params))
-                    .await
+                    .await;
+                if finishes {
+                    state.in_notification.store(false, Ordering::SeqCst);
+                    // Whoever asked for the stop is waiting for exactly this, and with nothing
+                    // queued behind the call nothing else would wake this task to see it.
+                    if state.worker_stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
             }
             PeerWork::Request { method, params, id } => {
                 // A question that waits for a person must not stop later events after it has
@@ -3218,6 +3429,7 @@ const FRAME_BYTES: &str = "bytes of one outgoing JSON-RPC frame";
 
 #[cfg(test)]
 mod tests {
+    mod handler_grace_tests;
     mod handoff_queue_tests;
     mod ordered_response_tests;
     mod outbox_tests;
