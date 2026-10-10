@@ -9,6 +9,7 @@ use super::outbox_tests::{
 use super::*;
 use crate::jsonrpc::{CallFailureCause, ConnectionEnd, Reply, WireOptions};
 use std::pin::Pin;
+use std::sync::PoisonError;
 
 const LONG: Duration = Duration::from_secs(60 * 60);
 
@@ -364,7 +365,6 @@ async fn a_failed_reply_names_the_request_it_was_for() {
 
 /// From the moment a close begins the queue takes nothing more. A caller that read the client
 /// as open an instant earlier is refused as it queues: nothing of its frame is held or written.
-#[tokio::test]
 async fn a_frame_queued_after_a_close_began_is_refused_and_never_written() {
     let gated = gated(options(), WireOptions::new());
     let held = link_held(&gated).await;
@@ -421,7 +421,6 @@ async fn a_frame_queued_after_a_close_began_is_refused_and_never_written() {
 
 /// A request that got into the queue ahead of a close is a frame queued before it: not written,
 /// its write reported as never begun, with the close as the typed reason for both halves.
-#[tokio::test]
 async fn a_request_queued_ahead_of_a_close_is_refused_unwritten_with_the_close_as_its_reason() {
     let gated = gated(options(), WireOptions::new());
     let held = link_held(&gated).await;
@@ -737,6 +736,7 @@ async fn frames_queued_around_a_close() -> (usize, usize) {
             go.wait().await;
             // (tag, is a request, outcome of the write, whether the write began)
             let mut fates = Vec::new();
+            let mut replies = Vec::new();
             for round in 0..ROUNDS {
                 let tag = (caller * ROUNDS + round) as u64;
                 let params = json!({"tag": tag});
@@ -768,11 +768,23 @@ async fn frames_queued_around_a_close() -> (usize, usize) {
                             let (mut written, reply) = submitted.into_parts();
                             let outcome = within("a request's write", &mut written).await;
                             fates.push((tag, true, outcome, written.started()));
-                            drop(reply);
+                            replies.push((tag, reply));
                         }
                     }
                 }
                 tokio::task::yield_now().await;
+            }
+            // The peer answers nothing, so every reply is ended by the close, once: as a call
+            // the close failed, or as a frame it kept from being written.
+            for (tag, reply) in replies {
+                let (cause, _) = failure(within("a request's reply", reply).await);
+                assert!(
+                    matches!(
+                        cause,
+                        CallFailureCause::Ended(ConnectionEnd::Closed) | CallFailureCause::Unwritten
+                    ),
+                    "expected the reply ended by the close: Ended(Closed) or Unwritten | received {cause:?} for {tag}"
+                );
             }
             fates
         }));
@@ -834,7 +846,6 @@ async fn frames_queued_around_a_close() -> (usize, usize) {
 
 /// A frame that comes after the peer has gone, or after it passed an inbound budget, is turned
 /// away by the queue like one that comes after a close: nothing of it is queued or written.
-#[tokio::test]
 async fn a_frame_queued_after_the_connection_ended_under_this_side_is_refused() {
     for ending in ["exit", "inbound overflow"] {
         let link = ScriptedLink::new();
@@ -884,7 +895,6 @@ async fn a_frame_queued_after_the_connection_ended_under_this_side_is_refused() 
 
 /// A frame that comes too late is refused for that, before the queue's bounds are looked at: a
 /// full queue does not turn a late frame into a peer that stopped reading.
-#[tokio::test]
 async fn a_late_frame_is_refused_as_late_even_when_the_queue_is_full() {
     let gated = gated(options(), limits(usize::MAX, usize::MAX, 1));
     let held = link_held(&gated).await;
@@ -976,4 +986,414 @@ async fn a_waiting_request_that_times_out_leaves_no_pending_entry() {
     })
     .await;
     gated.client.close().await.expect("expected a clean close");
+}
+
+/// A receiving half whose read fails once it is told to, as a carrier that broke would.
+struct FailingReceiver {
+    fail: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::link::LinkReceiver for FailingReceiver {
+    async fn recv(&mut self) -> crate::error::Result<Option<String>> {
+        self.fail.notified().await;
+        Err(Error::Link {
+            peer: String::from("fake peer"),
+            message: String::from("the read failed"),
+        })
+    }
+}
+
+/// A client whose sends are recorded by `link` and whose next read fails when `fail` is told.
+fn client_with_a_failing_read(link: &ScriptedLink) -> (Arc<RecordingHandler>, Arc<Notify>, Client) {
+    let (sender, _receiver) = link.clone().into_link().split();
+    let fail = Arc::new(Notify::new());
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect(
+        crate::link::Link::new(
+            sender,
+            Box::new(FailingReceiver {
+                fail: Arc::clone(&fail),
+            }),
+        ),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    (handler, fail, client)
+}
+
+/// A read that fails ends the connection with the sending half still good. A frame queued after
+/// that is refused like one queued after any other end, not written into a connection already
+/// reported ended.
+async fn a_frame_queued_after_a_read_failed_is_refused_and_never_written() {
+    let link = ScriptedLink::new();
+    let (handler, fail, client) = client_with_a_failing_read(&link);
+    fail.notify_one();
+    let termination = one_termination(&handler).await;
+    assert!(
+        matches!(&termination, PeerTermination::LinkFailed(cause) if cause.contains("the read failed")),
+        "expected the link failed by the read: LinkFailed(.. the read failed ..) | received {termination:?}"
+    );
+
+    // What `submit_*` runs once it has read the client as open.
+    let notification = client.queue_notification("late", json!({}));
+    assert!(
+        matches!(&notification, Err(Error::Closed { subject: "link" })),
+        "expected a notification after the failed read refused: Err(Closed(link)) | received {notification:?}"
+    );
+    let request = client.queue_request("late", json!({}), RequestOptions::new());
+    assert!(
+        matches!(&request, Err(Error::Closed { subject: "link" })),
+        "expected a request after the failed read refused: Err(Closed(link)) | received {request:?}"
+    );
+    let on_wire = link.sent();
+    assert!(
+        on_wire.is_empty(),
+        "expected nothing written after the failed read: [] | received {on_wire:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// The queue is sealed before the closed flag goes up. A frame that arrives between the two, on
+/// a queue that is full, is refused as late. Measured against the bounds instead, it would be
+/// taken for a peer that stopped reading and end the connection under the close.
+#[tokio::test]
+async fn a_frame_queued_between_the_seal_and_the_closed_flag_is_refused_as_late() {
+    let gated = gated(options(), limits(usize::MAX, usize::MAX, 1));
+    let held = link_held(&gated).await;
+    // What the caller in the window saw: (the closed flag, what queueing its frame returned).
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    {
+        let client = Arc::clone(&gated.client);
+        let seen = Arc::clone(&seen);
+        *gated
+            .client
+            .state
+            .after_seal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
+            let outcome = client.queue_notification("late", json!({}));
+            *seen.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some((client.is_closed(), outcome.map(drop)));
+        }));
+    }
+    let closing = {
+        let client = Arc::clone(&gated.client);
+        tokio::spawn(async move { client.close().await })
+    };
+    until("the close to have begun", || gated.client.is_closed()).await;
+
+    let seen = seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .expect("expected the hook to have run");
+    assert!(
+        matches!(&seen, (false, Err(Error::Closed { subject: "link" }))),
+        "expected the frame in the window refused as late, with the flag still down: (false, Err(Closed(link))) | received {seen:?}"
+    );
+    gated.gate.add_permits(1);
+    within("the held frame", held)
+        .await
+        .expect("expected the frame queued before the close still written");
+    within("the close", closing)
+        .await
+        .expect("expected the close task to finish")
+        .expect("expected a clean close");
+    assert_ended(&gated.client, Some(ConnectionEnd::Closed));
+    let terminations = gated.handler.terminations.lock().await.clone();
+    assert!(
+        terminations.is_empty(),
+        "expected no termination from a late frame: [] | received {terminations:?}"
+    );
+}
+
+/// A request that asked for its answer in order and raced a close is refused for the close,
+/// with the ordered reserve full: too late is said before a place is asked for.
+async fn a_late_ordered_request_is_refused_for_the_close_with_the_ordered_reserve_full() {
+    let gated = gated(one_place(), WireOptions::new());
+    let (written, _reply) = gated
+        .client
+        .submit_request("session/prompt", json!({}), prompt())
+        .expect("expected the prompt queued")
+        .into_parts();
+    within("the prompt's write", written)
+        .await
+        .expect("expected the prompt written");
+    let places = gated.client.state.ordered_places.available_permits();
+    assert_eq!(
+        places, 0,
+        "expected the ordered reserve full: 0 places | received {places}"
+    );
+    let map = gated.client.state.pending.lock().await;
+    let closing = {
+        let client = Arc::clone(&gated.client);
+        tokio::spawn(async move { client.close().await })
+    };
+    until("the close to have begun", || gated.client.is_closed()).await;
+
+    let late = gated
+        .client
+        .queue_request("session/prompt", json!({}), prompt());
+    assert!(
+        matches!(&late, Err(Error::Closed { subject: "link" })),
+        "expected the late ordered request refused for the close: Err(Closed(link)) | received {late:?}"
+    );
+    drop(map);
+    within("the close", closing)
+        .await
+        .expect("expected the close task to finish")
+        .expect("expected a clean close");
+}
+
+/// With no deadline, every end of the connection has to end the wait. The peer's exit and a
+/// close are covered above; these are the client being dropped, the link failing and this
+/// side's own outbound budget being passed.
+#[tokio::test(start_paused = true)]
+async fn a_request_without_a_deadline_is_ended_by_a_dropped_client() {
+    let gated = gated(options(), WireOptions::new());
+    let (written, reply) = gated
+        .client
+        .submit_request("session/prompt", json!({}), unbounded())
+        .expect("expected the request queued")
+        .into_parts();
+    eventually("the request written", written)
+        .await
+        .expect("expected the request written");
+    tokio::time::sleep(LONG).await;
+    let began = tokio::time::Instant::now();
+
+    let Gated { client, .. } = gated;
+    drop(Arc::into_inner(client).expect("expected the test to own the client"));
+    let (cause, _) = failure(eventually("the reply", reply).await);
+    let waited = began.elapsed();
+    assert_eq!(
+        (&cause, waited),
+        (
+            &CallFailureCause::Ended(ConnectionEnd::Closed),
+            Duration::ZERO
+        ),
+        "expected the reply ended by the drop at once: (Ended(Closed), 0s) | received ({cause:?}, {waited:?})"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_without_a_deadline_is_ended_by_a_failed_link() {
+    let link = ScriptedLink::new();
+    let (handler, fail, client) = client_with_a_failing_read(&link);
+    let (written, reply) = client
+        .submit_request("session/prompt", json!({}), unbounded())
+        .expect("expected the request queued")
+        .into_parts();
+    eventually("the request written", written)
+        .await
+        .expect("expected the request written");
+    tokio::time::sleep(LONG).await;
+
+    fail.notify_one();
+    let termination = one_termination(&handler).await;
+    let (cause, _) = failure(eventually("the reply", reply).await);
+    assert_eq!(
+        cause,
+        CallFailureCause::Ended(ConnectionEnd::Peer(termination.clone())),
+        "expected the reply ended by the failed link: Ended(Peer({termination:?})) | received {cause:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_without_a_deadline_is_ended_by_an_outbound_overflow() {
+    let gated = gated(options(), limits(usize::MAX, usize::MAX, 1));
+    let (written, reply) = gated
+        .client
+        .submit_request("session/prompt", json!({}), unbounded())
+        .expect("expected the request queued")
+        .into_parts();
+    eventually("the request written", written)
+        .await
+        .expect("expected the request written");
+    tokio::time::sleep(LONG).await;
+
+    let _held = link_held(&gated).await;
+    let refused = gated.client.submit_notification("one-too-many", json!({}));
+    assert!(
+        refused.is_err(),
+        "expected the frame past the budget refused: Err | received {refused:?}"
+    );
+    let termination = one_termination(&gated.handler).await;
+    let (cause, _) = failure(eventually("the reply", reply).await);
+    assert!(
+        matches!(&termination, PeerTermination::OutboundBackpressure { .. })
+            && cause == CallFailureCause::Ended(ConnectionEnd::Peer(termination.clone())),
+        "expected the reply ended by the outbound overflow: Ended(Peer(OutboundBackpressure)) | received {cause:?} with {termination:?}"
+    );
+    gated.gate.add_permits(1);
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// A prompt-shaped request given up by its caller leaves nothing behind: its entry among the
+/// calls awaiting an answer goes, and so does its place in the ordered reserve.
+async fn a_prompt_shaped_request_given_up_gives_back_its_entry_and_its_ordered_place() {
+    let gated = gated(one_place(), WireOptions::new());
+    let (written, reply) = gated
+        .client
+        .submit_request("session/prompt", json!({}), prompt())
+        .expect("expected the prompt queued")
+        .into_parts();
+    within("the prompt's write", written)
+        .await
+        .expect("expected the prompt written");
+    let holding = (
+        gated.client.state.pending.lock().await.len(),
+        gated.client.state.ordered_places.available_permits(),
+    );
+    assert_eq!(
+        holding,
+        (1, 0),
+        "expected the prompt to hold one entry and the one ordered place: (1, 0) | received {holding:?}"
+    );
+
+    drop(reply);
+    until("the abandoned prompt's entry and place given back", || {
+        gated
+            .client
+            .state
+            .pending
+            .try_lock()
+            .is_ok_and(|pending| pending.is_empty())
+            && gated.client.state.ordered_places.available_permits() == 1
+    })
+    .await;
+    let again = gated
+        .client
+        .submit_request("session/prompt", json!({}), prompt());
+    assert!(
+        again.is_ok(),
+        "expected the next prompt admitted into the place given back: Ok | received {again:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// `request` and `notify` write for themselves and do not pass through the queue. On a
+/// connection that has ended they are what they were: a request is refused as closed, and a
+/// notification is dropped without a word. Neither reaches the link.
+#[tokio::test]
+async fn waiting_calls_made_after_the_connection_ended_are_refused_or_dropped_as_before() {
+    for ending in ["close", "exit"] {
+        let gated = gated(options(), WireOptions::new());
+        if ending == "close" {
+            gated.client.close().await.expect("expected a clean close");
+        } else {
+            gated.link.end();
+            one_termination(&gated.handler).await;
+        }
+
+        let asked = gated
+            .client
+            .request::<_, Value>("session/list", json!({}))
+            .await;
+        assert!(
+            matches!(&asked, Err(Error::Closed { subject: "link" })),
+            "expected a request after the {ending} refused: Err(Closed(link)) | received {asked:?}"
+        );
+        let told = gated.client.notify("session/cancel", json!({})).await;
+        assert!(
+            told.is_ok(),
+            "expected a notification after the {ending} dropped without an error: Ok(()) | received {told:?}"
+        );
+        let on_wire = gated.link.sent();
+        let handed_late = gated.link.refused_sends();
+        assert!(
+            on_wire.is_empty() && handed_late == 0,
+            "expected nothing handed to the link after the {ending}: ([], 0) | received ({on_wire:?}, {handed_late})"
+        );
+        gated.client.close().await.expect("expected a clean close");
+    }
+}
+
+/// The tests above that place a frame around an end of the connection, on one thread and on
+/// four.
+mod on_either_runtime {
+    #[tokio::test]
+    async fn a_frame_queued_after_a_close_began_is_refused_and_never_written_on_one_thread() {
+        super::a_frame_queued_after_a_close_began_is_refused_and_never_written().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_frame_queued_after_a_close_began_is_refused_and_never_written_on_four_threads() {
+        super::a_frame_queued_after_a_close_began_is_refused_and_never_written().await;
+    }
+
+    #[tokio::test]
+    async fn a_request_queued_ahead_of_a_close_is_refused_unwritten_with_the_close_as_its_reason_on_one_thread()
+     {
+        super::a_request_queued_ahead_of_a_close_is_refused_unwritten_with_the_close_as_its_reason(
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_queued_ahead_of_a_close_is_refused_unwritten_with_the_close_as_its_reason_on_four_threads()
+     {
+        super::a_request_queued_ahead_of_a_close_is_refused_unwritten_with_the_close_as_its_reason(
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_late_frame_is_refused_as_late_even_when_the_queue_is_full_on_one_thread() {
+        super::a_late_frame_is_refused_as_late_even_when_the_queue_is_full().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_frame_is_refused_as_late_even_when_the_queue_is_full_on_four_threads() {
+        super::a_late_frame_is_refused_as_late_even_when_the_queue_is_full().await;
+    }
+
+    #[tokio::test]
+    async fn a_frame_queued_after_a_read_failed_is_refused_and_never_written_on_one_thread() {
+        super::a_frame_queued_after_a_read_failed_is_refused_and_never_written().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_frame_queued_after_a_read_failed_is_refused_and_never_written_on_four_threads() {
+        super::a_frame_queued_after_a_read_failed_is_refused_and_never_written().await;
+    }
+
+    #[tokio::test]
+    async fn a_late_ordered_request_is_refused_for_the_close_with_the_ordered_reserve_full_on_one_thread()
+     {
+        super::a_late_ordered_request_is_refused_for_the_close_with_the_ordered_reserve_full()
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_ordered_request_is_refused_for_the_close_with_the_ordered_reserve_full_on_four_threads()
+     {
+        super::a_late_ordered_request_is_refused_for_the_close_with_the_ordered_reserve_full()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_prompt_shaped_request_given_up_gives_back_its_entry_and_its_ordered_place_on_one_thread()
+     {
+        super::a_prompt_shaped_request_given_up_gives_back_its_entry_and_its_ordered_place().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_prompt_shaped_request_given_up_gives_back_its_entry_and_its_ordered_place_on_four_threads()
+     {
+        super::a_prompt_shaped_request_given_up_gives_back_its_entry_and_its_ordered_place().await;
+    }
+
+    #[tokio::test]
+    async fn a_frame_queued_after_the_connection_ended_under_this_side_is_refused_on_one_thread() {
+        super::a_frame_queued_after_the_connection_ended_under_this_side_is_refused().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_frame_queued_after_the_connection_ended_under_this_side_is_refused_on_four_threads()
+    {
+        super::a_frame_queued_after_the_connection_ended_under_this_side_is_refused().await;
+    }
 }

@@ -627,6 +627,15 @@ impl Outbox {
             .sealed = true;
     }
 
+    /// Whether the queue has stopped taking frames.
+    pub(super) fn is_sealed(&self) -> bool {
+        self.budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sealed
+    }
+
     /// Queues a barrier behind every frame queued so far. `None` when there is no queue to wait
     /// behind: nothing was ever queued, or the writer has gone.
     pub(super) fn barrier(&self) -> Option<oneshot::Receiver<()>> {

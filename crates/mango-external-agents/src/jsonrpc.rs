@@ -591,7 +591,9 @@ impl RequestOptions {
     /// session, say) can stand outside it, so that short requests are not refused while it
     /// runs and it is not refused because of them. It is neither counted nor checked: it is
     /// admitted with the budget full, and requests that do count are admitted as if it were not
-    /// there. The host answers for how many of these it makes.
+    /// there. The host answers for how many of these it makes: nothing in this client bounds
+    /// the ones whose answers are delivered as they are read, beyond what [`WireOptions`]
+    /// bounds of their frames.
     ///
     /// The places [`after_earlier_notifications`](Self::after_earlier_notifications) reserves
     /// are a budget of their own and still apply: an answer that waits its turn needs a place
@@ -1081,6 +1083,10 @@ struct ClientState {
     /// before it acts on that, so a test can queue a frame exactly there.
     #[cfg(test)]
     after_turn_decided: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when the queue has been sealed and before the closed flag goes up, so a test
+    /// can queue a frame exactly there.
+    #[cfg(test)]
+    after_seal: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The connection's runtime also owns cleanup when a request is dropped on another thread.
     runtime: tokio::runtime::Handle,
     options: ClientOptions,
@@ -1462,6 +1468,8 @@ impl Client {
             after_write_began: StdMutex::new(None),
             #[cfg(test)]
             after_turn_decided: StdMutex::new(None),
+            #[cfg(test)]
+            after_seal: StdMutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
@@ -1728,6 +1736,11 @@ impl Client {
     where
         P: Serialize,
     {
+        // Too late is said before anything else is asked of the request: with the ordered
+        // reserve full, a request that raced a close is refused for the close.
+        if self.state.outbox.is_sealed() {
+            return Err(Error::Closed { subject: "link" });
+        }
         let ordered = options.after_earlier_notifications;
         if ordered && self.state.handling_own_notification() {
             return Err(reentrant_ordered_request());
@@ -2070,7 +2083,7 @@ impl Drop for Client {
         let failure = self
             .state
             .ended_with(ConnectionEnd::Closed, self.state.closed_error());
-        self.state.closed.store(true, Ordering::Release);
+        self.state.mark_closed();
         self.state.shutdown.cancel();
         // Nothing holds the map across a wait, so this misses only against a thread inside it at
         // this instant. That thread may be entering a call, so the map is emptied behind it on
@@ -2361,15 +2374,22 @@ impl ClientState {
         }
     }
 
-    /// Marks the connection closed, to callers and to the queue.
+    /// Marks the connection closed, to the queue and to callers. Every end of a connection
+    /// comes through here.
     ///
     /// The flag turns callers away before they build a frame. The seal settles the caller that
     /// read the flag a moment too early: its frame is in the queue ahead of this, to be dealt
     /// with as any frame queued before the end, or it is refused as it is queued. No frame
-    /// arrives in the queue behind a close's back.
+    /// arrives in the queue behind an end's back.
+    ///
+    /// The seal goes first. With the flag up and the queue still open, a late frame would be
+    /// measured against the queue's bounds, and one that found the queue full would be taken
+    /// for a peer that stopped reading and end a connection that is only closing.
     fn mark_closed(&self) {
-        self.closed.store(true, Ordering::Release);
         self.outbox.seal();
+        #[cfg(test)]
+        Self::run_hook(&self.after_seal);
+        self.closed.store(true, Ordering::Release);
     }
 
     /// Ends the connection because this side holds more for the peer than it may.
@@ -2923,9 +2943,7 @@ async fn connection_failed(
     termination: PeerTermination,
     failure: Failed,
 ) {
-    // The link is already unusable here, which turns a late frame away before the queue is
-    // asked.
-    state.closed.store(true, Ordering::Release);
+    state.mark_closed();
     fail_pending_around_drain(state, notifications, failure).await;
     state.shutdown.cancel();
     state.drain_in_flight().await;

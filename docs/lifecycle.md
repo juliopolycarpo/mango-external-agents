@@ -166,7 +166,11 @@ carries. `Client::close` takes at most twice `shutdown_timeout`, once for the an
 still owes the peer and once for the queue and the link, and may be dropped at any point for a
 tighter bound. From the moment a close begins, or the connection ends, the queue takes nothing
 more: a `submit_*` that comes after is refused, with `Error::Closed` or, on a link an earlier write
-left unusable, `Error::Link`, and nothing of it is queued or written, and one that got in ahead is a frame queued before the close.
+left unusable, `Error::Link`, and nothing of it is queued or written, and one that got in ahead is a frame queued before the close. `Client::request` and
+`Client::notify` do not pass through the queue and are as they were: on a connection that has
+ended, `request` returns `Error::Closed` and `notify` returns `Ok(())` having written nothing, and
+one that read the connection as open an instant before it ended reaches the link, which answers it
+(a closed link refuses the write, and the call returns that refusal).
 
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
