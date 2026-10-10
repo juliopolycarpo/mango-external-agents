@@ -306,11 +306,19 @@ pub trait PeerHandler: Send + Sync {
     /// then gets up to [`ClientOptions::shutdown_timeout`] to return, and is cancelled only
     /// after that; a host that stopped reading cannot hold the connection's end for longer.
     ///
-    /// Either way nothing that is still queued once the end has been noticed is handed to the
-    /// handler, and [`on_terminated`](Self::on_terminated) comes after the handler's task has
-    /// stopped. A close waits for the call while it waits for the answers this side still owes
-    /// the peer, so it takes no longer than [`Client::close`] documents. Dropping the
-    /// [`Client`] cannot wait and cancels the call in every case.
+    /// For such a handler, what is still queued once the end has been noticed is neither
+    /// started nor delivered, beyond at most the one item its task had already taken up.
+    /// [`on_terminated`](Self::on_terminated) comes after the handler's task has stopped, as
+    /// for any handler.
+    ///
+    /// The call is not waited for in three cases. Dropping the [`Client`] cannot wait and
+    /// cancels it. A [`Client::close`] made from inside the call cannot wait for the call it
+    /// is made from, and cancels it as it always did; one made on another task that the call
+    /// then awaits is waited out for the whole grace, each waiting for the other, so do not
+    /// write that. And a close whose caller gives it up during the grace, by dropping it or
+    /// timing it out, stops the task there and then, even when the reader or another close is
+    /// still waiting for the same call. A close waits for the call while it waits for the answers this side still owes
+    /// the peer, so it takes no longer than [`Client::close`] documents.
     ///
     /// Read once, when the client connects.
     ///
@@ -704,7 +712,7 @@ impl RequestOptions {
     /// [`ClientOptions::shutdown_timeout`] bounds. [`Client::close`] and a queue overflow do not
     /// drain. They fail the call at once, or, when its answer was already queued behind a
     /// notification call that [`PeerHandler::finishes_notification_in_progress`] lets finish,
-    /// when that call returns.
+    /// when that call returns or its grace runs out.
     ///
     /// A request [`without_deadline`](Self::without_deadline) waits in that queue for as long
     /// as the handler takes: an `on_notification` that never returns holds its answer back

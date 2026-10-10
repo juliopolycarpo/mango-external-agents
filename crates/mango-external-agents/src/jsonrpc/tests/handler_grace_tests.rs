@@ -331,9 +331,11 @@ async fn a_close_racing_the_handlers_task_never_cuts_a_call_that_began() {
             link.push_line(UPDATE);
         }
         // A different point in the stream each round.
-        for _ in 0..round % 16 {
-            tokio::task::yield_now().await;
-        }
+        let reached = round % 32;
+        until("the handler to have begun that many calls", || {
+            handler.begun.load(Ordering::Acquire) >= reached
+        })
+        .await;
         within("the close", client.close())
             .await
             .expect("expected a clean close");
@@ -345,11 +347,11 @@ async fn a_close_racing_the_handlers_task_never_cuts_a_call_that_began() {
             calls.0, calls.1,
             "expected every call that began to have returned by the end of the close (round {round}): begun == returned | received {calls:?}"
         );
-        cut_short += usize::from(calls.1 < 32);
+        cut_short += usize::from(calls.1 > 0 && calls.1 < 32);
     }
     assert!(
         cut_short > 0,
-        "expected some close in 200 to land before the 32 notifications were all handled: > 0 | received {cut_short}"
+        "expected some close in 200 to land with some but not all of the 32 notifications handled: > 0 | received {cut_short}"
     );
 }
 
@@ -764,9 +766,9 @@ async fn a_question_read_after_the_stop_was_asked_for_is_not_put_to_the_handler(
     client.state.ask_handler_task_to_stop();
     link.push_line(r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission"}"#);
 
-    within(
-        "the handler's task to stop at the question",
-        client.state.worker_stopped.cancelled(),
+    until(
+        "the handler's task to stop, or the question to be asked",
+        || client.state.worker_stopped.is_cancelled() || handler.asked.load(Ordering::Acquire) > 0,
     )
     .await;
     let asked = handler.asked.load(Ordering::Acquire);
