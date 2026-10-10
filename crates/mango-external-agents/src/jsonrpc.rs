@@ -691,9 +691,10 @@ pub struct CallFailure {
 
 /// Which side failed a call, and how.
 ///
-/// More causes may be added, so a `match` on this needs a wildcard arm. What a cause carries
-/// is fixed; anything more a failure comes to know is read from [`CallFailure`] itself. It is
-/// not comparable: match on it.
+/// More causes may be added, so a `match` on this needs a wildcard arm, and a pattern on
+/// [`TimedOut`](Self::TimedOut) needs `..`. What the other causes carry is fixed; anything
+/// more a failure comes to know is read from [`CallFailure`] itself. It is not comparable:
+/// match on it.
 ///
 /// ```
 /// use mango_external_agents::jsonrpc::{CallFailureCause, ConnectionEnd};
@@ -723,8 +724,8 @@ pub enum CallFailureCause {
         after: Duration,
     },
     /// The request's frame did not reach the wire whole, so no answer could come. Its
-    /// [`Written`] resolves to the reason, and when that reason is the link's own failure the
-    /// connection ends next.
+    /// [`Written`] resolves to the reason. A link that failed under the write ends the
+    /// connection next.
     Unwritten,
 }
 
@@ -887,8 +888,10 @@ struct ClientState {
     writer_abort: OnceLock<tokio::task::AbortHandle>,
     /// The typed reason, when what ended the connection was this side's own outbound budget.
     outbound_overflow: StdMutex<Option<PeerTermination>>,
-    /// Whether a `close` has begun. The first one answers for whether the link was reached.
-    close_begun: AtomicBool,
+    /// Closes running now, and whether any close has got as far as the link. The last one to
+    /// leave without that poisons the link.
+    closes_in_progress: AtomicUsize,
+    close_reached_link: AtomicBool,
     /// Runs once when the writer has taken a queued frame and before it sends, so a test can
     /// place a caller's withdrawal exactly there.
     #[cfg(test)]
@@ -982,19 +985,33 @@ impl Drop for MidSend<'_> {
     }
 }
 
-/// Leaves the link unusable when a close ends without having reached it.
+/// Leaves the link unusable when the last close in progress ends without any having reached it.
 ///
 /// Whether the close's own grace ran out or its caller dropped it mid-wait, what was queued
 /// behind a write that would not finish is refused from then on, not written into a connection
-/// its host has walked away from.
+/// its host has walked away from. While another close is still waiting, the link is left to it.
 struct PoisonUnlessClosed<'a> {
     state: &'a ClientState,
     reached_the_link: bool,
 }
 
+impl<'a> PoisonUnlessClosed<'a> {
+    fn begin(state: &'a ClientState) -> Self {
+        state.closes_in_progress.fetch_add(1, Ordering::AcqRel);
+        Self {
+            state,
+            reached_the_link: false,
+        }
+    }
+}
+
 impl Drop for PoisonUnlessClosed<'_> {
     fn drop(&mut self) {
-        if !self.reached_the_link {
+        if self.reached_the_link {
+            self.state.close_reached_link.store(true, Ordering::Release);
+        }
+        let last = self.state.closes_in_progress.fetch_sub(1, Ordering::AcqRel) == 1;
+        if last && !self.state.close_reached_link.load(Ordering::Acquire) {
             self.state.link_poisoned.store(true, Ordering::Release);
         }
     }
@@ -1253,7 +1270,8 @@ impl Client {
             outbox,
             writer_abort: OnceLock::new(),
             outbound_overflow: StdMutex::new(None),
-            close_begun: AtomicBool::new(false),
+            closes_in_progress: AtomicUsize::new(0),
+            close_reached_link: AtomicBool::new(false),
             #[cfg(test)]
             after_write_began: StdMutex::new(None),
             #[cfg(test)]
@@ -1609,7 +1627,8 @@ impl Client {
     ///
     /// A close that does not reach the link leaves it unusable: nothing still queued is written
     /// afterwards. That is so when the close runs out of `shutdown_timeout` behind a write the
-    /// peer never reads, and when the future returned here is dropped before it finishes.
+    /// peer never reads, and when the future returned here is dropped before it finishes,
+    /// unless another call to `close` is still in progress, which then answers for the link.
     ///
     /// # Errors
     ///
@@ -1627,13 +1646,9 @@ impl Client {
         self.state.shutdown.cancel();
         // A close that does not get as far as the link, because its grace ran out or because its
         // caller stopped waiting, must not leave queued frames to be written behind it.
-        // Only the first close answers for the link: a later one, dropped while the first is
-        // still writing what was queued, must not take the link from under it.
-        let first = !self.state.close_begun.swap(true, Ordering::AcqRel);
-        let mut giving_up = PoisonUnlessClosed {
-            state: &self.state,
-            reached_the_link: !first,
-        };
+        // Closes running at once answer for the link together: one that gives up while another
+        // is still writing what was queued does not take the link from under it.
+        let mut giving_up = PoisonUnlessClosed::begin(&self.state);
         self.state.fail_pending(failure).await;
         self.state.stop_notifications().await;
         // The peer's own questions are answered on tasks of their own, and one waiting for a
@@ -1657,7 +1672,7 @@ impl Client {
             operation: String::from("JSON-RPC link shutdown"),
             after: self.state.options.shutdown_timeout,
         });
-        giving_up.reached_the_link |= closed.is_ok();
+        giving_up.reached_the_link = closed.is_ok();
         drop(giving_up);
         let closed = closed.and_then(std::convert::identity);
         if let Some(pump) = self.pump.lock().await.take() {
@@ -2021,11 +2036,13 @@ impl ClientState {
             // The entry was dropped unsettled, which is its frame going with a writer that was
             // taken down while the frame was still queued. A dropped client is on record as the
             // end; anything else that stops the writer has only left the frame unwritten.
-            Err(_) => Err(CallFailure::new(
-                self.ended()
-                    .map_or(CallFailureCause::Unwritten, CallFailureCause::Ended),
-                self.went_away(),
-            )),
+            Err(_) => Err(match self.ended() {
+                Some(end) => CallFailure::new(CallFailureCause::Ended(end), self.went_away()),
+                None => CallFailure::new(
+                    CallFailureCause::Unwritten,
+                    self.call_failed(self.unwritten().body, id),
+                ),
+            }),
         }
     }
 

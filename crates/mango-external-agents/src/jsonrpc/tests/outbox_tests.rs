@@ -91,7 +91,8 @@ fn a_frame_is_admitted_up_to_each_bound_and_refused_one_past_it() {
     );
 }
 
-/// Counts the sends of frames naming `hold` as each is entered, before it waits at the gate.
+/// Counts the sends of frames naming `hold` that are in progress: up as each is entered, before
+/// it waits at the gate, and down as it returns.
 struct CountingHolds {
     inner: GatedSender,
     entered: Arc<std::sync::atomic::AtomicUsize>,
@@ -100,11 +101,15 @@ struct CountingHolds {
 #[async_trait::async_trait]
 impl crate::link::LinkSender for CountingHolds {
     async fn send(&mut self, message: String) -> crate::error::Result<()> {
-        if message.contains(self.inner.method) {
-            self.entered
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if !message.contains(self.inner.method) {
+            return self.inner.send(message).await;
         }
-        self.inner.send(message).await
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let sent = self.inner.send(message).await;
+        self.entered
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        sent
     }
 
     async fn close(&mut self) -> crate::error::Result<()> {
@@ -116,7 +121,7 @@ impl crate::link::LinkSender for CountingHolds {
 struct Gated {
     link: ScriptedLink,
     gate: Arc<tokio::sync::Semaphore>,
-    /// How many `hold` frames have entered their send.
+    /// How many `hold` frames are inside their send.
     holds: Arc<std::sync::atomic::AtomicUsize>,
     handler: Arc<RecordingHandler>,
     client: Arc<Client>,
@@ -1803,7 +1808,7 @@ async fn a_frame_queued_as_a_caller_goes_for_the_lock_waits_for_that_caller() {
             // The caller's own thread stands still here; the queue's task runs on another.
             let began = std::time::Instant::now();
             while client.state.outbox.waited_for_direct() == 0
-                && began.elapsed() < Duration::from_secs(5)
+                && began.elapsed() < Duration::from_secs(2)
             {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -1829,7 +1834,7 @@ async fn a_frame_queued_as_a_caller_goes_for_the_lock_waits_for_that_caller() {
     let (taken, stops) = *seen.lock().unwrap_or_else(PoisonError::into_inner);
     assert!(
         stops > 0,
-        "expected the queue's task to stop for the caller on its way to the lock: 1 stop | received {stops} stops after {taken} entries taken in 5s"
+        "expected the queue's task to stop for the caller on its way to the lock: 1 stop | received {stops} stops after {taken} entries taken in 2s"
     );
     let written = queued
         .lock()
@@ -1866,7 +1871,7 @@ async fn a_frame_queued_as_a_caller_is_handed_the_free_link_goes_behind_it() {
             // Stand still until the queue's task, on another thread, has the frame in hand and
             // is waiting for the link.
             let began = std::time::Instant::now();
-            while client.state.outbox.taken() == taken && began.elapsed() < Duration::from_secs(5) {
+            while client.state.outbox.taken() == taken && began.elapsed() < Duration::from_secs(2) {
                 std::thread::sleep(Duration::from_millis(1));
             }
         });
@@ -2276,12 +2281,16 @@ async fn a_reply_lost_with_the_queue_task_claims_no_end_that_is_not_on_record() 
         .expect("expected the queue's task to be running")
         .abort();
 
-    let (cause, _) = failure(within("the reply", reply).await);
+    let (cause, error) = failure(within("the reply", reply).await);
     let ended = gated.client.ended();
     assert_eq!(
         (&cause, &ended),
         (&CallFailureCause::Unwritten, &None),
         "expected the reply failed as unwritten with no end on record: (Unwritten, None) | received ({cause:?}, {ended:?})"
+    );
+    assert!(
+        matches!(&error, Error::Vendor(vendor) if vendor.message == "the ACP agent request frame was not written"),
+        "expected the error to say the frame was not written | received {error:?}"
     );
     let unwritten = within("the write", written).await;
     assert!(
@@ -2315,8 +2324,9 @@ async fn a_second_close_given_up_does_not_stop_the_first_from_flushing() {
         gated
             .client
             .state
-            .close_begun
+            .closes_in_progress
             .load(std::sync::atomic::Ordering::Acquire)
+            == 1
     })
     .await;
 
@@ -2349,4 +2359,76 @@ async fn a_second_close_given_up_does_not_stop_the_first_from_flushing() {
         vec!["hold", "queued"],
         "expected what was queued before the first close on the wire: [hold, queued] | received {order:?}"
     );
+}
+
+/// The other way round: the first close is given up while a second is still waiting. The second
+/// answers for the link, so what was queued before them is written and it reports a clean close.
+#[tokio::test]
+async fn a_first_close_given_up_leaves_the_link_to_a_second_still_waiting() {
+    let gated = gated(options(), WireOptions::new());
+    let held = link_held(&gated).await;
+    let queued = gated
+        .client
+        .submit_notification("queued", json!({}))
+        .expect("expected a frame queued behind the held one");
+    let mut first = Box::pin(gated.client.close());
+    let mut second = Box::pin(gated.client.close());
+    for close in [&mut first, &mut second] {
+        let finished =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx).is_ready()))
+                .await;
+        assert!(
+            !finished,
+            "expected the close still waiting behind the held frame: pending | received finished"
+        );
+    }
+    drop(first);
+
+    gated.gate.add_permits(1);
+    within("the held frame", held)
+        .await
+        .expect("expected the held frame written");
+    within("the queued frame", queued)
+        .await
+        .expect("expected the frame queued before the closes written");
+    within("the second close", second)
+        .await
+        .expect("expected a clean close");
+    let order = methods(&gated.link);
+    assert_eq!(
+        order,
+        vec!["hold", "queued"],
+        "expected what was queued before the closes on the wire: [hold, queued] | received {order:?}"
+    );
+}
+
+/// The same holds when what the pump found is a failed write, not the peer's exit.
+#[tokio::test]
+async fn the_handler_is_told_the_reason_on_record_when_a_write_fails_after_it() {
+    let link = ScriptedLink::new();
+    let handler = RecordingHandler::arc(None);
+    let client = client(link.clone(), Arc::clone(&handler));
+    let recorded = PeerTermination::OutboundBackpressure {
+        subject: QUEUED_BYTES,
+        limit: 8,
+        received: 9,
+    };
+    client.state.ended_with(
+        ConnectionEnd::Peer(recorded.clone()),
+        client.state.closed_error(),
+    );
+    link.fail_sends("EPIPE");
+    let refused = client.notify("after", json!({})).await;
+    assert!(
+        matches!(&refused, Err(Error::Link { message, .. }) if message == "EPIPE"),
+        "expected the link's own failure: Err(Link(EPIPE)) | received {refused:?}"
+    );
+
+    let told = one_termination(&handler).await;
+    assert_eq!(
+        told, recorded,
+        "expected the handler told the reason on record: {recorded:?} | received {told:?}"
+    );
+    assert_ended(&client, Some(ConnectionEnd::Peer(recorded)));
+    client.close().await.expect("expected a clean close");
 }

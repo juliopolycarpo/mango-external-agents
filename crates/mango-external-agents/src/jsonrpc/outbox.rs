@@ -539,9 +539,11 @@ impl Outbox {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if !held.queueing {
-            // Free, so nobody is waiting for it either: the lock hands itself to a waiter
-            // before it is ever free again.
-            if let Ok(sender) = Arc::clone(sender).try_lock_owned() {
+            // Nobody on the way to it, and free: the lock hands itself to a waiter before it is
+            // ever free again, so nobody is waiting on it either.
+            if held.direct == 0
+                && let Ok(sender) = Arc::clone(sender).try_lock_owned()
+            {
                 return Turn::Now(sender);
             }
             held.direct += 1;
