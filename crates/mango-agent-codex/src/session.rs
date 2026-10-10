@@ -206,6 +206,12 @@ pub(crate) struct Shared {
     /// stays occupied. A terminated connection is stronger: nothing can safely use this session
     /// again, even after that slot has drained.
     shutting_down: AtomicBool,
+    /// The reason a host's `close` gave, recorded before it stops new work.
+    ///
+    /// The teardown has one owner and whoever asks first starts it. A stop worker that sees work
+    /// stopped can ask between a `close` stopping work and requesting the teardown itself, and
+    /// would otherwise tear the session down for its own generic reason.
+    close_reason: std::sync::OnceLock<CancelReason>,
     /// Held by a test to park [`Shared::poison`] after it released the turn and before it wakes
     /// the reaper, the point a racing stop has to be correct at.
     #[cfg(test)]
@@ -261,6 +267,7 @@ impl Shared {
             pending_questions: Mutex::new(HashMap::new()),
             question_settlements: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
+            close_reason: std::sync::OnceLock::new(),
             #[cfg(test)]
             poison_released: Mutex::new(()),
             #[cfg(test)]
@@ -296,6 +303,21 @@ impl Shared {
 
     fn stop_new_work(&self) -> bool {
         !self.shutting_down.swap(true, Ordering::AcqRel)
+    }
+
+    /// Records why the host is closing the session, then stops new work.
+    ///
+    /// In that order: once work is stopped another task may start the teardown, and it reads the
+    /// reason from here. Returns the reason the teardown will use, the first close's.
+    fn begin_close(&self, reason: CloseReason) -> CancelReason {
+        let reason = *self.close_reason.get_or_init(|| CancelReason::from(reason));
+        self.stop_new_work();
+        reason
+    }
+
+    /// The reason the teardown acts for: a host close's when there was one, else its requester's.
+    fn teardown_reason(&self, requested: CancelReason) -> CancelReason {
+        self.close_reason.get().copied().unwrap_or(requested)
     }
 
     fn is_shutting_down(&self) -> bool {
@@ -3476,6 +3498,7 @@ impl CodexSession {
     ) -> Result<()> {
         state.set_status(SessionStatus::Closing);
         shared.stop_new_work();
+        let reason = shared.teardown_reason(reason);
         let limits = *shared.host.limits();
         let _ = tokio::time::timeout(
             limits.kill_grace,
@@ -4238,14 +4261,14 @@ impl Session for CodexSession {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Self::wait_for_shutdown(&self.shared).await;
         }
-        self.shared.stop_new_work();
+        let reason = self.shared.begin_close(reason);
         self.shutdown_watcher.abort();
         Self::request_shutdown(
             Arc::clone(&self.shared),
             Arc::clone(&self.client),
             Arc::clone(&self.control),
             self.state.clone(),
-            CancelReason::from(reason),
+            reason,
         );
         Self::wait_for_shutdown(&self.shared).await
     }
@@ -7507,6 +7530,51 @@ mod tests {
             assert!(
                 shared.terminated.is_cancelled(),
                 "expected the reaper's token after the connection ended: cancelled | received: not cancelled"
+            );
+        }
+
+        /// A stop worker that sees work stopped can ask for the teardown between a `close` stopping
+        /// work and requesting it. The teardown still acts for the reason the host closed with,
+        /// which is what the turn's terminal and the host's process control are told.
+        #[tokio::test(start_paused = true)]
+        async fn a_teardown_a_stop_asked_for_first_keeps_the_reason_the_host_closed_with() {
+            use mango_external_agents::session::CloseReason;
+            let (shared, session, _link, launcher, mut stream) = running_session().await;
+
+            let recorded = shared.begin_close(CloseReason::ConsentRevoked);
+            assert_eq!(
+                recorded,
+                CancelReason::ConsentRevoked,
+                "expected the close's recorded reason: ConsentRevoked | received: {recorded:?}"
+            );
+            // What the stop worker does in that gap.
+            super::super::CodexSession::request_shutdown(
+                Arc::clone(&shared),
+                Arc::clone(&session.client),
+                Arc::clone(&session.control),
+                session.state.clone(),
+                CancelReason::Shutdown,
+            );
+            let closed = session.close(CloseReason::ConsentRevoked).await;
+
+            assert!(
+                closed.is_ok(),
+                "expected the close that joined the stop's teardown: Ok(()) | received: {closed:?}"
+            );
+            let events = kinds(&mut stream).await;
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    EventKind::Cancelled {
+                        reason: CancelReason::ConsentRevoked
+                    }
+                )),
+                "expected the turn cancelled for the close's reason: Cancelled(ConsentRevoked) | received: {events:?}"
+            );
+            let live = launcher.live_children();
+            assert_eq!(
+                live, 0,
+                "expected live children after the close: 0 | received: {live}"
             );
         }
 
