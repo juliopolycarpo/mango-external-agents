@@ -193,7 +193,10 @@ pub struct Limits {
     ///
     /// Shutdown is the process-teardown policy: closing a connection, then reaping its child after
     /// [`Self::kill_grace`]. In the Codex harness it does not bound a turn that is being cancelled
-    /// on a live session; that is [`Self::cancel_settle_timeout`].
+    /// on a live session; that is [`Self::cancel_settle_timeout`]. It does bound a wait on a
+    /// session that is ending: when the connection closes, or the session stops taking work,
+    /// under a cancel, the stop waits up to this long, at each point it checks, for that ending
+    /// to fail the turn before it joins the teardown.
     pub shutdown_timeout: Duration,
     /// How long a turn this side asked to stop may stay unresolved before the harness escalates to
     /// process shutdown.
