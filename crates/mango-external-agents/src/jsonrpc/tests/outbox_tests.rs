@@ -91,10 +91,33 @@ fn a_frame_is_admitted_up_to_each_bound_and_refused_one_past_it() {
     );
 }
 
+/// Counts the sends of frames naming `hold` as each is entered, before it waits at the gate.
+struct CountingHolds {
+    inner: GatedSender,
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::link::LinkSender for CountingHolds {
+    async fn send(&mut self, message: String) -> crate::error::Result<()> {
+        if message.contains(self.inner.method) {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.inner.send(message).await
+    }
+
+    async fn close(&mut self) -> crate::error::Result<()> {
+        self.inner.close().await
+    }
+}
+
 /// A link whose sends of frames naming `hold` wait at a gate, with a client over it.
 struct Gated {
     link: ScriptedLink,
     gate: Arc<tokio::sync::Semaphore>,
+    /// How many `hold` frames have entered their send.
+    holds: Arc<std::sync::atomic::AtomicUsize>,
     handler: Arc<RecordingHandler>,
     client: Arc<Client>,
 }
@@ -104,12 +127,16 @@ fn gated(options: ClientOptions, wire: WireOptions) -> Gated {
     let (sender, receiver) = link.clone().into_link().split();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let handler = RecordingHandler::arc(None);
+    let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let client = Arc::new(Client::connect_with(
         crate::link::Link::new(
-            Box::new(GatedSender {
-                inner: sender,
-                method: "hold",
-                gate: Arc::clone(&gate),
+            Box::new(CountingHolds {
+                inner: GatedSender {
+                    inner: sender,
+                    method: "hold",
+                    gate: Arc::clone(&gate),
+                },
+                entered: Arc::clone(&holds),
             }),
             receiver,
         ),
@@ -120,6 +147,7 @@ fn gated(options: ClientOptions, wire: WireOptions) -> Gated {
     Gated {
         link,
         gate,
+        holds,
         handler,
         client,
     }
@@ -1497,10 +1525,12 @@ async fn queueing_begun(gated: &Gated) {
         .expect("expected the first queued frame written");
 }
 
-/// Whether a caller holds the link and nobody is still on the way to it. A caller the lock was
-/// handed to stays counted until its task runs again, so the lock alone says too little.
+/// Whether the caller sending `hold` is inside its send, which is the link held and that caller
+/// past everything it does on the way there. The lock alone says too little: it is taken a
+/// step before, and a caller it was handed to stays counted until its task runs again.
 fn link_in_use(gated: &Gated) -> bool {
-    gated.client.state.outbox.direct().0 == 0 && gated.client.state.sender.try_lock().is_err()
+    gated.holds.load(std::sync::atomic::Ordering::Acquire) > 0
+        && gated.client.state.sender.try_lock().is_err()
 }
 
 /// A caller that waits for its own write, behind a link in use, stays counted as queued until the
@@ -1737,41 +1767,56 @@ fn when_a_turn_is_decided(gated: &Gated, hook: impl FnOnce() + Send + 'static) {
         .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
 }
 
-/// The narrowest version of that: a caller has been sent to the link's lock and has not asked
-/// for it yet when the first frame is queued, on another thread free to run. The queue's task
-/// stops for the caller, which called first, and does not take the idle link from under it.
+/// The narrowest version of that: a caller has been sent to wait on the link's lock and has not
+/// asked for it yet when the first frame is queued, on another thread free to run. The queue's
+/// task stops for the caller, which called first, and does not get in line for the lock ahead
+/// of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_queued_as_a_caller_goes_for_the_lock_waits_for_that_caller() {
     let gated = gated(options(), WireOptions::new());
-    let stopped_for_the_caller = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first = spawn_notify(&gated, "hold");
+    until("the first caller to hold the link", || link_in_use(&gated)).await;
+    // What the queue's task did while the caller stood still: (entries taken, stops for it).
+    let seen = Arc::new(std::sync::Mutex::new((0, 0)));
     let queued = Arc::new(std::sync::Mutex::new(None));
     {
         let client = Arc::clone(&gated.client);
-        let stopped = Arc::clone(&stopped_for_the_caller);
+        let gate = Arc::clone(&gated.gate);
+        let seen = Arc::clone(&seen);
         let queued = Arc::clone(&queued);
         when_a_turn_is_decided(&gated, move || {
             let written = client.submit_notification("queued", json!({}));
             *queued.lock().unwrap_or_else(PoisonError::into_inner) = Some(written);
             // The caller's own thread stands still here; the queue's task runs on another.
             let began = std::time::Instant::now();
-            while client.state.outbox.waited_for_direct() == 0 {
-                if began.elapsed() > Duration::from_secs(5) {
-                    return;
-                }
-                std::thread::yield_now();
+            while client.state.outbox.waited_for_direct() == 0
+                && began.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(1));
             }
-            stopped.store(true, std::sync::atomic::Ordering::Release);
+            *seen.lock().unwrap_or_else(PoisonError::into_inner) = (
+                client.state.outbox.taken(),
+                client.state.outbox.waited_for_direct(),
+            );
+            gate.add_permits(1);
         });
     }
 
+    // On this thread, not a worker: a worker standing still in the hook would keep the task it
+    // had just woken from running anywhere.
     gated
         .client
         .notify("waited", json!({}))
         .await
         .expect("expected the waiting caller's frame written");
+    within("the first caller", first)
+        .await
+        .expect("expected the first task to finish")
+        .expect("expected the first frame written");
+    let (taken, stops) = *seen.lock().unwrap_or_else(PoisonError::into_inner);
     assert!(
-        stopped_for_the_caller.load(std::sync::atomic::Ordering::Acquire),
-        "expected the queue's task to stop for the caller on its way to the lock: stopped | received it went on within 5s"
+        stops > 0,
+        "expected the queue's task to stop for the caller on its way to the lock: 1 stop | received {stops} stops after {taken} entries taken in 5s"
     );
     let written = queued
         .lock()
@@ -1785,8 +1830,8 @@ async fn a_frame_queued_as_a_caller_goes_for_the_lock_waits_for_that_caller() {
     let order = methods(&gated.link);
     assert_eq!(
         order,
-        vec!["waited", "queued"],
-        "expected the caller that asked first on the wire first: [waited, queued] | received {order:?}"
+        vec!["hold", "waited", "queued"],
+        "expected the caller that asked first on the wire first: [hold, waited, queued] | received {order:?}"
     );
     gated.client.close().await.expect("expected a clean close");
 }
@@ -1797,25 +1842,20 @@ async fn a_frame_queued_as_a_caller_goes_for_the_lock_waits_for_that_caller() {
 async fn a_frame_queued_as_a_caller_is_handed_the_free_link_goes_behind_it() {
     let gated = gated(options(), WireOptions::new());
     queueing_begun(&gated).await;
-    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let queued = Arc::new(std::sync::Mutex::new(None));
     {
         let client = Arc::clone(&gated.client);
-        let reached = Arc::clone(&reached);
         let queued = Arc::clone(&queued);
         when_a_turn_is_decided(&gated, move || {
             let taken = client.state.outbox.taken();
             let written = client.submit_notification("queued", json!({}));
             *queued.lock().unwrap_or_else(PoisonError::into_inner) = Some(written);
-            // Stand still until the queue's task, on another thread, has the frame in hand.
+            // Stand still until the queue's task, on another thread, has the frame in hand and
+            // is waiting for the link.
             let began = std::time::Instant::now();
-            while client.state.outbox.taken() == taken {
-                if began.elapsed() > Duration::from_secs(5) {
-                    return;
-                }
-                std::thread::yield_now();
+            while client.state.outbox.taken() == taken && began.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
             }
-            reached.store(true, std::sync::atomic::Ordering::Release);
         });
     }
 
@@ -1824,10 +1864,6 @@ async fn a_frame_queued_as_a_caller_is_handed_the_free_link_goes_behind_it() {
         .notify("waited", json!({}))
         .await
         .expect("expected the waiting caller's frame written");
-    assert!(
-        reached.load(std::sync::atomic::Ordering::Acquire),
-        "expected the queue's task to take the frame while the caller held the link: taken | received not within 5s"
-    );
     let written = queued
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

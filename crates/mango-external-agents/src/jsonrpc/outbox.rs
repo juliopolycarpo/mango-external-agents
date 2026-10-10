@@ -523,9 +523,10 @@ impl Outbox {
 
     /// How a caller that writes its own frame gets the link.
     ///
-    /// Before any frame has been queued: by waiting on the link's lock itself, as such callers
-    /// always have. The caller is counted until it holds the lock, so the first queued frame
-    /// can let everyone who called before it go first.
+    /// Before any frame has been queued: by the link's lock itself, as such callers always
+    /// have, taken at once when it is free and waited on otherwise. A caller that waits is
+    /// counted until it holds the lock, so the first queued frame can let everyone who called
+    /// before it go first.
     ///
     /// Once frames are queued: at once when nothing is queued, nobody is ahead and the link is
     /// free, since the caller is then first in line by any ordering; otherwise by a turn queued
@@ -538,6 +539,11 @@ impl Outbox {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if !held.queueing {
+            // Free, so nobody is waiting for it either: the lock hands itself to a waiter
+            // before it is ever free again.
+            if let Ok(sender) = Arc::clone(sender).try_lock_owned() {
+                return Turn::Now(sender);
+            }
             held.direct += 1;
             return Turn::Direct(Direct {
                 budget: &self.budget,
