@@ -409,22 +409,27 @@ different decisions, and a host that shows one as the other widens an authorisat
 Requests that expire or belong to a closed session are removed from the pending map. The runtime
 must not register the vendor's tools as application tools.
 
-| Library event or call                                       | Runtime integration                                          |
-| ----------------------------------------------------------- | ------------------------------------------------------------ |
-| `TextDelta`                                                 | Append to the vendor session's assistant message             |
-| `ActivityStarted` / `ActivityUpdated` / `ActivityCompleted` | Update that message's tool activity view                     |
-| `TurnStarted`                                               | Record the vendor's handle for this attempt                  |
-| `ApprovalRequested` / `ApprovalResolved`                    | Add or remove the pending approval UI, with its reach shown  |
-| `QuestionAsked` / `QuestionResolved`                        | Add or remove a question prompt — never an approval prompt   |
-| `Usage` / `ThreadUsage` / `AccountLimits`                   | Update usage displays without inferring prices               |
-| `Error`                                                     | Show the bounded error and retain the failed turn's identity |
-| `Completed`                                                 | Stop the turn relay and release its pending UI state         |
-| `cancel(ConsentRevoked)`                                    | Stop work when the user revokes the session's consent        |
-| `close(Shutdown)`                                           | Release the vendor session when the runtime shuts down       |
+| Library event or call                                       | Runtime integration                                           |
+| ----------------------------------------------------------- | ------------------------------------------------------------- |
+| `TextDelta`                                                 | Append to the vendor session's assistant message              |
+| `ActivityStarted` / `ActivityUpdated` / `ActivityCompleted` | Update that message's tool activity view                      |
+| `TurnStarted`                                               | Record the vendor's handle for this attempt                   |
+| `ApprovalRequested` / `ApprovalResolved`                    | Add or remove the pending approval UI, with its reach shown   |
+| `QuestionAsked` / `QuestionResolved`                        | Add or remove a question prompt — never an approval prompt    |
+| `Usage` / `ThreadUsage` / `AccountLimits`                   | Update usage displays without inferring prices                |
+| `Notice`                                                    | Show a banner or status line; display only, never model input |
+| `Error`                                                     | Show the bounded error and retain the failed turn's identity  |
+| `Completed`                                                 | Stop the turn relay and release its pending UI state          |
+| `cancel(ConsentRevoked)`                                    | Stop work when the user revokes the session's consent         |
+| `close(Shutdown)`                                           | Release the vendor session when the runtime shuts down        |
 
 Keep this mapping in the runtime adapter. The library does not depend on mangostudio's protocol
 or database types. Persist native session ids only for vendor resume; never feed the vendor's
-assistant output back into the host model's context as instructions. The `mea` host provides an
+assistant output back into the host model's context as instructions. That covers every piece of
+vendor-generated text, not only `TextDelta`: a compaction summary (the content of an activity of kind
+`Compaction`) and a `Notice` are for display only. A `Notice` is also best effort and turn-scoped:
+it is not part of the transcript, its `error` severity does not mean the turn failed, and a host
+that ignores the event loses nothing it needs. The `mea` host provides an
 executable example of `TokioLauncher`, terminal approval decisions, terminal question answers and
 event consumption without the runtime's browser or database dependencies. Its question path is the
 one worth copying: it reads `QuestionForm`, numbers the choices, and never touches the broker.

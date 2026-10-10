@@ -1012,14 +1012,92 @@ async fn each_update_restarts_the_idle_deadline() {
     session.close(CloseReason::Shutdown).await.expect("close");
 }
 
-/// Notices and compaction updates need a capability this client never advertises. Through schema
-/// 1.9.1 they did not parse and never reached the session, so they were not progress; now that
-/// they parse they still are not, exactly like an update kind no schema knows.
+/// What a turn under a 5s idle deadline did while the agent sent `update` once a second for nine
+/// seconds and nothing else: whether it was cancelled for idleness, and every event up to its
+/// terminal.
+async fn nine_seconds_of(update: &serde_json::Value) -> (&'static str, Vec<EventKind>) {
+    let announcer = mango_external_agents::testing::Announcer::new();
+    let (session, launcher) = open_idle(
+        FakeAcpAgent::new()
+            .with_updates(Vec::new())
+            .staying_silent()
+            .process()
+            .announcing(announcer.clone()),
+        Duration::from_secs(5),
+        Duration::from_secs(600),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("idle", "keep talking"))
+        .await
+        .expect("expected a turn");
+    settle().await;
+    for _ in 0..9 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        announcer.announce(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "sessionId": "sess_fake", "update": update }
+            })
+            .to_string(),
+        );
+        settle().await;
+    }
+    // Read before draining: a drain lets the paused clock run on to the deadline regardless.
+    let state = match cancel_sent(&launcher) {
+        true => "idle timeout",
+        false => "a turn kept alive",
+    };
+    let events = drain(&mut turn).await;
+    session.close(CloseReason::Shutdown).await.expect("close");
+    (state, events)
+}
+
+/// A notice is a live aside for the person at the host, not the agent working. It reaches the host
+/// and still does not restart idle accounting: an agent announcing a retry every second cannot hold
+/// a turn past its idle deadline. An update kind no schema knows is not progress either.
 #[tokio::test(start_paused = true)]
-async fn an_update_kind_this_client_never_asked_for_is_not_progress() {
-    let unadvertised = [
-        serde_json::json!({ "sessionUpdate": "brand_new_variant", "payload": { "x": 1 } }),
-        serde_json::json!({ "sessionUpdate": "notice", "severity": "info", "title": "heads up" }),
+async fn a_notice_every_second_reaches_the_host_and_is_not_progress() {
+    let notice = serde_json::json!({
+        "sessionUpdate": "notice", "severity": "warning", "title": "retrying"
+    });
+    let (received, events) = nine_seconds_of(&notice).await;
+    assert_eq!(
+        received, "idle timeout",
+        "expected turn state after 9s of notices under a 5s idle deadline: idle timeout | received: {received}"
+    );
+    assert!(
+        timed_out(&events),
+        "expected the timeout to be the turn's terminal | received {events:?}"
+    );
+    // Those sent before the deadline, at least: one sent after it races the terminal.
+    let notices = events
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::Notice { title, .. } if title == "retrying"))
+        .count();
+    assert!(
+        notices >= 4,
+        "expected notices delivered before the idle deadline: at least 4 | received: {notices} in {events:?}"
+    );
+
+    let unknown =
+        serde_json::json!({ "sessionUpdate": "brand_new_variant", "payload": { "x": 1 } });
+    let (received, events) = nine_seconds_of(&unknown).await;
+    assert_eq!(
+        received, "idle timeout",
+        "expected turn state after 9s of an unknown update kind under a 5s idle deadline: idle timeout | received: {received}"
+    );
+    assert!(
+        timed_out(&events),
+        "expected the timeout to be the turn's terminal | received {events:?}"
+    );
+}
+
+/// Compacting is the agent working, so its updates are progress like any other activity's.
+#[tokio::test(start_paused = true)]
+async fn a_compaction_update_every_second_keeps_an_idle_turn_alive() {
+    let frames = [
         serde_json::json!({
             "sessionUpdate": "compaction_update", "compactionId": "c1", "status": "in_progress"
         }),
@@ -1028,51 +1106,12 @@ async fn an_update_kind_this_client_never_asked_for_is_not_progress() {
             "content": { "type": "text", "text": "summary" }
         }),
     ];
-    for update in unadvertised {
-        let idle = Duration::from_secs(5);
-        let announcer = mango_external_agents::testing::Announcer::new();
-        let (session, launcher) = open_idle(
-            FakeAcpAgent::new()
-                .with_updates(Vec::new())
-                .staying_silent()
-                .process()
-                .announcing(announcer.clone()),
-            idle,
-            Duration::from_secs(600),
-        )
-        .await;
-        let mut turn = session
-            .start_turn(TurnRequest::new("idle", "keep talking"))
-            .await
-            .expect("expected a turn");
-        settle().await;
-        for _ in 0..3 {
-            tokio::time::advance(Duration::from_secs(3)).await;
-            announcer.announce(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": { "sessionId": "sess_fake", "update": update }
-                })
-                .to_string(),
-            );
-            settle().await;
-        }
-        // Read before draining: a drain lets the paused clock run on to the deadline regardless.
-        let received = match cancel_sent(&launcher) {
-            true => "idle timeout",
-            false => "a turn kept alive",
-        };
+    for frame in frames {
+        let (received, _events) = nine_seconds_of(&frame).await;
         assert_eq!(
-            received, "idle timeout",
-            "expected turn state after 9s of {update} under a 5s idle deadline: idle timeout | received: {received}"
+            received, "a turn kept alive",
+            "expected turn state after 9s of {frame} under a 5s idle deadline: a turn kept alive | received: {received}"
         );
-        let events = drain(&mut turn).await;
-        assert!(
-            timed_out(&events),
-            "expected the timeout to be the turn's terminal | received {events:?}"
-        );
-        session.close(CloseReason::Shutdown).await.expect("close");
     }
 }
 

@@ -8,8 +8,8 @@ use std::time::Duration;
 use mango_external_agents::event::{AgentEvent, EventKind};
 use mango_external_agents::{
     ActivityContent, BrokerDecision, CancelReason, CloseReason, Dispatch, Error, InteractionId,
-    PermissionBroker, PermissionRequest, PermissionResponse, QuestionRequest, QuestionResponse,
-    Result, Session, SessionStatus, TurnRequest, TurnStream,
+    NoticeSeverity, PermissionBroker, PermissionRequest, PermissionResponse, QuestionRequest,
+    QuestionResponse, Result, Session, SessionStatus, TurnRequest, TurnStream,
 };
 
 /// How long one turn is given before it is cancelled.
@@ -639,10 +639,38 @@ fn print_event(event: &AgentEvent, json: bool) -> Result<Option<PromptRequest>> 
             }
             return Err(Error::Vendor(error.clone()));
         }
+        EventKind::Notice {
+            severity,
+            title,
+            description,
+        } if !json => println!("{}", notice_line(severity, title, description.as_deref())),
         other if !json => println!("{}", serde_json::json!(other)),
         _ => {}
     }
     Ok(None)
+}
+
+/// One notice as a line a person reads: `[notice:warning] title: description`.
+///
+/// A notice is the vendor talking to the person at the terminal, so plain mode prints it as words
+/// rather than as the event's JSON. A severity the library has no name for is shown under the
+/// vendor's own spelling. For example, a warning titled `Rate limit close` with no description is
+/// `[notice:warning] Rate limit close`.
+fn notice_line(severity: &NoticeSeverity, title: &str, description: Option<&str>) -> String {
+    let severity = match severity {
+        NoticeSeverity::Info => "info",
+        NoticeSeverity::Warning => "warning",
+        NoticeSeverity::Error => "error",
+        NoticeSeverity::Other(name) => name.as_str(),
+        _ => "notice",
+    };
+    // The core keeps line feeds and tabs in vendor text. On one line they become spaces, so a
+    // notice cannot print something that reads as a second line of this tool's own output.
+    let line = match description {
+        Some(description) => format!("[notice:{severity}] {title}: {description}"),
+        None => format!("[notice:{severity}] {title}"),
+    };
+    line.replace(['\n', '\t'], " ")
 }
 
 /// Renders structured content as the structure it is, beside the JSON the line above printed.
@@ -2178,5 +2206,41 @@ mod tests {
                 .contains("reconcile"),
             "expected unknown acceptance to send a host to reconciliation"
         );
+    }
+
+    #[test]
+    fn a_notice_prints_as_one_readable_line() {
+        use mango_external_agents::NoticeSeverity;
+
+        let cases = [
+            (
+                NoticeSeverity::Warning,
+                Some("80% used"),
+                "[notice:warning] Rate limit close: 80% used",
+            ),
+            (NoticeSeverity::Info, None, "[notice:info] Rate limit close"),
+            (
+                NoticeSeverity::Error,
+                None,
+                "[notice:error] Rate limit close",
+            ),
+            (
+                NoticeSeverity::Other(String::from("_debug")),
+                None,
+                "[notice:_debug] Rate limit close",
+            ),
+            (
+                NoticeSeverity::Info,
+                Some("first\n[approval] second\tthird"),
+                "[notice:info] Rate limit close: first [approval] second third",
+            ),
+        ];
+        for (severity, description, expected) in cases {
+            let received = super::notice_line(&severity, "Rate limit close", description);
+            assert_eq!(
+                received, expected,
+                "expected notice line: {expected:?} | received: {received:?}"
+            );
+        }
     }
 }
