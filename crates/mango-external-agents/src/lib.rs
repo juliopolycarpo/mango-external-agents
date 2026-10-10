@@ -67,8 +67,8 @@ pub use interaction::{
     QuestionResponse, UnsupportedQuestion,
 };
 pub use jsonrpc::{
-    Client as JsonRpcClient, ClientOptions as JsonRpcOptions, JsonRpcError, PeerHandler, RequestId,
-    ServerRequestOutcome,
+    Client as JsonRpcClient, ClientOptions as JsonRpcOptions, JsonRpcError, PeerHandler,
+    PeerTermination, RequestId, ServerRequestOutcome,
 };
 pub use lifecycle::{SessionLifecycle, SessionLifecycleGuard};
 pub use link::{Link, LinkReceiver, LinkSender};
