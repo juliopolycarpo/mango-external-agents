@@ -210,7 +210,11 @@ same reason the worker, whoever requested it, gives a terminal that is being com
 so when that wait expires the worker fails the turn itself, with the vendor code
 `terminal-abandoned` and not retryable: the turn's real outcome is unknown. A connection's end
 that finds a poisoned session already ending the turn leaves both the turn and the wake to it. A
-teardown acts for the reason a host's `close` gave, even when a stop worker asked for it first. A session dropped on a thread
+teardown acts for the reason a host's `close` gave when that close stopped work before the
+teardown began, even if a stop worker asked for it first; a close that arrives later joins the
+teardown already running for its requester's reason. The failure the worker commits in a
+committer's place carries no closes for what the turn left open: those went with the claim, and a
+terminal ends them for the host all the same. A session dropped on a thread
 without a Tokio runtime hands that worker to the runtime it was opened on. Every `close` waits for
 the worker's result, so none reports success before the child is reaped. If the worker cannot reap
 the child, or panics inside the host's process control, each caller receives the same
