@@ -24,10 +24,10 @@ use std::sync::Arc;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, BooleanConfigOptionCapabilities, ClientCapabilities,
-    ClientSessionCapabilities, EnvVariable, FileSystemCapabilities, HttpHeader, Implementation,
-    InitializeRequest, LoadSessionRequest, McpServer as AcpMcpServer, McpServerHttp,
-    McpServerStdio, NewSessionRequest, SessionConfigOptionsCapabilities, SessionId as AcpSessionId,
-    SessionModeState,
+    ClientSessionCapabilities, CompactionCapabilities, EnvVariable, FileSystemCapabilities,
+    HttpHeader, Implementation, InitializeRequest, LoadSessionRequest, McpServer as AcpMcpServer,
+    McpServerHttp, McpServerStdio, NewSessionRequest, NoticeCapabilities,
+    SessionConfigOptionsCapabilities, SessionId as AcpSessionId, SessionModeState,
 };
 use http::header::{HeaderName, HeaderValue};
 use mango_external_agents::configuration::{
@@ -189,7 +189,14 @@ impl AcpHarness {
 
     /// The client capabilities this harness advertises.
     ///
-    /// Everything declined. The host owns files and terminals, so an agent that asked this client to
+    /// Everything that would let an agent act through this client is declined, and the three that
+    /// only let it *say* more are advertised: boolean config options, session notices and context
+    /// compaction updates. An ACP v1 agent may send a `notice`, a `compaction_update` or a
+    /// `compaction_summary_chunk` only to a client that advertised `session.notices` or
+    /// `session.compaction`; both are empty objects and both arrive as observational turn events
+    /// (see the reducer). Neither is a request, so neither can reach a host's executor.
+    ///
+    /// The host owns files and terminals, so an agent that asked this client to
     /// read or write one would be asking the library to act on the host's filesystem on a third
     /// party's instruction — and a vendor tool call must never reach a host's executor. Declining is
     /// not a gap: every agent here has its own file and shell tools and uses them, which is what the
@@ -210,10 +217,13 @@ impl AcpHarness {
             .fs(FileSystemCapabilities::default())
             .terminal(false)
             .session(
-                ClientSessionCapabilities::new().config_options(
-                    SessionConfigOptionsCapabilities::new()
-                        .boolean(BooleanConfigOptionCapabilities::new()),
-                ),
+                ClientSessionCapabilities::new()
+                    .config_options(
+                        SessionConfigOptionsCapabilities::new()
+                            .boolean(BooleanConfigOptionCapabilities::new()),
+                    )
+                    .notices(NoticeCapabilities::new())
+                    .compaction(CompactionCapabilities::new()),
             )
     }
 }

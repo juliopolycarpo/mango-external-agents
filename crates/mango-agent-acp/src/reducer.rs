@@ -42,6 +42,11 @@ use mango_external_agents::{
     normalize::{MAX_PATH_LENGTH, TextLimit},
 };
 
+mod compaction;
+mod notice;
+
+pub use compaction::{COMPACTION_NAME, COMPACTION_TITLE, compaction_call_id};
+
 /// The call id every plan update shares.
 ///
 /// ACP v1's `plan` update carries the whole plan and no identity of its own — the plan is a property
@@ -124,6 +129,8 @@ pub struct Reducer {
     next_call: u64,
     /// The shortest gap between two updates one running call sends a host.
     update_interval: Duration,
+    /// The summary and error each running compaction has reported so far.
+    compactions: compaction::Compactions,
 }
 
 /// How often one running tool call may send a host an update.
@@ -149,6 +156,7 @@ impl Default for Reducer {
             digest_key: RandomState::new(),
             next_call: 0,
             update_interval: TOOL_UPDATE_INTERVAL,
+            compactions: compaction::Compactions::default(),
         }
     }
 }
@@ -528,6 +536,8 @@ impl Reducer {
     /// ```
     pub fn finish_with(&mut self, calls: ActivityStatus) -> Vec<EventKind> {
         let mut events = self.close_reasoning();
+        // A compaction left running is one of the open calls below; only its patch state is here.
+        self.compactions.clear();
         let mut open: Vec<(String, OpenCall)> = self.open_calls.drain().collect();
         open.sort_by_key(|(_, call)| call.opened);
         for (call_id, call) in open {
@@ -621,9 +631,15 @@ impl Reducer {
             SessionUpdate::ConfigOptionUpdate(update) => {
                 (Vec::new(), vec![configuration_fact(update)])
             }
+            SessionUpdate::CompactionUpdate(update) => {
+                (self.compaction_update(update, now), Vec::new())
+            }
+            SessionUpdate::CompactionSummaryChunk(chunk) => {
+                (self.compaction_chunk(chunk, now), Vec::new())
+            }
+            SessionUpdate::Notice(notice) => (notice::notice(notice), Vec::new()),
             // Session state rather than transcript, and the `#[non_exhaustive]` tail: an agent that
-            // sends an update this client never advertised support for (a notice, a compaction) or
-            // one from a draft feature this build did not opt into is not a failed turn.
+            // sends an update from a draft feature this build did not opt into is not a failed turn.
             SessionUpdate::UserMessageChunk(_)
             | SessionUpdate::CurrentModeUpdate(_)
             | SessionUpdate::SessionInfoUpdate(_)
@@ -840,10 +856,16 @@ fn transcript(update: &SessionUpdate) -> bool {
         // The command catalog is session state, like the mode and config updates above: see
         // `SessionFact::Commands`'s own doc comment. It still produces a fact in `body`, it just
         // must not close a reasoning block on its way through.
-        | SessionUpdate::AvailableCommandsUpdate(_) => false,
+        | SessionUpdate::AvailableCommandsUpdate(_)
+        // A notice is a live aside, not session history: a banner shown mid-thought does not mean
+        // the agent stopped thinking.
+        | SessionUpdate::Notice(_) => false,
         SessionUpdate::AgentMessageChunk(_)
         | SessionUpdate::ToolCall(_)
         | SessionUpdate::ToolCallUpdate(_)
+        // A compaction is an activity on the turn's timeline, like a tool call.
+        | SessionUpdate::CompactionUpdate(_)
+        | SessionUpdate::CompactionSummaryChunk(_)
         | SessionUpdate::Plan(_) => true,
         _ => false,
     }

@@ -28,6 +28,9 @@ own deployment.
 - **Vendor tools never enter the host's tool registry.** A vendor-initiated tool call is answered
   with a protocol error, never executed by the host.
 - **Vendor assistant text is never replayed** into the host's own model context by the library.
+  The same holds for the other text a vendor generates: a compaction summary (an activity's
+  content) and a notice (`EventKind::Notice`) are for display only, and a host must not feed either
+  to its own model as instructions.
 - **Redaction.** stderr crossing a diagnostic boundary is redacted for credential-shaped text.
   `Debug` and `Display` for process, transport, MCP, JSON-RPC, error, session-listing, stream-handle
   and event payload carriers report only safe metadata. The same policy covers discovery and receipts,
@@ -287,6 +290,13 @@ and nothing implying an official or endorsed integration.
 **Surface used:** ACP v1 over the official `agent-client-protocol` crate, `unstable_protocol_v2` and
 every other draft feature off. Every method driven is listed with its specification page in
 [harness-acp.md](harness-acp.md#the-surface-driven). Profile facts were read on 2026-09-13.
+
+The client advertises three session capabilities, all of which only let an agent report more:
+`configOptions.boolean`, `notices` and `compaction`. The last two follow the
+[session notices](https://agentclientprotocol.com/rfds/session-notices) and
+[session compaction](https://agentclientprotocol.com/rfds/session-compaction) RFDs, stable in v1 from
+schema 1.11 and read on 2026-10-10. What they carry is vendor-generated text, surfaced for display
+only under the rule above.
 
 **Posture:** the protocol exists for exactly this use — it is published by its authors as the way a
 client drives an agent, and every profile here is an agent that ships an ACP mode of its own accord.

@@ -838,6 +838,16 @@ mod tests {
             resolved(QuestionOutcome::Refused {
                 reason: UnsupportedQuestion::ArbitraryForm,
             }),
+            EventKind::Notice {
+                severity: crate::event::NoticeSeverity::Warning,
+                title: text.to_owned(),
+                description: Some(text.to_owned()),
+            },
+            EventKind::Notice {
+                severity: crate::event::NoticeSeverity::Other(text.to_owned()),
+                title: text.to_owned(),
+                description: None,
+            },
             EventKind::Cancelled {
                 reason: CancelReason::Requested,
             },
@@ -886,6 +896,7 @@ mod tests {
             EventKind::Usage { .. } => "Usage",
             EventKind::ThreadUsage { .. } => "ThreadUsage",
             EventKind::AccountLimits { .. } => "AccountLimits",
+            EventKind::Notice { .. } => "Notice",
             EventKind::Cancelled { .. } => "Cancelled",
             EventKind::Completed => "Completed",
             EventKind::Error { .. } => "Error",
@@ -895,7 +906,7 @@ mod tests {
     /// Every kind of event is in the corpus, so "one event of every kind" is a checked claim.
     #[test]
     fn the_corpus_holds_every_event_kind() {
-        const KINDS: usize = 18;
+        const KINDS: usize = 19;
         let names: std::collections::BTreeSet<&str> = corpus("text")
             .iter()
             .map(|event| kind_name(&event.kind))
