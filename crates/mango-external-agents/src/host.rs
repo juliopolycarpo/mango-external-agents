@@ -193,10 +193,10 @@ pub struct Limits {
     ///
     /// Shutdown is the process-teardown policy: closing a connection, then reaping its child after
     /// [`Self::kill_grace`]. In the Codex harness it does not bound a turn that is being cancelled
-    /// on a live session; that is [`Self::cancel_settle_timeout`]. It does bound a wait on a
-    /// session that is ending: when the connection closes, or the session stops taking work,
-    /// under a cancel, the stop waits up to this long, at each point it checks, for that ending
-    /// to fail the turn before it joins the teardown.
+    /// on a live session; that is [`Self::cancel_settle_timeout`]. It does bound two waits on a
+    /// session that is ending: a stop whose connection closes under its interrupt waits up to
+    /// this long for that ending to fail the turn, and the teardown waits up to this long for a
+    /// turn's ending that another task is still committing before it closes the connection.
     pub shutdown_timeout: Duration,
     /// How long a turn this side asked to stop may stay unresolved before the harness escalates to
     /// process shutdown.
@@ -214,7 +214,10 @@ pub struct Limits {
     ///
     /// A Codex session can therefore stay busy for up to one request wait on a pending start, one
     /// interrupt request, this deadline, and then the shutdown stages. At the defaults that is
-    /// about five minutes. A `cancel` call waits only when the turn is already named: then it
+    /// about five and a half minutes. An interrupt that fails skips this deadline, but can wait
+    /// one more [`Self::request_timeout`] behind a steer in flight and one
+    /// [`Self::shutdown_timeout`] for a closing connection, about six and a half minutes in all;
+    /// `docs/harness-codex.md` has the table. A `cancel` call waits only when the turn is already named: then it
     /// covers the interrupt, this deadline and any shutdown. Before that it returns as soon as the
     /// stop is recorded. `close` skips the protocol stop and stays within [`Self::kill_grace`] and
     /// [`Self::shutdown_timeout`].
