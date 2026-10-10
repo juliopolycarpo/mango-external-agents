@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, ListSessionsRequest, PromptRequest,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionId as AcpSessionId, SetSessionConfigOptionRequest,
-    SetSessionModeRequest,
+    PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOptions, SessionId as AcpSessionId,
+    SetSessionConfigOptionRequest, SetSessionModeRequest,
 };
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationCategory, ConfigurationChange,
@@ -30,8 +30,8 @@ use mango_external_agents::session::{
 };
 use mango_external_agents::state::SessionStatus;
 use mango_external_agents::{
-    Capability, Dispatch, Error, EventSink, HostContext, PermissionResponse, Result,
-    SessionLifecycle, TurnStream,
+    Capability, Dispatch, Error, EventSink, HostContext, PermissionResponse, ProcessControl,
+    Result, SessionLifecycle, TurnStream,
 };
 
 use crate::client::{self, ConnectionHandle, link_failure, overflow_failure, with_stderr};
@@ -1330,40 +1330,19 @@ impl Session for AcpSession {
                     )))),
                     false,
                 )
-            } else if let Some(overflow) = match outcome {
+            } else if let Some(overflow) = match &outcome {
                 None | Some(Err(_)) => connection.overflow(),
                 Some(Ok(_)) => None,
             } {
                 (Some(Ending::Fail(overflow_failure(overflow))), true)
             } else {
-                let ending = match outcome {
-                    None => match cancel_failure {
-                        Some(message) => Some(Ending::Fail(link_failure(message))),
-                        None if turn.sink.is_terminal() => None,
-                        None => Some(Ending::Cancel(
-                            cancel_reason.unwrap_or(CancelReason::Requested),
-                        )),
-                    },
-                    Some(Ok(response)) if reducer::was_cancelled(response.stop_reason) => Some(
-                        Ending::Cancel(cancel_reason.unwrap_or(CancelReason::Requested)),
-                    ),
-                    Some(Ok(response)) => Some(match reducer::stop_failure(response.stop_reason) {
-                        Some(failure) => Ending::Fail(failure),
-                        None => Ending::Complete,
-                    }),
-                    Some(Err(error)) => Some(match cancel_reason {
-                        Some(reason) => Ending::Cancel(reason),
-                        None => {
-                            let message =
-                                if agent_client_protocol::is_incoming_transport_closed(&error) {
-                                    with_stderr(&error.message, control.as_ref())
-                                } else {
-                                    error.message.clone()
-                                };
-                            Ending::Fail(link_failure(format!("{}: {message}", profile.id)))
-                        }
-                    }),
+                let recorded = TurnRecord {
+                    cancel_reason,
+                    cancel_failure,
+                    already_terminal: turn.sink.is_terminal(),
                 };
+                let agent = profile.id.to_string();
+                let ending = prompt_ending(outcome, recorded, &agent, control.as_ref());
                 (ending, true)
             };
             let _ = turn.approvals.flush(&turn.sink).await;
@@ -1515,6 +1494,7 @@ fn detach_retry_cancel_cleanup(
 /// Deciding first is what lets the calls the agent left running close with a status that agrees
 /// with the terminal after them: a call nobody saw finish did not demonstrably succeed, so a failed
 /// turn closes it as failed and a cancelled one as cancelled.
+#[derive(Debug)]
 enum Ending {
     /// The agent ended its own turn.
     Complete,
@@ -1548,6 +1528,91 @@ impl Ending {
             Self::Cancel(reason) => sink.cancel(reason).await,
             Self::Fail(error) => sink.fail(error).await,
         };
+    }
+}
+
+/// What a session recorded about a turn by the time its prompt wait ended.
+struct TurnRecord {
+    /// The reason somebody asked to stop the turn, if anybody did.
+    cancel_reason: Option<CancelReason>,
+    /// Why the `session/cancel` for that request could not be written, if it could not.
+    cancel_failure: Option<String>,
+    /// Whether the stream already holds a terminal, so there is nothing left to report.
+    already_terminal: bool,
+}
+
+/// Decides how a turn ends from how its prompt wait ended and what the session recorded.
+///
+/// `outcome` is the agent's answer, or `None` when the wait stopped without one. Several things
+/// stop that wait and a multi-thread runtime can deliver them in any order, so whether a turn was
+/// cancelled is read from what was recorded and never from which one the task happened to see
+/// first:
+///
+/// - an answer from the agent ends the turn as the agent said;
+/// - a stop somebody asked for, recorded before this is decided, ends it as `Cancelled` with
+///   that reason, including when the agent died instead of answering the stop;
+/// - a connection that went away with no stop recorded is the closed link, carrying the agent's
+///   redacted stderr. It is the same failure whether the dispatch loop ended first, the SDK
+///   failed the prompt at EOF, or the reply was dropped with the loop.
+///
+/// A `session/cancel` that could not be written keeps the handling it had: it is the failure
+/// reported when the wait ended without an answer, and is passed over when the prompt itself
+/// failed, where the recorded reason is reported.
+///
+/// ```ignore
+/// let ending = prompt_ending(None, recorded, "opencode", control.as_ref());
+/// ```
+fn prompt_ending(
+    outcome: Option<std::result::Result<PromptResponse, agent_client_protocol::Error>>,
+    recorded: TurnRecord,
+    agent: &str,
+    control: &dyn ProcessControl,
+) -> Option<Ending> {
+    let TurnRecord {
+        cancel_reason,
+        cancel_failure,
+        already_terminal,
+    } = recorded;
+    let error = match outcome {
+        Some(Ok(response)) => return Some(answered_ending(&response, cancel_reason)),
+        Some(Err(error)) => Some(error),
+        None => None,
+    };
+    if error.is_none() {
+        if let Some(message) = cancel_failure {
+            return Some(Ending::Fail(link_failure(message)));
+        }
+        if already_terminal {
+            return None;
+        }
+    }
+    if let Some(reason) = cancel_reason {
+        return Some(Ending::Cancel(reason));
+    }
+    // Nobody asked to stop this turn. Reporting `Cancelled` from here would tell a host it
+    // stopped a turn whose agent died, and would drop the stderr that says why.
+    let message = match &error {
+        Some(error) if !client::is_link_closure(error) => error.message.clone(),
+        _ => with_stderr("a transport that closed under session/prompt", control),
+    };
+    Some(Ending::Fail(link_failure(format!("{agent}: {message}"))))
+}
+
+/// How a turn ends when the agent answered its prompt.
+///
+/// An agent that reports `cancelled` is believed even with no reason recorded: the stop reason is
+/// the agent's own statement about its turn.
+///
+/// ```ignore
+/// let ending = answered_ending(&response, None);
+/// ```
+fn answered_ending(response: &PromptResponse, cancel_reason: Option<CancelReason>) -> Ending {
+    if reducer::was_cancelled(response.stop_reason) {
+        return Ending::Cancel(cancel_reason.unwrap_or(CancelReason::Requested));
+    }
+    match reducer::stop_failure(response.stop_reason) {
+        Some(failure) => Ending::Fail(failure),
+        None => Ending::Complete,
     }
 }
 
@@ -1704,11 +1769,14 @@ impl AcpSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{accepted_axes, refuse_unsupported_reset};
+    use super::{Ending, TurnRecord, accepted_axes, prompt_ending, refuse_unsupported_reset};
+    use agent_client_protocol::schema::v1::{PromptResponse, StopReason};
     use mango_external_agents::configuration::{
         Configuration, ConfigurationChange, ConfigurationPatch,
     };
+    use mango_external_agents::session::CancelReason;
     use mango_external_agents::{ApprovalRouting, Error, PermissionLevel};
+    use mango_external_agents::{ExitStatus, ProcessControl};
 
     /// ACP has no vendor-side "put it back": neither the mode a session opens under nor the local
     /// routing decision can be un-set, so a reset is refused the same way everywhere it is asked.
@@ -1749,6 +1817,175 @@ mod tests {
         assert_eq!(
             accepted.model, None,
             "expected the model to stay unaccepted: nothing here ever encodes one"
+        );
+    }
+
+    /// An agent that left a line on stderr, with a credential beside it, and is gone.
+    struct DeadAgent;
+
+    #[async_trait::async_trait]
+    impl ProcessControl for DeadAgent {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn stderr_tail(&self) -> String {
+            String::from("panicked at src/main.rs:7\nAuthorization: Bearer top-secret-token")
+        }
+
+        async fn wait(&self) -> mango_external_agents::Result<ExitStatus> {
+            Ok(ExitStatus::default())
+        }
+
+        async fn kill(&self, _reason: CancelReason) -> mango_external_agents::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A turn nobody asked to stop and nothing else has ended.
+    fn untouched() -> TurnRecord {
+        TurnRecord {
+            cancel_reason: None,
+            cancel_failure: None,
+            already_terminal: false,
+        }
+    }
+
+    /// The SDK's error for a request whose incoming transport reached EOF.
+    fn transport_closed() -> agent_client_protocol::Error {
+        let mut error = agent_client_protocol::Error::internal_error();
+        error.message = String::from("Incoming transport closed");
+        error.data(serde_json::json!({
+            "reason": agent_client_protocol::INCOMING_TRANSPORT_CLOSED_REASON,
+            "method": "session/prompt",
+        }))
+    }
+
+    /// The SDK's error for a request whose reply channel was dropped with the dispatch loop.
+    fn reply_dropped() -> agent_client_protocol::Error {
+        agent_client_protocol::util::internal_error(
+            "response to `session/prompt` never received: oneshot canceled",
+        )
+    }
+
+    /// One ending as text a failure message can show.
+    fn shown(ending: Option<&Ending>) -> String {
+        match ending {
+            Some(Ending::Fail(error)) => {
+                format!("Fail({}, {:?})", error.code.as_str(), error.message)
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// How a prompt wait can end.
+    type Waited = Option<std::result::Result<PromptResponse, agent_client_protocol::Error>>;
+
+    /// The three ways a prompt task can learn the connection is gone: the dispatch loop ended
+    /// first, the SDK failed the prompt at EOF, or the reply was dropped with the loop.
+    fn ways_to_see_a_dead_link() -> [(&'static str, Waited); 3] {
+        [
+            ("the dispatch loop ended first", None),
+            ("the prompt failed at EOF", Some(Err(transport_closed()))),
+            ("the reply was dropped", Some(Err(reply_dropped()))),
+        ]
+    }
+
+    /// Nobody asked to stop the turn, so a connection that ended under it is the closed link with
+    /// the agent's redacted stderr, whichever way the prompt task observed it. Reporting
+    /// `Cancelled(Requested)` here would tell a host it stopped a turn whose agent died.
+    #[test]
+    fn a_dead_link_nobody_cancelled_ends_the_turn_as_a_closed_link_however_it_was_seen() {
+        let expected = "Fail(acp-link-closed, \"fake: a transport that closed under session/prompt; the agent's stderr: panicked at src/main.rs:7\\nAuthorization: Bearer [REDACTED]\")";
+        for (seen, outcome) in ways_to_see_a_dead_link() {
+            let ending = prompt_ending(outcome, untouched(), "fake", &DeadAgent);
+            let received = shown(ending.as_ref());
+            assert_eq!(
+                received, expected,
+                "expected the ending when {seen}: {expected} | received: {received}"
+            );
+        }
+    }
+
+    /// A stop somebody asked for before the terminal is decided is what the turn reports, with
+    /// its own reason, whichever way the prompt task then observed the dead connection.
+    #[test]
+    fn a_dead_link_under_a_requested_cancel_ends_the_turn_as_cancelled_with_its_reason() {
+        for reason in [
+            CancelReason::Requested,
+            CancelReason::Timeout,
+            CancelReason::Shutdown,
+        ] {
+            for (seen, outcome) in ways_to_see_a_dead_link() {
+                let recorded = TurnRecord {
+                    cancel_reason: Some(reason),
+                    ..untouched()
+                };
+                let ending = prompt_ending(outcome, recorded, "fake", &DeadAgent);
+                assert!(
+                    matches!(&ending, Some(Ending::Cancel(received)) if *received == reason),
+                    "expected the ending when {seen}: Cancel({reason:?}) | received: {}",
+                    shown(ending.as_ref())
+                );
+            }
+        }
+    }
+
+    /// A `session/cancel` that could not be written is the failure the turn reports when the wait
+    /// ended without an answer, ahead of the reason recorded with it.
+    #[test]
+    fn a_cancel_that_could_not_be_written_ends_an_unanswered_turn_with_that_failure() {
+        let recorded = TurnRecord {
+            cancel_reason: Some(CancelReason::Requested),
+            cancel_failure: Some(String::from("ACP session/cancel could not be queued")),
+            already_terminal: false,
+        };
+        let ending = prompt_ending(None, recorded, "fake", &DeadAgent);
+        let received = shown(ending.as_ref());
+        let expected = "Fail(acp-link-closed, \"ACP session/cancel could not be queued\")";
+        assert_eq!(
+            received, expected,
+            "expected the ending: {expected} | received: {received}"
+        );
+    }
+
+    /// A stream that already holds a terminal is left alone when the wait ended without an answer.
+    #[test]
+    fn an_unanswered_turn_whose_stream_is_already_terminal_reports_nothing_more() {
+        let recorded = TurnRecord {
+            already_terminal: true,
+            ..untouched()
+        };
+        let ending = prompt_ending(None, recorded, "fake", &DeadAgent);
+        assert!(
+            ending.is_none(),
+            "expected no further ending | received: {}",
+            shown(ending.as_ref())
+        );
+    }
+
+    /// The agent's own answer decides the ending: its stop reason, or the agent's own error kept
+    /// as it came, without a stderr tail that belongs to a closed link.
+    #[test]
+    fn an_answered_prompt_ends_the_turn_as_the_agent_said() {
+        let answers: [Waited; 3] = [
+            Some(Ok(PromptResponse::new(StopReason::EndTurn))),
+            Some(Ok(PromptResponse::new(StopReason::Cancelled))),
+            Some(Err(agent_client_protocol::Error::new(
+                -31_000,
+                "model busy",
+            ))),
+        ];
+        let received = answers
+            .map(|answer| shown(prompt_ending(answer, untouched(), "fake", &DeadAgent).as_ref()));
+        let expected = [
+            "Some(Complete)",
+            "Some(Cancel(Requested))",
+            "Fail(acp-link-closed, \"fake: model busy\")",
+        ];
+        assert_eq!(
+            received, expected,
+            "expected [end_turn, cancelled, agent error]: {expected:?} | received: {received:?}"
         );
     }
 }
