@@ -9,11 +9,52 @@ use mango_external_agents::event::{AgentEvent, EventKind};
 use mango_external_agents::{
     ActivityContent, BrokerDecision, CancelReason, CloseReason, Dispatch, Error, InteractionId,
     PermissionBroker, PermissionRequest, PermissionResponse, QuestionRequest, QuestionResponse,
-    Result, Session, TurnRequest, TurnStream,
+    Result, Session, SessionStatus, TurnRequest, TurnStream,
 };
 
 /// How long one turn is given before it is cancelled.
-const TURN_DEADLINE: Duration = Duration::from_secs(300);
+pub(crate) const TURN_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How one `mea turn` is printed and, optionally, when it is cancelled on purpose.
+///
+/// # Example
+///
+/// ```text
+/// mea turn --json --cancel-after 1.5 "count slowly to 300"
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TurnOptions {
+    /// Emit NDJSON instead of text.
+    pub json: bool,
+    /// Ask the session to cancel the turn this long after it started.
+    pub cancel_after: Option<Duration>,
+}
+
+/// How a drained turn ended, as its own stream told it.
+///
+/// A cancelled turn ends in [`EventKind::Completed`] like any other; what says it was cancelled is
+/// the [`EventKind::Cancelled`] marker before it, so both are kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TurnEnd {
+    /// The reason on the cancellation marker, when the stream carried one.
+    cancelled: Option<CancelReason>,
+    /// Whether the stream reached its completion terminal.
+    completed: bool,
+    /// The `--cancel-after` delay, when it elapsed and the cancel was asked for.
+    cancel_requested_after: Option<Duration>,
+}
+
+impl TurnEnd {
+    /// Records what one event says about how the turn ends. Example: a `Cancelled` marker with
+    /// `CancelReason::Requested` sets `cancelled` to that reason.
+    fn observe(&mut self, event: &EventKind) {
+        match event {
+            EventKind::Cancelled { reason } => self.cancelled = Some(*reason),
+            EventKind::Completed => self.completed = true,
+            _ => {}
+        }
+    }
+}
 
 /// Runs one turn, prints its events and closes the session.
 ///
@@ -28,18 +69,21 @@ const TURN_DEADLINE: Duration = Duration::from_secs(300);
 /// ```
 #[cfg(test)]
 pub async fn run(session: &dyn Session, request: TurnRequest) -> Result<()> {
-    run_with_format(session, request, false).await
+    run_with_format(session, request, TurnOptions::default()).await
 }
 
-/// Runs and closes a turn, optionally emitting NDJSON. Example: `mea turn --json "hello"`.
+/// Runs and closes a turn, optionally emitting NDJSON and optionally cancelling it after a delay.
+/// Example: `mea turn --json --cancel-after 2 "hello"`.
 pub async fn run_with_format(
     session: &dyn Session,
     request: TurnRequest,
-    json: bool,
+    options: TurnOptions,
 ) -> Result<()> {
     let input = crate::ask::TerminalInput::new();
     let broker = crate::terminal::TerminalBroker::new(input.clone());
-    run_with_host(session, request, json, &broker, &input).await
+    run_turn(session, request, options, &broker, &input)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -55,6 +99,7 @@ async fn run_with_broker(
 
 /// The same, with both host-facing surfaces injected: who decides an approval, and who types an
 /// answer. Separate because they are separate authorities — one grants, the other does not.
+#[cfg(test)]
 async fn run_with_host(
     session: &dyn Session,
     request: TurnRequest,
@@ -62,6 +107,28 @@ async fn run_with_host(
     broker: &dyn PermissionBroker,
     asker: &dyn crate::ask::QuestionInput,
 ) -> Result<()> {
+    let options = TurnOptions {
+        json,
+        cancel_after: None,
+    };
+    run_turn(session, request, options, broker, asker)
+        .await
+        .map(|_| ())
+}
+
+/// Starts the turn, drains it under the deadline and closes the session, whatever the turn did.
+///
+/// The requested cancel and the deadline share one clock: both count from the moment `start_turn`
+/// returned a stream, and the deadline wraps the drain that carries the requested cancel, so a
+/// vendor that ignores the request is still stopped by the deadline.
+async fn run_turn(
+    session: &dyn Session,
+    request: TurnRequest,
+    options: TurnOptions,
+    broker: &dyn PermissionBroker,
+    asker: &dyn crate::ask::QuestionInput,
+) -> Result<TurnEnd> {
+    let json = options.json;
     let outcome = async {
         let mut stream = match session.start_turn(request).await {
             Ok(stream) => stream,
@@ -71,12 +138,8 @@ async fn run_with_host(
             }
         };
         report_dispatch(&stream, json);
-        match tokio::time::timeout(
-            TURN_DEADLINE,
-            print_turn(session, &mut stream, json, broker, asker),
-        )
-        .await
-        {
+        let drain = print_turn(session, &mut stream, json, broker, asker);
+        match tokio::time::timeout(TURN_DEADLINE, drain_cancelling(session, drain, options)).await {
             Ok(result) => result,
             Err(_) => {
                 session.cancel(CancelReason::Timeout).await?;
@@ -89,7 +152,128 @@ async fn run_with_host(
     }
     .await;
     let closed = session.close(CloseReason::Requested).await;
-    outcome.and(closed)
+    outcome.and_then(|end| closed.map(|()| end))
+}
+
+/// Drains a turn and, when a delay was asked for and elapses first, asks the session to cancel it.
+///
+/// The drain is never abandoned: the cancel is sent while the stream is still being read, and the
+/// stream is then read to its own terminal. A turn that ends before the delay is not touched, and
+/// prints nothing this function adds. `mea` sends one cancel and does not retry
+/// it.
+///
+/// # Example
+///
+/// ```text
+/// mea turn --cancel-after 2 "count slowly to 300"
+/// ```
+async fn drain_cancelling(
+    session: &dyn Session,
+    drain: impl Future<Output = Result<TurnEnd>>,
+    options: TurnOptions,
+) -> Result<TurnEnd> {
+    let Some(delay) = options.cancel_after else {
+        return drain.await;
+    };
+    tokio::pin!(drain);
+    tokio::select! {
+        biased;
+        ended = &mut drain => return ended,
+        () = tokio::time::sleep(delay) => {}
+    }
+    println!("{}", cancel_request_notice(delay, options.json));
+    // Joined, not sequenced: a session whose cancel waits on the reader must find it reading.
+    let outcome =
+        tokio::try_join!(&mut drain, session.cancel(CancelReason::Requested)).map(|(end, ())| {
+            TurnEnd {
+                cancel_requested_after: Some(delay),
+                ..end
+            }
+        });
+    let summary = CancelSummary::new(delay, session.snapshot().status, &outcome);
+    println!("{}", summary.render(options.json));
+    outcome
+}
+
+/// The line that marks, between events, the moment the flag asked for the cancel.
+///
+/// # Example
+///
+/// ```text
+/// cancel requested after 2s by --cancel-after (reason: requested)
+/// ```
+fn cancel_request_notice(delay: Duration, json: bool) -> String {
+    let reason = CancelReason::Requested;
+    if !json {
+        // Text deltas are printed without a newline, so this starts on a line of its own.
+        return format!("\ncancel requested after {delay:?} by --cancel-after (reason: {reason})");
+    }
+    serde_json::json!({
+        "cancelRequested": {
+            "by": "--cancel-after",
+            "afterSeconds": delay.as_secs_f64(),
+            "reason": reason,
+        }
+    })
+    .to_string()
+}
+
+/// What a turn cancelled by `--cancel-after` came to, for the line printed after its last event.
+///
+/// Separated from the printing so it can be asserted on, as [`retry_advice`] is.
+#[derive(Clone, Debug, PartialEq)]
+struct CancelSummary {
+    /// The delay the flag asked for.
+    delay: Duration,
+    /// `completed`, `none` for a stream that ended without a terminal, or the error it ended in.
+    terminal: String,
+    /// The reason on the stream's cancellation marker; `None` when the turn ended some other way.
+    cancelled: Option<CancelReason>,
+    /// The session's status once the turn ended, before `mea` closes it.
+    session: SessionStatus,
+}
+
+impl CancelSummary {
+    /// Reads the outcome of a drain whose cancel was requested. Example: a stream that carried
+    /// `Cancelled { reason: Requested }` then `Completed` reads as `completed`, `Some(Requested)`.
+    fn new(delay: Duration, session: SessionStatus, outcome: &Result<TurnEnd>) -> Self {
+        let (terminal, cancelled) = match outcome {
+            Ok(end) if end.completed => (String::from("completed"), end.cancelled),
+            Ok(end) => (String::from("none"), end.cancelled),
+            Err(error) => (format!("error: {error}"), None),
+        };
+        Self {
+            delay,
+            terminal,
+            cancelled,
+            session,
+        }
+    }
+
+    /// One line for the terminal, or one NDJSON object. Example:
+    /// `turn ended: completed; cancelled: requested; cancel requested by --cancel-after after 2s;
+    /// session: ready`.
+    fn render(&self, json: bool) -> String {
+        if json {
+            return serde_json::json!({
+                "cancelAfter": {
+                    "requestedBy": "--cancel-after",
+                    "afterSeconds": self.delay.as_secs_f64(),
+                    "terminal": self.terminal,
+                    "cancelled": self.cancelled,
+                    "sessionStatus": self.session,
+                }
+            })
+            .to_string();
+        }
+        let cancelled = self
+            .cancelled
+            .map_or_else(|| String::from("no"), |reason| reason.to_string());
+        format!(
+            "turn ended: {}; cancelled: {cancelled}; cancel requested by --cancel-after after {:?}; session: {}",
+            self.terminal, self.delay, self.session
+        )
+    }
 }
 
 /// Says how certain the vendor's acceptance of this attempt is, before any event arrives.
@@ -172,7 +356,8 @@ async fn print_turn(
     json: bool,
     broker: &dyn PermissionBroker,
     asker: &dyn crate::ask::QuestionInput,
-) -> Result<()> {
+) -> Result<TurnEnd> {
+    let mut end = TurnEnd::default();
     let mut pending: Option<PendingPrompt<'_>> = None;
     let mut queued = VecDeque::new();
     let mut deferred_prompt_error = None;
@@ -194,9 +379,10 @@ async fn print_turn(
                 start_next_prompt(&mut pending, &mut queued, asker, broker);
             }
             NextTurnItem::Event(None) => {
-                return deferred_prompt_error.map_or(Ok(()), |deferred| Err(deferred.error));
+                return deferred_prompt_error.map_or(Ok(end), |deferred| Err(deferred.error));
             }
             NextTurnItem::Event(Some(event)) => {
+                end.observe(&event.kind);
                 if event.is_terminal() {
                     pending = None;
                     queued.clear();
@@ -492,14 +678,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
 
+    use mango_agent_acp::testing::FakeAcpAgent;
+    use mango_agent_acp::{AcpHarness, AcpProfile};
     use mango_external_agents::testing::{FakeHarness, FakeLauncher};
     use mango_external_agents::{
         ActivityKind, ApprovalDecision, BrokerDecision, CancelReason, CloseReason, DecisionSource,
         Error, ErrorCode, EventKind, EventSink, Harness, HostContext, Interaction, InteractionId,
         InteractionKind, OpenSession, PermissionBroker, PermissionEffect, PermissionOption,
         PermissionRequest, PermissionResponse, Question, QuestionForm, QuestionId, QuestionOutcome,
-        QuestionRequest, QuestionResponse, Result, Session, SessionState, SystemClock, TurnRequest,
-        TurnStream, VendorError,
+        QuestionRequest, QuestionResponse, Result, Session, SessionState, SessionStatus,
+        SystemClock, TurnRequest, TurnStream, VendorError,
     };
 
     use super::run;
@@ -1324,7 +1512,10 @@ mod tests {
         super::run_with_format(
             session.as_ref(),
             TurnRequest::new("json-turn", "hello"),
-            true,
+            super::TurnOptions {
+                json: true,
+                cancel_after: None,
+            },
         )
         .await
         .expect("JSON turn completes");
@@ -1497,6 +1688,468 @@ mod tests {
         assert!(
             session.closed.load(Ordering::Acquire),
             "expected a failed start to close the session"
+        );
+    }
+
+    /// Records every cancel a host sends and how long after the session was wrapped it arrived.
+    struct CancelRecordingSession {
+        inner: Box<dyn Session>,
+        wrapped: tokio::time::Instant,
+        cancels: std::sync::Mutex<Vec<(CancelReason, Duration)>>,
+    }
+
+    impl CancelRecordingSession {
+        fn new(inner: Box<dyn Session>) -> Self {
+            Self {
+                inner,
+                wrapped: tokio::time::Instant::now(),
+                cancels: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn cancels(&self) -> Vec<(CancelReason, Duration)> {
+            self.cancels
+                .lock()
+                .expect("expected the recorded cancels")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Session for CancelRecordingSession {
+        fn state(&self) -> &SessionState {
+            self.inner.state()
+        }
+
+        async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+            self.inner.start_turn(request).await
+        }
+
+        async fn respond(&self, response: PermissionResponse) -> Result<()> {
+            self.inner.respond(response).await
+        }
+
+        async fn cancel(&self, reason: CancelReason) -> Result<()> {
+            self.cancels
+                .lock()
+                .expect("expected the recorded cancels")
+                .push((reason, self.wrapped.elapsed()));
+            self.inner.cancel(reason).await
+        }
+
+        async fn close(&self, reason: CloseReason) -> Result<()> {
+            self.inner.close(reason).await
+        }
+    }
+
+    fn cancelling_after(delay: Duration) -> super::TurnOptions {
+        super::TurnOptions {
+            json: true,
+            cancel_after: Some(delay),
+        }
+    }
+
+    /// The turn waits on an approval nobody answers, so only the requested cancel can end it.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_would_not_end_is_cancelled_after_the_delay_and_drained() {
+        let delay = Duration::from_millis(1500);
+        let inner = FakeHarness::new()
+            .open_session(&host(), OpenSession::new("cancel-after"))
+            .await
+            .expect("expected a fake session");
+        let session = CancelRecordingSession::new(inner);
+        let broker = WithheldBroker {
+            started: Arc::new(tokio::sync::Notify::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let end = super::run_turn(
+            &session,
+            TurnRequest::new("cancel-after-turn", "wait for an approval"),
+            cancelling_after(delay),
+            &broker,
+            &NobodyTyping,
+        )
+        .await
+        .expect("expected the cancelled turn to drain to its terminal");
+
+        assert_eq!(
+            session.cancels(),
+            vec![(CancelReason::Requested, delay)],
+            "expected one requested cancel exactly {delay:?} after the turn started"
+        );
+        assert_eq!(
+            end,
+            super::TurnEnd {
+                cancelled: Some(CancelReason::Requested),
+                completed: true,
+                cancel_requested_after: Some(delay),
+            },
+            "expected the stream to carry the cancellation marker and then its terminal"
+        );
+        assert!(
+            broker.cancelled.load(Ordering::Acquire),
+            "expected the pending approval prompt to stop with the turn, unanswered"
+        );
+        let closed = session
+            .start_turn(TurnRequest::new("after-close", "again"))
+            .await;
+        assert!(
+            matches!(closed, Err(Error::Closed { subject: "session" })),
+            "expected the session to be closed after the cancelled turn"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_ends_before_the_delay_is_not_cancelled() {
+        let inner = FakeHarness::new()
+            .without_approvals()
+            .open_session(&host(), OpenSession::new("ends-first"))
+            .await
+            .expect("expected a fake session");
+        let session = CancelRecordingSession::new(inner);
+
+        let end = super::run_turn(
+            &session,
+            TurnRequest::new("ends-first-turn", "hello"),
+            cancelling_after(Duration::from_secs(2)),
+            &RecordingBroker::default(),
+            &NobodyTyping,
+        )
+        .await
+        .expect("expected the turn to finish on its own");
+
+        assert_eq!(
+            session.cancels(),
+            Vec::new(),
+            "expected no cancel for a turn that ended before the delay"
+        );
+        assert_eq!(
+            end,
+            super::TurnEnd {
+                cancelled: None,
+                completed: true,
+                cancel_requested_after: None,
+            },
+            "expected the ordinary completion, with nothing the flag added"
+        );
+    }
+
+    /// A cancel the session refuses is the turn's error, sent once and not sent again.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_cancel_fails_the_turn_without_a_second_attempt() {
+        struct RefusingCancelSession {
+            inner: Box<dyn Session>,
+            cancels: std::sync::Mutex<Vec<CancelReason>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Session for RefusingCancelSession {
+            fn state(&self) -> &SessionState {
+                self.inner.state()
+            }
+
+            async fn start_turn(&self, request: TurnRequest) -> Result<TurnStream> {
+                self.inner.start_turn(request).await
+            }
+
+            async fn respond(&self, response: PermissionResponse) -> Result<()> {
+                self.inner.respond(response).await
+            }
+
+            async fn cancel(&self, reason: CancelReason) -> Result<()> {
+                self.cancels
+                    .lock()
+                    .expect("expected the recorded cancels")
+                    .push(reason);
+                Err(Error::Protocol {
+                    expected: String::from("a cancel the session accepts"),
+                    received: String::from("the scripted cancel refusal"),
+                })
+            }
+
+            async fn close(&self, reason: CloseReason) -> Result<()> {
+                self.inner.close(reason).await
+            }
+        }
+
+        let inner = FakeHarness::new()
+            .open_session(&host(), OpenSession::new("refused-cancel"))
+            .await
+            .expect("expected a fake session");
+        let session = RefusingCancelSession {
+            inner,
+            cancels: std::sync::Mutex::new(Vec::new()),
+        };
+        let broker = WithheldBroker {
+            started: Arc::new(tokio::sync::Notify::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let error = super::run_turn(
+            &session,
+            TurnRequest::new("refused-cancel-turn", "wait for an approval"),
+            cancelling_after(Duration::from_secs(1)),
+            &broker,
+            &NobodyTyping,
+        )
+        .await
+        .expect_err("expected the refused cancel to fail the turn");
+
+        assert!(
+            matches!(&error, Error::Protocol { received, .. }
+                if received == "the scripted cancel refusal"),
+            "expected the scripted cancel refusal, received {error:?}"
+        );
+        assert_eq!(
+            *session
+                .cancels
+                .lock()
+                .expect("expected the recorded cancels"),
+            vec![CancelReason::Requested],
+            "expected the requested cancel to be sent once and never retried"
+        );
+    }
+
+    const ACP_VENDOR: mango_external_agents::VendorInfo = mango_external_agents::VendorInfo {
+        company: "Nobody",
+        terms_url: "https://example.invalid/terms",
+        privacy_url: "https://example.invalid/privacy",
+        skills_are_slash_commands: false,
+    };
+
+    /// One ACP session over the scripted agent, with the launcher that recorded what it was sent.
+    async fn acp_session(agent: FakeAcpAgent) -> (CancelRecordingSession, FakeLauncher) {
+        let launcher = FakeLauncher::new();
+        launcher.push(agent.process());
+        let host = HostContext::builder()
+            .launcher(Arc::new(launcher.clone()))
+            .cwd(std::env::temp_dir())
+            .client_info("mea-test", "0.0.0")
+            .build()
+            .expect("expected a host");
+        let profile = Arc::new(AcpProfile::custom("fake", ["fake-acp", "acp"], ACP_VENDOR));
+        let inner = AcpHarness::new(profile)
+            .open_session(&host, OpenSession::new("acp-cancel-after"))
+            .await
+            .expect("expected an ACP session");
+        (CancelRecordingSession::new(inner), launcher)
+    }
+
+    fn cancel_notifications(launcher: &FakeLauncher) -> usize {
+        launcher
+            .written()
+            .iter()
+            .filter(|line| line.contains("\"session/cancel\""))
+            .count()
+    }
+
+    /// The same flag against the ACP harness and its real transport: the agent holds the prompt
+    /// open until `session/cancel` and then answers `stop_reason: cancelled`.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_acp_agent_is_cancelled_after_the_delay_and_ends_cancelled() {
+        let delay = Duration::from_secs(2);
+        let (session, launcher) = acp_session(FakeAcpAgent::new().staying_silent()).await;
+
+        let end = super::run_turn(
+            &session,
+            TurnRequest::new("acp-cancel-turn", "count slowly"),
+            cancelling_after(delay),
+            &RecordingBroker::default(),
+            &NobodyTyping,
+        )
+        .await
+        .expect("expected the cancelled ACP turn to drain to its terminal");
+
+        let cancels = session.cancels();
+        assert_eq!(
+            cancels
+                .iter()
+                .map(|(reason, _)| *reason)
+                .collect::<Vec<_>>(),
+            vec![CancelReason::Requested],
+            "expected one requested cancel"
+        );
+        assert!(
+            cancels.iter().all(|(_, elapsed)| *elapsed >= delay),
+            "expected the cancel no earlier than {delay:?} in, received {cancels:?}"
+        );
+        assert_eq!(
+            cancel_notifications(&launcher),
+            1,
+            "expected one session/cancel on the wire, received {:?}",
+            launcher.written()
+        );
+        assert_eq!(
+            end,
+            super::TurnEnd {
+                cancelled: Some(CancelReason::Requested),
+                completed: true,
+                cancel_requested_after: Some(delay),
+            },
+            "expected the ACP stream to end cancelled for the reason the flag gave"
+        );
+        assert_eq!(
+            launcher.live_children(),
+            0,
+            "expected the closed session to leave no agent process"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_acp_turn_that_ends_before_the_delay_is_not_cancelled() {
+        let (session, launcher) = acp_session(FakeAcpAgent::new()).await;
+
+        let end = super::run_turn(
+            &session,
+            TurnRequest::new("acp-ends-first-turn", "hello"),
+            cancelling_after(Duration::from_secs(2)),
+            &RecordingBroker::default(),
+            &NobodyTyping,
+        )
+        .await
+        .expect("expected the ACP turn to finish on its own");
+
+        assert_eq!(
+            session.cancels(),
+            Vec::new(),
+            "expected no cancel for an ACP turn that ended before the delay"
+        );
+        assert_eq!(
+            cancel_notifications(&launcher),
+            0,
+            "expected no session/cancel on the wire, received {:?}",
+            launcher.written()
+        );
+        assert_eq!(
+            end,
+            super::TurnEnd {
+                cancelled: None,
+                completed: true,
+                cancel_requested_after: None,
+            },
+            "expected the ordinary completion"
+        );
+    }
+
+    #[test]
+    fn a_turn_end_keeps_the_cancellation_marker_beside_the_terminal() {
+        let mut end = super::TurnEnd::default();
+        end.observe(&EventKind::TextDelta {
+            text: String::from("one"),
+        });
+        assert_eq!(end, super::TurnEnd::default());
+
+        end.observe(&EventKind::Cancelled {
+            reason: CancelReason::Requested,
+        });
+        assert_eq!(end.cancelled, Some(CancelReason::Requested));
+        assert!(!end.completed, "a marker is not a terminal");
+
+        end.observe(&EventKind::Completed);
+        assert!(end.completed);
+        assert_eq!(end.cancelled, Some(CancelReason::Requested));
+    }
+
+    #[test]
+    fn the_cancel_request_notice_names_the_flag_the_delay_and_the_reason() {
+        let delay = Duration::from_millis(1500);
+        assert_eq!(
+            super::cancel_request_notice(delay, false),
+            "\ncancel requested after 1.5s by --cancel-after (reason: requested)"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&super::cancel_request_notice(delay, true))
+                .expect("expected one JSON object"),
+            serde_json::json!({
+                "cancelRequested": {
+                    "by": "--cancel-after",
+                    "afterSeconds": 1.5,
+                    "reason": "requested",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn the_cancel_summary_says_which_terminal_the_turn_reached() {
+        let delay = Duration::from_secs(2);
+        let cancelled = super::CancelSummary::new(
+            delay,
+            SessionStatus::Ready,
+            &Ok(super::TurnEnd {
+                cancelled: Some(CancelReason::Requested),
+                completed: true,
+                cancel_requested_after: Some(delay),
+            }),
+        );
+        assert_eq!(cancelled.terminal, "completed");
+        assert_eq!(cancelled.cancelled, Some(CancelReason::Requested));
+
+        // The cancel lost the race: the turn completed with no marker, and the summary says so.
+        let outran = super::CancelSummary::new(
+            delay,
+            SessionStatus::Ready,
+            &Ok(super::TurnEnd {
+                completed: true,
+                ..super::TurnEnd::default()
+            }),
+        );
+        assert_eq!(outran.terminal, "completed");
+        assert_eq!(outran.cancelled, None);
+
+        let unterminated =
+            super::CancelSummary::new(delay, SessionStatus::Ready, &Ok(super::TurnEnd::default()));
+        assert_eq!(unterminated.terminal, "none");
+
+        let failed = super::CancelSummary::new(
+            delay,
+            SessionStatus::Closed,
+            &Err(Error::Closed { subject: "session" }),
+        );
+        assert!(
+            failed.terminal.starts_with("error: "),
+            "expected the error the turn ended in, received {:?}",
+            failed.terminal
+        );
+        assert_eq!(failed.cancelled, None);
+        assert_eq!(failed.session, SessionStatus::Closed);
+    }
+
+    #[test]
+    fn the_cancel_summary_renders_as_one_line_or_one_json_object() {
+        let summary = super::CancelSummary {
+            delay: Duration::from_secs(2),
+            terminal: String::from("completed"),
+            cancelled: Some(CancelReason::Requested),
+            session: SessionStatus::Ready,
+        };
+        assert_eq!(
+            summary.render(false),
+            "turn ended: completed; cancelled: requested; cancel requested by --cancel-after after 2s; session: ready"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&summary.render(true))
+                .expect("expected one JSON object"),
+            serde_json::json!({
+                "cancelAfter": {
+                    "requestedBy": "--cancel-after",
+                    "afterSeconds": 2.0,
+                    "terminal": "completed",
+                    "cancelled": "requested",
+                    "sessionStatus": "ready",
+                }
+            })
+        );
+
+        let not_cancelled = super::CancelSummary {
+            cancelled: None,
+            ..summary
+        };
+        assert!(
+            not_cancelled.render(false).contains("cancelled: no;"),
+            "expected a turn the cancel did not end to say so, received {:?}",
+            not_cancelled.render(false)
         );
     }
 
