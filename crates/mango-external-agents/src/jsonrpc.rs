@@ -1258,6 +1258,15 @@ impl Drop for CancelHandlerOnDrop<'_> {
     }
 }
 
+/// Takes the reader down when the close holding it ends. A reader that finished is unaffected.
+struct AbortReaderOnDrop(JoinHandle<()>);
+
+impl Drop for AbortReaderOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Says the handler's task has stopped, when it is dropped with that task.
 struct WorkerStopped(CancelToken);
 
@@ -1976,8 +1985,12 @@ impl Client {
     /// therefore either granted, and waited for, or never granted. Ask for it before the first
     /// step of the stretch, not part-way through.
     ///
-    /// A hold counts until it is dropped. One kept past the call that asked for it, moved to
-    /// another task for one, is still waited for, for the same grace.
+    /// Holds nest: one asked for while another is out is granted, and the wait is for the last
+    /// of them to be dropped.
+    ///
+    /// Drop a hold in the call that asked for it. One kept past that call, moved to another
+    /// task for one, still counts until it is dropped: an end of the connection waits the
+    /// grace for it while later calls, which hold nothing themselves, go on being made.
     ///
     /// What a hold does not do:
     ///
@@ -2010,10 +2023,14 @@ impl Client {
         // Counted first, read second; a cancellation raises its flag first and counts the
         // holds second. Whichever the interleaving, either the cancellation sees this hold and
         // waits for it, or this sees the cancellation and takes the hold back.
-        self.state.holds.fetch_add(1, Ordering::SeqCst);
+        //
+        // A hold asked for under one already out is granted whatever the flag says: the
+        // cancellation that raised it counted the earlier hold and is waiting, and refusing
+        // this one would park the very stretch it waits for.
+        let already_holding = self.state.holds.fetch_add(1, Ordering::SeqCst) > 0;
         #[cfg(test)]
         ClientState::run_hook(&self.state.after_hold_counted);
-        if self.state.cancelling_handler.load(Ordering::SeqCst) {
+        if !already_holding && self.state.cancelling_handler.load(Ordering::SeqCst) {
             self.state.release_hold();
             // The cancellation is on its way to this task. Nothing past this point runs.
             std::future::pending::<()>().await;
@@ -2125,16 +2142,21 @@ impl Client {
         giving_up.reached_the_link = closed.is_ok();
         drop(giving_up);
         let closed = closed.and_then(std::convert::identity);
-        if let Some(mut pump) = self.pump.lock().await.take() {
+        if let Some(pump) = self.pump.lock().await.take() {
             // The reader of a connection that ended under this side is on its way to telling
             // the handler so, or is telling it. It is owed that call whole, so it is waited for
             // with what is left of the time this close may take.
             //
             // Not from that very call: a handler that closes its client from `on_terminated`
             // would be waiting for itself.
+            //
+            // A close given up during that wait takes the reader down, as it would have done
+            // had it not waited: nothing is left that could stop it later.
+            let mut pump = AbortReaderOnDrop(pump);
+            let pump = &mut pump.0;
             let told = ended_under_this_side
                 && tokio::task::try_id() != Some(pump.id())
-                && tokio::time::timeout_at(latest, &mut pump).await.is_ok();
+                && tokio::time::timeout_at(latest, &mut *pump).await.is_ok();
             // Taken down rather than waited out: the shutdown flag is only read between messages,
             // so a pump parked inside a handler — which is where a host that stopped reading its
             // turn stream parks it — would never reach the flag, and closing would never return.
@@ -3176,6 +3198,9 @@ async fn pump(
                         state.stop_notifications().await;
                         state.shutdown.cancel();
                         state.drain_in_flight().await;
+                        // At once unless a close holds the task's join handle and is still
+                        // waiting for it to stop.
+                        state.worker_stopped.cancelled().await;
                     }
                     handler.on_terminated(termination).await;
                     break;

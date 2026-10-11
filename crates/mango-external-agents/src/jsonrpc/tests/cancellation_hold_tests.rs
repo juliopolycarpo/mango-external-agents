@@ -16,6 +16,8 @@ struct Script {
     hold: bool,
     /// The stretch takes a few turns of the scheduler; otherwise it waits at a gate.
     quick: bool,
+    /// Asks for a second hold inside the stretch, as a helper it calls might.
+    nested_hold: bool,
     /// Panics inside the stretch.
     panic_inside: bool,
     /// Makes a request and queues a notification inside the stretch.
@@ -110,6 +112,12 @@ impl PeerHandler for HoldingHandler {
         } else {
             Self::at_gate(&self.inside).await;
         }
+        let _nested = if self.script.nested_hold {
+            let client = client().expect("expected the client to outlive the stretch");
+            Some(client.hold_cancellation().await)
+        } else {
+            None
+        };
         assert!(
             !self.script.panic_inside,
             "the handler under test panics on purpose"
@@ -211,6 +219,7 @@ const HOLDING: Script = Script {
     park_before_hold: false,
     hold: true,
     quick: false,
+    nested_hold: false,
     panic_inside: false,
     ask_inside: false,
     close_inside: false,
@@ -1122,4 +1131,101 @@ async fn the_handler_is_told_after_its_task_stopped_when_a_close_holds_the_task(
         "expected the handler told once its task had stopped: (1, true) | received {told:?}"
     );
     client.close().await.expect("expected a clean close");
+}
+
+/// A hold asked for inside a stretch that is already held is granted even after the
+/// cancellation was decided: refusing it would park the stretch the cancellation waits for.
+#[tokio::test(start_paused = true)]
+async fn a_hold_asked_for_under_another_is_granted_after_the_cancellation_was_decided() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            nested_hold: true,
+            ..HOLDING
+        },
+    );
+    overflow_behind_the_stretch(&link, &handler, &client).await;
+
+    let opened = tokio::time::Instant::now();
+    handler.inside.add_permits(1);
+    eventually("the termination", handler.terminated.notified()).await;
+    let observed = (opened.elapsed(), handler.progress(), handler.terminations());
+    assert!(
+        matches!(
+            &observed,
+            (Duration::ZERO, (1, 1, 1), told)
+                if matches!(&told[..], [(PeerTermination::NotificationBackpressure { .. }, 1)])
+        ),
+        "expected the stretch committed through its second hold, with no wait: (0s, (1, 1, 1), [(NotificationBackpressure, 1)]) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// Two closes at once both wait for the stretch, and both return when it is committed.
+#[tokio::test(start_paused = true)]
+async fn two_closes_at_once_both_wait_for_a_held_stretch() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(&link, HOLDING);
+    inside_the_stretch(&link, &handler).await;
+
+    let began = tokio::time::Instant::now();
+    let first = spawn_close(&client);
+    let second = spawn_close(&client);
+    tokio::time::sleep(GRACE / 2).await;
+    let waiting = (
+        first.is_finished(),
+        second.is_finished(),
+        handler.progress(),
+    );
+    assert_eq!(
+        waiting,
+        (false, false, (1, 1, 0)),
+        "expected both closes waiting on the stretch: (false, false, (1, 1, 0)) | received {waiting:?}"
+    );
+    handler.inside.add_permits(1);
+    for closing in [first, second] {
+        eventually("the close", closing)
+            .await
+            .expect("expected the close task to finish")
+            .expect("expected a clean close");
+    }
+    let observed = (began.elapsed(), handler.progress());
+    assert_eq!(
+        observed,
+        (GRACE / 2, (1, 1, 1)),
+        "expected both closes over when the stretch was committed: (100ms, (1, 1, 1)) | received {observed:?}"
+    );
+}
+
+/// A close given up while it waits for the handler to be told takes the reader down, as a
+/// close always did: the reader is not left running with nothing able to stop it.
+#[tokio::test(start_paused = true)]
+async fn a_close_given_up_while_the_handler_is_told_takes_the_reader_down() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            park_termination: true,
+            ..NOT_HOLDING
+        },
+    );
+    link.end();
+    eventually("the termination to begin", handler.terminated.notified()).await;
+    let with_the_reader = Arc::strong_count(&handler);
+
+    let abandoned = tokio::time::timeout(GRACE, client.close()).await;
+    assert!(
+        abandoned.is_err(),
+        "expected the close still waiting for the handler to be told at one grace: pending | received {abandoned:?}"
+    );
+    until("the reader to let go of the handler", || {
+        Arc::strong_count(&handler) < with_the_reader
+    })
+    .await;
+    let returned = HoldingHandler::count(&handler.terminations_returned);
+    assert_eq!(
+        returned, 0,
+        "expected the reader cancelled inside on_terminated: 0 returned | received {returned}"
+    );
 }
