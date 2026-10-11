@@ -68,6 +68,41 @@ const SEPARATOR_LINES: &str = concat!(
     "a=1 b=2 c=3 d:4 e:5 f::6 g=h=i j.k-l://m n_o_p=q\n",
 );
 
+/// Plain diagnostic lines that end in a non-ASCII character: the redactor reads a whole line of
+/// ASCII before it meets the one byte that makes it look again.
+const LATE_NON_ASCII_LINES: &str = concat!(
+    "error: the vendor exited with status 1 while loading the workspace configuration at \u{2026}\n",
+    "warning: retrying request 3 of 5 after 250 ms; the upstream said it was busy again \u{e9}\n",
+    "  at Object.spawn (node:internal/child_process:420:11) in the module loader \u{2014}\n",
+    "info: loaded 12 tools from 3 servers in 87 ms; cache hit rate 0.93, 4 stale entries \u{2713}\n",
+);
+
+/// Structured log lines: a quote stands before nearly every `:` and nothing here is a credential,
+/// so a rule that reacts to quoted names has to look at each one and leave it.
+const JSON_LINES: &str = concat!(
+    r#"{"level":"info","msg":"done","status":200,"dur_ms":87,"path":"/v1/messages","ok":true}"#,
+    "\n",
+    r#"{"ts":"2026-10-11T10:57:33Z","level":"warn","msg":"retrying","attempt":3,"of":5,"after_ms":250}"#,
+    "\n",
+    r#"{"error":{"type":"overloaded_error","message":"Overloaded","request_id":"req_011CS"}}"#,
+    "\n",
+    r#"{"model":"claude-sonnet-5","usage":{"input":1200,"output":87},"stop":"end_turn","id":"msg_01"}"#,
+    "\n",
+);
+
+/// The same shape with a credential in quoted form among the lines. Redacted only by a redactor
+/// that reads a quoted name, so it checks the cost of that work and not its result.
+const JSON_SECRET_LINES: &str = concat!(
+    r#"{"level":"info","msg":"done","status":200,"dur_ms":87,"path":"/v1/messages","ok":true}"#,
+    "\n",
+    r#"{"headers":{"Authorization":"Bearer sk-live-0123456789abcdef","Accept":"text/plain"}}"#,
+    "\n",
+    r#"{"env":{"OPENAI_API_KEY":"sk-proj-0123456789","HOME":"/home/a"},"attempt":3}"#,
+    "\n",
+    r#"{"error":{"type":"overloaded_error","message":"Overloaded","request_id":"req_011CS"}}"#,
+    "\n",
+);
+
 /// A keyword repeated in a credential name that never gets a value: every word start in the name
 /// reaches the same separator, and the redactor has to learn once that nothing follows it.
 const NAME_UNIT: &str = "token_";
@@ -94,7 +129,8 @@ fn tail(lines: &str, len: usize) -> String {
 /// Fails the run when a case did not do the work its name claims.
 fn assert_redacted(label: &str, raw: &str, redacted: &str) {
     match label {
-        "plain" | "separators" | "names" | "schemes" => assert!(
+        "plain" | "separators" | "names" | "schemes" | "late-non-ascii" | "json"
+        | "quoted-names" | "quotes" => assert!(
             redacted == raw,
             "expected a {label} tail of {} bytes returned unchanged | received {} bytes",
             raw.len(),
@@ -105,6 +141,11 @@ fn assert_redacted(label: &str, raw: &str, redacted: &str) {
                 && !redacted.contains("hunter2")
                 && !redacted.contains("0123"),
             "expected every credential in a {} byte tail redacted | received {redacted:?}",
+            raw.len()
+        ),
+        "json-secrets" => assert!(
+            !redacted.is_empty(),
+            "expected a {} byte tail of quoted credentials to come back",
             raw.len()
         ),
         _ => assert!(
@@ -126,6 +167,9 @@ fn main() {
             ("secrets", SECRET_LINES),
             ("controls", CONTROL_LINES),
             ("separators", SEPARATOR_LINES),
+            ("late-non-ascii", LATE_NON_ASCII_LINES),
+            ("json", JSON_LINES),
+            ("json-secrets", JSON_SECRET_LINES),
         ] {
             let raw = tail(lines, len);
             assert_redacted(label, &raw, &stderr_text(&raw));
@@ -152,6 +196,10 @@ fn pathological(bench: &Bench) {
         for (label, raw) in [
             ("names", repeated(NAME_UNIT, "=", len)),
             ("schemes", repeated(SCHEME_UNIT, "://", len)),
+            // Quotes around names that never get a value: a rule that reads a quoted name must
+            // not read the rest of the run again for each quote.
+            ("quoted-names", repeated("\"token_", "\":", len)),
+            ("quotes", repeated("\"", ":", len)),
         ] {
             let name = format!("redact/stderr_text-{size_label}/{label}");
             // Checked only when the case runs: a filtered-out case must not pay for the call.
