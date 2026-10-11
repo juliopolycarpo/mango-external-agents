@@ -171,6 +171,9 @@ impl Asked {
     }
 }
 
+/// The default `shutdown_timeout`.
+const GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
 fn refused_as_closed() -> Vec<String> {
     vec![String::from("\"1\":-32000")]
 }
@@ -274,8 +277,8 @@ async fn an_inbound_overflow_drops_the_call_and_the_peer_is_refused() {
 
 /// This side passing its outbound budget with the writer held behind a write the peer never
 /// reads drops the call, and the refusal waits behind that write for the whole grace and is cut:
-/// nothing is written for it.
-#[tokio::test]
+/// nothing is written for it, and the handler is told when the grace has run out.
+#[tokio::test(start_paused = true)]
 async fn an_outbound_overflow_behind_a_held_writer_cuts_the_refusal_at_the_grace() {
     let asked = asked(options(), limits(usize::MAX, usize::MAX, 2)).await;
     let held = asked
@@ -287,14 +290,16 @@ async fn an_outbound_overflow_behind_a_held_writer_cuts_the_refusal_at_the_grace
         .client
         .submit_notification("queued", json!({}))
         .expect("expected the second frame queued");
+    let began = tokio::time::Instant::now();
     let refused = asked.client.submit_notification("one-too-many", json!({}));
 
     within("the end", asked.handler.terminated.notified()).await;
-    let observed = (refused.is_err(), asked.after_the_end().await);
+    let waited = began.elapsed();
+    let observed = (refused.is_err(), waited, asked.after_the_end().await);
     assert_eq!(
         observed,
-        (true, (1, Vec::<String>::new(), 1)),
-        "expected the third frame refused, the call dropped, nothing written for it and the handler told once: (true, (1, [], 1)) | received {observed:?}"
+        (true, GRACE, (1, Vec::<String>::new(), 1)),
+        "expected the third frame refused, the handler told when the grace ran out, the call dropped and nothing written for it: (true, {GRACE:?}, (1, [], 1)) | received {observed:?}"
     );
     asked.gate.add_permits(1);
     asked.client.close().await.expect("expected a clean close");
@@ -370,8 +375,11 @@ async fn a_call_that_returns_while_the_notifications_are_drained_answers_the_pee
     })
     .await;
 
-    // The drain waits on the blocked notification for the grace; the question is answered in it.
+    // The drain waits on the blocked notification for the grace, and the flag is not up until
+    // it ends. Half the grace passes with nothing done; a flag raised at once would by now have
+    // dropped the call and refused the peer. The question is answered in what is left.
     asked.exit.notify_one();
+    tokio::time::sleep(GRACE / 2).await;
     asked.handler.answer_gate.add_permits(1);
     within("the end", asked.handler.terminated.notified()).await;
     let observed = asked.after_the_end().await;

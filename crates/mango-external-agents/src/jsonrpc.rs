@@ -1736,10 +1736,14 @@ struct ClientState {
     /// test can have the writer's work done exactly there.
     #[cfg(test)]
     after_batch_member_answered: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Runs once when the reader lets a link failure go because a close is on record, so a
-    /// test can tell that from the reader never having heard of the failure.
+    /// Runs once when the reader lets a failure that would end the connection go because a
+    /// close is on record, so a test can tell that from the reader never having heard of it.
     #[cfg(test)]
     after_write_failure_ignored: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once on the reader as soon as it is woken to end the connection, before it has
+    /// looked at why, so a test can have a close and a failure land exactly there.
+    #[cfg(test)]
+    after_reader_woken_to_end: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once in [`link_failed`] before the failure is put on record, so a test can have a
     /// close put its own end on record exactly there.
     #[cfg(test)]
@@ -2534,6 +2538,8 @@ impl Client {
             after_batch_member_answered: StdMutex::new(None),
             #[cfg(test)]
             after_write_failure_ignored: StdMutex::new(None),
+            #[cfg(test)]
+            after_reader_woken_to_end: StdMutex::new(None),
             #[cfg(test)]
             before_link_failure_recorded: StdMutex::new(None),
             #[cfg(test)]
@@ -3939,7 +3945,8 @@ impl ClientState {
         self.handling_own_notification()
     }
 
-    /// Whether the caller is inside this client's `on_notification`, on the task that awaits it.
+    /// Whether the caller is inside a call this client's worker task awaits and scopes as a
+    /// notification call: its `on_notification`, or an `on_request_handoff`.
     fn handling_own_notification(&self) -> bool {
         HANDLING_NOTIFICATION_FOR
             .try_with(|call| call.client == self.address())
@@ -4344,6 +4351,8 @@ async fn pump(
             // A transport failure, refused reply or abandoned send can leave the read side open.
             // End the connection here, on the one task that owns termination.
             () = state.write_failed.notified() => {
+                #[cfg(test)]
+                ClientState::run_hook(&state.after_reader_woken_to_end);
                 let overflow = state
                     .outbound_overflow
                     .lock()
@@ -4458,10 +4467,12 @@ async fn connection_failed(
     failure: Failed,
 ) {
     // Decided on the record, not on a look taken before it: a close that put its own end on
-    // record first owns this one, whichever of the failures that end connections reaches here
-    // a moment after it. The close fails the calls and stops the handler's task itself, and the
-    // handler is not told of an end its host caused, under a client whose host says so through
-    // `Client::ended`.
+    // record first owns this one, whichever of the failures that end through here (a link's
+    // write or read, this side's outbound budget) reaches here a moment after it. The close
+    // fails the calls and stops the handler's task itself, and the handler is not told of an
+    // end its host caused, under a client whose host says so through `Client::ended`. The
+    // peer's exit and an inbound budget record their own ends in the reader and are not
+    // decided here.
     if matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
         #[cfg(test)]
         ClientState::run_hook(&state.after_write_failure_ignored);
