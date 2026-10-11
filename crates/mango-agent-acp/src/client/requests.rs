@@ -415,9 +415,11 @@ fn decode<Response: DeserializeOwned>(method: &str, result: Value) -> Result<Res
         Value::Null => Value::Object(serde_json::Map::new()),
         other => other,
     };
+    // The decoder's own text quotes the value it could not read, which is the agent's, and this
+    // error's `Display` writes `received` verbatim. Only the kind of mismatch is kept.
     serde_json::from_value(result).map_err(|error| Error::Protocol {
         expected: format!("a {method} result"),
-        received: error.to_string(),
+        received: format!("a result with a {:?} error", error.classify()),
     })
 }
 
@@ -559,15 +561,33 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_result_does_not_quote_the_agents_value() {
+        let read: mango_external_agents::Result<PromptResponse> = decode(
+            "session/prompt",
+            serde_json::json!({ "stopReason": "Authorization: Bearer top-secret-token" }),
+        );
+        let shown = format!(
+            "{:?} {}",
+            read,
+            read.as_ref().expect_err("expected an error")
+        );
+        assert!(
+            !shown.contains("top-secret-token"),
+            "expected the agent's value kept out of the error | received: {shown}"
+        );
+    }
+
+    #[test]
     fn a_result_that_is_not_the_methods_is_a_protocol_error_naming_the_method() {
         let read: mango_external_agents::Result<PromptResponse> =
             decode("session/prompt", serde_json::json!({ "stopReason": 7 }));
-        let Err(Error::Protocol { expected, .. }) = &read else {
+        let Err(Error::Protocol { expected, received }) = &read else {
             panic!("expected Error::Protocol | received: {read:?}");
         };
         assert_eq!(
-            expected, "a session/prompt result",
-            "expected the protocol error to name the method | received: {expected:?}"
+            (expected.as_str(), received.as_str()),
+            ("a session/prompt result", "a result with a Data error"),
+            "expected the protocol error to name the method and the kind of mismatch | received: ({expected:?}, {received:?})"
         );
     }
 }

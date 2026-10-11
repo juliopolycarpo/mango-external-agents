@@ -210,6 +210,11 @@ const KEPT_UP_BURST: usize = 400;
 /// The message budget bounds what waits for the client, not how much an agent may say. A burst
 /// of single-line notifications fifty times the budget, written in one go, costs the session
 /// nothing: each line is handled before the next is counted.
+///
+/// That holds by construction on the current-thread runtime this runs on, where the reader's
+/// yield before each line always lets the handler run first. On a multi-thread runtime the
+/// reader and the handler run at once and the budget only has to absorb how far the reader gets
+/// ahead; nothing makes the reader wait for the handler there.
 #[tokio::test]
 async fn a_burst_of_lines_past_the_message_budget_is_handled_as_it_is_read() {
     let (session, _launcher) = open_under(
@@ -282,4 +287,93 @@ async fn an_unknown_request_behind_a_run_of_updates_is_still_refused_as_method_n
     })
     .await;
     assert_wire_after(&launcher, "session/prompt", &["error -32601 for 999"]);
+}
+
+/// An inbound overflow does not drain what was read before it. An agent's own refusal that is
+/// still waiting its turn when the agent passes the message budget, here in the very batch that
+/// passes it, is not what the request reports: the budget is, because nothing of a batch that
+/// does not fit is handled.
+#[tokio::test]
+async fn a_refusal_in_the_batch_that_overflows_is_reported_as_the_overflow() {
+    const FLOOD: usize = 1_100;
+    let (session, _launcher) =
+        open_under(
+            listing_peer(|frame| {
+                let mut batch = vec![serde_json::json!({
+                    "jsonrpc": "2.0", "id": frame["id"],
+                    "error": { "code": -31_004, "message": "no workspace" }
+                })];
+                batch.extend((0..FLOOD).map(
+                    |_| serde_json::json!({ "jsonrpc": "2.0", "method": "$/vendor/heartbeat" }),
+                ));
+                vec![serde_json::Value::Array(batch).to_string()]
+            }),
+            Limits::default(),
+        )
+        .await;
+
+    let error = refusal(session.list_sessions(Default::default()).await);
+    assert_limit_exceeded(
+        &error,
+        ("JSON-RPC messages queued from the ACP agent", 1_024, FLOOD),
+    );
+}
+
+/// Credential-shaped text an agent might put where a permission request's options belong.
+const SECRET: &str = "Authorization: Bearer top-secret-token";
+
+/// A `session/request_permission` the client cannot read is refused with `-32602` on its own id
+/// and nothing else: no `data`, so nothing the agent put in the request, a credential included,
+/// is written back to it. The turn it arrived in carries on.
+#[tokio::test]
+async fn an_unreadable_permission_request_is_refused_without_echoing_what_it_carried() {
+    let ask = serde_json::json!({
+        "jsonrpc": "2.0", "id": 4_321, "method": "session/request_permission",
+        "params": { "sessionId": "sess_fake", "toolCall": SECRET, "options": SECRET }
+    });
+    let (session, launcher) = open(
+        FakeAcpAgent::new()
+            .with_updates(vec![text_chunk("before"), text_chunk("after")])
+            .writing_mid_turn(1, ask.to_string()),
+        permissive(),
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "say two things"))
+        .await
+        .expect("expected a turn");
+    assert_events(
+        "events",
+        &drain(&mut turn).await,
+        &[
+            "TurnStarted",
+            "TextDelta(before)",
+            "TextDelta(after)",
+            "Completed",
+        ],
+    );
+    eventually("the refusal on the wire", &launcher, || {
+        (!wire_after(&launcher, "session/prompt").is_empty()).then_some(())
+    })
+    .await;
+    assert_wire_after(&launcher, "session/prompt", &["error -32602 for 4321"]);
+
+    let refusals: Vec<serde_json::Value> = wire(&launcher)
+        .into_iter()
+        .filter(|frame| frame["id"] == 4_321)
+        .collect();
+    let received = (
+        refusals
+            .first()
+            .and_then(|frame| frame["error"].get("data").cloned()),
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("top-secret-token")),
+    );
+    let expected = (None, false);
+    assert_eq!(
+        received, expected,
+        "expected (error.data, the secret written back): {expected:?} | received: {received:?} in {refusals:?}"
+    );
 }

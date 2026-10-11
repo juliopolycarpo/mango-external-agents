@@ -1403,12 +1403,9 @@ impl PeerHandler for AcpHandler {
         }
         let request = match serde_json::from_value::<RequestPermissionRequest>(params) {
             Ok(request) => request,
-            Err(error) => {
-                let mut unreadable = agent_client_protocol_schema::v1::Error::invalid_params();
-                // serde's own description of the shape it wanted; none of the agent's values.
-                unreadable.data = Some(serde_json::Value::String(error.to_string()));
-                return refusal(unreadable);
-            }
+            // No `data`: the decoder's description quotes the value it could not read, and
+            // nothing an agent sent is echoed back onto the wire.
+            Err(_) => return refusal(agent_client_protocol_schema::v1::Error::invalid_params()),
         };
         let (reply, question) = PermissionReply::parked();
         // An answer that could not be handed over is the connection ending under the question,
