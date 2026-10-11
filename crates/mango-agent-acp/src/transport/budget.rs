@@ -4,11 +4,12 @@
 //! The JSON-RPC peer enforces every budget here and reports a passed one as a
 //! [`PeerTermination`]. That type names the peer generically; [`Overflow`] turns it back into the
 //! [`Error::LimitExceeded`](mango_external_agents::Error::LimitExceeded) an ACP host has always
-//! been given, with this crate's own subjects.
+//! been given, with this crate's own subjects. Which budget it was is read from the peer's
+//! types ([`OutboundBound`] for the outgoing ones), never from the text of its errors.
 
 use agent_client_protocol_schema::v1::PROTOCOL_LEVEL_METHOD_NAMES;
 use mango_external_agents::Limits;
-use mango_external_agents::jsonrpc::{ClientOptions, PeerTermination, WireOptions};
+use mango_external_agents::jsonrpc::{ClientOptions, OutboundBound, PeerTermination, WireOptions};
 
 /// How many replies of one kind to input that named no request may wait to be written at once:
 /// `-32700` for a line that is not JSON, and `-32600` for JSON that is not a frame.
@@ -75,23 +76,21 @@ impl Overflow {
     /// The frame budget a refused request names, or `None` for any other refusal.
     ///
     /// The peer refuses one frame larger than its outgoing bound without touching the
-    /// connection, and names what it counted in the error's subject. For example, a 9-byte frame
-    /// under an 8-byte bound is refused as
-    /// `LimitExceeded { subject: "bytes of one outgoing JSON-RPC frame", limit: 8, received: 9 }`,
-    /// which is `Overflow::outgoing_frame(8, 9)` here.
+    /// connection, as a `LimitExceeded` that [`OutboundBound::exceeded_by`] reads as
+    /// [`OutboundBound::FrameBytes`]. For example, a 9-byte frame refused under an 8-byte bound
+    /// is `Overflow::outgoing_frame(8, 9)` here, and a refusal for a full queue or for the
+    /// requests awaiting an answer is `None`.
     pub(crate) fn from_refused_frame(error: &mango_external_agents::Error) -> Option<Self> {
+        if OutboundBound::exceeded_by(error) != Some(OutboundBound::FrameBytes) {
+            return None;
+        }
         let mango_external_agents::Error::LimitExceeded {
-            subject,
-            limit,
-            received,
+            limit, received, ..
         } = error.cause()
         else {
             return None;
         };
-        match outgoing_budget(subject)? {
-            Budget::OutgoingFrameBytes => Some(Self::outgoing_frame(*limit, *received)),
-            _ => None,
-        }
+        Some(Self::outgoing_frame(*limit, *received))
     }
 
     /// The budget a connection's end names, or `None` when it ended for any other reason.
@@ -108,11 +107,12 @@ impl Overflow {
                 limit, received, ..
             } => (Budget::IncomingBytes, *limit, *received),
             PeerTermination::OutboundBackpressure {
-                subject,
-                limit,
-                received,
-                ..
-            } => (outgoing_budget(subject)?, *limit, *received),
+                limit, received, ..
+            } => (
+                outgoing_budget(termination.outbound_bound())?,
+                *limit,
+                *received,
+            ),
             _ => return None,
         };
         Some(Self {
@@ -135,21 +135,19 @@ impl Overflow {
     }
 }
 
-/// Which outgoing budget one of the peer's own subjects names, or `None` for a subject this
-/// crate does not know.
+/// Which outgoing budget one of the peer's outbound bounds is, or `None` when the peer named
+/// none this crate knows.
 ///
-/// The one place this crate reads the peer's wording. The peer says what it counted in the
-/// `subject` of its `LimitExceeded` and of its `OutboundBackpressure`, as text, and has no type
-/// for it. The three it uses are matched whole, so a subject the peer rewords stops matching
-/// and the failure reads as a closed link instead of as the wrong budget;
-/// `the_peers_own_subjects_are_the_ones_matched` ends a real connection each way and fails when
-/// that happens. For example, `"outgoing JSON-RPC frames awaiting their write"` is the frame
-/// count of the queue.
-fn outgoing_budget(subject: &str) -> Option<Budget> {
-    match subject {
-        "bytes of one outgoing JSON-RPC frame" => Some(Budget::OutgoingFrameBytes),
-        "bytes of outgoing JSON-RPC frames awaiting their write" => Some(Budget::OutgoingBytes),
-        "outgoing JSON-RPC frames awaiting their write" => Some(Budget::OutgoingFrames),
+/// [`OutboundBound`] is `#[non_exhaustive]`: a bound the peer adds later has no budget here and
+/// no subject a host has been promised. It takes the same arm as no bound at all, so a failure
+/// under it reads as a closed link instead of as the wrong budget. For example,
+/// `outgoing_budget(Some(OutboundBound::QueuedFrames))` is the frame count of the queue and
+/// `outgoing_budget(None)` is `None`.
+fn outgoing_budget(bound: Option<OutboundBound>) -> Option<Budget> {
+    match bound {
+        Some(OutboundBound::FrameBytes) => Some(Budget::OutgoingFrameBytes),
+        Some(OutboundBound::QueuedBytes) => Some(Budget::OutgoingBytes),
+        Some(OutboundBound::QueuedFrames) => Some(Budget::OutgoingFrames),
         _ => None,
     }
 }
@@ -289,8 +287,8 @@ mod tests {
         outgoing_frame_limit, queued_bytes_limit, wire_options,
     };
     use mango_external_agents::jsonrpc::{
-        Client, ClientOptions, ConnectionEnd, PeerHandler, PeerTermination, ServerRequestOutcome,
-        WireOptions,
+        Client, ClientOptions, ConnectionEnd, OutboundBound, PeerHandler, PeerTermination,
+        ServerRequestOutcome, WireOptions,
     };
     use mango_external_agents::{Limits, Link, LinkReceiver, LinkSender};
     use std::sync::Arc;
@@ -400,15 +398,19 @@ mod tests {
         })
     }
 
-    /// The peer names what it counted as text. Each of its three outgoing subjects is produced
-    /// here by a real connection and has to come back as this crate's own budget; a subject the
-    /// peer reworded comes back as `None` and fails this by name.
-    #[tokio::test]
-    async fn the_peers_own_subjects_are_the_ones_matched() {
-        let one_frame = stalled_client(WireOptions::new().with_max_outbound_frame_bytes(64));
-        let refused = one_frame
+    /// A frame of 128 bytes of padding refused under a 64-byte frame bound, as the peer tells
+    /// it.
+    fn refused_frame() -> mango_external_agents::Error {
+        stalled_client(WireOptions::new().with_max_outbound_frame_bytes(64))
             .submit_notification("ping", serde_json::json!({ "pad": "x".repeat(128) }))
-            .expect_err("expected a frame over the bound refused");
+            .expect_err("expected a frame over the bound refused")
+    }
+
+    /// Each of the peer's three outbound bounds is passed here on a real connection and has to
+    /// come back as this crate's own budget, under the subject a host has always been given.
+    #[tokio::test]
+    async fn each_outbound_bound_the_peer_reports_is_its_own_budget() {
+        let refused = refused_frame();
         let received = Overflow::from_refused_frame(&refused).map(|overflow| fields(overflow).0);
         let expected = Some("bytes in one frame to the ACP agent");
         assert_eq!(
@@ -434,26 +436,65 @@ mod tests {
     }
 
     #[test]
-    fn a_subject_the_peer_does_not_use_names_no_budget() {
-        let received = outgoing_budget("bytes of something else").map(Budget::subject);
-        assert_eq!(
-            received, None,
-            "expected no budget for an unknown subject | received: {received:?}"
-        );
+    fn every_outbound_bound_has_one_budget_and_no_bound_has_none() {
+        let cases = [
+            (
+                Some(OutboundBound::FrameBytes),
+                Some("bytes in one frame to the ACP agent"),
+            ),
+            (
+                Some(OutboundBound::QueuedBytes),
+                Some("bytes queued for the ACP agent"),
+            ),
+            (
+                Some(OutboundBound::QueuedFrames),
+                Some("frames queued for the ACP agent"),
+            ),
+            // The arm a bound the peer adds later takes: `OutboundBound` is non-exhaustive, so
+            // no such value can be written here, and it shares the fallback with no bound.
+            (None, None),
+        ];
+        for (bound, expected) in cases {
+            let received = outgoing_budget(bound).map(Budget::subject);
+            assert_eq!(
+                received, expected,
+                "expected the budget of {bound:?}: {expected:?} | received: {received:?}"
+            );
+        }
     }
 
-    #[test]
-    fn only_the_peers_frame_refusal_reads_as_the_frame_budget() {
-        let frame = mango_external_agents::Error::LimitExceeded {
-            subject: "bytes of one outgoing JSON-RPC frame",
-            limit: 8,
-            received: 9,
+    #[tokio::test]
+    async fn only_the_peers_frame_refusal_reads_as_the_frame_budget() {
+        let frame = refused_frame();
+        // The numbers are the peer's own: the bound it was given and the frame it measured.
+        let mango_external_agents::Error::LimitExceeded {
+            limit: 64,
+            received: frame_bytes,
+            ..
+        } = frame.cause()
+        else {
+            panic!("expected LimitExceeded under a limit of 64 | received: {frame:?}");
         };
         let received = Overflow::from_refused_frame(&frame).map(fields);
-        let expected = Some(("bytes in one frame to the ACP agent", 8, 9));
+        let expected = Some(("bytes in one frame to the ACP agent", 64, *frame_bytes));
         assert_eq!(
             received, expected,
-            "expected (subject, limit, received): {expected:?} | received: {received:?}"
+            "expected (subject, limit, received): {expected:?} | received: {received:?} from {frame:?}"
+        );
+
+        // A queue that is full is an outbound bound too, and not the frame's.
+        let queue = stalled_client(WireOptions::new().with_max_outbound_queued_frames(2));
+        let full = (0..64)
+            .find_map(|_| queue.submit_notification("ping", "x").err())
+            .expect("expected a queued notification refused within 64");
+        let received = (
+            OutboundBound::exceeded_by(&full),
+            Overflow::from_refused_frame(&full),
+        );
+        let expected = (Some(OutboundBound::QueuedFrames), None);
+        assert_eq!(
+            received, expected,
+            "expected (the bound, the frame overflow) of a full queue: {expected:?} | received: {received:?} from {full:?}"
         );
 
         for other in [
@@ -612,6 +653,29 @@ mod tests {
         assert_eq!(
             received, expected,
             "expected (frame bytes, queued bytes, queued frames, batches, parse replies, invalid-request replies, cancel method): {expected:?} | received: {received:?}"
+        );
+    }
+
+    /// A queue bound of nothing would refuse every frame this side queues, with the bound named,
+    /// and end nothing. The smallest limits a host can build leave room for the prompt.
+    #[test]
+    fn no_limit_a_host_can_build_leaves_a_queue_bound_of_nothing() {
+        let none = Limits {
+            turn_channel_capacity: 0,
+            max_pending_requests: 0,
+            ..Limits::default()
+        };
+        // `HostContext` refuses an outbound budget of zero, so one byte is the smallest.
+        let wire = wire_options(&none, 1);
+        let received = (
+            wire.max_outbound_frame_bytes(),
+            wire.max_outbound_queued_bytes(),
+            wire.max_outbound_queued_frames(),
+        );
+        let expected = (1, 2, 4);
+        assert_eq!(
+            received, expected,
+            "expected (frame bytes, queued bytes, queued frames) for zero counts and one byte: {expected:?} | received: {received:?}"
         );
     }
 }
