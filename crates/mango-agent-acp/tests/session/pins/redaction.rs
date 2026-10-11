@@ -186,12 +186,22 @@ async fn a_credential_in_data_is_redacted_and_its_siblings_are_kept() {
             "credentials": { "user": "u-0123456789", "pass": "pw-0123456789" },
             "env": [{ "name": "OPENAI_API_KEY", "value": "ev-0123456789" }],
             "note": "line one\nAuthorization:\nBearer nl-0123456789",
+            "headers": [["Authorization", "Bearer pa-0123456789"]],
+            "pairs": [{ "Name": "X_AUTH_TOKEN", "Value": "pn-0123456789" }],
+            "cookie": "sid=ck-0123456789",
+            "privateKey": "pk-0123456789",
+            "pin": { "auth": 1234567890 },
             "retry_after": 30,
         },
     }))
     .await;
 
     for secret in [
+        "pa-0123456789",
+        "pn-0123456789",
+        "ck-0123456789",
+        "pk-0123456789",
+        "1234567890",
         "sk-live-0123456789",
         "abc.def.ghi",
         "rt-0123456789",

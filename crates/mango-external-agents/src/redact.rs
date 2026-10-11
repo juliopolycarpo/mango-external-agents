@@ -34,6 +34,7 @@ mod differential;
 mod reference;
 mod scan;
 mod strip;
+mod structured;
 #[cfg(test)]
 mod work;
 
@@ -43,6 +44,7 @@ use std::ops::Range;
 use scan::{Anchor, Candidates, count_steps, first_match, run_start};
 pub(crate) use strip::{MAX_ESCAPE_BYTES, holds_string_terminator};
 use strip::{remove_boundaries, strip_control_characters};
+pub use structured::structured;
 
 /// Redacts a stderr tail and strips terminal-unsafe control characters.
 ///

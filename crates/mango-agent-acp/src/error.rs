@@ -137,87 +137,20 @@ pub(crate) fn prompt_failure(
 fn message(error: &agent_client_protocol_schema::v1::Error) -> String {
     let text = match &error.data {
         Some(data) if !data.is_null() => {
-            format!("{} ({})", error.message, redact_credential_keys(data))
+            format!(
+                "{} ({})",
+                error.message,
+                mango_external_agents::redact::structured(data)
+            )
         }
         _ => error.message.clone(),
     };
     mango_external_agents::redact::bounded(&text, TextLimit::ErrorMessage).text
 }
 
-/// `data` with every string under a credential-named key replaced, at any depth, and every other
-/// string redacted on its own.
-///
-/// The redactor reads `api_key=value`, and a JSON object writes the same thing as
-/// `"api_key":"value"`, with a quote between the name and the colon, which it does not read. So the
-/// structure is used while it is still structure. A string anywhere under a key that names a
-/// secret, a token, a password, a credential, an API key or an authorization header becomes
-/// `[REDACTED]`, and so does the `value` of an object whose `name` is such a name, which is how an
-/// environment variable or an HTTP header is written. Every other string is redacted as text before
-/// it is rendered, because rendering escapes a line break into two characters the redactor does not
-/// skip. Numbers and booleans are kept, so `"retry_after":30` and a sibling `"path"` stay readable.
-fn redact_credential_keys(value: &serde_json::Value) -> serde_json::Value {
-    redact_under(value, false)
-}
-
-/// [`redact_credential_keys`] below a point that may already be a credential's.
-fn redact_under(value: &serde_json::Value, credential: bool) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::Object(members) => {
-            let named = members
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(names_a_credential);
-            Value::Object(
-                members
-                    .iter()
-                    .map(|(key, member)| {
-                        let secret =
-                            credential || names_a_credential(key) || (named && key == "value");
-                        (key.clone(), redact_under(member, secret))
-                    })
-                    .collect(),
-            )
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| redact_under(item, credential))
-                .collect(),
-        ),
-        Value::String(_) if credential => Value::String(String::from("[REDACTED]")),
-        Value::String(text) => Value::String(mango_external_agents::redact::stderr_text(text)),
-        other => other.clone(),
-    }
-}
-
-/// Whether a JSON key names a credential, however it is cased or separated: `api_key`, `apiKey`,
-/// `refresh-token`, `Authorization`, `client_secret`, `pass`.
-fn names_a_credential(key: &str) -> bool {
-    const NAMES: [&str; 8] = [
-        "secret",
-        "token",
-        "password",
-        "passwd",
-        "pwd",
-        "credential",
-        "apikey",
-        "authorization",
-    ];
-    let squashed: String = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|character| character.to_ascii_lowercase())
-        .collect();
-    squashed == "pass" || NAMES.iter().any(|name| squashed.contains(name))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        AUTH_REQUIRED_CODE, names_a_credential, prompt_failure, redact_credential_keys,
-        request_error, vendor_error,
-    };
+    use super::{AUTH_REQUIRED_CODE, prompt_failure, request_error, vendor_error};
     use agent_client_protocol_schema::v1::Error as AcpError;
     use mango_external_agents::Error;
 
@@ -342,58 +275,6 @@ mod tests {
             failure,
             vendor_error("session/prompt", &refusal),
             "expected the unchanged vendor failure for a non-authentication code"
-        );
-    }
-
-    #[test]
-    fn a_key_names_a_credential_however_it_is_cased_or_separated() {
-        let received: Vec<bool> = [
-            "api_key",
-            "apiKey",
-            "API-KEY",
-            "refresh_token",
-            "clientSecret",
-            "Authorization",
-            "password",
-            "pass",
-            "pwd",
-            "path",
-            "retry_after",
-            "key",
-        ]
-        .map(names_a_credential)
-        .to_vec();
-        let expected = vec![
-            true, true, true, true, true, true, true, true, true, false, false, false,
-        ];
-        assert_eq!(
-            received, expected,
-            "expected which keys name a credential: {expected:?} | received: {received:?}"
-        );
-    }
-
-    #[test]
-    fn only_text_under_a_credential_key_is_replaced_at_any_depth() {
-        let data = serde_json::json!({
-            "token": "t-1",
-            "expires": 30,
-            "nested": [{ "password": "p-1", "path": "/repo" }],
-            "tokens": ["t-2", { "inner": "t-3" }],
-            "env": [{ "name": "OPENAI_API_KEY", "value": "v-1" }, { "name": "HOME", "value": "/h" }],
-            "tokens_used": { "count": 4 },
-        });
-        let received = redact_credential_keys(&data);
-        let expected = serde_json::json!({
-            "token": "[REDACTED]",
-            "expires": 30,
-            "nested": [{ "password": "[REDACTED]", "path": "/repo" }],
-            "tokens": ["[REDACTED]", { "inner": "[REDACTED]" }],
-            "env": [{ "name": "OPENAI_API_KEY", "value": "[REDACTED]" }, { "name": "HOME", "value": "/h" }],
-            "tokens_used": { "count": 4 },
-        });
-        assert_eq!(
-            received, expected,
-            "expected text under credential keys replaced: {expected} | received: {received}"
         );
     }
 
