@@ -1684,8 +1684,10 @@ async fn the_drain_deadline_waits_for_a_held_stretch_and_the_answers_owed_at_onc
 }
 
 /// A caller that puts its own timeout around a close has to allow more than the close's bound.
-/// At exactly twice `shutdown_timeout` the caller's timer and the close's last deadline fall
-/// on the same instant, and the caller's fires first: the close is given up, not finished.
+/// At exactly twice `shutdown_timeout` the close's last deadline and the caller's timer fall on
+/// the same instant. The close then still has the reader to take down and join, which needs
+/// one more turn of the scheduler, and the caller's timer is found expired before that turn
+/// comes: the close is given up, not finished.
 #[tokio::test(start_paused = true)]
 async fn a_callers_timeout_at_exactly_the_closes_bound_gives_the_close_up() {
     for (allowed, finishes) in [
@@ -1760,7 +1762,7 @@ async fn nested_holds_dropped_apart_hold_until_the_last_is_dropped() {
     }
 }
 
-/// A hold handed to another task and dropped there while its call is still running is
+/// A hold handed to another thread and dropped there while its call is still running is
 /// released there and then: the stretch is no longer held, and the end goes ahead.
 #[tokio::test(start_paused = true)]
 async fn a_hold_dropped_on_another_thread_during_its_call_releases_the_stretch() {
