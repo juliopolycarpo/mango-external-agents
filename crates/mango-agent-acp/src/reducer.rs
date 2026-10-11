@@ -80,6 +80,14 @@ fn clear_of_plan(id: ToolCallId) -> ToolCallId {
     }
 }
 
+/// The name the reducer keeps a call under, for an id as the agent wrote it.
+///
+/// For example, `call_key(&ToolCallId::new("call_1"))` is `"call_1"`; only an id in this
+/// crate's own minted namespace is renamed (see [`clear_of_plan`]).
+pub(crate) fn call_key(id: &ToolCallId) -> String {
+    clear_of_plan(id.clone()).0.to_string()
+}
+
 /// The title a tool call gets when its first frame named none.
 ///
 /// Only reachable through a `tool_call_update` for a call this client never saw announced:
@@ -577,6 +585,14 @@ impl Reducer {
                 held.detail.as_ref().map_or(0, String::len) + output
             })
             .sum()
+    }
+
+    /// The ids of the tool calls still open, as [`call_key`] names them.
+    ///
+    /// What a turn's terminal is about to close. For example, a reducer that saw `call_1` start
+    /// and never finish yields `["call_1"]`.
+    pub(crate) fn open_call_ids(&self) -> impl Iterator<Item = &str> {
+        self.open_calls.keys().map(String::as_str)
     }
 
     /// How many tool calls the reducer is holding open, for the tests that prove a frame did not
@@ -3198,6 +3214,25 @@ mod tests {
                 "expected the agent's id {id:?} unchanged | received {started:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_open_call_ids_are_the_keys_a_wire_id_maps_to() {
+        let mut reducer = Reducer::new();
+        let started: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "call_1", "title": "Run tests",
+            "kind": "execute", "status": "in_progress",
+        }))
+        .expect("expected a tool call frame");
+        reducer.update_at(started, std::time::Instant::now());
+
+        let open: Vec<&str> = reducer.open_call_ids().collect();
+        let key = super::call_key(&agent_client_protocol_schema::v1::ToolCallId::new("call_1"));
+        assert_eq!(
+            (open.as_slice(), key.as_str()),
+            (["call_1"].as_slice(), "call_1"),
+            "expected (open ids, the key of the wire id): ([\"call_1\"], \"call_1\") | received: ({open:?}, {key:?})"
+        );
     }
 
     #[test]
