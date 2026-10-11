@@ -92,9 +92,54 @@ pub trait ByteSource: Send {
 }
 
 /// Bytes going to a child.
+///
+/// What a failed [`write_all`](Self::write_all) says about the bytes is part of the contract,
+/// because the JSON-RPC link over a child's input passes the error on as it is and acts on it.
+///
+/// ```
+/// use mango_external_agents::{ByteSink, Error, Result};
+///
+/// /// Accepts whole writes into memory, and takes none once it is closed.
+/// struct Memory {
+///     written: Vec<u8>,
+///     closed: bool,
+/// }
+///
+/// #[async_trait::async_trait]
+/// impl ByteSink for Memory {
+///     async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+///         if self.closed {
+///             // No byte was accepted and nothing is wrong with the child: not a link failure.
+///             return Err(Error::Closed { subject: "memory sink" });
+///         }
+///         self.written.extend_from_slice(bytes);
+///         Ok(())
+///     }
+///
+///     async fn close(&mut self) -> Result<()> {
+///         self.closed = true;
+///         Ok(())
+///     }
+/// }
+/// ```
 #[async_trait::async_trait]
 pub trait ByteSink: Send {
     /// Writes every byte, or fails.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Link`] when the child's input is gone, and for any failure after which some
+    /// of the bytes may have been accepted: a pipe that broke part-way through the write.
+    ///
+    /// Any other error says that no byte was accepted and that the sink is as usable as it
+    /// was: a sink already closed on this side, a refusal for size. A JSON-RPC client over
+    /// this sink fails the frame it was writing with that error and goes on writing, where an
+    /// [`Error::Link`] ends the connection, since half a frame may be on the wire. An
+    /// implementation that cannot tell whether bytes were accepted reports [`Error::Link`].
+    ///
+    /// A write that is abandoned while it is in progress, by a deadline or a dropped caller,
+    /// is not an error this method returns. The client treats the sink as unusable from then
+    /// on, so an implementation need not make a half-done write safe to follow.
     async fn write_all(&mut self, bytes: &[u8]) -> Result<()>;
 
     /// Closes the child's input.
