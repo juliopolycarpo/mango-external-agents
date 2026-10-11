@@ -4,7 +4,7 @@
 
 use super::outbox_tests::{limits, options, until, within};
 use super::*;
-use crate::jsonrpc::WireOptions;
+use crate::jsonrpc::{ConnectionEnd, WireOptions};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex as StdMutex, PoisonError};
 
@@ -424,4 +424,67 @@ async fn an_outbound_overflow_makes_the_link_unusable_so_the_refusal_is_not_writ
         "expected the third frame refused, the call dropped, no refusal written for the question and the handler told once: (true, 1, false, 1) | received {observed:?} with {wire:?}"
     );
     asked.client.close().await.expect("expected a clean close");
+}
+
+/// The peer passing an inbound budget in the moment a close puts its own end on record: the
+/// close owns the end. The handler is told of no termination, the call is dropped by the close,
+/// and the client reports the close.
+#[tokio::test(start_paused = true)]
+async fn an_inbound_overflow_that_a_close_overtakes_while_it_is_recorded_is_not_reported() {
+    let asked = asked(
+        options().with_max_pending_notifications(1),
+        WireOptions::new(),
+    )
+    .await;
+    let ignored = Arc::new(AtomicUsize::new(0));
+    {
+        let ignored = Arc::clone(&ignored);
+        *asked
+            .client
+            .state
+            .after_write_failure_ignored
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
+            ignored.fetch_add(1, Ordering::AcqRel);
+        }));
+    }
+    {
+        let state = Arc::clone(&asked.client.state);
+        *asked
+            .client
+            .state
+            .before_peer_end_recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
+            // What the first step of a close does.
+            state.ended_with(ConnectionEnd::Closed, state.closed_error());
+        }));
+    }
+
+    asked
+        .link
+        .push_line(r#"{"jsonrpc":"2.0","method":"block","params":{}}"#);
+    for _ in 0..3 {
+        asked
+            .link
+            .push_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#);
+    }
+    until("the reader to let the overflow go", || {
+        ignored.load(Ordering::Acquire) == 1
+    })
+    .await;
+    asked.client.close().await.expect("expected a clean close");
+
+    let told = asked
+        .handler
+        .terminations
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .len();
+    let observed = (told, asked.client.ended());
+    assert_eq!(
+        observed,
+        (0, Some(ConnectionEnd::Closed)),
+        "expected the handler told nothing and the close reported: (0, Some(Closed)) | received {observed:?}"
+    );
 }

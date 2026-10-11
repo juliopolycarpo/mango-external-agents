@@ -1744,6 +1744,10 @@ struct ClientState {
     /// looked at why, so a test can have a close and a failure land exactly there.
     #[cfg(test)]
     after_reader_woken_to_end: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once on the reader before it puts the peer's exit, or an inbound budget the peer
+    /// passed, on record, so a test can have a close put its own end on record exactly there.
+    #[cfg(test)]
+    before_peer_end_recorded: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once in [`link_failed`] before the failure is put on record, so a test can have a
     /// close put its own end on record exactly there.
     #[cfg(test)]
@@ -2540,6 +2544,8 @@ impl Client {
             after_write_failure_ignored: StdMutex::new(None),
             #[cfg(test)]
             after_reader_woken_to_end: StdMutex::new(None),
+            #[cfg(test)]
+            before_peer_end_recorded: StdMutex::new(None),
             #[cfg(test)]
             before_link_failure_recorded: StdMutex::new(None),
             #[cfg(test)]
@@ -4381,10 +4387,15 @@ async fn pump(
         match message {
             Ok(Some(message)) => {
                 if let Err(termination) = dispatch(&state, &notifications, message).await {
+                    #[cfg(test)]
+                    ClientState::run_hook(&state.before_peer_end_recorded);
                     let failure = state.ended_with(
                         ConnectionEnd::Peer(termination.clone()),
                         state.overflow_failure(),
                     );
+                    if owned_by_a_close(&state, &failure) {
+                        break;
+                    }
                     let termination = failure.termination(termination);
                     state.mark_closed();
                     state.fail_pending(failure).await;
@@ -4411,6 +4422,8 @@ async fn pump(
                 }
             }
             Ok(None) => {
+                #[cfg(test)]
+                ClientState::run_hook(&state.before_peer_end_recorded);
                 let failure = state.ended_with(
                     ConnectionEnd::Peer(PeerTermination::Exited),
                     JsonRpcError {
@@ -4420,11 +4433,7 @@ async fn pump(
                     },
                 );
                 let termination = failure.termination(PeerTermination::Exited);
-                state.mark_closed();
-                fail_pending_around_drain(&state, notifications, failure).await;
-                state.shutdown.cancel();
-                state.drain_in_flight().await;
-                handler.on_terminated(termination).await;
+                connection_failed(&state, &handler, notifications, termination, failure).await;
                 break;
             }
             Err(error) => {
@@ -4458,6 +4467,27 @@ async fn link_failed(
     connection_failed(state, handler, notifications, termination, failure).await;
 }
 
+/// Whether a close put its own end on record ahead of the one the reader was about to record,
+/// which then is the close's and is not told to the handler.
+///
+/// Decided on the record `ended_with` handed back, not on a look taken before it: a close
+/// that records between the reader's look and its record is found all the same. It holds for
+/// every end the reader records, whatever the cause: a link's write or read failing, this side
+/// passing its outbound budget, the peer passing an inbound budget, the peer's exit (which a
+/// close brings about itself by closing the link). The close fails the calls and stops the
+/// handler's task itself, and the handler is not told of an end its host caused, under a client
+/// whose host says so through `Client::ended`.
+fn owned_by_a_close(state: &ClientState, failure: &Failed) -> bool {
+    if !matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
+        return false;
+    }
+    #[cfg(test)]
+    ClientState::run_hook(&state.after_write_failure_ignored);
+    #[cfg(not(test))]
+    let _ = state;
+    true
+}
+
 /// Ends a connection that can no longer be written to, telling the handler why.
 async fn connection_failed(
     state: &Arc<ClientState>,
@@ -4466,16 +4496,7 @@ async fn connection_failed(
     termination: PeerTermination,
     failure: Failed,
 ) {
-    // Decided on the record, not on a look taken before it: a close that put its own end on
-    // record first owns this one, whichever of the failures that end through here (a link's
-    // write or read, this side's outbound budget) reaches here a moment after it. The close
-    // fails the calls and stops the handler's task itself, and the handler is not told of an
-    // end its host caused, under a client whose host says so through `Client::ended`. The
-    // peer's exit and an inbound budget record their own ends in the reader and are not
-    // decided here.
-    if matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
-        #[cfg(test)]
-        ClientState::run_hook(&state.after_write_failure_ignored);
+    if owned_by_a_close(state, &failure) {
         return;
     }
     state.mark_closed();

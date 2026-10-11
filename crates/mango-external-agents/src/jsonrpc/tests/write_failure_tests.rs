@@ -307,7 +307,8 @@ async fn a_link_failure_that_a_close_overtakes_while_it_is_recorded_is_not_repor
 /// The reader is woken to end the connection, and before it has looked at why, a close puts its
 /// end on record and this side passes its outbound budget. The reader then finds the overflow
 /// and is handed the close's record by the end it records. The close owns that end: the handler
-/// is told of no termination, and the client reports the close it was given.
+/// is told of no termination, and the client reports the close it was given. The reader took the
+/// overflow to get there; had it gone the link's way, a marker says so.
 #[tokio::test]
 async fn an_outbound_overflow_landing_on_a_close_after_the_reader_woke_is_not_reported() {
     let link = ScriptedLink::new();
@@ -331,6 +332,14 @@ async fn an_outbound_overflow_landing_on_a_close_after_the_reader_woke_is_not_re
         state.ended_with(ConnectionEnd::Closed, state.closed_error());
         let _ = state.outbound_overflow("frames", 1, 2);
     }));
+    let went_the_links_way = say.clone();
+    *client
+        .state
+        .before_link_failure_recorded
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let _ = went_the_links_way.send("went the link's way");
+    }));
     *client
         .state
         .after_write_failure_ignored
@@ -352,7 +361,7 @@ async fn an_outbound_overflow_landing_on_a_close_after_the_reader_woke_is_not_re
     );
     assert_eq!(
         observed, expected,
-        "expected the reader to let the overflow go under the close recorded after it woke, and the handler told nothing: {expected:?} | received {observed:?}"
+        "expected the reader to take the overflow, let it go under the close recorded after it woke, and the handler told nothing: {expected:?} | received {observed:?}"
     );
 }
 
@@ -422,5 +431,73 @@ async fn a_read_failure_that_a_close_overtakes_while_it_is_recorded_is_not_repor
     assert_eq!(
         observed, expected,
         "expected the reader to let the read failure go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
+    );
+}
+
+/// A receiver that reports the peer's exit when told to.
+struct ExitingReceiver {
+    exit: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::link::LinkReceiver for ExitingReceiver {
+    async fn recv(&mut self) -> crate::Result<Option<String>> {
+        self.exit.notified().await;
+        Ok(None)
+    }
+}
+
+/// The peer's exit read in the moment a close puts its own end on record: the close owns the
+/// end, the handler is told of no termination, and the client reports the close. A close
+/// closes the link, so the reader reads the exit of a peer that was told to go; the end is the
+/// host's.
+#[tokio::test]
+async fn a_peer_exit_that_a_close_overtakes_while_it_is_recorded_is_not_reported() {
+    let (say, mut said) = tokio::sync::mpsc::unbounded_channel();
+    let exit = Arc::new(tokio::sync::Notify::new());
+    let (sender, _unused) = ScriptedLink::new().into_link().split();
+    let client = Client::connect(
+        crate::link::Link::new(
+            sender,
+            Box::new(ExitingReceiver {
+                exit: Arc::clone(&exit),
+            }),
+        ),
+        Arc::new(SayingHandler { said: say.clone() }) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    *client
+        .state
+        .after_write_failure_ignored
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let _ = say.send("let go by the reader");
+    }));
+    {
+        let state = Arc::clone(&client.state);
+        *client
+            .state
+            .before_peer_end_recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            // What the first step of a close does.
+            state.ended_with(ConnectionEnd::Closed, state.closed_error());
+        }));
+    }
+
+    exit.notify_one();
+    let first = within("what the reader did with the exit", said.recv()).await;
+    client.close().await.expect("expected a clean close");
+    let later = said.try_recv().ok();
+
+    let observed = (first, later, client.ended());
+    let expected = (
+        Some("let go by the reader"),
+        None,
+        Some(ConnectionEnd::Closed),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the reader to let the peer's exit go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
     );
 }
