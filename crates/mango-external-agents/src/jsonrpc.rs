@@ -435,6 +435,25 @@ pub trait PeerHandler: Send + Sync {
     /// that one is never asked here and need not write this at all. The default refuses
     /// with `-32601`, "Method not found", which is what a peer is owed by a handler that
     /// answers no questions.
+    ///
+    /// # When the connection ends
+    ///
+    /// Without that option, at most [`ClientOptions::max_in_flight_requests`] calls are out at
+    /// once, each on a task of its own, and every end of the connection drops the call at the
+    /// await it is parked at. None is run to its end or waited for, and
+    /// [`Client::hold_cancellation`] holds nothing in one. The peer is refused with `-32000`,
+    /// "the connection was closed", over the link, so long as the link takes the write:
+    ///
+    /// - [`Client::close`], the peer's exit, a failed link, the peer passing an inbound budget
+    ///   and this side passing its outbound budget raise the shutdown flag first. The call is
+    ///   dropped, and the refusal is waited for, for up to [`ClientOptions::shutdown_timeout`],
+    ///   before the link is closed and, for an end that is not a close, before
+    ///   [`on_terminated`](Self::on_terminated) is made. A task still writing when that runs
+    ///   out is cut.
+    /// - A link that failed, one the peer's exit has closed to writes, and one the outbound
+    ///   budget has made unusable take no refusal, and none is written. One whose writer is
+    ///   held behind a write the peer never reads outlasts the grace, and the task is cut.
+    /// - Dropping the [`Client`] cuts the call at once and writes nothing.
     async fn on_request(
         &self,
         _method: String,
@@ -460,9 +479,12 @@ pub trait PeerHandler: Send + Sync {
     /// is kept, not awaited here.
     ///
     /// Like a notification call, this one is cancelled at an await when the connection ends
-    /// without draining. [`Client::hold_cancellation`] has nothing to hold here, and a
-    /// [`Client::close`] awaited from inside the call ends the call at that await, as it
-    /// does inside a notification.
+    /// without draining, unless it holds that off: [`Client::hold_cancellation`] holds here as
+    /// it does in a notification call, and the same ends wait for the hold. A
+    /// [`Client::close`] awaited from inside the call cannot wait for it, and ends the call at
+    /// that await, as it does inside a notification. A [`Responder`] dropped with a call that
+    /// was cut says nothing to the peer, since the connection has ended by then; one kept
+    /// answers nothing once it has.
     ///
     /// The default asks [`on_request`](Self::on_request) and answers with what it returns,
     /// one question at a time. That suits an `on_request` that returns promptly. It is not
@@ -1019,14 +1041,15 @@ impl RequestOptions {
 
 tokio::task_local! {
     /// The client whose `on_request_handoff` the current task is inside, as its state's
-    /// address. Apart from the notification call's: a hand-off is awaited by the same task,
-    /// so an ordered answer asked for from inside it would wait for it too, but it is not a
-    /// call a [`CancellationHold`] can be taken in.
+    /// address. A hand-off is awaited by the same task that awaits a notification call, so an
+    /// ordered answer asked for from inside it would wait for it too. It is also scoped with
+    /// [`HANDLING_NOTIFICATION_FOR`], which is what a [`CancellationHold`] is taken in.
     static HANDING_OFF_FOR: usize;
 }
 
 tokio::task_local! {
-    /// The client whose `on_notification` the current task is inside, as its state's address.
+    /// The client whose `on_notification` or `on_request_handoff` the current task is inside,
+    /// as its state's address: the two calls the handler's task awaits.
     ///
     /// Scoped around that one call, so it says nothing once the handler returned or panicked,
     /// and nothing on any other task. A recorded task id would do neither: it outlives a worker
@@ -1034,7 +1057,7 @@ tokio::task_local! {
     static HANDLING_NOTIFICATION_FOR: NotificationCall;
 }
 
-/// One call to `on_notification`, as the task making it knows it.
+/// One call to `on_notification` or `on_request_handoff`, as the task making it knows it.
 struct NotificationCall {
     /// The client's state, by address.
     client: usize,
@@ -1844,7 +1867,7 @@ impl Drop for WorkerStopped {
 #[must_use = "the call may be cancelled again as soon as this is dropped"]
 pub struct CancellationHold {
     /// The holds of the call this was granted to. `None` for a hold asked for outside a
-    /// notification call, which holds nothing.
+    /// notification call or a hand-off, which holds nothing.
     call: Option<Arc<CallHolds>>,
 }
 
@@ -1859,8 +1882,9 @@ impl std::fmt::Debug for CancellationHold {
 
 impl CancellationHold {
     /// Whether this hold keeps anything from being cancelled. `false` for one asked for
-    /// outside a call to [`PeerHandler::on_notification`] on the client it was asked of, and
-    /// for one whose call is over.
+    /// outside a call to [`PeerHandler::on_notification`] or
+    /// [`PeerHandler::on_request_handoff`] on the client it was asked of, and for one whose
+    /// call is over.
     ///
     /// ```no_run
     /// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
@@ -2859,12 +2883,13 @@ impl Client {
         Ok(Written::new(ticket, self.state.options.peer_name.clone()))
     }
 
-    /// Keeps the notification call this is made from from being cancelled until the returned
-    /// hold is dropped, for a handler that must finish what it has begun.
+    /// Keeps the notification call or the hand-off this is made from from being cancelled
+    /// until the returned hold is dropped, for a handler that must finish what it has begun.
     ///
     /// Two ends of a connection stop the handler's task without draining its queue: the peer
     /// passing an inbound budget, and [`Client::close`]. The call to
-    /// [`PeerHandler::on_notification`] in progress is then cancelled at whichever await it had
+    /// [`PeerHandler::on_notification`], or to [`PeerHandler::on_request_handoff`] on a client
+    /// that hands questions over, in progress is then cancelled at whichever await it had
     /// reached. That is right for a call parked on a host that stopped reading, and wrong for
     /// one that has claimed something it releases a few awaits further down. Such a call asks
     /// for a hold around exactly that stretch:
@@ -2900,9 +2925,12 @@ impl Client {
     ///
     /// What a hold does not do:
     ///
-    /// - It holds nothing outside a notification call on this client's handler task
-    ///   ([`CancellationHold::is_holding`] says so): not in
-    ///   [`on_request`](PeerHandler::on_request), not on a task the handler spawned.
+    /// - It holds nothing outside a call the client's handler task awaits, which is a
+    ///   notification call or an [`on_request_handoff`](PeerHandler::on_request_handoff) call,
+    ///   and the [`on_request`](PeerHandler::on_request) the default hand-off asks inside it
+    ///   ([`CancellationHold::is_holding`] says so). Not in `on_request` on a client that does
+    ///   not hand questions off, which is answered on a task of its own, and not on a task
+    ///   the handler spawned.
     /// - Dropping the [`Client`] cannot wait and cancels the call whatever it holds.
     /// - A [`Client::close`] awaited from inside the same call cannot wait for that call and
     ///   cancels it. One made on another task that the call then awaits is waited out for the
@@ -4795,10 +4823,15 @@ async fn hand_off(
         return;
     };
     let responder = Responder::new(state, raw_id, Some(slot), bytes);
+    // A call the worker awaits as it awaits a notification, and so one a hold can be taken in:
+    // the end that cancels it waits for the hold as it does for a notification call's.
     HANDING_OFF_FOR
         .scope(
             state.address(),
-            handler.on_request_handoff(method, params, responder),
+            HANDLING_NOTIFICATION_FOR.scope(
+                NotificationCall::of(state.address()),
+                handler.on_request_handoff(method, params, responder),
+            ),
         )
         .await;
 }
@@ -4867,8 +4900,10 @@ fn oversized_frame(error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     mod cancellation_hold_tests;
+    mod handoff_hold_tests;
     mod handoff_queue_tests;
     mod invalid_request_tests;
+    mod on_request_end_tests;
     mod ordered_response_tests;
     mod outbound_bound_tests;
     mod outbox_tests;

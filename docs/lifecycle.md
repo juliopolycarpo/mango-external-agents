@@ -182,8 +182,8 @@ one that read the connection as open an instant before it ended reaches the link
 (a closed link refuses the write, and the call returns that refusal).
 
 Two ends of a connection stop the handler's task without draining its queue: the peer passing an
-inbound budget, and `Client::close`. A call to `PeerHandler::on_notification` that is in progress
-then is cancelled at the await it had reached. A call that must finish a stretch it has begun asks
+inbound budget, and `Client::close`. A call to `PeerHandler::on_notification`, or to
+`PeerHandler::on_request_handoff`, that is in progress then is cancelled at the await it had reached. A call that must finish a stretch it has begun asks
 for `Client::hold_cancellation()` before the stretch and drops the hold after it. While a hold is
 out, such an end waits for it, for up to `shutdown_timeout`, and cancels only then; a hold asked
 for after the cancellation was decided is never granted, so the stretch runs whole or not at all.
@@ -263,10 +263,14 @@ termination for it. A question still queued when the
 connection ends is not handed over. Once the connection has ended a
 responder still out answers nothing and says nothing: a handler that parks questions settles them
 before it closes. The hand-off call is cancelled at an end like a notification call, and
-`hold_cancellation` holds nothing there. A request with `after_earlier_notifications` made from
+`hold_cancellation` holds there as it does in one. A request with `after_earlier_notifications` made from
 inside it is refused before it is written, as it is inside a notification. Without the option none of this applies: a question is
 answered by `on_request` on a task of its own, and its answer is written when that task has the
-link.
+link. At every end of the connection that call is dropped at the await it is parked at, never run
+to its end, and the peer is refused with `-32000` over a link that still takes the write: awaited
+for up to `shutdown_timeout`, before the link is closed, and before `on_terminated` for an end
+that is not a close. A link that failed, or that the peer's exit has closed to writes, takes none.
+Dropping the `Client` cuts the call at once and writes nothing.
 
 ACP sets those bounds from `Limits`: queued JSON-RPC messages by the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members that are

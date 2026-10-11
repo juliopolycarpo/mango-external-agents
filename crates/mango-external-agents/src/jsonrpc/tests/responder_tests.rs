@@ -814,7 +814,7 @@ async fn questions_and_notifications_reach_the_handler_in_the_order_they_were_se
 
 /// A request whose answer is delivered in order cannot be awaited from inside a hand-off: the
 /// task that would deliver it is the one awaiting the hand-off. It is refused before anything
-/// is written, as it is inside a notification, and no hold is to be had there either.
+/// is written, as it is inside a notification, and a hold is to be had there, as it is in one.
 #[tokio::test]
 async fn an_ordered_request_made_inside_a_hand_off_is_refused_before_it_is_written() {
     let connected = connect(options(), handoff());
@@ -833,13 +833,13 @@ async fn an_ordered_request_made_inside_a_hand_off_is_refused_before_it_is_writt
             String::from(
                 "one made inside on_notification or on_request_handoff, whose return its answer would wait for",
             ),
-            false,
+            true,
         )],
         vec![String::from("result:1")],
     );
     assert_eq!(
         observed, expected,
-        "expected the ordered request refused by name, no hold granted, and only the answer written: {expected:?} | received {observed:?}"
+        "expected the ordered request refused by name, a hold granted, and only the answer written: {expected:?} | received {observed:?}"
     );
     connected
         .client
