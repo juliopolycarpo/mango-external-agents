@@ -222,15 +222,40 @@ impl PendingApproval {
             return Answered::Sent;
         }
         if announced {
-            turn.approvals.push(EventKind::ApprovalResolved {
-                interaction_id: question.id().clone(),
-                decision: ApprovalDecision::unresolved(
-                    WITHDRAWN_OPTION_ID,
-                    DecisionSource::Cancelled,
-                ),
-            });
+            turn.approvals.push(withdrawn_resolution(&question));
         }
         Answered::AlreadyResolved
+    }
+
+    /// Gives the agent `response` with no resolution of its own to publish, which is how a
+    /// question is let go.
+    ///
+    /// A connection that does not take the answer has ended under the question, exactly as in
+    /// [`respond_with_resolution`](Self::respond_with_resolution): the host's question is
+    /// closed as withdrawn when it was shown one, and the answer reads as too late.
+    fn respond_unresolved(self, response: RequestPermissionResponse) -> Answered {
+        let Self {
+            reply,
+            question,
+            announced,
+            turn,
+            ..
+        } = self;
+        if reply.respond(response).is_ok() {
+            return Answered::Sent;
+        }
+        if announced {
+            turn.approvals.push(withdrawn_resolution(&question));
+        }
+        Answered::AlreadyResolved
+    }
+}
+
+/// What a host is told when `question` will not be answered: resolved, by nobody, as cancelled.
+fn withdrawn_resolution(question: &mango_external_agents::PermissionRequest) -> EventKind {
+    EventKind::ApprovalResolved {
+        interaction_id: question.id().clone(),
+        decision: ApprovalDecision::unresolved(WITHDRAWN_OPTION_ID, DecisionSource::Cancelled),
     }
 }
 
@@ -932,7 +957,7 @@ impl SessionState {
         };
         self.touch();
         if cancelling.is_some() {
-            pending.reply.respond(permission::cancelled())?;
+            pending.respond_unresolved(permission::cancelled());
             return Ok(Answered::AlreadyResolved);
         }
         if !pending.deadline.is_elapsed() {
@@ -942,8 +967,7 @@ impl SessionState {
                 let option_id = outcome.option_id.to_string();
                 return Ok(pending.respond_with_resolution(requested, option_id, source));
             }
-            pending.reply.respond(requested)?;
-            return Ok(Answered::Sent);
+            return Ok(pending.respond_unresolved(requested));
         }
 
         pending.announce();
@@ -985,7 +1009,8 @@ impl SessionState {
         match pending {
             Some(pending) => {
                 self.touch();
-                pending.reply.respond(permission::cancelled())
+                pending.respond_unresolved(permission::cancelled());
+                Ok(())
             }
             None => Ok(()),
         }

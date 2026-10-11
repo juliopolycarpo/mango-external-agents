@@ -305,6 +305,52 @@ async fn a_host_answer_after_the_connection_ended_closes_the_question_as_withdra
     );
 }
 
+/// The same late answer once the turn itself is over, which is the answer a host gives in the
+/// moment between the turn's terminal and the sweep of its questions: `Session::respond` sends
+/// the agent `cancelled` there, and a connection that does not take it is not the agent's
+/// failure either.
+#[tokio::test]
+async fn a_host_answer_after_the_turn_and_the_connection_ended_is_not_an_error() {
+    let mut running = RunningTurn::start().await;
+    running.agent.announce(ask_line(78));
+    let question = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), running.events.recv())
+            .await
+            .expect("expected the question announced within 5s")
+            .expect("expected an open stream");
+        if let EventKind::ApprovalRequested { request } = event.kind {
+            break request;
+        }
+    };
+    running.agent.announce(flood());
+    running.connection.ended().cancelled().await;
+    running.turn.finish();
+
+    let refusal = question.deny().expect("expected a refusing option");
+    let answered = running.state.answer(&refusal);
+    running
+        .turn
+        .approvals
+        .flush(&running.turn.sink)
+        .await
+        .expect("expected the resolution delivered");
+    let mut resolutions = Vec::new();
+    while let Ok(event) = running.events.try_recv() {
+        if let EventKind::ApprovalResolved { decision, .. } = event.kind {
+            resolutions.push(format!("{:?}", decision.source));
+        }
+    }
+    let received = (format!("{answered:?}"), resolutions);
+    let expected = (
+        String::from("Ok(AlreadyResolved)"),
+        vec![String::from("Cancelled")],
+    );
+    assert_eq!(
+        received, expected,
+        "expected (the answer's result, resolutions shown to the host): {expected:?} | received: {received:?}"
+    );
+}
+
 /// A request made on a connection that has already ended is refused with what ended it, and
 /// marked not submitted: none of it was queued, so a host may send it again elsewhere.
 #[tokio::test]

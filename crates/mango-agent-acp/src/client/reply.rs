@@ -44,9 +44,11 @@ impl PermissionReply {
     ///
     /// # Errors
     ///
-    /// A JSON-RPC internal error when the response does not serialise, or when the connection
-    /// did not take the answer because it has ended or its outgoing queue is full. Each names
-    /// what was expected and what was found.
+    /// A JSON-RPC internal error when the response does not serialise, when the connection did
+    /// not take the answer because it has ended or its outgoing queue is full, or when the
+    /// answer is larger than one frame may be. Each names what was expected and what was found.
+    /// In every case the agent was not given this answer, so nothing may be recorded as
+    /// decided.
     ///
     /// ```ignore
     /// reply.respond(permission::selected("reject"))?;
@@ -98,14 +100,30 @@ pub(super) fn past_cap(is_permission: bool) -> ServerRequestOutcome {
     }
 }
 
-/// Queues `outcome` through `responder`, or says why the connection did not take it.
+/// Queues `outcome` through `responder`, or says why the agent was not given it.
+///
+/// An answer over the frame bound is an error here too, and the agent is told `-32603` in its
+/// place so it does not wait on the question: the caller must not take the question as
+/// answered the way it asked. Only an agent that chose an id nearly as large as the bound can
+/// make an answer that size.
 fn answer(
     responder: Responder,
     outcome: ServerRequestOutcome,
 ) -> mango_external_agents::Result<()> {
     // The write itself is not waited for: the frame is queued, in order, and the connection
     // reports a write that fails as its own end.
-    responder.answer_or_refuse(outcome).map(drop)
+    let unanswered = match responder.answer(outcome) {
+        Ok(_written) => return Ok(()),
+        Err(unanswered) => unanswered,
+    };
+    let too_large = unanswered.is_too_large();
+    let (responder, error) = unanswered.into_parts();
+    if too_large {
+        let _ = responder.answer(refusal(internal_error(String::from(
+            "the answer was too large to send",
+        ))));
+    }
+    Err(error)
 }
 
 /// An ACP error as the answer to one of the agent's requests.
@@ -182,13 +200,18 @@ mod tests {
 
     /// A connection whose agent has asked one question, and the responder for it.
     async fn asked(id: u32) -> (Client, ScriptedLink, Responder) {
+        asked_under(id, WireOptions::new()).await
+    }
+
+    /// [`asked`], on a connection with these wire options and the hand-off.
+    async fn asked_under(id: u32, wire: WireOptions) -> (Client, ScriptedLink, Responder) {
         let link = ScriptedLink::new();
         let handler = Arc::new(KeepingHandler::default());
         let client = Client::connect_with(
             link.clone().into_link(),
             Arc::clone(&handler) as Arc<dyn PeerHandler>,
             ClientOptions::new("ACP agent"),
-            WireOptions::new().with_request_handoff(),
+            wire.with_request_handoff(),
         );
         link.push_line(
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "session/request_permission" })
@@ -263,6 +286,30 @@ mod tests {
             0,
             "expected nothing written after the close | received: {:?}",
             link.sent()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_over_the_frame_bound_is_an_error_and_the_agent_is_told_so() {
+        let (_client, link, responder) =
+            asked_under(11, WireOptions::new().with_max_outbound_frame_bytes(160)).await;
+        let received = PermissionReply::new(responder)
+            .respond(permission::selected(&"x".repeat(400)))
+            .map_err(|error| error.message);
+        assert!(
+            received.as_ref().is_err_and(|message| message
+                .starts_with("expected an ACP connection that takes this answer | received: ")),
+            "expected the oversized answer refused to its caller | received: {received:?}"
+        );
+
+        let received = first_sent(&link).await;
+        let expected = serde_json::json!({
+            "jsonrpc": "2.0", "id": 11,
+            "error": { "code": -32603, "message": "the answer was too large to send" }
+        });
+        assert_eq!(
+            received, expected,
+            "expected the agent told the answer was too large: {expected} | received: {received}"
         );
     }
 
