@@ -75,9 +75,9 @@ pub fn request_error(
 /// it is what makes "internal error" the only thing anyone can say afterwards. It is rendered
 /// compactly and the core bounds and sanitises it downstream like any other vendor text.
 ///
-/// An explicit `"data": null` says nothing, so it reads as no data. SDK 3.x keeps that null as
-/// `Some(Null)` where 2.x dropped it while parsing; without this arm the message would grow a
-/// `(null)` suffix.
+/// An explicit `"data": null` says nothing, so it reads as no data. The connection already
+/// drops it while parsing; this arm holds the rule for an error built any other way, where the
+/// message would otherwise grow a `(null)` suffix.
 fn message(error: &agent_client_protocol_schema::v1::Error) -> String {
     match &error.data {
         Some(data) if !data.is_null() => format!("{} ({data})", error.message),

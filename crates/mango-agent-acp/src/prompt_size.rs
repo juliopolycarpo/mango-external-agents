@@ -1,35 +1,40 @@
-//! The size of a `session/prompt` frame, measured before the turn is submitted.
+//! The size of a `session/prompt` frame, measured before the turn is admitted.
 //!
-//! The bounded transport refuses any outgoing frame over `HostContext::outbound_buffer_bytes()`.
-//! It sees the frame only after the turn has started: the connection fails, the session closes and the host
-//! is told the acceptance is unknown. Each attachment is capped alone, and the encoding grows what
-//! it carries (base64 by a third, a control character sixfold), so inputs that pass every earlier
-//! check can still overflow. This module measures the frame the SDK will write so the overflow is
-//! refused while nothing has been submitted.
+//! The connection refuses any outgoing frame over `HostContext::outbound_buffer_bytes()`, and
+//! refuses it alone: nothing is queued and the session stays usable. That refusal comes when the
+//! prompt is queued, which is after the turn took the session's single slot. Each attachment is
+//! capped alone, and the encoding grows what it carries (base64 by a third, a control character
+//! sixfold), so inputs that pass every earlier check can still overflow. This module measures the
+//! frame beforehand, so a prompt that cannot fit is refused for its size before it competes for
+//! the slot.
+//!
+//! The one thing not known beforehand is the request id, which the connection assigns as it
+//! queues the frame: a decimal counter, written as a JSON string. The measure here assumes the
+//! shortest id there is, so it never refuses a frame the connection would take. A frame it lets
+//! through because the real id is longer is refused by the connection, with the same error.
 
 use std::io;
 
-use agent_client_protocol::{JsonRpcMessage, RawJsonRpcMessage, TransportFrame};
-use agent_client_protocol_schema::v1::{ContentBlock, PromptRequest, RequestId, SessionId};
+use agent_client_protocol_schema::v1::{ContentBlock, PromptRequest, SessionId};
 use mango_external_agents::{Error, Result};
 
-use crate::transport::{Overflow, outgoing_frame_limit};
+use crate::client::AgentRequest;
+use crate::transport::Overflow;
 
-/// Stands in for the request id the SDK assigns, which is a hyphenated UUID of this exact length.
+/// Stands in for the request id the connection assigns: the shortest one it can.
 ///
-/// The SDK draws the real id at send time, so it cannot be read beforehand; only its length matters
-/// to the frame's size. A test compares the prediction with the frame the transport really wrote.
-const REQUEST_ID_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
+/// Ids count up from `"1"`, so every real id is at least this long.
+const SHORTEST_REQUEST_ID: &str = "1";
 
-/// Refuses a prompt whose `session/prompt` frame would exceed the outgoing frame budget.
+/// Refuses a prompt whose `session/prompt` frame cannot fit the outgoing frame budget.
 ///
 /// Call this before anything is submitted: the returned error is a local refusal, so the caller
 /// marks it not submitted and the session stays usable.
 ///
 /// # Errors
 ///
-/// [`Error::LimitExceeded`] naming the frame's byte count and effective outgoing budget when the
-/// frame is over; [`Error::Protocol`] when the prompt cannot be serialised at all.
+/// [`Error::LimitExceeded`] naming the frame's byte count and the outgoing budget when the frame
+/// is over; [`Error::Protocol`] when the prompt cannot be serialised at all.
 ///
 /// # Example
 ///
@@ -42,45 +47,38 @@ pub(crate) fn refuse_oversized_prompt(
     prompt: &[ContentBlock],
     outbound_buffer_bytes: usize,
 ) -> Result<()> {
-    let limit = outgoing_frame_limit(outbound_buffer_bytes);
     let received = prompt_frame_bytes(session_id, prompt)?;
-    match received > limit {
-        true => Err(Overflow::outgoing_frame(limit, received).error()),
+    match received > outbound_buffer_bytes {
+        true => Err(Overflow::outgoing_frame(outbound_buffer_bytes, received).error()),
         false => Ok(()),
     }
 }
 
-/// The exact byte length of the `session/prompt` frame the SDK writes for `prompt`, without its
-/// trailing newline.
+/// The byte length of the smallest `session/prompt` frame the connection can write for `prompt`,
+/// without its trailing newline: the frame under a one-character request id.
 ///
-/// The fixed part is measured by the official crate: a request with an empty prompt is put through
-/// the SDK's own frame serialiser under a request id of the length it draws. The blocks are then
-/// counted as they serialise, into a sink that keeps nothing, so no second copy of an attachment is
-/// built.
+/// The connection writes `{"jsonrpc":"2.0","id":"<n>","method":"session/prompt","params":{…}}`
+/// with no whitespace. The fixed part is measured by serialising that envelope around a request
+/// with an empty prompt. The blocks are then counted as they serialise, into a sink that keeps
+/// nothing, so no second copy of an attachment is built.
 ///
-/// This assumes the SDK writes the request exactly as it serialises it. Between the two the SDK
-/// runs a protocol-compatibility step and a role-style step, and both return the message unchanged
-/// for a client-to-agent v1 request in this build (`unstable_protocol_v2` is off). If a later SDK
-/// starts adding bytes there, the session-level boundary test in `tests/session/prompt_frame.rs`,
-/// which compares this count with the frame the transport really wrote, is what fails.
+/// The session-level boundary test in `tests/session/prompt_frame.rs` compares this count with
+/// the frame that really reached the agent.
 ///
 /// # Errors
 ///
 /// [`Error::Protocol`] when the request cannot be serialised.
 pub(crate) fn prompt_frame_bytes(session_id: &SessionId, prompt: &[ContentBlock]) -> Result<usize> {
     let empty = PromptRequest::new(session_id.clone(), Vec::<ContentBlock>::new());
-    let untyped = empty.to_untyped_message().map_err(unserialisable)?;
-    let (method, params) = untyped.into_parts();
-    let message = RawJsonRpcMessage::request(
-        method,
-        params,
-        RequestId::Str(REQUEST_ID_PLACEHOLDER.to_owned()),
-    )
-    .map_err(unserialisable)?;
-    let envelope = TransportFrame::Single(message)
-        .to_json()
-        .map_err(unserialisable)?
-        .len();
+    let params = serde_json::to_value(empty).map_err(|error| unserialisable(&error))?;
+    let envelope = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": SHORTEST_REQUEST_ID,
+        "method": PromptRequest::METHOD,
+        "params": params,
+    })
+    .to_string()
+    .len();
 
     let mut counter = ByteCounter::default();
     serde_json::to_writer(&mut counter, prompt).map_err(|error| Error::Protocol {
@@ -91,10 +89,10 @@ pub(crate) fn prompt_frame_bytes(session_id: &SessionId, prompt: &[ContentBlock]
     Ok(envelope - "[]".len() + counter.bytes)
 }
 
-fn unserialisable(error: agent_client_protocol_schema::v1::Error) -> Error {
+fn unserialisable(error: &serde_json::Error) -> Error {
     Error::Protocol {
         expected: String::from("a serialisable session/prompt request"),
-        received: format!("{error}"),
+        received: error.to_string(),
     }
 }
 
@@ -129,23 +127,18 @@ mod tests {
         SessionId::new("sess_0123456789abcdef")
     }
 
-    /// The frame the SDK would write, built the long way: the whole request into one value, then
-    /// the SDK's own serialiser, under an id of the length the SDK draws.
+    /// The frame the connection writes, built the long way: the whole request into one value,
+    /// inside the envelope, under a one-character id. `tests/session/prompt_frame.rs` holds the
+    /// same count against the bytes that really reach an agent.
     fn frame_by_serialising(prompt: Vec<ContentBlock>) -> String {
         let request = PromptRequest::new(session_id(), prompt);
-        let (method, params) = request
-            .to_untyped_message()
-            .expect("expected an untyped prompt")
-            .into_parts();
-        let message = RawJsonRpcMessage::request(method, params, RequestId::Str(uuid_shaped_id()))
-            .expect("expected a raw request");
-        TransportFrame::Single(message)
-            .to_json()
-            .expect("expected a frame")
-    }
-
-    fn uuid_shaped_id() -> String {
-        String::from("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "7",
+            "method": "session/prompt",
+            "params": serde_json::to_value(request).expect("expected serialisable params"),
+        })
+        .to_string()
     }
 
     fn text(text: &str) -> ContentBlock {
@@ -174,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn the_counted_size_is_the_size_of_the_frame_the_sdk_serialises() {
+    fn the_counted_size_is_the_size_of_the_frame_under_a_one_character_id() {
         let escapes = "\u{1}\u{1f}\"\\\n\t\u{7f}é世🦀";
         let prompts: Vec<(&str, Vec<ContentBlock>)> = vec![
             ("no blocks", Vec::new()),
@@ -254,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_beyond_the_permit_range_is_capped_like_the_transport() {
+    fn a_small_prompt_fits_an_unbounded_budget() {
         let limits = Limits {
             turn_buffer_bytes: usize::MAX,
             ..Limits::default()

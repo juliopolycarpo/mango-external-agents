@@ -32,7 +32,7 @@ fn written_with_id(launcher: &FakeLauncher, id: &serde_json::Value) -> Vec<serde
 
 /// Waits until the client has written `count` frames carrying `id`, or fails naming what it wrote.
 ///
-/// A bounded poll rather than one read: the SDK's transport actor flushes a reply after the handler
+/// A bounded poll rather than one read: the connection's writer flushes a reply after the handler
 /// that produced it returned, so the line is not there yet when the turn ends.
 async fn replies_reaching_the_agent(
     launcher: &FakeLauncher,
@@ -79,9 +79,9 @@ async fn assert_turn_streams_around_the_stray_line(session: &dyn Session, turn_i
 /// What happens today when an agent prints something that is not JSON between two updates, as a
 /// CLI that logs a warning to stdout does: the line costs the turn nothing. The update after it
 /// still arrives, the turn completes, the session stays `Ready` and takes another turn, and the
-/// SDK answers each such line with a JSON-RPC parse error (`-32700`, `id: null`).
+/// connection answers each such line with a JSON-RPC parse error (`-32700`, `id: null`).
 ///
-/// A pin rather than a requirement: it records the behaviour so a change in the SDK's handling of
+/// A pin rather than a requirement: it records the behaviour so a change in the connection's handling of
 /// malformed input shows up here instead of as a session that dies on a stray log line.
 #[tokio::test]
 async fn a_non_json_line_mid_turn_is_answered_with_a_parse_error_and_costs_the_turn_nothing() {
@@ -130,7 +130,7 @@ async fn a_non_json_line_mid_turn_is_answered_with_a_parse_error_and_costs_the_t
 /// `terminal: false`), so an agent that asks anyway is refused with JSON-RPC `-32601` on the id it
 /// used, and the turn it asked during carries on to its end.
 ///
-/// These are methods the SDK's schema knows, unlike the invented method the connection's own unit
+/// These are methods the schema knows, unlike the invented method the connection's own unit
 /// test sends, so this is the case where a typed default handler could answer in the library's
 /// place.
 #[tokio::test]

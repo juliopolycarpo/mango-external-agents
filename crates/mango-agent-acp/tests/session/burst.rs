@@ -75,7 +75,7 @@ async fn open_with(agent: FakeAcpAgent, limits: Limits) -> (Box<dyn Session>, Fa
 
 /// Notifications are not requests: a burst larger than the request cap must not kill the session
 /// when it fits the message budget. The burst arrives as one batch, so it is queued whole before
-/// the SDK actor can drain any of it.
+/// the handler can drain any of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_notification_burst_larger_than_the_request_cap_completes_the_turn() {
     let (session, launcher) = open_with(
@@ -119,7 +119,7 @@ async fn a_notification_burst_larger_than_the_request_cap_completes_the_turn() {
 /// How many updates the stalled-host turn streams, one frame each, ahead of its prompt response.
 ///
 /// Under the default 64-message cap together with that response, so the whole turn can sit queued
-/// at the SDK boundary without tripping the transport budget.
+/// in the connection's queue without tripping the transport budget.
 const STALLED_BURST: usize = 48;
 
 /// Waits for the turn's terminal to be committed without reading a single event of it.

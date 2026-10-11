@@ -1,6 +1,6 @@
 //! The harness driven end to end against [`FakeAcpAgent`], including the core conformance suite.
 //!
-//! Everything here goes through the real transport, the real dispatch loop and the real reducer; the
+//! Everything here goes through the real transport, the real connection and the real reducer; the
 //! only thing replaced is the process, which the core's `FakeLauncher` hands over as scripted pipes.
 //! That is deliberate: the parts most worth testing on this dialect are the ones the reducer's unit
 //! tests cannot reach — that a turn ends exactly once, that an approval round trip lands, that a
@@ -535,7 +535,7 @@ async fn status_once_settled(lifecycle: &mut SessionSubscription) -> SessionStat
     }
 }
 
-/// An agent that exits, or a transport that fails, ends the dispatch loop with no `close` in
+/// An agent that exits, or a transport that fails, ends the connection with no `close` in
 /// sight. Nothing else on that path touches the lifecycle, so without a watcher the handle reports
 /// `Ready` forever and a host learns the connection is dead only from the next request's failure.
 #[tokio::test]
@@ -575,7 +575,7 @@ async fn an_agent_that_dies_ends_the_published_lifecycle() {
 }
 
 /// The other half of the watcher, and the one a clean EOF cannot reach: a session dropped instead
-/// of closed releases the dispatch loop's shutdown channel with the handle, so the loop ends with
+/// of closed releases the connection with the handle, so it ends with
 /// no EOF to report. Without the driver-done arm the lifecycle would stop at `Ready` there.
 #[tokio::test]
 async fn a_session_dropped_without_a_close_still_ends_its_lifecycle() {
@@ -1334,7 +1334,7 @@ async fn a_timed_out_generic_request_closes_admission_and_reaps_the_silent_peer(
 
 /// A caller can abandon a generic request before its own deadline. ACP only queues a cancellation
 /// notification in that case, so the harness must still seal admission and let its owned teardown
-/// release the SDK's reply slot without waiting for another caller to close the session.
+/// release the request's reply without waiting for another caller to close the session.
 #[tokio::test]
 async fn an_abandoned_generic_request_closes_admission_and_reaps_the_silent_peer() {
     let launcher = FakeLauncher::new();
@@ -2481,7 +2481,7 @@ async fn a_question_still_parked_when_the_turn_ends_is_withdrawn_by_the_turn() {
         })
         .expect("expected the question to reach the host");
 
-    // Awaited rather than read once: the answer reaches the agent through the transport actor, so
+    // Awaited rather than read once: the answer reaches the agent through the connection's writer, so
     // reading immediately would report an empty list for a write that simply had not flushed — which
     // would make this pass for the wrong reason in both directions.
     let withdrawal = answers_reaching_the_agent(&launcher, 1).await;
@@ -2980,7 +2980,7 @@ impl RefusingListingAgent {
 
 /// A named ACP peer that accepts setup and then leaves one generic request unanswered.
 ///
-/// It gives cancellation tests a concrete pending reply in the SDK, rather than relying on a timer
+/// It gives cancellation tests a concrete pending reply on the connection, rather than relying on a timer
 /// or an inline closure that might accidentally answer a different request.
 #[derive(Clone)]
 struct HeldRequestAgent {
@@ -3056,7 +3056,7 @@ impl HeldRequestAgent {
             }
         })
         .await
-        .expect("expected the held request to enter the ACP SDK");
+        .expect("expected the held request to be queued for the agent");
     }
 }
 
@@ -3423,7 +3423,7 @@ async fn a_dropped_stream_reaps_an_agent_that_ignores_native_cancellation() {
     );
 }
 
-/// A failed `open_session` must not leave an agent running with nothing driving it. The dispatch loop
+/// A failed `open_session` must not leave an agent running with nothing driving it. The connection
 /// winds down only when the shutdown channel drops, so a child left behind would outlive the call
 /// that started it by however long that took to reach it.
 #[tokio::test]

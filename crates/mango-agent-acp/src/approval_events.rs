@@ -32,6 +32,17 @@ impl ApprovalEvents {
         Ok(())
     }
 
+    /// Holds the delivery gate, so a test can park a [`flush`](Self::flush) where it wants one.
+    ///
+    /// ```ignore
+    /// let delivery = approvals.hold_delivery().await;
+    /// // a flush started now waits until `delivery` is dropped
+    /// ```
+    #[cfg(test)]
+    pub(crate) async fn hold_delivery(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.delivery.lock().await
+    }
+
     /// The sink admits a bounded control reserve, so delivery never waits for transcript capacity.
     pub(crate) async fn flush(&self, sink: &EventSink) -> Result<()> {
         let _delivery = self.delivery.lock().await;

@@ -32,21 +32,20 @@ path = "tests/session.rs"
 required-features = ["testing"]
 
 [dependencies]
-# ACP v1 only: `unstable_protocol_v2` and the other draft features stay off, so the wire this
-# crate speaks is the one agentclientprotocol.com documents as stable.
-agent-client-protocol = { version = "3.3.0", default-features = false }
-# The ACP wire types, named directly rather than through the SDK's re-export, at the exact version
-# the SDK pins. Nothing beyond the bare types is needed here: no `schemars`, no `unstable_*`. The
-# SDK still turns the schema's `tracing` feature on for the whole graph until it is removed.
+# The ACP wire types and method names, and nothing else of the official SDK: the connection is
+# the core crate's own JSON-RPC peer. ACP v1 only. Every `unstable_*` feature stays off, so the
+# wire this crate speaks is the one agentclientprotocol.com documents as stable, and so do
+# `schemars` and `tracing`, which nothing here uses. Pinned exactly: a schema release can reshape
+# a type, and the fixtures are captured against this one.
 agent-client-protocol-schema = { version = "=1.11.0", default-features = false }
 async-trait = "0.1.92"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }
-# `Sink`/`Stream` adapters between the core's `ManagedProcess` halves and the official crate's
-# bounded `Channel` transport. No executor: the host owns the runtime.
-futures = { version = "0.3.32", default-features = false, features = ["std"] }
 http = "1.4.0"
 mango-external-agents.workspace = true
+# The bounds on the request and response types a caller hands the connection. No derive here: the
+# schema crate owns every wire type.
+serde = { version = "1.0.229", default-features = false, features = ["std"] }
 # The fake agent composes the v1 wire as JSON rather than as Rust values, so a schema reshape shows
 # up as a test that stops matching rather than one that compiles against a wire nobody speaks.
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }

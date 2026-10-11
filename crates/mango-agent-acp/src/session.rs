@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use agent_client_protocol_schema::v1::{
-    AgentCapabilities, CancelNotification, CloseSessionRequest, ListSessionsRequest, PromptRequest,
-    PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigSelectOptions, SessionId as AcpSessionId,
-    SetSessionConfigOptionRequest, SetSessionModeRequest,
+    AgentCapabilities, CloseSessionRequest, ListSessionsRequest, PromptRequest, PromptResponse,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOptions, SessionId as AcpSessionId, SetSessionConfigOptionRequest,
+    SetSessionModeRequest,
 };
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationCategory, ConfigurationChange,
@@ -34,7 +34,9 @@ use mango_external_agents::{
     Result, SessionLifecycle, TurnStream,
 };
 
-use crate::client::{self, ConnectionHandle, link_failure, overflow_failure, with_stderr};
+use crate::client::{
+    self, ConnectionHandle, PromptFailure, link_failure, overflow_failure, with_stderr,
+};
 use crate::profile::AcpProfile;
 use crate::{content, prompt_size, reducer};
 
@@ -42,7 +44,7 @@ use crate::{content, prompt_size, reducer};
 pub struct AcpSession {
     profile: Arc<AcpProfile>,
     host: HostContext,
-    /// The dispatch loop's own shared state: the running turn, pending approvals, the inherited
+    /// The connection handlers' own shared state: the running turn, pending approvals, the inherited
     /// configuration and a handle to `session_state` for publishing session facts as they arrive.
     connection_state: Arc<client::SessionState>,
     /// The core's live, observable session state — the one thing [`Session::state`] hands back.
@@ -209,15 +211,9 @@ impl AcpSession {
             SetSessionModeRequest::new(self.native_session_id.clone(), String::from(mode_id)),
         )?;
         drop(lifecycle);
-        client::await_sent(
-            &self.connection,
-            &self.profile,
-            self.host.limits().request_timeout,
-            "session/set_mode",
-            sent,
-        )
-        .await
-        .map(|_| ())
+        client::await_sent(&self.connection, &self.profile, sent)
+            .await
+            .map(|_| ())
     }
 
     /// Applies one complete live configuration patch while no prompt is in flight.
@@ -494,14 +490,7 @@ impl AcpSession {
                 .map(|sent| (revision, sent))
             })?;
         drop(lifecycle);
-        let response = client::await_sent(
-            &self.connection,
-            &self.profile,
-            self.host.limits().request_timeout,
-            "session/set_config_option",
-            sent,
-        )
-        .await?;
+        let response = client::await_sent(&self.connection, &self.profile, sent).await?;
         let catalog = catalog_from_options(&response.config_options);
         let (current_catalog, current_revision) = self.connection_state.catalog_snapshot();
         if current_revision != response_revision {
@@ -749,14 +738,7 @@ pub(crate) async fn list_sessions(
     if let Some(cursor) = query.cursor {
         request = request.cursor(cursor);
     }
-    let response = client::send(
-        connection,
-        profile,
-        host.limits().request_timeout,
-        "session/list",
-        request,
-    )
-    .await?;
+    let response = client::send(connection, profile, request).await?;
     let workspace = String::from(workspace);
     let sessions: Vec<NativeSession> = response
         .sessions
@@ -819,7 +801,7 @@ pub(crate) fn refuse_unsupported_reset(patch: &ConfigurationPatch) -> Result<()>
 /// records a reason and writes the notification.
 fn request_native_cancel(
     state: &client::SessionState,
-    connection: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    connection: &ConnectionHandle,
     session_id: AcpSessionId,
     reason: CancelReason,
 ) -> bool {
@@ -830,10 +812,7 @@ fn request_native_cancel(
     if !state.begin_cancellation(reason) {
         return true;
     }
-    if connection
-        .send_notification(CancelNotification::new(session_id))
-        .is_ok()
-    {
+    if connection.cancel_prompt(session_id).is_ok() {
         return true;
     }
     state.record_cancel_failure(&handle, "ACP session/cancel could not be queued");
@@ -1089,10 +1068,10 @@ impl Session for AcpSession {
             &self.agent_capabilities.prompt_capabilities,
         )
         .map_err(|error| error.with_dispatch(Dispatch::NotSubmitted))?;
-        // Each attachment is capped alone, but the frame the SDK writes for all of them is not. The
-        // transport refuses an outgoing frame over the host's outgoing byte budget only once the turn
-        // has started, which fails the connection and leaves the host with `AcceptanceUnknown`.
-        // Refused here, nothing has been submitted and the session stays usable.
+        // Each attachment is capped alone, but the frame written for all of them is not. Measured
+        // here, ahead of the turn's admission, so a prompt that cannot fit is refused for its size
+        // whatever else the session is doing. The connection measures the frame it really queues
+        // and refuses it the same way below; this is the same answer, earlier.
         prompt_size::refuse_oversized_prompt(
             &self.native_session_id,
             &prompt,
@@ -1114,8 +1093,8 @@ impl Session for AcpSession {
         //
         // ACP's `session/prompt` names no per-turn handle of its own, so `native_turn_id` is this
         // harness's own per-session turn sequence number, minted here — before the wire request is
-        // sent — rather than read off the JSON-RPC id `send_request` would assign. That id is only
-        // known once the request is actually dispatched, and dispatching it has to stay gated behind
+        // sent — rather than read off the JSON-RPC id the connection assigns. That id is only
+        // known once the request is actually queued, and queueing it has to stay gated behind
         // the same re-entrant start guard `retry_cancel_error` depends on below; minting our own
         // avoids reordering that gate around a value the wire cannot supply early enough. One real
         // cost: unlike Claude's or Codex's native turn ids, this one never appears in a captured
@@ -1188,20 +1167,33 @@ impl Session for AcpSession {
                     Error::Closed { subject: "session" }.with_dispatch(Dispatch::NotSubmitted)
                 );
             }
-            let sent = self
-                .connection
-                .connection()
-                .send_request(PromptRequest::new(self.native_session_id.clone(), prompt));
+            let sent = match client::submit_prompt(
+                &self.connection,
+                PromptRequest::new(self.native_session_id.clone(), prompt),
+            ) {
+                Ok(sent) => sent,
+                Err(error) => {
+                    // Nothing was queued: the frame was over the outgoing budget as the
+                    // connection measured it. The turn is over before it reached the agent, so
+                    // its slot is released the way the failed `TurnStarted` above releases it.
+                    if let Some((turn, _, _)) =
+                        self.connection_state.prepare_terminal_matching(&handle)
+                    {
+                        let _ = turn.finish();
+                        self.connection_state.release_turn_matching(&handle);
+                    }
+                    return Err(error);
+                }
+            };
             // The reserved handle alone is not submission. A close can win while TurnStarted is
-            // being published; only inherit this patch once the prompt has entered the SDK.
+            // being published; only inherit this patch once the prompt has been queued.
             self.connection_state
                 .accept_configuration(configuration.clone());
             self.publish_configuration(&configuration);
             let retry_cancel_error = match self.connection_state.is_cancelling() {
                 true => self
                     .connection
-                    .connection()
-                    .send_notification(CancelNotification::new(self.native_session_id.clone()))
+                    .cancel_prompt(self.native_session_id.clone())
                     .err()
                     .map(|_| Error::Link {
                         peer: format!("ACP agent {}", self.profile.id),
@@ -1221,8 +1213,8 @@ impl Session for AcpSession {
             native_turn_id.clone(),
             events,
         )
-        // ACP has no prompt acknowledgement or native turn handle. `send_request` only hands the
-        // request to the SDK's outgoing queue, so a lost pipe remains ambiguous to the host.
+        // ACP has no prompt acknowledgement or native turn handle. The prompt is only queued for
+        // the agent at this point, so a lost pipe remains ambiguous to the host.
         .with_dispatch(Dispatch::AcceptanceUnknown);
         if retry_cancel_error.is_some() {
             // The prompt is already on the wire. Preserve its owned stream rather than returning an
@@ -1247,28 +1239,26 @@ impl Session for AcpSession {
         let state = Arc::clone(&self.connection_state);
         let connection = Arc::clone(&self.connection);
         let lifecycle = Arc::clone(&self.lifecycle);
-        let outgoing = self.connection.connection().clone();
         let control = Arc::clone(self.connection.control());
-        let driver_done = self.connection.driver_done().clone();
+        let connection_ended = self.connection.ended().clone();
         let limits = *self.host.limits();
         let native_session_id = self.native_session_id.clone();
         let profile = Arc::clone(&self.profile);
         // Spawned rather than awaited: the response *is* the turn's end, and a host that could not
         // read its events until then would receive the whole turn at once or not at all.
-        // `block_task` is sound here for the same reason — this task is not the dispatch loop.
         tokio::spawn(async move {
-            let mut prompt = Box::pin(sent.block_task());
+            let mut prompt = Box::pin(sent.answer());
             let outcome = tokio::select! {
                 outcome = &mut prompt => Some(outcome),
                 () = handle.sink.closed() => {
-                    if request_native_cancel(&state, &outgoing, native_session_id.clone(), CancelReason::Requested) {
+                    if request_native_cancel(&state, &connection, native_session_id.clone(), CancelReason::Requested) {
                         tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
                     } else {
                         None
                     }
                 },
                 () = handle.sink.terminated() => {
-                    if request_native_cancel(&state, &outgoing, native_session_id.clone(), CancelReason::Requested) {
+                    if request_native_cancel(&state, &connection, native_session_id.clone(), CancelReason::Requested) {
                         tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
                     } else {
                         None
@@ -1285,13 +1275,19 @@ impl Session for AcpSession {
                     // The agent went quiet with nothing waiting on the host. Stopped the same way a
                     // host cancel is, so an agent that honours `session/cancel` ends its own turn and
                     // one that does not is reaped after the kill grace.
-                    if request_native_cancel(&state, &outgoing, native_session_id.clone(), CancelReason::Timeout) {
+                    if request_native_cancel(&state, &connection, native_session_id.clone(), CancelReason::Timeout) {
                         tokio::time::timeout(limits.kill_grace, &mut prompt).await.ok()
                     } else {
                         None
                     }
                 },
-                () = driver_done.cancelled() => None,
+                // The connection reports its end only after it has settled every reply, and
+                // this `select!` picks among ready arms at random: an agent that answers and
+                // exits at once has both ready. The answer is looked at once more, so a prompt
+                // the agent did answer is never reported as a closed link.
+                () = connection_ended.cancelled() => {
+                    tokio::time::timeout(std::time::Duration::ZERO, &mut prompt).await.ok()
+                },
             };
             let cleanup_error = if outcome.is_none() || matches!(outcome, Some(Err(_))) {
                 connection.begin_shutdown(CancelReason::Shutdown);
@@ -1340,6 +1336,7 @@ impl Session for AcpSession {
                     cancel_reason,
                     cancel_failure,
                     already_terminal: turn.sink.is_terminal(),
+                    timed_out: connection.timed_out().map(String::from),
                 };
                 let agent = profile.id.to_string();
                 let ending = prompt_ending(outcome, recorded, &agent, control.as_ref());
@@ -1389,8 +1386,7 @@ impl Session for AcpSession {
         // a later ACP prompt on the same session.
         let result = self
             .connection
-            .connection()
-            .send_notification(CancelNotification::new(self.native_session_id.clone()))
+            .cancel_prompt(self.native_session_id.clone())
             .map_err(|_| Error::Link {
                 peer: format!("ACP agent {}", self.profile.id),
                 message: String::from("a link that could not carry session/cancel"),
@@ -1539,6 +1535,8 @@ struct TurnRecord {
     cancel_failure: Option<String>,
     /// Whether the stream already holds a terminal, so there is nothing left to report.
     already_terminal: bool,
+    /// The request whose deadline made this side end the connection, when one did.
+    timed_out: Option<String>,
 }
 
 /// Decides how a turn ends from how its prompt wait ended and what the session recorded.
@@ -1549,12 +1547,13 @@ struct TurnRecord {
 /// first:
 ///
 /// - a stop reason from the agent ends the turn as the agent said, and the agent's own error
-///   fails it unless a stop was recorded;
+///   fails it unless a stop was recorded, as `acp-request-failed` naming `session/prompt`
+///   and carrying the agent's code;
 /// - a stop somebody asked for, recorded before this is decided, ends it as `Cancelled` with
 ///   that reason, including when the agent died instead of answering the stop;
 /// - a connection that went away with no stop recorded is the closed link, carrying the agent's
-///   redacted stderr. It is the same failure whether the dispatch loop ended first, the SDK
-///   failed the prompt at EOF, or the reply was dropped with the loop.
+///   redacted stderr, and naming the request whose deadline ended it when that is why. It is the same failure whether the connection's end was seen first or the
+///   prompt's own failure was.
 ///
 /// A `session/cancel` that could not be written keeps the handling it had: it is the failure
 /// reported when the wait ended without an answer, and is passed over when the prompt itself
@@ -1564,7 +1563,7 @@ struct TurnRecord {
 /// let ending = prompt_ending(None, recorded, "opencode", control.as_ref());
 /// ```
 fn prompt_ending(
-    outcome: Option<std::result::Result<PromptResponse, agent_client_protocol_schema::v1::Error>>,
+    outcome: Option<std::result::Result<PromptResponse, PromptFailure>>,
     recorded: TurnRecord,
     agent: &str,
     control: &dyn ProcessControl,
@@ -1573,6 +1572,7 @@ fn prompt_ending(
         cancel_reason,
         cancel_failure,
         already_terminal,
+        timed_out,
     } = recorded;
     let error = match outcome {
         Some(Ok(response)) => return Some(answered_ending(&response, cancel_reason)),
@@ -1592,10 +1592,23 @@ fn prompt_ending(
     }
     // Nobody asked to stop this turn. Reporting `Cancelled` from here would tell a host it
     // stopped a turn whose agent died, and would drop the stderr that says why.
-    let message = match &error {
-        Some(error) if !client::is_link_closure(error) => error.message.clone(),
-        _ => with_stderr("a transport that closed under session/prompt", control),
+    if let Some(PromptFailure::Agent(refusal)) = &error {
+        // The agent answered, with an error of its own. That is its refusal of the prompt,
+        // with its code, and not a link that closed: the same failure a refused
+        // `session/new` is reported as.
+        return Some(Ending::Fail(crate::error::vendor_error(
+            <PromptRequest as client::AgentRequest>::METHOD,
+            refusal,
+        )));
+    }
+    // The link is closed either way. When this side closed it because another request on it
+    // passed its deadline, the message says which, so a host is not left reading a turn that
+    // failed for no visible reason.
+    let closed = match timed_out {
+        Some(cause) => format!("a transport that closed under session/prompt after {cause}"),
+        None => String::from("a transport that closed under session/prompt"),
     };
+    let message = with_stderr(&closed, control);
     Some(Ending::Fail(link_failure(format!("{agent}: {message}"))))
 }
 
@@ -1646,17 +1659,16 @@ async fn finish_close(
     // in flight. Withdraw them before and after the bounded handshake.
     state.withdraw_pending();
     if capabilities.session_capabilities.close.is_some() {
-        let _ = tokio::time::timeout(
-            limits.shutdown_timeout,
-            client::send(
-                &connection,
-                profile.as_ref(),
-                limits.request_timeout,
-                "session/close",
-                CloseSessionRequest::new(native_session_id),
-            ),
-        )
-        .await;
+        // Given up at the deadline, this request starts the teardown itself, so it carries the
+        // reason the host closed with: the child is stopped for the first reason given.
+        if let Ok(sent) = client::submit(&connection, CloseSessionRequest::new(native_session_id)) {
+            let sent = sent.abandoned_for(reason.into());
+            let _ = tokio::time::timeout(
+                limits.shutdown_timeout,
+                client::await_sent(&connection, profile.as_ref(), sent),
+            )
+            .await;
+        }
         state.withdraw_pending();
     }
 
@@ -1770,7 +1782,9 @@ impl AcpSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ending, TurnRecord, accepted_axes, prompt_ending, refuse_unsupported_reset};
+    use super::{
+        Ending, PromptFailure, TurnRecord, accepted_axes, prompt_ending, refuse_unsupported_reset,
+    };
     use agent_client_protocol_schema::v1::{PromptResponse, StopReason};
     use mango_external_agents::configuration::{
         Configuration, ConfigurationChange, ConfigurationPatch,
@@ -1849,24 +1863,22 @@ mod tests {
             cancel_reason: None,
             cancel_failure: None,
             already_terminal: false,
+            timed_out: None,
         }
     }
 
-    /// The SDK's error for a request whose incoming transport reached EOF.
-    fn transport_closed() -> agent_client_protocol_schema::v1::Error {
-        let mut error = agent_client_protocol_schema::v1::Error::internal_error();
-        error.message = String::from("Incoming transport closed");
-        error.data(serde_json::json!({
-            "reason": agent_client_protocol::INCOMING_TRANSPORT_CLOSED_REASON,
-            "method": "session/prompt",
-        }))
-    }
-
-    /// The SDK's error for a request whose reply channel was dropped with the dispatch loop.
-    fn reply_dropped() -> agent_client_protocol_schema::v1::Error {
-        agent_client_protocol::util::internal_error(
-            "response to `session/prompt` never received: oneshot canceled",
-        )
+    #[test]
+    fn a_link_closed_by_another_requests_deadline_names_that_request() {
+        let recorded = TurnRecord {
+            timed_out: Some(String::from("session/list got no answer within 5s")),
+            ..untouched()
+        };
+        let received = shown(prompt_ending(None, recorded, "fake", &DeadAgent).as_ref());
+        let expected = "Fail(acp-link-closed, \"fake: a transport that closed under session/prompt after session/list got no answer within 5s\")";
+        assert!(
+            received.starts_with(expected.trim_end_matches("\")")),
+            "expected the ending to start: {expected} | received: {received}"
+        );
     }
 
     /// One ending as text a failure message can show.
@@ -1880,16 +1892,17 @@ mod tests {
     }
 
     /// How a prompt wait can end.
-    type Waited =
-        Option<std::result::Result<PromptResponse, agent_client_protocol_schema::v1::Error>>;
+    type Waited = Option<std::result::Result<PromptResponse, PromptFailure>>;
 
-    /// The three ways a prompt task can learn the connection is gone: the dispatch loop ended
-    /// first, the SDK failed the prompt at EOF, or the reply was dropped with the loop.
-    fn ways_to_see_a_dead_link() -> [(&'static str, Waited); 3] {
+    /// The two ways a prompt task can learn the connection is gone: the connection's own end was
+    /// seen first, or the prompt was failed with it.
+    fn ways_to_see_a_dead_link() -> [(&'static str, Waited); 2] {
         [
-            ("the dispatch loop ended first", None),
-            ("the prompt failed at EOF", Some(Err(transport_closed()))),
-            ("the reply was dropped", Some(Err(reply_dropped()))),
+            ("the connection's end was seen first", None),
+            (
+                "the prompt was failed with the connection",
+                Some(Err(PromptFailure::LinkClosed)),
+            ),
         ]
     }
 
@@ -1940,7 +1953,7 @@ mod tests {
         let recorded = TurnRecord {
             cancel_reason: Some(CancelReason::Requested),
             cancel_failure: Some(String::from("ACP session/cancel could not be queued")),
-            already_terminal: false,
+            ..untouched()
         };
         let ending = prompt_ending(None, recorded, "fake", &DeadAgent);
         let received = shown(ending.as_ref());
@@ -1973,9 +1986,8 @@ mod tests {
         let answers: [Waited; 3] = [
             Some(Ok(PromptResponse::new(StopReason::EndTurn))),
             Some(Ok(PromptResponse::new(StopReason::Cancelled))),
-            Some(Err(agent_client_protocol_schema::v1::Error::new(
-                -31_000,
-                "model busy",
+            Some(Err(PromptFailure::Agent(
+                agent_client_protocol_schema::v1::Error::new(-31_000, "model busy"),
             ))),
         ];
         let received = answers
@@ -1983,7 +1995,7 @@ mod tests {
         let expected = [
             "Some(Complete)",
             "Some(Cancel(Requested))",
-            "Fail(acp-link-closed, \"fake: model busy\")",
+            "Fail(acp-request-failed, \"model busy\")",
         ];
         assert_eq!(
             received, expected,

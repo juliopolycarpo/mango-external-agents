@@ -34,7 +34,7 @@ with `-` filter cases by substring; flags such as `--bench` are ignored.
 | `mango-agent-claude` / `tool_results` | `TurnReducer::reduce` closing a call: a `tool_result` record with a string payload (1 MiB, 32 KiB) or an array of text blocks (1 MiB in one block and in 100 blocks, 12 KiB and 32 KiB in one block, 6 KiB and 600 bytes in three); starting a `Write` (16 KiB, 200 KiB) or an `Edit` (two 2 KiB or two 100-byte strings) call; 1000 subagent text blocks of 1 KiB forwarded under one `Task`                                                                                                                                                                                                                                                                                                                                                                      |
 
 The ACP `prompt` binary adds `prompt/4KiB` (100 turns per sample) and `prompt/1MiB`
-(16 turns). It drives exact preflight, the official serializer, the physical writer, and terminal
+(16 turns). It drives the preflight, the connection's own frame queue, the physical writer, and terminal
 drain through the named `FakeAcpAgent`, with unchanged default limits and no override. Session
 opening and request construction are outside the clock; final cleanup and the fake's wire capture
 are included. It needs `--features testing`, which `scripts/bench.sh` supplies. This measures the

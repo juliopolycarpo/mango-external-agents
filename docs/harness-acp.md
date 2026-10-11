@@ -1,18 +1,19 @@
 # Agent Client Protocol harness (`mango-agent-acp`)
 
-One harness for every agent that speaks the [Agent Client Protocol][acp] as the agent side, over the
-official [`agent-client-protocol`][sdk] crate. What differs between agents is not the protocol — it is
+One harness for every agent that speaks the [Agent Client Protocol][acp] as the agent side. The wire
+types are the official [`agent-client-protocol-schema`][schema] crate's; the connection is this
+library's own JSON-RPC 2.0 peer, the one the Codex harness uses. What differs between agents is not the protocol — it is
 the argv, the version string, the login command and the documents a host's disclosure links, and those
 live in a **profile**. Adding an agent is a table entry, not a new harness.
 
 Facts here were read on 2026-09-17 against the pages linked inline. Re-verify before relying on them.
 
 [acp]: https://agentclientprotocol.com/protocol/overview
-[sdk]: https://crates.io/crates/agent-client-protocol
+[schema]: https://crates.io/crates/agent-client-protocol-schema
 
 ## The surface driven
 
-ACP **v1 only**. The SDK's `unstable_protocol_v2` feature and every other draft feature stay off, so
+ACP **v1 only**. Every `unstable_*` feature of the schema crate stays off, so
 the wire this crate speaks is the one the specification documents as stable. An agent whose
 `initialize` answers a different `protocolVersion` is refused before a session exists — negotiating
 down would mean sending v1 messages to an agent that answered something else.
@@ -30,61 +31,90 @@ down would mean sending v1 messages to an agent that answered something else.
 | Configuration | `session/set_config_option`; complete `configOptions` replies           | [session config options](https://agentclientprotocol.com/protocol/v1/session-config-options) |
 | Listing       | `session/list`, when `sessionCapabilities.list`                         | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)                   |
 | Close         | `session/close`, when `sessionCapabilities.close`                       | [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)                   |
+| Give up       | `$/cancel_request`, for a request given up after its write began        | [cancellation](https://agentclientprotocol.com/protocol/v1/cancellation)                     |
 
 `authenticate` is **never sent**. See [Auth](#auth).
 
 ## Transport
 
 `TransportKind::Acp` only, through `AcpSpec::ChildPipes`. The host's `ProcessLauncher` spawns the
-agent and the library receives the pipes; the SDK's own `AcpAgent` and `Stdio` carriers are unusable
-here because the first spawns the agent itself and the second takes over this process's stdio.
-Since SDK 3.0 both sit behind its `process` and `stdio` Cargo features
-([rust-sdk#397](https://github.com/agentclientprotocol/rust-sdk/pull/397)), which this crate leaves
-off along with `schemars`, so neither they nor their async-io dependencies are compiled.
+agent and the library receives the pipes. The official Rust SDK (`agent-client-protocol`) is not a
+dependency: its connection, its process spawner and its stdio adapter are all things the host or
+the core already own, and `deny.toml` bans the crate so it cannot come back through another one.
+Only its schema crate is used, pinned exactly, with `schemars` and `tracing` off.
 
-The core's `LineStream` and `ByteSink` frame the pipes under `Limits::line`. `BoundedTransport`
-passes frames through the SDK's [`Channel` interface](https://docs.rs/agent-client-protocol/3.3.0/agent_client_protocol/struct.Channel.html),
-leaving JSON-RPC parsing and routing to the official SDK. Each direction has two bounds:
+The core's `LineStream` and `ByteSink` frame the pipes, one JSON-RPC message per line each way
+and incoming lines under `Limits::line`, and `transport::frame` hands them back as a `Link`. The core's
+`jsonrpc::Client` speaks over that link and enforces every queue bound:
 
-| Bound                      | Limit                                                                    | Unit                                | Default           |
-| -------------------------- | ------------------------------------------------------------------------ | ----------------------------------- | ----------------- |
-| Queued messages            | larger of `Limits::turn_channel_capacity` and `max_pending_requests`     | JSON-RPC messages                   | 1,024             |
-| Incoming bytes             | `Limits::turn_buffer_bytes`                                              | serialized bytes                    | 8 MiB (8,388,608) |
-| Outgoing frame/queue bytes | `HostContext::outbound_buffer_bytes()` (defaults to `turn_buffer_bytes`) | serialized bytes, excluding newline | 8 MiB (8,388,608) |
+| Bound                    | Limit                                                                    | Unit                                | Default           | Passing it               |
+| ------------------------ | ------------------------------------------------------------------------ | ----------------------------------- | ----------------- | ------------------------ |
+| Queued incoming messages | larger of `Limits::turn_channel_capacity` and `max_pending_requests`     | notifications and agent requests    | 1,024             | ends the connection      |
+| Queued incoming bytes    | `Limits::turn_buffer_bytes`                                              | serialized bytes                    | 8 MiB (8,388,608) | ends the connection      |
+| One outgoing frame       | `HostContext::outbound_buffer_bytes()` (defaults to `turn_buffer_bytes`) | serialized bytes, excluding newline | 8 MiB (8,388,608) | refuses that frame alone |
+| Queued outgoing bytes    | twice `HostContext::outbound_buffer_bytes()`                             | serialized bytes, excluding newline | 16 MiB            | ends the connection      |
+| Queued outgoing frames   | the incoming message limit + 2 x `max_pending_requests` + 3              | frames                              | 1,155             | ends the connection      |
 
-Incoming messages are counted individually: a batch is charged one message per member, so
-batches cannot multiply the queue past the cap. Outgoing frames are single messages from the SDK
-and are counted one each. The queue carries both `session/update` notifications and responses to
-the requests admitted under `max_pending_requests`, so the message cap is never below either
-quantity. It is deliberately not `max_pending_requests` alone: a burst of ordinary notifications
-ahead of the SDK actor is not request concurrency. Notifications and turn events are related but
-not one to one (a first thought chunk opens reasoning and adds a delta; a completed tool call
-starts and completes an activity), so the message count is a coarse guard and the byte budget is
-what bounds retained wire payloads. These are not heap bounds. A host may set a very large count to rely on bytes alone; the outgoing writer
-queue is clamped to tokio's `Semaphore::MAX_PERMITS` rather than panicking, and so is the request
-admission semaphore that `max_pending_requests` sizes (a `usize::MAX` there means no cap in
-practice, and opens, runs turns and closes like any other value).
+Incoming messages are counted individually: a batch is charged one message per member that is a
+notification or a request, and the whole batch is counted before any of it is handled, so a batch
+that does not fit ends the connection with nothing of it delivered. A response takes none of the
+message budget: its place was reserved when its request was admitted. The message cap is
+deliberately not `max_pending_requests` alone: a burst of ordinary notifications is not request
+concurrency. Notifications and turn events are related but not one to one (a first thought chunk
+opens reasoning and adds a delta; a completed tool call starts and completes an activity), so the
+message count is a coarse guard and the byte budget is what bounds retained wire payloads. These
+are not heap bounds. A host may set a very large count to rely on bytes alone; the queues and the
+request admission semaphore are clamped to what tokio can allocate rather than panicking (a
+`usize::MAX` there means no cap in practice, and opens, runs turns and closes like any other
+value).
+
+The incoming budgets bound what waits for the handler, not how much an agent may write. The
+reader yields before each line, so on a current-thread runtime a line is normally handled
+before the next is counted, and a burst many times the budget costs nothing. On a multi-thread runtime the
+reader and the handler run at once: the budget has to absorb how far the reader gets ahead, and
+nothing makes the reader wait. The handler never waits on the host (see below), so in practice
+it keeps up; the default 1,024 messages is the margin.
 
 A host can set `HostContext::builder().outbound_buffer_bytes(bytes)` independently of incoming
 frames and turn events. An explicit override must be nonzero and at most the smaller of
 `u32::MAX` and tokio's `Semaphore::MAX_PERMITS`; invalid values are configuration refusals.
-Unset preserves existing default and custom `Limits::turn_buffer_bytes` behavior. Legacy values
-above the permit range are clamped at the ACP boundary.
+Unset preserves existing default and custom `Limits::turn_buffer_bytes` behavior.
 
-Output bytes remain charged through the physical write. For a byte budget `B` and writer queue
-capacity `N`, accepted serialized payload lengths sum to at most `B` across at most `N` queued
-frames plus one physical write. The writer adds one newline byte. One additional candidate is
-serialized before its size and queue charges are checked; a fitting candidate is at most `B`, but
-a refused oversized candidate can be larger. String allocation capacity, parsed messages,
-attachments, the official SDK's unbounded actor channel, and host-supplied sinks are outside that
-accounting, so this is not a hard memory bound. A single frame larger than the byte
-budget, or a queue that would exceed either bound, fails the connection with an error naming the
-received count or size and the limit; the session then closes and its child is released. A prompt
-too large for one frame does not reach that path: `start_turn` measures it first and refuses it
-before submission (see [Attachments](#attachments)).
+`outbound_buffer_bytes` means two things, and a host sees a different outcome at each:
 
-What the host observes: the turn in flight ends with one `EventKind::Error` whose code is
-`acp-transport-overflow` and whose message is the core `Error::LimitExceeded` text, for example
+- **One frame may be that large.** A larger one is refused alone: the call returns
+  `Error::LimitExceeded` ("bytes in one frame to the ACP agent") with `Dispatch::NotSubmitted`,
+  nothing is queued and the session stays usable. A prompt meets this in `start_turn` (see
+  [Attachments](#attachments)).
+- **The queue may hold twice that**, counting the frame being written until its write returns.
+  That is room for the largest frame and as much again behind it, so a prompt that fills the
+  frame budget can still be followed by its `session/cancel`. A frame that would pass it, or the
+  frame count, ends the connection.
+
+The frame count is sized so that what this side queues by itself always fits. With `r` for
+`max_pending_requests` that is at most 2`r` + 3 counted frames at one moment: the prompt, the
+`r` requests beside it, the answers to `r` parked questions withdrawn at once by a cancel, and
+`session/cancel` with its one repeat. `$/cancel_request` and `-32700` are queued beside the
+bounds and count for nothing. The incoming message limit is added on top for answers the agent
+asks for and this side gives on the spot (`-32601`, a question past the cap). Only those can
+fill the frame count, so a host's own `cancel` or `close` never passes it, and a frame-count
+overflow is always an agent that keeps asking and reads nothing.
+
+The byte bound has no such guarantee. It counts every frame whatever its source, so with
+`outbound_buffer_bytes` set smaller than what this side has to say at once (a cancel's withdrawn
+answers, say, behind an agent that is not reading) this side's own frames can pass it. Either
+overflow is reported as `acp-transport-overflow` even when the host had asked for the turn to
+stop: the session is gone, and that is why.
+
+So the outgoing ACP frames a host holds for one session are bounded by twice
+`outbound_buffer_bytes`, 16 MiB at the defaults, not by that number itself, apart from the few
+small frames queued beside the bounds. String allocation
+capacity, parsed messages, attachments and host-supplied sinks are outside that accounting, so
+this is not a hard memory bound either.
+
+What the host observes when a queue bound ends the connection: the turn in flight ends with one
+`EventKind::Error` whose code is `acp-transport-overflow` and whose message is the core
+`Error::LimitExceeded` text, for example
 `expected at most 8 JSON-RPC messages queued from the ACP agent, received 50`, instead of a
 `Cancelled { reason: Requested }` or the generic `acp-link-closed`. That holds when a host `close`
 races the overflow's cleanup. One outcome takes precedence: if the process cleanup itself fails,
@@ -92,10 +122,8 @@ the turn ends with `acp-link-closed` naming the cleanup failure, because a possi
 is the more urgent fact. A session request
 awaiting an answer on that connection returns `Error::LimitExceeded` with the same subject, limit
 and received value. The session then reaches `Closing` and, once the child is reaped and the turn's
-terminal is written, `Closed`.
-
-The SDK's `Lines` carrier uses unbounded internal queues; its `ByteStreams` carrier also frames input
-without the host's line cap. Neither provides the budgets this harness requires.
+terminal is written, `Closed`. An inbound overflow does not drain what was read before it: an
+agent's own refusal still waiting its turn behind notifications is reported as the overflow.
 
 `AcpSpec::Http` exists in the core and is **not implemented**: `agent-client-protocol-http` 3.3.0 pulls
 `aws-lc-rs` through `reqwest` 0.13's `rustls` feature and through `async-tungstenite`'s
@@ -104,36 +132,72 @@ Asking for it is `Error::UnsupportedTransport`.
 
 ## The driving model
 
-The SDK's connection is a scope rather than an object: `connect_with` runs the dispatch loop for
-exactly as long as its closure, and the closure is the only place a `ConnectionTo` exists. A `Session`
-outlives any one call, so the closure hands a clone out through a channel and parks on a shutdown
-signal, with the whole thing on one spawned task per session.
+`client::drive` connects the peer over the framed link and returns a `ConnectionHandle` that owns
+it and the child. The peer reads on one task and hands notifications and the agent's requests to
+the handler in arrival order on a second, a request with the responder that answers it. No
+`LocalSet` and no thread per session.
 
-This works because 3.3.0's connection is `Send`: `ConnectTo` is `Send + 'static`, its future is `Send`,
-and `ConnectionTo<Agent>` is `Clone + Send + Sync`. No `LocalSet` and no thread per session.
+Every answer to the agent is queued, not written, by the call that gives it: it takes its place
+behind what this side queued before it and ahead of what it queues after, and it counts against
+the outgoing queue's bounds like any other frame. A withdrawn question and then `session/cancel`
+reach the agent in that order.
 
-Handlers leave the dispatch loop promptly:
+What the handler does with the agent's traffic:
 
-- A `session/update` handler reserves bounded transcript capacity and returns. If the transcript
-  budget is exhausted, the stream commits its terminal error and the prompt owner cancels native work;
-  dispatch never waits for a host to read.
-- A `session/request_permission` handler must not wait for an answer, because the answer arrives
-  through `Session::respond` on another task. It parks the agent's responder and returns; broker
+- A `session/update` is reduced and emitted on the notification call. The call reserves bounded
+  transcript capacity and returns. If the transcript budget is exhausted, the stream commits its
+  terminal error and the prompt owner cancels native work; the handler never waits for a host to
+  read.
+- A `session/request_permission` must not wait for an answer inline, because the answer arrives
+  through `Session::respond` on another task. It parks the reply and returns, and it has done so
+  before anything the agent sent after it is handled, the answer to the prompt included: a
+  question still parked when the turn ends is always there for the turn to withdraw. Broker
   deliberation is a separate callback that lives only as long as its question stays parked, so
   `Limits::max_pending_requests` caps it too. Once the question is answered, withdrawn, expired,
   cancelled or swept by a close, the broker's `decide` future is dropped rather than left to run
   out the approval deadline; a broker must tolerate that, as it already must at the deadline.
+- Any other request is answered `-32601` (`Method not found`), and one whose `session/request_permission`
+  parameters cannot be read `-32602`, with no `data`: nothing the agent sent is echoed back.
+- Any other notification is dropped without an answer.
+- A `session/update` this build cannot read is dropped too, and the turn is told once: the first
+  one in a turn becomes a warning `EventKind::Notice` ("The agent sent an update this client
+  could not read") in this library's own words, with nothing of the frame in it. It is not
+  progress, so it does not restart the idle deadline, and it does not fail the turn. A tool
+  call whose first frame was lost this way is opened by its next `tool_call_update`.
 
-The typed handlers are installed before connecting. A final SDK handler consumes unsupported
-notifications and answers unsupported requests with `Method not found`; it does not retain them
-for a future dynamic session handler. Responses continue through the SDK's correlation router.
+One stretch on the notification call must run whole: a `session/update` whose event the core
+refuses to publish fails the turn there, taking the turn's reducer and questions and then
+committing `acp-refused-event`. The peer cancels a notification call when the agent passes an
+inbound budget and when the connection is closed, so that stretch asks for
+`Client::hold_cancellation` first, and those ends wait for it, up to `shutdown_timeout`. Apart
+from that and the stream's own overflow terminal, which `emit` commits where it is called, every
+terminal is committed off the notification call, by the prompt's own task or by `close`.
+
+Every request asks for its answer behind the notifications read before it
+(`RequestOptions::after_earlier_notifications`). A `session/prompt` answer reaches the prompt's
+owner only after the turn's last `session/update` was emitted, a `session/set_config_option`
+answer only after a `config_option_update` the agent sent ahead of it, and a `session/load`
+answer only after the replay.
 
 Every request except `session/prompt` is bounded by `Limits::request_timeout` and fails with
-`Error::Timeout` naming the method. The prompt is a turn and may take as long as the agent needs.
-Timing out or abandoning a generic request seals request admission and starts owned connection
-cleanup. The SDK retains unanswered requests until a response or connection teardown, so returning
-their permits while keeping the connection open would allow an unresponsive agent to defeat the
-pending-request budget.
+`Error::Timeout` naming the method. The prompt is a turn and may take as long as the agent needs:
+its answer has no deadline and it stands outside the request budget, in both directions. Its
+frame, like every frame, must still be written within `request_timeout` of being queued. Timing out or
+abandoning a generic request seals request admission, tells the agent which request was given up
+(`$/cancel_request` naming its id) and starts owned connection cleanup. Returning the permit
+while keeping the connection open would allow an unresponsive agent to defeat the pending-request
+budget.
+
+What the peer writes that the agent did not ask for, all JSON-RPC 2.0:
+
+| Frame                            | When                                                              |
+| -------------------------------- | ----------------------------------------------------------------- |
+| `-32700`, `id: null`             | a line that is not JSON, not quoted back; at most 8 wait at once  |
+| `$/cancel_request` (`requestId`) | a request this side gave up after its write began                 |
+| nothing                          | a line that is JSON and not a frame, an empty batch, a blank line |
+
+Request ids are decimal strings counting up from `"1"`. An id is the client's to choose and an
+agent only echoes it.
 
 ## Turns
 
@@ -145,8 +209,8 @@ then escalates through the host's process control if the prompt remains live. Th
 installed until that native work can no longer report, and each turn carries a generation so a late
 prompt can only ever end its own turn.
 
-ACP v1 does not acknowledge a submitted prompt or assign it a turn handle. The SDK accepting the
-request into its outgoing queue is therefore `Dispatch::AcceptanceUnknown`: after a broken pipe, a
+ACP v1 does not acknowledge a submitted prompt or assign it a turn handle. A prompt queued for
+the agent is therefore `Dispatch::AcceptanceUnknown`: after a broken pipe, a
 host cannot safely replay the same prompt without knowing whether the agent received it.
 
 `start_turn` and `close` share the core lifecycle gate while they synchronously claim the prompt slot
@@ -173,6 +237,12 @@ answers with `stop_reason: cancelled`, or after `Limits::kill_grace` and a reap 
 There is no floor, unlike the Claude harness's ten minutes: an ACP agent reports a running tool call
 through `tool_call_update`, so a silent one is not a working one.
 
+An agent that answers `session/prompt` with a JSON-RPC error has refused the prompt: the turn
+ends with one `EventKind::Error` coded `acp-request-failed`, with `request_id` `session/prompt`,
+the agent's code as `vendor_code` and its message, or `-32603` for a result this client could
+not read. The connection is torn down before the event is written, as for any prompt that did
+not complete; a stop reason such as `refusal` or `max_tokens` is a result and does not end it.
+
 A turn ends as `Cancelled` in two cases. The agent answered its prompt with
 `stop_reason: cancelled`, which is believed and reported as `Requested` when no reason was
 recorded. Or a stop was recorded for the turn: a host `cancel`, a dropped stream or session, the
@@ -182,16 +252,24 @@ idle deadline, a permission question that expired with no option to refuse, a ho
 `<profile id>: a transport that closed under session/prompt`, followed by the agent's redacted
 stderr tail when it wrote any. That covers an agent that exited mid-turn and a connection the
 harness itself ended because another request on it passed `Limits::request_timeout` or was
-dropped by its caller. The outcome does not depend on which of the prompt's failure and the end
-of the dispatch loop is observed first. When both a stop and the agent's death apply, the stop
+dropped by its caller. When a deadline is why, the message names the request and the deadline:
+`<profile id>: a transport that closed under session/prompt after session/list got no answer
+within 120s`. The outcome does not depend on which of the prompt's failure and the end
+of the connection is observed first. When both a stop and the agent's death apply, the stop
 wins if it was recorded before the turn's terminal was decided: the turn ends as `Cancelled` with
 that reason, without the stderr tail. A `session/cancel` that could not be written can instead
 end the turn with `acp-link-closed` naming that write.
 
+A request the session refuses before queueing anything is marked `Dispatch::NotSubmitted`: one
+made after teardown began (`Error::Closed`), one past `max_pending_requests`
+(`expected at most N outstanding ACP requests, received N + 1`), one whose frame is too large,
+and one made on a connection that had already ended. A prompt on an ended connection is the
+exception: it is accepted and its stream ends as the closed link.
+
 A request other than the prompt that was still waiting when the connection went away fails the
 same way, as `acp-link-closed` with `a transport that closed under <method>` and the stderr tail,
-whether its reply was failed at EOF or dropped with the dispatch loop. It is never reported as the
-agent's own refusal.
+unless a queue budget ended the connection, when it fails with that `LimitExceeded`. It is never
+reported as the agent's own refusal.
 
 Steering is `Error::NotSupported` on every profile: ACP v1 has no surface for adding to a turn that is
 already running.
@@ -260,7 +338,7 @@ Two deliberate limits, each with a test pinning it:
   Rendering one into words would attribute prose to the agent that it did not write.
 - `usage_update` reports context **in use** against the window, not cumulative spend. It reaches a host
   as `ThreadUsage.total` with `context_window_tokens` set, which is the only denominator that makes a
-  percentage honest; there is no per-turn figure, because `PromptResponse.usage` is behind the SDK's
+  percentage honest; there is no per-turn figure, because `PromptResponse.usage` is behind the schema crate's
   `unstable_end_turn_token_usage` feature.
 
 ### Notices and compaction
@@ -429,11 +507,9 @@ that has since claimed its terminal is treated the same way, so it cannot leave 
 reducer of the turn that replaced it.
 
 A `session/load` answered with `"result": null` resumes the session with no modes and no
-configuration options: `LoadSessionResponse` has no required field, and the schema crate reads a
-null result as that empty response by 1.9.1, which the SDK moved to in 2.2.0
-([rust-sdk#366](https://github.com/agentclientprotocol/rust-sdk/pull/366)). SDK 2.1.0, on schema
-1.7.0, failed the same reply, which a strict resume reported as a vendor failure. `session/set_mode`
-and `session/close` read a null result the same way.
+configuration options: `LoadSessionResponse` has no required field, and this harness reads a
+null result as the empty object before it decodes it. `session/set_mode` and `session/close` read
+a null result the same way.
 
 ## Permissions
 
@@ -739,7 +815,7 @@ adds `NO_BROWSER`, the [adapter's documented switch][p-codex] for suppressing a 
 | `start_review`          | `Error::NotSupported`                                                                                                            |
 | `refresh_account_usage` | `Error::NotSupported` — v1 reports a session's context window, never an account's plan quota                                     |
 
-Teardown has one owner per session: the connection's shutdown task, which ends the dispatch loop
+Teardown has one owner per session: the connection's shutdown task, which closes the connection
 and reaps the child through a single shared reaper. `close`, the watcher that notices an agent
 exit or a failed transport, and an abandoned request all join that task rather than killing the
 child again. A dropped session has no connection handle left to join, so its watcher reaps through
@@ -781,6 +857,49 @@ on, which also works from a thread with no runtime. The held `TurnStream` ends a
 drop with no turn running keeps its earlier behaviour: the watcher reaps once the connection is
 released.
 
+### Deadlines
+
+Nothing in ACP v1 bounds a stop, so every stage is bounded by the host's `Limits`:
+
+| Stage                       | Bound                                                 | On expiry                                                          |
+| --------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------ |
+| Request other than a prompt | `request_timeout`, from when it is queued             | `Error::Timeout`; the connection is torn down                      |
+| Any frame's write           | `request_timeout`, from when it is queued             | the write fails and the connection ends                            |
+| Silent turn                 | `idle_timeout`, paused while a question waits         | `session/cancel`, then the cancel stages                           |
+| Parked question             | `approval_timeout`                                    | the refusing option is sent, or the turn is cancelled              |
+| Cancel honoured             | `kill_grace`, from the `session/cancel`               | the connection is torn down                                        |
+| `session/close`             | `shutdown_timeout`, only when the agent advertised it | abandoned; the close carries on                                    |
+| Connection close            | `shutdown_timeout`                                    | given up; the child goes to the reaper                             |
+| Process stop                | `kill_grace` twice, then `shutdown_timeout` twice     | `Error::CleanupRequired` carrying the host's process control       |
+| Turn another task settles   | `shutdown_timeout`                                    | `Error::Timeout` naming the turn slot; the session stays `Closing` |
+
+The stages add up. With `rt` for `request_timeout`, `st` for `shutdown_timeout` and `kg` for
+`kill_grace`, the worst cases are:
+
+| Path                                | Worst case                         | At the defaults |
+| ----------------------------------- | ---------------------------------- | --------------- |
+| Teardown `T`                        | `st` + (`kg` + `kg` + `st` + `st`) | 19 s            |
+| `close`                             | `st` + `T` + `st`                  | 29 s            |
+| Cancel, to the turn's terminal      | `kg` + `T`                         | 21 s            |
+| Request timeout, to `Closed`        | `rt` + `T` + `st`                  | 144 s           |
+| Agent exit or overflow, to `Closed` | `st` + `st` + `T` + `st`           | 34 s            |
+| Dropped session mid-turn            | `T`                                | 19 s            |
+
+The teardown's terms are the connection's close and the process stop (a graceful interrupt and
+its wait, then the kill and its wait). `close` adds the `session/close` handshake in front and the
+wait for a turn another task is still settling behind. `cancel` itself returns as soon as
+`session/cancel` is queued; the row is how long the turn can then take to end when the agent
+ignores it. An agent that exits is told to the handler after the peer has drained what it read,
+which the first `st` of that row bounds; the second is for a stretch held under
+`hold_cancellation` at that moment, and is not spent otherwise.
+
+The peer bounds its own close at twice `shutdown_timeout`: once for the answers it still owes the
+agent and for a notification call that holds its cancellation off, once to write its queue and
+close the link. The harness gives the close one `shutdown_timeout` and then moves on to the
+process: both waits are over at once on a link that takes its writes, and behind a write the
+agent never reads there is nothing to gain from the second. A close the harness gave up, or one
+that reports an error, is not a failed teardown. The reap decides that.
+
 A strict resume against an agent that does not advertise `loadSession` is an explicit `Resume`
 refusal. `ResumeMode::Fallback` opens a new conversation when the handshake conclusively reports
 that absence or the pinned profiles return a stale-session reply (`session/load` code `-32002`),
@@ -808,21 +927,23 @@ An attachment whose kind the agent never advertised in `promptCapabilities` is r
 turn starts. Rejected mid-turn it reads to a user as the agent breaking rather than as a file that was
 never going to work.
 
-The whole prompt is checked too, not only each attachment. The transport refuses any outgoing frame
+The whole prompt is checked too, not only each attachment. The connection refuses any outgoing frame
 over `host.outbound_buffer_bytes()` (8 MiB by default), and the encoding grows what it carries: base64
 adds a third, and a control character in a text attachment becomes a six-byte `\u00XX` escape. Three
 2 MiB images or one 2 MiB text of control characters pass the per-attachment cap and still exceed the
-frame. Refused there, the turn has already started: the connection fails, the session closes and the
-host is left with `AcceptanceUnknown`. So `start_turn` measures the exact `session/prompt` frame the
-official crate will write, before it submits anything, and answers `LimitExceeded` ("bytes in one
-frame to the ACP agent") with `Dispatch::NotSubmitted`. The session stays usable for the next turn.
-The count is exact, not a bound: the check accepts a frame of exactly the effective outgoing budget in bytes,
-refuses one byte more, and refuses nothing that fits the frame budget today. It guarantees only that
-the frame fits alone. The outgoing byte budget is shared by every frame queued for the agent until it
-is written, so a near-budget prompt can still fail the connection after submission when another
-outgoing frame is queued at the same moment (a `session/cancel`, a permission or file response).
-That is the transport's queue cap described above, not a prompt-size refusal. It serialises into a counting sink, so no second
-copy of an attachment is built. It is one extra serialization pass per turn. A host that wants larger prompts can set
+frame. `start_turn` answers such a prompt `LimitExceeded` ("bytes in one frame to the ACP agent")
+with `Dispatch::NotSubmitted`, and the session stays usable for the next turn.
+
+Two checks give that one answer. The first runs before the turn is admitted and measures the
+`session/prompt` frame with a one-character request id, the shortest the connection assigns, so
+it never refuses a frame that would fit. It serialises into a counting sink, so no second copy
+of an attachment is built; it is one extra serialization pass per turn. The second is the
+connection's own, on the frame it really queues, id included, and it catches the prompt the
+first let through because the id had grown. Together the budget is exact: a frame of exactly the
+outgoing budget is sent and one byte more is refused, whatever the id's width. A prompt refused
+by the second check had been admitted and is released again; the host is told nothing but the
+refusal. A prompt that fits is no longer at risk from what is queued beside it: the queue holds
+twice the frame budget (see [Transport](#transport)). A host that wants larger prompts can set
 `HostContextBuilder::outbound_buffer_bytes` without raising incoming or turn-event caps. This is
 host budgeting around the documented [v1 prompt frame](https://agentclientprotocol.com/protocol/v1/prompt-turn);
 it does not change the vendor wire, prompt capability checks, or per-attachment caps.
