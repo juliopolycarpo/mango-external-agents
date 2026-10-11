@@ -529,3 +529,48 @@ async fn an_expiry_cancel_is_not_sent_once_another_turn_is_running() {
         "expected (session/cancel frames written, the running turn told to stop, its questions parked): {expected:?} | received: {received:?}"
     );
 }
+
+/// A `session/update` whose tool call id is a number, which no schema this build knows reads.
+fn unreadable_update() -> String {
+    update_line(serde_json::json!({ "sessionUpdate": "tool_call", "toolCallId": 7 }))
+}
+
+/// Updates this client cannot read are skipped, not silent: the host is told once per turn, in
+/// words that carry nothing of the frame. They are not progress, so only the update that can be
+/// read restarts the idle deadline. The turn carries on and that update is reduced as usual.
+#[tokio::test]
+async fn unreadable_updates_are_announced_once_and_are_not_progress() {
+    let mut running = RunningTurn::start().await;
+    let before = *running.state.activity.borrow();
+    for _ in 0..3 {
+        running.agent.announce(unreadable_update());
+    }
+    running.agent.announce(running_call("call-0"));
+    until("the readable update reduced", || {
+        running.state.open_call_count() == 1
+    })
+    .await;
+
+    let mut notices = Vec::new();
+    while let Ok(event) = running.events.try_recv() {
+        if let EventKind::Notice {
+            severity, title, ..
+        } = event.kind
+        {
+            notices.push(format!("{severity:?}: {title}"));
+        }
+    }
+    let touches = running.state.activity.borrow().wrapping_sub(before);
+    let received = (touches, notices, running.outcome());
+    let expected = (
+        1,
+        vec![String::from(
+            "Warning: The agent sent an update this client could not read",
+        )],
+        String::from("no terminal"),
+    );
+    assert_eq!(
+        received, expected,
+        "expected (frames counted as progress, notices shown, the turn's outcome): {expected:?} | received: {received:?}"
+    );
+}

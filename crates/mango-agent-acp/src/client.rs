@@ -97,6 +97,8 @@ pub(crate) struct TurnHandle {
     /// task; resuming afterwards would put the rest of that frame's events *after* the terminal,
     /// which the core's conformance suite refuses. Checked before every emit.
     finished: Arc<AtomicBool>,
+    /// Set once this turn's host was told the agent sent an update that could not be read.
+    unreadable_update_noticed: Arc<AtomicBool>,
     /// Wakes the prompt owner when native cancellation starts.
     pub(crate) cancellation: mango_external_agents::CancelToken,
     /// A notification error belongs to this generation, never a later prompt.
@@ -589,6 +591,7 @@ impl SessionState {
             level,
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
             finished: Arc::new(AtomicBool::new(false)),
+            unreadable_update_noticed: Arc::new(AtomicBool::new(false)),
             cancellation: mango_external_agents::CancelToken::new(),
             cancel_failure: Arc::new(Mutex::new(None)),
             approvals: Arc::new(ApprovalEvents::default()),
@@ -1220,6 +1223,45 @@ async fn on_session_update(state: &Arc<SessionState>, notification: SessionNotif
     }
 }
 
+/// What a `session/update` this client cannot read still does: the turn's host is told once.
+///
+/// There is no request to answer, and one frame in a shape this build does not know is not the
+/// turn's end, so the frame itself is dropped, as the SDK this crate used to run on dropped it.
+/// Dropped silently, it left a host with an empty turn and nothing to say why, so the first one
+/// in a turn is announced as a warning notice, in this crate's own words and with nothing of
+/// the frame in it. Later ones in the same turn say nothing more.
+///
+/// It is not progress: an update kind no schema knows does not restart the idle deadline, any
+/// more than a notice does. A turn made only of such frames still ends at that deadline, and
+/// the notice is what tells the host why it was empty.
+///
+/// It does not go through the refused-event path: that one fails the turn, which is right for
+/// an event the core cannot publish and too much for a frame that was only skipped.
+///
+/// ```ignore
+/// on_unreadable_update(&state).await;
+/// ```
+async fn on_unreadable_update(state: &Arc<SessionState>) {
+    let Some(turn) = state.turn() else {
+        return;
+    };
+    if turn.is_finished() || turn.unreadable_update_noticed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(notice) = EventKind::notice(
+        mango_external_agents::NoticeSeverity::Warning,
+        "The agent sent an update this client could not read",
+        Some(
+            "Updates in a shape this client does not know are skipped. The turn continues without them.",
+        ),
+    ) else {
+        return;
+    };
+    if let Err(error) = turn.sink.emit(notice).await {
+        report_refused_event(state, &turn, &error).await;
+    }
+}
+
 /// Fails the turn when the core refused to publish one of its events, so the host is told.
 ///
 /// Only a value the core cannot make safe (an agent's call id that is blank or longer than the
@@ -1459,9 +1501,8 @@ impl PeerHandler for AcpHandler {
         if method != CLIENT_METHOD_NAMES.session_update {
             return;
         }
-        // A `session/update` this client cannot read is dropped like a notification it does not
-        // know: there is no request to answer, and one unreadable frame is not the turn's end.
         let Ok(notification) = serde_json::from_value::<SessionNotification>(params) else {
+            on_unreadable_update(&self.state).await;
             return;
         };
         on_session_update(&self.state, notification).await;
