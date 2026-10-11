@@ -209,10 +209,19 @@ which includes a stdio line whose bytes were not UTF-8, since the line reader re
 and hands the line on. What the transport cannot hand over is not answered, because the read fails
 and the connection ends: a line or websocket message past `max_line_bytes`, and a websocket text
 frame that is not UTF-8. `with_invalid_request_replies(max_queued)` answers JSON that is not a
-request with `-32600` and a null id, under a bound of its own and beside the queue's bounds in the
-same way: a line that is a number, a string, `true`, `false` or `null`, and, where batches are
-read, an empty batch and each member of a batch that is not an object, each reply a frame of its own. An array on a client that
-does not read batches is not answered, and neither is an object, whatever it holds.
+request with `-32600`, under a bound of its own and beside the queue's bounds in the same way,
+each reply a frame of its own. Answered under a null id: a line that is a number, a string,
+`true`, `false` or `null`; where batches are read, an empty batch and each member of a batch that
+is not an object; where they are not, a line that is an array, once. Answered under its own id
+when that is a string or a number, and under null otherwise: an object with neither `result` nor
+`error` whose `method` is missing or not a string, or whose `id` is something an id cannot be.
+Never answered: an object with `result` or `error`, which is a response, this side's own replies
+among them, so two peers that answer invalid requests cannot loop; an object with only an id that
+could name a call, which is read as that call's response as before; and a request or notification
+with a `method` that is a string, whatever its `params` or `jsonrpc` say. One batch is answered
+for at most `max_queued` of its members, and a batch refused whole is answered for none. Without
+the option every object is routed exactly as before: `{"id":4,"method":5}` is the response to
+call `4`, and `{"method":"x","id":{}}` is put to the handler.
 `with_cancel_on_abandon(method)` queues a notification
 `method` with `{"requestId": id}` when a request that was written is given up, by its future or
 `Reply` being dropped or its deadline running out; not for a request that never began to be

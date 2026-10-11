@@ -305,34 +305,45 @@ impl WireOptions {
     }
 
     /// Answers JSON that is not a request with a JSON-RPC invalid-request error: code
-    /// `-32600`, "Invalid Request", `id` null.
+    /// `-32600`, "Invalid Request".
     ///
-    /// Off by default, where such input is dropped. On, what is answered is:
+    /// Off by default. What each input comes to, with this on and without it:
     ///
-    /// - a line that is JSON and neither an object nor an array: a number, a string, `true`,
-    ///   `false`, `null`;
-    /// - with [`with_batch_decoding`](Self::with_batch_decoding), an empty batch, and each
-    ///   member of a batch that is not an object, once for each such member. The other
-    ///   members are handled as they are without this.
+    /// | Input | With this on | Without it |
+    /// | --- | --- | --- |
+    /// | a number, a string, `true`, `false`, `null` | answered, `id` null | dropped |
+    /// | `[]`, with [`with_batch_decoding`](Self::with_batch_decoding) | answered once, `id` null | dropped |
+    /// | a member of a batch that is not an object | answered, `id` null; the other members are handled | passed over |
+    /// | an array, without [`with_batch_decoding`](Self::with_batch_decoding) | answered once, `id` null | dropped |
+    /// | an object with no `result` and no `error`, whose `method` is missing or not a string | answered | see below |
+    /// | an object with no `result` and no `error`, whose `id` is not a string, a number or null | answered, `id` null | see below |
+    /// | an object with only an `id` that is a string or a number | the response it always was, with no result | the same |
+    /// | an object with `result` or `error` | a response, never answered | the same |
+    /// | an object with a `method` that is a string and an `id` that can be one, or none | a request or a notification, whatever its `params` or `jsonrpc` say | the same |
+    /// | a line that is not JSON | [`with_parse_error_replies`](Self::with_parse_error_replies)'s to answer | the same |
     ///
-    /// What is not: an array on a client that does not read batches, which is a request this
-    /// client was not asked to read and not an invalid one, and stays dropped; an object,
-    /// whatever its members, which is routed as it always was; and a line that is not JSON,
-    /// which is a parse error and [`with_parse_error_replies`](Self::with_parse_error_replies)'s
-    /// to answer.
+    /// An object is answered under its own `id` when that is a string or a number, and under
+    /// null otherwise. So `{}`, `{"jsonrpc":"2.0"}`, `{"method":1}` and `{"id":null}` are
+    /// answered under null, `{"id":4,"method":5}` under `4`, and `{"method":"x","id":{}}`
+    /// under null. Without this option the first four are dropped, the fifth is read as the
+    /// response to call `4` with no result, and the last is put to the handler and answered
+    /// under `{}` as it came: a client that does not ask for these replies routes every
+    /// object exactly as it did before there were any.
+    ///
+    /// Every reply carries `error`, and an object with `error` is never answered: two peers
+    /// that both answer invalid requests cannot answer each other for ever.
     ///
     /// Each reply is a frame of its own, for the members of a batch as well: they are not
-    /// gathered into one array.
+    /// gathered into one array. The reply does not quote what it answers.
     ///
     /// At most `max_queued` such replies wait to be written at a time, and input that would
-    /// be answered while that many wait is dropped as before; `0` answers none. A batch is
-    /// read in one go, so one with more members to answer than `max_queued` gets that many
-    /// replies and no more, however fast the peer reads. Keep the bound small: it is looked
-    /// through for each thing answered once it is reached. The bound is
+    /// be answered while that many wait is dropped; `0` answers none. One batch is answered
+    /// for at most `max_queued` of its members, however fast the replies are written, and a
+    /// batch refused whole for passing the handoff budget is answered for none. The bound is
     /// this option's own, apart from the one on parse-error replies. The replies are held
     /// beside the bounds of the outbound queue and go through the queue, and a reply is a
     /// write, with what [`with_parse_error_replies`](Self::with_parse_error_replies) says
-    /// that costs with a peer that does not read. The reply does not quote what it answers.
+    /// that costs with a peer that does not read.
     ///
     /// # Example
     ///

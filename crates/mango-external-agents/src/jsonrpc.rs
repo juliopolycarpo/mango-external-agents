@@ -15,7 +15,7 @@
 
 mod outbox;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1239,6 +1239,72 @@ fn given_up(claim: &CallClaim) -> bool {
     claim.is_some() && !take_claim(claim)
 }
 
+/// The replies of one kind that this side sends unasked and that still wait to be written,
+/// oldest first, for the bound on how many may.
+///
+/// They are queued in this order and written in it by the one writer, and nobody takes one
+/// back, so the ones already written are always at the front. Letting those go is all the
+/// upkeep there is: the list never holds more than what still waits, plus what was written
+/// since the last reply was queued.
+#[derive(Default)]
+struct UnaskedReplies(StdMutex<VecDeque<Arc<outbox::FrameCtl>>>);
+
+impl UnaskedReplies {
+    /// Queues one more through `queue`, unless `limit` of them still wait to be written.
+    fn queue_within(&self, limit: usize, queue: impl FnOnce() -> Option<Arc<outbox::FrameCtl>>) {
+        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while waiting.front().is_some_and(|reply| !reply.queued()) {
+            waiting.pop_front();
+        }
+        if waiting.len() >= limit {
+            return;
+        }
+        if let Some(reply) = queue() {
+            waiting.push_back(reply);
+        }
+    }
+
+    /// How many the list holds, written or not.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+}
+
+/// The id an invalid request is answered under: the one it came with when that can name a
+/// request, and null otherwise.
+fn echoed_id(id: Option<&Value>) -> Value {
+    match id {
+        Some(id @ (Value::String(_) | Value::Number(_))) => id.clone(),
+        _ => Value::Null,
+    }
+}
+
+/// Whether `frame` is an object that JSON-RPC 2.0 owes an invalid-request error, and the id
+/// to answer it under if so.
+///
+/// It is one that is not a response and cannot be a request: it has neither `result` nor
+/// `error`, and its `method` is missing or not a string, or its `id` is something an id
+/// cannot be. One exception is kept from before there was any such answer: an object with
+/// nothing but an id that could name a call is read as that call's response with no result.
+///
+/// Every reply this side sends for it carries `error`, so two peers that both answer invalid
+/// requests cannot answer each other for ever.
+fn invalid_request(frame: &Map<String, Value>) -> Option<Value> {
+    if frame.contains_key("result") || frame.contains_key("error") {
+        return None;
+    }
+    let id = frame.get("id");
+    let invalid = match frame.get("method") {
+        Some(Value::String(_)) => {
+            id.is_some_and(|id| !matches!(id, Value::String(_) | Value::Number(_) | Value::Null))
+        }
+        Some(_) => true,
+        None => !matches!(id, Some(Value::String(_) | Value::Number(_))),
+    };
+    invalid.then(|| echoed_id(id))
+}
+
 /// Drops the entries nobody waits on any more and counts those that hold a place in the budget.
 fn counted_pending(pending: &mut HashMap<String, PendingAnswer>) -> usize {
     let mut counted = 0;
@@ -1367,9 +1433,9 @@ struct ClientState {
     /// The pump ends the connection later, on its own task.
     link_poisoned: AtomicBool,
     /// The parse-error replies still waiting to be written, for the bound on them.
-    parse_error_replies: StdMutex<Vec<Arc<outbox::FrameCtl>>>,
+    parse_error_replies: UnaskedReplies,
     /// The invalid-request replies still waiting to be written, for the bound on those.
-    invalid_request_replies: StdMutex<Vec<Arc<outbox::FrameCtl>>>,
+    invalid_request_replies: UnaskedReplies,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
     /// The questions handed over with a [`Responder`] and not yet answered: one permit each,
@@ -2167,8 +2233,8 @@ impl Client {
             write_failed: Notify::new(),
             ended: StdMutex::new(None),
             link_poisoned: AtomicBool::new(false),
-            parse_error_replies: StdMutex::new(Vec::new()),
-            invalid_request_replies: StdMutex::new(Vec::new()),
+            parse_error_replies: UnaskedReplies::default(),
+            invalid_request_replies: UnaskedReplies::default(),
             in_flight: StdMutex::new(JoinSet::new()),
             handoff_slots,
             notifications: StdMutex::new(None),
@@ -3694,61 +3760,59 @@ impl ClientState {
     /// fewer such answers than its bound are still waiting to be written.
     fn answer_unparseable(&self) {
         if let Some(limit) = self.outbox.wire().parse_error_replies() {
-            self.answer_unasked(limit, &self.parse_error_replies, -32700, "Parse error");
+            let replies = &self.parse_error_replies;
+            self.answer_unasked(limit, replies, Value::Null, -32700, "Parse error");
         }
     }
 
-    /// Answers JSON that was not a request with an invalid-request error, if this client was
-    /// asked to and fewer such answers than its bound are still waiting to be written.
-    fn answer_invalid_request(&self) {
+    /// The id to answer `frame` under, if it is an object owed an invalid-request error and
+    /// this client was asked to answer those. See [`invalid_request`].
+    fn invalid_request(&self, frame: &Map<String, Value>) -> Option<Value> {
+        self.outbox.wire().invalid_request_replies()?;
+        invalid_request(frame)
+    }
+
+    /// Answers JSON that was not a request with an invalid-request error under `id`, if this
+    /// client was asked to and fewer such answers than its bound are still waiting to be
+    /// written.
+    fn answer_invalid_request(&self, id: Value) {
         if let Some(limit) = self.outbox.wire().invalid_request_replies() {
-            self.answer_unasked(
-                limit,
-                &self.invalid_request_replies,
-                -32600,
-                "Invalid Request",
-            );
+            let replies = &self.invalid_request_replies;
+            self.answer_unasked(limit, replies, id, -32600, "Invalid Request");
         }
     }
 
-    /// Queues an error with a null id for input that named no request to answer, unless
-    /// `limit` such errors of its kind are still `waiting` to be written.
+    /// Queues an error for input that was not a request this side could put to its handler,
+    /// unless `limit` such errors of its kind still wait to be written.
     fn answer_unasked(
         &self,
         limit: usize,
-        waiting: &StdMutex<Vec<Arc<outbox::FrameCtl>>>,
+        replies: &UnaskedReplies,
+        id: Value,
         code: i32,
         message: &str,
     ) {
         if self.closed.load(Ordering::Acquire) || self.link_poisoned.load(Ordering::Acquire) {
             return;
         }
-        let mut waiting = waiting.lock().unwrap_or_else(PoisonError::into_inner);
-        if waiting.len() >= limit {
-            // Looked through only when it matters: the ones written since are let go.
-            waiting.retain(|reply| reply.queued());
-        }
-        if waiting.len() >= limit {
-            return;
-        }
-        let mut frame = Map::new();
-        if self.options.include_version_header {
-            frame.insert(String::from("jsonrpc"), json!("2.0"));
-        }
-        frame.insert(String::from("id"), Value::Null);
-        frame.insert(
-            String::from("error"),
-            json!({ "code": code, "message": message }),
-        );
-        let deadline = deadline_after(self.options.request_timeout);
-        // Beside the queue's bounds, being bounded here: the peer's noise takes none of the
-        // room they leave this side's own frames.
-        if let Ok(ticket) = self
-            .outbox
-            .enqueue_aside(Value::Object(frame).to_string(), deadline)
-        {
-            waiting.push(ticket.ctl);
-        }
+        replies.queue_within(limit, || {
+            let mut frame = Map::new();
+            if self.options.include_version_header {
+                frame.insert(String::from("jsonrpc"), json!("2.0"));
+            }
+            frame.insert(String::from("id"), id);
+            frame.insert(
+                String::from("error"),
+                json!({ "code": code, "message": message }),
+            );
+            let deadline = deadline_after(self.options.request_timeout);
+            // Beside the queue's bounds, being bounded here: the peer's noise takes none of
+            // the room they leave this side's own frames.
+            self.outbox
+                .enqueue_aside(Value::Object(frame).to_string(), deadline)
+                .ok()
+                .map(|ticket| ticket.ctl)
+        });
     }
 
     /// What a call still waiting is failed with when the peer overran the handoff queue.
@@ -4113,11 +4177,10 @@ async fn dispatch(
         Ok(Value::Array(members)) if state.outbox.wire().decodes_batches() => {
             return dispatch_batch(state, notifications, members, message.len()).await;
         }
-        // A batch, to a client that was not asked to read batches: not read, and not an
-        // invalid request either.
-        Ok(Value::Array(_)) => return Ok(()),
+        // A batch to a client that was not asked to read batches, or JSON that is no frame
+        // at all: neither is a request this side can put to its handler.
         Ok(_) => {
-            state.answer_invalid_request();
+            state.answer_invalid_request(Value::Null);
             return Ok(());
         }
         Err(_) => {
@@ -4128,6 +4191,10 @@ async fn dispatch(
             return Ok(());
         }
     };
+    if let Some(id) = state.invalid_request(&frame) {
+        state.answer_invalid_request(id);
+        return Ok(());
+    }
     dispatch_frame(state, notifications, frame, PeerBytes::Line(message.len())).await
 }
 
@@ -4172,9 +4239,19 @@ async fn dispatch_batch(
     bytes: usize,
 ) -> std::result::Result<(), PeerTermination> {
     if members.is_empty() {
-        state.answer_invalid_request();
+        state.answer_invalid_request(Value::Null);
         return Ok(());
     }
+    // A batch is answered for at most as many of its members as may wait at once. Counted
+    // here, for the batch: what waits is written by another task, so the count of what still
+    // waits can fall while this one line is read, and would bound nothing.
+    let mut owed = state.outbox.wire().invalid_request_replies().unwrap_or(0);
+    let mut answer_invalid = |id: Value| {
+        if owed > 0 {
+            owed -= 1;
+            state.answer_invalid_request(id);
+        }
+    };
     let mut work = members.iter().filter(|member| is_peer_work(member)).count();
     let mut held = None;
     if work > 0 {
@@ -4188,7 +4265,7 @@ async fn dispatch_batch(
     let share = bytes.checked_div(work).unwrap_or(0);
     for member in members {
         let Value::Object(frame) = member else {
-            state.answer_invalid_request();
+            answer_invalid(Value::Null);
             continue;
         };
         let mine = if frame.get("method").is_some_and(Value::is_string) {
@@ -4200,6 +4277,12 @@ async fn dispatch_batch(
         } else {
             None
         };
+        if let Some(id) = state.invalid_request(&frame) {
+            // Its share of the bytes, if it was counted for one, goes back as it is let go.
+            drop(mine);
+            answer_invalid(id);
+            continue;
+        }
         // A response holds nothing of the byte budget.
         let bytes = mine.map_or(PeerBytes::Line(0), PeerBytes::Share);
         dispatch_frame(state, notifications, frame, bytes).await?;

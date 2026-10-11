@@ -1,6 +1,8 @@
 //! JSON that is not a request, answered with `-32600` only by a client that was asked to.
 
-use super::outbox_tests::{gated, limits, link_held, options, outbox_holds, sent, until, within};
+use super::outbox_tests::{
+    gated, limits, link_held, one_termination, options, outbox_holds, sent, until, within,
+};
 use super::*;
 use crate::jsonrpc::WireOptions;
 
@@ -21,10 +23,11 @@ fn notification(method: &str) -> String {
     json!({ "jsonrpc": "2.0", "method": method, "params": {} }).to_string()
 }
 
-fn invalid_request() -> Value {
+/// The invalid-request error, under `id`.
+fn invalid_request(id: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
-        "id": null,
+        "id": id,
         "error": { "code": -32600, "message": "Invalid Request" },
     })
 }
@@ -40,45 +43,112 @@ fn methods_seen(handled: &[(String, Value)]) -> Vec<&str> {
     handled.iter().map(|(method, _)| method.as_str()).collect()
 }
 
-/// Writes a probe and says what is on the wire with it: the methods written (`?` for a frame
-/// that has none), what is still queued beside the bounds, and whether the client closed. A
-/// reply queued and not yet written would go out ahead of the probe.
-async fn nothing_but_a_probe(link: &ScriptedLink, client: &Client) -> (Vec<String>, usize, bool) {
+/// Writes a probe and says what is on the wire with it: every frame written, what is still
+/// queued beside the bounds, and whether the client closed. A reply queued and not yet
+/// written would go out ahead of the probe.
+async fn up_to_a_probe(link: &ScriptedLink, client: &Client) -> (Vec<Value>, usize, bool) {
     within("the probe", client.notify("probe", json!({})))
         .await
         .expect("expected the probe written");
-    let written = frames(link)
-        .iter()
-        .map(|frame| frame["method"].as_str().unwrap_or("?").to_owned())
-        .collect();
-    (written, client.state.outbox.aside(), client.is_closed())
+    (
+        frames(link),
+        client.state.outbox.aside(),
+        client.is_closed(),
+    )
 }
 
-/// The lines a client that answers invalid requests owes an answer: JSON that is neither an
-/// object nor an array.
-const NOT_REQUESTS: [&str; 5] = ["5", "\"text\"", "true", "false", "null"];
+fn probe() -> Value {
+    json!({ "jsonrpc": "2.0", "method": "probe", "params": {} })
+}
 
-/// A client that was not asked answers none of it: JSON that is not a request is dropped, as
-/// it always was, in a batch or on a line of its own, and the connection goes on.
+/// Every option that has this side write something the peer did not ask for.
+fn every_reply() -> WireOptions {
+    WireOptions::new()
+        .with_batch_decoding()
+        .with_parse_error_replies(8)
+        .with_invalid_request_replies(8)
+}
+
+/// Lines that are JSON and neither an object nor an array.
+const SCALARS: [&str; 5] = ["5", "\"text\"", "true", "false", "null"];
+
+/// Objects that cannot be requests and are not responses, with the id each is answered under
+/// by a client that answers invalid requests.
+fn invalid_objects() -> Vec<(Value, Value)> {
+    vec![
+        (json!({}), Value::Null),
+        (json!({ "jsonrpc": "2.0" }), Value::Null),
+        (json!({ "method": 1 }), Value::Null),
+        (json!({ "id": 4, "method": 5 }), json!(4)),
+        (json!({ "id": "a", "method": null }), json!("a")),
+        (json!({ "method": "x", "id": {} }), Value::Null),
+        (json!({ "method": "x", "id": true }), Value::Null),
+        (json!({ "id": null }), Value::Null),
+        (json!({ "id": [1] }), Value::Null),
+    ]
+}
+
+/// A client that was not asked answers none of it, and routes every object as it always did.
+/// What is not a frame is dropped. An object with a method that is a string is put to the
+/// handler whatever its id is, and answered under that id as it came; an object with an id
+/// and no method that is a string is read as a response, here to nobody.
 #[tokio::test]
-async fn json_that_is_not_a_request_is_dropped_by_a_client_that_was_not_asked_to_answer() {
+async fn a_client_that_was_not_asked_answers_nothing_and_routes_objects_as_before() {
     let (link, handler, client) = connect(WireOptions::new().with_batch_decoding());
-    for line in NOT_REQUESTS {
+    for line in SCALARS {
         link.push_line(line);
     }
     link.push_line("[]");
+    link.push_line("[[]]");
     link.push_line(json!([7, "text"]).to_string());
+    for (object, _) in invalid_objects() {
+        link.push_line(object.to_string());
+    }
     link.push_line(notification("after"));
 
     let handled = handler.wait_for_notifications(1).await;
-    let observed = (
-        methods_seen(&handled),
-        nothing_but_a_probe(&link, &client).await,
+    // The two objects with a method that is a string are questions to this client.
+    sent(&link, 2).await;
+    let observed = (methods_seen(&handled), up_to_a_probe(&link, &client).await);
+    let expected = (
+        vec!["after"],
+        (
+            vec![
+                json!({ "jsonrpc": "2.0", "id": {}, "result": "yes" }),
+                json!({ "jsonrpc": "2.0", "id": true, "result": "yes" }),
+                probe(),
+            ],
+            0,
+            false,
+        ),
     );
     assert_eq!(
+        observed, expected,
+        "expected no invalid-request error, and the two questions answered under the ids they came with: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// The same client reads an object with an id and a method that is not a string as the
+/// response to the call that id names, with no result, as it always has.
+#[tokio::test]
+async fn a_client_that_was_not_asked_reads_an_id_with_a_bad_method_as_a_response() {
+    let (link, _handler, client) = connect(WireOptions::new());
+    let (written, reply) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    link.push_line(json!({ "id": "1", "method": 5 }).to_string());
+
+    let answer = within("the reply", reply).await;
+    let observed = (answer.ok(), link.sent().len());
+    assert_eq!(
         observed,
-        (vec!["after"], (vec![String::from("probe")], 0, false)),
-        "expected nothing written or queued and the next frame handled: ([\"after\"], ([\"probe\"], 0, false)) | received {observed:?}"
+        (Some(Value::Null), 1),
+        "expected the call answered with no result and nothing written for it: (Some(Null), 1) | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -88,16 +158,16 @@ async fn json_that_is_not_a_request_is_dropped_by_a_client_that_was_not_asked_to
 #[tokio::test]
 async fn a_line_that_is_json_and_not_a_request_is_answered_as_an_invalid_request() {
     let (link, handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
-    for line in NOT_REQUESTS {
+    for line in SCALARS {
         link.push_line(line);
     }
     link.push_line(notification("after"));
 
     let handled = handler.wait_for_notifications(1).await;
-    sent(&link, NOT_REQUESTS.len()).await;
+    sent(&link, SCALARS.len()).await;
     let observed = (frames(&link), methods_seen(&handled), client.is_closed());
     let expected = (
-        vec![invalid_request(); NOT_REQUESTS.len()],
+        vec![invalid_request(Value::Null); SCALARS.len()],
         vec!["after"],
         false,
     );
@@ -137,7 +207,8 @@ async fn an_invalid_request_is_answered_in_the_dialect_of_the_connection() {
 }
 
 /// With batches read, an empty batch is answered once, and so is each member of a batch that
-/// is not an object. The members that are frames are handled as they are without the option.
+/// is not an object, a batch inside the batch included. The members that are frames are
+/// handled as they are without the option.
 #[tokio::test]
 async fn an_empty_batch_and_each_member_that_is_not_an_object_are_answered() {
     let (link, handler, client) = connect(
@@ -146,6 +217,7 @@ async fn an_empty_batch_and_each_member_that_is_not_an_object_are_answered() {
             .with_invalid_request_replies(8),
     );
     link.push_line("[]");
+    link.push_line("[[]]");
     link.push_line(
         json!([
             { "jsonrpc": "2.0", "method": "one", "params": {} },
@@ -157,39 +229,169 @@ async fn an_empty_batch_and_each_member_that_is_not_an_object_are_answered() {
     );
 
     let handled = handler.wait_for_notifications(2).await;
-    sent(&link, 3).await;
+    sent(&link, 4).await;
     let observed = (frames(&link), methods_seen(&handled));
-    let expected = (vec![invalid_request(); 3], vec!["one", "two"]);
+    let expected = (vec![invalid_request(Value::Null); 4], vec!["one", "two"]);
     assert_eq!(
         observed, expected,
-        "expected one error for the empty batch and one for each member that is not an object, the frames handled in order: {expected:?} | received {observed:?}"
+        "expected one error for the empty batch, one for the batch of an empty batch, and one for each member that is not an object, the frames handled in order: {expected:?} | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
 
-/// An array to a client that does not read batches is a request it was not asked to read, not
-/// an invalid one, and an object is routed as it always was whatever it holds. Neither is
-/// answered, and neither is a line that is not JSON: that is a parse error, which this client
-/// was not asked to answer.
+/// A client that does not read batches cannot put one to its handler. Asked to answer invalid
+/// requests, it answers the whole line once, under a null id, empty or not.
 #[tokio::test]
-async fn what_is_not_an_invalid_request_is_not_answered_as_one() {
+async fn a_batch_to_a_client_that_reads_none_is_answered_once() {
     let (link, handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
     link.push_line("[]");
-    link.push_line(json!([notification("in a batch")]).to_string());
-    link.push_line("{}");
-    link.push_line(json!({ "jsonrpc": "2.0", "id": 4, "method": 5 }).to_string());
-    link.push_line("{oops");
+    link.push_line(json!([notification("in a batch"), 5, 6]).to_string());
     link.push_line(notification("after"));
 
     let handled = handler.wait_for_notifications(1).await;
-    let observed = (
-        methods_seen(&handled),
-        nothing_but_a_probe(&link, &client).await,
+    sent(&link, 2).await;
+    let observed = (methods_seen(&handled), up_to_a_probe(&link, &client).await);
+    let expected = (
+        vec!["after"],
+        (
+            vec![
+                invalid_request(Value::Null),
+                invalid_request(Value::Null),
+                probe(),
+            ],
+            0,
+            false,
+        ),
     );
     assert_eq!(
-        observed,
-        (vec!["after"], (vec![String::from("probe")], 0, false)),
-        "expected none of it answered and the next frame handled: ([\"after\"], ([\"probe\"], 0, false)) | received {observed:?}"
+        observed, expected,
+        "expected one error for each line that was a batch, and none of its members handled: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// An object that is not a response and cannot be a request is answered: under its own id
+/// when that is a string or a number, under null otherwise. None of them reaches the handler,
+/// on a line of its own or in a batch.
+#[tokio::test]
+async fn an_object_that_cannot_be_a_request_is_answered_under_the_id_it_can_name() {
+    for batched in [false, true] {
+        let (link, handler, client) = connect(
+            WireOptions::new()
+                .with_batch_decoding()
+                .with_invalid_request_replies(16),
+        );
+        let objects = invalid_objects();
+        if batched {
+            let members: Vec<Value> = objects.iter().map(|(object, _)| object.clone()).collect();
+            link.push_line(Value::Array(members).to_string());
+        } else {
+            for (object, _) in &objects {
+                link.push_line(object.to_string());
+            }
+        }
+        link.push_line(notification("after"));
+
+        let handled = handler.wait_for_notifications(1).await;
+        sent(&link, objects.len()).await;
+        let mut expected: Vec<Value> = objects
+            .into_iter()
+            .map(|(_, id)| invalid_request(id))
+            .collect();
+        expected.push(probe());
+        let observed = (methods_seen(&handled), up_to_a_probe(&link, &client).await);
+        let expected = (vec!["after"], (expected, 0, false));
+        assert_eq!(
+            observed, expected,
+            "expected each object answered under the id it can name and none put to the handler (batched: {batched}): {expected:?} | received {observed:?}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+}
+
+/// An object with the id of a call in flight and a method that is not a string is answered as
+/// an invalid request, where a client that was not asked takes it for the call's response.
+/// The call goes on waiting, and the response that follows reaches it.
+#[tokio::test]
+async fn an_invalid_request_with_the_id_of_a_call_in_flight_does_not_answer_the_call() {
+    let (link, _handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
+    let (written, reply) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    link.push_line(json!({ "id": "1", "method": 5 }).to_string());
+    sent(&link, 2).await;
+    let still_waiting = client.state.pending.lock().await.len();
+    link.push_line(json!({ "jsonrpc": "2.0", "id": "1", "result": "real" }).to_string());
+
+    let answer = within("the reply", reply).await;
+    let observed = (still_waiting, answer.ok(), frames(&link).pop());
+    let expected = (1, Some(json!("real")), Some(invalid_request(json!("1"))));
+    assert_eq!(
+        observed, expected,
+        "expected the call still waiting after the invalid request, then answered by the response, and the error under the id it came with: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// What is a response, or a request read leniently, is never answered as invalid, with every
+/// option on that has this side answer unasked. That includes this side's own replies fed
+/// back to it: each carries `error`, so two peers that answer invalid requests cannot answer
+/// each other for ever.
+#[tokio::test]
+async fn what_is_a_response_or_a_lenient_request_is_never_answered_as_invalid() {
+    let (link, handler, client) = connect(every_reply());
+    let (written, reply) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    // A response to nobody, a response with both members, and this side's own two replies.
+    link.push_line(json!({ "result": 1 }).to_string());
+    link.push_line(json!({ "id": 99, "result": 1 }).to_string());
+    link.push_line(
+        json!({ "id": 9, "result": 1, "error": { "code": 1, "message": "m" } }).to_string(),
+    );
+    link.push_line(invalid_request(Value::Null).to_string());
+    link.push_line(invalid_request(json!(4)).to_string());
+    link.push_line(
+        json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "Parse error" } })
+            .to_string(),
+    );
+    // Read leniently, as before: params that are not structured, and another version.
+    link.push_line(json!({ "method": "lenient params", "params": 1 }).to_string());
+    link.push_line(json!({ "jsonrpc": "1.0", "method": "other version" }).to_string());
+    // An id alone is the response it always was: the call in flight gets no result.
+    link.push_line(json!({ "id": "1" }).to_string());
+    link.push_line(notification("after"));
+
+    let answer = within("the reply", reply).await;
+    let handled = handler.wait_for_notifications(3).await;
+    let (written, queued, closed) = up_to_a_probe(&link, &client).await;
+    let observed = (
+        answer.ok(),
+        methods_seen(&handled),
+        written.len(),
+        written.last().cloned(),
+        queued,
+        closed,
+    );
+    let expected = (
+        Some(Value::Null),
+        vec!["lenient params", "other version", "after"],
+        2,
+        Some(probe()),
+        0,
+        false,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the call answered by the bare id, both lenient requests handled, and nothing written but the request and the probe: {expected:?} | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -303,32 +505,21 @@ async fn invalid_request_replies_take_none_of_the_room_the_queue_leaves_the_host
 async fn a_write_made_on_an_idle_link_follows_an_invalid_request_reply_still_queued() {
     let (link, _handler, client) = connect(WireOptions::new().with_invalid_request_replies(4));
     // Queued from here, so nothing has run between this and the write that follows.
-    client.state.answer_invalid_request();
-    within("the host's notification", client.notify("mine", json!({})))
-        .await
-        .expect("expected the notification written");
-
-    let written: Vec<String> = frames(&link)
-        .iter()
-        .map(|frame| {
-            frame["method"]
-                .as_str()
-                .map_or_else(|| frame["error"]["code"].to_string(), str::to_owned)
-        })
-        .collect();
+    client.state.answer_invalid_request(Value::Null);
+    let (written, _, _) = up_to_a_probe(&link, &client).await;
+    let expected = vec![invalid_request(Value::Null), probe()];
     assert_eq!(
-        written,
-        vec!["-32600", "mine"],
-        "expected the error ahead of the host's notification: [\"-32600\", \"mine\"] | received {written:?}"
+        written, expected,
+        "expected the error ahead of the host's notification: {expected:?} | received {written:?}"
     );
     client.close().await.expect("expected a clean close");
 }
 
 /// A bound of nothing answers nothing, and a batch with more members to answer than the bound
-/// allows gets as many answers as the bound and no more: a batch is read in one go.
+/// allows gets as many answers as the bound and no more.
 #[tokio::test]
 async fn the_bound_holds_at_nothing_and_inside_one_batch() {
-    for (bound, answered) in [(0, 0), (2, 2)] {
+    for bound in [0, 2] {
         let (link, handler, client) = connect(
             WireOptions::new()
                 .with_batch_decoding()
@@ -338,13 +529,144 @@ async fn the_bound_holds_at_nothing_and_inside_one_batch() {
         link.push_line(notification("after"));
         handler.wait_for_notifications(1).await;
 
-        let (written, queued, closed) = nothing_but_a_probe(&link, &client).await;
+        let (written, queued, closed) = up_to_a_probe(&link, &client).await;
         let observed = (written.len() - 1, queued, closed);
-        let expected = (answered, 0, false);
+        let expected = (bound, 0, false);
         assert_eq!(
             observed, expected,
             "expected a bound of {bound} to answer that many of the batch's three members and no more: {expected:?} | received {observed:?} ({written:?})"
         );
         client.close().await.expect("expected a clean close");
     }
+}
+
+/// The bound on one batch does not depend on how fast its answers are written. On four
+/// threads, with a peer that reads at once, the writer takes each answer as it is queued, so
+/// the count of what still waits never reaches the bound; the batch is answered for as many
+/// members as the bound all the same, round after round, and not for the hundreds it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_is_answered_for_no_more_members_than_the_bound_however_fast_it_is_written() {
+    const ROUNDS: usize = 40;
+    const MEMBERS: usize = 400;
+    let (link, handler, client) = connect(
+        WireOptions::new()
+            .with_batch_decoding()
+            .with_invalid_request_replies(2),
+    );
+    let mut members = vec![json!(1); MEMBERS / 2];
+    members.extend(vec![json!({ "method": 1 }); MEMBERS / 2]);
+    let batch = Value::Array(members).to_string();
+    for round in 1..=ROUNDS {
+        link.push_line(batch.clone());
+        link.push_line(notification("after"));
+        handler.wait_for_notifications(round).await;
+        until("the answers to be written", || {
+            client.state.outbox.aside() == 0
+        })
+        .await;
+    }
+
+    let (written, queued, closed) = up_to_a_probe(&link, &client).await;
+    let observed = (written.len() - 1, queued, closed);
+    let expected = (2 * ROUNDS, 0, false);
+    assert_eq!(
+        observed, expected,
+        "expected two answers for each of the {ROUNDS} batches of {MEMBERS} members: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// What the bound is kept on does not grow with the connection. After a long run of inputs
+/// each answered and written before the next, the list of replies holds no more than the last
+/// one, for parse errors and for invalid requests alike, however large the bound.
+#[tokio::test]
+async fn the_replies_kept_for_the_bound_do_not_grow_with_what_was_answered() {
+    let (link, _handler, client) = connect(
+        WireOptions::new()
+            .with_parse_error_replies(10_000)
+            .with_invalid_request_replies(10_000),
+    );
+    let mut most = (0, 0);
+    for round in 1..=100 {
+        link.push_line("5");
+        link.push_line("{oops");
+        sent(&link, 2 * round).await;
+        let held = (
+            client.state.invalid_request_replies.held(),
+            client.state.parse_error_replies.held(),
+        );
+        most = (most.0.max(held.0), most.1.max(held.1));
+    }
+
+    assert!(
+        most.0 <= 1 && most.1 <= 1,
+        "expected no more than the last reply of each kind kept after 100 of each were written: (at most 1, at most 1) | received {most:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A batch refused whole, for passing the handoff budget, is not answered for the members it
+/// holds that are not objects: nothing of such a batch is handled, and the connection ends.
+#[tokio::test]
+async fn a_batch_refused_whole_is_not_answered_for_its_invalid_members() {
+    let link = ScriptedLink::new();
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect_with(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options().with_max_pending_notifications(2),
+        WireOptions::new()
+            .with_batch_decoding()
+            .with_invalid_request_replies(8),
+    );
+    let mut members = vec![json!(5), json!({ "method": 1 })];
+    members.extend((0..3).map(|n| json!({ "jsonrpc": "2.0", "method": format!("n{n}") })));
+    link.push_line(Value::Array(members).to_string());
+
+    let termination = one_termination(&handler).await;
+    let observed = (&termination, link.sent().len(), client.state.outbox.aside());
+    assert!(
+        matches!(
+            &observed,
+            (
+                PeerTermination::NotificationBackpressure {
+                    limit: 2,
+                    received: 3,
+                    ..
+                },
+                0,
+                0
+            )
+        ),
+        "expected the batch refused for its three notifications, with nothing written or queued for its other members: (NotificationBackpressure {{ limit: 2, received: 3 }}, 0, 0) | received {observed:?}"
+    );
+    let _ = client.close().await;
+}
+
+/// What turning the answers on costs, as for parse errors: an answer is a write, and a peer
+/// that sends invalid requests while it does not read leaves that write waiting. When its
+/// deadline runs out the connection ends.
+#[tokio::test(start_paused = true)]
+async fn an_invalid_request_reply_the_peer_never_reads_ends_the_connection_at_the_write_deadline() {
+    let script = ScriptedLink::new();
+    let (sender, receiver) = script.clone().into_link().split();
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect_with(
+        crate::link::Link::new(Box::new(StalledReplies { inner: sender }), receiver),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options().with_request_timeout(Duration::from_millis(50)),
+        WireOptions::new().with_invalid_request_replies(4),
+    );
+    let began = tokio::time::Instant::now();
+    script.push_line("5");
+
+    let termination = one_termination(&handler).await;
+    let observed = (began.elapsed(), &termination);
+    assert!(
+        matches!(observed, (waited, PeerTermination::LinkFailed(_))
+            if waited >= Duration::from_millis(50) && waited < Duration::from_millis(100)),
+        "expected the connection ended by the stalled write at its deadline, not before: (50ms or just after, LinkFailed) | received {observed:?}"
+    );
+    // The link is unusable by now; what the close makes of that is not this test's subject.
+    let _ = client.close().await;
 }

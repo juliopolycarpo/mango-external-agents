@@ -297,13 +297,7 @@ async fn parse_error_replies_are_bounded_by_how_many_wait_to_be_written() {
     }
     gated.link.push_line(notification("after").to_string());
     gated.handler.wait_for_notifications(1).await;
-    let waiting = gated
-        .client
-        .state
-        .parse_error_replies
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .len();
+    let waiting = gated.client.state.parse_error_replies.held();
     assert_eq!(
         waiting, 2,
         "expected two parse errors waiting to be written, the other three dropped: 2 | received {waiting}"
