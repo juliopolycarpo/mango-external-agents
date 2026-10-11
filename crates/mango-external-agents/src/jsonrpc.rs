@@ -1040,14 +1040,6 @@ impl RequestOptions {
 }
 
 tokio::task_local! {
-    /// The client whose `on_request_handoff` the current task is inside, as its state's
-    /// address. A hand-off is awaited by the same task that awaits a notification call, so an
-    /// ordered answer asked for from inside it would wait for it too. It is also scoped with
-    /// [`HANDLING_NOTIFICATION_FOR`], which is what a [`CancellationHold`] is taken in.
-    static HANDING_OFF_FOR: usize;
-}
-
-tokio::task_local! {
     /// The client whose `on_notification` or `on_request_handoff` the current task is inside,
     /// as its state's address: the two calls the handler's task awaits.
     ///
@@ -3935,9 +3927,6 @@ impl ClientState {
     /// a call that task is awaiting: a notification, or a question being handed over.
     fn on_own_worker(&self) -> bool {
         self.handling_own_notification()
-            || HANDING_OFF_FOR
-                .try_with(|client| *client == self.address())
-                .unwrap_or(false)
     }
 
     /// Whether the caller is inside this client's `on_notification`, on the task that awaits it.
@@ -4345,15 +4334,6 @@ async fn pump(
             // A transport failure, refused reply or abandoned send can leave the read side open.
             // End the connection here, on the one task that owns termination.
             () = state.write_failed.notified() => {
-                // A close already on record owns this end. A write that failed in the moment
-                // between that record and the closed flag going up was let through by the
-                // flag; it is not a failure to tell the handler of, under a client whose
-                // host is closing it and says so through `Client::ended`.
-                if matches!(state.ended(), Some(ConnectionEnd::Closed)) {
-                    #[cfg(test)]
-                    ClientState::run_hook(&state.after_write_failure_ignored);
-                    break;
-                }
                 let overflow = state
                     .outbound_overflow
                     .lock()
@@ -4455,15 +4435,6 @@ async fn link_failed(
             data: None,
         },
     );
-    // Decided on the record, not on a look taken before it: a close that put its own end on
-    // record first owns this one. It fails the calls and stops the handler's task itself, and
-    // the handler is not told of an end its host caused, so a failure that lands here a moment
-    // after the look the reader took, but before this record, is let go the same way.
-    if matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
-        #[cfg(test)]
-        ClientState::run_hook(&state.after_write_failure_ignored);
-        return;
-    }
     let termination = failure.termination(termination);
     connection_failed(state, handler, notifications, termination, failure).await;
 }
@@ -4476,6 +4447,16 @@ async fn connection_failed(
     termination: PeerTermination,
     failure: Failed,
 ) {
+    // Decided on the record, not on a look taken before it: a close that put its own end on
+    // record first owns this one, whichever of the failures that end connections reaches here
+    // a moment after it. The close fails the calls and stops the handler's task itself, and the
+    // handler is not told of an end its host caused, under a client whose host says so through
+    // `Client::ended`.
+    if matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
+        #[cfg(test)]
+        ClientState::run_hook(&state.after_write_failure_ignored);
+        return;
+    }
     state.mark_closed();
     fail_pending_around_drain(state, notifications, failure).await;
     state.shutdown.cancel();
@@ -4860,15 +4841,14 @@ async fn hand_off(
         return;
     };
     let responder = Responder::new(state, raw_id, Some(slot), bytes);
-    // A call the worker awaits as it awaits a notification, and so one a hold can be taken in:
-    // the end that cancels it waits for the hold as it does for a notification call's.
-    HANDING_OFF_FOR
+    // A call the worker awaits as it awaits a notification, so it is scoped as one: an ordered
+    // answer asked for from inside it would wait for the call it is made from, and a hold can
+    // be taken in it, which the end that cancels it waits for as it does for a notification
+    // call's.
+    HANDLING_NOTIFICATION_FOR
         .scope(
-            state.address(),
-            HANDLING_NOTIFICATION_FOR.scope(
-                NotificationCall::of(state.address()),
-                handler.on_request_handoff(method, params, responder),
-            ),
+            NotificationCall::of(state.address()),
+            handler.on_request_handoff(method, params, responder),
         )
         .await;
 }

@@ -303,3 +303,51 @@ async fn a_link_failure_that_a_close_overtakes_while_it_is_recorded_is_not_repor
         "expected the reader to let the failure go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
     );
 }
+
+/// This side passing its outbound budget in the moment a close is on record and its flag is
+/// not yet up reaches the reader as an overflow. The close owns that end too: the reader lets
+/// it go, the handler is told of no termination, and the client reports the close it was given.
+#[tokio::test]
+async fn an_outbound_overflow_that_lands_on_a_close_is_not_reported_as_a_termination() {
+    let link = ScriptedLink::new();
+    let (say, mut said) = tokio::sync::mpsc::unbounded_channel();
+    let client = Client::connect(
+        link.into_link(),
+        Arc::new(SayingHandler { said: say.clone() }) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    *client
+        .state
+        .after_write_failure_ignored
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let _ = say.send("let go by the reader");
+    }));
+
+    // What the first step of a close does, and then what a caller that found the queue full
+    // before the closed flag went up does.
+    client
+        .state
+        .ended_with(ConnectionEnd::Closed, client.state.closed_error());
+    let refused = client.state.outbound_overflow("frames", 1, 2);
+    let first = within("what the reader did with the overflow", said.recv()).await;
+    client.close().await.expect("expected a clean close");
+    let later = said.try_recv().ok();
+
+    let observed = (
+        matches!(refused.cause(), Error::LimitExceeded { .. }),
+        first,
+        later,
+        client.ended(),
+    );
+    let expected = (
+        true,
+        Some("let go by the reader"),
+        None,
+        Some(ConnectionEnd::Closed),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the overflow refused, the reader to let it go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
+    );
+}
