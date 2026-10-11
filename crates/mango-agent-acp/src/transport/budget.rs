@@ -168,20 +168,22 @@ fn message_limit(limits: &Limits) -> usize {
 /// does, and only answers the agent itself keeps asking for can fill it. With `r` for
 /// `max_pending_requests`, this side's own frames at one moment are at most:
 ///
-/// - the prompt, and the `$/cancel_request` that follows it when it is given up: 2;
-/// - the `r` requests admitted beside it, and a `$/cancel_request` for each: 2`r`;
+/// - the prompt: 1;
+/// - the `r` requests admitted beside it: `r`;
 /// - the answers to the `r` questions that may be parked, all withdrawn at once by a cancel: `r`;
 /// - `session/cancel`, and the one repeat a cancel that beat its prompt is owed: 2.
 ///
-/// That is 3`r` + 4. On top of it the queue takes [`message_limit`] answers to requests the
-/// agent makes and this side answers on the spot (`-32601`, or a question past the cap): the
-/// agent sets how many of those there are, so they are what a queue that fills is made of. For
-/// example, the default limits allow 1,024 + 3 x 64 + 4 = 1,220 frames.
+/// That is 2`r` + 3. A `$/cancel_request` for a request given up, and a `-32700`, are not in
+/// it: the peer queues those beside its bounds. On top of it the queue takes [`message_limit`]
+/// answers to requests the agent makes and this side answers on the spot (`-32601`, or a
+/// question past the cap): the agent sets how many of those there are, so they are what a
+/// frame count that fills is made of. For example, the default limits allow
+/// 1,024 + 2 x 64 + 3 = 1,155 frames.
 fn outgoing_frame_limit(limits: &Limits) -> usize {
     limits
         .max_pending_requests
-        .saturating_mul(3)
-        .saturating_add(4)
+        .saturating_mul(2)
+        .saturating_add(3)
         .saturating_add(message_limit(limits))
 }
 
@@ -499,11 +501,11 @@ mod tests {
 
     #[test]
     fn the_frame_limit_holds_this_sides_own_frames_on_top_of_the_message_limit() {
-        // (turn_channel_capacity, max_pending_requests) -> message limit + 3 requests' worth + 4.
+        // (turn_channel_capacity, max_pending_requests) -> message limit + 2 requests' worth + 3.
         let cases = [
-            ((1, 1), 1 + 3 + 4),
-            ((2, 4), 4 + 12 + 4),
-            ((1_024, 64), 1_024 + 192 + 4),
+            ((1, 1), 1 + 2 + 3),
+            ((2, 4), 4 + 8 + 3),
+            ((1_024, 64), 1_024 + 128 + 3),
             ((usize::MAX, usize::MAX), usize::MAX),
         ];
         for ((turn_channel_capacity, max_pending_requests), expected) in cases {
@@ -589,7 +591,7 @@ mod tests {
             wire.parse_error_replies(),
             wire.cancel_on_abandon(),
         );
-        let expected = (4_096, 8_192, 21, true, Some(8), Some("$/cancel_request"));
+        let expected = (4_096, 8_192, 17, true, Some(8), Some("$/cancel_request"));
         assert_eq!(
             received, expected,
             "expected (frame bytes, queued bytes, queued frames, batches, parse replies, cancel method): {expected:?} | received: {received:?}"

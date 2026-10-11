@@ -692,8 +692,8 @@ async fn a_cancel_that_withdraws_every_parked_question_fits_the_frame_budget() {
 /// its own account always fits, so the count is reached only by answers the agent keeps asking
 /// for while it reads none of them: here refusals of a method this client does not serve, small
 /// enough that their bytes are no issue. The frame that does not fit ends the connection and
-/// the turn names the frame budget: the message limit of 4, three frames for each of the 4
-/// requests the session may have out, and 4 more.
+/// the turn names the frame budget: the message limit of 4, two frames for each of the 4
+/// requests the session may have out, and 3 more.
 #[tokio::test(start_paused = true)]
 async fn answers_queued_behind_a_stalled_agent_fail_the_turn_with_the_outgoing_frame_budget() {
     let limits = Limits {
@@ -728,7 +728,7 @@ async fn answers_queued_behind_a_stalled_agent_fail_the_turn_with_the_outgoing_f
     let Some(EventKind::Error { error }) = events.last() else {
         unreachable!("the events above end in an error");
     };
-    let expected = "expected at most 20 frames queued for the ACP agent, received 21";
+    let expected = "expected at most 15 frames queued for the ACP agent, received 16";
     assert_eq!(
         error.message, expected,
         "expected the turn's failure message: {expected:?} | received: {:?}",
