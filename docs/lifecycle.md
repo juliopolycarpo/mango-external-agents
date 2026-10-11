@@ -194,7 +194,7 @@ while a connection is ending under this side waits for that call to return, with
 close, where it used to take the reader down under it. Dropping the `Client` cannot wait: the
 call in progress is cancelled whatever it holds, and `on_terminated` may not be made at all.
 
-Three things a client does on the wire only when its `WireOptions` ask for them, each off by
+Things a client does on the wire only when its `WireOptions` ask for them, each off by
 default. `with_batch_decoding` reads a line that is a JSON array as a batch: its members are
 routed in order, each notification and question counted against `max_pending_notifications` on its
 own and the whole batch counted before any of it is queued, the line's bytes taken from
@@ -208,7 +208,12 @@ would have gone on reading. What is answered is a line the transport handed over
 which includes a stdio line whose bytes were not UTF-8, since the line reader replaces those bytes
 and hands the line on. What the transport cannot hand over is not answered, because the read fails
 and the connection ends: a line or websocket message past `max_line_bytes`, and a websocket text
-frame that is not UTF-8. `with_cancel_on_abandon(method)` queues a notification
+frame that is not UTF-8. `with_invalid_request_replies(max_queued)` answers JSON that is not a
+request with `-32600` and a null id, under a bound of its own and beside the queue's bounds in the
+same way: a line that is a number, a string, `true`, `false` or `null`, and, where batches are
+read, an empty batch and each member of a batch that is not an object. An array on a client that
+does not read batches is not answered, and neither is an object, whatever it holds.
+`with_cancel_on_abandon(method)` queues a notification
 `method` with `{"requestId": id}` when a request that was written is given up, by its future or
 `Reply` being dropped or its deadline running out; not for a request that never began to be
 written or whose write has ended with the link refusing its frame whole, not once a response to

@@ -1368,6 +1368,8 @@ struct ClientState {
     link_poisoned: AtomicBool,
     /// The parse-error replies still waiting to be written, for the bound on them.
     parse_error_replies: StdMutex<Vec<Arc<outbox::FrameCtl>>>,
+    /// The invalid-request replies still waiting to be written, for the bound on those.
+    invalid_request_replies: StdMutex<Vec<Arc<outbox::FrameCtl>>>,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
     /// The questions handed over with a [`Responder`] and not yet answered: one permit each,
@@ -2166,6 +2168,7 @@ impl Client {
             ended: StdMutex::new(None),
             link_poisoned: AtomicBool::new(false),
             parse_error_replies: StdMutex::new(Vec::new()),
+            invalid_request_replies: StdMutex::new(Vec::new()),
             in_flight: StdMutex::new(JoinSet::new()),
             handoff_slots,
             notifications: StdMutex::new(None),
@@ -3690,16 +3693,37 @@ impl ClientState {
     /// Answers a line that was not JSON with a parse error, if this client was asked to and
     /// fewer such answers than its bound are still waiting to be written.
     fn answer_unparseable(&self) {
-        let Some(limit) = self.outbox.wire().parse_error_replies() else {
-            return;
-        };
+        if let Some(limit) = self.outbox.wire().parse_error_replies() {
+            self.answer_unasked(limit, &self.parse_error_replies, -32700, "Parse error");
+        }
+    }
+
+    /// Answers JSON that was not a request with an invalid-request error, if this client was
+    /// asked to and fewer such answers than its bound are still waiting to be written.
+    fn answer_invalid_request(&self) {
+        if let Some(limit) = self.outbox.wire().invalid_request_replies() {
+            self.answer_unasked(
+                limit,
+                &self.invalid_request_replies,
+                -32600,
+                "Invalid Request",
+            );
+        }
+    }
+
+    /// Queues an error with a null id for input that named no request to answer, unless
+    /// `limit` such errors of its kind are still `waiting` to be written.
+    fn answer_unasked(
+        &self,
+        limit: usize,
+        waiting: &StdMutex<Vec<Arc<outbox::FrameCtl>>>,
+        code: i32,
+        message: &str,
+    ) {
         if self.closed.load(Ordering::Acquire) || self.link_poisoned.load(Ordering::Acquire) {
             return;
         }
-        let mut waiting = self
-            .parse_error_replies
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut waiting = waiting.lock().unwrap_or_else(PoisonError::into_inner);
         waiting.retain(|reply| reply.queued());
         if waiting.len() >= limit {
             return;
@@ -3711,7 +3735,7 @@ impl ClientState {
         frame.insert(String::from("id"), Value::Null);
         frame.insert(
             String::from("error"),
-            json!({ "code": -32700, "message": "Parse error" }),
+            json!({ "code": code, "message": message }),
         );
         let deadline = deadline_after(self.options.request_timeout);
         // Beside the queue's bounds, being bounded here: the peer's noise takes none of the
@@ -4086,7 +4110,13 @@ async fn dispatch(
         Ok(Value::Array(members)) if state.outbox.wire().decodes_batches() => {
             return dispatch_batch(state, notifications, members, message.len()).await;
         }
-        Ok(_) => return Ok(()),
+        // A batch, to a client that was not asked to read batches: not read, and not an
+        // invalid request either.
+        Ok(Value::Array(_)) => return Ok(()),
+        Ok(_) => {
+            state.answer_invalid_request();
+            return Ok(());
+        }
         Err(_) => {
             // A blank line is nothing a peer could be told about.
             if !message.trim().is_empty() {
@@ -4138,6 +4168,10 @@ async fn dispatch_batch(
     members: Vec<Value>,
     bytes: usize,
 ) -> std::result::Result<(), PeerTermination> {
+    if members.is_empty() {
+        state.answer_invalid_request();
+        return Ok(());
+    }
     let mut work = members.iter().filter(|member| is_peer_work(member)).count();
     let mut held = None;
     if work > 0 {
@@ -4151,6 +4185,7 @@ async fn dispatch_batch(
     let share = bytes.checked_div(work).unwrap_or(0);
     for member in members {
         let Value::Object(frame) = member else {
+            state.answer_invalid_request();
             continue;
         };
         let mine = if frame.get("method").is_some_and(Value::is_string) {
@@ -4468,6 +4503,7 @@ const FRAME_BYTES: &str = "bytes of one outgoing JSON-RPC frame";
 mod tests {
     mod cancellation_hold_tests;
     mod handoff_queue_tests;
+    mod invalid_request_tests;
     mod ordered_response_tests;
     mod outbox_tests;
     mod request_lifecycle_tests;

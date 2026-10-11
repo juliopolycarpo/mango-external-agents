@@ -705,6 +705,36 @@ async fn a_handler_without_the_hand_off_is_asked_through_on_request() {
     client.close().await.expect("expected a clean close");
 }
 
+/// The same handler with an answer that fits: `on_request` is asked, once, and what it
+/// returns is what the peer gets, queued like any other answer.
+#[tokio::test]
+async fn a_handler_without_the_hand_off_has_its_answer_queued() {
+    let link = ScriptedLink::new();
+    let handler = RecordingHandler::arc(Some(ServerRequestOutcome::Answer(json!("yes"))));
+    let client = Client::connect_with(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+        handoff(),
+    );
+    link.push_line(question(3, "ask"));
+    link.push_line(json!({ "jsonrpc": "2.0", "method": "after", "params": {} }).to_string());
+
+    handler.wait_for_notifications(1).await;
+    sent(&link, 1).await;
+    let observed = (link.sent(), slots(&client), client.state.outbox.held());
+    let expected = (
+        vec![json!({ "jsonrpc": "2.0", "id": 3, "result": "yes" }).to_string()],
+        256,
+        (0, 0),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the answer on_request returned written once, and its place back: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
 /// Questions and notifications reach the handler in the order the peer sent them, one call at
 /// a time, whatever the handler does with each question.
 #[tokio::test]

@@ -61,6 +61,7 @@ pub struct WireOptions {
     batch_decoding: bool,
     request_handoff: bool,
     parse_error_replies: Option<usize>,
+    invalid_request_replies: Option<usize>,
     cancel_on_abandon: Option<String>,
 }
 
@@ -73,6 +74,7 @@ impl Default for WireOptions {
             batch_decoding: false,
             request_handoff: false,
             parse_error_replies: None,
+            invalid_request_replies: None,
             cancel_on_abandon: None,
         }
     }
@@ -282,7 +284,9 @@ impl WireOptions {
     ///
     /// The reply does not quote the line. A line that is empty or only whitespace gets none,
     /// and neither does a line that is JSON and not a frame (a number, a string, an array
-    /// without [`with_batch_decoding`](Self::with_batch_decoding)).
+    /// without [`with_batch_decoding`](Self::with_batch_decoding)): that is not a parse error.
+    /// [`with_invalid_request_replies`](Self::with_invalid_request_replies) answers the ones
+    /// that are owed an answer.
     ///
     /// # Example
     ///
@@ -295,6 +299,44 @@ impl WireOptions {
     #[must_use]
     pub fn with_parse_error_replies(mut self, max_queued: usize) -> Self {
         self.parse_error_replies = Some(max_queued);
+        self
+    }
+
+    /// Answers JSON that is not a request with a JSON-RPC invalid-request error: code
+    /// `-32600`, "Invalid Request", `id` null.
+    ///
+    /// Off by default, where such input is dropped. On, what is answered is:
+    ///
+    /// - a line that is JSON and neither an object nor an array: a number, a string, `true`,
+    ///   `false`, `null`;
+    /// - with [`with_batch_decoding`](Self::with_batch_decoding), an empty batch, and each
+    ///   member of a batch that is not an object, once for each such member. The other
+    ///   members are handled as they are without this.
+    ///
+    /// What is not: an array on a client that does not read batches, which is a request this
+    /// client was not asked to read and not an invalid one, and stays dropped; an object,
+    /// whatever its members, which is routed as it always was; and a line that is not JSON,
+    /// which is a parse error and [`with_parse_error_replies`](Self::with_parse_error_replies)'s
+    /// to answer.
+    ///
+    /// At most `max_queued` such replies wait to be written at a time, and input that would
+    /// be answered while that many wait is dropped as before; `0` answers none. The bound is
+    /// this option's own, apart from the one on parse-error replies. The replies are held
+    /// beside the bounds of the outbound queue and go through the queue, and a reply is a
+    /// write, with what [`with_parse_error_replies`](Self::with_parse_error_replies) says
+    /// that costs with a peer that does not read. The reply does not quote what it answers.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_invalid_request_replies(8);
+    /// assert_eq!(wire.invalid_request_replies(), Some(8));
+    /// ```
+    #[must_use]
+    pub fn with_invalid_request_replies(mut self, max_queued: usize) -> Self {
+        self.invalid_request_replies = Some(max_queued);
         self
     }
 
@@ -364,6 +406,20 @@ impl WireOptions {
     #[must_use]
     pub fn parse_error_replies(&self) -> Option<usize> {
         self.parse_error_replies
+    }
+
+    /// How many invalid-request replies may wait to be written, or `None` when none are sent.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert_eq!(WireOptions::new().invalid_request_replies(), None);
+    /// ```
+    #[must_use]
+    pub fn invalid_request_replies(&self) -> Option<usize> {
+        self.invalid_request_replies
     }
 
     /// Whether the peer's questions are handed to the handler in order, with a
