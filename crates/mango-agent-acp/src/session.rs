@@ -1336,6 +1336,7 @@ impl Session for AcpSession {
                     cancel_reason,
                     cancel_failure,
                     already_terminal: turn.sink.is_terminal(),
+                    timed_out: connection.timed_out().map(String::from),
                 };
                 let agent = profile.id.to_string();
                 let ending = prompt_ending(outcome, recorded, &agent, control.as_ref());
@@ -1534,6 +1535,8 @@ struct TurnRecord {
     cancel_failure: Option<String>,
     /// Whether the stream already holds a terminal, so there is nothing left to report.
     already_terminal: bool,
+    /// The request whose deadline made this side end the connection, when one did.
+    timed_out: Option<String>,
 }
 
 /// Decides how a turn ends from how its prompt wait ended and what the session recorded.
@@ -1549,7 +1552,7 @@ struct TurnRecord {
 /// - a stop somebody asked for, recorded before this is decided, ends it as `Cancelled` with
 ///   that reason, including when the agent died instead of answering the stop;
 /// - a connection that went away with no stop recorded is the closed link, carrying the agent's
-///   redacted stderr. It is the same failure whether the connection's end was seen first or the
+///   redacted stderr, and naming the request whose deadline ended it when that is why. It is the same failure whether the connection's end was seen first or the
 ///   prompt's own failure was.
 ///
 /// A `session/cancel` that could not be written keeps the handling it had: it is the failure
@@ -1569,6 +1572,7 @@ fn prompt_ending(
         cancel_reason,
         cancel_failure,
         already_terminal,
+        timed_out,
     } = recorded;
     let error = match outcome {
         Some(Ok(response)) => return Some(answered_ending(&response, cancel_reason)),
@@ -1597,7 +1601,14 @@ fn prompt_ending(
             refusal,
         )));
     }
-    let message = with_stderr("a transport that closed under session/prompt", control);
+    // The link is closed either way. When this side closed it because another request on it
+    // passed its deadline, the message says which, so a host is not left reading a turn that
+    // failed for no visible reason.
+    let closed = match timed_out {
+        Some(cause) => format!("a transport that closed under session/prompt after {cause}"),
+        None => String::from("a transport that closed under session/prompt"),
+    };
+    let message = with_stderr(&closed, control);
     Some(Ending::Fail(link_failure(format!("{agent}: {message}"))))
 }
 
@@ -1852,7 +1863,22 @@ mod tests {
             cancel_reason: None,
             cancel_failure: None,
             already_terminal: false,
+            timed_out: None,
         }
+    }
+
+    #[test]
+    fn a_link_closed_by_another_requests_deadline_names_that_request() {
+        let recorded = TurnRecord {
+            timed_out: Some(String::from("session/list got no answer within 5s")),
+            ..untouched()
+        };
+        let received = shown(prompt_ending(None, recorded, "fake", &DeadAgent).as_ref());
+        let expected = "Fail(acp-link-closed, \"fake: a transport that closed under session/prompt after session/list got no answer within 5s\")";
+        assert!(
+            received.starts_with(expected.trim_end_matches("\")")),
+            "expected the ending to start: {expected} | received: {received}"
+        );
     }
 
     /// One ending as text a failure message can show.
@@ -1927,7 +1953,7 @@ mod tests {
         let recorded = TurnRecord {
             cancel_reason: Some(CancelReason::Requested),
             cancel_failure: Some(String::from("ACP session/cancel could not be queued")),
-            already_terminal: false,
+            ..untouched()
         };
         let ending = prompt_ending(None, recorded, "fake", &DeadAgent);
         let received = shown(ending.as_ref());

@@ -282,10 +282,15 @@ where
                 &profile.login_text(),
             ))
         }
-        CallFailureCause::TimedOut { after, .. } => Err(Error::Timeout {
-            operation: format!("{method} on an ACP agent"),
-            after: *after,
-        }),
+        CallFailureCause::TimedOut { after, .. } => {
+            // On record before the abandonment below ends the connection, so a turn that was
+            // running on it can say which request's deadline closed its link.
+            connection.record_timeout(method, *after);
+            Err(Error::Timeout {
+                operation: format!("{method} on an ACP agent"),
+                after: *after,
+            })
+        }
         // The connection is over, so there is nothing left for an abandonment to end.
         CallFailureCause::Ended(_) => {
             submitted.abandonment.disarm();

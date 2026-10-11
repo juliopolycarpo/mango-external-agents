@@ -242,7 +242,9 @@ idle deadline, a permission question that expired with no option to refuse, a ho
 `<profile id>: a transport that closed under session/prompt`, followed by the agent's redacted
 stderr tail when it wrote any. That covers an agent that exited mid-turn and a connection the
 harness itself ended because another request on it passed `Limits::request_timeout` or was
-dropped by its caller. The outcome does not depend on which of the prompt's failure and the end
+dropped by its caller. When a deadline is why, the message names the request and the deadline:
+`<profile id>: a transport that closed under session/prompt after session/list got no answer
+within 120s`. The outcome does not depend on which of the prompt's failure and the end
 of the connection is observed first. When both a stop and the agent's death apply, the stop
 wins if it was recorded before the turn's terminal was decided: the turn ends as `Cancelled` with
 that reason, without the stderr tail. A `session/cancel` that could not be written can instead

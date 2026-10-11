@@ -1575,6 +1575,8 @@ pub(crate) struct ConnectionHandle {
     /// its diagnostic-safe summary here because the core error is not cloneable and a second close
     /// must still report the first cleanup failure rather than inventing success.
     shutdown_result: Mutex<Option<std::result::Result<(), String>>>,
+    /// Which request passed its deadline, when that is why this side ended the connection.
+    timed_out: std::sync::OnceLock<String>,
     /// The runtime the connection was driven on. Shutdown is spawned through it, so a request
     /// or scope guard dropped on a thread without a runtime still ends the child.
     runtime: tokio::runtime::Handle,
@@ -1761,6 +1763,7 @@ pub(crate) fn drive(launched: LaunchedAgent, state: Arc<SessionState>) -> Connec
         shutdown_started: AtomicBool::new(false),
         shutdown_complete: mango_external_agents::CancelToken::new(),
         shutdown_result: Mutex::new(None),
+        timed_out: std::sync::OnceLock::new(),
         runtime: tokio::runtime::Handle::current(),
         #[cfg(test)]
         shutdown_runs: std::sync::atomic::AtomicUsize::new(0),
@@ -1792,6 +1795,29 @@ impl ConnectionHandle {
                 .unwrap_or_else(PoisonError::into_inner) = Some(result);
             connection.shutdown_complete.cancel();
         });
+    }
+
+    /// Records that `method` got no answer within `after`, which is about to end the connection.
+    ///
+    /// The first one is kept: it is the one that ended it. A turn that was running on the
+    /// connection reads it through [`Self::timed_out`] to say why its link closed. For
+    /// example, `record_timeout("session/list", Duration::from_secs(120))` reads back as
+    /// `session/list got no answer within 120s`.
+    pub(super) fn record_timeout(&self, method: &str, after: std::time::Duration) {
+        let _ = self
+            .timed_out
+            .set(format!("{method} got no answer within {after:?}"));
+    }
+
+    /// The request whose deadline ended this connection, if one did.
+    ///
+    /// A method name of this crate's and a duration: nothing of the agent's, and bounded.
+    ///
+    /// ```ignore
+    /// let cause = connection.timed_out();
+    /// ```
+    pub(crate) fn timed_out(&self) -> Option<&str> {
+        self.timed_out.get().map(String::as_str)
     }
 
     /// Waits for the shutdown task started by [`Self::begin_shutdown`].
