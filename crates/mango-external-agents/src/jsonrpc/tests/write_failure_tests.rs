@@ -1,8 +1,8 @@
 //! Completed transport failures and safe local refusals have different link consequences.
 
-use super::outbox_tests::{options, until, within};
+use super::outbox_tests::{gated, link_held, methods, options, until, within};
 use super::*;
-use crate::jsonrpc::ConnectionEnd;
+use crate::jsonrpc::{ConnectionEnd, WireOptions};
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 
@@ -583,5 +583,81 @@ async fn a_peer_exit_read_by_a_poll_that_began_before_a_close_is_not_reported() 
     assert_eq!(
         observed, expected,
         "expected the reader to let the exit its earlier poll read go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
+    );
+}
+
+/// The same landing, over a writer that is held behind a write with a notification queued behind
+/// it: the close is on record, so the overflow only refuses its own frame. What was queued before
+/// the close is still written before the link goes, and the link is not made unusable.
+#[tokio::test]
+async fn an_outbound_overflow_landing_on_a_close_leaves_what_was_queued_before_it_to_be_written() {
+    let gated = gated(options(), WireOptions::new());
+    let held = link_held(&gated).await;
+    let queued = gated
+        .client
+        .submit_notification("queued", json!({}))
+        .expect("expected a frame queued behind the held one");
+    let ignored = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let state = Arc::downgrade(&gated.client.state);
+        *gated
+            .client
+            .state
+            .after_reader_woken_to_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            // What the first step of a close does, and then what a caller that found the queue
+            // full before the closed flag went up does.
+            state.ended_with(ConnectionEnd::Closed, state.closed_error());
+            let _ = state.outbound_overflow("frames", 1, 2);
+        }));
+    }
+    {
+        let ignored = Arc::clone(&ignored);
+        *gated
+            .client
+            .state
+            .after_write_failure_ignored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            ignored.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }));
+    }
+
+    gated.client.state.write_failed.notify_one();
+    until("the reader to let the overflow go", || {
+        ignored.load(std::sync::atomic::Ordering::Acquire) == 1
+    })
+    .await;
+    let poisoned = gated
+        .client
+        .state
+        .link_poisoned
+        .load(std::sync::atomic::Ordering::Acquire);
+    gated.gate.add_permits(1);
+    let held = within("the held frame", held).await;
+    let queued = within("the queued frame", queued).await;
+    let closed = within("the close", gated.client.close()).await;
+
+    let observed = (
+        poisoned,
+        held.is_ok(),
+        queued.is_ok(),
+        methods(&gated.link),
+        closed.is_ok(),
+    );
+    let expected = (
+        false,
+        true,
+        true,
+        vec![String::from("hold"), String::from("queued")],
+        true,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the link usable and both frames queued before the close written before it went: {expected:?} | received {observed:?}"
     );
 }

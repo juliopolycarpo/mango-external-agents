@@ -3721,23 +3721,32 @@ impl ClientState {
     /// call is failed with, the typed reason the handler is told, and a link no later frame may
     /// use. The pump does the ending, as for any failed write.
     fn outbound_overflow(&self, subject: &'static str, limit: usize, received: usize) -> Error {
-        self.link_poisoned.store(true, Ordering::Release);
         let termination = PeerTermination::OutboundBackpressure {
             subject,
             limit,
             received,
         };
-        self.ended_with(
-            ConnectionEnd::Peer(termination.clone()),
-            JsonRpcError {
-                code: -32000,
-                message: format!(
-                    "the {} outbound queue reached its limit",
-                    self.options.peer_name
-                ),
-                data: None,
-            },
-        );
+        // Recorded and, unless a close is on record ahead of it, made unusable under one lock,
+        // so whoever sees the record finds the link unusable with it. A close that recorded
+        // first owns the queue: what was queued before it is still written before the link goes,
+        // and the overflow only refuses this frame.
+        {
+            let mut ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+            let failure = ended.get_or_insert(Failed {
+                body: JsonRpcError {
+                    code: -32000,
+                    message: format!(
+                        "the {} outbound queue reached its limit",
+                        self.options.peer_name
+                    ),
+                    data: None,
+                },
+                cause: FailedCause::Ended(ConnectionEnd::Peer(termination.clone())),
+            });
+            if !matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
+                self.link_poisoned.store(true, Ordering::Release);
+            }
+        }
         if !self.closed.load(Ordering::Acquire) {
             self.outbound_overflow
                 .lock()
