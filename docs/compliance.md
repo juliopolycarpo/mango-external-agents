@@ -31,7 +31,12 @@ own deployment.
   The same holds for the other text a vendor generates: a compaction summary (an activity's
   content) and a notice (`EventKind::Notice`) are for display only, and a host must not feed either
   to its own model as instructions.
-- **Redaction.** stderr crossing a diagnostic boundary is redacted for credential-shaped text.
+- **Redaction.** stderr crossing a diagnostic boundary is redacted for credential-shaped text. So is
+  a vendor's error message, which the core redacts before it bounds it, whichever harness produced
+  it, a JSON-RPC peer's error message when it is an error object (a malformed `error` member is
+  quoted whole and is not), and the title and description of a notice. A vendor's
+  transcript content (assistant text, reasoning, tool output) is the answer and not a diagnostic,
+  and is not redacted.
   `Debug` and `Display` for process, transport, MCP, JSON-RPC, error, session-listing, stream-handle
   and event payload carriers report only safe metadata. The same policy covers discovery and receipts,
   configuration, interactions, identity containers and extension values; callers handle originals through

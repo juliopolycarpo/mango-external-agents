@@ -110,8 +110,9 @@ pub(crate) fn is_label_shaped(code: &str) -> bool {
 pub struct VendorError {
     /// The harness's own code for this failure.
     pub code: ErrorCode,
-    /// The vendor's message as payload data. Event normalization bounds and strips it before a
-    /// harness emits it; diagnostic formatting reports only metadata.
+    /// The vendor's message as payload data. Event normalization redacts it of credential-shaped
+    /// text, then bounds and strips it, before a harness emits it; diagnostic formatting reports
+    /// only metadata. A harness that returns one as an `Error` redacts it where it makes it.
     pub message: String,
     /// The id of the request that failed, when the dialect correlates one.
     pub request_id: Option<String>,

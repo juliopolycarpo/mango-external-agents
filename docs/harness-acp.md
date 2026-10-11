@@ -244,7 +244,13 @@ through `tool_call_update`, so a silent one is not a working one.
 
 An agent that answers `session/prompt` with a JSON-RPC error has refused the prompt: the turn
 ends with one `EventKind::Error` coded `acp-request-failed` (`-32000` is the exception, below), with `request_id` `session/prompt`,
-the agent's code as `vendor_code` and its message. The session stays usable, as it does after a
+the agent's code as `vendor_code` and its message, with whatever it put in `data` appended. The
+message is redacted of credential-shaped text and then bounded. So is the message of a refused setup
+request, which is returned as an error and redacted where it is made, and so are the title and
+description of an agent's notice and the `error` of a compaction. In `data`, every string under a
+credential-named key is replaced, as is the `value` beside a credential-named `name`, because the
+redactor does not read `"api_key":"..."`. The code and the words around the credentials stay
+readable. The session stays usable, as it does after a
 `refusal` or `max_tokens` stop: the agent answered, so the connection is as healthy as after
 any answer. The failed turn's parked questions are withdrawn with ACP's `cancelled` outcome, the
 calls it left running are closed as failed, and the next turn begins clean. A host `cancel`
@@ -412,8 +418,8 @@ A `notice` becomes `EventKind::Notice { severity, title, description }`:
   `{"other": "<its spelling>"}`, to be shown generically; a spelling with nothing left once
   sanitised is read as `"info"`. It is a presentation hint: an `error` notice does not fail the
   turn, and only the prompt's own answer ends one.
-- `title` is cut to a title's length and `description` to a detail's, both sanitised. `_meta` is not
-  carried.
+- `title` is cut to a title's length and `description` to a detail's, both sanitised and redacted of
+  credential-shaped text before they are cut. `_meta` is not carried.
 - A notice whose title has nothing to show once sanitised is dropped, and the turn goes on. Nothing
   is logged for it, as for any other frame the reducer has no use for.
 - A notice is turn-scoped. One that arrives with no turn in flight (between turns, or replayed by
@@ -520,7 +526,7 @@ bounded by the core's `TextLimit::Detail`.
 
 A held field that is over the size the core publishes (a text body or a diff body over
 `TextLimit::Detail`, a title over `TextLimit::Title`, or a diff past the core's row or total-size
-limits) is bounded when it is held, through the core's own bounding, which redacts before it cuts;
+limits) is bounded when it is held, through the core's own bounding, which sanitises before it cuts;
 delivery bounds it again to the same result. An agent with many calls open at once therefore leaves
 each holding what a host would be sent rather than its latest whole body. A field that already fits
 is held exactly as it arrived and bounded once, at delivery, as before. Whether a held field was cut

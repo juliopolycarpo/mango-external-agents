@@ -117,10 +117,13 @@ impl std::fmt::Debug for JsonRpcError {
 
 impl JsonRpcError {
     /// The failure this represents, with the peer's structure kept.
+    ///
+    /// The message is redacted of credential-shaped text, as a stderr tail is: a peer that fails
+    /// while describing the request it was making may print the header it sent.
     pub fn into_vendor_error(self, code: ErrorCode, request_id: Option<String>) -> VendorError {
         let retryable = jsonrpc_code_is_retryable(self.code);
-        let mut error =
-            VendorError::new(code, self.message).with_vendor_code(self.code.to_string(), retryable);
+        let mut error = VendorError::new(code, crate::redact::stderr_text(&self.message))
+            .with_vendor_code(self.code.to_string(), retryable);
         error.request_id = request_id;
         error
     }
@@ -6041,6 +6044,40 @@ mod tests {
                 "expected no caller-defined label in diagnostics, received {rendered:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_peers_error_message_is_redacted_of_credential_shaped_text() {
+        let link = ScriptedLink::new();
+        link.push_line(
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"refused: Authorization: Bearer top-secret-token API_KEY=another-secret redis://app:password@db/main"}}"#,
+        );
+        let client = Client::connect(
+            link.into_link(),
+            RecordingHandler::arc(None),
+            ClientOptions::new("peer"),
+        );
+
+        let error = client
+            .request::<_, Value>("ping", json!({}))
+            .await
+            .expect_err("expected the error frame to fail the call");
+
+        let Error::Vendor(vendor) = &error else {
+            panic!("expected a vendor error, received {error:?}");
+        };
+        for secret in ["top-secret-token", "another-secret", "password"] {
+            assert!(
+                !vendor.message.contains(secret),
+                "expected a peer's error message without {secret:?} | received: {:?}",
+                vendor.message
+            );
+        }
+        assert!(
+            vendor.message.starts_with("refused: "),
+            "expected the peer's own words to stay readable | received: {:?}",
+            vendor.message
+        );
     }
 
     #[tokio::test]
