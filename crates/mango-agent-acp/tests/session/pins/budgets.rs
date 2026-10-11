@@ -203,13 +203,13 @@ async fn a_frame_over_the_byte_budget_fails_the_request_with_the_byte_budget() {
 /// Models an agent that is alive and still writing but no longer drains its input, which is the
 /// only way a host's outgoing queue can fill.
 #[derive(Clone)]
-struct StallingLauncher {
+pub(super) struct StallingLauncher {
     inner: FakeLauncher,
     after: &'static str,
 }
 
 impl StallingLauncher {
-    fn new(inner: FakeLauncher, after: &'static str) -> Self {
+    pub(super) fn new(inner: FakeLauncher, after: &'static str) -> Self {
         Self { inner, after }
     }
 }
@@ -257,7 +257,7 @@ impl ByteSink for StallingStdin {
 /// and far less than the replies the flooding agent asks for.
 const OUTBOUND: usize = 4 * 1024;
 
-fn stalling_host(launcher: &StallingLauncher, limits: Limits) -> HostContext {
+pub(super) fn stalling_host(launcher: &StallingLauncher, limits: Limits) -> HostContext {
     HostContext::builder()
         .launcher(Arc::new(launcher.clone()))
         .cwd(std::env::temp_dir())
@@ -516,4 +516,146 @@ async fn questions_past_the_cap_are_withdrawn_at_once_and_the_rest_reach_the_hos
         settled, expected,
         "expected the parked questions withdrawn, sorted, and then the last frame: {expected:?} | received: {settled:?}"
     );
+}
+
+/// Opens a session on `agent` behind a launcher that stops reading once `after` has landed.
+async fn open_stalling(
+    agent: FakeAcpAgent,
+    after: &'static str,
+    limits: Limits,
+) -> (Arc<dyn Session>, FakeLauncher) {
+    let inner = FakeLauncher::new();
+    inner.push(agent.process());
+    let launcher = StallingLauncher::new(inner.clone(), after);
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &stalling_host(&launcher, limits),
+            OpenSession::new("chat-1"),
+        )
+        .await
+        .expect("expected a session");
+    (Arc::from(session), inner)
+}
+
+/// What the outgoing queue may hold under [`OUTBOUND`]: a frame of that size being written, and
+/// as much again waiting behind it.
+const QUEUED: usize = 2 * OUTBOUND;
+
+/// The outgoing byte budget bounds this side's own requests too. With the agent no longer
+/// reading, every `session/list` after the first waits in the queue; the one that would take
+/// the queue past twice `outbound_buffer_bytes` is refused naming that budget, the connection
+/// ends, and every request still waiting fails with the same budget instead of a closed link.
+#[tokio::test(start_paused = true)]
+async fn requests_queued_behind_a_stalled_agent_fail_with_the_outgoing_byte_budget() {
+    // Enough requests that their frames, a hundred bytes or so each, pass the queue's bytes
+    // well before they pass its frame count.
+    let limits = Limits {
+        max_pending_requests: 512,
+        ..Limits::default()
+    };
+    let (session, inner) = open_stalling(
+        FakeAcpAgent::new().listing_sessions(),
+        "\"session/new\"",
+        limits,
+    )
+    .await;
+    let mut lifecycle = session.subscribe();
+
+    let begun = tokio::time::Instant::now();
+    let mut listings = tokio::task::JoinSet::new();
+    for _ in 0..limits.max_pending_requests {
+        let session = Arc::clone(&session);
+        listings.spawn(async move { session.list_sessions(Default::default()).await });
+    }
+    let mut refusals = Vec::new();
+    while let Some(listed) = listings.join_next().await {
+        refusals.push(refusal(listed.expect("expected the listing task to join")));
+    }
+
+    let subject = "bytes queued for the ACP agent";
+    let unexpected: Vec<String> = refusals
+        .iter()
+        .filter(|error| {
+            !matches!(
+                error.cause(),
+                Error::LimitExceeded { subject: named, limit, received }
+                    if *named == subject && *limit == QUEUED && *received > QUEUED
+            )
+        })
+        .map(|error| format!("{error:?}"))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "expected every listing: LimitExceeded {{ {subject:?}, {QUEUED}, more than {QUEUED} }} | received otherwise: {unexpected:?}"
+    );
+
+    let status = status_once_settled(&mut lifecycle).await;
+    let waited = begun.elapsed();
+    assert_status("after the overflow", status, SessionStatus::Closed);
+    assert_no_live_children("after the overflow", &inner);
+    assert!(
+        waited <= limits.shutdown_timeout,
+        "expected teardown within shutdown_timeout ({:?}) | received: {waited:?}",
+        limits.shutdown_timeout
+    );
+}
+
+/// The outgoing queue is bounded by a frame count as well as by bytes: the larger of
+/// `turn_channel_capacity` and `max_pending_requests`. With the agent stalled under the prompt,
+/// the prompt, its cancel and two requests fill a four-frame queue. The next request is refused
+/// naming the frame budget and what the queue would have held, and so is everything that was
+/// waiting on that connection.
+#[tokio::test(start_paused = true)]
+async fn frames_queued_behind_a_stalled_agent_fail_with_the_outgoing_frame_budget() {
+    let limits = Limits {
+        turn_channel_capacity: 2,
+        max_pending_requests: 4,
+        ..Limits::default()
+    };
+    let (session, inner) = open_stalling(
+        FakeAcpAgent::new().listing_sessions(),
+        "\"session/new\"",
+        limits,
+    )
+    .await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "never read"))
+        .await
+        .expect("expected a turn");
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to be queued");
+
+    let frame_budget = ("frames queued for the ACP agent", 4, 5);
+    let third_frame = session.list_sessions(Default::default());
+    let fourth_frame = session.list_sessions(Default::default());
+    tokio::pin!(third_frame, fourth_frame);
+    // Polled in this order, so both held requests are queued before the one that does not fit.
+    let fifth_frame = tokio::select! {
+        biased;
+        listed = &mut third_frame => panic!("expected the third frame still queued | received: {listed:?}"),
+        listed = &mut fourth_frame => panic!("expected the fourth frame still queued | received: {listed:?}"),
+        listed = session.list_sessions(Default::default()) => listed,
+    };
+    assert_limit_exceeded(&refusal(fifth_frame), frame_budget);
+    assert_limit_exceeded(&refusal(third_frame.await), frame_budget);
+    assert_limit_exceeded(&refusal(fourth_frame.await), frame_budget);
+
+    let events = drain(&mut turn).await;
+    assert_events(
+        "the turn in flight",
+        &events,
+        &["TurnStarted", "Error(acp-transport-overflow)"],
+    );
+    let Some(EventKind::Error { error }) = events.last() else {
+        unreachable!("the events above end in an error");
+    };
+    let expected = "expected at most 4 frames queued for the ACP agent, received 5";
+    assert_eq!(
+        error.message, expected,
+        "expected the turn's failure message: {expected:?} | received: {:?}",
+        error.message
+    );
+    assert_no_live_children("after the overflow", &inner);
 }

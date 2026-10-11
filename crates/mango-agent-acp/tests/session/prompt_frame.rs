@@ -464,3 +464,80 @@ async fn two_images_at_the_attachment_cap_still_fit_under_default_limits() {
         "expected one prompt frame under {budget} bytes | received {lengths:?}"
     );
 }
+
+/// Starts a turn of `input` once the session's slot is free, cancels it without waiting for
+/// anything, and returns how the cancel was answered and the turn's events as short labels.
+async fn cancelled_at_once(
+    session: &dyn Session,
+    turn_id: &str,
+    input: &str,
+) -> (Option<String>, Vec<String>) {
+    let mut turn = loop {
+        match session.start_turn(TurnRequest::new(turn_id, input)).await {
+            Ok(turn) => break turn,
+            // The previous turn's terminal is published just ahead of the release of its slot.
+            Err(error) if matches!(error.cause(), Error::Busy) => tokio::task::yield_now().await,
+            Err(error) => panic!("expected {turn_id} accepted | received refusal: {error}"),
+        }
+    };
+    let cancel_refused = session
+        .cancel(CancelReason::Requested)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let events = drain(&mut turn)
+        .await
+        .iter()
+        .map(|kind| match kind {
+            EventKind::Error { error } => {
+                format!("Error({}: {})", error.code.as_str(), error.message)
+            }
+            other => format!("{other:?}").chars().take(40).collect(),
+        })
+        .collect();
+    (cancel_refused, events)
+}
+
+/// The frame budget is for one frame, and the queue has room behind it. A prompt that fills the
+/// frame budget exactly is still followed by its `session/cancel`: both are queued in the same
+/// instant, the prompt not yet written, and the cancel stops the turn. It does not end the
+/// connection for a queue that one more small frame overfilled.
+#[tokio::test]
+async fn a_cancel_queued_behind_a_prompt_that_fills_the_frame_budget_stops_the_turn() {
+    let silent = FakeAcpAgent::new()
+        .with_updates(Vec::new())
+        .staying_silent();
+    let (session, launcher) = open_with(silent, small_budget()).await;
+    let cancelled = (
+        None,
+        vec![
+            String::from("TurnStarted"),
+            String::from("Cancelled { reason: Requested }"),
+            String::from("Completed"),
+        ],
+    );
+
+    let calibrating = cancelled_at_once(session.as_ref(), "turn-empty", "").await;
+    assert_eq!(
+        calibrating, cancelled,
+        "expected the empty turn (cancel refusal, events): {cancelled:?} | received: {calibrating:?}"
+    );
+    let base = prompt_frame_lengths(&launcher)[0];
+
+    let filling = "a".repeat(SMALL_BUDGET - base);
+    let received = cancelled_at_once(session.as_ref(), "turn-full", &filling).await;
+    assert_eq!(
+        received, cancelled,
+        "expected the turn that fills the frame budget (cancel refusal, events): {cancelled:?} | received: {received:?}"
+    );
+    assert_eq!(
+        prompt_frame_lengths(&launcher).last().copied(),
+        Some(SMALL_BUDGET),
+        "expected the filling prompt written as one {SMALL_BUDGET}-byte frame"
+    );
+    assert_eq!(
+        session.snapshot().status,
+        SessionStatus::Ready,
+        "expected the session to stay usable"
+    );
+}

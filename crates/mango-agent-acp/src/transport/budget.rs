@@ -184,13 +184,34 @@ pub(crate) fn client_options(limits: &Limits) -> ClientOptions {
     options
 }
 
+/// The bytes the outgoing queue may hold: one frame of the largest size the host's budget allows,
+/// and as much again behind it.
+///
+/// The queue counts the frame being written with the ones waiting. Bounded by the frame budget
+/// alone, a prompt that filled that budget left no room for anything queued in the same instant,
+/// so the `session/cancel` meant to stop it ended the connection instead. Twice the budget is
+/// room for that largest frame and a full budget of frames behind it. For example, the default
+/// 8 MiB budget gives a 16 MiB queue.
+fn queued_bytes_limit(outbound_buffer_bytes: usize) -> usize {
+    outbound_buffer_bytes.saturating_mul(2)
+}
+
 /// What the connection holds for the agent, and which protocol behaviours it turns on.
 ///
 /// `outbound_buffer_bytes` is the host's outgoing budget
 /// ([`HostContext::outbound_buffer_bytes`](mango_external_agents::HostContext::outbound_buffer_bytes)).
-/// It bounds one frame, where passing it refuses that frame alone, and the bytes of every frame
-/// queued or being written, where passing it means the agent stopped reading and ends the
-/// connection. The frame count is bounded by the same number as the incoming queue.
+/// Two bounds come from it, and a host sees a different thing at each:
+///
+/// - One frame may be that many bytes. A larger one is refused alone, as `LimitExceeded` naming
+///   "bytes in one frame to the ACP agent" with `Dispatch::NotSubmitted`: nothing is queued and
+///   the session stays usable.
+/// - The queue, the frame being written included, may hold twice that many
+///   ([`queued_bytes_limit`]). A frame that would pass it means the agent stopped reading: the
+///   connection ends, a turn in flight fails with `acp-transport-overflow`, and a request still
+///   waiting fails as `LimitExceeded` naming "bytes queued for the ACP agent".
+///
+/// The frame count is bounded by the same number as the incoming queue, and passing it ends the
+/// connection the same way, naming "frames queued for the ACP agent".
 ///
 /// ACP is JSON-RPC 2.0, so a batch is read member by member, a line that is not JSON is
 /// answered with `-32700`, and a request this side gives up is followed by `$/cancel_request`.
@@ -199,7 +220,7 @@ pub(crate) fn client_options(limits: &Limits) -> ClientOptions {
 pub(crate) fn wire_options(limits: &Limits, outbound_buffer_bytes: usize) -> WireOptions {
     WireOptions::new()
         .with_max_outbound_frame_bytes(outbound_buffer_bytes)
-        .with_max_outbound_queued_bytes(outbound_buffer_bytes)
+        .with_max_outbound_queued_bytes(queued_bytes_limit(outbound_buffer_bytes))
         .with_max_outbound_queued_frames(message_limit(limits))
         .with_batch_decoding()
         .with_parse_error_replies(PARSE_ERROR_REPLIES)
@@ -208,7 +229,9 @@ pub(crate) fn wire_options(limits: &Limits, outbound_buffer_bytes: usize) -> Wir
 
 #[cfg(test)]
 mod tests {
-    use super::{Overflow, client_options, message_limit, outgoing_budget, wire_options};
+    use super::{
+        Overflow, client_options, message_limit, outgoing_budget, queued_bytes_limit, wire_options,
+    };
     use mango_external_agents::Limits;
     use mango_external_agents::jsonrpc::PeerTermination;
 
@@ -326,6 +349,17 @@ mod tests {
     }
 
     #[test]
+    fn the_queue_holds_twice_the_frame_budget_and_never_wraps() {
+        for (budget, expected) in [(0, 0), (4_096, 8_192), (usize::MAX, usize::MAX)] {
+            let received = queued_bytes_limit(budget);
+            assert_eq!(
+                received, expected,
+                "expected the queued byte limit for a budget of {budget}: {expected} | received: {received}"
+            );
+        }
+    }
+
+    #[test]
     fn the_client_options_take_every_bound_from_the_hosts_limits() {
         let limits = Limits {
             turn_channel_capacity: 8,
@@ -378,7 +412,7 @@ mod tests {
             wire.parse_error_replies(),
             wire.cancel_on_abandon(),
         );
-        let expected = (4_096, 4_096, 8, true, Some(8), Some("$/cancel_request"));
+        let expected = (4_096, 8_192, 8, true, Some(8), Some("$/cancel_request"));
         assert_eq!(
             received, expected,
             "expected (frame bytes, queued bytes, queued frames, batches, parse replies, cancel method): {expected:?} | received: {received:?}"
