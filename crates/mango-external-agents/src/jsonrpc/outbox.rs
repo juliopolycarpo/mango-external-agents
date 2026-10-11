@@ -196,7 +196,9 @@ impl WireOptions {
     ///   line of its own takes none.
     /// - A response in a batch reaches its caller as one on a line of its own does, ordered
     ///   answers behind the notifications before them in the batch.
-    /// - A member that is not an object, and an empty array, are dropped.
+    /// - A member that is not an object, and an empty array, are dropped, unless
+    ///   [`with_invalid_request_replies`](Self::with_invalid_request_replies) has them
+    ///   answered.
     ///
     /// The answers to a batch's questions go out as frames of their own, not as one array.
     ///
@@ -319,8 +321,14 @@ impl WireOptions {
     /// which is a parse error and [`with_parse_error_replies`](Self::with_parse_error_replies)'s
     /// to answer.
     ///
+    /// Each reply is a frame of its own, for the members of a batch as well: they are not
+    /// gathered into one array.
+    ///
     /// At most `max_queued` such replies wait to be written at a time, and input that would
-    /// be answered while that many wait is dropped as before; `0` answers none. The bound is
+    /// be answered while that many wait is dropped as before; `0` answers none. A batch is
+    /// read in one go, so one with more members to answer than `max_queued` gets that many
+    /// replies and no more, however fast the peer reads. Keep the bound small: it is looked
+    /// through for each thing answered once it is reached. The bound is
     /// this option's own, apart from the one on parse-error replies. The replies are held
     /// beside the bounds of the outbound queue and go through the queue, and a reply is a
     /// write, with what [`with_parse_error_replies`](Self::with_parse_error_replies) says

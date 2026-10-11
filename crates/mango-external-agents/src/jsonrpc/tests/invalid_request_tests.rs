@@ -40,6 +40,20 @@ fn methods_seen(handled: &[(String, Value)]) -> Vec<&str> {
     handled.iter().map(|(method, _)| method.as_str()).collect()
 }
 
+/// Writes a probe and says what is on the wire with it: the methods written (`?` for a frame
+/// that has none), what is still queued beside the bounds, and whether the client closed. A
+/// reply queued and not yet written would go out ahead of the probe.
+async fn nothing_but_a_probe(link: &ScriptedLink, client: &Client) -> (Vec<String>, usize, bool) {
+    within("the probe", client.notify("probe", json!({})))
+        .await
+        .expect("expected the probe written");
+    let written = frames(link)
+        .iter()
+        .map(|frame| frame["method"].as_str().unwrap_or("?").to_owned())
+        .collect();
+    (written, client.state.outbox.aside(), client.is_closed())
+}
+
 /// The lines a client that answers invalid requests owes an answer: JSON that is neither an
 /// object nor an array.
 const NOT_REQUESTS: [&str; 5] = ["5", "\"text\"", "true", "false", "null"];
@@ -59,13 +73,12 @@ async fn json_that_is_not_a_request_is_dropped_by_a_client_that_was_not_asked_to
     let handled = handler.wait_for_notifications(1).await;
     let observed = (
         methods_seen(&handled),
-        link.sent().len(),
-        client.is_closed(),
+        nothing_but_a_probe(&link, &client).await,
     );
     assert_eq!(
         observed,
-        (vec!["after"], 0, false),
-        "expected nothing written and the next frame handled: ([\"after\"], 0, false) | received {observed:?}"
+        (vec!["after"], (vec![String::from("probe")], 0, false)),
+        "expected nothing written or queued and the next frame handled: ([\"after\"], ([\"probe\"], 0, false)) | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -171,13 +184,12 @@ async fn what_is_not_an_invalid_request_is_not_answered_as_one() {
     let handled = handler.wait_for_notifications(1).await;
     let observed = (
         methods_seen(&handled),
-        link.sent().len(),
-        client.is_closed(),
+        nothing_but_a_probe(&link, &client).await,
     );
     assert_eq!(
         observed,
-        (vec!["after"], 0, false),
-        "expected none of it answered and the next frame handled: ([\"after\"], 0, false) | received {observed:?}"
+        (vec!["after"], (vec![String::from("probe")], 0, false)),
+        "expected none of it answered and the next frame handled: ([\"after\"], ([\"probe\"], 0, false)) | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -310,4 +322,29 @@ async fn a_write_made_on_an_idle_link_follows_an_invalid_request_reply_still_que
         "expected the error ahead of the host's notification: [\"-32600\", \"mine\"] | received {written:?}"
     );
     client.close().await.expect("expected a clean close");
+}
+
+/// A bound of nothing answers nothing, and a batch with more members to answer than the bound
+/// allows gets as many answers as the bound and no more: a batch is read in one go.
+#[tokio::test]
+async fn the_bound_holds_at_nothing_and_inside_one_batch() {
+    for (bound, answered) in [(0, 0), (2, 2)] {
+        let (link, handler, client) = connect(
+            WireOptions::new()
+                .with_batch_decoding()
+                .with_invalid_request_replies(bound),
+        );
+        link.push_line(json!([1, 2, 3]).to_string());
+        link.push_line(notification("after"));
+        handler.wait_for_notifications(1).await;
+
+        let (written, queued, closed) = nothing_but_a_probe(&link, &client).await;
+        let observed = (written.len() - 1, queued, closed);
+        let expected = (answered, 0, false);
+        assert_eq!(
+            observed, expected,
+            "expected a bound of {bound} to answer that many of the batch's three members and no more: {expected:?} | received {observed:?} ({written:?})"
+        );
+        client.close().await.expect("expected a clean close");
+    }
 }

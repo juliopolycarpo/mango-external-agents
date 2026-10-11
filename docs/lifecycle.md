@@ -211,7 +211,7 @@ and the connection ends: a line or websocket message past `max_line_bytes`, and 
 frame that is not UTF-8. `with_invalid_request_replies(max_queued)` answers JSON that is not a
 request with `-32600` and a null id, under a bound of its own and beside the queue's bounds in the
 same way: a line that is a number, a string, `true`, `false` or `null`, and, where batches are
-read, an empty batch and each member of a batch that is not an object. An array on a client that
+read, an empty batch and each member of a batch that is not an object, each reply a frame of its own. An array on a client that
 does not read batches is not answered, and neither is an object, whatever it holds.
 `with_cancel_on_abandon(method)` queues a notification
 `method` with `{"requestId": id}` when a request that was written is given up, by its future or

@@ -3724,7 +3724,10 @@ impl ClientState {
             return;
         }
         let mut waiting = waiting.lock().unwrap_or_else(PoisonError::into_inner);
-        waiting.retain(|reply| reply.queued());
+        if waiting.len() >= limit {
+            // Looked through only when it matters: the ones written since are let go.
+            waiting.retain(|reply| reply.queued());
+        }
         if waiting.len() >= limit {
             return;
         }

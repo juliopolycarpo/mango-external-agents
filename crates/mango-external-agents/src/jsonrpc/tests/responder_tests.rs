@@ -706,9 +706,9 @@ async fn a_handler_without_the_hand_off_is_asked_through_on_request() {
 }
 
 /// The same handler with an answer that fits: `on_request` is asked, once, and what it
-/// returns is what the peer gets, queued like any other answer.
+/// returns is what the peer gets, with the question's place given back.
 #[tokio::test]
-async fn a_handler_without_the_hand_off_has_its_answer_queued() {
+async fn a_handler_without_the_hand_off_has_its_answer_written() {
     let link = ScriptedLink::new();
     let handler = RecordingHandler::arc(Some(ServerRequestOutcome::Answer(json!("yes"))));
     let client = Client::connect_with(
