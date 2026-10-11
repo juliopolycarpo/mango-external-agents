@@ -250,7 +250,8 @@ where
 ///   connection ended any other way. An opening call returns no session or control handle, so
 ///   this is the only path that preserves the tail for a host to inspect.
 /// - Whatever [`request_error`](crate::error::request_error) made of the agent's own refusal.
-/// - [`Error::Protocol`] when the answer is not the method's result.
+/// - [`Error::Protocol`] when the answer is not the method's result, or carries an `error`
+///   member that is not an error object.
 ///
 /// ```ignore
 /// let response = await_sent(&connection, &profile, sent).await?;
@@ -274,6 +275,12 @@ where
         Err(failure) => failure,
     };
     match failure.cause() {
+        // An `error` member that is not an error object is not the agent's refusal. Like a
+        // result that is not the method's, it is an answer this side could not read.
+        CallFailureCause::Peer(_) if failure.peer_error_was_unreadable() => {
+            submitted.abandonment.disarm();
+            Err(unreadable_error(method))
+        }
         CallFailureCause::Peer(refusal) => {
             submitted.abandonment.disarm();
             Err(crate::error::request_error(
@@ -337,7 +344,8 @@ pub(crate) enum PromptFailure {
     ///
     /// The connection is as healthy as after any answer, so the session stays usable.
     Agent(AcpError),
-    /// The agent answered with a result this client could not read as a prompt's.
+    /// The agent answered with a result this client could not read as a prompt's, or with an
+    /// `error` member that is not an error object.
     ///
     /// The agent believes the turn ended some way this side cannot tell, so what state it
     /// holds the session in is unknown, and the connection is not used again. Carried as the
@@ -399,6 +407,14 @@ impl PromptCall {
             Err(failure) => failure,
         };
         match failure.cause() {
+            // Not a refusal this side understood: the agent answered with something where an
+            // error object belongs, so what it holds the session to be is as unknown as after
+            // a result that cannot be read.
+            CallFailureCause::Peer(_) if failure.peer_error_was_unreadable() => {
+                let mut unreadable = AcpError::internal_error();
+                unreadable.message = unreadable_error(PromptRequest::METHOD).to_string();
+                Err(PromptFailure::Unreadable(unreadable))
+            }
             CallFailureCause::Peer(refusal) => Err(PromptFailure::Agent(agent_error(refusal))),
             _ => Err(PromptFailure::LinkClosed),
         }
@@ -450,6 +466,18 @@ pub(crate) fn submit_prompt(
         return Ok(PromptCall { reply: None });
     }
     Err(connection.not_queued(error))
+}
+
+/// What a request reports when the agent answered it with an `error` member that is not an
+/// error object: `null`, a string, an object without a numeric code or a message.
+///
+/// Nothing of the member is quoted. For example, `unreadable_error("session/list")` displays
+/// as a protocol failure that expected `a session/list error object`.
+fn unreadable_error(method: &str) -> Error {
+    Error::Protocol {
+        expected: format!("a {method} error object"),
+        received: String::from("an error member that is not an error object"),
+    }
 }
 
 /// The agent's own error frame, in the schema's type.
@@ -520,6 +548,22 @@ mod tests {
                 "expected (connection usable, code reported) for {failure:?}: ({usable}, {code:?}) | received: {received:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_unreadable_error_names_the_method_and_quotes_nothing() {
+        let received = super::unreadable_error("session/list");
+        let Error::Protocol { expected, received } = &received else {
+            panic!("expected Error::Protocol | received: {received:?}");
+        };
+        assert_eq!(
+            (expected.as_str(), received.as_str()),
+            (
+                "a session/list error object",
+                "an error member that is not an error object"
+            ),
+            "expected the protocol error to name the method and the mismatch | received: ({expected:?}, {received:?})"
+        );
     }
 
     #[test]

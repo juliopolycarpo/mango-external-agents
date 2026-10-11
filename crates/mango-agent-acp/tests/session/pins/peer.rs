@@ -417,3 +417,42 @@ async fn requests_cycled_one_at_a_time_behind_a_prompt_are_all_admitted() {
         );
     }
 }
+
+/// An answer whose `error` member is not an error object is not the agent's refusal: there is
+/// no code and no message to report. A request other than a prompt fails as a protocol
+/// failure naming what was expected, with nothing of the member quoted, and the session goes
+/// on, as it does after a result that is not the method's.
+#[tokio::test]
+async fn an_error_member_that_is_not_an_error_object_fails_a_request_as_a_protocol_failure() {
+    for body in [
+        serde_json::Value::Null,
+        serde_json::json!("Authorization: Bearer top-secret-token"),
+        serde_json::json!({ "code": "x" }),
+        serde_json::json!([-32000, "no"]),
+    ] {
+        let malformed = body.clone();
+        let (session, _launcher) = open_under(
+            listing_peer(move |frame| {
+                vec![
+                    serde_json::json!({ "jsonrpc": "2.0", "id": frame["id"], "error": malformed })
+                        .to_string(),
+                ]
+            }),
+            Limits::default(),
+        )
+        .await;
+
+        let error = refusal(session.list_sessions(Default::default()).await);
+        let shown = error.to_string();
+        let received = (
+            matches!(error.cause(), Error::Protocol { expected, .. } if expected == "a session/list error object"),
+            shown.contains("top-secret-token"),
+            session.snapshot().status,
+        );
+        let expected = (true, false, SessionStatus::Ready);
+        assert_eq!(
+            received, expected,
+            "expected (a protocol failure naming session/list, the member quoted, status) for error {body}: {expected:?} | received: {received:?} from {error:?}"
+        );
+    }
+}
