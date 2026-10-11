@@ -239,9 +239,16 @@ through `tool_call_update`, so a silent one is not a working one.
 
 An agent that answers `session/prompt` with a JSON-RPC error has refused the prompt: the turn
 ends with one `EventKind::Error` coded `acp-request-failed`, with `request_id` `session/prompt`,
-the agent's code as `vendor_code` and its message, or `-32603` for a result this client could
-not read. The connection is torn down before the event is written, as for any prompt that did
-not complete; a stop reason such as `refusal` or `max_tokens` is a result and does not end it.
+the agent's code as `vendor_code` and its message. The session stays usable, as it does after a
+`refusal` or `max_tokens` stop: the agent answered, so the connection is as healthy as after
+any answer. The failed turn's parked questions are withdrawn with ACP's `cancelled` outcome, the
+calls it left running are closed as failed, and the next `start_turn` begins clean. A host
+`cancel` that the agent answers with such an error still ends the turn as `Cancelled`.
+
+A result this client could not read is different. The turn reports it the same way, with
+`-32603` as the code, but the connection is torn down before the event is written: the agent
+believes the turn ended some way this side cannot tell, so what it holds the session to be is
+unknown. A prompt with no answer at all, because the link closed, ends the session too.
 
 A turn ends as `Cancelled` in two cases. The agent answered its prompt with
 `stop_reason: cancelled`, which is believed and reported as `Requested` when no reason was

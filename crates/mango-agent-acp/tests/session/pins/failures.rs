@@ -570,6 +570,258 @@ async fn an_agents_own_error_on_the_prompt_fails_the_turn_as_its_refusal() {
     );
 }
 
+/// The JSON-RPC error an agent answers a prompt with.
+fn prompt_refusal(id: &serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "error": { "code": -31_000, "message": "model busy" }
+    })
+    .to_string()
+}
+
+/// A `session/update` line for the fake session carrying `update`.
+fn update_line(update: serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": { "sessionId": "sess_fake", "update": update }
+    })
+    .to_string()
+}
+
+/// A `session/request_permission` line under `id` with one way to allow and one to refuse.
+fn permission_ask(id: u32) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_fake",
+            "toolCall": { "toolCallId": "call_1", "kind": "execute", "title": "Run tests" },
+            "options": [
+                { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                { "optionId": "reject", "name": "Reject", "kind": "reject_once" },
+            ],
+        }
+    })
+    .to_string()
+}
+
+/// Starts `turn_id` once the session's turn slot is free, within five seconds.
+///
+/// A turn's terminal is published just ahead of the release of its slot, so the next start can
+/// be answered `Busy` for a moment. Bounded, so a slot that is never released fails here.
+async fn start_when_free(session: &dyn Session, turn_id: &str, input: &str) -> TurnStream {
+    let begun = std::time::Instant::now();
+    loop {
+        match session.start_turn(TurnRequest::new(turn_id, input)).await {
+            Ok(turn) => return turn,
+            Err(error) if matches!(error.cause(), Error::Busy) => {
+                assert!(
+                    begun.elapsed() < Duration::from_secs(5),
+                    "expected the turn slot free for {turn_id} within 5s | received: still busy"
+                );
+                tokio::task::yield_now().await;
+            }
+            Err(error) => panic!("expected {turn_id} accepted | received refusal: {error:?}"),
+        }
+    }
+}
+
+/// An agent that refuses a prompt with an error of its own has answered: the connection is as
+/// healthy as after any answer, so the session stays usable, as it does after a `refusal` or a
+/// `max_tokens` stop. The failed turn leaves nothing behind for the next one: the question it
+/// left parked is withdrawn, the call it left running is closed with the failed turn, and the
+/// second turn on the same session starts clean and completes.
+#[tokio::test]
+async fn a_session_takes_another_turn_after_an_agents_error_on_the_prompt() {
+    let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&prompts);
+    let peer = ScriptedPeer::new(move |frame| match frame["method"].as_str() {
+        Some("session/prompt") => {
+            match seen.fetch_add(1, std::sync::atomic::Ordering::AcqRel) {
+                // The first prompt: a call left running, a question left open, then the error.
+                0 => vec![
+                    update_line(serde_json::json!({
+                        "sessionUpdate": "tool_call", "toolCallId": "call_1",
+                        "title": "Run tests", "kind": "execute", "status": "in_progress",
+                    })),
+                    permission_ask(9_001),
+                    prompt_refusal(&frame["id"]),
+                ],
+                _ => vec![
+                    update_line(serde_json::json!({
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "second" }
+                    })),
+                    reply(
+                        &frame["id"],
+                        serde_json::json!({ "stopReason": "end_turn" }),
+                    ),
+                ],
+            }
+        }
+        _ => Vec::new(),
+    });
+    let launcher = FakeLauncher::new();
+    launcher.push(peer.process());
+    let session = AcpHarness::new(profile())
+        .open_session(
+            &host(&launcher),
+            OpenSession::new("chat-1").with_configuration(permissive()),
+        )
+        .await
+        .expect("expected a session");
+
+    let mut first = session
+        .start_turn(TurnRequest::new("turn-1", "try"))
+        .await
+        .expect("expected the first turn");
+    let events = event_labels(&drain(&mut first).await);
+    let received = (
+        events
+            .iter()
+            .filter(|label| label.starts_with("ActivityCompleted"))
+            .count(),
+        events.last().map(String::as_str),
+    );
+    let expected = (1, Some("Error(acp-request-failed)"));
+    assert_eq!(
+        received, expected,
+        "expected (calls closed, terminal) of the refused turn: {expected:?} | received: {received:?} in {events:?}"
+    );
+    eventually("the parked question withdrawn", &launcher, || {
+        wire_labels(&launcher)
+            .iter()
+            .any(|label| label == "outcome cancelled for 9001")
+            .then_some(())
+    })
+    .await;
+    assert_status(
+        "after the agent's error",
+        session.snapshot().status,
+        SessionStatus::Ready,
+    );
+    assert_eq!(
+        launcher.live_children(),
+        1,
+        "expected the agent still running after its own error | received: {} children",
+        launcher.live_children()
+    );
+
+    let mut second = start_when_free(session.as_ref(), "turn-2", "again").await;
+    assert_events(
+        "the second turn",
+        &drain(&mut second).await,
+        &["TurnStarted", "TextDelta(second)", "Completed"],
+    );
+    assert_status(
+        "after the second turn",
+        session.snapshot().status,
+        SessionStatus::Ready,
+    );
+}
+
+/// A cancel that races the agent's own error is still the host's cancel: the turn ends as
+/// `Cancelled` with the reason the host gave, the agent having answered, and the session takes
+/// the next turn.
+#[tokio::test]
+async fn a_cancel_answered_with_the_agents_error_ends_as_cancelled_and_keeps_the_session() {
+    let prompt = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let held = Arc::clone(&prompt);
+    let peer = ScriptedPeer::new(move |frame| {
+        let mut held = held.lock().expect("expected the prompt slot");
+        match frame["method"].as_str() {
+            Some("session/prompt")
+                if held.is_none() && frame["params"]["prompt"][0]["text"] == "wait" =>
+            {
+                *held = frame.get("id").cloned();
+                Vec::new()
+            }
+            Some("session/prompt") => {
+                vec![reply(
+                    &frame["id"],
+                    serde_json::json!({ "stopReason": "end_turn" }),
+                )]
+            }
+            // The agent answers the cancel by failing the prompt it was holding.
+            Some("session/cancel") => held.take().iter().map(prompt_refusal).collect(),
+            _ => Vec::new(),
+        }
+    });
+    let (session, _launcher) = open_under(peer.process(), Limits::default()).await;
+
+    let mut first = session
+        .start_turn(TurnRequest::new("turn-1", "wait"))
+        .await
+        .expect("expected the first turn");
+    session
+        .cancel(CancelReason::Requested)
+        .await
+        .expect("expected the cancel to be queued");
+    assert_events(
+        "the cancelled turn",
+        &drain(&mut first).await,
+        &["TurnStarted", "Cancelled(Requested)", "Completed"],
+    );
+    assert_status(
+        "after the cancel",
+        session.snapshot().status,
+        SessionStatus::Ready,
+    );
+
+    let mut second = start_when_free(session.as_ref(), "turn-2", "again").await;
+    assert_events(
+        "the turn after the cancel",
+        &drain(&mut second).await,
+        &["TurnStarted", "Completed"],
+    );
+}
+
+/// A result this client cannot read is not the agent's refusal: the agent believes it answered
+/// and nothing says what it thinks the session's state is. The turn fails and the session ends,
+/// as it does when the link closes.
+#[tokio::test]
+async fn a_prompt_result_that_cannot_be_read_still_ends_the_session() {
+    let peer = ScriptedPeer::new(|frame| match frame["method"].as_str() {
+        Some("session/prompt") => vec![reply(&frame["id"], serde_json::json!({ "stopReason": 7 }))],
+        _ => Vec::new(),
+    });
+    let (session, launcher) = open_under(peer.process(), Limits::default()).await;
+    let mut lifecycle = session.subscribe();
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "try"))
+        .await
+        .expect("expected a turn");
+
+    let events = drain(&mut turn).await;
+    assert_events(
+        "the unreadable turn",
+        &events,
+        &["TurnStarted", "Error(acp-request-failed)"],
+    );
+    let Some(EventKind::Error { error }) = events.last() else {
+        unreachable!("the events above end in an error");
+    };
+    let received = (error.request_id.as_deref(), error.vendor_code.as_deref());
+    let expected = (Some("session/prompt"), Some("-32603"));
+    assert_eq!(
+        received, expected,
+        "expected (request, code) of the unreadable result: {expected:?} | received: {received:?}"
+    );
+    assert_status(
+        "after an unreadable result",
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+    );
+    assert_no_live_children("after an unreadable result", &launcher);
+    let next = refusal(
+        session
+            .start_turn(TurnRequest::new("turn-2", "again"))
+            .await,
+    );
+    assert!(
+        matches!(next.cause(), Error::Closed { subject: "session" }),
+        "expected the next turn: Closed {{ subject: \"session\" }} | received: {next:?}"
+    );
+}
+
 /// A request that passed its deadline ends the connection under a turn that was still running.
 /// Nobody asked to stop that turn, so it ends as the closed link and not as a cancellation the
 /// host never requested. The message says which request's deadline closed the link, so the

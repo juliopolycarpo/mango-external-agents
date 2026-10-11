@@ -1289,11 +1289,20 @@ impl Session for AcpSession {
                     tokio::time::timeout(std::time::Duration::ZERO, &mut prompt).await.ok()
                 },
             };
-            let cleanup_error = if outcome.is_none() || matches!(outcome, Some(Err(_))) {
+            // The connection is kept after any answer this side understood: a result, and the
+            // agent's own refusal of the prompt. It is ended when there was no answer, and when
+            // the answer could not be read, because what the agent then holds the session to be
+            // is unknown.
+            let answered = match &outcome {
+                Some(Ok(_)) => true,
+                Some(Err(failure)) => failure.leaves_the_connection_usable(),
+                None => false,
+            };
+            let cleanup_error = if answered {
+                None
+            } else {
                 connection.begin_shutdown(CancelReason::Shutdown);
                 connection.wait_shutdown().await.err()
-            } else {
-                None
             };
             // Once `close` owns this session, its task also owns the terminal and the status. A
             // prompt response racing the close handshake must not publish a competing outcome.
@@ -1592,10 +1601,10 @@ fn prompt_ending(
     }
     // Nobody asked to stop this turn. Reporting `Cancelled` from here would tell a host it
     // stopped a turn whose agent died, and would drop the stderr that says why.
-    if let Some(PromptFailure::Agent(refusal)) = &error {
-        // The agent answered, with an error of its own. That is its refusal of the prompt,
-        // with its code, and not a link that closed: the same failure a refused
-        // `session/new` is reported as.
+    if let Some(refusal) = error.as_ref().and_then(PromptFailure::answered_with) {
+        // The agent answered, with an error of its own or with a result this side could not
+        // read. Either is a failed request with a code, and not a link that closed: the same
+        // failure a refused `session/new` is reported as.
         return Some(Ending::Fail(crate::error::vendor_error(
             <PromptRequest as client::AgentRequest>::METHOD,
             refusal,
