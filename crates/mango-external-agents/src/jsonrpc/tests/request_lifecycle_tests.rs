@@ -1399,10 +1399,10 @@ mod on_either_runtime {
 }
 
 /// The failure of a call the peer answered with `error`, the member written as given.
-async fn answered_with_error(gated: &Gated, error: &str) -> CallFailure {
+async fn answered_with_error(gated: &Gated, asking: RequestOptions, error: &str) -> CallFailure {
     let submitted = gated
         .client
-        .submit_request("session/new", json!({}), RequestOptions::new())
+        .submit_request("session/new", json!({}), asking)
         .expect("expected the request queued");
     let id = submitted.id().as_json().clone();
     let (written, reply) = submitted.into_parts();
@@ -1417,15 +1417,31 @@ async fn answered_with_error(gated: &Gated, error: &str) -> CallFailure {
         .expect_err("expected the reply to fail")
 }
 
-/// What a failure says of the peer's error: whether it could not be read, and the cause.
-fn peer_error(failure: &CallFailure) -> (bool, CallFailureCause) {
-    (failure.peer_error_was_unreadable(), failure.cause().clone())
+/// What a failure says of the peer's error: whether it was not an error object, and the code,
+/// message and data in its cause. Spelled out, since an error's `Debug` shows no text.
+fn peer_error(failure: &CallFailure) -> (bool, Option<(i64, String, Option<Value>)>) {
+    let held = match failure.cause() {
+        CallFailureCause::Peer(error) => {
+            Some((error.code, error.message.clone(), error.data.clone()))
+        }
+        _ => None,
+    };
+    (failure.peer_error_was_unreadable(), held)
+}
+
+/// The code and message of the error a failure turns into, when it is a vendor's.
+fn vendor_error(failure: CallFailure) -> Option<(Option<String>, String)> {
+    match failure.into_error() {
+        Error::Vendor(vendor) => Some((vendor.vendor_code, vendor.message)),
+        _ => None,
+    }
 }
 
 /// An `error` member that is not an error object fails the call as the peer's doing, with
 /// this side's stand-in for the error, and says that it could not be read. Each shape: not an
-/// object, an object without a code or without a message, and one whose code is not an integer
-/// or whose message is not a string. The connection stays open.
+/// object, an object without a code or without a message, one whose code is not a whole
+/// number as written or is past 64 bits, and one whose message is not a string. The same for
+/// a call that waits its turn behind earlier notifications. The connection stays open.
 #[tokio::test]
 async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
     let gated = gated(options(), WireOptions::new());
@@ -1439,37 +1455,68 @@ async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
         r#"{"code":"x"}"#,
         r#"{"code":"x","message":"m"}"#,
         r#"{"code":1.5,"message":"m"}"#,
+        r#"{"code":1.0,"message":"m"}"#,
+        r#"{"code":9223372036854775808,"message":"m"}"#,
         r#"{"code":1}"#,
         r#"{"message":"m"}"#,
         r#"{"code":1,"message":2}"#,
     ];
     for shape in shapes {
-        let failure = answered_with_error(&gated, shape).await;
+        for ordered in [false, true] {
+            let asking = match ordered {
+                true => ordered_options(),
+                false => RequestOptions::new(),
+            };
+            let failure = answered_with_error(&gated, asking, shape).await;
+            let observed = peer_error(&failure);
+            let expected = (true, Some((-32603, String::from(shape), None)));
+            assert_eq!(
+                observed, expected,
+                "expected the error member {shape} told as unreadable, with the stand-in for it (ordered: {ordered}): {expected:?} | received {observed:?}"
+            );
+            let observed = vendor_error(failure);
+            let expected = Some((Some(String::from("-32603")), String::from(shape)));
+            assert_eq!(
+                observed, expected,
+                "expected the failure to turn into a vendor error with the stand-in's code and text for {shape}: {expected:?} | received {observed:?}"
+            );
+        }
+    }
+    assert_ended(&gated.client, None);
+}
+
+/// An array is not an error object, and is told as unreadable. One that holds a code and a
+/// message in that order has always failed its call with that code and message, not with the
+/// stand-in, and still does.
+#[tokio::test]
+async fn an_error_member_that_is_an_array_is_told_as_unreadable_with_what_it_read_as() {
+    let gated = gated(options(), WireOptions::new());
+    let arrays = [
+        (r#"[-32000,"no"]"#, None),
+        (r#"[-32000,"no",null]"#, None),
+        (r#"[-32000,"no",{"a":1}]"#, Some(json!({"a": 1}))),
+    ];
+    for (array, data) in arrays {
+        let failure = answered_with_error(&gated, RequestOptions::new(), array).await;
         let observed = peer_error(&failure);
-        let expected = (
-            true,
-            CallFailureCause::Peer(JsonRpcError {
-                code: -32603,
-                message: String::from(shape),
-                data: None,
-            }),
-        );
+        let expected = (true, Some((-32000, String::from("no"), data)));
         assert_eq!(
             observed, expected,
-            "expected the error member {shape} told as unreadable, with the stand-in for it: {expected:?} | received {observed:?}"
+            "expected the array {array} told as unreadable, with the code and message it reads as: {expected:?} | received {observed:?}"
         );
-        let error = failure.into_error();
-        assert!(
-            matches!(&error, Error::Vendor(vendor) if vendor.vendor_code.as_deref() == Some("-32603") && vendor.message == shape),
-            "expected the error `request` returns for the error member {shape}: a vendor failure with the code -32603 and that text | received {error:?}"
+        let observed = vendor_error(failure);
+        let expected = Some((Some(String::from("-32000")), String::from("no")));
+        assert_eq!(
+            observed, expected,
+            "expected the failure to turn into the vendor error it always has for {array}: {expected:?} | received {observed:?}"
         );
     }
     assert_ended(&gated.client, None);
 }
 
 /// An error object the peer sent is its own, whatever it says: its own `-32603`, one whose
-/// message is the very text a stand-in would carry, and one with members this side does not
-/// know. None of them is told as unreadable.
+/// message is the very text a stand-in would carry, one with members this side does not
+/// know, and one whose data is null. None of them is told as unreadable.
 #[tokio::test]
 async fn an_error_object_from_the_peer_is_never_told_as_unreadable() {
     let gated = gated(options(), WireOptions::new());
@@ -1485,18 +1532,16 @@ async fn an_error_object_from_the_peer_is_never_told_as_unreadable() {
             -32000,
             "no",
         ),
+        (
+            r#"{"code":-32000,"message":"no","data":null}"#,
+            -32000,
+            "no",
+        ),
     ];
     for (object, code, message) in objects {
-        let failure = answered_with_error(&gated, object).await;
+        let failure = answered_with_error(&gated, RequestOptions::new(), object).await;
         let observed = peer_error(&failure);
-        let expected = (
-            false,
-            CallFailureCause::Peer(JsonRpcError {
-                code,
-                message: String::from(message),
-                data: None,
-            }),
-        );
+        let expected = (false, Some((code, String::from(message), None)));
         assert_eq!(
             observed, expected,
             "expected the peer's own error {object} told as read: {expected:?} | received {observed:?}"
@@ -1505,31 +1550,35 @@ async fn an_error_object_from_the_peer_is_never_told_as_unreadable() {
     assert_ended(&gated.client, None);
 }
 
-/// A failure that is not the peer's answer says nothing of an unreadable error: here a call
-/// the peer left unanswered when it went away.
-#[tokio::test]
+/// A failure that is not the peer's answer says nothing of an unreadable error: a call whose
+/// deadline passed, and one the peer left unanswered when it went away.
+#[tokio::test(start_paused = true)]
 async fn a_failure_that_is_not_the_peers_answer_is_not_told_as_unreadable() {
     let gated = gated(options(), WireOptions::new());
-    let (written, reply) = gated
-        .client
-        .submit_request("session/new", json!({}), RequestOptions::new())
-        .expect("expected the request queued")
-        .into_parts();
-    within("the request written", written)
-        .await
-        .expect("expected the request written");
+    let ask = |asking: RequestOptions| {
+        gated
+            .client
+            .submit_request("session/new", json!({}), asking)
+            .expect("expected the request queued")
+            .into_parts()
+    };
+    let (written, late) = ask(RequestOptions::new().with_timeout(Duration::from_secs(1)));
+    written.await.expect("expected the request written");
+    let late = late.await.expect_err("expected the deadline to pass");
+    let (written, unanswered) = ask(unbounded());
+    written.await.expect("expected the request written");
     gated.link.end();
+    let unanswered = unanswered.await.expect_err("expected the reply to fail");
 
-    let failure = within("the reply", reply)
-        .await
-        .expect_err("expected the reply to fail");
     let observed = (
-        failure.peer_error_was_unreadable(),
-        matches!(failure.cause(), CallFailureCause::Ended(_)),
+        late.peer_error_was_unreadable(),
+        matches!(late.cause(), CallFailureCause::TimedOut { .. }),
+        unanswered.peer_error_was_unreadable(),
+        matches!(unanswered.cause(), CallFailureCause::Ended(_)),
     );
     assert_eq!(
         observed,
-        (false, true),
-        "expected an ended connection, not told as an unreadable error: (false, true) | received {observed:?}"
+        (false, true, false, true),
+        "expected a deadline and an ended connection, neither told as an unreadable error: (false, true, false, true) | received {observed:?}"
     );
 }

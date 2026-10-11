@@ -1065,14 +1065,19 @@ pub struct CallFailure {
 #[non_exhaustive]
 pub enum CallFailureCause {
     /// The peer answered with an error frame. Its code, message and data are here as it sent
-    /// them when its `error` member was an error object: an object with a `code` that is an
-    /// integer and a `message` that is a string. Nothing this side says about itself ever
-    /// appears in this variant, with one exception: an `error` member that is anything else
-    /// (`null`, a string, an object with a `code` that is not an integer) could not be read as
-    /// one, and what is here is then this side's stand-in for it, the code `-32603` and the
-    /// member's JSON text for a message. The stand-in cannot be told from a peer's own
-    /// `-32603` by what it holds;
-    /// [`CallFailure::peer_error_was_unreadable`] tells them apart.
+    /// them when its `error` member was an error object: an object with a `code` that is a
+    /// whole number written without a fraction or an exponent and within a signed 64 bits,
+    /// and a `message` that is a string. Nothing this side says about itself ever appears in
+    /// this variant, with one exception: an `error` member that is anything else (`null`, a
+    /// string, an object with a `code` of `"x"` or `1.0`) could not be read as one, and what
+    /// is here is then this side's stand-in for it, the code `-32603` and the member's JSON
+    /// text for a message. The stand-in cannot be told from a peer's own `-32603` by what it
+    /// holds; [`CallFailure::peer_error_was_unreadable`] tells them apart.
+    ///
+    /// An array is not an error object either. One that holds a code and a message in that
+    /// order, such as `[-32000,"no"]`, has always been read as if it were, and still is: that
+    /// code and message are here, and
+    /// [`peer_error_was_unreadable`](CallFailure::peer_error_was_unreadable) says `true`.
     Peer(JsonRpcError),
     /// The connection ended before an answer came. [`Client::ended`] returns the same reason.
     Ended(ConnectionEnd),
@@ -1121,12 +1126,15 @@ impl CallFailure {
         &self.parts.0
     }
 
-    /// Whether the peer answered with an `error` member that could not be read as an error
-    /// object: one that is not an object with a `code` that is an integer and a `message`
-    /// that is a string, such as `null`, `"boom"` or `{"code":"x"}`.
+    /// Whether the peer answered with an `error` member that is not an error object: not an
+    /// object with a `code` that is a whole number, written without a fraction or an exponent
+    /// and within a signed 64 bits, and a `message` that is a string. `null`, `"boom"`,
+    /// `[1]`, `{"code":"x"}` and `{"code":1.0,"message":"m"}` are such members.
     ///
     /// The cause of such a failure is still [`CallFailureCause::Peer`], and the error in it
     /// is this side's stand-in: the code `-32603` and the member's JSON text for a message.
+    /// The one exception is an array that holds a code and a message in that order: what it
+    /// holds is in the cause, as it always was, and this is `true` for it all the same.
     /// A peer that answers with its own `-32603` gives the same code and `false` here. It is
     /// `false` for every other cause. A harness can use it to treat a peer that breaks the
     /// protocol differently from one that refuses a request, without reading the message.
@@ -1237,8 +1245,8 @@ impl Failed {
 enum FailedCause {
     /// The peer's own error frame.
     Peer,
-    /// The peer's error frame, with an `error` member that could not be read as an error
-    /// object. The body is this side's stand-in for it.
+    /// The peer's error frame, with an `error` member that is not an error object. The body
+    /// is this side's stand-in for it, or what an array read as.
     PeerUnreadable,
     /// The connection ended.
     Ended(ConnectionEnd),
@@ -4431,20 +4439,23 @@ async fn dispatch_frame(
         let outcome = match frame.remove("error") {
             // Deserialised from a reference so the raw value survives for the fallback, which is
             // only rendered when the body is malformed.
-            Some(error) => Err(match JsonRpcError::deserialize(&error) {
-                Ok(body) => Failed {
-                    body,
-                    cause: FailedCause::Peer,
-                },
-                Err(_) => Failed {
-                    body: JsonRpcError {
+            Some(error) => {
+                let read = JsonRpcError::deserialize(&error);
+                // An array reads as the fields in order, and what it reads as is still what
+                // the call fails with; it is not an error object for that.
+                let cause = match &read {
+                    Ok(_) if error.is_object() => FailedCause::Peer,
+                    _ => FailedCause::PeerUnreadable,
+                };
+                Err(Failed {
+                    body: read.unwrap_or_else(|_| JsonRpcError {
                         code: -32603,
                         message: error.to_string(),
                         data: None,
-                    },
-                    cause: FailedCause::PeerUnreadable,
-                },
-            }),
+                    }),
+                    cause,
+                })
+            }
             None => Ok(frame.remove("result").unwrap_or(Value::Null)),
         };
         return ClientState::deliver(state, notifications, RequestId::new(id).key(), outcome).await;
