@@ -1071,19 +1071,21 @@ pub struct CallFailure {
 #[non_exhaustive]
 pub enum CallFailureCause {
     /// The peer answered with an error frame. Its code, message and data are here as it sent
-    /// them when its `error` member was an error object: an object with a `code` that is a
-    /// whole number written without a fraction or an exponent and within a signed 64 bits,
-    /// and a `message` that is a string. Nothing this side says about itself ever appears in
-    /// this variant, with one exception: an `error` member that is anything else (`null`, a
-    /// string, an object with a `code` of `"x"` or `1.0`) could not be read as one, and what
-    /// is here is then this side's stand-in for it, the code `-32603` and the member's JSON
-    /// text for a message. The stand-in cannot be told from a peer's own `-32603` by what it
+    /// them when its `error` member was an error object: an object with a `code` this side
+    /// reads as a signed 64-bit integer and a `message` that is a string. Such a code is a
+    /// whole number within that range, written without a fraction or an exponent and not as
+    /// `-0`. Nothing this side says about itself ever appears in this variant, with one
+    /// exception: an `error` member that is anything else (`null`, a string, an object with
+    /// a `code` of `"x"` or `1.0`) could not be read as one, and what is here is then this
+    /// side's stand-in for it, the code `-32603` and, for a message, the member written
+    /// again as JSON. The stand-in cannot be told from a peer's own `-32603` by what it
     /// holds; [`CallFailure::peer_error_was_unreadable`] tells them apart.
     ///
-    /// An array is not an error object either. One that holds a code and a message in that
-    /// order, such as `[-32000,"no"]`, has always been read as if it were, and still is: that
-    /// code and message are here, and
+    /// An array is not an error object either. One of exactly such a code and a message, with
+    /// or without data after them, such as `[-32000,"no"]`, has always been read as if it
+    /// were, and still is: that code and message are here, and
     /// [`peer_error_was_unreadable`](CallFailure::peer_error_was_unreadable) says `true`.
+    /// Any other array comes to the stand-in.
     Peer(JsonRpcError),
     /// The connection ended before an answer came. [`Client::ended`] returns the same reason.
     Ended(ConnectionEnd),
@@ -1133,14 +1135,16 @@ impl CallFailure {
     }
 
     /// Whether the peer answered with an `error` member that is not an error object: not an
-    /// object with a `code` that is a whole number, written without a fraction or an exponent
-    /// and within a signed 64 bits, and a `message` that is a string. `null`, `"boom"`,
-    /// `[1]`, `{"code":"x"}` and `{"code":1.0,"message":"m"}` are such members.
+    /// object with a `code` this side reads as a signed 64-bit integer (a whole number within
+    /// that range, written without a fraction or an exponent and not as `-0`) and a `message`
+    /// that is a string. `null`, `"boom"`, `[1]`, `{"code":"x"}` and
+    /// `{"code":1.0,"message":"m"}` are such members.
     ///
     /// The cause of such a failure is still [`CallFailureCause::Peer`], and the error in it
-    /// is this side's stand-in: the code `-32603` and the member's JSON text for a message.
-    /// The one exception is an array that holds a code and a message in that order: what it
-    /// holds is in the cause, as it always was, and this is `true` for it all the same.
+    /// is this side's stand-in: the code `-32603` and, for a message, the member written
+    /// again as JSON. The one exception is an array of exactly such a code and a message,
+    /// with or without data after them: what it holds is in the cause, as it always was, and
+    /// this is `true` for it all the same.
     /// A peer that answers with its own `-32603` gives the same code and `false` here. It is
     /// `false` for every other cause. A harness can use it to treat a peer that breaks the
     /// protocol differently from one that refuses a request, without reading the message.

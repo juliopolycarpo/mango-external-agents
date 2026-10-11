@@ -1440,8 +1440,10 @@ fn vendor_error(failure: CallFailure) -> Option<(Option<String>, String)> {
 /// An `error` member that is not an error object fails the call as the peer's doing, with
 /// this side's stand-in for the error, and says that it could not be read. Each shape: not an
 /// object, an object without a code or without a message, one whose code is not a whole
-/// number as written or is past 64 bits, and one whose message is not a string. The same for
-/// a call that waits its turn behind earlier notifications. The connection stays open.
+/// number as written, is `-0` or is past 64 bits, and one whose message is not a string, and
+/// an array that does not read as a code and a message. The same for a call that asks for its
+/// answer in turn with the notifications, which is handed over by the handler's task. The
+/// connection stays open.
 #[tokio::test]
 async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
     let gated = gated(options(), WireOptions::new());
@@ -1451,6 +1453,9 @@ async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
         "7",
         "true",
         "[1]",
+        "[]",
+        r#"["x","m"]"#,
+        r#"[-32000,"no",null,1]"#,
         "{}",
         r#"{"code":"x"}"#,
         r#"{"code":"x","message":"m"}"#,
@@ -1461,7 +1466,16 @@ async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
         r#"{"message":"m"}"#,
         r#"{"code":1,"message":2}"#,
     ];
-    for shape in shapes {
+    // Each with the text it is written again as, which for `-0` is not what was sent.
+    let minus_zero = (
+        r#"{"code":-0,"message":"m"}"#,
+        r#"{"code":-0.0,"message":"m"}"#,
+    );
+    let shapes = shapes
+        .into_iter()
+        .map(|shape| (shape, shape))
+        .chain([minus_zero]);
+    for (shape, text) in shapes {
         for ordered in [false, true] {
             let asking = match ordered {
                 true => ordered_options(),
@@ -1469,13 +1483,13 @@ async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
             };
             let failure = answered_with_error(&gated, asking, shape).await;
             let observed = peer_error(&failure);
-            let expected = (true, Some((-32603, String::from(shape), None)));
+            let expected = (true, Some((-32603, String::from(text), None)));
             assert_eq!(
                 observed, expected,
                 "expected the error member {shape} told as unreadable, with the stand-in for it (ordered: {ordered}): {expected:?} | received {observed:?}"
             );
             let observed = vendor_error(failure);
-            let expected = Some((Some(String::from("-32603")), String::from(shape)));
+            let expected = Some((Some(String::from("-32603")), String::from(text)));
             assert_eq!(
                 observed, expected,
                 "expected the failure to turn into a vendor error with the stand-in's code and text for {shape}: {expected:?} | received {observed:?}"
@@ -1563,12 +1577,20 @@ async fn a_failure_that_is_not_the_peers_answer_is_not_told_as_unreadable() {
             .into_parts()
     };
     let (written, late) = ask(RequestOptions::new().with_timeout(Duration::from_secs(1)));
-    written.await.expect("expected the request written");
-    let late = late.await.expect_err("expected the deadline to pass");
+    eventually("the first request written", written)
+        .await
+        .expect("expected the request written");
+    let late = eventually("the deadline to pass", late)
+        .await
+        .expect_err("expected the deadline to pass");
     let (written, unanswered) = ask(unbounded());
-    written.await.expect("expected the request written");
+    eventually("the second request written", written)
+        .await
+        .expect("expected the request written");
     gated.link.end();
-    let unanswered = unanswered.await.expect_err("expected the reply to fail");
+    let unanswered = eventually("the reply to fail", unanswered)
+        .await
+        .expect_err("expected the reply to fail");
 
     let observed = (
         late.peer_error_was_unreadable(),
