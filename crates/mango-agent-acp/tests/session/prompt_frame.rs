@@ -8,7 +8,7 @@
 //! The check exists because the transport enforces the same budget on every outgoing frame, and
 //! a prompt refused only there would be refused too late: the turn has already started, the
 //! connection fails, the session closes and the host is left with `AcceptanceUnknown`. These
-//! tests drive the real outbound path (the SDK's own serialisation and the bounded transport's
+//! tests drive the real outbound path (the connection's own serialisation and its
 //! own check), so the boundary they pin is the one a host meets.
 
 use super::*;
@@ -472,11 +472,19 @@ async fn cancelled_at_once(
     turn_id: &str,
     input: &str,
 ) -> (Option<String>, Vec<String>) {
+    let begun = std::time::Instant::now();
     let mut turn = loop {
         match session.start_turn(TurnRequest::new(turn_id, input)).await {
             Ok(turn) => break turn,
             // The previous turn's terminal is published just ahead of the release of its slot.
-            Err(error) if matches!(error.cause(), Error::Busy) => tokio::task::yield_now().await,
+            // Bounded, so a slot that is never released fails here instead of spinning.
+            Err(error) if matches!(error.cause(), Error::Busy) => {
+                assert!(
+                    begun.elapsed() < std::time::Duration::from_secs(5),
+                    "expected the turn slot free for {turn_id} within 5s | received: still busy"
+                );
+                tokio::task::yield_now().await;
+            }
             Err(error) => panic!("expected {turn_id} accepted | received refusal: {error}"),
         }
     };

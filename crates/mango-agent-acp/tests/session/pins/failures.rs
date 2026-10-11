@@ -137,7 +137,7 @@ fn assert_turn_died_as_a_closed_link(what: &str, events: &[EventKind], before: &
 /// The same death on a multi-thread runtime, repeated so every order the prompt task can observe
 /// it in shows up in one run.
 ///
-/// The prompt task waits on the prompt's own failure and on the end of the dispatch loop. The
+/// The prompt task waits on the prompt's own failure and on the end of the connection. The
 /// lifecycle watcher can wind the loop down before that task is polled, so either may be seen
 /// first. Nobody asked for a cancel, so both orders end the turn as the closed link, with the
 /// agent's stderr: a host is never told it stopped a turn whose agent died.
@@ -154,7 +154,7 @@ async fn an_agent_death_mid_prompt_is_never_reported_as_a_cancellation() {
 }
 
 /// An agent that dies the moment it reads the prompt, before it reports anything, ends the turn
-/// the same way: the dispatch loop can be over before the prompt task first looks at it.
+/// the same way: the connection can be over before the prompt task first looks at it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_death_under_the_prompt_it_just_read_is_never_reported_as_a_cancellation() {
     for round in 0..DEATH_ROUNDS {
@@ -279,7 +279,7 @@ async fn an_agent_death_under_a_request_is_never_reported_as_the_agents_refusal(
 }
 
 /// A request still waiting when the connection is wound down under it loses its reply with the
-/// dispatch loop rather than at EOF. The agent refused nothing, so that is the closed link naming
+/// connection rather than at EOF. The agent refused nothing, so that is the closed link naming
 /// the request too, and never `acp-request-failed`. Here the connection ends because the host
 /// dropped another request it had sent.
 #[tokio::test(start_paused = true)]
