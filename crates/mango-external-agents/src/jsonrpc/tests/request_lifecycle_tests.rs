@@ -7,7 +7,7 @@ use super::outbox_tests::{
     within,
 };
 use super::*;
-use crate::jsonrpc::{CallFailureCause, ConnectionEnd, Reply, WireOptions};
+use crate::jsonrpc::{CallFailure, CallFailureCause, ConnectionEnd, Reply, WireOptions};
 use std::pin::Pin;
 use std::sync::PoisonError;
 
@@ -1396,4 +1396,140 @@ mod on_either_runtime {
     {
         super::a_frame_queued_after_the_connection_ended_under_this_side_is_refused().await;
     }
+}
+
+/// The failure of a call the peer answered with `error`, the member written as given.
+async fn answered_with_error(gated: &Gated, error: &str) -> CallFailure {
+    let submitted = gated
+        .client
+        .submit_request("session/new", json!({}), RequestOptions::new())
+        .expect("expected the request queued");
+    let id = submitted.id().as_json().clone();
+    let (written, reply) = submitted.into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    gated
+        .link
+        .push_line(format!(r#"{{"id":{id},"error":{error}}}"#));
+    within("the reply", reply)
+        .await
+        .expect_err("expected the reply to fail")
+}
+
+/// What a failure says of the peer's error: whether it could not be read, and the cause.
+fn peer_error(failure: &CallFailure) -> (bool, CallFailureCause) {
+    (failure.peer_error_was_unreadable(), failure.cause().clone())
+}
+
+/// An `error` member that is not an error object fails the call as the peer's doing, with
+/// this side's stand-in for the error, and says that it could not be read. Each shape: not an
+/// object, an object without a code or without a message, and one whose code is not an integer
+/// or whose message is not a string. The connection stays open.
+#[tokio::test]
+async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
+    let gated = gated(options(), WireOptions::new());
+    let shapes = [
+        "null",
+        r#""boom""#,
+        "7",
+        "true",
+        "[1]",
+        "{}",
+        r#"{"code":"x"}"#,
+        r#"{"code":"x","message":"m"}"#,
+        r#"{"code":1.5,"message":"m"}"#,
+        r#"{"code":1}"#,
+        r#"{"message":"m"}"#,
+        r#"{"code":1,"message":2}"#,
+    ];
+    for shape in shapes {
+        let failure = answered_with_error(&gated, shape).await;
+        let observed = peer_error(&failure);
+        let expected = (
+            true,
+            CallFailureCause::Peer(JsonRpcError {
+                code: -32603,
+                message: String::from(shape),
+                data: None,
+            }),
+        );
+        assert_eq!(
+            observed, expected,
+            "expected the error member {shape} told as unreadable, with the stand-in for it: {expected:?} | received {observed:?}"
+        );
+        let error = failure.into_error();
+        assert!(
+            matches!(&error, Error::Vendor(vendor) if vendor.vendor_code.as_deref() == Some("-32603") && vendor.message == shape),
+            "expected the error `request` returns for the error member {shape}: a vendor failure with the code -32603 and that text | received {error:?}"
+        );
+    }
+    assert_ended(&gated.client, None);
+}
+
+/// An error object the peer sent is its own, whatever it says: its own `-32603`, one whose
+/// message is the very text a stand-in would carry, and one with members this side does not
+/// know. None of them is told as unreadable.
+#[tokio::test]
+async fn an_error_object_from_the_peer_is_never_told_as_unreadable() {
+    let gated = gated(options(), WireOptions::new());
+    let objects = [
+        (
+            r#"{"code":-32603,"message":"internal"}"#,
+            -32603,
+            "internal",
+        ),
+        (r#"{"code":-32603,"message":"null"}"#, -32603, "null"),
+        (
+            r#"{"code":-32000,"message":"no","more":true}"#,
+            -32000,
+            "no",
+        ),
+    ];
+    for (object, code, message) in objects {
+        let failure = answered_with_error(&gated, object).await;
+        let observed = peer_error(&failure);
+        let expected = (
+            false,
+            CallFailureCause::Peer(JsonRpcError {
+                code,
+                message: String::from(message),
+                data: None,
+            }),
+        );
+        assert_eq!(
+            observed, expected,
+            "expected the peer's own error {object} told as read: {expected:?} | received {observed:?}"
+        );
+    }
+    assert_ended(&gated.client, None);
+}
+
+/// A failure that is not the peer's answer says nothing of an unreadable error: here a call
+/// the peer left unanswered when it went away.
+#[tokio::test]
+async fn a_failure_that_is_not_the_peers_answer_is_not_told_as_unreadable() {
+    let gated = gated(options(), WireOptions::new());
+    let (written, reply) = gated
+        .client
+        .submit_request("session/new", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    gated.link.end();
+
+    let failure = within("the reply", reply)
+        .await
+        .expect_err("expected the reply to fail");
+    let observed = (
+        failure.peer_error_was_unreadable(),
+        matches!(failure.cause(), CallFailureCause::Ended(_)),
+    );
+    assert_eq!(
+        observed,
+        (false, true),
+        "expected an ended connection, not told as an unreadable error: (false, true) | received {observed:?}"
+    );
 }
