@@ -6491,3 +6491,41 @@ mod dropping_without_a_runtime {
         inner.end_turns_for_host_cleanup();
     }
 }
+
+/// A failed `result` record's own explanation is where a CLI that died while describing the
+/// request it was making prints the header it sent, so the host is shown it redacted, with the
+/// words around the credentials kept.
+mod redacted_failure {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_result_error_carrying_credential_shaped_text_is_redacted_before_the_host_sees_it() {
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(Run::replaying(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["request refused: Authorization: Bearer top-secret-token API_KEY=another-secret redis://app:password@db/main unreachable"]}"#,
+        )));
+        let session = open(&launcher).await;
+
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "try"))
+            .await
+            .expect("expected a turn");
+        let events = drain(&mut turn).await;
+
+        let Some(EventKind::Error { error }) = events.last() else {
+            panic!("expected the turn to end in an error | received: {events:?}");
+        };
+        for secret in ["top-secret-token", "another-secret", "password"] {
+            assert!(
+                !error.message.contains(secret),
+                "expected an error message without {secret:?} | received: {:?}",
+                error.message
+            );
+        }
+        assert!(
+            error.message.starts_with("request refused: ")
+                && error.message.ends_with("unreachable"),
+            "expected the words around the credentials to stay readable | received: {:?}",
+            error.message
+        );
+    }
+}

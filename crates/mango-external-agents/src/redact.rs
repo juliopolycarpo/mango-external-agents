@@ -9,6 +9,18 @@
 //! with the same shapes as the patterns they replace, so each rule can be read on its own:
 //! a bearer header, a `key = value` assignment, and the password in a URL's userinfo.
 //!
+//! Redact before bounding. A cut that lands inside a credential can keep its head where no rule
+//! recognises it: a URL with a password, cut before the `@` that closes it, has no closing `@`
+//! and so no password to the URL rule. A caller that both redacts and bounds redacts the whole
+//! text first, as the core does for an error's message and a notice.
+//!
+//! The rules know the shape of a credential and not its meaning, so a message that merely looks like
+//! an assignment loses its value: `token: expired` reads `token=[REDACTED]` afterwards. The name and
+//! the words around it stay readable, which is what a host needs of a message beside its code. A
+//! count named like a token loses its number the same way: `max_tokens: 100000` reads
+//! `max_tokens=[REDACTED]`. A JSON object's `"api_key":"sk-..."` is not read at all, because a quote
+//! stands between the name and the colon, so a caller holding structure redacts by key first.
+//!
 //! Every pass is linear in the text. A rule is asked at each place a match can start, and the
 //! places that share an end share everything after their start, so what depends on the end is
 //! decided once, by the function that finds the anchor (see `scan::Candidates`), and not by
@@ -521,6 +533,18 @@ mod tests {
     /// The fixture a vendor child writes in the port's own process test.
     const FIXTURE: &str =
         "Authorization: Bearer top-secret API_KEY=another-secret redis://app:password@db/main";
+
+    /// The module documents what a message that only looks like an assignment comes to, and that
+    /// the words around the credential stay readable.
+    #[test]
+    fn an_assignment_shaped_message_keeps_its_name_and_the_words_around_it() {
+        let received = stderr_text("session refused, token: expired, sign in again");
+        let expected = "session refused, token=[REDACTED], sign in again";
+        assert_eq!(
+            received, expected,
+            "expected the words around a redacted value to stay readable: {expected:?} | received: {received:?}"
+        );
+    }
 
     /// A rule that breaks the invariant `rewrite` relies on: it claims a span that begins in the
     /// middle of the two-byte `\u{e9}`. No rule in this module does, which is the point of not

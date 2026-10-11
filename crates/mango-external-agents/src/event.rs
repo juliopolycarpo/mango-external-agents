@@ -372,8 +372,9 @@ impl EventKind {
     /// what this returns `None` for; a harness that emitted such a notice anyway would be handing
     /// its sink an error for something that is only a banner with no words on it.
     ///
-    /// The title is sanitised and cut to [`TextLimit::Title`], the description to
-    /// [`TextLimit::Detail`]. A description left with nothing but whitespace is dropped.
+    /// The title is redacted of credential-shaped text, sanitised and cut to
+    /// [`TextLimit::Title`], the description likewise to [`TextLimit::Detail`]. A description left
+    /// with nothing but whitespace is dropped.
     ///
     /// # Example
     ///
@@ -390,12 +391,18 @@ impl EventKind {
         title: &str,
         description: Option<&str>,
     ) -> Option<Self> {
-        let title = normalize::bound_text(title, TextLimit::Title).text;
+        // Redacted before it is cut, like an error's message: a cut inside a credential leaves its
+        // head where no rule recognises it.
+        let title =
+            normalize::bound_text(&crate::redact::stderr_text(title), TextLimit::Title).text;
         if title.trim().is_empty() {
             return None;
         }
         let description = description
-            .map(|description| normalize::bound_text(description, TextLimit::Detail).text)
+            .map(|description| {
+                normalize::bound_text(&crate::redact::stderr_text(description), TextLimit::Detail)
+                    .text
+            })
             .filter(|description| !description.trim().is_empty());
         Some(Self::Notice {
             severity: severity.normalized(),
@@ -404,7 +411,8 @@ impl EventKind {
         })
     }
 
-    /// This event with every vendor-supplied value bounded.
+    /// This event with every vendor-supplied value bounded, and an error's message and a notice's
+    /// text redacted of credential-shaped text first.
     ///
     /// Applied by [`EventSink`](crate::EventSink) so a harness cannot emit an unbounded event by
     /// accident. Exposed because a harness's own reducer tests want to assert on the result.
@@ -1605,17 +1613,25 @@ fn normalize_commands(commands: Vec<Command>) -> Vec<Command> {
     kept
 }
 
-/// Bounds a vendor failure without refusing it.
+/// Redacts a vendor failure's message, then bounds the failure without refusing it.
 ///
 /// An error is the one place a refusal would be self-defeating: the turn is already failing, and
 /// dropping the report would leave the host with nothing to show. So the ids here are cut like
 /// text rather than refused like the ids that get echoed back.
+///
+/// The message is also where a vendor prints the request it was making, so it is redacted like a
+/// stderr tail, and before it is cut: a cut inside a credential leaves its head where no rule
+/// recognises it.
 fn normalize_error(error: VendorError) -> VendorError {
     VendorError {
         code: crate::ErrorCode::new(
             normalize::bound_text(error.code.as_str(), TextLimit::VendorId).text,
         ),
-        message: normalize::bound_text(&error.message, TextLimit::ErrorMessage).text,
+        message: normalize::bound_text(
+            &crate::redact::stderr_text(&error.message),
+            TextLimit::ErrorMessage,
+        )
+        .text,
         request_id: error
             .request_id
             .map(|id| normalize::bound_text(&id, TextLimit::VendorId).text),
@@ -2368,6 +2384,98 @@ mod tests {
                 assert!(error.retryable);
             }
             other => panic!("expected an error, received {other:?}"),
+        }
+    }
+
+    /// Credential-shaped text in the three shapes the redactor's own corpus uses: a bearer header,
+    /// an API-key assignment and a URL with a password, each beside words worth keeping.
+    const CREDENTIAL_SHAPED: &str = "request refused: Authorization: Bearer top-secret-token, API_KEY=another-secret, redis://app:password@db/main unreachable";
+
+    /// The secrets inside [`CREDENTIAL_SHAPED`], none of which may reach a host.
+    const SECRETS: [&str; 3] = ["top-secret-token", "another-secret", "password"];
+
+    /// Asserts none of [`SECRETS`] is in `text`.
+    #[track_caller]
+    fn assert_no_secret(what: &str, text: &str) {
+        for secret in SECRETS {
+            assert!(
+                !text.contains(secret),
+                "expected {what} without {secret:?} | received: {text:?}"
+            );
+        }
+    }
+
+    /// An error is the one place a refusal would be self-defeating, so it is bounded; it is also
+    /// where a vendor prints the request it was making, so it is redacted like a stderr tail.
+    #[test]
+    fn an_errors_message_is_redacted_and_keeps_the_part_a_host_needs() {
+        let kind = EventKind::Error {
+            error: VendorError::new(ErrorCode::from_static("codex-failed"), CREDENTIAL_SHAPED)
+                .with_vendor_code("-32000", false),
+        };
+        let EventKind::Error { error } = kind.normalized().expect("expected an error event") else {
+            panic!("expected an error event");
+        };
+        assert_no_secret("an error message", &error.message);
+        assert!(
+            error.message.starts_with("request refused: ")
+                && error.message.contains("API_KEY=")
+                && error.message.ends_with("unreachable"),
+            "expected the words around the secrets to stay readable | received: {:?}",
+            error.message
+        );
+        assert_eq!(error.code.as_str(), "codex-failed");
+        assert_eq!(error.vendor_code.as_deref(), Some("-32000"));
+    }
+
+    /// A cut before the `@` that closes a URL's password leaves `redis://app:hunter2`, which no rule
+    /// recognises, so the text is redacted whole and bounded after.
+    #[test]
+    fn a_credential_across_the_bound_is_redacted_before_it_is_cut() {
+        let limit = TextLimit::ErrorMessage.max_code_points();
+        let url = " redis://app:hunter2";
+        let message = format!("{}{url}@db", "x".repeat(limit - url.len()));
+        let kind = EventKind::Error {
+            error: VendorError::new(ErrorCode::from_static("codex-failed"), message),
+        };
+        let EventKind::Error { error } = kind.normalized().expect("expected an error event") else {
+            panic!("expected an error event");
+        };
+        assert!(
+            !error.message.contains("hunter2"),
+            "expected a URL password that the bound would cut off from its closing @ to be redacted first | received: {:?}",
+            &error.message[limit - url.len()..]
+        );
+        assert!(
+            error.message.chars().count() <= limit,
+            "expected the message within {limit} code points | received: {}",
+            error.message.chars().count()
+        );
+    }
+
+    /// A notice is display-only vendor text, but it reaches the same screen as an error.
+    #[test]
+    fn a_notice_is_redacted_of_credential_shaped_text() {
+        let made = EventKind::notice(
+            NoticeSeverity::Warning,
+            "Sign-in failed: API_KEY=another-secret",
+            Some(CREDENTIAL_SHAPED),
+        )
+        .expect("expected a notice with a title to be usable");
+        let normalized = made.clone().normalized().expect("expected a usable notice");
+        for notice in [made, normalized] {
+            let EventKind::Notice {
+                title, description, ..
+            } = notice
+            else {
+                panic!("expected a notice");
+            };
+            assert_no_secret("a notice title", &title);
+            assert_no_secret("a notice description", &description.unwrap_or_default());
+            assert!(
+                title.starts_with("Sign-in failed: "),
+                "expected the title's words to stay readable | received: {title:?}"
+            );
         }
     }
 
