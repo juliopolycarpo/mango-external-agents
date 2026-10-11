@@ -1525,9 +1525,15 @@ enum Read {
 /// One `recv` is polled to completion however many times the loop turns, so the exit arriving
 /// mid-read never abandons a read that may already hold part of a line. A line that is ready
 /// wins over either deadline: the grace exists so that what the child wrote before it left is
-/// read, and a host that set `kill_grace` to zero still gets every line that is already there.
-/// The deadline is fixed at the exit, so a helper that writes now and then does not move it. One
-/// that never stops writing keeps the read busy, as a turn that never stops talking always could.
+/// read. The deadline is fixed at the exit, so a helper that writes now and then does not move
+/// it. One that never stops writing keeps the read busy, as a turn that never stops talking
+/// always could.
+///
+/// When the grace runs out the read gets one more pass of the runtime before it is given up. A
+/// read of a real pipe is ready only once the runtime's I/O driver has reported the bytes, and
+/// with a `kill_grace` of zero the grace is over in the same instant the exit is seen: bytes the
+/// child wrote just before it left can be in the kernel and not yet reported. Yielding lets the
+/// driver run, and the read is then asked once more.
 async fn next_line(
     receiver: &mut dyn mango_external_agents::LinkReceiver,
     exit: &mut ExitWatch,
@@ -1553,9 +1559,20 @@ async fn next_line(
                 Ok(None) => Read::Ended,
                 Err(error) => Read::Failed(error),
             },
-            () = drained => return Read::Ended,
+            () = drained => break,
             () = &mut idle => return Read::Idle,
         }
+    }
+    tokio::task::yield_now().await;
+    let last = tokio::select! {
+        biased;
+        received = &mut received => received,
+        () = std::future::ready(()) => return Read::Ended,
+    };
+    match last {
+        Ok(Some(line)) => Read::Line(line),
+        Ok(None) => Read::Ended,
+        Err(error) => Read::Failed(error),
     }
 }
 

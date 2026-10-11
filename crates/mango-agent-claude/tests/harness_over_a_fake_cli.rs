@@ -5964,6 +5964,36 @@ mod deadlines {
         );
     }
 
+    /// A real pipe's read is ready only once the runtime has reported the bytes, which can be a
+    /// pass after the exit is seen. With no grace at all the read is still asked once more after
+    /// that pass, so a `result` the child wrote before it left is not lost to the ordering.
+    #[tokio::test(start_paused = true)]
+    async fn a_result_the_runtime_reports_a_pass_late_survives_a_zero_kill_grace() {
+        let limits = Limits {
+            kill_grace: Duration::ZERO,
+            ..Limits::default()
+        };
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_turn(stalled())
+                .with_output_ready_a_pass_late(),
+        );
+        let session = open_under(&launcher, limits).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        launcher.turn_reading().await;
+        launcher.announce_to_turn(r#"{"type":"result","is_error":false}"#);
+        launcher.exit_turn_holding_its_output(0);
+        let events = terminal_of(&mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Completed)),
+            "expected a result reported one pass late to complete the turn under a zero kill_grace | received {events:?}"
+        );
+    }
+
     /// A host can set `kill_grace` to zero to mean "kill at once". That leaves no time to wait
     /// for more output after the exit, and still must not throw away a line that is already there.
     #[tokio::test(start_paused = true)]
