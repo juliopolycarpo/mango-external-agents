@@ -9159,6 +9159,296 @@ mod tests {
                 }
             }
 
+            /// The committers that run on no notification call, so they take no hold and an end of
+            /// the connection never cuts them: the steer replay is a task of the harness's own, and
+            /// the report of a connection's end runs on the client's reader, which only
+            /// `Client::close` (the teardown's, and only after it ended the turn or gave a claimed
+            /// one `shutdown_timeout`) or dropping the client can stop. Each test claims the
+            /// terminal, parks the commit, ends the connection, and reads what the host is given.
+            mod off_the_handlers_task {
+                use super::super::super::super::{CodexSession, SteerHoldGuard};
+                use super::*;
+
+                /// How the connection ends while the commit is parked.
+                #[derive(Clone, Copy, Debug)]
+                enum End {
+                    /// The app-server sends a frame past the inbound byte budget.
+                    Overflow,
+                    /// The app-server exits.
+                    PeerExit,
+                    /// The host closes the session.
+                    HostClose,
+                }
+
+                /// A completion a steer held, whose replay has claimed the turn's terminal and
+                /// is parked before committing it for as long as the guard is kept.
+                async fn replay_parked_after_its_claim(
+                    shared: Arc<Shared>,
+                    options: ClientOptions,
+                ) -> (
+                    Arc<Shared>,
+                    Arc<CodexSession>,
+                    ScriptedLink,
+                    FakeLauncher,
+                    TurnStream,
+                    OwnedMutexGuard<()>,
+                ) {
+                    let (shared, session, link, launcher, stream) =
+                        running_session_with(shared, options, |control| control).await;
+                    let parked = Arc::clone(&shared.handler_commit_parked).lock_owned().await;
+                    let steer = SteerHoldGuard::hold(&shared);
+                    link.push_line(turn_completed("completed"));
+                    until("the steer: holding the completion", || {
+                        shared
+                            .steer_hold
+                            .lock()
+                            .is_ok_and(|hold| !hold.held.is_empty())
+                    })
+                    .await;
+                    // The last claim released starts the replay on a task of its own.
+                    drop(steer);
+                    until("the replay: holding the turn's claimed terminal", || {
+                        terminal_is_claimed(&shared)
+                    })
+                    .await;
+                    (shared, Arc::new(session), link, launcher, stream, parked)
+                }
+
+                /// Ends the connection under the parked replay.
+                async fn end_under(
+                    end: End,
+                    shared: &Arc<Shared>,
+                    session: &Arc<CodexSession>,
+                    link: &ScriptedLink,
+                ) {
+                    match end {
+                        End::Overflow => {
+                            let client = client_of(shared);
+                            Overflow::Bytes.send(link);
+                            until("the connection: ended by the overflow", || {
+                                client.is_closed()
+                            })
+                            .await;
+                        }
+                        End::PeerExit => link.end(),
+                        End::HostClose => {
+                            let closing = Arc::clone(session);
+                            tokio::spawn(async move { closing.close(CloseReason::Shutdown).await });
+                        }
+                    }
+                }
+
+                /// The replay is let go within the teardown's wait: the host is given the real
+                /// completion, as the replay is no handler call for the end to cut.
+                async fn a_replay_let_go_in_time_delivers_its_completion(end: End) {
+                    let shared = shared();
+                    let grace = shared.host.limits().shutdown_timeout;
+                    let options = match end {
+                        End::Overflow => Overflow::Bytes.options(&shared),
+                        End::PeerExit | End::HostClose => as_the_harness_connects(&shared),
+                    };
+                    let (shared, session, link, launcher, mut stream, parked) =
+                        replay_parked_after_its_claim(shared, options).await;
+
+                    let began = Instant::now();
+                    end_under(end, &shared, &session, &link).await;
+                    tokio::time::sleep(grace / 2).await;
+                    drop(parked);
+
+                    let (events, ended_after) = ending(&mut stream, began).await;
+                    let released = turn_is_released(&shared);
+                    let (teardown, reaped_after) = torn_down(&shared, began).await;
+                    let live = launcher.live_children();
+                    let completions = events
+                        .iter()
+                        .filter(|kind| {
+                            matches!(kind, EventKind::Completed | EventKind::Error { .. })
+                        })
+                        .count();
+                    assert!(
+                        matches!(events.last(), Some(EventKind::Completed))
+                            && completions == 1
+                            && ended_after < grace,
+                        "expected after {end:?} under a replay committing a completion: exactly one terminal, Completed, within {grace:?} | received: {events:?} after {ended_after:?}"
+                    );
+                    assert!(
+                        released && matches!(teardown, Some(Ok(()))) && live == 0,
+                        "expected after the replay's commit: turn released, teardown Ok(()), live children 0 | received: turn released {released}, teardown {teardown:?} after {reaped_after:?}, live children {live}"
+                    );
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn a_replay_committing_a_completion_survives_an_inbound_overflow() {
+                    a_replay_let_go_in_time_delivers_its_completion(End::Overflow).await;
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn a_replay_committing_a_completion_survives_the_peers_exit() {
+                    a_replay_let_go_in_time_delivers_its_completion(End::PeerExit).await;
+                }
+
+                #[tokio::test(start_paused = true)]
+                async fn a_replay_committing_a_completion_survives_the_hosts_close() {
+                    a_replay_let_go_in_time_delivers_its_completion(End::HostClose).await;
+                }
+
+                /// A replay that is not let go for a whole `shutdown_timeout` is the one case the
+                /// host is not given its real terminal: the teardown fails the turn as abandoned,
+                /// and the replay that lands afterwards finds its terminal refused.
+                #[tokio::test(start_paused = true)]
+                async fn a_replay_that_outlasts_the_teardowns_wait_ends_as_abandoned_once() {
+                    let shared = shared();
+                    let grace = shared.host.limits().shutdown_timeout;
+                    let options = as_the_harness_connects(&shared);
+                    let (shared, session, link, launcher, mut stream, parked) =
+                        replay_parked_after_its_claim(shared, options).await;
+
+                    let began = Instant::now();
+                    end_under(End::PeerExit, &shared, &session, &link).await;
+                    let (events, ended_after) = ending(&mut stream, began).await;
+                    let abandoned = is_abandoned_terminal(&events);
+                    drop(parked);
+                    // The replay lands only now, behind the terminal the teardown wrote.
+                    let released =
+                        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                            while !turn_is_released(&shared) {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .is_ok();
+                    let terminal = stream.terminal_status();
+                    let (teardown, reaped_after) = torn_down(&shared, began).await;
+                    let live = launcher.live_children();
+                    assert!(
+                        abandoned
+                            && ended_after >= grace
+                            && ended_after < grace + std::time::Duration::from_secs(1),
+                        "expected a replay parked past the teardown's wait: Error(terminal-abandoned) after {grace:?} | received: {events:?} after {ended_after:?}"
+                    );
+                    assert!(
+                        released
+                            && matches!(terminal, Some(TerminalStatus::Failed { .. }))
+                            && matches!(teardown, Some(Ok(())))
+                            && live == 0,
+                        "expected after the late replay: turn released, terminal still the abandoned failure, teardown Ok(()), live children 0 | received: released {released}, terminal {terminal:?}, teardown {teardown:?} after {reaped_after:?}, live children {live}"
+                    );
+                }
+
+                /// The report of a dead connection lands after the teardown gave up on it. The
+                /// client's close waits for the report, within twice `shutdown_timeout` of its
+                /// own start, rather than stopping the reader under it: the host has the one
+                /// terminal the teardown wrote, the late commit is refused, the close succeeds.
+                #[tokio::test(start_paused = true)]
+                async fn a_report_that_lands_after_the_teardown_abandoned_the_turn_adds_no_terminal()
+                 {
+                    let shared = shared();
+                    let grace = shared.host.limits().shutdown_timeout;
+                    let options = as_the_harness_connects(&shared);
+                    let (shared, session, link, launcher, mut stream) =
+                        running_session_with(shared, options, |control| control).await;
+
+                    let parked = shared.termination_claimed.lock().await;
+                    link.end();
+                    until("the report: holding the turn's claimed terminal", || {
+                        terminal_is_claimed(&shared)
+                    })
+                    .await;
+                    let began = Instant::now();
+                    let close =
+                        tokio::spawn(async move { session.close(CloseReason::Shutdown).await });
+                    let (events, ended_after) = ending(&mut stream, began).await;
+                    tokio::time::sleep(grace / 2).await;
+                    drop(parked);
+
+                    let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                        .await
+                        .map(|joined| joined.expect("expected the close task"));
+                    let closed_after = began.elapsed();
+                    let terminal = stream.terminal_status();
+                    let live = launcher.live_children();
+                    assert!(
+                        is_abandoned_terminal(&events)
+                            && ended_after >= grace
+                            && ended_after < grace + std::time::Duration::from_secs(1),
+                        "expected a report parked past the teardown's wait: Error(terminal-abandoned) after {grace:?} | received: {events:?} after {ended_after:?}"
+                    );
+                    assert!(
+                        matches!(closed, Ok(Ok(()))) && live == 0,
+                        "expected the close behind a report that lands late: Ok(()), live children 0 | received: {closed:?}, live children {live}"
+                    );
+                    assert!(
+                        closed_after >= grace + grace / 2 && closed_after < grace * 3,
+                        "expected the close to wait for the late report: returned between {:?} and {:?} after it began | received: {closed_after:?}",
+                        grace + grace / 2,
+                        grace * 3
+                    );
+                    assert!(
+                        matches!(terminal, Some(TerminalStatus::Failed { .. }))
+                            && turn_is_released(&shared),
+                        "expected after the late report: the abandoned failure still the terminal, turn released | received: terminal {terminal:?}, turn released {}",
+                        turn_is_released(&shared)
+                    );
+                }
+
+                /// The host's close stopped new work before the connection's end was reported:
+                /// the report steps aside, and the teardown ends the turn once, as cancelled.
+                #[tokio::test(start_paused = true)]
+                async fn a_connection_end_after_the_hosts_close_began_leaves_the_turn_to_the_teardown()
+                 {
+                    let shared = shared();
+                    let options = as_the_harness_connects(&shared);
+                    let (_shared, session, link, launcher, mut stream) =
+                        running_session_with(shared, options, |control| control).await;
+
+                    let began = Instant::now();
+                    let closing = Arc::new(session);
+                    let close = {
+                        let closing = Arc::clone(&closing);
+                        tokio::spawn(async move { closing.close(CloseReason::Shutdown).await })
+                    };
+                    // The teardown's interrupt is written and waits for an answer nobody gives.
+                    tokio::time::timeout(std::time::Duration::from_secs(5), link.wait_for_sent(1))
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "expected the teardown to write its interrupt: 1 frame | received: none within 5s"
+                            )
+                        });
+                    link.end();
+
+                    let (events, ended_after) = ending(&mut stream, began).await;
+                    let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                        .await
+                        .map(|joined| joined.expect("expected the close task"));
+                    let live = launcher.live_children();
+                    let completions = events
+                        .iter()
+                        .filter(|kind| {
+                            matches!(kind, EventKind::Completed | EventKind::Error { .. })
+                        })
+                        .count();
+                    assert!(
+                        matches!(
+                            events.as_slice(),
+                            [
+                                ..,
+                                EventKind::Cancelled {
+                                    reason: CancelReason::Shutdown
+                                },
+                                EventKind::Completed
+                            ]
+                        ) && completions == 1
+                            && ended_after < std::time::Duration::from_secs(1),
+                        "expected a connection end behind the host's close: exactly one terminal, Cancelled(Shutdown), at once | received: {events:?} after {ended_after:?}"
+                    );
+                    assert!(
+                        matches!(closed, Ok(Ok(()))) && live == 0,
+                        "expected the close: Ok(()), live children 0 | received: {closed:?}, live children {live}"
+                    );
+                }
+            }
+
             /// The overflow on four workers and the real clock. The commit is let go as soon as
             /// the connection has ended, with the client on its way to stopping the handler.
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
