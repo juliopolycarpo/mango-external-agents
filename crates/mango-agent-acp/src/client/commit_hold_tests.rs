@@ -10,6 +10,9 @@
 //!
 //! They go through a real connection, so the call under test is the peer's own notification
 //! call and the hold it asks for is the peer's own.
+//!
+//! The last two tests are the other order: the end is decided before the call asks for its
+//! hold, which is then refused, and the call must have taken nothing.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,64 +77,96 @@ fn flood() -> String {
     serde_json::Value::Array(vec![heartbeat; 2 * MESSAGE_BUDGET]).to_string()
 }
 
+/// What a fake agent and a session state bound to it are made of, before a connection is driven.
+struct Launch {
+    launcher: FakeLauncher,
+    host: HostContext,
+    state: Arc<SessionState>,
+    agent: Announcer,
+    framed: crate::transport::LaunchedAgent,
+}
+
+/// Launches the fake agent and builds the session state its updates are for.
+async fn launch() -> Launch {
+    let agent = Announcer::new();
+    let launcher = FakeLauncher::new();
+    launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(agent.clone()));
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher.clone()))
+        .cwd(std::env::temp_dir())
+        .client_info("acp-client-tests", "0.1.0")
+        .limits(Limits {
+            turn_channel_capacity: MESSAGE_BUDGET,
+            max_pending_requests: 1,
+            ..Limits::default()
+        })
+        .build()
+        .expect("expected a host context");
+    let core_state = mango_external_agents::SessionState::new(
+        Arc::clone(host.clock()),
+        SessionSnapshot::opening(
+            SessionIds {
+                session_id: SessionId::new("session-1"),
+                native_session_id: String::from("native-1"),
+            },
+            HarnessIdentity::claude(),
+            TransportSelection::new(None, TransportKind::Acp),
+            std::time::SystemTime::UNIX_EPOCH,
+        ),
+    );
+    let state = Arc::new(SessionState::new(
+        SessionId::new("session-1"),
+        &host,
+        Configuration::default(),
+        core_state,
+    ));
+    let process = launcher
+        .spawn(LaunchSpec {
+            argv: vec![String::from("fake-acp")],
+            cwd: host.cwd().to_path_buf(),
+            env: Default::default(),
+            stdin: true,
+            hide_window: true,
+        })
+        .await
+        .expect("expected the fake child to launch");
+    let framed = crate::transport::frame(process, &host).expect("expected a framed child");
+    Launch {
+        launcher,
+        host,
+        state,
+        agent,
+        framed,
+    }
+}
+
+/// Admits the turn the agent's updates belong to. The stream is wider than the connection's
+/// message budget, so it never refuses what a refusal has to say.
+fn begin_turn(host: &HostContext, state: &SessionState) -> (TurnHandle, EventReceiver) {
+    let (sink, events) = EventSink::new(
+        SessionId::new("session-1"),
+        TurnId::new("turn-1"),
+        AttemptId::default(),
+        Arc::clone(host.clock()),
+        16,
+    );
+    let turn = state
+        .begin_turn(sink, None)
+        .expect("expected the turn to be admitted");
+    (turn, events)
+}
+
 impl RunningTurn {
     async fn start() -> Self {
-        let agent = Announcer::new();
-        let launcher = FakeLauncher::new();
-        launcher.push(FakeProcess::responding(|_| Vec::new()).announcing(agent.clone()));
-        let host = HostContext::builder()
-            .launcher(Arc::new(launcher.clone()))
-            .cwd(std::env::temp_dir())
-            .client_info("acp-client-tests", "0.1.0")
-            .limits(Limits {
-                turn_channel_capacity: MESSAGE_BUDGET,
-                max_pending_requests: 1,
-                ..Limits::default()
-            })
-            .build()
-            .expect("expected a host context");
-        let core_state = mango_external_agents::SessionState::new(
-            Arc::clone(host.clock()),
-            SessionSnapshot::opening(
-                SessionIds {
-                    session_id: SessionId::new("session-1"),
-                    native_session_id: String::from("native-1"),
-                },
-                HarnessIdentity::claude(),
-                TransportSelection::new(None, TransportKind::Acp),
-                std::time::SystemTime::UNIX_EPOCH,
-            ),
-        );
-        let state = Arc::new(SessionState::new(
-            SessionId::new("session-1"),
-            &host,
-            Configuration::default(),
-            core_state,
-        ));
-        let process = launcher
-            .spawn(LaunchSpec {
-                argv: vec![String::from("fake-acp")],
-                cwd: host.cwd().to_path_buf(),
-                env: Default::default(),
-                stdin: true,
-                hide_window: true,
-            })
-            .await
-            .expect("expected the fake child to launch");
-        let launched = crate::transport::frame(process, &host).expect("expected a framed child");
-        let connection = Arc::new(drive(launched, Arc::clone(&state)));
-        // Wider than the connection's message budget, so the stream never refuses what the
-        // refusal has to say.
-        let (sink, events) = EventSink::new(
-            SessionId::new("session-1"),
-            TurnId::new("turn-1"),
-            AttemptId::default(),
-            Arc::clone(host.clock()),
-            16,
-        );
-        let turn = state
-            .begin_turn(sink, None)
-            .expect("expected the turn to be admitted");
+        let Launch {
+            launcher,
+            host,
+            state,
+            agent,
+            framed,
+        } = launch().await;
+        let connection = Arc::new(drive(framed, Arc::clone(&state)));
+        let (turn, events) = begin_turn(&host, &state);
         Self {
             launcher,
             host,
@@ -614,5 +649,261 @@ async fn a_slot_released_on_an_ended_connection_admits_no_further_turn() {
         (true, true),
         "expected (next turn admitted on a live connection, refused as closed on an ended one): (true, true) | received: {received:?} from {:?}",
         refused.map(|_| "an installed turn")
+    );
+}
+
+/// Parks every notification call ahead of the real handler, for as long as a test holds the
+/// gate, so a test can decide the end of the connection inside a call that has begun and has
+/// not yet asked for its hold.
+struct ParkedBeforeTheCall {
+    inner: super::AcpHandler,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    /// Notification calls begun, counted before the gate.
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::jsonrpc::PeerHandler for ParkedBeforeTheCall {
+    async fn on_notification(&self, method: String, params: serde_json::Value) {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(self.gate.lock().await);
+        self.inner.on_notification(method, params).await;
+    }
+
+    async fn on_request_handoff(
+        &self,
+        method: String,
+        params: serde_json::Value,
+        responder: mango_external_agents::jsonrpc::Responder,
+    ) {
+        self.inner
+            .on_request_handoff(method, params, responder)
+            .await;
+    }
+
+    fn on_request_past_cap(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        id: &mango_external_agents::jsonrpc::RequestId,
+    ) -> Option<mango_external_agents::jsonrpc::ServerRequestOutcome> {
+        self.inner.on_request_past_cap(method, params, id)
+    }
+
+    async fn on_terminated(&self, termination: mango_external_agents::jsonrpc::PeerTermination) {
+        self.inner.on_terminated(termination).await;
+    }
+}
+
+/// A turn running on a connection the test drives itself, through [`ParkedBeforeTheCall`].
+struct GatedTurn {
+    state: Arc<SessionState>,
+    client: Arc<mango_external_agents::jsonrpc::Client>,
+    agent: Announcer,
+    turn: TurnHandle,
+    events: EventReceiver,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Kept so the fake child outlives the connection.
+    _control: Arc<dyn mango_external_agents::ProcessControl>,
+}
+
+impl GatedTurn {
+    /// The connection as `drive` makes it, with the handler wrapped.
+    async fn start() -> Self {
+        let Launch {
+            host,
+            state,
+            agent,
+            framed,
+            ..
+        } = launch().await;
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = Arc::new(ParkedBeforeTheCall {
+            inner: super::AcpHandler {
+                state: Arc::clone(&state),
+                ended: mango_external_agents::CancelToken::new(),
+            },
+            gate: Arc::clone(&gate),
+            entered: Arc::clone(&entered),
+        });
+        let limits = *host.limits();
+        let crate::transport::LaunchedAgent {
+            link,
+            control,
+            outbound_buffer_bytes,
+        } = framed;
+        let client = Arc::new(mango_external_agents::jsonrpc::Client::connect_with(
+            link,
+            handler,
+            crate::transport::client_options(&limits),
+            crate::transport::wire_options(&limits, outbound_buffer_bytes),
+        ));
+        state.attach_peer(&client);
+        let (turn, events) = begin_turn(&host, &state);
+        Self {
+            state,
+            client,
+            agent,
+            turn,
+            events,
+            gate,
+            entered,
+            _control: control,
+        }
+    }
+
+    /// Notification calls begun so far.
+    fn calls_begun(&self) -> usize {
+        self.entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Leaves a running call and a parked question for the refusal to take, then parks the next
+    /// update, whose blank call id the core refuses, ahead of the real handler, decides the
+    /// end and lets the call go on. It is then at the request for its hold, which never
+    /// returns.
+    async fn refused_at_its_hold(&mut self) {
+        self.agent.announce(running_call("call-0"));
+        until("the running call reduced", || {
+            self.state.open_call_count() == 1
+        })
+        .await;
+        self.agent.announce(ask_line(5));
+        until("the question parked", || self.state.pending_count() == 1).await;
+
+        let gate = Arc::clone(&self.gate).lock_owned().await;
+        self.agent.announce(running_call("   "));
+        until("the refused update's call begun", || {
+            self.calls_begun() == 2
+        })
+        .await;
+        let held = self.client.decide_cancellation();
+        assert!(
+            !held,
+            "expected the end decided with no stretch held: false | received: {held}"
+        );
+        drop(gate);
+        // The call took the gate when it was let go and drops it ahead of the real handler,
+        // which runs on to its request for the hold in the same poll; taking the gate again
+        // waits behind all of that.
+        drop(self.gate.lock().await);
+    }
+
+    /// What the call left the turn: its running calls, its parked questions, its terminal.
+    fn left(&self) -> (usize, usize, String) {
+        let terminal = match self.events.terminal_status() {
+            Some(status) => format!("{status:?}"),
+            None => String::from("no terminal"),
+        };
+        (
+            self.state.open_call_count(),
+            self.state.pending_count(),
+            terminal,
+        )
+    }
+
+    /// The turn's owner settling it after the connection ended, as the prompt does: the
+    /// questions still parked are withdrawn and their resolutions flushed, whatever the turn
+    /// still owes closes as failed, then one terminal commits. The terminal is a stand-in with
+    /// its own code: the owner's real cause is not what is under test. Returns what the host was
+    /// told, resolutions, closes and terminal only.
+    async fn settled_by_its_owner(&mut self) -> Vec<String> {
+        if let Some((_, _, mut closing)) = self.state.prepare_terminal_matching(&self.turn) {
+            let _ = self.turn.approvals.flush(&self.turn.sink).await;
+            for kind in closing.finish_with(ActivityStatus::Failed) {
+                let _ = self.turn.sink.emit(kind).await;
+            }
+        }
+        let _ = self
+            .turn
+            .sink
+            .fail(mango_external_agents::VendorError::new(
+                mango_external_agents::ErrorCode::from_static("acp-link-closed"),
+                "the connection ended under the turn",
+            ))
+            .await;
+        let mut sequence = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            sequence.push(match event.kind {
+                EventKind::ApprovalResolved { decision, .. } => {
+                    format!("resolved {:?}", decision.source)
+                }
+                EventKind::ActivityCompleted { call_id, result } => {
+                    format!("completed {call_id} {:?}", result.status)
+                }
+                EventKind::Error { error } => format!("error {}", error.code.as_str()),
+                _ => continue,
+            });
+        }
+        sequence
+    }
+}
+
+/// What the host is told when the refusal's hold is refused: the call took nothing, so the
+/// turn's owner still finds the running call to close and the question to withdraw, and the
+/// host gets the owner's one terminal.
+fn the_owners_settlement() -> Vec<String> {
+    vec![
+        String::from("resolved Cancelled"),
+        format!("completed call-0 {:?}", ActivityStatus::Failed),
+        String::from("error acp-link-closed"),
+    ]
+}
+
+/// The end is decided before the refusal asks for its hold, and the agent then passes an
+/// inbound budget. The call never gets past the ask, so it has taken nothing, and the
+/// overflow ends the connection at once, with no stretch to wait for.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_whose_hold_is_refused_takes_nothing_and_an_overflow_leaves_the_turn_to_its_owner()
+ {
+    let mut gated = GatedTurn::start().await;
+    let grace = gated.state.limits.shutdown_timeout;
+    gated.refused_at_its_hold().await;
+    let before = gated.left();
+    let expected = (1, 1, String::from("no terminal"));
+    assert_eq!(
+        before, expected,
+        "expected (running calls, parked questions, terminal) after the hold was refused: {expected:?} | received: {before:?}"
+    );
+
+    let began = tokio::time::Instant::now();
+    gated.agent.announce(flood());
+    until("the overflow to have ended the connection", || {
+        gated.client.ended().is_some()
+    })
+    .await;
+    let ended_after = began.elapsed();
+    let told = gated.settled_by_its_owner().await;
+    let expected = the_owners_settlement();
+    assert!(
+        told == expected && ended_after < grace,
+        "expected after the overflow: {expected:?} within {grace:?} | received: {told:?} after {ended_after:?}"
+    );
+}
+
+/// The same for a close of the connection: its wait is for holds, and none was granted, so it
+/// returns at once and the owner settles what the call left untouched.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_whose_hold_is_refused_takes_nothing_and_a_close_leaves_the_turn_to_its_owner() {
+    let mut gated = GatedTurn::start().await;
+    let grace = gated.state.limits.shutdown_timeout;
+    gated.refused_at_its_hold().await;
+    let before = gated.left();
+    let expected = (1, 1, String::from("no terminal"));
+    assert_eq!(
+        before, expected,
+        "expected (running calls, parked questions, terminal) after the hold was refused: {expected:?} | received: {before:?}"
+    );
+
+    let began = tokio::time::Instant::now();
+    let closed = gated.client.close().await;
+    let closed_after = began.elapsed();
+    let told = gated.settled_by_its_owner().await;
+    let expected = the_owners_settlement();
+    assert!(
+        closed.is_ok() && told == expected && closed_after < grace,
+        "expected after the close: Ok(()), {expected:?} within {grace:?} | received: {closed:?}, {told:?} after {closed_after:?}"
     );
 }
