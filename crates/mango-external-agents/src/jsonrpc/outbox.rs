@@ -347,8 +347,11 @@ impl WireOptions {
     /// asking: every object is routed as it is without this. One batch is answered for at
     /// most `max_queued` of its members, however fast the replies are written, and a batch
     /// refused whole for passing the handoff budget is answered for none. A member of a batch
-    /// that is answered this way is not counted against that budget, nor against the byte
-    /// budget. The bound is
+    /// that is answered this way is not counted against that budget and holds no share of the
+    /// byte budget. Its bytes are still part of the line: a batch with anything for the
+    /// handler takes the whole line's bytes, as
+    /// [`with_batch_decoding`](Self::with_batch_decoding) says, and the members handled hold
+    /// them between them. The bound is
     /// this option's own, apart from the one on parse-error replies. The replies are held
     /// beside the bounds of the outbound queue and go through the queue, and a reply is a
     /// write, with what [`with_parse_error_replies`](Self::with_parse_error_replies) says

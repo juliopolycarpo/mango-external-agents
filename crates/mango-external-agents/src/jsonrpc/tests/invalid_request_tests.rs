@@ -820,8 +820,9 @@ async fn a_bound_of_nothing_routes_every_object_as_before() {
 }
 
 /// A member of a batch that is answered as an invalid request is not something for the
-/// handler, though it has a method: it takes none of the handoff budget and none of the byte
-/// budget. A batch of two notifications and such a member fits a budget of two.
+/// handler, though it has a method: it takes none of the handoff budget. A batch of two
+/// notifications and such a member fits a budget of two, and the line's bytes, which the two
+/// notifications hold between them, are all given back when both are handled.
 #[tokio::test]
 async fn a_batch_member_answered_as_invalid_takes_none_of_the_handlers_budget() {
     let link = ScriptedLink::new();
@@ -864,16 +865,17 @@ async fn a_batch_member_answered_as_invalid_takes_none_of_the_handlers_budget() 
 }
 
 /// The id is sent back only when it is short as this side writes it. A string of quotes and
-/// control characters is measured with its escapes: sixty-two such characters and the two
-/// quotes are 126 bytes written, and sixty-four are past the cap. A number is written again
-/// from what was read: a long numeral that is a number this side can hold comes back as it
-/// prints that number, short, and not digit for digit.
+/// control characters is measured with its escapes: sixty-three such characters and the two
+/// quotes are 128 bytes written, the most that is sent back, and sixty-four are past it. The
+/// reply to the first is the longest there is: its 75 bytes and the id's 128. A number is
+/// written again from what was read: a long numeral that is a number this side can hold
+/// comes back as it prints that number, short, and not digit for digit.
 #[tokio::test]
 async fn an_id_is_sent_back_only_when_it_is_short_as_written() {
     let (link, _handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
     let escaped = |count: usize| "\"".repeat(count / 2) + &"\n".repeat(count - count / 2);
     let long_numeral = format!("0.{}", "1".repeat(400));
-    link.push_line(json!({ "id": escaped(62), "method": 7 }).to_string());
+    link.push_line(json!({ "id": escaped(63), "method": 7 }).to_string());
     link.push_line(json!({ "id": escaped(64), "method": 7 }).to_string());
     link.push_line(format!(r#"{{"id":{long_numeral},"method":7}}"#));
 
@@ -888,12 +890,12 @@ async fn an_id_is_sent_back_only_when_it_is_short_as_written() {
     let observed = (
         ids[..2].to_vec(),
         ids[2].is_number() && numeral_written.len() < 30,
-        longest <= 73 + 128,
+        longest,
     );
-    let expected = (vec![json!(escaped(62)), Value::Null], true, true);
+    let expected = (vec![json!(escaped(63)), Value::Null], true, 75 + 128);
     assert_eq!(
         observed, expected,
-        "expected the short string sent back, the long one answered under null, the numeral sent back as a short number, and no reply longer than its 73 bytes and the 128 an id may take: {expected:?} | received {observed:?} (numeral {numeral_written}, longest {longest})"
+        "expected the short string sent back, the long one answered under null, the numeral sent back as a short number, and the longest reply its 75 bytes and the 128 an id may take: {expected:?} | received {observed:?} (numeral {numeral_written})"
     );
     client.close().await.expect("expected a clean close");
 }

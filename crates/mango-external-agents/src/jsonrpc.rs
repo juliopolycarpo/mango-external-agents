@@ -1283,9 +1283,9 @@ impl UnaskedReplies {
 /// The most an invalid request's id may take in the reply and still be sent back, in bytes
 /// as this side writes it: a string with its quotes and escapes, a number as it is printed.
 ///
-/// A reply is otherwise some seventy bytes whatever it answers, and is held beside every
-/// bound on what this side queues. An id sent back whole would make it as large as the
-/// peer's line, with nothing counting it. With this, a reply is at most some two hundred.
+/// A reply is otherwise 75 bytes whatever it answers, and is held beside every bound on
+/// what this side queues. An id sent back whole would make it as large as the peer's line,
+/// with nothing counting it. With this, a reply is at most 203.
 const ECHOED_ID_BYTES: usize = 128;
 
 /// The id an invalid request is answered under: the one it came with when that can name a
@@ -4292,7 +4292,8 @@ async fn dispatch_batch(
         }
     };
     // What the handler will see of the batch. A member with a method that is answered as an
-    // invalid request is not among it, and takes no place and no bytes.
+    // invalid request is not among it: it takes no place and holds no share of the bytes,
+    // which are the whole line's all the same when anything in the batch is for the handler.
     let is_work = |member: &Value| match member {
         Value::Object(frame) => is_peer_work(member) && state.invalid_request(frame).is_none(),
         _ => false,
