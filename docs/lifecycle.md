@@ -182,7 +182,9 @@ A close overlaps that wait with the one for the answers it owes the peer, so its
 `shutdown_timeout` stands, and after an inbound overflow `on_terminated` comes within one
 `shutdown_timeout`. Calls that hold nothing are cancelled as promptly as before. The other ends
 (the peer's exit, a failed link, this side's outbound budget) drain the queue within
-`shutdown_timeout`, as before.
+`shutdown_timeout`, as before; a stretch still held when that runs out is waited for in the same
+way, for up to one `shutdown_timeout` more. A hold belongs to its call: one kept, moved or
+forgotten stops counting when the call is over.
 
 `on_terminated` is made once, after the handler's task has stopped. A `Client::close` that arrives
 while a connection is ending under this side waits for that call to return, within the bound of a
