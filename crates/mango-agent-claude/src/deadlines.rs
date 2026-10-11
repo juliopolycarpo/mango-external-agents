@@ -101,18 +101,6 @@ impl Deadlines {
         Self { limits: *limits }
     }
 
-    fn kill_grace(&self) -> Duration {
-        exit_grace(&self.limits)
-    }
-
-    fn shutdown(&self) -> Duration {
-        launch_wait(&self.limits)
-    }
-
-    fn removal(&self) -> Duration {
-        removal_bound(&self.limits)
-    }
-
     /// The longest one process stop takes, counted from the moment the stop begins.
     ///
     /// The stop is the core's `stop_process_with_limits`, which every Claude stop goes through:
@@ -220,7 +208,7 @@ impl Deadlines {
     /// ```
     #[must_use]
     pub fn close_no_turn(&self) -> Duration {
-        self.removal()
+        removal_bound(&self.limits)
     }
 
     /// From the call to `Session::close` while a turn's child is installed, until `close` returns.
@@ -241,7 +229,8 @@ impl Deadlines {
     /// ```
     #[must_use]
     pub fn close_with_turn(&self) -> Duration {
-        self.process_stop().saturating_add(self.removal())
+        self.process_stop()
+            .saturating_add(removal_bound(&self.limits))
     }
 
     /// From the call to `Session::close` while the turn's launch is still inside the host's
@@ -277,9 +266,9 @@ impl Deadlines {
     /// ```
     #[must_use]
     pub fn close_pending_launch(&self) -> Duration {
-        self.shutdown()
+        launch_wait(&self.limits)
             .saturating_add(self.process_stop())
-            .saturating_add(self.removal())
+            .saturating_add(removal_bound(&self.limits))
     }
 
     /// How long any `Session::close` can take, counted from the call to `close`.
@@ -345,7 +334,7 @@ impl Deadlines {
     /// ```
     #[must_use]
     pub fn exit_to_terminal(&self) -> Duration {
-        self.kill_grace()
+        exit_grace(&self.limits)
     }
 
     /// From the child's exit, or the end of its stream, until the child is reaped.
@@ -365,7 +354,7 @@ impl Deadlines {
     /// ```
     #[must_use]
     pub fn exit_to_reaped(&self) -> Duration {
-        self.kill_grace().saturating_add(self.process_stop())
+        exit_grace(&self.limits).saturating_add(self.process_stop())
     }
 
     /// From the last line read from a silent child, until the turn's terminal is written.
@@ -389,7 +378,7 @@ impl Deadlines {
     /// ```
     #[must_use]
     pub fn silent_stream_to_terminal(&self) -> Duration {
-        crate::pinned::stream_idle_timeout(&self.limits).saturating_add(self.kill_grace())
+        crate::pinned::stream_idle_timeout(&self.limits).saturating_add(exit_grace(&self.limits))
     }
 
     /// From the host's shutdown token being cancelled, until the running turn's terminal is
