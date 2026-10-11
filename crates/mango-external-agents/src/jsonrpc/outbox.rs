@@ -297,7 +297,8 @@ impl WireOptions {
     /// dropped. Nothing is sent:
     ///
     /// - for a request whose frame never began to be written, since the peer never saw it;
-    /// - for a request whose caller was told the link refused its frame;
+    /// - for a request whose write has ended with the link refusing its frame whole, whether
+    ///   or not its caller has heard yet;
     /// - once a response to it has been taken for its caller, delivered yet or not;
     /// - once the connection has ended.
     ///

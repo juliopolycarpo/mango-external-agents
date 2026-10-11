@@ -1350,6 +1350,9 @@ struct ClientState {
     /// response on, so a test can have the caller give the call up exactly there.
     #[cfg(test)]
     after_response_claimed: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The calls whose claim the reader took, for a test that has to know which side won.
+    #[cfg(test)]
+    claimed_by_reader: StdMutex<Vec<String>>,
     peer_bytes: Arc<Semaphore>,
     /// How many notifications and peer questions may wait in the handoff queue. The channel is
     /// larger than this by the reserve below, so the reader counts what is in it.
@@ -2048,6 +2051,8 @@ impl Client {
             after_response_matched: StdMutex::new(None),
             #[cfg(test)]
             after_response_claimed: StdMutex::new(None),
+            #[cfg(test)]
+            claimed_by_reader: StdMutex::new(Vec::new()),
             peer_bytes,
             notification_capacity,
             queued_answers: AtomicUsize::new(0),
@@ -3661,6 +3666,14 @@ impl ClientState {
         // its way: the response is a late one and is dropped, its place with it.
         if given_up(&claim) {
             return Ok(());
+        }
+        #[cfg(test)]
+        if claim.is_some() {
+            state
+                .claimed_by_reader
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(id.clone());
         }
         #[cfg(test)]
         Self::run_hook(&state.after_response_claimed);

@@ -209,10 +209,32 @@ and the connection ends: a line or websocket message past `max_line_bytes`, and 
 frame that is not UTF-8. `with_cancel_on_abandon(method)` queues a notification
 `method` with `{"requestId": id}` when a request that was written is given up, by its future or
 `Reply` being dropped or its deadline running out; not for a request that never began to be
-written or whose caller was told the link refused its frame, not once a response to it has been
-taken for its caller, and not after the connection has ended. A response read at the moment its
-caller lets go ends one way only: taken for the caller with nothing sent, or the cancel sent and
-the response dropped as a late one.
+written or whose write has ended with the link refusing its frame whole, not once a response to
+it has been taken for its caller, and not after the connection has ended. A response read at the
+moment its caller lets go ends one way only: taken for the caller with nothing sent, or the cancel
+sent and the response dropped as a late one. One request the peer never got is announced all the
+same: one given up while its frame is being written, when the link then refuses that frame whole
+and stays usable. Some of the frame may have reached the peer at the moment the call is let go,
+and a decision put off until the write ended would let the caller's next write out ahead of the
+cancel. That a refusal which is not a link failure took no byte is the contract of
+`LinkSender::send`.
+
+A client made with `WireOptions::with_request_handoff` hands each of the peer's questions to
+`PeerHandler::on_request_handoff` on the task that runs the notifications, in the order the peer
+sent it, with a `Responder`. The call is awaited like a notification, so a response asked for
+after earlier peer work waits for the questions read before it to be handed over too. The handler
+answers there or keeps the responder and returns; a responder is answered from any task, and
+`Responder::answer` queues the answer without waiting, in the outbound queue and against its
+bounds, behind every frame queued before it. A question past `max_in_flight_requests` is not
+handed over: `PeerHandler::on_request_past_cap` answers it on the spot, with a result if the
+protocol wants one, and this client's `-32000` refusal otherwise. An answer too large for a frame
+comes back with its responder, the connection untouched. A responder dropped unanswered tells the
+peer with `-32603` and gives back what the question held. Once the connection has ended a
+responder still out answers nothing and says nothing: a handler that parks questions settles them
+before it closes. The hand-off call is cancelled at an end like a notification call, and
+`hold_cancellation` holds nothing there. Without the option none of this applies: a question is
+answered by `on_request` on a task of its own, and its answer is written when that task has the
+link.
 
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted
