@@ -43,6 +43,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify, oneshot, watch};
 
 use crate::approvals::{self, PendingApproval};
+use crate::deadlines::{close_backstop, interrupt_bound};
 use crate::protocol::approvals::{
     McpServerElicitationRequestParams, McpServerElicitationRequestResponse, ServerAnswer,
     ServerRequest, ToolRequestUserInputAnswer, ToolRequestUserInputOption,
@@ -3626,7 +3627,7 @@ impl CodexSession {
         let reason = shared.teardown_reason(reason);
         let limits = *shared.host.limits();
         let _ = tokio::time::timeout(
-            limits.kill_grace,
+            interrupt_bound(&limits),
             shared.cancel_owner(&client, None, reason, InterruptAnswer::AsRead),
         )
         .await;
@@ -4627,24 +4628,6 @@ impl Drop for CodexSession {
             Self::request_shutdown(shared, client, control, state, CancelReason::Shutdown);
         });
     }
-}
-
-/// How long the teardown gives the JSON-RPC client's close before it reaps the child anyway.
-///
-/// The client bounds its own close at twice `shutdown_timeout`: one for a notification call
-/// that holds its cancellation off and for the answers still owed to the app-server, and one for
-/// the queue and the link; a connection that had already ended has the report of that end waited
-/// for inside the same two. This is one `shutdown_timeout` more than that, so a close that uses
-/// all of its own time still returns its own result, and the reap never depends on a client that
-/// overran it. A bound equal to the client's would cut such a close short and report a timeout
-/// for a teardown that delivered the terminal and reaped the child.
-///
-/// ```ignore
-/// let limits = Limits::default();
-/// assert_eq!(close_backstop(&limits), limits.shutdown_timeout * 3);
-/// ```
-fn close_backstop(limits: &mango_external_agents::Limits) -> std::time::Duration {
-    limits.shutdown_timeout.saturating_mul(3)
 }
 
 /// The typed failure every close waiter receives when the teardown worker did not return.
@@ -8818,7 +8801,7 @@ mod tests {
             #[test]
             fn the_teardown_gives_the_close_longer_than_the_clients_own_bound() {
                 let limits = Limits::default();
-                let backstop = super::super::super::close_backstop(&limits);
+                let backstop = crate::deadlines::close_backstop(&limits);
                 assert_eq!(
                     backstop,
                     limits.shutdown_timeout * 3,
@@ -9524,6 +9507,225 @@ mod tests {
                     matches!(events.last(), Some(EventKind::Completed)),
                     "expected the stream to end with: Completed | received: {events:?}"
                 );
+            }
+
+            /// The teardown's stages driven to their limits, to measure the figures
+            /// `crate::deadlines::Deadlines` states against the code that enforces them.
+            ///
+            /// Every stage stalls: the discarded interrupt is never answered, a commit is parked
+            /// after the teardown began so the terminal it claimed is waited for, the client's
+            /// close finds a call holding its cancellation and a link whose close never returns,
+            /// and the child ignores the stop.
+            mod worst_case {
+                use super::*;
+                use crate::deadlines::Deadlines;
+                use crate::deadlines::stalls::{JUST_UNDER, StallingControl};
+                use mango_external_agents::link::{Link, LinkSender};
+
+                /// A link whose close never returns, as a pipe the agent stopped reading.
+                struct NeverClosingSender {
+                    inner: Box<dyn LinkSender>,
+                }
+
+                #[async_trait::async_trait]
+                impl LinkSender for NeverClosingSender {
+                    async fn send(&mut self, message: String) -> mango_external_agents::Result<()> {
+                        self.inner.send(message).await
+                    }
+
+                    async fn close(&mut self) -> mango_external_agents::Result<()> {
+                        std::future::pending().await
+                    }
+                }
+
+                /// A session over a link that never finishes closing and a child that stalls
+                /// every stage of its stop, with one turn running.
+                async fn stalled_session(
+                    shared: Arc<Shared>,
+                    options: ClientOptions,
+                ) -> (
+                    Arc<Shared>,
+                    crate::session::CodexSession,
+                    ScriptedLink,
+                    TurnStream,
+                ) {
+                    shared.adopt_thread(String::from("thread-1"));
+                    let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
+                    let link = ScriptedLink::new();
+                    let (sender, receiver) = link.clone().into_link().split();
+                    let stalled =
+                        Link::new(Box::new(NeverClosingSender { inner: sender }), receiver);
+                    let client = Arc::new(Client::connect(
+                        stalled,
+                        crate::session::CodexSession::handler(Arc::clone(&shared)),
+                        options,
+                    ));
+                    let control = StallingControl::under(shared.host.limits());
+                    let snapshot = SessionSnapshot::opening(
+                        SessionIds {
+                            session_id: mango_external_agents::SessionId::new("chat-1"),
+                            native_session_id: String::from("thread-1"),
+                        },
+                        HarnessIdentity::codex(),
+                        TransportSelection::new(None, TransportKind::Stdio),
+                        shared.host.now(),
+                    );
+                    let state = SessionState::new(Arc::clone(shared.host.clock()), snapshot);
+                    let session = crate::session::CodexSession::new(
+                        state,
+                        Arc::clone(&shared),
+                        client,
+                        control,
+                    );
+                    (shared, session, link, stream)
+                }
+
+                fn within(
+                    what: &str,
+                    spent: std::time::Duration,
+                    at_least: std::time::Duration,
+                    at_most: std::time::Duration,
+                ) {
+                    assert!(
+                        spent >= at_least && spent <= at_most,
+                        "expected {what} within [{at_least:?}, {at_most:?}] | received: {spent:?}"
+                    );
+                }
+
+                /// A host's `close` on a turn whose every stage stalls: the interrupt waits its
+                /// `kill_grace`, the claimed terminal its `shutdown_timeout`, the client's close
+                /// two, and the stop its four stages.
+                ///
+                /// The client's close never reaches its third `shutdown_timeout`, the harness's
+                /// backstop for a client that overruns its own bound of two, so the figure driven
+                /// here is the teardown less that one stage.
+                #[tokio::test(start_paused = true)]
+                async fn a_close_that_stalls_every_stage_spends_the_teardown_less_its_backstop() {
+                    let shared = shared();
+                    let limits = *shared.host.limits();
+                    let deadlines = Deadlines::from_limits(&limits);
+                    let options = as_the_harness_connects(&shared);
+                    let (shared, session, link, mut stream) =
+                        stalled_session(shared, options).await;
+
+                    let began = Instant::now();
+                    let close =
+                        tokio::spawn(async move { session.close(CloseReason::Shutdown).await });
+                    link.wait_for_sent(1).await;
+                    let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+
+                    let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                        .await
+                        .map(|joined| joined.expect("expected the close task"));
+                    let spent = began.elapsed();
+                    drop(parked);
+                    let events = ending(&mut stream, Instant::now()).await.0;
+
+                    assert!(
+                        matches!(&closed, Ok(Err(Error::CleanupRequired { .. }))),
+                        "expected a close behind a child that never exits: CleanupRequired | received: {closed:?} after {spent:?}"
+                    );
+                    assert!(
+                        is_abandoned_terminal(&events),
+                        "expected the claimed terminal nobody committed: Error(terminal-abandoned) | received: {events:?}"
+                    );
+                    let backstop = limits.shutdown_timeout;
+                    within(
+                        "a close with every stage stalled",
+                        spent,
+                        deadlines.close_worst_case() - backstop - JUST_UNDER * 4,
+                        deadlines.close_worst_case() - backstop,
+                    );
+                }
+
+                /// A `close` called while an inbound overflow's hold wait is still running joins
+                /// the same stalled stages, and is bounded from its own call by the teardown.
+                /// The overflow itself is bounded by `overflow_to_closed`.
+                #[tokio::test(start_paused = true)]
+                async fn a_close_inside_an_overflows_hold_wait_is_bounded_from_its_call() {
+                    let shared = shared();
+                    let limits = *shared.host.limits();
+                    let deadlines = Deadlines::from_limits(&limits);
+                    let options = Overflow::Notifications.options(&shared);
+                    let (shared, session, link, mut stream) =
+                        stalled_session(shared, options).await;
+                    let client = client_of(&shared);
+
+                    let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                    tokio::time::sleep(SETTLED).await;
+                    let overflowed = Instant::now();
+                    Overflow::Notifications.send(&link);
+                    until("the connection: ended by the overflow", || {
+                        client.is_closed()
+                    })
+                    .await;
+                    let called = Instant::now();
+                    let close =
+                        tokio::spawn(async move { session.close(CloseReason::Shutdown).await });
+
+                    let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                        .await
+                        .map(|joined| joined.expect("expected the close task"));
+                    let from_the_call = called.elapsed();
+                    let from_the_overflow = overflowed.elapsed();
+                    drop(parked);
+                    let events = ending(&mut stream, Instant::now()).await.0;
+
+                    assert!(
+                        matches!(&closed, Ok(Err(Error::CleanupRequired { .. }))),
+                        "expected a close behind a child that never exits: CleanupRequired | received: {closed:?} after {from_the_call:?}"
+                    );
+                    assert!(
+                        is_abandoned_terminal(&events),
+                        "expected the claimed terminal nobody committed: Error(terminal-abandoned) | received: {events:?}"
+                    );
+                    assert!(
+                        from_the_call <= deadlines.close_worst_case(),
+                        "expected a close called inside an overflow's hold wait to return within {:?} of its call | received: {from_the_call:?}",
+                        deadlines.close_worst_case()
+                    );
+                    assert!(
+                        from_the_overflow <= deadlines.overflow_to_closed(),
+                        "expected the close to return within {:?} of the overflow | received: {from_the_overflow:?}",
+                        deadlines.overflow_to_closed()
+                    );
+                }
+
+                /// No host close at all: the overflow's own teardown, which the watcher starts
+                /// once the client has reported the connection's end, is bounded from the
+                /// overflow by `overflow_to_closed`.
+                #[tokio::test(start_paused = true)]
+                async fn an_overflows_own_teardown_ends_within_the_overflow_bound() {
+                    let shared = shared();
+                    let limits = *shared.host.limits();
+                    let deadlines = Deadlines::from_limits(&limits);
+                    let options = Overflow::Notifications.options(&shared);
+                    let (shared, _session, link, mut stream) =
+                        stalled_session(shared, options).await;
+
+                    let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                    tokio::time::sleep(SETTLED).await;
+                    let began = Instant::now();
+                    Overflow::Notifications.send(&link);
+
+                    let events = ending(&mut stream, began).await.0;
+                    let (teardown, reaped_after) = torn_down(&shared, began).await;
+                    drop(parked);
+
+                    assert!(
+                        is_abandoned_terminal(&events),
+                        "expected the claimed terminal nobody committed: Error(terminal-abandoned) | received: {events:?}"
+                    );
+                    assert!(
+                        matches!(&teardown, Some(Err(Error::CleanupRequired { .. }))),
+                        "expected a teardown behind a child that never exits: CleanupRequired | received: {teardown:?} after {reaped_after:?}"
+                    );
+                    assert!(
+                        reaped_after <= deadlines.overflow_to_closed(),
+                        "expected the overflow's teardown to end within {:?} of the overflow | received: {reaped_after:?}",
+                        deadlines.overflow_to_closed()
+                    );
+                }
             }
         }
     }

@@ -4,6 +4,7 @@ pub mod account;
 pub mod activity;
 pub mod approvals;
 mod configuration;
+pub mod deadlines;
 pub mod discovery;
 pub mod harness;
 mod mcp;

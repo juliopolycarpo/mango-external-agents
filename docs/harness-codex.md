@@ -325,16 +325,34 @@ fire.
 A start future dropped before any byte of its `turn/start` reached the link releases the slot at
 once, with no settle wait and no kill: Codex never saw the request, so no native turn can exist.
 
-The stages add up. With `rt` for `request_timeout`, `st` for `shutdown_timeout` and `kg` for
-`kill_grace`, the worst cases are:
+The stages add up. With `rt` for `request_timeout`, `st` for `shutdown_timeout`, `kg` for
+`kill_grace` and `cs` for `cancel_settle_timeout`, the worst cases are below. A host computes them
+from its `Limits` with `mango_agent_codex::deadlines::Deadlines::from_limits`; the last column is
+the method for the row, and each method's documentation says where its clock starts.
 
-| Path                       | Worst case                                         | At the defaults |
-| -------------------------- | -------------------------------------------------- | --------------- |
-| Teardown `T`               | `kg` + `st` + 3 `st` + (`kg` + `kg` + `st` + `st`) | 36 s            |
-| Cancel, interrupt accepted | `rt` + `rt` + `cancel_settle_timeout` + `T`        | about 5.6 min   |
-| Cancel, interrupt failed   | `rt` + `rt` + `rt` + `st` + `T`                    | about 6.7 min   |
+| Path                                  | Clock starts at     | Worst case                      | At the defaults | `Deadlines` method          |
+| ------------------------------------- | ------------------- | ------------------------------- | --------------- | --------------------------- |
+| Process stop `S`                      | the stop            | `kg` + `kg` + `st` + `st`       | 14 s            | `process_stop`              |
+| Teardown `T`                          | the teardown        | `kg` + `st` + 3 `st` + `S`      | 36 s            | `teardown`                  |
+| `close`, whichever teardown it joins  | the call to `close` | `T`                             | 36 s            | `close`, `close_worst_case` |
+| Inbound overflow, to the child's reap | the overflow        | `st` + `T`                      | 41 s            | `overflow_to_closed`        |
+| Cancel, interrupt accepted            | the call            | `rt` + `rt` + `cs` + `T`        | about 5.6 min   | `cancel_interrupt_accepted` |
+| Cancel, interrupt failed              | the call            | `rt` + `rt` + `rt` + `st` + `T` | about 6.7 min   | `cancel_interrupt_failed`   |
 
-The teardown's terms are, in order: the discarded protocol interrupt, the wait for a terminal
+`close_worst_case` is the figure to put a host's own timeout around, plus the host's margin. It
+reads 36 s because a `close` has no wait of its own: it starts the teardown or joins the one
+already running, and a teardown that has started has only its own stages left. That holds for a
+teardown an inbound overflow, a lost connection or an abandoned turn started. The overflow row is
+longer because its clock starts earlier. The client waits up to one `st` for a held commit before
+it reports the connection's end, and the watcher starts the teardown after that report, so the
+child is reaped at most `st` + `T` after the overflow. A `close` called inside that `st` starts the
+teardown itself, and one called after the report joins a teardown that began at the report.
+Either way it returns within `T` of its own call. A host that times from the overflow uses the
+overflow row; one that times from its call to `close` uses the close row. The cancel rows exclude
+the extra interrupt and settle round that a start named late pays (below).
+
+The teardown's terms are, in order: the discarded protocol interrupt (only for a turn whose
+terminal nobody has claimed), the wait for a terminal
 another task claimed (only when there is one), the client's close, and the process stop (a
 graceful interrupt and its wait, then the kill and its wait).
 
@@ -361,6 +379,19 @@ An inbound overflow adds a wait ahead of `T`. The client waits up to one `st` fo
 before it reports the end, and the teardown starts after that report. A commit that never
 finishes there gives `terminal-abandoned` 10 s after the overflow, and the child is reaped at
 that moment.
+
+Tests on a paused clock assert these sums against the code, in `deadlines.rs` and in the
+`worst_case` tests of `session.rs`. A fake child that spends every stage of the stop takes the
+14 s of `S` (less two milliseconds so that each stage returns instead of timing out). A `close` on
+a turn whose every stage stalls (the interrupt unanswered, a commit parked after the teardown
+began, a call holding the client's cancellation, a link whose close never returns, and that child)
+takes 31 s, which is `T` less the backstop. A `close` called inside an overflow's hold wait
+returned 24 s after its call and an overflow's own teardown 29 s after the overflow, both under
+their bounds. The rows not driven to their figure are the backstop `st`, which only a client that
+overruns its own bound could spend, and the overflow row's 41 s: a turn whose commit is claimed
+is not interrupted, and behind an overflow the held commit's wait comes first and leaves the turn
+claimed, so the teardown that follows spends no interrupt stage with the existing fakes. The cancel rows are asserted as sums only; the stages they are made of are exercised in
+`tests/cancel_deadlines.rs`.
 
 A cancel's first `rt` is the pending
 start and its second the interrupt. In the failed case the third `rt` is the steer hold, paid only
