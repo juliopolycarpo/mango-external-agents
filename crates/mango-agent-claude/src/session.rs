@@ -569,9 +569,9 @@ async fn run_close_teardown(
     active: Option<Arc<Teardown>>,
     mut mcp_config: crate::mcp::Prepared<Arc<ConfigFile>>,
 ) {
-    let bound = shared.host.limits().shutdown_timeout;
+    let launch_bound = crate::deadlines::launch_wait(shared.host.limits());
     let native = match active {
-        Some(teardown) => teardown.wait_past_launch(bound).await,
+        Some(teardown) => teardown.wait_past_launch(launch_bound).await,
         None => Some(Ok(())),
     };
     let Some(native) = native else {
@@ -584,13 +584,14 @@ async fn run_close_teardown(
         crate::mcp::release_lease(mcp_config.take());
         close.finish(Err(Error::Timeout {
             operation: String::from(PENDING_LAUNCH_OPERATION),
-            after: bound,
+            after: launch_bound,
         }));
         return;
     };
     let result = match native {
         Ok(()) => {
-            let result = crate::mcp::remove_on_close(mcp_config.take(), bound).await;
+            let removal_bound = crate::deadlines::removal_bound(shared.host.limits());
+            let result = crate::mcp::remove_on_close(mcp_config.take(), removal_bound).await;
             // Close is terminal after native cleanup, even when the host's scratch mount refuses
             // the final unlink or never answers it. The typed error still tells the caller which
             // resource remained, and the wait for it is one more shutdown stage.
@@ -1591,7 +1592,7 @@ async fn pump(
     let mut reducer = TurnReducer::for_limits(shared.host.limits());
     // The host's own patience for a child that should be exiting; it owns the process, so it owns
     // how long the turn waits on one that is not.
-    let exit_grace = shared.host.limits().kill_grace;
+    let exit_grace = crate::deadlines::exit_grace(shared.host.limits());
     // The host's cap, floored: below `pinned::STREAM_IDLE_TIMEOUT` it stops describing a stalled
     // child and starts cutting turns whose tool call is merely slow.
     let idle_timeout = crate::pinned::stream_idle_timeout(shared.host.limits());

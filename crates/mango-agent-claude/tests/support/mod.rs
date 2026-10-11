@@ -169,6 +169,8 @@ pub struct FakeClaudeCli {
     graceful_interrupts: Arc<Mutex<usize>>,
     interrupt_supported: bool,
     slow_stop: Option<SlowStop>,
+    /// How long after a kill that answered without ending the child the child is reaped.
+    slow_reap: Option<std::time::Duration>,
     /// Fired each time a child is handed out, for a test waiting on one that is still spawning.
     spawned: Notify,
     /// Holds one permit per turn whose prompt was written and whose stdin was closed.
@@ -204,6 +206,7 @@ impl FakeClaudeCli {
             graceful_interrupts: Arc::new(Mutex::new(0)),
             interrupt_supported: false,
             slow_stop: None,
+            slow_reap: None,
             spawned: Notify::new(),
             input_closed: Arc::new(Notify::new()),
             output_needs_a_pass: false,
@@ -261,6 +264,17 @@ impl FakeClaudeCli {
     #[must_use]
     pub fn with_slow_stop(mut self, stop: SlowStop) -> Self {
         self.slow_stop = Some(stop);
+        self
+    }
+
+    /// Makes a child that a kill left running exit this long after the kill answered.
+    ///
+    /// For a test that needs a stop to succeed at the very end of its bound: the kill answers
+    /// inside `shutdown_timeout`, and the reap that follows lands inside the next one. Only
+    /// meaningful with a [`SlowStop`] whose `kill_ends_child` is false.
+    #[must_use]
+    pub fn with_slow_reap(mut self, reap: std::time::Duration) -> Self {
+        self.slow_reap = Some(reap);
         self
     }
 
@@ -566,6 +580,8 @@ impl ProcessLauncher for FakeClaudeCli {
             output_open: Mutex::new(!finished),
             output_needs_a_pass: is_turn && self.output_needs_a_pass,
             slow_stop: is_turn.then_some(self.slow_stop).flatten(),
+            slow_reap: is_turn.then_some(self.slow_reap).flatten(),
+            reap_at: Mutex::new(None),
             exit: Mutex::new(exit),
             stderr,
             written: Arc::clone(&self.written),
@@ -605,6 +621,9 @@ struct Child {
     output_open: Mutex<bool>,
     output_needs_a_pass: bool,
     slow_stop: Option<SlowStop>,
+    slow_reap: Option<std::time::Duration>,
+    /// When a kill that left the child running promised its exit.
+    reap_at: Mutex<Option<tokio::time::Instant>>,
     exit: Mutex<ExitStatus>,
     stderr: StderrTail,
     written: Arc<Mutex<Vec<String>>>,
@@ -654,6 +673,15 @@ impl ProcessControl for Child {
             let changed = self.changed.notified();
             if self.is_finished() {
                 return Ok(*lock(&self.exit));
+            }
+            let reap_at = *lock(&self.reap_at);
+            if let Some(at) = reap_at {
+                tokio::time::sleep_until(at).await;
+                self.end(ExitStatus {
+                    code: Some(143),
+                    signal: None,
+                });
+                continue;
             }
             changed.await;
         }
@@ -705,6 +733,10 @@ impl ProcessControl for Child {
         if let Some(stop) = self.slow_stop {
             tokio::time::sleep(stop.kill).await;
             if !stop.kill_ends_child {
+                if let Some(reap) = self.slow_reap {
+                    *lock(&self.reap_at) = Some(tokio::time::Instant::now() + reap);
+                    self.changed.notify_waiters();
+                }
                 return Ok(());
             }
         }
