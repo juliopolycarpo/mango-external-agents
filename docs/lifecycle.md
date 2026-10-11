@@ -124,7 +124,8 @@ before the handler has seen a notification that arrived ahead of it. A request m
 `RequestOptions::after_earlier_notifications` opts out of that for its own answer: the response
 waits in the callback queue and reaches its caller once the handler has returned from every
 notification read before it, and when the peer exits or the link fails it is still delivered (or
-the call failed) only after that queued work has drained, within `shutdown_timeout`. Up to
+the call failed) only after that queued work has drained, within `shutdown_timeout` (twice that
+when the drain runs out inside a stretch that holds its cancellation off, below). Up to
 `max_pending_requests` such answers have places reserved in the queue apart from the callback
 budgets, so callback pressure cannot refuse one. `Client::close` and callback queue pressure fail
 such a call at once. Request deadlines include
@@ -171,6 +172,25 @@ left unusable, `Error::Link`, and nothing of it is queued or written, and one th
 ended, `request` returns `Error::Closed` and `notify` returns `Ok(())` having written nothing, and
 one that read the connection as open an instant before it ended reaches the link, which answers it
 (a closed link refuses the write, and the call returns that refusal).
+
+Two ends of a connection stop the handler's task without draining its queue: the peer passing an
+inbound budget, and `Client::close`. A call to `PeerHandler::on_notification` that is in progress
+then is cancelled at the await it had reached. A call that must finish a stretch it has begun asks
+for `Client::hold_cancellation()` before the stretch and drops the hold after it. While a hold is
+out, such an end waits for it, for up to `shutdown_timeout`, and cancels only then; a hold asked
+for after the cancellation was decided is never granted, so the stretch runs whole or not at all.
+A close overlaps that wait with the one for the answers it owes the peer, so its bound of twice
+`shutdown_timeout` stands, and after an inbound overflow `on_terminated` comes within one
+`shutdown_timeout`. Calls that hold nothing are cancelled as promptly as before. The other ends
+(the peer's exit, a failed link, this side's outbound budget) drain the queue within
+`shutdown_timeout`, as before; a stretch still held when that runs out is waited for in the same
+way, for up to one `shutdown_timeout` more. A hold belongs to its call: one kept, moved or
+forgotten stops counting when the call is over.
+
+`on_terminated` is made once, after the handler's task has stopped. A `Client::close` that arrives
+while a connection is ending under this side waits for that call to return, within the bound of a
+close, where it used to take the reader down under it. Dropping the `Client` cannot wait: the
+call in progress is cancelled whatever it holds, and `on_terminated` may not be made at all.
 
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted

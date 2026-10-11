@@ -293,6 +293,18 @@ pub trait PeerHandler: Send + Sync {
     ///
     /// A handler can release state that only a complete vendor turn would otherwise clear. This
     /// callback is never made for [`Client::close`], whose caller already owns that shutdown.
+    ///
+    /// Made once, after the handler's task has stopped. A [`Client::close`] that arrives while
+    /// the connection is ending this way waits for this call to return, within the time a close
+    /// may take, where it would otherwise take the reader down mid-call. Dropping the
+    /// [`Client`] cannot wait: a connection that is ending as its client is dropped may never
+    /// have this called, or have it cancelled at an await.
+    ///
+    /// Do not await, from here, a [`Client::close`] that runs on another task. That close waits
+    /// for this call to return while this call waits for it, and both stand still until the
+    /// close's bound, twice [`ClientOptions::shutdown_timeout`], cuts this call short. Signal
+    /// whoever owns the client and return; or close from this call itself, which is recognised
+    /// and waits for nothing.
     async fn on_terminated(&self, _termination: PeerTermination) {}
 }
 
@@ -657,8 +669,10 @@ impl RequestOptions {
     /// The same order holds when the connection ends. A response that was read before the peer
     /// exited or the link failed still reaches its caller once the notifications ahead of it have
     /// been handled, and a request the peer never answered fails only after that drain, which
-    /// [`ClientOptions::shutdown_timeout`] bounds. [`Client::close`] and a queue overflow do not
-    /// drain: they fail the call at once.
+    /// [`ClientOptions::shutdown_timeout`] bounds, or twice that when the drain runs out inside
+    /// a stretch under a [`CancellationHold`]. [`Client::close`] and a queue overflow do not
+    /// drain: they fail the call at once, or, for an answer already queued behind such a
+    /// stretch, when the stretch is over.
     ///
     /// A request [`without_deadline`](Self::without_deadline) waits in that queue for as long
     /// as the handler takes: an `on_notification` that never returns holds its answer back
@@ -763,13 +777,114 @@ tokio::task_local! {
     /// Scoped around that one call, so it says nothing once the handler returned or panicked,
     /// and nothing on any other task. A recorded task id would do neither: it outlives a worker
     /// that panicked, and tokio may hand a finished task's id to a new one.
-    static HANDLING_NOTIFICATION_FOR: usize;
+    static HANDLING_NOTIFICATION_FOR: NotificationCall;
+}
+
+/// One call to `on_notification`, as the task making it knows it.
+struct NotificationCall {
+    /// The client's state, by address.
+    client: usize,
+    /// Whether the call asked for a [`CancellationHold`]. Read by the handler's task when the
+    /// call returns, so a handler that never asks pays nothing for the ones that do.
+    asked_for_hold: std::cell::Cell<bool>,
+    /// The holds this call has out, made on its first. Shared with each hold, which may be
+    /// dropped on another task.
+    holds: std::cell::OnceCell<Arc<CallHolds>>,
+}
+
+impl Drop for NotificationCall {
+    /// The call is over, however it ended: returned, panicked, or cancelled. What it still
+    /// has out stops counting here, so a hold that was kept, moved or forgotten holds nothing
+    /// past the call it was granted to.
+    fn drop(&mut self) {
+        if let Some(holds) = self.holds.get() {
+            holds.end();
+        }
+    }
+}
+
+/// The holds out on one client. Shared with every hold, so that a hold keeps this alive and
+/// nothing else of the client: not its state, and not the link's sender.
+#[derive(Default)]
+struct Holds {
+    /// Raised before `cancelling_handler` is read and read after that flag is raised, so one
+    /// side always sees the other: a hold is granted only to a call the cancellation will
+    /// wait for.
+    out: AtomicUsize,
+    /// Told when `out` returns to zero.
+    released: Notify,
+}
+
+impl Holds {
+    fn release(&self, holds: usize) {
+        if holds > 0 && self.out.fetch_sub(holds, Ordering::SeqCst) == holds {
+            self.released.notify_waiters();
+        }
+    }
+}
+
+/// The holds one notification call has out.
+struct CallHolds {
+    client: Arc<Holds>,
+    call: StdMutex<CallHoldCount>,
+}
+
+#[derive(Default)]
+struct CallHoldCount {
+    out: usize,
+    /// Set when the call is over. A hold dropped after that has nothing left to release.
+    ended: bool,
+}
+
+impl CallHolds {
+    fn of(client: &Arc<Holds>) -> Self {
+        Self {
+            client: Arc::clone(client),
+            call: StdMutex::new(CallHoldCount::default()),
+        }
+    }
+
+    /// Counts one more hold, and says whether the call already had one out.
+    fn take_one(&self) -> bool {
+        let mut call = self.call.lock().unwrap_or_else(PoisonError::into_inner);
+        call.out += 1;
+        self.client.out.fetch_add(1, Ordering::SeqCst);
+        call.out > 1
+    }
+
+    fn give_back(&self) {
+        let mut call = self.call.lock().unwrap_or_else(PoisonError::into_inner);
+        if call.ended || call.out == 0 {
+            return;
+        }
+        call.out -= 1;
+        self.client.release(1);
+    }
+
+    fn end(&self) {
+        let mut call = self.call.lock().unwrap_or_else(PoisonError::into_inner);
+        call.ended = true;
+        self.client.release(std::mem::take(&mut call.out));
+    }
+}
+
+impl NotificationCall {
+    fn of(client: usize) -> Self {
+        Self {
+            client,
+            asked_for_hold: std::cell::Cell::new(false),
+            holds: std::cell::OnceCell::new(),
+        }
+    }
 }
 
 /// A JSON-RPC client that also answers.
 pub struct Client {
     state: Arc<ClientState>,
     pump: Mutex<Option<JoinHandle<()>>>,
+    /// The reader's task, so that a close can tell it is being made from that task without
+    /// taking the lock a close that waits for the reader holds.
+    reader: tokio::task::Id,
 }
 
 /// How a connection came to its end.
@@ -1116,6 +1231,21 @@ struct ClientState {
     /// of `notifications` to wait on it, and a close or a drop that lands in that drain still
     /// has to stop the task, with whatever its queue holds.
     worker_abort: OnceLock<tokio::task::AbortHandle>,
+    /// Cancelled when the handler's task has stopped, however it stopped.
+    worker_stopped: CancelToken,
+    /// Raised when the handler's task is about to be cancelled without its queue being drained.
+    /// From then on no hold is granted.
+    cancelling_handler: AtomicBool,
+    /// The [`CancellationHold`]s the notification call in progress has out.
+    holds: Arc<Holds>,
+    /// Runs once in [`ClientState::cancellation_held`] between raising the flag and reading
+    /// the holds, so a test can ask for a hold exactly there.
+    #[cfg(test)]
+    after_cancelling_raised: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in [`Client::hold_cancellation`] between counting the hold and reading the
+    /// flag, so a test can have a cancellation land exactly there.
+    #[cfg(test)]
+    after_hold_counted: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once between the two reads the reader admits a notification on, so a test can place
     /// the worker's dequeue exactly there.
     #[cfg(test)]
@@ -1200,6 +1330,85 @@ impl Drop for PoisonUnlessClosed<'_> {
         let last = self.state.closes_in_progress.fetch_sub(1, Ordering::AcqRel) == 1;
         if last && !self.state.close_reached_link.load(Ordering::Acquire) {
             self.state.link_poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Asks the handler's task to stop when a close ends, however it ends. A close that ran its
+/// course has stopped the task already, and this changes nothing.
+struct CancelHandlerOnDrop<'a>(&'a ClientState);
+
+impl Drop for CancelHandlerOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.cancelling_handler.store(true, Ordering::SeqCst);
+        self.0.abort_worker();
+    }
+}
+
+/// Takes the reader down when the close holding it ends. A reader that finished is unaffected.
+struct AbortReaderOnDrop(JoinHandle<()>);
+
+impl Drop for AbortReaderOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Says the handler's task has stopped, when it is dropped with that task.
+struct WorkerStopped(CancelToken);
+
+impl Drop for WorkerStopped {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Keeps a notification call from being cancelled part-way through what it must finish.
+///
+/// Returned by [`Client::hold_cancellation`], and released when dropped.
+#[must_use = "the call may be cancelled again as soon as this is dropped"]
+pub struct CancellationHold {
+    /// The holds of the call this was granted to. `None` for a hold asked for outside a
+    /// notification call, which holds nothing.
+    call: Option<Arc<CallHolds>>,
+}
+
+impl std::fmt::Debug for CancellationHold {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CancellationHold")
+            .field("holding", &self.is_holding())
+            .finish()
+    }
+}
+
+impl CancellationHold {
+    /// Whether this hold keeps anything from being cancelled. `false` for one asked for
+    /// outside a call to [`PeerHandler::on_notification`] on the client it was asked of, and
+    /// for one whose call is over.
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
+    /// let hold = client.hold_cancellation().await;
+    /// assert!(!hold.is_holding(), "not inside on_notification here");
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn is_holding(&self) -> bool {
+        self.call.as_ref().is_some_and(|holds| {
+            !holds
+                .call
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .ended
+        })
+    }
+}
+
+impl Drop for CancellationHold {
+    fn drop(&mut self) {
+        if let Some(call) = self.call.take() {
+            call.give_back();
         }
     }
 }
@@ -1482,6 +1691,13 @@ impl Client {
             in_flight: StdMutex::new(JoinSet::new()),
             notifications: StdMutex::new(None),
             worker_abort: OnceLock::new(),
+            worker_stopped: CancelToken::new(),
+            cancelling_handler: AtomicBool::new(false),
+            holds: Arc::default(),
+            #[cfg(test)]
+            after_cancelling_raised: StdMutex::new(None),
+            #[cfg(test)]
+            after_hold_counted: StdMutex::new(None),
             #[cfg(test)]
             after_queue_length_read: StdMutex::new(None),
             peer_bytes,
@@ -1492,11 +1708,18 @@ impl Client {
         let writer = tokio::spawn(outbox::run(Arc::clone(&state), entries));
         let _ = state.writer_abort.set(writer.abort_handle());
         let (notifications, notification_receiver) = mpsc::channel(queue_capacity);
-        let worker = tokio::spawn(peer_work_pump(
+        // Held by the task's future from the moment it exists, so it is dropped with the task
+        // however the task ends: returned, cancelled mid-call, or cancelled before it ever ran.
+        let stopped = WorkerStopped(state.worker_stopped.clone());
+        let work = peer_work_pump(
             Arc::clone(&state),
             notification_receiver,
             Arc::clone(&handler),
-        ));
+        );
+        let worker = tokio::spawn(async move {
+            let _stopped = stopped;
+            work.await;
+        });
         let _ = state.worker_abort.set(worker.abort_handle());
         *state
             .notifications
@@ -1505,6 +1728,7 @@ impl Client {
         let pump = tokio::spawn(pump(Arc::clone(&state), receiver, handler, notifications));
         Self {
             state,
+            reader: pump.id(),
             pump: Mutex::new(Some(pump)),
         }
     }
@@ -1824,6 +2048,99 @@ impl Client {
         Ok(Written::new(ticket, self.state.options.peer_name.clone()))
     }
 
+    /// Keeps the notification call this is made from from being cancelled until the returned
+    /// hold is dropped, for a handler that must finish what it has begun.
+    ///
+    /// Two ends of a connection stop the handler's task without draining its queue: the peer
+    /// passing an inbound budget, and [`Client::close`]. The call to
+    /// [`PeerHandler::on_notification`] in progress is then cancelled at whichever await it had
+    /// reached. That is right for a call parked on a host that stopped reading, and wrong for
+    /// one that has claimed something it releases a few awaits further down. Such a call asks
+    /// for a hold around exactly that stretch:
+    ///
+    /// ```no_run
+    /// # async fn commit() {}
+    /// # async fn on_notification(client: &mango_external_agents::jsonrpc::Client) {
+    /// // Anything before this may be cancelled at any await.
+    /// let hold = client.hold_cancellation().await;
+    /// commit().await; // claimed, reported, released: all of it or none of it
+    /// drop(hold);
+    /// # }
+    /// ```
+    ///
+    /// While a hold is out, an end that would cancel the call waits for it instead, for up to
+    /// [`ClientOptions::shutdown_timeout`], and cancels only then. The wait overlaps the one a
+    /// close already makes for the answers this side owes the peer, so a close takes no longer
+    /// than it documents, and after an inbound overflow
+    /// [`on_terminated`](PeerHandler::on_terminated) comes within one `shutdown_timeout`.
+    /// Calls that hold nothing are cancelled as promptly as before.
+    ///
+    /// If the cancellation has already been decided when the hold is asked for, this does not
+    /// return: the call is cancelled here, before it began what it wanted to finish. A hold is
+    /// therefore either granted, and waited for, or never granted. Ask for it before the first
+    /// step of the stretch, not part-way through.
+    ///
+    /// Holds nest: one asked for while the same call has another out is granted, and the wait
+    /// is for the last of them to be dropped.
+    ///
+    /// A hold belongs to the call that asked for it. When that call is over, however it ended,
+    /// whatever it still had out stops counting: a hold that was stored, moved to another task
+    /// or forgotten holds nothing past its call, and keeps nothing of the client alive.
+    ///
+    /// What a hold does not do:
+    ///
+    /// - It holds nothing outside a notification call on this client's handler task
+    ///   ([`CancellationHold::is_holding`] says so): not in
+    ///   [`on_request`](PeerHandler::on_request), not on a task the handler spawned.
+    /// - Dropping the [`Client`] cannot wait and cancels the call whatever it holds.
+    /// - A [`Client::close`] awaited from inside the same call cannot wait for that call and
+    ///   cancels it. One made on another task that the call then awaits is waited out for the
+    ///   whole grace, each waiting for the other.
+    /// - A close whose caller gives it up, by dropping it or timing it out, asks for the call
+    ///   to be cancelled then, wherever the close had got to and whatever the call holds. That
+    ///   is a request: the call ends at its next await, and nothing waits for it to.
+    ///
+    /// The other ends (the peer's exit, a failed link, this side's outbound budget) drain the
+    /// queue for up to `shutdown_timeout`, held or not. A stretch still held when that runs out
+    /// is waited for in the same way, for up to one `shutdown_timeout` more, so on those ends
+    /// [`on_terminated`](PeerHandler::on_terminated) comes within two.
+    pub async fn hold_cancellation(&self) -> CancellationHold {
+        let address = self.state.address();
+        let in_own_call = HANDLING_NOTIFICATION_FOR
+            .try_with(|call| {
+                (call.client == address).then(|| {
+                    call.asked_for_hold.set(true);
+                    Arc::clone(
+                        call.holds
+                            .get_or_init(|| Arc::new(CallHolds::of(&self.state.holds))),
+                    )
+                })
+            })
+            .ok()
+            .flatten();
+        let Some(in_call) = in_own_call else {
+            return CancellationHold { call: None };
+        };
+        // Counted first, read second; a cancellation raises its flag first and counts the
+        // holds second. Whichever the interleaving, either the cancellation sees this hold and
+        // waits for it, or this sees the cancellation and takes the hold back.
+        //
+        // A hold asked for under one this call already has out is granted whatever the flag
+        // says: the cancellation that raised it counted the earlier hold and is waiting, and
+        // refusing this one would park the very stretch it waits for.
+        let already_holding = in_call.take_one();
+        #[cfg(test)]
+        ClientState::run_hook(&self.state.after_hold_counted);
+        if !already_holding && self.state.cancelling_handler.load(Ordering::SeqCst) {
+            in_call.give_back();
+            // The cancellation is on its way to this task. Nothing past this point runs.
+            std::future::pending::<()>().await;
+        }
+        CancellationHold {
+            call: Some(in_call),
+        }
+    }
+
     /// Stops the pump, fails every call still waiting, and closes this side of the link.
     ///
     /// The process or socket underneath is the caller's to reap: this client did not open it.
@@ -1835,7 +2152,11 @@ impl Client {
     /// owes the peer to be written, and once for what was queued before the close to be written
     /// and the link closed. Both waits are over at once on a link that takes its writes. The
     /// handler's tasks are cancelled, not waited out, which takes no time unless a handler is
-    /// blocking its thread without yielding; nothing here can bound that. A caller that wants
+    /// blocking its thread without yielding; nothing here can bound that. Two things are waited
+    /// for inside the same bound: a notification call that asked for a
+    /// [`hold`](Self::hold_cancellation), during the first wait, and, on a connection that had
+    /// already ended under this side, the handler's
+    /// [`on_terminated`](PeerHandler::on_terminated), with whatever is left of the bound. A caller that wants
     /// a tighter bound puts its own timeout around this future or drops it: that is safe at any
     /// point, and leaves the link as the last paragraph below describes.
     ///
@@ -1879,14 +2200,31 @@ impl Client {
         // Closes running at once answer for the link together: one that gives up while another
         // is still writing what was queued does not take the link from under it.
         let mut giving_up = PoisonUnlessClosed::begin(&self.state);
+        // Wherever this close is given up, by a caller that drops it or times it out, the
+        // handler's task is asked to stop: nobody is waiting any more for what it holds, and it
+        // must not run on behind a client its host has walked away from.
+        let _stops_the_handler = CancelHandlerOnDrop(&self.state);
+        // A connection that ended under this side has its handler still to be told, by the
+        // reader. This close waits for that, within the time it may take, where it otherwise
+        // takes the reader down.
+        let ended_under_this_side = matches!(self.state.ended(), Some(ConnectionEnd::Peer(_)));
+        let latest = deadline_after(self.state.options.shutdown_timeout.saturating_mul(2));
         self.state.fail_pending(failure).await;
-        self.state.stop_notifications().await;
         // The peer's own questions are answered on tasks of their own, and one waiting for a
         // person would otherwise outlive the client that spawned it — holding its share of the
         // state for the rest of the process, and replying into a link that is already gone. The
         // shutdown flag has already reached them, so this is the moment they need to write the
         // refusal, and it happens before the link is closed under them.
-        self.state.drain_in_flight().await;
+        //
+        // A notification call that holds its cancellation off is waited for at the same time:
+        // the two waits overlap, so the close takes no longer for it.
+        if self.state.cancellation_held() {
+            tokio::join!(self.state.wait_for_holds(), self.state.drain_in_flight());
+            self.state.stop_notifications().await;
+        } else {
+            self.state.stop_notifications().await;
+            self.state.drain_in_flight().await;
+        }
 
         let closed = tokio::time::timeout(self.state.options.shutdown_timeout, async {
             // Behind whatever is already queued, as a close has always waited its turn behind
@@ -1905,12 +2243,35 @@ impl Client {
         giving_up.reached_the_link = closed.is_ok();
         drop(giving_up);
         let closed = closed.and_then(std::convert::identity);
-        if let Some(pump) = self.pump.lock().await.take() {
+        // A handler that closes its client from `on_terminated` is on the reader's own task, in
+        // the last thing that task does. The reader is left where it is, to return from that
+        // call: taking it down here would cut the call short, and waiting for it would be
+        // waiting for this. Decided without the lock, which a close that is waiting for that
+        // very call holds.
+        if tokio::task::try_id() == Some(self.reader) {
+            return closed;
+        }
+        // The lock is kept across the wait, so that a second close waits for the handler to be
+        // told as the first one does.
+        let mut reader = self.pump.lock().await;
+        if let Some(pump) = reader.take() {
+            // The reader of a connection that ended under this side is on its way to telling
+            // the handler so, or is telling it. It is owed that call whole, so it is waited for
+            // with what is left of the time this close may take.
+            //
+            // A close given up during that wait takes the reader down, as it would have done
+            // had it not waited: nothing is left that could stop it later.
+            let mut pump = AbortReaderOnDrop(pump);
+            let pump = &mut pump.0;
+            let told =
+                ended_under_this_side && tokio::time::timeout_at(latest, &mut *pump).await.is_ok();
             // Taken down rather than waited out: the shutdown flag is only read between messages,
             // so a pump parked inside a handler — which is where a host that stopped reading its
             // turn stream parks it — would never reach the flag, and closing would never return.
-            pump.abort();
-            let _ = pump.await;
+            if !told {
+                pump.abort();
+                let _ = pump.await;
+            }
         }
         closed
     }
@@ -2102,6 +2463,7 @@ impl Drop for Client {
             writer.abort();
         }
         self.state.abort_in_flight();
+        self.state.cancelling_handler.store(true, Ordering::SeqCst);
         self.state.abort_notifications();
         if let Ok(mut pump) = self.pump.try_lock()
             && let Some(pump) = pump.take()
@@ -2187,6 +2549,44 @@ impl ClientState {
         }
     }
 
+    /// Decides that the handler's task is to be cancelled without its queue being drained, and
+    /// says whether the notification call in progress holds that off.
+    ///
+    /// The flag is raised first and the holds are counted second; a call counts its hold first
+    /// and reads the flag second. So a hold this does not see is one that will see the flag
+    /// and be taken back.
+    fn cancellation_held(&self) -> bool {
+        self.cancelling_handler.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        Self::run_hook(&self.after_cancelling_raised);
+        // A close made from inside the call cannot wait for the call it is made from.
+        self.holds.out.load(Ordering::SeqCst) > 0 && !self.handling_own_notification()
+    }
+
+    /// Waits until the notification call in progress holds nothing any more, for as long as the
+    /// shutdown grace. The caller cancels the task afterwards.
+    async fn wait_for_holds(&self) {
+        let released = async {
+            loop {
+                let released = self.holds.released.notified();
+                if self.holds.out.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                released.await;
+            }
+        };
+        let _ = tokio::time::timeout(self.options.shutdown_timeout, async {
+            tokio::select! {
+                () = released => {}
+                // A task that stopped holds nothing. Its last call released what it had out as
+                // it ended, so this says nothing the count does not; it is here so that the
+                // wait cannot outlive the task whatever becomes of the count.
+                () = self.worker_stopped.cancelled() => {}
+            }
+        })
+        .await;
+    }
+
     /// Lets already queued peer work reach the handler before reporting that the peer vanished.
     ///
     /// A complete activity frame followed by EOF is still observable output. Dropping the sender
@@ -2199,6 +2599,9 @@ impl ClientState {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         let Some(mut handle) = handle else {
+            // A close got to the task first and is stopping it. What follows this drain, the
+            // handler being told, comes after the task has stopped all the same.
+            self.worker_stopped.cancelled().await;
             return;
         };
         // A close or a drop that lands here stops the worker through its abort handle, which
@@ -2207,6 +2610,16 @@ impl ClientState {
             .await
             .is_err()
         {
+            // The queue had its time. A stretch held at this moment is given the same bounded
+            // wait as on the ends that do not drain, and no hold is granted from here on.
+            //
+            // The shutdown flag goes up first and the answers still owed to the peer are
+            // written meanwhile, as on those ends, so the two waits overlap and the handler
+            // is told within two graces of the end, held or not.
+            if self.cancellation_held() {
+                self.shutdown.cancel();
+                tokio::join!(self.wait_for_holds(), self.drain_in_flight());
+            }
             handle.abort();
             let _ = handle.await;
         }
@@ -2623,7 +3036,7 @@ impl ClientState {
     /// Whether the caller is inside this client's `on_notification`, on the task that awaits it.
     fn handling_own_notification(&self) -> bool {
         HANDLING_NOTIFICATION_FOR
-            .try_with(|client| *client == self.address())
+            .try_with(|call| call.client == self.address())
             .unwrap_or(false)
     }
 
@@ -2843,7 +3256,17 @@ async fn pump(
     loop {
         let message = tokio::select! {
             biased;
-            () = state.shutdown.cancelled() => break,
+            () = state.shutdown.cancelled() => {
+                // Its owner closed the connection. If it had already ended under this side,
+                // which a caller passing the outbound budget records before this task hears of
+                // it, the handler is still owed the reason: `Client::ended` reports it. The
+                // close stops the handler's task and is waiting for this.
+                if let Some(ConnectionEnd::Peer(termination)) = state.ended() {
+                    state.worker_stopped.cancelled().await;
+                    handler.on_terminated(termination).await;
+                }
+                break;
+            }
             // A transport failure, refused reply or abandoned send can leave the read side open.
             // End the connection here, on the one task that owns termination.
             () = state.write_failed.notified() => {
@@ -2882,9 +3305,24 @@ async fn pump(
                     let termination = failure.termination(termination);
                     state.mark_closed();
                     state.fail_pending(failure).await;
-                    state.stop_notifications().await;
-                    state.shutdown.cancel();
-                    state.drain_in_flight().await;
+                    if state.cancellation_held() {
+                        // As a close does it: the shutdown flag first, so whatever the call is
+                        // waiting on that the flag releases lets it get on, and the two waits
+                        // at once, so the handler is told within one grace.
+                        state.shutdown.cancel();
+                        tokio::join!(state.wait_for_holds(), state.drain_in_flight());
+                        state.stop_notifications().await;
+                        // A close may hold the task's join handle. The handler is told only
+                        // once the task has stopped, whoever stopped it.
+                        state.worker_stopped.cancelled().await;
+                    } else {
+                        state.stop_notifications().await;
+                        state.shutdown.cancel();
+                        state.drain_in_flight().await;
+                        // At once unless a close holds the task's join handle and is still
+                        // waiting for it to stop.
+                        state.worker_stopped.cancelled().await;
+                    }
                     handler.on_terminated(termination).await;
                     break;
                 }
@@ -3101,6 +3539,12 @@ async fn peer_work_pump(
     while let Some(queued) = notifications.recv().await {
         let (work, _permit) = match queued {
             QueuedWork::Response(answer) => {
+                // An end that does not drain has been noticed and is on its way to stopping
+                // this task. An answer still queued then is not delivered: it fails with what
+                // ended the connection, as it and the rest of the queue are let go.
+                if state.cancelling_handler.load(Ordering::SeqCst) {
+                    break;
+                }
                 // Everything read before this response has been handed to the handler and, for a
                 // notification, awaited.
                 answer.deliver();
@@ -3110,9 +3554,18 @@ async fn peer_work_pump(
         };
         match work {
             PeerWork::Notification { method, params } => {
-                HANDLING_NOTIFICATION_FOR
-                    .scope(state.address(), handler.on_notification(method, params))
-                    .await
+                let asked_for_hold = HANDLING_NOTIFICATION_FOR
+                    .scope(NotificationCall::of(state.address()), async {
+                        handler.on_notification(method, params).await;
+                        HANDLING_NOTIFICATION_FOR.with(|call| call.asked_for_hold.get())
+                    })
+                    .await;
+                // A cancellation that waited for this call's hold is over the moment the hold
+                // is dropped, and whatever is queued behind the call is not to be begun. Only a
+                // call that asked for a hold can have been waited for, so only it looks.
+                if asked_for_hold && state.cancelling_handler.load(Ordering::SeqCst) {
+                    break;
+                }
             }
             PeerWork::Request { method, params, id } => {
                 // A question that waits for a person must not stop later events after it has
@@ -3218,6 +3671,7 @@ const FRAME_BYTES: &str = "bytes of one outgoing JSON-RPC frame";
 
 #[cfg(test)]
 mod tests {
+    mod cancellation_hold_tests;
     mod handoff_queue_tests;
     mod ordered_response_tests;
     mod outbox_tests;
