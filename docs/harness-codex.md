@@ -214,7 +214,49 @@ teardown acts for the reason a host's `close` gave when that close stopped work 
 teardown began, even if a stop worker asked for it first; a close that arrives later joins the
 teardown already running for its requester's reason. The failure the worker commits in a
 committer's place carries no closes for what the turn left open: those went with the claim, and a
-terminal ends them for the host all the same. A session dropped on a thread
+terminal ends them for the host all the same.
+
+That wait covers the worker's own close. The JSON-RPC client also stops the notification handler
+on its own when the app-server passes an inbound budget, which is `turn_channel_capacity`
+notifications or `turn_buffer_bytes` read and not yet handled. It does not drain what it has read,
+and it cancels the call in progress at the await that call had reached (`docs/lifecycle.md`). A
+`turn/completed` cut between claiming the turn's terminal and releasing the turn left the turn
+claimed. The host then got `terminal-abandoned` one `shutdown_timeout` later, for a turn Codex had
+completed.
+
+The handler now asks the client for a cancellation hold (`Client::hold_cancellation`) around that
+stretch, from the claim to the release. Two paths claim a turn's terminal from inside a notification
+and both take it: a turn's own ending, and the failure of a session poisoned there. An event the
+core refuses fails the turn there too, but it claims nothing and leaves the slot to the stop that
+follows, so it needs no hold. While the
+hold is out, an end that would cancel the handler waits for the stretch for up to
+`shutdown_timeout`, and the host gets the turn's real terminal.
+
+The stretch takes this session's locks and publishes without blocking. It never waits on the
+app-server or the host. A poisoned session's interrupt does wait, so the handler sends it before
+it asks for the hold. The handler also lets the question-settlement lock go at the claim, so a
+teardown that has questions to settle does not queue behind a commit.
+
+The handler asks for the hold before the claim. If the client has already decided to cancel, it
+grants nothing and the call ends there, with nothing claimed. The turn then ends once, with the
+connection's failure or the teardown's cancellation.
+
+Three committers run outside a notification call, so they hold nothing and rely on the worker's
+wait alone: a poison raised while answering an app-server request, the steer replay, which routes
+the notifications a steer held and can end or poison the turn, and the report of a connection's
+end.
+
+The client's wait and the worker's wait run one after the other, and each ends when the commit
+lands. A commit that lands therefore costs only its own duration. A commit still unfinished after
+a whole `shutdown_timeout` pays both, and the host gets `terminal-abandoned`. After an inbound
+overflow the client waits one `shutdown_timeout` and stops the handler, then the worker waits one
+more and fails the turn. On a `close` the worker waits one and fails the turn, then the client's
+close waits one more for the stretch and stops the handler.
+
+Dropping the session starts the same teardown, and the commit gets the same wait. The worker
+closes the session's client; nothing drops it under the handler.
+
+A session dropped on a thread
 without a Tokio runtime hands that worker to the runtime it was opened on. Every `close` waits for
 the worker's result, so none reports success before the child is reaped. If the worker cannot reap
 the child, or panics inside the host's process control, each caller receives the same
@@ -246,15 +288,41 @@ once, with no settle wait and no kill: Codex never saw the request, so no native
 The stages add up. With `rt` for `request_timeout`, `st` for `shutdown_timeout` and `kg` for
 `kill_grace`, the worst cases are:
 
-| Path                       | Worst case                                       | At the defaults |
-| -------------------------- | ------------------------------------------------ | --------------- |
-| Teardown `T`               | `kg` + `st` + `st` + (`kg` + `kg` + `st` + `st`) | 26 s            |
-| Cancel, interrupt accepted | `rt` + `rt` + `cancel_settle_timeout` + `T`      | about 5.5 min   |
-| Cancel, interrupt failed   | `rt` + `rt` + `rt` + `st` + `T`                  | about 6.5 min   |
+| Path                       | Worst case                                         | At the defaults |
+| -------------------------- | -------------------------------------------------- | --------------- |
+| Teardown `T`               | `kg` + `st` + 3 `st` + (`kg` + `kg` + `st` + `st`) | 36 s            |
+| Cancel, interrupt accepted | `rt` + `rt` + `cancel_settle_timeout` + `T`        | about 5.6 min   |
+| Cancel, interrupt failed   | `rt` + `rt` + `rt` + `st` + `T`                    | about 6.7 min   |
 
 The teardown's terms are, in order: the discarded protocol interrupt, the wait for a terminal
 another task claimed (only when there is one), the client's close, and the process stop (a
-graceful interrupt and its wait, then the kill and its wait). A cancel's first `rt` is the pending
+graceful interrupt and its wait, then the kill and its wait).
+
+The close is the term that grew, from one `st` to three. The client bounds its own close at twice
+`shutdown_timeout`. In the first it waits for a notification call that holds its cancellation off
+and, at the same time, for the answers it still owes the app-server. In the second it writes the
+queue and closes the link. On a connection that had already ended it also waits for the report of
+that end, inside the same two.
+
+The harness used to cut the close off after one `st`, less than the client's own bound. A close
+still waiting for a held commit, or for a slow report of the connection's end, then came back as
+a timeout from a teardown that had delivered the terminal and reaped the child. The harness now
+gives up on the close one `st` after the client's bound. That third `st` is a backstop, so the
+reap does not depend on the client keeping its bound, and a close is not expected to use it. A
+client within its bound makes `T` 31 s at the defaults.
+
+One commit can use two of those terms, the wait for a claimed terminal and the first `st` of the
+close, and only if it outlasts both. These are the times measured from the host's `close` at the
+defaults. A commit that never finishes gives the host `terminal-abandoned` at 5 s and the close
+returns `Ok` at 10 s. A report of the connection's end that never returns gives
+`terminal-abandoned` at 5 s and `Ok` at 15 s.
+
+An inbound overflow adds a wait ahead of `T`. The client waits up to one `st` for a held commit
+before it reports the end, and the teardown starts after that report. A commit that never
+finishes there gives `terminal-abandoned` 10 s after the overflow, and the child is reaped at
+that moment.
+
+A cancel's first `rt` is the pending
 start and its second the interrupt. In the failed case the third `rt` is the steer hold, paid only
 while a `turn/steer` is in flight, and the `st` is the wait for a closing connection to fail the
 turn, paid only when the connection is ending; a refused interrupt on a healthy connection with no
@@ -263,8 +331,7 @@ more interrupt and settle round; if that late interrupt fails, its steer and con
 on top, outside `cancel_settle_timeout`. For that whole time the session stays busy. A `cancel` call waits
 only when the turn is already named: then it covers the interrupt, the settle deadline and any
 shutdown. A cancel that arrives before the start answer returns once the stop is recorded. `close`
-does not wait for this: it goes straight to process shutdown, bounded by `kill_grace` and
-`shutdown_timeout` alone.
+does not wait for this: it goes straight to the teardown, bounded by `T`.
 
 Each owner has one stop worker, and it sends at most one `turn/interrupt`: repeated cancels, a
 dropped stream, an idle expiry and a racing `close` all share it. Until the turn ends the slot stays

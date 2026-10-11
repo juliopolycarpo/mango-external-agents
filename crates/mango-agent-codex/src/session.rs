@@ -24,8 +24,8 @@ use mango_external_agents::interaction::{
     UnsupportedQuestion,
 };
 use mango_external_agents::jsonrpc::{
-    Client, JsonRpcError, PeerHandler, PeerTermination, RequestId, RequestOptions,
-    ServerRequestOutcome,
+    CancellationHold, Client, JsonRpcError, PeerHandler, PeerTermination, RequestId,
+    RequestOptions, ServerRequestOutcome,
 };
 use mango_external_agents::operation::{AttemptId, Dispatch, OperationRef};
 use mango_external_agents::permission::{
@@ -220,6 +220,10 @@ pub(crate) struct Shared {
     /// terminal and before it commits it.
     #[cfg(test)]
     termination_claimed: Mutex<()>,
+    /// Held by a test to park [`Shared::finish_for`] or [`Shared::poison`] after it claimed the
+    /// turn's terminal and before it commits it.
+    #[cfg(test)]
+    terminal_claimed: Arc<Mutex<()>>,
     /// Wakes the session-owned process reaper after an unexpected link termination.
     terminated: mango_external_agents::CancelToken,
     /// Wakes an abandonment watcher after its owned native turn reaches a terminal outcome, and a
@@ -272,6 +276,8 @@ impl Shared {
             poison_released: Mutex::new(()),
             #[cfg(test)]
             termination_claimed: Mutex::new(()),
+            #[cfg(test)]
+            terminal_claimed: Arc::new(Mutex::new(())),
             terminated: mango_external_agents::CancelToken::new(),
             turn_finished: Notify::new(),
             idle_changes,
@@ -1632,6 +1638,36 @@ impl Shared {
             .await;
     }
 
+    /// Keeps the notification call this is made from whole until the returned hold is dropped,
+    /// for the stretch that claims a turn's terminal, commits it and releases the turn.
+    ///
+    /// The JSON-RPC client stops the handler's task without draining its queue when the
+    /// app-server passes an inbound budget and when the client is closed, and it cancels the
+    /// call in progress at the await it had reached. Cut between the claim and the release, a
+    /// turn keeps its slot with no terminal for the host, and nothing can claim it again. Under
+    /// a hold those ends wait for the stretch, up to `shutdown_timeout`.
+    ///
+    /// Ask before the claim, never after it. When the cancellation has already been decided
+    /// this does not return: the call ends here with nothing claimed, and whoever ends the
+    /// connection ends the turn. So a stretch runs whole or is not begun.
+    ///
+    /// Keep nothing under the hold that can wait on the app-server or the host. It holds
+    /// nothing on a task that is not the client's notification call (a peer request, the steer
+    /// replay, the report of a connection's end) or before the session has its client, and
+    /// returns at once there.
+    ///
+    /// ```ignore
+    /// let hold = self.hold_terminal_commit().await;
+    /// if let Some(claim) = self.claim_terminal(None).await {
+    ///     self.commit_terminal(claim, Vec::new(), None, None).await;
+    /// }
+    /// drop(hold);
+    /// ```
+    async fn hold_terminal_commit(&self) -> Option<CancellationHold> {
+        let client = self.client.get()?;
+        Some(client.hold_cancellation().await)
+    }
+
     /// Claims a turn's terminal while retaining admission until it is committed.
     async fn claim_terminal(&self, owner: Option<&Arc<()>>) -> Option<TerminalClaim> {
         let mut turn = self.turn.lock().await;
@@ -1732,11 +1768,23 @@ impl Shared {
     }
 
     /// Ends the stream that still belongs to this start attempt.
+    ///
+    /// `settlement` is the question-settlement lock, which the caller took before it settled
+    /// what the turn was still asking. It is kept through the claim, so a request that already
+    /// routed to this turn reads `finishing` before it can announce another round, and let go
+    /// there: the commit needs none of it, and a teardown that has to settle questions of its
+    /// own must not wait behind a commit.
+    ///
+    /// ```ignore
+    /// let settlement = shared.question_settlements.lock().await;
+    /// shared.finish_for(&route, Some("vendor-turn-1"), outcome, settlement).await;
+    /// ```
     async fn finish_for(
         &self,
         route: &ActiveTurnRoute,
         completed_native_turn_id: Option<&str>,
         outcome: Outcome,
+        settlement: tokio::sync::MutexGuard<'_, ()>,
     ) {
         let Outcome::Finish {
             events,
@@ -1746,17 +1794,24 @@ impl Shared {
         else {
             return;
         };
+        // From the claim to the release in one piece: see `hold_terminal_commit`. Everything
+        // under it is a lock of this session's or a publication, and neither waits for the host.
+        let hold = self.hold_terminal_commit().await;
         let Some(claim) = self.claim_terminal(Some(&route.owner)).await else {
             return;
         };
+        drop(settlement);
         self.remember_completed(
             completed_native_turn_id
                 .filter(|native_turn_id| !native_turn_id.is_empty())
                 .unwrap_or(&route.native_turn_id),
         )
         .await;
+        #[cfg(test)]
+        drop(self.terminal_claimed.lock().await);
         self.commit_terminal(claim, events, cancelled, failure)
             .await;
+        drop(hold);
     }
 
     /// Ends a turn because the host is shutting the session down.
@@ -1844,11 +1899,18 @@ impl Shared {
         }
         self.release_pending_for(None, DecisionSource::Cancelled)
             .await;
+        // Held from the claim to the release only: the interrupt above waits for the app-server
+        // and stays outside. Off the handler's task this holds nothing, and the teardown's wait
+        // for a claimed terminal covers the poison instead.
+        let hold = self.hold_terminal_commit().await;
         if let Some(mut claim) = self.claim_terminal(None).await {
+            #[cfg(test)]
+            drop(self.terminal_claimed.lock().await);
             claim.close_open(ActivityStatus::Failed).await;
             let _ = claim.sink.fail(failure).await;
             self.release_terminal(&claim.owner).await;
         }
+        drop(hold);
         #[cfg(test)]
         drop(self.poison_released.lock().await);
         // The reaper is woken as `_reaper` drops.
@@ -2474,8 +2536,9 @@ impl CodexHandler {
                 //
                 // Hold question settlement ownership through both the drain and terminal claim.
                 // A request task that already routed to this turn then observes `finishing`
-                // before it can register a new host-visible round after this drain.
-                let _settlement = self.shared.question_settlements.lock().await;
+                // before it can register a new host-visible round after this drain. `finish_for`
+                // lets it go once the terminal is claimed.
+                let settlement = self.shared.question_settlements.lock().await;
                 self.shared
                     .release_pending_approvals_for(
                         Some(&active_route.owner),
@@ -2486,7 +2549,7 @@ impl CodexHandler {
                     .release_pending_questions_for_locked(Some(&active_route.owner))
                     .await;
                 self.shared
-                    .finish_for(&active_route, notification.turn_id(), outcome)
+                    .finish_for(&active_route, notification.turn_id(), outcome, settlement)
                     .await;
             }
             Outcome::Poison { failure } => {
@@ -3553,11 +3616,12 @@ impl CodexSession {
             .await;
         shared.cancel_active(reason).await;
         shared.settle_claimed_terminal().await;
-        let close = tokio::time::timeout(limits.shutdown_timeout, client.close())
+        let close_backstop = close_backstop(&limits);
+        let close = tokio::time::timeout(close_backstop, client.close())
             .await
             .map_err(|_| Error::Timeout {
                 operation: String::from("Codex app-server connection close"),
-                after: limits.shutdown_timeout,
+                after: close_backstop,
             })
             .and_then(|result| result);
         let stop = stop_process_with_limits(&*control, reason, &limits).await;
@@ -4546,6 +4610,24 @@ impl Drop for CodexSession {
     }
 }
 
+/// How long the teardown gives the JSON-RPC client's close before it reaps the child anyway.
+///
+/// The client bounds its own close at twice `shutdown_timeout`: one for a notification call
+/// that holds its cancellation off and for the answers still owed to the app-server, and one for
+/// the queue and the link; a connection that had already ended has the report of that end waited
+/// for inside the same two. This is one `shutdown_timeout` more than that, so a close that uses
+/// all of its own time still returns its own result, and the reap never depends on a client that
+/// overran it. A bound equal to the client's would cut such a close short and report a timeout
+/// for a teardown that delivered the terminal and reaped the child.
+///
+/// ```ignore
+/// let limits = Limits::default();
+/// assert_eq!(close_backstop(&limits), limits.shutdown_timeout * 3);
+/// ```
+fn close_backstop(limits: &mango_external_agents::Limits) -> std::time::Duration {
+    limits.shutdown_timeout.saturating_mul(3)
+}
+
 /// The typed failure every close waiter receives when the teardown worker did not return.
 ///
 /// The child may still be live, so the host's control rides along for reconciliation.
@@ -5308,6 +5390,7 @@ mod tests {
                     cancelled: None,
                     failure: None,
                 },
+                shared.question_settlements.lock().await,
             )
             .await;
 
@@ -5345,6 +5428,7 @@ mod tests {
                         cancelled: None,
                         failure: None,
                     },
+                    completed.question_settlements.lock().await,
                 )
                 .await;
         });
@@ -7442,13 +7526,30 @@ mod tests {
             FakeLauncher,
             TurnStream,
         ) {
+            running_session_with(shared, ClientOptions::new("Codex app-server"), wrap).await
+        }
+
+        /// [`running_session_on`] over a client with these options. The harness itself connects
+        /// with `ClientOptions::with_limits`, which makes the client's `shutdown_timeout` the
+        /// host's; a test that measures a wait against that limit asks for the same here.
+        async fn running_session_with(
+            shared: Arc<Shared>,
+            options: ClientOptions,
+            wrap: impl FnOnce(Arc<dyn ProcessControl>) -> Arc<dyn ProcessControl>,
+        ) -> (
+            Arc<Shared>,
+            super::super::CodexSession,
+            ScriptedLink,
+            FakeLauncher,
+            TurnStream,
+        ) {
             shared.adopt_thread(String::from("thread-1"));
             let (_turn_id, stream) = running(&shared, "vendor-turn-1").await;
             let link = ScriptedLink::new();
             let client = Arc::new(Client::connect(
                 link.clone().into_link(),
                 super::super::CodexSession::handler(Arc::clone(&shared)),
-                ClientOptions::new("Codex app-server"),
+                options,
             ));
             let launcher = FakeLauncher::new();
             launcher.push(FakeProcess::responding(|_| Vec::new()));
@@ -8096,6 +8197,727 @@ mod tests {
                 "expected frames written by the poisoned handler: [turn/interrupt] | received: {sent:?}"
             );
         }
+
+        /// A turn's terminal that the notification handler is committing when the connection is
+        /// cut under it.
+        ///
+        /// The JSON-RPC client stops the handler's task without draining its queue on two ends:
+        /// the peer passing an inbound budget, and `Client::close`. Each test parks the handler
+        /// between claiming the terminal and committing it, ends the connection, and reads what
+        /// the host is left with. Every client here is connected as the harness connects it, with
+        /// the host's limits, so the client's grace and the teardown's are the same
+        /// `shutdown_timeout`.
+        mod held_terminal {
+            use super::*;
+            use mango_external_agents::session::CloseReason;
+            use mango_external_agents::state::SessionStatus;
+            use mango_external_agents::stream::TerminalStatus;
+            use tokio::sync::OwnedMutexGuard;
+            use tokio::time::Instant;
+
+            /// How many notifications the peer may have waiting behind the one being handled.
+            const NOTIFICATION_BUDGET: usize = 2;
+            /// How many bytes of notifications the peer may have read and not yet handled.
+            const BYTE_BUDGET: usize = 4096;
+
+            /// Which inbound budget the peer passes.
+            #[derive(Clone, Copy, Debug)]
+            enum Overflow {
+                Notifications,
+                Bytes,
+            }
+
+            impl Overflow {
+                fn options(self, shared: &Shared) -> ClientOptions {
+                    let mut options = as_the_harness_connects(shared);
+                    match self {
+                        Self::Notifications => {
+                            options.with_max_pending_notifications(NOTIFICATION_BUDGET)
+                        }
+                        Self::Bytes => {
+                            options.max_pending_bytes = BYTE_BUDGET;
+                            options
+                        }
+                    }
+                }
+
+                /// Sends what passes the budget while one notification is being handled.
+                fn send(self, link: &ScriptedLink) {
+                    match self {
+                        Self::Notifications => {
+                            for _ in 0..NOTIFICATION_BUDGET + 2 {
+                                link.push_line(
+                                    serde_json::json!({"method": "flood", "params": {}})
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Self::Bytes => link.push_line(
+                            serde_json::json!({
+                                "method": "flood",
+                                "params": {"padding": "x".repeat(BYTE_BUDGET)},
+                            })
+                            .to_string(),
+                        ),
+                    }
+                }
+            }
+
+            /// [`real_clock_limits`] with the client's grace for a held stretch out of reach too,
+            /// so a stalled runner cannot let it expire under a commit the test has let go.
+            fn held_real_clock_limits() -> Limits {
+                Limits {
+                    shutdown_timeout: std::time::Duration::from_secs(60),
+                    ..real_clock_limits()
+                }
+            }
+
+            fn as_the_harness_connects(shared: &Shared) -> ClientOptions {
+                ClientOptions::new("Codex app-server").with_limits(shared.host.limits())
+            }
+
+            /// A terminal nobody is expected to send, which poisons the session.
+            fn unroutable_terminal() -> String {
+                serde_json::json!({"method": "turn/completed", "params": {"unexpected": true}})
+                    .to_string()
+            }
+
+            fn client_of(shared: &Shared) -> Arc<Client> {
+                Arc::clone(
+                    shared
+                        .client
+                        .get()
+                        .expect("expected the session to have recorded its client"),
+                )
+            }
+
+            /// Yields until `ready`, which another task makes true without the clock moving.
+            async fn until(what: &str, ready: impl Fn() -> bool) {
+                let began = std::time::Instant::now();
+                while !ready() {
+                    assert!(
+                        began.elapsed() < std::time::Duration::from_secs(30),
+                        "expected {what} | received: not within 30s"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            fn terminal_is_claimed(shared: &Shared) -> bool {
+                shared
+                    .turn
+                    .try_lock()
+                    .is_ok_and(|turn| turn.as_ref().is_some_and(|active| active.finishing))
+            }
+
+            fn turn_is_released(shared: &Shared) -> bool {
+                shared.turn.try_lock().is_ok_and(|turn| turn.is_none())
+            }
+
+            /// Sends `terminal` and returns once the handler has claimed the turn's terminal and
+            /// is parked before committing it, for as long as the guard is kept.
+            async fn park_commit_of(
+                shared: &Arc<Shared>,
+                link: &ScriptedLink,
+                terminal: String,
+            ) -> OwnedMutexGuard<()> {
+                let parked = Arc::clone(&shared.terminal_claimed).lock_owned().await;
+                link.push_line(terminal);
+                until("the handler: holding the turn's claimed terminal", || {
+                    terminal_is_claimed(shared)
+                })
+                .await;
+                parked
+            }
+
+            /// The stream's events and how long after `began` it ended. A stream with no
+            /// terminal after two minutes is returned as it stands.
+            async fn ending(
+                stream: &mut TurnStream,
+                began: Instant,
+            ) -> (Vec<EventKind>, std::time::Duration) {
+                let mut events = Vec::new();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                    while let Some(event) = stream.recv().await {
+                        events.push(event.kind);
+                    }
+                })
+                .await;
+                (events, began.elapsed())
+            }
+
+            /// The teardown's result and how long after `began` it had it, or `None` when the
+            /// teardown had not finished two minutes later.
+            async fn torn_down(
+                shared: &Shared,
+                began: Instant,
+            ) -> (
+                Option<mango_external_agents::Result<()>>,
+                std::time::Duration,
+            ) {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    super::super::super::CodexSession::wait_for_shutdown(shared),
+                )
+                .await
+                .ok();
+                (result, began.elapsed())
+            }
+
+            /// Codex completed the turn, and then passes an inbound budget while the handler is
+            /// committing that completion. The host must be given the completion.
+            async fn an_overflow_under_a_parked_completion_delivers_it(overflow: Overflow) {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = overflow.options(&shared);
+                let (shared, session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+                let client = client_of(&shared);
+
+                let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                overflow.send(&link);
+                until("the connection: ended by the overflow", || {
+                    client.is_closed()
+                })
+                .await;
+                tokio::time::sleep(SETTLED).await;
+                drop(parked);
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let released = turn_is_released(&shared);
+                let (teardown, reaped_after) = torn_down(&shared, began).await;
+                let live = launcher.live_children();
+                let status = session.state().snapshot().status;
+                let abandoned = is_abandoned_terminal(&events);
+                assert!(
+                    matches!(events.last(), Some(EventKind::Completed)) && ended_after < grace,
+                    "expected after {overflow:?} overflow under a parked completion: Completed within {grace:?} | received: {events:?} after {ended_after:?} (terminal-abandoned {abandoned}, turn released {released}, teardown {teardown:?} after {reaped_after:?}, live children {live}, session {status:?})"
+                );
+                assert!(
+                    released,
+                    "expected the turn slot after the completion: released | received: still claimed"
+                );
+                assert!(
+                    matches!(teardown, Some(Ok(()))) && live == 0 && reaped_after < grace,
+                    "expected the teardown after the overflow: Ok(()) within {grace:?}, live children 0 | received: {teardown:?} after {reaped_after:?}, live children {live}"
+                );
+                assert_eq!(
+                    status,
+                    SessionStatus::Closed,
+                    "expected the session after the teardown: Closed | received: {status:?}"
+                );
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn a_completion_being_committed_survives_a_notification_overflow() {
+                an_overflow_under_a_parked_completion_delivers_it(Overflow::Notifications).await;
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn a_completion_being_committed_survives_a_byte_overflow() {
+                an_overflow_under_a_parked_completion_delivers_it(Overflow::Bytes).await;
+            }
+
+            /// The client is closed under a handler that is committing a completion. Nothing in
+            /// the harness closes the client outside the teardown, which waits for a claimed
+            /// terminal itself; this is the client's own close, with no teardown in front of it.
+            #[tokio::test(start_paused = true)]
+            async fn a_completion_being_committed_survives_the_clients_close() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = as_the_harness_connects(&shared);
+                let (shared, session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+                let client = client_of(&shared);
+
+                let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                let closing = Arc::clone(&client);
+                let close = tokio::spawn(async move { closing.close().await });
+                until("the client: closing", || client.is_closed()).await;
+                tokio::time::sleep(SETTLED).await;
+                drop(parked);
+
+                let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                    .await
+                    .map(|joined| joined.expect("expected the close task"));
+                let closed_after = began.elapsed();
+                let terminal = stream.terminal_status();
+                let released = turn_is_released(&shared);
+                // What the host is left to do on a turn that got no terminal: close the session.
+                let session_closed = tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    session.close(CloseReason::Shutdown),
+                )
+                .await;
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let live = launcher.live_children();
+                assert!(
+                    matches!(closed, Ok(Ok(())))
+                        && terminal == Some(TerminalStatus::Completed)
+                        && released
+                        && closed_after < grace,
+                    "expected when the client's close returned: Ok(()) within {grace:?}, terminal Completed, turn released | received: {closed:?} after {closed_after:?}, terminal {terminal:?}, turn released {released} (then the session's close: {session_closed:?}, stream {events:?} ended after {ended_after:?}, live children {live})"
+                );
+                assert!(
+                    matches!(session_closed, Ok(Ok(()))) && live == 0,
+                    "expected the session's close afterwards: Ok(()), live children 0 | received: {session_closed:?}, live children {live}"
+                );
+            }
+
+            /// The host closes the session from another task while the handler is committing a
+            /// completion. The teardown gives the commit `shutdown_timeout` before it closes the
+            /// client, so the commit lands before any close. That wait predates the hold: this
+            /// pins the outcome and does not depend on the hold.
+            #[tokio::test(start_paused = true)]
+            async fn a_completion_being_committed_survives_the_hosts_close() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = as_the_harness_connects(&shared);
+                let (shared, session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+                let session = Arc::new(session);
+
+                let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                let closing = Arc::clone(&session);
+                let close = tokio::spawn(async move { closing.close(CloseReason::Shutdown).await });
+                tokio::time::sleep(grace / 2).await;
+                drop(parked);
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                    .await
+                    .map(|joined| joined.expect("expected the close task"));
+                let closed_after = began.elapsed();
+                let live = launcher.live_children();
+                assert!(
+                    matches!(events.last(), Some(EventKind::Completed)) && ended_after < grace,
+                    "expected a completion the host's close found being committed: Completed within {grace:?} | received: {events:?} after {ended_after:?} (close {closed:?} after {closed_after:?}, live children {live})"
+                );
+                assert!(
+                    matches!(closed, Ok(Ok(()))) && live == 0 && closed_after < grace,
+                    "expected the host's close: Ok(()) within {grace:?}, live children 0 | received: {closed:?} after {closed_after:?}, live children {live}"
+                );
+            }
+
+            /// The session is dropped while the handler is committing a completion. Dropping a
+            /// session does not drop its client: it starts the same teardown a close does, so
+            /// the commit gets the teardown's wait. Like the host's close above, this pins the
+            /// outcome and does not depend on the hold.
+            #[tokio::test(start_paused = true)]
+            async fn a_completion_being_committed_survives_the_sessions_drop() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = as_the_harness_connects(&shared);
+                let (shared, session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+
+                let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                drop(session);
+                tokio::time::sleep(grace / 2).await;
+                drop(parked);
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let (teardown, reaped_after) = torn_down(&shared, began).await;
+                let live = launcher.live_children();
+                assert!(
+                    matches!(events.last(), Some(EventKind::Completed)) && ended_after < grace,
+                    "expected a completion being committed when the session was dropped: Completed within {grace:?} | received: {events:?} after {ended_after:?}"
+                );
+                assert!(
+                    matches!(teardown, Some(Ok(()))) && live == 0 && reaped_after < grace,
+                    "expected the teardown a dropped session starts: Ok(()) within {grace:?}, live children 0 | received: {teardown:?} after {reaped_after:?}, live children {live}"
+                );
+            }
+
+            /// A poisoned session fails its turn from inside the handler. Cut by an overflow
+            /// between the claim and the commit, the host must still be given that failure.
+            #[tokio::test(start_paused = true)]
+            async fn a_poison_failure_being_committed_survives_an_overflow() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = Overflow::Notifications.options(&shared);
+                let (shared, _session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+                let client = client_of(&shared);
+
+                let parked = Arc::clone(&shared.terminal_claimed).lock_owned().await;
+                link.push_line(unroutable_terminal());
+                // The poison interrupts the turn before it fails it, and waits for the answer.
+                link.wait_for_sent(1).await;
+                let sent: serde_json::Value = serde_json::from_str(&link.sent()[0])
+                    .expect("expected the poisoned handler to write a JSON frame");
+                link.push_line(serde_json::json!({"id": sent["id"], "result": {}}).to_string());
+                until("the handler: holding the turn's claimed terminal", || {
+                    terminal_is_claimed(&shared)
+                })
+                .await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                Overflow::Notifications.send(&link);
+                until("the connection: ended by the overflow", || {
+                    client.is_closed()
+                })
+                .await;
+                tokio::time::sleep(SETTLED).await;
+                drop(parked);
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let (teardown, reaped_after) = torn_down(&shared, began).await;
+                let live = launcher.live_children();
+                assert!(
+                    matches!(events.last(), Some(EventKind::Error { error })
+                        if error.code == crate::reducer::PROTOCOL_ERROR)
+                        && ended_after < grace,
+                    "expected a poison failure being committed under an overflow: Error(codex-protocol-error) within {grace:?} | received: {events:?} after {ended_after:?}"
+                );
+                assert!(
+                    matches!(teardown, Some(Ok(()))) && live == 0 && reaped_after < grace,
+                    "expected the teardown after the overflow: Ok(()) within {grace:?}, live children 0 | received: {teardown:?} after {reaped_after:?}, live children {live}"
+                );
+            }
+
+            /// A completion the handler had not yet claimed when the overflow stopped it is not
+            /// half-committed: the turn ends once, with the connection's failure, at once.
+            ///
+            /// The handler is stopped ahead of where it asks for the hold. A hold asked for after
+            /// the client decided to cancel, and refused, cannot be placed from this crate: the
+            /// seams that put a cancellation between the two are the client's own test hooks,
+            /// and its tests cover that refusal. Nothing here fails if the hold were asked for
+            /// after the claim.
+            #[tokio::test(start_paused = true)]
+            async fn a_completion_cut_before_its_claim_ends_with_the_connection_failure() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = Overflow::Notifications.options(&shared);
+                let (shared, _session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+                let client = client_of(&shared);
+
+                // The handler settles approvals before it claims, and parks on their lock.
+                let before_the_claim = shared.pending.lock().await;
+                link.push_line(turn_completed("completed"));
+                handler_parked_in_completion(&shared).await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                Overflow::Notifications.send(&link);
+                until("the connection: ended by the overflow", || {
+                    client.is_closed()
+                })
+                .await;
+                tokio::time::sleep(SETTLED).await;
+                let claimed = terminal_is_claimed(&shared);
+                drop(before_the_claim);
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let (teardown, reaped_after) = torn_down(&shared, began).await;
+                let live = launcher.live_children();
+                assert!(
+                    !claimed && is_connection_failure(&events) && ended_after < grace,
+                    "expected a completion cut before its claim: unclaimed, then the connection failure within {grace:?} | received: claimed {claimed}, {events:?} after {ended_after:?}"
+                );
+                assert!(
+                    matches!(teardown, Some(Ok(()))) && live == 0 && reaped_after < grace,
+                    "expected the teardown after the overflow: Ok(()) within {grace:?}, live children 0 | received: {teardown:?} after {reaped_after:?}, live children {live}"
+                );
+            }
+
+            /// The commit outlasts every grace: the client waits one `shutdown_timeout` for the
+            /// held stretch and stops the handler, and the teardown that follows waits one more
+            /// for a committer it cannot know is gone before it fails the turn itself.
+            #[tokio::test(start_paused = true)]
+            async fn a_commit_that_outlasts_an_overflows_grace_ends_as_abandoned() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = Overflow::Notifications.options(&shared);
+                let (shared, _session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+
+                let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                Overflow::Notifications.send(&link);
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let released = turn_is_released(&shared);
+                let (teardown, reaped_after) = torn_down(&shared, began).await;
+                let live = launcher.live_children();
+                assert!(
+                    is_abandoned_terminal(&events)
+                        && ended_after >= grace * 2
+                        && ended_after < grace * 2 + std::time::Duration::from_secs(1),
+                    "expected a commit parked past the overflow's grace: Error(terminal-abandoned) after {:?} | received: {events:?} after {ended_after:?}",
+                    grace * 2
+                );
+                assert!(
+                    released && matches!(teardown, Some(Ok(()))) && live == 0,
+                    "expected after the abandoned terminal: turn released, teardown Ok(()), live children 0 | received: turn released {released}, teardown {teardown:?} after {reaped_after:?}, live children {live}"
+                );
+                assert!(
+                    reaped_after < grace * 2 + std::time::Duration::from_secs(1),
+                    "expected the child reaped within {:?} of the overflow | received: {reaped_after:?}",
+                    grace * 2
+                );
+                drop(parked);
+            }
+
+            /// The same for a host's close: the teardown waits one `shutdown_timeout` and fails
+            /// the turn, then the client's close waits one more for the stretch still held. The
+            /// close still succeeds, and the child is reaped.
+            #[tokio::test(start_paused = true)]
+            async fn a_commit_that_outlasts_a_closes_grace_ends_as_abandoned() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = as_the_harness_connects(&shared);
+                let (shared, session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+
+                let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                let close = tokio::spawn(async move { session.close(CloseReason::Shutdown).await });
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let released = turn_is_released(&shared);
+                let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                    .await
+                    .map(|joined| joined.expect("expected the close task"));
+                let closed_after = began.elapsed();
+                let live = launcher.live_children();
+                assert!(
+                    is_abandoned_terminal(&events)
+                        && ended_after >= grace
+                        && ended_after < grace + std::time::Duration::from_secs(1),
+                    "expected a commit parked past the teardown's wait: Error(terminal-abandoned) after {grace:?} | received: {events:?} after {ended_after:?}"
+                );
+                assert!(
+                    released && matches!(closed, Ok(Ok(()))) && live == 0,
+                    "expected the close after the abandoned terminal: turn released, Ok(()), live children 0 | received: turn released {released}, {closed:?} after {closed_after:?}, live children {live}"
+                );
+                assert!(
+                    closed_after >= grace * 2
+                        && closed_after < grace * 2 + std::time::Duration::from_secs(1),
+                    "expected the close to return {:?} after it began | received: {closed_after:?}",
+                    grace * 2
+                );
+                drop(parked);
+            }
+
+            /// The report of a dead connection (`on_terminated`) never returns. The client's
+            /// close waits for it with what is left of twice `shutdown_timeout` and then stops
+            /// it; the teardown has failed the turn by then and still reaps the child, so the
+            /// host's close succeeds.
+            #[tokio::test(start_paused = true)]
+            async fn a_connection_report_that_never_returns_does_not_fail_the_close() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = as_the_harness_connects(&shared);
+                let (shared, session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+
+                let parked = shared.termination_claimed.lock().await;
+                link.end();
+                until("the report: holding the turn's claimed terminal", || {
+                    terminal_is_claimed(&shared)
+                })
+                .await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                let close = tokio::spawn(async move { session.close(CloseReason::Shutdown).await });
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                    .await
+                    .map(|joined| joined.expect("expected the close task"));
+                let closed_after = began.elapsed();
+                let live = launcher.live_children();
+                assert!(
+                    is_abandoned_terminal(&events)
+                        && ended_after < grace + std::time::Duration::from_secs(1),
+                    "expected a report parked past the teardown's wait: Error(terminal-abandoned) after {grace:?} | received: {events:?} after {ended_after:?}"
+                );
+                assert!(
+                    matches!(closed, Ok(Ok(()))) && live == 0,
+                    "expected the close behind a report that never returns: Ok(()), live children 0 | received: {closed:?} after {closed_after:?}, live children {live}"
+                );
+                assert!(
+                    closed_after >= grace * 3
+                        && closed_after < grace * 3 + std::time::Duration::from_secs(1),
+                    "expected the close to return {:?} after it began | received: {closed_after:?}",
+                    grace * 3
+                );
+                drop(parked);
+            }
+
+            /// The report of a dead connection is slow and lands: the host gets the connection's
+            /// failure and the close succeeds. The teardown's own wait covers this, so it pins
+            /// the outcome and does not depend on the longer bound on the client's close.
+            #[tokio::test(start_paused = true)]
+            async fn a_slow_connection_report_that_lands_leaves_the_close_successful() {
+                let shared = shared();
+                let grace = shared.host.limits().shutdown_timeout;
+                let options = as_the_harness_connects(&shared);
+                let (shared, session, link, launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+
+                let parked = shared.termination_claimed.lock().await;
+                link.end();
+                until("the report: holding the turn's claimed terminal", || {
+                    terminal_is_claimed(&shared)
+                })
+                .await;
+                tokio::time::sleep(SETTLED).await;
+                let began = Instant::now();
+                let close = tokio::spawn(async move { session.close(CloseReason::Shutdown).await });
+                tokio::time::sleep(grace / 2).await;
+                drop(parked);
+
+                let (events, ended_after) = ending(&mut stream, began).await;
+                let closed = tokio::time::timeout(std::time::Duration::from_secs(120), close)
+                    .await
+                    .map(|joined| joined.expect("expected the close task"));
+                let closed_after = began.elapsed();
+                let live = launcher.live_children();
+                assert!(
+                    is_connection_failure(&events) && ended_after < grace,
+                    "expected a slow report that landed: the connection failure within {grace:?} | received: {events:?} after {ended_after:?}"
+                );
+                assert!(
+                    matches!(closed, Ok(Ok(()))) && live == 0 && closed_after < grace,
+                    "expected the close behind a slow report: Ok(()) within {grace:?}, live children 0 | received: {closed:?} after {closed_after:?}, live children {live}"
+                );
+            }
+
+            /// The teardown's bound on the client's close, as a number. What it buys is pinned by
+            /// `a_connection_report_that_never_returns_does_not_fail_the_close`.
+            #[test]
+            fn the_teardown_gives_the_close_longer_than_the_clients_own_bound() {
+                let limits = Limits::default();
+                let backstop = super::super::super::close_backstop(&limits);
+                assert_eq!(
+                    backstop,
+                    limits.shutdown_timeout * 3,
+                    "expected the teardown's bound on the client's close: {:?} | received: {backstop:?}",
+                    limits.shutdown_timeout * 3
+                );
+            }
+
+            /// A session that has no client yet has no notification call to hold.
+            #[tokio::test(start_paused = true)]
+            async fn a_session_without_a_client_asks_for_no_hold() {
+                let shared = shared();
+                let hold = shared.hold_terminal_commit().await;
+                assert!(
+                    hold.is_none(),
+                    "expected the hold of a session with no client: none | received: {hold:?}"
+                );
+            }
+
+            /// Off the client's notification call the hold is returned at once and holds
+            /// nothing: a poison raised from another task must not wait on it, and is covered by
+            /// the teardown's wait for a claimed terminal.
+            #[tokio::test(start_paused = true)]
+            async fn a_hold_asked_for_off_the_handlers_task_holds_nothing() {
+                let shared = shared();
+                let options = as_the_harness_connects(&shared);
+                let (shared, _session, _link, _launcher, _stream) =
+                    running_session_with(shared, options, |control| control).await;
+
+                let holding = shared
+                    .hold_terminal_commit()
+                    .await
+                    .map(|hold| hold.is_holding());
+                assert_eq!(
+                    holding,
+                    Some(false),
+                    "expected a hold asked for off the handler's task: Some(false) | received: {holding:?}"
+                );
+            }
+
+            /// The overflow on four workers and the real clock. The commit is let go as soon as
+            /// the connection has ended, with the client on its way to stopping the handler.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn on_four_workers_a_completion_being_committed_survives_an_overflow() {
+                let shared = shared_with(
+                    held_real_clock_limits(),
+                    mango_external_agents::CancelToken::new(),
+                );
+                let options = Overflow::Notifications.options(&shared);
+                let (shared, _session, link, _launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+                let client = client_of(&shared);
+
+                let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                Overflow::Notifications.send(&link);
+                until("the connection: ended by the overflow", || {
+                    client.is_closed()
+                })
+                .await;
+                drop(parked);
+                // The connection's end is reported once the handler's task has stopped.
+                until("the connection's end: reported to the session", || {
+                    shared.is_shutting_down()
+                })
+                .await;
+
+                let terminal = stream.terminal_status();
+                assert_eq!(
+                    terminal,
+                    Some(TerminalStatus::Completed),
+                    "expected the terminal once the overflow was reported: Completed | received: {terminal:?}"
+                );
+                let events = kinds(&mut stream).await;
+                assert!(
+                    matches!(events.last(), Some(EventKind::Completed)),
+                    "expected the stream to end with: Completed | received: {events:?}"
+                );
+            }
+
+            /// The client's own close on four workers and the real clock.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn on_four_workers_a_completion_being_committed_survives_the_clients_close() {
+                let shared = shared_with(
+                    held_real_clock_limits(),
+                    mango_external_agents::CancelToken::new(),
+                );
+                let options = as_the_harness_connects(&shared);
+                let (shared, _session, link, _launcher, mut stream) =
+                    running_session_with(shared, options, |control| control).await;
+                let client = client_of(&shared);
+
+                let parked = park_commit_of(&shared, &link, turn_completed("completed")).await;
+                let closing = Arc::clone(&client);
+                let close = tokio::spawn(async move { closing.close().await });
+                until("the client: closing", || client.is_closed()).await;
+                drop(parked);
+                let closed = tokio::time::timeout(std::time::Duration::from_secs(30), close)
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "expected the client's close: returned | received: still waiting after 30s"
+                        )
+                    })
+                    .expect("expected the close task");
+
+                let terminal = stream.terminal_status();
+                assert!(
+                    closed.is_ok() && terminal == Some(TerminalStatus::Completed),
+                    "expected when the client's close returned: Ok(()), terminal Completed | received: {closed:?}, terminal {terminal:?}"
+                );
+                let events = kinds(&mut stream).await;
+                assert!(
+                    matches!(events.last(), Some(EventKind::Completed)),
+                    "expected the stream to end with: Completed | received: {events:?}"
+                );
+            }
+        }
     }
 
     /// Every way a turn ends owes the host a close for what it left open.
@@ -8348,6 +9170,7 @@ mod tests {
                             cancelled: None,
                             failure: None,
                         },
+                        finishing.question_settlements.lock().await,
                     )
                     .await;
             });
