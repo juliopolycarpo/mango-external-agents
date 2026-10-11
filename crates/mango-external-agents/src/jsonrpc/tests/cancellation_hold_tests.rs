@@ -1,9 +1,11 @@
 //! What becomes of a notification call in progress, and of the handler's `on_terminated`, when
 //! the connection is cut short: by the peer passing a budget, by a close, by a drop.
 
-use super::outbox_tests::{eventually, limits, until, within};
+use super::outbox_tests::{
+    eventually, gated, limits, link_held, one_termination, options, until, within,
+};
 use super::*;
-use crate::jsonrpc::{ConnectionEnd, HANDLING_NOTIFICATION_FOR, NotificationCall, WireOptions};
+use crate::jsonrpc::{HANDLING_NOTIFICATION_FOR, NotificationCall, WireOptions};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex as StdMutex, OnceLock, PoisonError, Weak};
 
@@ -758,34 +760,34 @@ async fn a_close_of_a_live_connection_does_not_wait_for_the_reader() {
 /// This side's outbound budget is passed by a caller, on the caller's thread, and the reader
 /// ends the connection when it gets to it. A close that gets there first does not swallow the
 /// end: the handler is still told why the connection ended.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_close_that_overtakes_an_outbound_overflow_still_lets_the_handler_be_told() {
-    let link = ScriptedLink::new();
-    let (handler, client) = connect_with(
-        &link,
-        NOT_HOLDING,
-        ClientOptions::new("ACP agent"),
-        limits(usize::MAX, usize::MAX, 0),
-    );
-    // The reader has not run since: it will find the close's flag first.
-    let recorded = PeerTermination::OutboundBackpressure {
-        subject: "outgoing JSON-RPC frames awaiting their write",
-        limit: 1,
-        received: 2,
-    };
-    client.state.ended_with(
-        ConnectionEnd::Peer(recorded.clone()),
-        client.state.closed_error(),
-    );
-
-    client.close().await.expect("expected a clean close");
-    let told = (
-        handler.terminations(),
-        HoldingHandler::count(&handler.terminations_returned),
-    );
+    let gated = gated(options(), limits(usize::MAX, usize::MAX, 2));
+    let _held = link_held(&gated).await;
+    let _queued = gated
+        .client
+        .submit_notification("queued", json!({}))
+        .expect("expected the second frame queued");
+    let refused = gated.client.submit_notification("one-too-many", json!({}));
     assert!(
-        matches!(&told, (told, 1) if matches!(&told[..], [(termination, 0)] if *termination == recorded)),
-        "expected the handler told the end on record, once: ([({recorded:?}, 0)], 1) | received {told:?}"
+        refused.is_err(),
+        "expected the frame past the budget refused: Err | received Ok"
+    );
+    // Nothing has been awaited since the budget was passed, so the reader has not run: the
+    // close below raises its flag before the reader hears of the overflow.
+    let _ = within("the close", gated.client.close()).await;
+
+    let termination = one_termination(&gated.handler).await;
+    assert!(
+        matches!(
+            termination,
+            PeerTermination::OutboundBackpressure {
+                limit: 2,
+                received: 3,
+                ..
+            }
+        ),
+        "expected the handler told the end on record: OutboundBackpressure {{ limit: 2, received: 3 }} | received {termination:?}"
     );
 }
 
