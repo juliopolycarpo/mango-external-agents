@@ -1,6 +1,6 @@
 //! Completed transport failures and safe local refusals have different link consequences.
 
-use super::outbox_tests::{options, within};
+use super::outbox_tests::{options, until, within};
 use super::*;
 use crate::jsonrpc::ConnectionEnd;
 use std::future::{Future, poll_fn};
@@ -253,10 +253,10 @@ impl PeerHandler for SayingHandler {
     }
 }
 
-/// A link that fails in the moment after the reader has looked for a close on record and
-/// before it records the failure, and a close puts its own end on record exactly there. The
-/// close owns that end: the reader lets the failure go, the handler is told of no termination,
-/// and the client reports the close it was given, as for a failure that lands a moment later.
+/// A link whose write fails, and a close that puts its own end on record just before the reader
+/// records the failure. The close owns that end: the reader lets the failure go, the handler is
+/// told of no termination, and the client reports the close it was given, as for a failure that
+/// lands a moment later.
 #[tokio::test]
 async fn a_link_failure_that_a_close_overtakes_while_it_is_recorded_is_not_reported() {
     let link = ScriptedLink::new();
@@ -499,5 +499,89 @@ async fn a_peer_exit_that_a_close_overtakes_while_it_is_recorded_is_not_reported
     assert_eq!(
         observed, expected,
         "expected the reader to let the peer's exit go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
+    );
+}
+
+/// A receiver whose read, once begun, holds the reader's thread until it is released, and then
+/// reports the peer's exit: a poll of the reader that began before a close and ends after it.
+struct HeldRead {
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    released: std::sync::mpsc::Receiver<()>,
+}
+
+#[async_trait::async_trait]
+impl crate::link::LinkReceiver for HeldRead {
+    async fn recv(&mut self) -> crate::Result<Option<String>> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::Release);
+        // The thread is held on purpose: the reader's poll is under way, and has checked that
+        // the connection is not shut down, for as long as this waits.
+        let _ = self
+            .released
+            .recv_timeout(std::time::Duration::from_secs(10));
+        Ok(None)
+    }
+}
+
+/// The order a handler told `Exited` while `Client::ended` said `Closed` needs, from reading the
+/// reader: its poll begins and finds the connection open, a real `Client::close` puts its end
+/// on record and shuts the connection down, and only then does the poll read the peer's exit.
+/// The close owns the end: the handler is told of no termination and the client reports the
+/// close. A stress run of the whole suite showed the outcome once; this order was not observed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_exit_read_by_a_poll_that_began_before_a_close_is_not_reported() {
+    let (say, mut said) = tokio::sync::mpsc::unbounded_channel();
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (sender, _unused) = ScriptedLink::new().into_link().split();
+    let client = Arc::new(Client::connect(
+        crate::link::Link::new(
+            sender,
+            Box::new(HeldRead {
+                entered: Arc::clone(&entered),
+                released,
+            }),
+        ),
+        Arc::new(SayingHandler { said: say.clone() }) as Arc<dyn PeerHandler>,
+        options(),
+    ));
+    *client
+        .state
+        .after_write_failure_ignored
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let _ = say.send("let go by the reader");
+    }));
+    until("the reader to be inside its read", || {
+        entered.load(std::sync::atomic::Ordering::Acquire)
+    })
+    .await;
+
+    let closing = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.close().await })
+    };
+    until(
+        "the close to be on record and the connection shut down",
+        || client.ended() == Some(ConnectionEnd::Closed) && client.state.shutdown.is_cancelled(),
+    )
+    .await;
+    release.send(()).expect("expected the read still waiting");
+    let first = within("what the reader did with the exit", said.recv()).await;
+    within("the close", closing)
+        .await
+        .expect("expected the close task to finish")
+        .expect("expected a clean close");
+    let later = said.try_recv().ok();
+
+    let observed = (first, later, client.ended());
+    let expected = (
+        Some("let go by the reader"),
+        None,
+        Some(ConnectionEnd::Closed),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the reader to let the exit its earlier poll read go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
     );
 }
