@@ -58,11 +58,15 @@ deny = [
   { crate = "openssl-sys", reason = "TLS is ring; no system OpenSSL" },
   { crate = "aws-lc-rs", reason = "TLS is ring; aws-lc-rs fails on aarch64-pc-windows-msvc" },
   { crate = "aws-lc-sys", reason = "TLS is ring; aws-lc-rs fails on aarch64-pc-windows-msvc" },
-  # `agent-client-protocol` 3.x keeps its process spawner and stdio adapter behind the `process`
-  # and `stdio` features. The host owns the process and the runtime, so neither is enabled.
-  { crate = "async-io", reason = "agent-client-protocol's `process` feature stays off; the host owns the runtime" },
-  { crate = "async-process", reason = "agent-client-protocol's `process` feature stays off; the host owns the process" },
-  { crate = "blocking", reason = "agent-client-protocol's `stdio` feature stays off; the host owns the pipes" },
+  # ACP runs on this workspace's own JSON-RPC peer. Only the schema crate of the official SDK is
+  # a dependency, for the wire types; the SDK's connection and what it brought with it stay out.
+  { crate = "agent-client-protocol", reason = "ACP uses the in-house JSON-RPC peer; depend on agent-client-protocol-schema for wire types" },
+  { crate = "futures-concurrency", reason = "came in only with agent-client-protocol; the JSON-RPC peer runs on tokio" },
+  # The SDK's process spawner and stdio adapter pulled these in. The host owns the process, the
+  # pipes and the runtime, so nothing here may bring a second executor.
+  { crate = "async-io", reason = "the host owns the runtime; no second reactor" },
+  { crate = "async-process", reason = "the host owns the process; the library never spawns" },
+  { crate = "blocking", reason = "the host owns the pipes; no blocking thread pool" },
 ]
 skip = []
 skip-tree = []
