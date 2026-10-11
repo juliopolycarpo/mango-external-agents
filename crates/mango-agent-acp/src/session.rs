@@ -1544,7 +1544,8 @@ struct TurnRecord {
 /// first:
 ///
 /// - a stop reason from the agent ends the turn as the agent said, and the agent's own error
-///   fails it unless a stop was recorded;
+///   fails it unless a stop was recorded, as `acp-request-failed` naming `session/prompt`
+///   and carrying the agent's code;
 /// - a stop somebody asked for, recorded before this is decided, ends it as `Cancelled` with
 ///   that reason, including when the agent died instead of answering the stop;
 /// - a connection that went away with no stop recorded is the closed link, carrying the agent's
@@ -1587,12 +1588,16 @@ fn prompt_ending(
     }
     // Nobody asked to stop this turn. Reporting `Cancelled` from here would tell a host it
     // stopped a turn whose agent died, and would drop the stderr that says why.
-    let message = match &error {
-        Some(PromptFailure::Agent(error)) => error.message.clone(),
-        Some(PromptFailure::LinkClosed) | None => {
-            with_stderr("a transport that closed under session/prompt", control)
-        }
-    };
+    if let Some(PromptFailure::Agent(refusal)) = &error {
+        // The agent answered, with an error of its own. That is its refusal of the prompt,
+        // with its code, and not a link that closed: the same failure a refused
+        // `session/new` is reported as.
+        return Some(Ending::Fail(crate::error::vendor_error(
+            "session/prompt",
+            refusal,
+        )));
+    }
+    let message = with_stderr("a transport that closed under session/prompt", control);
     Some(Ending::Fail(link_failure(format!("{agent}: {message}"))))
 }
 
@@ -1963,7 +1968,7 @@ mod tests {
         let expected = [
             "Some(Complete)",
             "Some(Cancel(Requested))",
-            "Fail(acp-link-closed, \"fake: model busy\")",
+            "Fail(acp-request-failed, \"model busy\")",
         ];
         assert_eq!(
             received, expected,

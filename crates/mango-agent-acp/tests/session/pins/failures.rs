@@ -527,6 +527,49 @@ async fn a_request_past_its_deadline_times_out_and_ends_the_connection() {
     assert_first_frame_after(&launcher, "session/new", "session/list");
 }
 
+/// An agent that answers `session/prompt` with an error of its own has refused the prompt. The
+/// turn fails as that refusal: `acp-request-failed`, naming the request, with the agent's code
+/// and message. It is not reported as a link that closed, which is what a host is told when
+/// the agent went away.
+#[tokio::test]
+async fn an_agents_own_error_on_the_prompt_fails_the_turn_as_its_refusal() {
+    let refusing = ScriptedPeer::new(|frame| match frame["method"].as_str() {
+        Some("session/prompt") => vec![
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": frame["id"],
+                "error": { "code": -31_000, "message": "model busy" }
+            })
+            .to_string(),
+        ],
+        _ => Vec::new(),
+    });
+    let (session, _launcher) = open_under(refusing.process(), Limits::default()).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "try"))
+        .await
+        .expect("expected a turn");
+
+    let events = drain(&mut turn).await;
+    assert_events(
+        "the refused turn",
+        &events,
+        &["TurnStarted", "Error(acp-request-failed)"],
+    );
+    let Some(EventKind::Error { error }) = events.last() else {
+        unreachable!("the events above end in an error");
+    };
+    let received = (
+        error.request_id.as_deref(),
+        error.vendor_code.as_deref(),
+        error.message.as_str(),
+    );
+    let expected = (Some("session/prompt"), Some("-31000"), "model busy");
+    assert_eq!(
+        received, expected,
+        "expected (request, the agent's code, message): {expected:?} | received: {received:?}"
+    );
+}
+
 /// A request that passed its deadline ends the connection under a turn that was still running.
 /// Nobody asked to stop that turn, so it ends as the closed link and not as a cancellation the
 /// host never requested.
