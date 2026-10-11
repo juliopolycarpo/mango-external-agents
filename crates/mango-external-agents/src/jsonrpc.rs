@@ -1104,6 +1104,24 @@ struct PendingAnswer {
     delivery: Delivery,
     /// Whether it holds a place among `max_pending_requests`.
     counted: bool,
+    /// Who has had the last word on the call, for a client that cancels what it gives up. See
+    /// [`CallClaim`].
+    claim: CallClaim,
+}
+
+/// The last word on a call, shared by the record of calls and the caller, for a client that
+/// tells the peer when it gives a request up: `None` for one that does not.
+///
+/// The reader takes it for a response that came, the caller for a call it gives up, and only
+/// the first to take it acts on it. So a call is never both answered and cancelled, and
+/// neither side has to wait for the record of calls to find out which it is.
+type CallClaim = Option<Arc<AtomicBool>>;
+
+/// Takes the last word on a call, and says whether it was still there to take.
+fn take_claim(claim: &CallClaim) -> bool {
+    claim
+        .as_ref()
+        .is_some_and(|claim| !claim.swap(true, Ordering::SeqCst))
 }
 
 /// Drops the entries nobody waits on any more and counts those that hold a place in the budget.
@@ -1168,6 +1186,7 @@ struct Registration {
     answer: oneshot::Sender<Answer>,
     delivery: Delivery,
     counted: bool,
+    claim: CallClaim,
 }
 
 struct ClientState {
@@ -1419,6 +1438,7 @@ struct PendingCall {
     ctl: Option<Arc<outbox::FrameCtl>>,
     /// Set once a caller that writes for itself has written the frame whole.
     wrote: bool,
+    claim: CallClaim,
 }
 
 impl PendingCall {
@@ -1430,16 +1450,14 @@ impl PendingCall {
 
 impl Drop for PendingCall {
     fn drop(&mut self) {
-        // Whoever takes the entry out of the map decides what became of the call: the reader,
-        // for a response that came, or this, for a call given up. Only one of them finds it,
-        // so a call is never both answered and cancelled.
-        let began = self.began();
+        // Decided here and now, whatever the record of calls is doing: a cancel that waited
+        // for it would let this caller's next write out ahead of it. The peer has seen the
+        // request, and no response to it has been read.
+        if self.began() && take_claim(&self.claim) {
+            self.state.cancel_abandoned(&self.id);
+        }
         if let Ok(mut pending) = self.state.pending.try_lock() {
-            let unanswered = pending.remove(&self.id).is_some();
-            drop(pending);
-            if unanswered && began {
-                self.state.cancel_abandoned(&self.id);
-            }
+            pending.remove(&self.id);
             return;
         }
         // A host can drop this future outside the connection's runtime. Keep cleanup on the
@@ -1448,10 +1466,7 @@ impl Drop for PendingCall {
         let state = Arc::clone(&self.state);
         let id = self.id.clone();
         self.state.runtime.spawn(async move {
-            let unanswered = state.pending.lock().await.remove(&id).is_some();
-            if unanswered && began {
-                state.cancel_abandoned(&id);
-            }
+            state.pending.lock().await.remove(&id);
         });
     }
 }
@@ -2005,11 +2020,13 @@ impl Client {
             Delivery::Immediate
         };
         let (answer, waiting) = oneshot::channel();
+        let claim = self.state.call_claim();
         let registration = Registration {
             id: id.clone(),
             answer,
             delivery,
             counted: !options.outside_pending_budget,
+            claim: claim.clone(),
         };
         let ticket = self.state.enqueue(frame, Some(registration))?;
         let ctl = Arc::clone(&ticket.ctl);
@@ -2027,6 +2044,7 @@ impl Client {
                     id,
                     ctl: Some(Arc::clone(&ctl)),
                     wrote: false,
+                    claim,
                 },
                 ctl,
             },
@@ -2393,6 +2411,7 @@ impl Client {
             .frame(Some(Value::String(id.clone())), method, params)?;
 
         let (answer, waiting) = oneshot::channel();
+        let claim = self.state.call_claim();
         {
             let mut pending = self.state.pending.lock().await;
             // Read again, holding the map, because the check above is not the same instant as this
@@ -2424,6 +2443,7 @@ impl Client {
                     answer,
                     delivery,
                     counted,
+                    claim: claim.clone(),
                 },
             );
         }
@@ -2432,6 +2452,7 @@ impl Client {
             id: id.clone(),
             ctl: None,
             wrote: false,
+            claim,
         };
 
         if let Err(error) = self.state.write_marking(frame, write_started).await {
@@ -2903,6 +2924,7 @@ impl ClientState {
             answer,
             delivery,
             counted,
+            claim,
         } = registration;
         let mut pending = self.pending.lock().await;
         if self.closed.load(Ordering::Acquire) {
@@ -2928,6 +2950,7 @@ impl ClientState {
                 answer,
                 delivery,
                 counted,
+                claim,
             },
         );
         Ok(id)
@@ -3119,6 +3142,15 @@ impl ClientState {
         }
     }
 
+    /// A claim for a new call, for a client that cancels what it gives up.
+    fn call_claim(&self) -> CallClaim {
+        self.outbox
+            .wire()
+            .cancel_on_abandon()
+            .is_some()
+            .then(|| Arc::new(AtomicBool::new(false)))
+    }
+
     /// Tells the peer that a request it may have seen was given up, if this client was asked
     /// to. Silent once the connection has ended. Queued beside the queue's bounds: there is at
     /// most one of these for each request written, and a caller letting go of a request is
@@ -3270,11 +3302,17 @@ impl ClientState {
         // A response nobody is waiting for is dropped: the call timed out or was abandoned, or
         // this is a second response to a request whose first is already delivered or queued.
         let Some(PendingAnswer {
-            answer, delivery, ..
+            answer,
+            delivery,
+            claim,
+            ..
         }) = state.pending.lock().await.remove(&id)
         else {
             return Ok(());
         };
+        // A response has been read: from here the call is answered, not given up, whatever
+        // its caller does next.
+        take_claim(&claim);
         let place = match delivery {
             Delivery::Immediate => {
                 let _ = answer.send(outcome);

@@ -214,10 +214,17 @@ impl WireOptions {
     /// written at a time, and a line that is not JSON while that many wait is dropped as
     /// before; `0` answers none. The replies are held beside the bounds of the outbound queue,
     /// not within them: the peer's noise takes none of the room those bounds leave this side's
-    /// own frames, and cannot bring the queue to the bound that ends a connection. A reply is
-    /// still a write: one that fails ends the connection as any failed write does. The replies
+    /// own frames, and cannot bring the queue to the bound that ends a connection. The replies
     /// go through the queue, so from the first one on, every write of this client takes its
     /// turn there.
+    ///
+    /// What turning this on costs: a reply is a write. A peer that sends lines that are not
+    /// JSON and does not read what it is sent leaves a reply waiting to be written, and when
+    /// that write's deadline ([`ClientOptions::request_timeout`](super::ClientOptions::request_timeout))
+    /// runs out the connection ends, as after any write that could not finish: a line may be
+    /// half written by then. With this off, such a peer is read for as long as it writes. A
+    /// peer that reads what it is sent pays nothing for a line that is not JSON beyond the
+    /// reply.
     ///
     /// The reply does not quote the line. A line that is empty or only whitespace gets none,
     /// and neither does a line that is JSON and not a frame (a number, a string, an array

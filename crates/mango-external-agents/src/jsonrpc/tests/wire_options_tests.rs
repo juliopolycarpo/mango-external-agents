@@ -64,7 +64,7 @@ async fn a_batch_is_dropped_by_a_client_that_was_not_asked_to_read_batches() {
 
 /// A batch reaches the handler member by member, in the order the array gives them. A question
 /// in it is answered with a frame of its own; a member that is not an object is passed over,
-/// and so is an empty batch.
+/// an array inside the array included, and so is an empty batch.
 #[tokio::test]
 async fn a_batch_reaches_the_handler_member_by_member_in_order() {
     let (link, handler, client) = connect(options(), WireOptions::new().with_batch_decoding());
@@ -74,6 +74,7 @@ async fn a_batch_reaches_the_handler_member_by_member_in_order() {
             notification("one"),
             { "jsonrpc": "2.0", "id": 7, "method": "ask", "params": {} },
             5,
+            [notification("nested")],
             notification("two"),
         ])
         .to_string(),
@@ -528,10 +529,11 @@ async fn a_request_that_times_out_sends_the_cancel() {
     client.close().await.expect("expected a clean close");
 }
 
-/// A reply dropped while something else holds the record of calls decides the cancel later, on
-/// the connection's runtime, and still sends it.
+/// The cancel is decided and queued as the reply is dropped, whatever the record of calls is
+/// doing at that moment. With the record held by someone else, the cancel is in the queue
+/// before the drop returns, and a write this caller makes next goes out behind it.
 #[tokio::test]
-async fn a_cancel_decided_after_waiting_for_the_record_of_calls_is_still_sent() {
+async fn a_cancel_does_not_wait_for_the_record_of_calls() {
     let (link, _handler, client) =
         connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
     let (written, reply) = client
@@ -543,19 +545,21 @@ async fn a_cancel_decided_after_waiting_for_the_record_of_calls_is_still_sent() 
         .expect("expected the request written");
     let in_the_way = client.state.pending.lock().await;
     drop(reply);
-    let early = link.sent().len();
+    let queued = client.state.outbox.aside();
     assert_eq!(
-        early, 1,
-        "expected no cancel while the record of calls is held: 1 frame | received {early}"
+        queued, 1,
+        "expected the cancel queued before the drop returned, the record still held: 1 | received {queued}"
     );
+    within("the next write", client.notify("second", json!({})))
+        .await
+        .expect("expected the notification written");
     drop(in_the_way);
 
-    sent(&link, 2).await;
     let written = methods(&link);
     assert_eq!(
         written,
-        vec!["ask", CANCEL],
-        "expected the cancel once the record of calls was free | received {written:?}"
+        vec!["ask", CANCEL, "second"],
+        "expected the cancel ahead of the caller's next write: [\"ask\", \"$/cancel_request\", \"second\"] | received {written:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -821,4 +825,449 @@ async fn a_write_made_straight_after_a_request_is_given_up_follows_its_cancel() 
         "expected the cancel ahead of the next write: [\"ask\", \"$/cancel_request\", \"second\"] | received {written:?}"
     );
     client.close().await.expect("expected a clean close");
+}
+
+/// A handler that stops inside each notification until it is let through, and says which it
+/// has begun and which it has finished.
+struct GatedHandler {
+    begun: std::sync::Mutex<Vec<String>>,
+    finished: std::sync::Mutex<Vec<String>>,
+    gate: tokio::sync::Semaphore,
+    terminations: std::sync::Mutex<Vec<PeerTermination>>,
+}
+
+impl GatedHandler {
+    fn connect(
+        options: ClientOptions,
+        wire: WireOptions,
+    ) -> (ScriptedLink, Arc<Self>, Arc<Client>) {
+        let link = ScriptedLink::new();
+        let handler = Arc::new(Self {
+            begun: std::sync::Mutex::new(Vec::new()),
+            finished: std::sync::Mutex::new(Vec::new()),
+            gate: tokio::sync::Semaphore::new(0),
+            terminations: std::sync::Mutex::new(Vec::new()),
+        });
+        let client = Arc::new(Client::connect_with(
+            link.clone().into_link(),
+            Arc::clone(&handler) as Arc<dyn PeerHandler>,
+            options,
+            wire,
+        ));
+        (link, handler, client)
+    }
+
+    fn list(of: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        of.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn terminations(&self) -> Vec<PeerTermination> {
+        self.terminations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for GatedHandler {
+    async fn on_notification(&self, method: String, _params: Value) {
+        self.begun
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(method.clone());
+        if let Ok(permit) = self.gate.acquire().await {
+            permit.forget();
+        }
+        self.finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(method);
+    }
+
+    async fn on_request(
+        &self,
+        _method: String,
+        _params: Value,
+        _id: RequestId,
+    ) -> ServerRequestOutcome {
+        ServerRequestOutcome::Answer(json!("yes"))
+    }
+
+    async fn on_terminated(&self, termination: PeerTermination) {
+        self.terminations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(termination);
+    }
+}
+
+/// An ordered response inside a batch reaches its caller once the handler has returned from
+/// the notifications before it in the batch, and does not wait for the ones after it.
+#[tokio::test]
+async fn an_ordered_response_in_a_batch_waits_for_the_members_before_it_only() {
+    let (link, handler, client) =
+        GatedHandler::connect(options(), WireOptions::new().with_batch_decoding());
+    let (written, reply) = client
+        .submit_request("ask", json!({}), ordered_options())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    link.push_line(
+        json!([
+            notification("before"),
+            { "jsonrpc": "2.0", "id": "1", "result": "done" },
+            notification("after"),
+        ])
+        .to_string(),
+    );
+    until("the handler to be inside the first member", || {
+        GatedHandler::list(&handler.begun) == ["before"]
+    })
+    .await;
+    let mut reply = Box::pin(reply);
+    let early =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(reply.as_mut().poll(cx).is_ready())).await;
+    assert!(
+        !early,
+        "expected the answer held back while the member before it is handled: pending | received an outcome"
+    );
+
+    handler.gate.add_permits(1);
+    let answer = within("the reply", reply).await;
+    let observed = (
+        answer.as_ref().ok().cloned(),
+        GatedHandler::list(&handler.finished),
+    );
+    assert_eq!(
+        observed,
+        (Some(json!("done")), vec![String::from("before")]),
+        "expected the answer once the member before it was handled, the one after still in progress: (Some(\"done\"), [\"before\"]) | received {observed:?}"
+    );
+    handler.gate.add_permits(1);
+    client.close().await.expect("expected a clean close");
+}
+
+/// A batch is counted on top of what the queue already holds. With one notification queued
+/// behind a handler that is busy, a batch of two does not fit a budget of two, and the
+/// termination reports the three.
+#[tokio::test]
+async fn a_batch_that_overflows_a_queue_already_in_use_reports_what_was_queued_too() {
+    let (link, handler, client) = GatedHandler::connect(
+        options().with_max_pending_notifications(2),
+        WireOptions::new().with_batch_decoding(),
+    );
+    link.push_line(notification("busy").to_string());
+    until("the handler to be inside a call", || {
+        GatedHandler::list(&handler.begun) == ["busy"]
+    })
+    .await;
+    link.push_line(notification("queued").to_string());
+    link.push_line(json!([notification("one"), notification("two")]).to_string());
+
+    until("the overflow to be told", || {
+        handler.terminations().len() == 1
+    })
+    .await;
+    let observed = (handler.terminations(), GatedHandler::list(&handler.begun));
+    assert!(
+        matches!(
+            &observed,
+            (terminations, begun)
+                if matches!(
+                    terminations[..],
+                    [PeerTermination::NotificationBackpressure { limit: 2, received: 3 }]
+                ) && begun == &["busy"]
+        ),
+        "expected the batch refused whole with the queued one counted: ([NotificationBackpressure {{ limit: 2, received: 3 }}], [\"busy\"]) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A batch admitted whole is not counted again member by member. The count of what is queued
+/// can read one low for a moment, while the handler's task has taken an answer out of the
+/// queue and not yet let it go; a batch admitted on that reading must not be refused half-way
+/// when the reading corrects itself. That moment is put in place by hand here: the count of
+/// queued answers is raised as the taken-out answer raises it, and lowered again by a hook
+/// that only a second reading of the queue would run.
+#[tokio::test]
+async fn a_batch_admitted_whole_is_not_refused_half_way_by_a_second_count() {
+    let (link, handler, client) = GatedHandler::connect(
+        options().with_max_pending_notifications(2),
+        WireOptions::new().with_batch_decoding(),
+    );
+    link.push_line(notification("busy").to_string());
+    until("the handler to be inside a call", || {
+        GatedHandler::list(&handler.begun) == ["busy"]
+    })
+    .await;
+    link.push_line(notification("queued").to_string());
+    until("the second notification to be queued", || {
+        client.state.peer_bytes.available_permits()
+            <= client.state.options.max_pending_bytes - 2 * notification("busy").to_string().len()
+    })
+    .await;
+
+    // An answer taken out of the queue and not yet let go: still counted, no longer queued.
+    client.state.queued_answers.fetch_add(1, Ordering::AcqRel);
+    let state = Arc::clone(&client.state);
+    *client
+        .state
+        .after_queue_length_read
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let again = Arc::clone(&state);
+        // The first reading is the batch's own. A second one finds the answer let go.
+        *state
+            .after_queue_length_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            again.queued_answers.fetch_sub(1, Ordering::AcqRel);
+        }));
+    }));
+    link.push_line(json!([notification("one"), notification("two")]).to_string());
+    handler.gate.add_permits(4);
+    until("every notification to be handled", || {
+        GatedHandler::list(&handler.finished).len() == 4 || !handler.terminations().is_empty()
+    })
+    .await;
+
+    let observed = (
+        GatedHandler::list(&handler.finished),
+        handler.terminations().len(),
+    );
+    assert_eq!(
+        observed,
+        (
+            ["busy", "queued", "one", "two"].map(String::from).to_vec(),
+            0
+        ),
+        "expected the whole batch handled and the connection kept: ([\"busy\", \"queued\", \"one\", \"two\"], 0) | received {observed:?}"
+    );
+    // Put back what the hook did not get to take away.
+    if client
+        .state
+        .after_queue_length_read
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .is_some()
+    {
+        client.state.queued_answers.fetch_sub(1, Ordering::AcqRel);
+    }
+    client.close().await.expect("expected a clean close");
+}
+
+/// The numbers the ACP harness pins for a flood: a batch of 1,100 notifications against a
+/// budget of 1,024, read with nothing queued, is reported as 1,024 and 1,100.
+#[tokio::test]
+async fn a_flood_in_one_batch_reports_the_budget_and_the_size_of_the_batch() {
+    let (link, handler, client) = connect(
+        options().with_max_pending_notifications(1_024),
+        WireOptions::new().with_batch_decoding(),
+    );
+    let flood: Vec<Value> = (0..1_100).map(|_| notification("session/update")).collect();
+    link.push_line(Value::Array(flood).to_string());
+
+    let termination = one_termination(&handler).await;
+    let handled = handler.notifications.lock().await.len();
+    assert!(
+        matches!(
+            termination,
+            PeerTermination::NotificationBackpressure {
+                limit: 1_024,
+                received: 1_100
+            }
+        ) && handled == 0,
+        "expected the flood refused whole: (NotificationBackpressure {{ limit: 1024, received: 1100 }}, 0 handled) | received ({termination:?}, {handled})"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A frame queued beside the bounds is still ahead of what is written after it. With a parse
+/// error waiting behind a write in progress, a notification the host writes for itself and an
+/// answer to a question from the peer both go out behind it.
+#[tokio::test]
+async fn writes_made_after_a_parse_error_was_queued_follow_it() {
+    let gated = gated(options(), WireOptions::new().with_parse_error_replies(4));
+    let _held = link_held(&gated).await;
+    gated.link.push_line("{oops");
+    until("the parse error to be queued", || {
+        gated.client.state.outbox.aside() == 1
+    })
+    .await;
+    let mine = tokio::spawn({
+        let client = Arc::clone(&gated.client);
+        async move { client.notify("mine", json!({})).await }
+    });
+    gated
+        .link
+        .push_line(r#"{"jsonrpc":"2.0","id":9,"method":"ask","params":{}}"#);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let early = gated.link.sent().len();
+    assert_eq!(
+        early, 0,
+        "expected nothing written while the link is held: 0 | received {early}"
+    );
+
+    gated.gate.add_permits(1);
+    within("the host's notification", mine)
+        .await
+        .expect("expected the notifying task to finish")
+        .expect("expected the notification written");
+    sent(&gated.link, 4).await;
+    let written = frames(&gated.link);
+    let first_two: Vec<String> = written
+        .iter()
+        .take(2)
+        .map(|frame| {
+            frame["method"]
+                .as_str()
+                .map_or_else(|| frame["error"]["code"].to_string(), str::to_owned)
+        })
+        .collect();
+    let rest_follow = written[2..]
+        .iter()
+        .all(|frame| frame["method"] == "mine" || frame["id"] == 9);
+    assert!(
+        first_two == ["hold", "-32700"] && rest_follow,
+        "expected the parse error ahead of the host's notification and of the answer to the peer: [hold, -32700, then mine and the answer to 9] | received {written:?}"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// Requests given up and retried from four threads, with the record of calls kept busy the
+/// whole time. For every request that reached the wire, its cancel is there too, after it and
+/// ahead of the retry its caller made next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_keeps_its_place_ahead_of_the_retry_with_the_record_of_calls_contended() {
+    let (link, _handler, client) =
+        connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
+    let busy = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            loop {
+                let held = client.state.pending.lock().await;
+                tokio::task::yield_now().await;
+                drop(held);
+            }
+        }
+    });
+    let callers: Vec<_> = (0..4)
+        .map(|caller| {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                for round in 0..50 {
+                    let tag = json!({ "caller": caller, "round": round });
+                    // Nobody answers, so the wait ends by being given up.
+                    let asking = client.request::<_, Value>("ask", tag.clone());
+                    let _ = tokio::time::timeout(Duration::from_millis(2), asking).await;
+                    client
+                        .notify("retry", tag)
+                        .await
+                        .expect("expected the retry written");
+                }
+            })
+        })
+        .collect();
+    for caller in callers {
+        within("a caller", caller)
+            .await
+            .expect("expected the caller to finish");
+    }
+    busy.abort();
+    let _ = busy.await;
+    until("every cancel to be written", || {
+        client.state.outbox.aside() == 0
+    })
+    .await;
+
+    let written = frames(&link);
+    let place = |wanted: &dyn Fn(&Value) -> bool| written.iter().position(wanted);
+    let mut checked = 0;
+    for (asked_at, ask) in written
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| frame["method"] == "ask")
+    {
+        let cancel_at =
+            place(&|frame| frame["method"] == CANCEL && frame["params"]["requestId"] == ask["id"]);
+        let retry_at =
+            place(&|frame| frame["method"] == "retry" && frame["params"] == ask["params"]);
+        let in_order = matches!(
+            (cancel_at, retry_at),
+            (Some(cancel_at), Some(retry_at)) if asked_at < cancel_at && cancel_at < retry_at
+        );
+        assert!(
+            in_order,
+            "expected request {}, its cancel and its retry in that order: {asked_at} < cancel < retry | received cancel at {cancel_at:?}, retry at {retry_at:?}",
+            ask["params"]
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 100,
+        "expected most of the 200 requests to have reached the wire before they were given up: > 100 | received {checked}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A line the transport decoded from bytes that were not UTF-8 arrives with replacement
+/// characters in it. Inside a string of a frame it is a frame like any other; in a line that
+/// is not JSON it is answered like any other.
+#[tokio::test]
+async fn a_line_with_replacement_characters_is_read_for_what_it_is() {
+    let (link, handler, client) =
+        connect(options(), WireOptions::new().with_parse_error_replies(4));
+    link.push_line(
+        json!({ "jsonrpc": "2.0", "method": "said", "params": { "text": "caf\u{fffd}" } })
+            .to_string(),
+    );
+    link.push_line("\u{fffd}\u{fffd} not json");
+    link.push_line(notification("after").to_string());
+
+    let handled = handler.wait_for_notifications(2).await;
+    sent(&link, 1).await;
+    let observed = (seen(&handled), link.sent().len());
+    assert_eq!(
+        observed,
+        (vec!["said", "after"], 1),
+        "expected the frame handled and the other line answered once: ([\"said\", \"after\"], 1) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// What turning the answers on costs: an answer is a write, and a peer that sends lines that
+/// are not JSON while it does not read what it is sent leaves that write waiting. When its
+/// deadline runs out the connection ends, as after any write that could not finish, where a
+/// client that answers nothing would have gone on reading.
+#[tokio::test(start_paused = true)]
+async fn a_parse_error_the_peer_never_reads_ends_the_connection_at_the_write_deadline() {
+    let script = ScriptedLink::new();
+    let (sender, receiver) = script.clone().into_link().split();
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect_with(
+        crate::link::Link::new(Box::new(StalledReplies { inner: sender }), receiver),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options().with_request_timeout(Duration::from_millis(50)),
+        WireOptions::new().with_parse_error_replies(4),
+    );
+    let began = tokio::time::Instant::now();
+    script.push_line("{oops");
+
+    let termination = one_termination(&handler).await;
+    let observed = (began.elapsed(), &termination);
+    assert!(
+        matches!(observed, (waited, PeerTermination::LinkFailed(_))
+            if waited >= Duration::from_millis(50) && waited < Duration::from_millis(100)),
+        "expected the connection ended by the stalled write at its deadline, not before: (50ms or just after, LinkFailed) | received {observed:?}"
+    );
+    // The link is unusable by now; what the close makes of that is not this test's subject.
+    let _ = client.close().await;
 }
