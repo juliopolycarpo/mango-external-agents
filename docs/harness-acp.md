@@ -240,20 +240,33 @@ There is no floor, unlike the Claude harness's ten minutes: an ACP agent reports
 through `tool_call_update`, so a silent one is not a working one.
 
 An agent that answers `session/prompt` with a JSON-RPC error has refused the prompt: the turn
-ends with one `EventKind::Error` coded `acp-request-failed`, with `request_id` `session/prompt`,
+ends with one `EventKind::Error` coded `acp-request-failed` (`-32000` is the exception, below), with `request_id` `session/prompt`,
 the agent's code as `vendor_code` and its message. The session stays usable, as it does after a
 `refusal` or `max_tokens` stop: the agent answered, so the connection is as healthy as after
 any answer. The failed turn's parked questions are withdrawn with ACP's `cancelled` outcome, the
 calls it left running are closed as failed, and the next turn begins clean. A host `cancel`
 that the agent answers with such an error still ends the turn as `Cancelled`.
 
-The library does not judge the agent's code. A host that treats a particular failure as fatal
-for the conversation calls `close` itself; nothing ends the session on its behalf. That
-includes an agent saying its session is gone, for which ACP has no code this client could
-rely on, and `-32000` (`AuthRequired`) on a prompt: a turn's terminal carries the agent's code
-as `vendor_code` and has no typed form for it, so the profile's login hint that
-`open_session` returns in `Error::AuthRequired` is not on the stream. The library never
-attempts a login either way.
+The library does not judge the agent's code, with one exception. A host that treats a particular
+failure as fatal for the conversation calls `close` itself; nothing ends the session on its behalf.
+That includes an agent saying its session is gone, for which ACP has no code this client could
+rely on.
+
+The exception is `-32000`, ACP's `auth_required` error, which the
+[authentication page](https://agentclientprotocol.com/protocol/v1/authentication) says an agent may
+return for future session activity and which `session/new` turns into `Error::AuthRequired`. A turn's terminal is a `VendorError`,
+which has no login-hint field, so on a prompt the same condition ends the turn with one
+`EventKind::Error` coded `acp-auth-required` (`mango_agent_acp::error::AUTH_REQUIRED_CODE`), with
+`request_id` `session/prompt`, `vendor_code` `-32000` and `retryable` false. Its message is
+`authentication required; to sign in:` followed by the profile's login command (or its documentation
+link when it has none), bounded like any error message. It carries none of the agent's own message or
+`data`: the hint is the profile's text, while the agent's words are whatever it held when its token
+failed, so they are left out. A host branches on the code exactly where it branches on
+`Error::AuthRequired` from `open_session`, and shows the message. The session stays `Ready`, as after
+any prompt error: the agent answered, so the connection is healthy, and a host that signs the vendor
+CLI in out of band can prompt again on it. An agent that keeps its old credential in memory will
+answer `-32000` again, and the host then closes the session and opens a new one. The library never
+sends `authenticate`, opens a browser or touches a credential either way.
 
 As after any turn, the terminal is published a moment before the turn's slot is released, so a
 host that starts the next turn the instant it reads the terminal can be answered `Error::Busy`
@@ -670,6 +683,10 @@ answers `-32000` (`AuthRequired`), `open_session` fails with `Error::AuthRequire
 profile's own login command as **text for a person to run**. A profile with no login command of its own
 — a CLI that signs in inside an interactive session — carries its documentation link instead, because
 printing a plausible command would send a person to a prompt that does not exist.
+
+The same `-32000` answered to a later `session/prompt`, when a token expires mid-session, ends that
+turn as `acp-auth-required` with the same text in its message, as [Turns](#turns) describes; the
+session stays `Ready`.
 
 ## Discovery
 
