@@ -17,6 +17,8 @@ mod close;
 mod failures;
 #[path = "pins/peer.rs"]
 mod peer;
+#[path = "pins/prompt_auth.rs"]
+mod prompt_auth;
 #[path = "pins/wire.rs"]
 mod wire;
 
