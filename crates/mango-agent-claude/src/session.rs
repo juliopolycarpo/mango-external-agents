@@ -610,6 +610,11 @@ impl Drop for ClaudeSession {
     /// The stream pump holds `Shared`, not `ClaudeSession`, so waiting for `Shared::drop` would
     /// leave a running child alive precisely when no host session can cancel it. The synchronous
     /// claim ensures a pump that is already completing cannot be stopped twice.
+    ///
+    /// The stop is asynchronous and runs on the runtime that opened the session. If that runtime
+    /// has shut down, nothing can run it and no stop is sent: the session releases the host's
+    /// control, and the child's fate is that control's own `Drop`. See the Deadlines section of
+    /// `docs/harness-claude.md`.
     fn drop(&mut self) {
         let claim = {
             let mut state = self.shared.lock();
@@ -679,9 +684,9 @@ fn active_turn(state: &Mutable) -> Option<TakenTurn> {
 ///
 /// The awaits between installing a child and returning its stream are the problem this exists
 /// for. A caller that times out or drops `start_turn` at one of them leaves a started child that
-/// no pump owns yet. A [`ProcessControl`](mango_external_agents::ProcessControl) that is merely
-/// dropped is not killed — the launcher sets no kill-on-drop — so this guard joins the session's
-/// shared teardown or starts it itself. Session drop records the same teardown, and a late child
+/// no pump owns yet. Dropping a [`ProcessControl`](mango_external_agents::ProcessControl) is not
+/// a stop the trait promises: the core launcher's control ends its tree when dropped, and a
+/// host's own need not. So this guard joins the session's shared teardown or starts it itself. Session drop records the same teardown, and a late child
 /// becomes the guard's owned input to that one cleanup worker.
 ///
 /// Disarmed once the pump owns the child, which is the moment something else is responsible for it.

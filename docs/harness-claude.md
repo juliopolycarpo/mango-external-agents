@@ -236,11 +236,12 @@ completion all join the same per-turn teardown. Exit 143 is read as a clean stop
 failure: putting an error in the transcript for something the user asked for is worse than saying
 nothing.
 
-Close waits for a pending launch and for native cleanup before reporting success. If native cleanup
-fails, it returns the error, keeps the session `Closing`, and preserves the MCP artifact in the
-host's scratch directory because the child may still read it. The host reclaims that artifact after
-independently establishing that no child remains. If native cleanup succeeds but artifact removal
-fails, the session is `Closed` and close reports the removal error.
+Close waits for a pending launch and for native cleanup before reporting success, each under a
+bound: see [Deadlines](#deadlines). If native cleanup fails, it returns the error, keeps the
+session `Closing`, and preserves the MCP artifact in the host's scratch directory because the child
+may still read it. The host reclaims that artifact after independently establishing that no child
+remains. If native cleanup succeeds but artifact removal fails or does not finish in time, the
+session is `Closed` and close reports the removal error.
 
 **The vendor's own turn is left unfinished.** This is a real asymmetry and it is the vendor's
 documented behaviour, not this harness's choice:
@@ -267,6 +268,115 @@ broke mid-run, and the idle timeout — leave a child that is alive and has no r
 wait is bounded by the host's own `Limits::kill_grace` and the turn ends either way. The child is
 killed after, not before: killing first would make every broken link exit 143 and read as an
 outside interruption.
+
+**A child that exits ends its turn even if its stdout stays open.** A pipe closes when its last
+writer does. A helper that inherited the descriptor, such as a background Bash task the run left
+behind, holds the read open after the Claude process is gone. The pump watches
+`ProcessControl::wait` beside the read. When the exit arrives it keeps reading for one
+`Limits::kill_grace`, counted from the exit, because what the child wrote before it left is still
+in the pipe and can be the `result`. Then the turn ends as it does at end of stream, with the exit
+status in its error, and the stop that follows ends the helper. A host control that fails to report
+an exit leaves the read to the idle timer.
+
+### Deadlines
+
+The [headless documentation](https://code.claude.com/docs/en/headless.md) names SIGINT, SIGTERM and
+exit code 143, and gives no deadline for any of them. Every stage is bounded by the host's
+`Limits`:
+
+| Stage                                     | Bound                                   | On expiry                                                                    |
+| ----------------------------------------- | --------------------------------------- | ---------------------------------------------------------------------------- |
+| Prompt write and stdin close              | `request_timeout`, for the two together | The turn fails as `claude-stream-broken`; the exit wait and a stop follow    |
+| Silent stream                             | `idle_timeout`, floored at ten minutes  | The same                                                                     |
+| Reading on after the child exited         | `kill_grace`, from the exit             | The read ends as if the stream had                                           |
+| Exit wait before a failure's terminal     | `kill_grace`                            | The terminal is written with no exit status                                  |
+| Stop: the interrupt call                  | `kill_grace`                            | Taken as not delivered; the kill is next                                     |
+| Stop: exit after a delivered interrupt    | `kill_grace`                            | The kill is next                                                             |
+| Stop: the kill                            | `shutdown_timeout`                      | `Error::Timeout` naming `process-tree termination`; no reap is waited for    |
+| Stop: the reap                            | `shutdown_timeout`                      | `Error::Timeout` naming `process reaping`                                    |
+| Close: a launch still inside the launcher | `shutdown_timeout`, from the close      | `Error::Timeout` naming `a pending Claude launch`; the session is `Closing`  |
+| Close: MCP artifact removal               | `shutdown_timeout`, after the stop      | `Error::Timeout` naming `MCP configuration removal`; the session is `Closed` |
+
+The four stop stages are core's `stop_process_with_limits`, which every Claude stop goes through.
+A launcher that reports no graceful interrupt skips both `kill_grace` stages. The interrupt and
+the kill are the host's `ProcessControl`, so a stage can also end early with that control's own
+error.
+
+The stages add up. With `st` for `shutdown_timeout` and `kg` for `kill_grace`, the worst cases are
+below. The first value column holds for any launcher on any platform. The other two are what the
+core `TokioLauncher` can reach when it was built `with_limits` from the same `Limits`. Its kill
+sends SIGTERM, waits `kg`, sends SIGKILL and waits `kg` again, so the kill stage ends at the smaller
+of 2 `kg` and `st`. On Windows it reports no graceful interrupt, and its kill gives the Job 2 `kg`
+to empty.
+
+| Path                                         | Worst case                 | At the defaults | `TokioLauncher`, Unix | `TokioLauncher`, Windows |
+| -------------------------------------------- | -------------------------- | --------------- | --------------------- | ------------------------ |
+| Stop `S`                                     | `kg` + `kg` + `st` + `st`  | 14 s            | 11 s                  | 9 s                      |
+| `cancel`, to the turn's terminal             | none                       | at once         | at once               | at once                  |
+| `cancel`, to its return                      | `S`                        | 14 s            | 11 s                  | 9 s                      |
+| `cancel` while the launch is pending         | none                       | at once         | at once               | at once                  |
+| `close`, no turn                             | `st`                       | 5 s             | 5 s                   | 5 s                      |
+| `close` with a turn active                   | `S` + `st`                 | 19 s            | 16 s                  | 14 s                     |
+| `close` while the launch is pending          | `st`, or `st` + `S` + `st` | 5 s, or 24 s    | 5 s, or 21 s          | 5 s, or 19 s             |
+| Child exit or end of stream, to the terminal | `kg`                       | 2 s             | 2 s                   | 2 s                      |
+| Child exit or end of stream, to reaped       | `kg` + `S`                 | 16 s            | 13 s                  | 11 s                     |
+| Silent stream, to the terminal               | idle floor + `kg`          | 602 s           | 602 s                 | 602 s                    |
+| Host shutdown token, to the terminal         | `S`                        | 14 s            | 11 s                  | 9 s                      |
+| Session dropped mid-turn, to reaped          | `S`                        | 14 s            | 11 s                  | 9 s                      |
+
+The first value column is pinned by tests on a paused clock against a fake launcher, and those run
+on CI's Linux, macOS and Windows lanes. The two `TokioLauncher` columns come from reading the
+launcher and are not asserted as sums anywhere.
+
+What each path does, and what a host sees when a bound runs out:
+
+- **`cancel`.** The pump writes `Cancelled { reason }` and the terminal as soon as the stop is
+  recorded, without waiting for the process. `cancel` itself returns when the stop does. While the
+  launch is still pending there is no child, so `cancel` returns `Ok` at once. The `start_turn`
+  that owns the launch stops the child when the launcher returns it and answers
+  `Error::Cancelled`.
+- **`close` with a turn active.** The stop, then the artifact removal. A stop that fails leaves
+  the session `Closing` and busy, and the artifact on disk. A removal that fails or runs out of
+  time leaves the session `Closed`. A blocking removal cannot be cancelled, so it carries on in
+  the background and the artifact goes when the host's mount answers.
+- **`close` while the launch is pending.** The close waits one `shutdown_timeout` for the launcher.
+  If the child arrives in that time the close waits for its stop and removes the artifact. If it
+  does not, the close fails and the session stays `Closing`. The start that owns the launch still
+  stops the child when it arrives, and removes the artifact once it has. That holds whether the
+  `start_turn` caller is still waiting or dropped its call. A `start_turn` future that is kept
+  alive and never polled again stops nothing until it is polled or dropped.
+- **Child exit or end of stream.** The terminal is an `Error` event with code `claude-no-result`,
+  `claude-terminated` for exit 143, or `claude-stream-broken` when the link itself failed. The
+  stop runs after it. Nobody is waiting on that stop, so
+  if it fails the next `start_turn` gets `Error::Busy`, and a later `cancel` or `close` returns the
+  stop's error.
+- **Host shutdown token.** The pump stops the child first and writes `Cancelled { Shutdown }` once
+  the stop returns.
+- **Session dropped mid-turn.** `Drop` cannot wait, so the stop runs detached on the runtime that
+  opened the session and its result goes nowhere. If that runtime has shut down, no stop is sent.
+  The session still releases the host's `ProcessControl`, and the child's fate is that control's
+  own `Drop`. The core `TokioLauncher`'s control kills the tree there, with SIGKILL on Unix and by
+  closing the Job on Windows. A host control with no such `Drop` leaves the child running.
+
+A stop that runs out of time returns the stop's own error: `Error::Timeout` from the stage that
+expired, or whatever the host's `ProcessControl` returned. It is not wrapped in
+`Error::CleanupRequired` and carries no process control, unlike the Codex and ACP harnesses. The
+first outcome of a teardown is kept. Every later `cancel` and `close` gets a copy of it and nothing
+retries. The turn's slot stays taken, so `start_turn` answers `Error::Busy`. A host in that state
+reconciles the child through its own launcher and opens a new session.
+
+Not bounded by anything here:
+
+- **The launcher's own `spawn`.** `start_turn` waits for it as long as the host's launcher takes.
+  Only a close's wait for that launch has a bound.
+- **A turn that keeps talking.** The idle timer measures silence. A run that prints a record at
+  least every ten minutes can run as long as the vendor lets it.
+- **The artifact removal on a path other than close.** A `start_turn` that a close raced can hold
+  the last reference to the MCP artifact, and waits for its removal on the blocking pool before it
+  returns.
+
+`cancel_settle_timeout` and `approval_timeout` are not read by this harness. It has no protocol
+stop to settle and no approval to wait for. `request_timeout` bounds only the prompt write.
 
 ## Permissions
 
