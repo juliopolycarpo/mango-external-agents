@@ -238,20 +238,60 @@ it asks for the hold. The handler also lets the question-settlement lock go at t
 teardown that has questions to settle does not queue behind a commit.
 
 The handler asks for the hold before the claim. If the client has already decided to cancel, it
-grants nothing and the call ends there, with nothing claimed. The turn then ends once, with the
-connection's failure or the teardown's cancellation.
+grants nothing and the call ends there, with nothing claimed: the turn is still admitted and
+unclaimed. The client aborts the handler's task right after it decides, so this is the instant
+between the two, and nobody waits for the refused stretch. The turn then ends once:
 
-Three committers run outside a notification call, so they hold nothing and rely on the worker's
-wait alone: a poison raised while answering an app-server request, the steer replay, which routes
-the notifications a steer held and can end or poison the turn, and the report of a connection's
-end.
+- After an inbound overflow, a turn's own ending fails with the connection's failure at once, and
+  a poisoned session's turn is cancelled by the teardown at once.
+- After the app-server's exit, a failed link or the client's outbound budget, the client first
+  gives the queue one `shutdown_timeout` to drain, and decides the end only when that runs out.
+  The same two endings follow then, with nothing more to wait for.
+- After the client's own close, which nothing in the harness issues ahead of the teardown, a cut
+  completion leaves nothing to commit its terminal and the host's `close` cancels the turn at
+  once. A cut poison wakes the teardown itself, which cancels the turn at once.
+
+A poison stops new work before it asks for its hold, which is why the report of the connection's
+end steps aside for it and the poison's own failure is never written in that case: the turn ends
+as the teardown cancels it. A host's `close` finds the turn ended before it closes the client, so
+a hold refused behind it finds nothing to claim.
+
+Three committers run outside a notification call and take no hold. An end of the connection
+treats them differently:
+
+- **A poison raised while answering an app-server request** runs on a task of its own, one per
+  request, which the client owns. The client drops that task at the await it is parked at once its
+  shutdown flag rises: at once on an inbound overflow; on the app-server's exit, a failed link or
+  the client's outbound budget, after the notifications already read have reached the handler,
+  which takes at most one `shutdown_timeout`; and on a host's `close`, not before the teardown has
+  ended the turn. So this is the one committer that can still be cut between its claim and its
+  release. The turn can then be left claimed and uncommitted, and the teardown fails it as
+  `terminal-abandoned` one `shutdown_timeout` after it starts; the poison's own failure is lost
+  unless it was committed before the cut.
+  The client holds a cancellation off only for a call on its handler task, and a request is
+  answered on a task of its own unless the client hands requests off. Handing them off would move
+  every request onto the notification task, in wire order and awaited, so a handler that waits for
+  the host's answer would have to park the request's `Responder`. The harness does not do that.
+- **The steer replay**, which routes the notifications a steer held and can end or poison the
+  turn, runs on a task of the harness's own. The client does not track it, `hold_cancellation`
+  holds nothing there, and no end of the connection stops it. A replay that is slow is waited for
+  by the teardown for `shutdown_timeout`, then the turn fails as `terminal-abandoned`; a replay
+  that lands later finds its terminal refused.
+- **The report of a connection's end** runs on the client's reader. Nothing in the harness stops
+  the reader: only `Client::close` or dropping the client does, and the one close of a live
+  session's client is the teardown's, which first ends the turn or gives a claimed one
+  `shutdown_timeout`. That close waits for the report, within twice its own `shutdown_timeout`
+  from its start, and a report that lands after the teardown abandoned the turn adds no terminal.
 
 The client's wait and the worker's wait run one after the other, and each ends when the commit
 lands. A commit that lands therefore costs only its own duration. A commit still unfinished after
 a whole `shutdown_timeout` pays both, and the host gets `terminal-abandoned`. After an inbound
 overflow the client waits one `shutdown_timeout` and stops the handler, then the worker waits one
 more and fails the turn. On a `close` the worker waits one and fails the turn, then the client's
-close waits one more for the stretch and stops the handler.
+close waits one more for the stretch and stops the handler. After an inbound overflow, a
+committer that holds nothing is waited for by the worker alone: its commit that never finishes
+gives `terminal-abandoned` one `shutdown_timeout` after the overflow, where a held one gives it
+after two.
 
 Dropping the session starts the same teardown, and the commit gets the same wait. The worker
 closes the session's client; nothing drops it under the handler.
