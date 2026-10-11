@@ -289,6 +289,70 @@ pub trait PeerHandler: Send + Sync {
         id: RequestId,
     ) -> ServerRequestOutcome;
 
+    /// The peer asked something, on a client made with
+    /// [`WireOptions::with_request_handoff`]: the question, and the [`Responder`] that
+    /// answers it.
+    ///
+    /// Called in the order the peer sent the question among its notifications, on the task
+    /// that runs them, and awaited like one of them: nothing the peer sent later is handled,
+    /// and no response asked for with [`RequestOptions::after_earlier_notifications`] is
+    /// delivered, until this returns. Answer here, or keep the responder and return: it can
+    /// be answered later from any task, and it is `Send`. A question that waits for a person
+    /// is kept, not awaited here.
+    ///
+    /// Like a notification call, this one is cancelled at an await when the connection ends
+    /// without draining. [`Client::hold_cancellation`] has nothing to hold here.
+    ///
+    /// The default asks [`on_request`](Self::on_request) and answers with what it returns,
+    /// which keeps a handler written for it working, one question at a time.
+    ///
+    /// ```no_run
+    /// # use mango_external_agents::jsonrpc::{JsonRpcError, Responder, ServerRequestOutcome};
+    /// # use serde_json::Value;
+    /// # fn park(_: Responder) {}
+    /// # async fn on_request_handoff(method: String, _params: Value, responder: Responder) {
+    /// if method == "session/request_permission" {
+    ///     park(responder); // answered when a person has decided
+    ///     return;
+    /// }
+    /// let unknown = JsonRpcError { code: -32601, message: String::from("Method not found"), data: None };
+    /// let _ = responder.answer(ServerRequestOutcome::Failure(unknown));
+    /// # }
+    /// ```
+    async fn on_request_handoff(&self, method: String, params: Value, responder: Responder) {
+        let outcome = self
+            .on_request(method, params, responder.id().clone())
+            .await;
+        let _ = responder.answer_or_refuse(outcome);
+    }
+
+    /// The peer asked something while as many questions as
+    /// [`ClientOptions::max_in_flight_requests`] allows were still unanswered, on a client
+    /// made with [`WireOptions::with_request_handoff`]. The answer, or `None` for this
+    /// client's own refusal.
+    ///
+    /// Not asynchronous and with nothing to keep: a question past the cap is answered on the
+    /// spot, so the cap bounds what a handler can have parked whatever the handler does. The
+    /// default refuses with `-32000`, as a client without the option does. A protocol that
+    /// would withdraw such a question with a result of its own returns it here.
+    ///
+    /// ```
+    /// # use mango_external_agents::jsonrpc::{RequestId, ServerRequestOutcome};
+    /// # use serde_json::{Value, json};
+    /// fn on_request_past_cap(_method: &str, _params: &Value, _id: &RequestId) -> Option<ServerRequestOutcome> {
+    ///     Some(ServerRequestOutcome::Answer(json!({ "outcome": { "outcome": "cancelled" } })))
+    /// }
+    /// # assert!(on_request_past_cap("ask", &Value::Null, &RequestId::new(json!(1))).is_some());
+    /// ```
+    fn on_request_past_cap(
+        &self,
+        _method: &str,
+        _params: &Value,
+        _id: &RequestId,
+    ) -> Option<ServerRequestOutcome> {
+        None
+    }
+
     /// The peer's link ended unexpectedly, on its read or write side.
     ///
     /// A handler can release state that only a complete vendor turn would otherwise clear. This
@@ -1251,6 +1315,9 @@ struct ClientState {
     parse_error_replies: StdMutex<Vec<Arc<outbox::FrameCtl>>>,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
+    /// The questions handed over with a [`Responder`] and not yet answered: one permit each,
+    /// `max_in_flight_requests` of them.
+    handoff_slots: Arc<Semaphore>,
     notifications: StdMutex<Option<JoinHandle<()>>>,
     /// Takes the handler's task down whoever holds its join handle. A drain takes the handle out
     /// of `notifications` to wait on it, and a close or a drop that lands in that drain still
@@ -1443,6 +1510,226 @@ impl Drop for CancellationHold {
         if let Some(call) = self.call.take() {
             call.give_back();
         }
+    }
+}
+
+/// The answer to one of the peer's questions, to give now or later, from any task.
+///
+/// Handed to [`PeerHandler::on_request_handoff`] on a client made with
+/// [`WireOptions::with_request_handoff`]. While it is out it holds one of the
+/// [`ClientOptions::max_in_flight_requests`] places and the question's share of
+/// [`ClientOptions::max_pending_bytes`]; both are given back as it is answered or dropped.
+///
+/// Dropped unanswered, it tells the peer so: an error `-32603`, "the request was let go
+/// without an answer", queued as it is dropped, so the peer does not wait on the question
+/// for good. Nothing is sent once the connection has ended.
+///
+/// ```no_run
+/// # use mango_external_agents::jsonrpc::{Responder, ServerRequestOutcome};
+/// # async fn decided() -> serde_json::Value { serde_json::Value::Null }
+/// # fn example(responder: Responder) {
+/// // Kept by the handler when the question arrived; answered when a person has decided.
+/// tokio::spawn(async move {
+///     let decision = decided().await;
+///     let _ = responder.answer(ServerRequestOutcome::Answer(decision));
+/// });
+/// # }
+/// ```
+pub struct Responder {
+    state: Arc<ClientState>,
+    id: RequestId,
+    /// What the question holds until it is settled. `None` once it has been.
+    held: Option<Held>,
+}
+
+/// What a question holds while its [`Responder`] is out.
+struct Held {
+    /// Its place among the questions in flight. `None` for one answered past the cap.
+    _slot: Option<OwnedSemaphorePermit>,
+    /// Its share of the callback byte budget.
+    _bytes: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for Responder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Responder")
+            .field("id", &self.id)
+            .field("answered", &self.held.is_none())
+            .finish()
+    }
+}
+
+impl Responder {
+    fn new(
+        state: &Arc<ClientState>,
+        raw_id: Value,
+        slot: Option<OwnedSemaphorePermit>,
+        bytes: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            state: Arc::clone(state),
+            id: RequestId::new(raw_id),
+            held: Some(Held {
+                _slot: slot,
+                _bytes: bytes,
+            }),
+        }
+    }
+
+    /// The id the peer gave the question, for a handler that names it to the host.
+    ///
+    /// ```no_run
+    /// # fn example(responder: &mango_external_agents::jsonrpc::Responder) {
+    /// let _key = responder.id().key();
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn id(&self) -> &RequestId {
+        &self.id
+    }
+
+    /// Queues the answer without waiting, behind every frame queued before it, and returns
+    /// its write to wait for.
+    ///
+    /// The frame is in the queue by the time this returns, so an answer given and then a
+    /// [`Client::submit_notification`] reach the peer in that order. It counts against the
+    /// outbound queue's bounds like any frame queued by the host.
+    ///
+    /// # Errors
+    ///
+    /// The responder comes back in [`Unanswered`] with the reason, and nothing was queued:
+    ///
+    /// - [`Error::LimitExceeded`] for an answer larger than
+    ///   [`WireOptions::with_max_outbound_frame_bytes`] allows. The connection is untouched
+    ///   and the question is still open: [`Unanswered::is_too_large`] says so, and a smaller
+    ///   answer can be given through the responder that came back;
+    /// - [`Error::LimitExceeded`] for a queue that is full, which ends the connection as
+    ///   it does for [`Client::submit_notification`];
+    /// - [`Error::Closed`] or [`Error::Link`] once the connection has ended.
+    ///
+    /// ```no_run
+    /// # use mango_external_agents::jsonrpc::{JsonRpcError, Responder, ServerRequestOutcome};
+    /// # fn example(responder: Responder, large: serde_json::Value) {
+    /// if let Err(unanswered) = responder.answer(ServerRequestOutcome::Answer(large)) {
+    ///     if unanswered.is_too_large() {
+    ///         let (responder, _error) = unanswered.into_parts();
+    ///         let refusal = JsonRpcError { code: -32603, message: String::from("too large"), data: None };
+    ///         let _ = responder.answer(ServerRequestOutcome::Failure(refusal));
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub fn answer(
+        mut self,
+        outcome: ServerRequestOutcome,
+    ) -> std::result::Result<Written, Unanswered> {
+        let frame = reply_frame(&self.state, self.id.as_json().clone(), outcome);
+        match self.state.enqueue(frame, None) {
+            Ok(ticket) => {
+                // Settled: what it held goes back now, and its drop has nothing to say.
+                self.held = None;
+                Ok(Written::new(ticket, self.state.options.peer_name.clone()))
+            }
+            Err(error) => Err(Unanswered {
+                parts: Box::new((self, error)),
+            }),
+        }
+    }
+
+    /// The same, for a caller with nothing better to say when the answer is too large: the
+    /// question is then refused with `-32603`, "the answer was too large to send", which is
+    /// what a client without [`WireOptions::with_request_handoff`] does.
+    ///
+    /// # Errors
+    ///
+    /// The other refusals of [`answer`](Self::answer), and the size refusal itself when even
+    /// the replacement does not fit, which is a peer that chose an id as large as the bound.
+    /// The question is let go either way.
+    ///
+    /// ```no_run
+    /// # use mango_external_agents::jsonrpc::{Responder, ServerRequestOutcome};
+    /// # fn example(responder: Responder, answer: serde_json::Value) -> mango_external_agents::Result<()> {
+    /// let _written = responder.answer_or_refuse(ServerRequestOutcome::Answer(answer))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn answer_or_refuse(self, outcome: ServerRequestOutcome) -> Result<Written> {
+        let unanswered = match self.answer(outcome) {
+            Ok(written) => return Ok(written),
+            Err(unanswered) => unanswered,
+        };
+        if !unanswered.is_too_large() {
+            return Err(unanswered.into_parts().1);
+        }
+        let (responder, _) = unanswered.into_parts();
+        responder
+            .answer(answer_too_large())
+            .map_err(|unanswered| unanswered.into_parts().1)
+    }
+}
+
+impl Drop for Responder {
+    fn drop(&mut self) {
+        if self.held.take().is_some() {
+            self.state.refuse_dropped(self.id.as_json().clone());
+        }
+    }
+}
+
+/// An answer [`Responder::answer`] could not queue, with the responder it was given through.
+///
+/// ```no_run
+/// # use mango_external_agents::jsonrpc::Unanswered;
+/// # fn example(unanswered: Unanswered) {
+/// let still_open = unanswered.is_too_large();
+/// let (_responder, _error) = unanswered.into_parts();
+/// # let _ = still_open;
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct Unanswered {
+    /// Boxed: the refusal is the rare path, and the common one should not carry its size.
+    parts: Box<(Responder, Error)>,
+}
+
+impl Unanswered {
+    /// Why the answer was not queued.
+    ///
+    /// ```no_run
+    /// # fn example(unanswered: &mango_external_agents::jsonrpc::Unanswered) {
+    /// eprintln!("{}", unanswered.error());
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn error(&self) -> &Error {
+        &self.parts.1
+    }
+
+    /// Whether the only thing wrong was the size of the answer: the connection is as it was,
+    /// and the question can still be answered with something smaller.
+    ///
+    /// ```no_run
+    /// # fn example(unanswered: &mango_external_agents::jsonrpc::Unanswered) {
+    /// if unanswered.is_too_large() { /* answer again, smaller */ }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn is_too_large(&self) -> bool {
+        oversized_frame(&self.parts.1)
+    }
+
+    /// The responder, to answer through again or to drop, and the reason.
+    ///
+    /// ```no_run
+    /// # fn example(unanswered: mango_external_agents::jsonrpc::Unanswered) {
+    /// let (responder, error) = unanswered.into_parts();
+    /// # let _ = (responder, error);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn into_parts(self) -> (Responder, Error) {
+        *self.parts
     }
 }
 
@@ -1717,6 +2004,9 @@ impl Client {
         let peer_bytes = Arc::new(Semaphore::new(
             options.max_pending_bytes.min(Semaphore::MAX_PERMITS),
         ));
+        let handoff_slots = Arc::new(Semaphore::new(
+            options.max_in_flight_requests.min(Semaphore::MAX_PERMITS),
+        ));
         let state = Arc::new(ClientState {
             sender: Arc::new(Mutex::new(sender)),
             pending: Mutex::new(HashMap::new()),
@@ -1742,6 +2032,7 @@ impl Client {
             link_poisoned: AtomicBool::new(false),
             parse_error_replies: StdMutex::new(Vec::new()),
             in_flight: StdMutex::new(JoinSet::new()),
+            handoff_slots,
             notifications: StdMutex::new(None),
             worker_abort: OnceLock::new(),
             worker_stopped: CancelToken::new(),
@@ -3163,6 +3454,37 @@ impl ClientState {
         }
     }
 
+    /// What a question is refused with when as many as may be are already unanswered.
+    fn past_in_flight_cap(&self) -> JsonRpcError {
+        JsonRpcError {
+            code: -32000,
+            message: format!(
+                "expected at most {} questions in flight, received one more",
+                self.options.max_in_flight_requests
+            ),
+            data: None,
+        }
+    }
+
+    /// Tells the peer that a question handed over with a [`Responder`] was let go unanswered,
+    /// so it does not wait on it for good. Silent once the connection has ended. Queued
+    /// beside the queue's bounds: there is at most one of these for each question, and a
+    /// drop has nobody to tell that a full queue ended the connection.
+    fn refuse_dropped(&self, raw_id: Value) {
+        if self.closed.load(Ordering::Acquire) || self.link_poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        let refusal = ServerRequestOutcome::Failure(JsonRpcError {
+            code: -32603,
+            message: String::from("the request was let go without an answer"),
+            data: None,
+        });
+        let deadline = deadline_after(self.options.request_timeout);
+        let _ = self
+            .outbox
+            .enqueue_aside(reply_frame(self, raw_id, refusal), deadline);
+    }
+
     /// A claim for a new call, for a client that cancels what it gives up.
     fn call_claim(&self) -> CallClaim {
         self.outbox
@@ -3810,20 +4132,18 @@ async fn peer_work_pump(
                     )
                     .await;
             }
+            PeerWork::Request { method, params, id }
+                if state.outbox.wire().hands_requests_off() =>
+            {
+                hand_off(&state, &handler, method, params, id, _permit).await;
+            }
             PeerWork::Request { method, params, id } => {
                 // A question that waits for a person must not stop later events after it has
                 // reached the head of the queue. Count the task before starting it so a peer
                 // cannot use request frames to create unbounded work.
                 if !ClientState::spawn_answer(&state, &handler, method, params, id.clone(), _permit)
                 {
-                    let refusal = JsonRpcError {
-                        code: -32000,
-                        message: format!(
-                            "expected at most {} questions in flight, received one more",
-                            state.options.max_in_flight_requests
-                        ),
-                        data: None,
-                    };
+                    let refusal = state.past_in_flight_cap();
                     write_reply(&state, id, ServerRequestOutcome::Failure(refusal)).await;
                 }
             }
@@ -3848,8 +4168,32 @@ async fn answer(
     write_reply(state, raw_id, outcome).await;
 }
 
-/// Writes one reply frame for a question the peer asked.
-async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerRequestOutcome) {
+/// Hands one of the peer's questions to the handler with its [`Responder`], or has it
+/// answered on the spot when as many as may be are already out.
+async fn hand_off(
+    state: &Arc<ClientState>,
+    handler: &Arc<dyn PeerHandler>,
+    method: String,
+    params: Value,
+    raw_id: Value,
+    bytes: OwnedSemaphorePermit,
+) {
+    let Ok(slot) = Arc::clone(&state.handoff_slots).try_acquire_owned() else {
+        let id = RequestId::new(raw_id.clone());
+        let outcome = handler
+            .on_request_past_cap(&method, &params, &id)
+            .unwrap_or_else(|| ServerRequestOutcome::Failure(state.past_in_flight_cap()));
+        // Not counted among the questions out, and gone before the next one is looked at.
+        let responder = Responder::new(state, raw_id, None, bytes);
+        let _ = responder.answer_or_refuse(outcome);
+        return;
+    };
+    let responder = Responder::new(state, raw_id, Some(slot), bytes);
+    handler.on_request_handoff(method, params, responder).await;
+}
+
+/// The frame that answers the peer's question `raw_id` with `outcome`.
+fn reply_frame(state: &ClientState, raw_id: Value, outcome: ServerRequestOutcome) -> String {
     let mut frame = Map::new();
     if state.options.include_version_header {
         frame.insert(String::from("jsonrpc"), json!("2.0"));
@@ -3868,11 +4212,25 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
             );
         }
     }
+    Value::Object(frame).to_string()
+}
+
+/// What a question is refused with when its answer was too large to send.
+fn answer_too_large() -> ServerRequestOutcome {
+    ServerRequestOutcome::Failure(JsonRpcError {
+        code: -32603,
+        message: String::from("the answer was too large to send"),
+        data: None,
+    })
+}
+
+/// Writes one reply frame for a question the peer asked.
+async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerRequestOutcome) {
+    let id = raw_id.clone();
     // A reply that never lands leaves the peer blocked on a question this side believes it has
     // answered, and a timed-out write may have left half a frame on the link. Either way the link
     // is unusable, so the pump is told; it is the only place that ends a connection.
-    let id = frame.get("id").cloned().unwrap_or(Value::Null);
-    let Err(error) = state.write(Value::Object(frame).to_string()).await else {
+    let Err(error) = state.write(reply_frame(state, raw_id, outcome)).await else {
         return;
     };
     if !oversized_frame(&error) {
@@ -3884,16 +4242,8 @@ async fn write_reply(state: &Arc<ClientState>, raw_id: Value, outcome: ServerReq
     // this question for good. The replacement carries the peer's own id, so a peer that chose an
     // id as large as the bound gets no reply that fits at all; that connection cannot answer the
     // question in any form and ends as a failed link, naming the bound.
-    let mut refusal = Map::new();
-    if state.options.include_version_header {
-        refusal.insert(String::from("jsonrpc"), json!("2.0"));
-    }
-    refusal.insert(String::from("id"), id);
-    refusal.insert(
-        String::from("error"),
-        json!({ "code": -32603, "message": "the answer was too large to send" }),
-    );
-    if let Err(error) = state.write(Value::Object(refusal).to_string()).await {
+    let refusal = reply_frame(state, id, answer_too_large());
+    if let Err(error) = state.write(refusal).await {
         state.signal_write_failure(&error);
     }
 }
@@ -3919,6 +4269,7 @@ mod tests {
     mod ordered_response_tests;
     mod outbox_tests;
     mod request_lifecycle_tests;
+    mod responder_tests;
     mod wire_options_tests;
     mod write_failure_tests;
 

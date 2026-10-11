@@ -59,6 +59,7 @@ pub struct WireOptions {
     max_outbound_queued_bytes: usize,
     max_outbound_queued_frames: usize,
     batch_decoding: bool,
+    request_handoff: bool,
     parse_error_replies: Option<usize>,
     cancel_on_abandon: Option<String>,
 }
@@ -70,6 +71,7 @@ impl Default for WireOptions {
             max_outbound_queued_bytes: usize::MAX,
             max_outbound_queued_frames: usize::MAX,
             batch_decoding: false,
+            request_handoff: false,
             parse_error_replies: None,
             cancel_on_abandon: None,
         }
@@ -207,6 +209,47 @@ impl WireOptions {
         self
     }
 
+    /// Hands each of the peer's questions to the handler in the order it was read, with a
+    /// [`Responder`](super::Responder) to answer it through, now or later.
+    ///
+    /// Off by default, where a question is answered by
+    /// [`PeerHandler::on_request`](super::PeerHandler::on_request) on a task of its own and
+    /// its answer is written by that task when its turn at the link comes. On:
+    ///
+    /// - a question reaches
+    ///   [`PeerHandler::on_request_handoff`](super::PeerHandler::on_request_handoff) on the
+    ///   task that runs the notifications, in the order the peer sent it among them, and that
+    ///   call is awaited like a notification. So a response asked for with
+    ///   [`RequestOptions::after_earlier_notifications`](super::RequestOptions::after_earlier_notifications)
+    ///   waits for the questions read before it to be handed over too;
+    /// - every answer is queued without waiting, by [`Responder::answer`](super::Responder::answer),
+    ///   in the order the answers are given among the frames queued with
+    ///   [`Client::submit_request`](super::Client::submit_request) and
+    ///   [`Client::submit_notification`](super::Client::submit_notification), and counted
+    ///   against [`with_max_outbound_queued_frames`](Self::with_max_outbound_queued_frames)
+    ///   and [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) like
+    ///   them. Answers go through the queue, so from the first one on, every write of this
+    ///   client takes its turn there;
+    /// - a question past
+    ///   [`ClientOptions::max_in_flight_requests`](super::ClientOptions::max_in_flight_requests)
+    ///   is put to
+    ///   [`PeerHandler::on_request_past_cap`](super::PeerHandler::on_request_past_cap), which
+    ///   answers it on the spot.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_request_handoff();
+    /// assert!(wire.hands_requests_off());
+    /// ```
+    #[must_use]
+    pub fn with_request_handoff(mut self) -> Self {
+        self.request_handoff = true;
+        self
+    }
+
     /// Answers a line that is not JSON with a JSON-RPC parse error: code `-32700`, `id` null.
     ///
     /// Off by default, where such a line is dropped: a vendor that prints a stray diagnostic
@@ -309,6 +352,21 @@ impl WireOptions {
     #[must_use]
     pub fn parse_error_replies(&self) -> Option<usize> {
         self.parse_error_replies
+    }
+
+    /// Whether the peer's questions are handed to the handler in order, with a
+    /// [`Responder`](super::Responder).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert!(!WireOptions::new().hands_requests_off());
+    /// ```
+    #[must_use]
+    pub fn hands_requests_off(&self) -> bool {
+        self.request_handoff
     }
 
     /// The notification sent for a request given up, or `None` when none is.
