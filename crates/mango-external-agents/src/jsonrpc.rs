@@ -3076,8 +3076,10 @@ impl Client {
     /// [`hold`](Self::hold_cancellation), during the first wait, and, on a connection that had
     /// already ended under this side, the handler's
     /// [`on_terminated`](PeerHandler::on_terminated), with whatever is left of the bound. A caller that wants
-    /// a tighter bound puts its own timeout around this future or drops it: that is safe at any
-    /// point, and leaves the link as the last paragraph below describes.
+    /// a tighter bound puts its own timeout around this future or drops it: that is sound at any
+    /// point, and leaves the link as "A close given up" below describes. A bound shorter than
+    /// twice `shutdown_timeout` can cut [`on_terminated`](PeerHandler::on_terminated) short, as
+    /// "Wrapping a close" below says.
     ///
     /// # What becomes of queued frames
     ///

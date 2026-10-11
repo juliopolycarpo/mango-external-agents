@@ -157,7 +157,9 @@ instead: the call alone receives the `LimitExceeded`, the link is not made unusa
 is told nothing, and what was queued before the close is still written before the link goes. Which of the three bounds was passed is read by type, not from
 the error's text: `OutboundBound::exceeded_by(&error)` for the refusal a caller receives and
 `PeerTermination::outbound_bound()` for the end the handler is told of, each `None` for anything
-else; `is_link_shutdown_timeout(&error)` says whether a `Timeout` is `Client::close` giving up.
+else; `is_link_shutdown_timeout(&error)` says whether a `Timeout` is `Client::close` giving up on
+the link, which may be still open. A `Timeout` that names the reader is a later close giving up
+behind another close's wait for `on_terminated`: the link is already closed, and `false` here.
 A queued request's `Reply` resolves to a `CallFailure` that
 tells the peer's own error from an ended connection (`Client::ended` gives the same
 `ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type, and
