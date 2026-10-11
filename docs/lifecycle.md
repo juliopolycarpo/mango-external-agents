@@ -158,7 +158,9 @@ the error's text: `OutboundBound::exceeded_by(&error)` for the refusal a caller 
 else; `is_link_shutdown_timeout(&error)` says whether a `Timeout` is `Client::close` giving up.
 A queued request's `Reply` resolves to a `CallFailure` that
 tells the peer's own error from an ended connection (`Client::ended` gives the same
-`ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type. `Client::close`
+`ConnectionEnd`), a deadline, an unwritten frame and a stopped handler by type, and
+`CallFailure::peer_error_was_unreadable` tells an `error` member that could not be read as an
+error object, which fails the call with a stand-in `-32603`, from a peer's own `-32603`. `Client::close`
 writes the notifications queued before it and refuses the requests still queued: a host that needs a last
 request answered waits for its reply first. A close that times out or is dropped before it
 reaches the link leaves the link unusable, so nothing queued is written afterwards. A `Reply` that
@@ -257,9 +259,10 @@ written: one that was queued and then could not be, because the link refused it 
 ran out in the queue, ends the connection whether or not anyone awaits its write, and so does a
 question nothing can be said for: one no reply to fits a frame, or one let go on a queue bounded
 at nothing. Answers are queued without waiting, so the outbound bounds are
-what limits them when a peer asks faster than it reads: the option does not set them, so set them beside it. A write that
-fails in the moment a close is on record is the close's, and the handler is told of no
-termination for it. A question still queued when the
+what limits them when a peer asks faster than it reads: the option does not set them, so set them beside it. A write or a
+read that fails once a close is on record is the close's, whether the reader looks for the close
+before it records the failure or the close lands between the look and the record, and the handler
+is told of no termination for it. A question still queued when the
 connection ends is not handed over. Once the connection has ended a
 responder still out answers nothing and says nothing: a handler that parks questions settles them
 before it closes. The hand-off call is cancelled at an end like a notification call, and

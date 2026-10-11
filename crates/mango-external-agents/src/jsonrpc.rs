@@ -1861,9 +1861,19 @@ impl Drop for WorkerStopped {
     }
 }
 
-/// Keeps a notification call from being cancelled part-way through what it must finish.
+/// Keeps a notification call, or a hand-off, from being cancelled part-way through what it must
+/// finish.
 ///
 /// Returned by [`Client::hold_cancellation`], and released when dropped.
+///
+/// ```no_run
+/// # async fn commit() {}
+/// # async fn on_notification(client: &mango_external_agents::jsonrpc::Client) {
+/// let hold = client.hold_cancellation().await;
+/// commit().await; // an end of the connection waits for this, up to `shutdown_timeout`
+/// drop(hold); // released: the call may be cancelled again
+/// # }
+/// ```
 #[must_use = "the call may be cancelled again as soon as this is dropped"]
 pub struct CancellationHold {
     /// The holds of the call this was granted to. `None` for a hold asked for outside a
@@ -3018,7 +3028,7 @@ impl Client {
     /// and the link closed. Both waits are over at once on a link that takes its writes. The
     /// handler's tasks are cancelled, not waited out, which takes no time unless a handler is
     /// blocking its thread without yielding; nothing here can bound that. Two things are waited
-    /// for inside the same bound: a notification call that asked for a
+    /// for inside the same bound: a notification call or a hand-off that asked for a
     /// [`hold`](Self::hold_cancellation), during the first wait, and, on a connection that had
     /// already ended under this side, the handler's
     /// [`on_terminated`](PeerHandler::on_terminated), with whatever is left of the bound. A caller that wants
@@ -3081,8 +3091,8 @@ impl Client {
         // shutdown flag has already reached them, so this is the moment they need to write the
         // refusal, and it happens before the link is closed under them.
         //
-        // A notification call that holds its cancellation off is waited for at the same time:
-        // the two waits overlap, so the close takes no longer for it.
+        // A notification call or a hand-off that holds its cancellation off is waited for at the
+        // same time: the two waits overlap, so the close takes no longer for it.
         if self.state.cancellation_held() {
             tokio::join!(self.state.wait_for_holds(), self.state.drain_in_flight());
             self.state.stop_notifications().await;
