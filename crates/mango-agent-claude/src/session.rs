@@ -1514,10 +1514,11 @@ enum Read {
 /// Reads the next line, under the idle timeout and under the grace an observed exit starts.
 ///
 /// One `recv` is polled to completion however many times the loop turns, so the exit arriving
-/// mid-read never abandons a read that may already hold part of a line. The order is the bound:
-/// the exit and its deadline are looked at before the pipe, so a helper that keeps writing after
-/// the child left cannot hold the turn open past that deadline. A line that is ready when the
-/// idle timer fires still wins, as it always did.
+/// mid-read never abandons a read that may already hold part of a line. A line that is ready
+/// wins over either deadline: the grace exists so that what the child wrote before it left is
+/// read, and a host that set `kill_grace` to zero still gets every line that is already there.
+/// The deadline is fixed at the exit, so a helper that writes now and then does not move it. One
+/// that never stops writing keeps the read busy, as a turn that never stops talking always could.
 async fn next_line(
     receiver: &mut dyn mango_external_agents::LinkReceiver,
     exit: &mut ExitWatch,
@@ -1538,12 +1539,12 @@ async fn next_line(
         tokio::select! {
             biased;
             () = exit.seen() => {}
-            () = drained => return Read::Ended,
             received = &mut received => return match received {
                 Ok(Some(line)) => Read::Line(line),
                 Ok(None) => Read::Ended,
                 Err(error) => Read::Failed(error),
             },
+            () = drained => return Read::Ended,
             () = &mut idle => return Read::Idle,
         }
     }
@@ -1735,6 +1736,10 @@ async fn pump(
             break;
         }
     }
+
+    // The watch holds a wait on the host's control. The stop below waits on the same control, so
+    // the first is let go before the second begins.
+    drop(exit);
 
     // An EOF, idle timeout, or broken link can end before any conversation record arrives. It is
     // still a failed strict verification: cleanup only tells us that the child stopped, never

@@ -5932,6 +5932,110 @@ mod deadlines {
         );
     }
 
+    /// A host can set `kill_grace` to zero to mean "kill at once". That leaves no time to wait
+    /// for more output after the exit, and still must not throw away a line that is already there.
+    #[tokio::test(start_paused = true)]
+    async fn a_result_already_printed_survives_a_zero_kill_grace() {
+        let limits = Limits {
+            kill_grace: Duration::ZERO,
+            ..Limits::default()
+        };
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let session = open_under(&launcher, limits).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        launcher.announce_to_turn(r#"{"type":"result","is_error":false}"#);
+        launcher.exit_turn_holding_its_output(0);
+        let events = terminal_of(&mut turn).await;
+        assert!(
+            matches!(events.last(), Some(EventKind::Completed)),
+            "expected the printed result to complete the turn under a zero kill_grace | received {events:?}"
+        );
+    }
+
+    /// A host control that cannot say when its child exited gives the pump nothing to watch, so
+    /// the read is left to the idle timer, as it was before the exit was watched at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_control_that_cannot_report_an_exit_leaves_the_read_to_the_idle_timer() {
+        let limits = Limits::default();
+        let floor = mango_agent_claude::pinned::stream_idle_timeout(&limits);
+        let inner = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(UnwaitableLauncher {
+            inner: Arc::clone(&inner),
+        });
+        let host = host_under(launcher, limits);
+        let session = ClaudeHarness::new()
+            .open_session(&host, OpenSession::new("chat-1"))
+            .await
+            .expect("expected a session");
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let began = tokio::time::Instant::now();
+        let events = terminal_of(&mut turn).await;
+        assert_eq!(
+            began.elapsed(),
+            floor,
+            "expected the terminal at the idle floor ({floor:?}) and no sooner | received {:?}",
+            began.elapsed()
+        );
+        assert!(
+            matches!(events.last(), Some(EventKind::Error { error })
+                if error.code.as_str() == "claude-stream-broken"),
+            "expected a claude-stream-broken terminal | received {events:?}"
+        );
+    }
+
+    /// A launcher whose turn controls fail every `wait`.
+    struct UnwaitableLauncher {
+        inner: Arc<FakeClaudeCli>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLauncher for UnwaitableLauncher {
+        async fn spawn(&self, spec: LaunchSpec) -> Result<ManagedProcess> {
+            let is_turn = spec.argv.iter().any(|argument| argument == "--print");
+            let mut child = self.inner.spawn(spec).await?;
+            if is_turn {
+                child.control = Arc::new(UnwaitableControl {
+                    inner: child.control,
+                });
+            }
+            Ok(child)
+        }
+    }
+
+    struct UnwaitableControl {
+        inner: Arc<dyn ProcessControl>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for UnwaitableControl {
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+
+        fn stderr_tail(&self) -> String {
+            self.inner.stderr_tail()
+        }
+
+        async fn wait(&self) -> Result<mango_external_agents::ExitStatus> {
+            Err(Error::Launch {
+                program: String::from("claude"),
+                message: String::from("a host control that cannot observe its child's exit"),
+            })
+        }
+
+        async fn kill(&self, reason: CancelReason) -> Result<()> {
+            self.inner.kill(reason).await
+        }
+    }
+
     /// A child that says nothing and does not exit is cut at the idle floor, then given the same
     /// kill grace to exit before the terminal is written.
     #[tokio::test(start_paused = true)]
