@@ -2414,8 +2414,10 @@ mod tests {
         std::thread::spawn(move || drop(guard))
             .join()
             .expect("expected the dropping thread to finish");
+        // Both, not the child alone: closing the connection ends the fake child by closing its
+        // stdin, a moment before the reaper asks the launcher to stop it.
         let reaped = tokio::time::timeout(Duration::from_secs(5), async {
-            while launcher.live_children() != 0 {
+            while launcher.live_children() != 0 || kills.load(Ordering::Acquire) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
