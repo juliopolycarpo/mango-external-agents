@@ -70,6 +70,22 @@ impl SpawnGate {
     }
 }
 
+/// How a turn child answers the two things a stop asks of it, for a test that times a stop.
+///
+/// The durations are the child's own behaviour, not a wait the test performs: each one is how long
+/// the fake host launcher takes to answer that call, measured on the runtime's clock, so a test
+/// under a paused clock reads the stop's bound off `Instant::elapsed` to the millisecond.
+#[derive(Clone, Copy, Debug)]
+pub struct SlowStop {
+    /// How long the graceful interrupt takes to be delivered. The child does not exit for it.
+    /// `None` is a launcher with no graceful interrupt, which is what Windows reports.
+    pub interrupt: Option<std::time::Duration>,
+    /// How long the kill takes to answer.
+    pub kill: std::time::Duration,
+    /// Whether the child is gone once the kill has answered.
+    pub kill_ends_child: bool,
+}
+
 /// What one fake child does once it is spawned.
 #[derive(Clone, Debug)]
 pub enum Run {
@@ -152,6 +168,7 @@ pub struct FakeClaudeCli {
     kill_requests: Arc<Mutex<usize>>,
     graceful_interrupts: Arc<Mutex<usize>>,
     interrupt_supported: bool,
+    slow_stop: Option<SlowStop>,
 }
 
 impl Default for FakeClaudeCli {
@@ -180,6 +197,7 @@ impl FakeClaudeCli {
             kill_requests: Arc::new(Mutex::new(0)),
             graceful_interrupts: Arc::new(Mutex::new(0)),
             interrupt_supported: false,
+            slow_stop: None,
         }
     }
 
@@ -227,6 +245,13 @@ impl FakeClaudeCli {
     #[must_use]
     pub fn with_graceful_interrupt(mut self) -> Self {
         self.interrupt_supported = true;
+        self
+    }
+
+    /// Makes turn children answer a stop this slowly, and not exit for the interrupt.
+    #[must_use]
+    pub fn with_slow_stop(mut self, stop: SlowStop) -> Self {
+        self.slow_stop = Some(stop);
         self
     }
 
@@ -324,7 +349,9 @@ impl FakeClaudeCli {
 
     /// Whether every child this launcher handed out has ended.
     pub fn all_children_ended(&self) -> bool {
-        lock(&self.children).iter().all(|child| child.is_finished())
+        lock(&self.children)
+            .iter()
+            .all(|child| child.is_finished() && !child.output_is_open())
     }
 
     /// Whether any child is still running.
@@ -340,13 +367,64 @@ impl FakeClaudeCli {
         let children = lock(&self.children).clone();
         for child in children
             .into_iter()
-            .filter(|child| child.is_turn && !child.is_finished())
+            .filter(|child| child.is_turn && (!child.is_finished() || child.output_is_open()))
         {
             child.end(ExitStatus {
                 code: Some(143),
                 signal: None,
             });
         }
+    }
+
+    /// Makes the newest running turn child exit while something it started keeps its stdout open.
+    ///
+    /// A pipe ends when its last writer closes it, not when the process the library spawned
+    /// exits: a helper that inherited the descriptor holds the read open after `wait` has already
+    /// answered. Killing the tree is what closes it.
+    pub fn exit_turn_holding_its_output(&self, code: i32) {
+        let Some(child) = self.newest_turn(|child| !child.is_finished()) else {
+            return;
+        };
+        *lock(&child.exit) = ExitStatus {
+            code: Some(code),
+            signal: None,
+        };
+        *lock(&child.finished) = true;
+        child.changed.notify_waiters();
+    }
+
+    /// Closes the newest running turn child's stdout while the child itself keeps running.
+    pub fn close_turn_output(&self) {
+        let Some(child) = self.newest_turn(|child| !child.is_finished()) else {
+            return;
+        };
+        *lock(&child.output_open) = false;
+        child.changed.notify_waiters();
+    }
+
+    /// Returns once the newest turn child is gone: exited, and its stdout closed.
+    ///
+    /// Waits on the child's own notification rather than polling, so a test under a paused clock
+    /// can read off how long the reap took.
+    pub async fn turn_reaped(&self) {
+        let Some(child) = self.newest_turn(|_| true) else {
+            return;
+        };
+        loop {
+            let changed = child.changed.notified();
+            if child.is_finished() && !child.output_is_open() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn newest_turn(&self, wanted: impl Fn(&Child) -> bool) -> Option<Arc<Child>> {
+        lock(&self.children)
+            .iter()
+            .rev()
+            .find(|child| child.is_turn && wanted(child))
+            .map(Arc::clone)
     }
 
     /// Makes the newest live turn child print one more line after it has gone quiet.
@@ -440,6 +518,8 @@ impl ProcessLauncher for FakeClaudeCli {
         let child = Arc::new(Child {
             pending: Mutex::new(lines.into()),
             finished: Mutex::new(finished),
+            output_open: Mutex::new(!finished),
+            slow_stop: is_turn.then_some(self.slow_stop).flatten(),
             exit: Mutex::new(exit),
             stderr,
             written: Arc::clone(&self.written),
@@ -472,6 +552,10 @@ impl ProcessLauncher for FakeClaudeCli {
 struct Child {
     pending: Mutex<VecDeque<String>>,
     finished: Mutex<bool>,
+    /// Whether anything still holds the write end of stdout. Separate from `finished` because a
+    /// pipe outlives the process that was handed it for as long as a helper keeps it open.
+    output_open: Mutex<bool>,
+    slow_stop: Option<SlowStop>,
     exit: Mutex<ExitStatus>,
     stderr: StderrTail,
     written: Arc<Mutex<Vec<String>>>,
@@ -490,9 +574,18 @@ impl Child {
         *lock(&self.finished)
     }
 
+    fn output_is_open(&self) -> bool {
+        *lock(&self.output_open)
+    }
+
+    /// Ends the whole tree: the child exits and nothing is left holding its stdout. A child that
+    /// already exited keeps the status it exited with.
     fn end(&self, exit: ExitStatus) {
-        *lock(&self.exit) = exit;
+        if !self.is_finished() {
+            *lock(&self.exit) = exit;
+        }
         *lock(&self.finished) = true;
+        *lock(&self.output_open) = false;
         self.changed.notify_waiters();
     }
 }
@@ -518,6 +611,14 @@ impl ProcessControl for Child {
     }
 
     async fn interrupt(&self, _reason: CancelReason) -> Result<InterruptOutcome> {
+        if let Some(stop) = self.slow_stop {
+            let Some(delay) = stop.interrupt else {
+                return Ok(InterruptOutcome::Unsupported);
+            };
+            tokio::time::sleep(delay).await;
+            *lock(&self.graceful_interrupts) += 1;
+            return Ok(InterruptOutcome::Delivered);
+        }
         if !self.interrupt_supported {
             return Ok(InterruptOutcome::Unsupported);
         }
@@ -549,8 +650,14 @@ impl ProcessControl for Child {
         // that recorded a second observation here would be inventing a kill the real launcher
         // never performs — and the turn's own stream task does call `kill` after a close already
         // did.
-        if self.is_finished() {
+        if self.is_finished() && !self.output_is_open() {
             return Ok(());
+        }
+        if let Some(stop) = self.slow_stop {
+            tokio::time::sleep(stop.kill).await;
+            if !stop.kill_ends_child {
+                return Ok(());
+            }
         }
         if let Some(path) = &self.mcp_config {
             lock(&self.config_at_kill).push(path.exists());
@@ -575,7 +682,7 @@ impl ByteSource for FakeStdout {
             if let Some(line) = lock(&self.child.pending).pop_front() {
                 return Ok(Some(format!("{line}\n").into_bytes()));
             }
-            if self.child.is_finished() {
+            if !self.child.output_is_open() {
                 return Ok(None);
             }
             changed.await;
