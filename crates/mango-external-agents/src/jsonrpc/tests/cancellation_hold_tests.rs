@@ -24,6 +24,13 @@ struct Script {
     forget_hold: bool,
     /// Asks for a second hold inside the stretch, as a helper it calls might.
     nested_hold: bool,
+    /// Drops the nested hold where the stretch is committed and the outer one at the end of
+    /// the call; otherwise the other way round.
+    nested_dropped_first: bool,
+    /// Hands its hold to someone else as soon as it has it, and goes on with the stretch.
+    hold_elsewhere: bool,
+    /// Asks for a hold of a second stretch once the first is committed and let go.
+    second_stretch: bool,
     /// Panics inside the stretch.
     panic_inside: bool,
     /// Makes a request and queues a notification inside the stretch.
@@ -104,7 +111,7 @@ impl PeerHandler for HoldingHandler {
         if self.script.park_before_hold {
             Self::at_gate(&self.before_hold).await;
         }
-        let hold = if self.script.hold {
+        let mut hold = if self.script.hold {
             self.asked_for_hold.fetch_add(1, Ordering::AcqRel);
             let client = client().expect("expected the client to outlive the call's first step");
             let hold = client.hold_cancellation().await;
@@ -121,6 +128,12 @@ impl PeerHandler for HoldingHandler {
                 .extend(hold);
             return;
         }
+        if self.script.hold_elsewhere {
+            self.kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(hold.take());
+        }
         if self.script.quick {
             for _ in 0..3 {
                 tokio::task::yield_now().await;
@@ -128,7 +141,7 @@ impl PeerHandler for HoldingHandler {
         } else {
             Self::at_gate(&self.inside).await;
         }
-        let _nested = if self.script.nested_hold {
+        let mut nested = if self.script.nested_hold {
             let client = client().expect("expected the client to outlive the stretch");
             Some(client.hold_cancellation().await)
         } else {
@@ -153,14 +166,23 @@ impl PeerHandler for HoldingHandler {
         }
         self.committed.fetch_add(1, Ordering::AcqRel);
         if self.script.forget_hold {
-            std::mem::forget(hold);
+            std::mem::forget(hold.take());
+        } else if self.script.nested_dropped_first {
+            drop(nested.take());
         } else {
-            // The outer hold goes first and the nested one, if any, at the end of the call.
-            drop(hold);
+            drop(hold.take());
+        }
+        if self.script.second_stretch {
+            self.asked_for_hold.fetch_add(1, Ordering::AcqRel);
+            let client = client().expect("expected the client to outlive the stretch");
+            let _second = client.hold_cancellation().await;
+            self.granted.fetch_add(1, Ordering::AcqRel);
         }
         if self.script.park_after {
             Self::at_gate(&self.after).await;
         }
+        // Whichever of the two holds is still out goes with the call.
+        drop((hold, nested));
     }
 
     async fn on_request(
@@ -246,6 +268,9 @@ const HOLDING: Script = Script {
     keep_first_hold: false,
     forget_hold: false,
     nested_hold: false,
+    nested_dropped_first: false,
+    hold_elsewhere: false,
+    second_stretch: false,
     panic_inside: false,
     ask_inside: false,
     close_inside: false,
@@ -1013,6 +1038,12 @@ async fn a_hold_asked_for_outside_a_notification_call_holds_nothing() {
 
 /// A close on one thread while the handler's task, on another, runs one held stretch after
 /// another. Wherever the close lands, every stretch whose hold was granted is committed.
+///
+/// Where the close lands is up to the scheduler, so that some close lands mid-stream is a
+/// matter of chance, however likely the pacing makes it. The property does not rest on this
+/// test: `a_hold_and_a_cancellation_that_cross_never_both_go_ahead` places each side inside
+/// the other with hooks, which are the only two ways the two can cross. This one is here to
+/// run the real tasks against each other on real threads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_racing_the_handlers_task_never_cuts_a_held_stretch() {
     let mut mid_stream = 0;
@@ -1503,7 +1534,12 @@ async fn an_answer_queued_behind_a_held_stretch_is_failed_not_delivered() {
     );
     handler.inside.add_permits(1);
     let outcome = eventually("the reply", reply).await;
-    let failed = outcome.expect_err("expected the queued answer not delivered after the end");
+    let failed = match outcome {
+        Err(failed) => failed,
+        Ok(delivered) => panic!(
+            "expected the queued answer failed, not delivered: Err(Ended(Peer(NotificationBackpressure))) | received Ok({delivered:?})"
+        ),
+    };
     assert!(
         matches!(
             failed.cause(),
@@ -1643,6 +1679,261 @@ async fn the_drain_deadline_waits_for_a_held_stretch_and_the_answers_owed_at_onc
         waited,
         GRACE * 2,
         "expected the handler told two graces after the end: 400ms | received {waited:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A caller that puts its own timeout around a close has to allow more than the close's bound.
+/// At exactly twice `shutdown_timeout` the caller's timer and the close's last deadline fall
+/// on the same instant, and the caller's fires first: the close is given up, not finished.
+#[tokio::test(start_paused = true)]
+async fn a_callers_timeout_at_exactly_the_closes_bound_gives_the_close_up() {
+    for (allowed, finishes) in [
+        (GRACE * 2, false),
+        (GRACE * 2 + Duration::from_millis(1), true),
+    ] {
+        let link = ScriptedLink::new();
+        let (handler, client) = connect(
+            &link,
+            Script {
+                park_termination: true,
+                ..NOT_HOLDING
+            },
+        );
+        link.end();
+        eventually("the termination to begin", handler.terminated.notified()).await;
+
+        let began = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(allowed, client.close()).await;
+        let observed = (outcome.is_ok(), began.elapsed());
+        assert_eq!(
+            observed,
+            (finishes, GRACE * 2),
+            "expected a close allowed {allowed:?} to finish: ({finishes}, 400ms) | received {observed:?}"
+        );
+    }
+}
+
+/// Two holds in one call are let go at different moments, in either order. The stretch is
+/// over, and the end of the connection goes ahead, only when the last of them is dropped.
+#[tokio::test(start_paused = true)]
+async fn nested_holds_dropped_apart_hold_until_the_last_is_dropped() {
+    for nested_dropped_first in [false, true] {
+        let link = ScriptedLink::new();
+        let (handler, client) = connect(
+            &link,
+            Script {
+                nested_hold: true,
+                nested_dropped_first,
+                park_after: true,
+                ..HOLDING
+            },
+        );
+        overflow_behind_the_stretch(&link, &handler, &client).await;
+        // The first of the two is dropped here, and the call waits with the other still out.
+        handler.inside.add_permits(1);
+        tokio::time::sleep(GRACE / 4).await;
+        let waiting = (
+            handler.progress(),
+            client.state.holds.out.load(Ordering::SeqCst),
+            handler.terminations().len(),
+        );
+        assert_eq!(
+            waiting,
+            ((1, 1, 1), 1, 0),
+            "expected one hold still out and the end still waiting (nested first: {nested_dropped_first}): ((1, 1, 1), 1, 0) | received {waiting:?}"
+        );
+
+        let opened = tokio::time::Instant::now();
+        handler.after.add_permits(1);
+        eventually("the termination", handler.terminated.notified()).await;
+        let observed = (
+            opened.elapsed(),
+            client.state.holds.out.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            observed,
+            (Duration::ZERO, 0),
+            "expected the handler told when the last hold was dropped (nested first: {nested_dropped_first}): (0s, 0) | received {observed:?}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+}
+
+/// A hold handed to another task and dropped there while its call is still running is
+/// released there and then: the stretch is no longer held, and the end goes ahead.
+#[tokio::test(start_paused = true)]
+async fn a_hold_dropped_on_another_thread_during_its_call_releases_the_stretch() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            hold_elsewhere: true,
+            ..HOLDING
+        },
+    );
+    overflow_behind_the_stretch(&link, &handler, &client).await;
+    tokio::time::sleep(GRACE / 4).await;
+    let waiting = handler.terminations().len();
+    assert_eq!(
+        waiting, 0,
+        "expected the end waiting for the hold kept on another task: 0 | received {waiting}"
+    );
+
+    let elsewhere = handler
+        .kept
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop()
+        .expect("expected the hold handed over");
+    let opened = tokio::time::Instant::now();
+    std::thread::spawn(move || drop(elsewhere))
+        .join()
+        .expect("expected the hold dropped on another thread");
+    eventually("the termination", handler.terminated.notified()).await;
+    let observed = (
+        opened.elapsed(),
+        handler.progress(),
+        client.state.holds.out.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        observed,
+        (Duration::ZERO, (1, 1, 0), 0),
+        "expected the end to go ahead as the hold was dropped elsewhere, the call cut: (0s, (1, 1, 0), 0) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A hold handed to another task and kept there past the end of its call is released when the
+/// call returns, and dropping it afterwards takes nothing off the count.
+#[tokio::test(start_paused = true)]
+async fn a_hold_kept_on_another_task_is_released_when_its_call_returns() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            hold_elsewhere: true,
+            ..HOLDING
+        },
+    );
+    overflow_behind_the_stretch(&link, &handler, &client).await;
+
+    let opened = tokio::time::Instant::now();
+    handler.inside.add_permits(1);
+    eventually("the termination", handler.terminated.notified()).await;
+    let observed = (
+        opened.elapsed(),
+        handler.progress(),
+        client.state.holds.out.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        observed,
+        (Duration::ZERO, (1, 1, 1), 0),
+        "expected the handler told when the call returned, its hold still kept elsewhere: (0s, (1, 1, 1), 0) | received {observed:?}"
+    );
+    handler
+        .kept
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    let left = client.state.holds.out.load(Ordering::SeqCst);
+    assert_eq!(
+        left, 0,
+        "expected the hold dropped after its call to take nothing off the count: 0 | received {left}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// The drain's deadline has passed while one stretch was held. A hold the same call asks for
+/// after that, for a second stretch, is refused: the call is cut there, before the stretch.
+#[tokio::test(start_paused = true)]
+async fn a_hold_asked_for_after_the_drain_deadline_is_refused() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            second_stretch: true,
+            ..HOLDING
+        },
+    );
+    inside_the_stretch(&link, &handler).await;
+    let began = tokio::time::Instant::now();
+    link.end();
+    tokio::time::sleep(GRACE + GRACE / 2).await;
+
+    handler.inside.add_permits(1);
+    eventually("the termination", handler.terminated.notified()).await;
+    let observed = (
+        began.elapsed(),
+        HoldingHandler::count(&handler.asked_for_hold),
+        handler.progress(),
+    );
+    assert_eq!(
+        observed,
+        (GRACE + GRACE / 2, 2, (1, 1, 1)),
+        "expected the second hold asked for and never granted, the handler told at once: (300ms, 2, (1, 1, 1)) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// With nothing held, there is a moment between an end deciding to stop the handler's task and
+/// the task being stopped. An ordered answer the task comes to in that moment is not
+/// delivered: its caller is failed, once, with what ended the connection.
+#[tokio::test(start_paused = true)]
+async fn an_answer_reached_after_the_end_was_decided_is_failed_not_delivered() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(&link, NOT_HOLDING);
+    let (written, reply) = client
+        .submit_request(
+            "session/prompt",
+            json!({}),
+            RequestOptions::new()
+                .without_deadline()
+                .after_earlier_notifications(),
+        )
+        .expect("expected the request queued")
+        .into_parts();
+    eventually("the request written", written)
+        .await
+        .expect("expected the request written");
+    inside_the_stretch(&link, &handler).await;
+    link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"done"}"#);
+    until("the answer to take its place behind the call", || {
+        client
+            .state
+            .pending
+            .try_lock()
+            .is_ok_and(|pending| pending.is_empty())
+    })
+    .await;
+
+    // What a close does up to the moment before it stops the task, and no further.
+    let _ = client.state.ended_with(
+        crate::jsonrpc::ConnectionEnd::Closed,
+        client.state.closed_error(),
+    );
+    client.state.mark_closed();
+    let held = client.state.cancellation_held();
+    assert!(
+        !held,
+        "expected nothing held when the end was decided: false | received true"
+    );
+    // The task gets on before it is stopped: its call returns and it comes to the answer.
+    handler.inside.add_permits(1);
+    let outcome = eventually("the reply", reply).await;
+    let failed = match outcome {
+        Err(failed) => failed,
+        Ok(delivered) => panic!(
+            "expected the queued answer failed, not delivered: Err(Ended(Closed)) | received Ok({delivered:?})"
+        ),
+    };
+    assert!(
+        matches!(
+            failed.cause(),
+            crate::jsonrpc::CallFailureCause::Ended(crate::jsonrpc::ConnectionEnd::Closed)
+        ),
+        "expected the reply failed by the close: Ended(Closed) | received {:?}",
+        failed.cause()
     );
     client.close().await.expect("expected a clean close");
 }

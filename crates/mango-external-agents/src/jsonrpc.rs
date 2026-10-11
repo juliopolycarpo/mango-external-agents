@@ -299,6 +299,12 @@ pub trait PeerHandler: Send + Sync {
     /// may take, where it would otherwise take the reader down mid-call. Dropping the
     /// [`Client`] cannot wait: a connection that is ending as its client is dropped may never
     /// have this called, or have it cancelled at an await.
+    ///
+    /// Do not await, from here, a [`Client::close`] that runs on another task. That close waits
+    /// for this call to return while this call waits for it, and both stand still until the
+    /// close's bound, twice [`ClientOptions::shutdown_timeout`], cuts this call short. Signal
+    /// whoever owns the client and return; or close from this call itself, which is recognised
+    /// and waits for nothing.
     async fn on_terminated(&self, _termination: PeerTermination) {}
 }
 
@@ -3533,6 +3539,12 @@ async fn peer_work_pump(
     while let Some(queued) = notifications.recv().await {
         let (work, _permit) = match queued {
             QueuedWork::Response(answer) => {
+                // An end that does not drain has been noticed and is on its way to stopping
+                // this task. An answer still queued then is not delivered: it fails with what
+                // ended the connection, as it and the rest of the queue are let go.
+                if state.cancelling_handler.load(Ordering::SeqCst) {
+                    break;
+                }
                 // Everything read before this response has been handed to the handler and, for a
                 // notification, awaited.
                 answer.deliver();
