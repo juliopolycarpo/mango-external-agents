@@ -116,9 +116,14 @@ Asking for it is `Error::UnsupportedTransport`.
 ## The driving model
 
 `client::drive` connects the peer over the framed link and returns a `ConnectionHandle` that owns
-it and the child. The peer reads on one task, hands notifications to the handler in arrival order
-on a second, and answers each of the agent's requests on a task of its own. No `LocalSet` and no
-thread per session.
+it and the child. The peer reads on one task and hands notifications and the agent's requests to
+the handler in arrival order on a second, a request with the responder that answers it. No
+`LocalSet` and no thread per session.
+
+Every answer to the agent is queued, not written, by the call that gives it: it takes its place
+behind what this side queued before it and ahead of what it queues after, and it counts against
+the outgoing queue's bounds like any other frame. A withdrawn question and then `session/cancel`
+reach the agent in that order.
 
 What the handler does with the agent's traffic:
 
@@ -127,7 +132,9 @@ What the handler does with the agent's traffic:
   terminal error and the prompt owner cancels native work; the handler never waits for a host to
   read.
 - A `session/request_permission` must not wait for an answer inline, because the answer arrives
-  through `Session::respond` on another task. It parks the reply and returns; broker
+  through `Session::respond` on another task. It parks the reply and returns, and it has done so
+  before anything the agent sent after it is handled, the answer to the prompt included: a
+  question still parked when the turn ends is always there for the turn to withdraw. Broker
   deliberation is a separate callback that lives only as long as its question stays parked, so
   `Limits::max_pending_requests` caps it too. Once the question is answered, withdrawn, expired,
   cancelled or swept by a close, the broker's `decide` future is dropped rather than left to run

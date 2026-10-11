@@ -222,6 +222,8 @@ fn queued_bytes_limit(outbound_buffer_bytes: usize) -> usize {
 ///
 /// ACP is JSON-RPC 2.0, so a batch is read member by member, a line that is not JSON is
 /// answered with `-32700`, and a request this side gives up is followed by `$/cancel_request`.
+/// The agent's own requests are handed over in wire order with a responder, so their answers
+/// are queued, in order and against the same bounds, with everything else this side writes.
 ///
 /// For example, `wire_options(host.limits(), host.outbound_buffer_bytes())`.
 pub(crate) fn wire_options(limits: &Limits, outbound_buffer_bytes: usize) -> WireOptions {
@@ -232,6 +234,7 @@ pub(crate) fn wire_options(limits: &Limits, outbound_buffer_bytes: usize) -> Wir
         .with_batch_decoding()
         .with_parse_error_replies(PARSE_ERROR_REPLIES)
         .with_cancel_on_abandon(PROTOCOL_LEVEL_METHOD_NAMES.cancel_request)
+        .with_request_handoff()
 }
 
 #[cfg(test)]

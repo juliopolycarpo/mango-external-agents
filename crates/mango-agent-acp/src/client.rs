@@ -5,8 +5,9 @@
 //! The connection is the repository's own JSON-RPC peer,
 //! [`jsonrpc::Client`](mango_external_agents::jsonrpc::Client), over the line-framed link
 //! [`transport::frame`](crate::transport::frame) builds. The peer reads on a task of its own,
-//! hands each `session/update` to [`AcpHandler`] in arrival order on a second task, and answers
-//! each of the agent's questions on a task per question. A [`ConnectionHandle`] owns the peer and
+//! and hands each `session/update` and each of the agent's questions to [`AcpHandler`] in arrival
+//! order on a second task, a question with the responder that answers it. A question is answered
+//! there or parked; none is waited on. A [`ConnectionHandle`] owns the peer and
 //! the child behind it; [`ConnectionHandle::shutdown`] is the one place both end.
 //!
 //! Every request this side makes asks for its answer behind the notifications that arrived before
@@ -1368,7 +1369,7 @@ fn standing_refusal(
 /// What the JSON-RPC peer hands the agent's traffic to.
 ///
 /// - `session/update` is reduced and emitted, one call at a time, in arrival order.
-/// - `session/request_permission` is brokered; its call returns when the question is settled.
+/// - `session/request_permission` is brokered: its reply is parked and the call returns.
 /// - Any other request is refused with JSON-RPC `-32601`, which is what the capabilities this
 ///   client advertises promise: no filesystem, no terminal, nothing else an agent may ask for.
 /// - Any other notification is dropped without an answer.
@@ -1392,26 +1393,56 @@ impl PeerHandler for AcpHandler {
         on_session_update(&self.state, notification).await;
     }
 
+    /// Not asked on this connection, which hands its questions over. Answered as a question
+    /// past the cap is, so nothing could ever be parked here.
     async fn on_request(
         &self,
         method: String,
-        params: serde_json::Value,
+        _params: serde_json::Value,
         _id: jsonrpc::RequestId,
     ) -> ServerRequestOutcome {
+        reply::past_cap(method == CLIENT_METHOD_NAMES.session_request_permission)
+    }
+
+    /// Runs on the notification worker, in wire order: a permission is parked, or settled,
+    /// before anything the agent sent after it is handled and before a later response reaches
+    /// its caller. Nothing here waits for a person.
+    async fn on_request_handoff(
+        &self,
+        method: String,
+        params: serde_json::Value,
+        responder: jsonrpc::Responder,
+    ) {
         if method != CLIENT_METHOD_NAMES.session_request_permission {
-            return refusal(agent_client_protocol_schema::v1::Error::method_not_found());
+            reply::refuse(
+                responder,
+                agent_client_protocol_schema::v1::Error::method_not_found(),
+            );
+            return;
         }
-        let request = match serde_json::from_value::<RequestPermissionRequest>(params) {
-            Ok(request) => request,
+        let Ok(request) = serde_json::from_value::<RequestPermissionRequest>(params) else {
             // No `data`: the decoder's description quotes the value it could not read, and
             // nothing an agent sent is echoed back onto the wire.
-            Err(_) => return refusal(agent_client_protocol_schema::v1::Error::invalid_params()),
+            reply::refuse(
+                responder,
+                agent_client_protocol_schema::v1::Error::invalid_params(),
+            );
+            return;
         };
-        let (reply, question) = PermissionReply::parked();
-        // An answer that could not be handed over is the connection ending under the question,
-        // and the peer answers for a closing connection itself.
-        let _ = on_request_permission(&self.state, request, reply).await;
-        question.answer().await
+        // An answer the connection did not take is the connection ending under the question,
+        // which its owner hears on its own.
+        let _ = on_request_permission(&self.state, request, PermissionReply::new(responder)).await;
+    }
+
+    fn on_request_past_cap(
+        &self,
+        method: &str,
+        _params: &serde_json::Value,
+        _id: &jsonrpc::RequestId,
+    ) -> Option<ServerRequestOutcome> {
+        Some(reply::past_cap(
+            method == CLIENT_METHOD_NAMES.session_request_permission,
+        ))
     }
 
     async fn on_terminated(&self, _termination: jsonrpc::PeerTermination) {
@@ -1419,18 +1450,6 @@ impl PeerHandler for AcpHandler {
         // down from its own task. Closing from here would wait on this very call.
         self.ended.cancel();
     }
-}
-
-/// An ACP error as the answer the peer writes for one of the agent's requests.
-///
-/// For example, `refusal(Error::method_not_found())` writes
-/// `{"error":{"code":-32601,"message":"Method not found"}}` on the id the agent used.
-fn refusal(error: agent_client_protocol_schema::v1::Error) -> ServerRequestOutcome {
-    ServerRequestOutcome::Failure(jsonrpc::JsonRpcError {
-        code: i64::from(i32::from(error.code)),
-        message: error.message,
-        data: error.data,
-    })
 }
 
 /// A live connection to one agent, and the child behind it.
