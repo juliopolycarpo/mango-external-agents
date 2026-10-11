@@ -624,6 +624,9 @@ pub(super) struct Outgoing {
     call: Option<Registration>,
     /// Whether the frame has a share of the queue's bounds to give back.
     counted: bool,
+    /// Whether the frame answers one of the peer's questions. Nobody has to be waiting on
+    /// such a write for it to matter: an answer that was not written leaves the peer waiting.
+    reply: bool,
 }
 
 /// What the writer takes off the queue.
@@ -732,7 +735,18 @@ impl Outbox {
         deadline: Instant,
         call: Option<Registration>,
     ) -> std::result::Result<Ticket, Refusal> {
-        self.queue_frame(frame, deadline, call, true)
+        self.queue_frame(frame, deadline, call, true, false)
+    }
+
+    /// The same, for the answer to one of the peer's questions: a frame that must be written.
+    /// One that is not, for any reason, ends the connection, since the peer would otherwise
+    /// wait for good on a question this side believes it has answered.
+    pub(super) fn enqueue_reply(
+        &self,
+        frame: String,
+        deadline: Instant,
+    ) -> std::result::Result<Ticket, Refusal> {
+        self.queue_frame(frame, deadline, None, true, true)
     }
 
     /// Queues a frame this side sends of its own accord, beside the queue's bounds: it takes
@@ -747,7 +761,7 @@ impl Outbox {
         frame: String,
         deadline: Instant,
     ) -> std::result::Result<Ticket, Refusal> {
-        self.queue_frame(frame, deadline, None, false)
+        self.queue_frame(frame, deadline, None, false, false)
     }
 
     fn queue_frame(
@@ -756,6 +770,7 @@ impl Outbox {
         deadline: Instant,
         call: Option<Registration>,
         counted: bool,
+        reply: bool,
     ) -> std::result::Result<Ticket, Refusal> {
         let bytes = frame.len();
         let mut held = self
@@ -796,6 +811,7 @@ impl Outbox {
             deadline,
             call,
             counted,
+            reply,
         };
         if let Err(refused) = self.queue.send(Entry::Frame(queued)) {
             // The frame comes back in the error and gives its share back as it is dropped, which
@@ -1044,6 +1060,12 @@ async fn frame(state: &ClientState, mut outgoing: Outgoing) {
     }
     let outcome = write(state, &mut outgoing).await;
     let ack = outgoing.ack.take();
+    if outgoing.reply
+        && let Some(Err(error)) = &outcome
+    {
+        // Whether or not anyone waits to hear: the pump is told, and ends the connection.
+        state.signal_write_failure(error);
+    }
     let unwritten = call.filter(|_| !matches!(outcome, Some(Ok(()))));
     if let Some((_, claim)) = &unwritten {
         // The write is over and the link took none of the frame, or is unusable now. Settled

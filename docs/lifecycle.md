@@ -229,10 +229,16 @@ bounds, behind every frame queued before it. A question past `max_in_flight_requ
 handed over: `PeerHandler::on_request_past_cap` answers it on the spot, with a result if the
 protocol wants one, and this client's `-32000` refusal otherwise. An answer too large for a frame
 comes back with its responder, the connection untouched. A responder dropped unanswered tells the
-peer with `-32603` and gives back what the question held. Once the connection has ended a
+peer with `-32603` and gives back what the question held. An answer is a frame that has to be
+written: one that was queued and then could not be, because the link refused it or its deadline
+ran out in the queue, ends the connection whether or not anyone awaits its write, and so does a
+question no reply to fits a frame. Answers are queued without waiting, so the outbound bounds are
+what limits them when a peer asks faster than it reads. A question still queued when the
+connection ends is not handed over. Once the connection has ended a
 responder still out answers nothing and says nothing: a handler that parks questions settles them
 before it closes. The hand-off call is cancelled at an end like a notification call, and
-`hold_cancellation` holds nothing there. Without the option none of this applies: a question is
+`hold_cancellation` holds nothing there. A request with `after_earlier_notifications` made from
+inside it is refused before it is written, as it is inside a notification. Without the option none of this applies: a question is
 answered by `on_request` on a task of its own, and its answer is written when that task has the
 link.
 

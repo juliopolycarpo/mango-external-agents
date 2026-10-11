@@ -304,7 +304,14 @@ pub trait PeerHandler: Send + Sync {
     /// without draining. [`Client::hold_cancellation`] has nothing to hold here.
     ///
     /// The default asks [`on_request`](Self::on_request) and answers with what it returns,
-    /// which keeps a handler written for it working, one question at a time.
+    /// one question at a time. That suits an `on_request` that returns promptly. It is not
+    /// what a client without the option does with the same handler: an `on_request` that
+    /// waits holds back everything the peer sent after the question; one cut short by the
+    /// end of the connection leaves its question unanswered, where the other path answers it
+    /// with an error; and one that panics takes the task that runs the notifications with
+    /// it. A handler that waits for a person overrides this and keeps the responder.
+    ///
+    /// A question still queued when the connection ends is not handed over.
     ///
     /// ```no_run
     /// # use mango_external_agents::jsonrpc::{JsonRpcError, Responder, ServerRequestOutcome};
@@ -763,6 +770,10 @@ impl RequestOptions {
     /// on a task the handler spawned and then awaits is the same deadlock and runs until the
     /// request times out. A request made from [`PeerHandler::on_request`] is safe, since nothing
     /// in the queue waits for a question to be answered, and so is one made to another client.
+    /// On a client made with [`WireOptions::with_request_handoff`] the queue does wait for a
+    /// question to be handed over, so a request made inside
+    /// [`PeerHandler::on_request_handoff`], or inside an `on_request` its default calls, is
+    /// refused in the same way.
     ///
     /// # Example
     ///
@@ -833,6 +844,14 @@ impl RequestOptions {
     pub fn label(&self) -> Option<&'static str> {
         self.label
     }
+}
+
+tokio::task_local! {
+    /// The client whose `on_request_handoff` the current task is inside, as its state's
+    /// address. Apart from the notification call's: a hand-off is awaited by the same task,
+    /// so an ordered answer asked for from inside it would wait for it too, but it is not a
+    /// call a [`CancellationHold`] can be taken in.
+    static HANDING_OFF_FOR: usize;
 }
 
 tokio::task_local! {
@@ -1527,6 +1546,18 @@ impl Drop for CancellationHold {
 /// without an answer", queued as it is dropped, so the peer does not wait on the question
 /// for good. Nothing is sent once the connection has ended.
 ///
+/// An answer is a frame that has to be written. One that was queued and then could not be
+/// written, because the link refused it or its deadline ran out in the queue, ends the
+/// connection whether or not anyone awaits its [`Written`]: the peer would otherwise wait for
+/// good on a question this side believes it has answered. A connection whose peer may ask
+/// faster than it reads should set [`WireOptions::with_max_outbound_queued_frames`] or
+/// [`WireOptions::with_max_outbound_queued_bytes`]: answers are queued without waiting, so
+/// those bounds are what limits them.
+///
+/// It keeps the connection's state alive, and with it the link's sending half, like a
+/// [`Reply`]: a host that drops its [`Client`] and waits for the child to see end-of-input
+/// lets its responders go first.
+///
 /// ```no_run
 /// # use mango_external_agents::jsonrpc::{Responder, ServerRequestOutcome};
 /// # async fn decided() -> serde_json::Value { serde_json::Value::Null }
@@ -1608,7 +1639,8 @@ impl Responder {
     ///   and the question is still open: [`Unanswered::is_too_large`] says so, and a smaller
     ///   answer can be given through the responder that came back;
     /// - [`Error::LimitExceeded`] for a queue that is full, which ends the connection as
-    ///   it does for [`Client::submit_notification`];
+    ///   it does for [`Client::submit_notification`], and for a queue whose bound is zero,
+    ///   which takes no answer at all and leaves the connection as it was;
     /// - [`Error::Closed`] or [`Error::Link`] once the connection has ended.
     ///
     /// ```no_run
@@ -1628,7 +1660,7 @@ impl Responder {
         outcome: ServerRequestOutcome,
     ) -> std::result::Result<Written, Unanswered> {
         let frame = reply_frame(&self.state, self.id.as_json().clone(), outcome);
-        match self.state.enqueue(frame, None) {
+        match self.state.enqueue_reply(frame) {
             Ok(ticket) => {
                 // Settled: what it held goes back now, and its drop has nothing to say.
                 self.held = None;
@@ -1646,9 +1678,10 @@ impl Responder {
     ///
     /// # Errors
     ///
-    /// The other refusals of [`answer`](Self::answer), and the size refusal itself when even
-    /// the replacement does not fit, which is a peer that chose an id as large as the bound.
-    /// The question is let go either way.
+    /// The other refusals of [`answer`](Self::answer), after which the responder is dropped
+    /// as any other is. And the size refusal itself when even the replacement does not fit,
+    /// which is a peer that chose an id as large as the bound: no reply to that question fits
+    /// a frame, so the connection ends as a failed link, as it does without the option.
     ///
     /// ```no_run
     /// # use mango_external_agents::jsonrpc::{Responder, ServerRequestOutcome};
@@ -1666,9 +1699,23 @@ impl Responder {
             return Err(unanswered.into_parts().1);
         }
         let (responder, _) = unanswered.into_parts();
-        responder
-            .answer(answer_too_large())
-            .map_err(|unanswered| unanswered.into_parts().1)
+        let state = Arc::clone(&responder.state);
+        responder.answer(answer_too_large()).map_err(|unanswered| {
+            let (unanswerable, error) = unanswered.into_parts();
+            if oversized_frame(&error) {
+                // No reply that carries this id fits a frame, so the question cannot be
+                // answered in any form: the connection ends as a failed link, naming the
+                // bound, and there is nothing for the responder to say on its way out.
+                state.signal_write_failure(&error);
+                unanswerable.settle_unsent();
+            }
+            error
+        })
+    }
+
+    /// Lets the question go with nothing sent for it, giving back what it held.
+    fn settle_unsent(mut self) {
+        self.held = None;
     }
 }
 
@@ -2319,7 +2366,7 @@ impl Client {
             return Err(Error::Closed { subject: "link" });
         }
         let ordered = options.after_earlier_notifications;
-        if ordered && self.state.handling_own_notification() {
+        if ordered && self.state.on_own_worker() {
             return Err(reentrant_ordered_request());
         }
         let timeout = self.state.answer_deadline(options.deadline);
@@ -2713,7 +2760,8 @@ impl Client {
         // An ordered answer is delivered by the task that awaits `on_notification`. Asked for
         // from inside that call, it would wait for the call to return while the call waits for
         // it. Refused before the frame exists, so the peer is never left running the request.
-        if ordered && self.state.handling_own_notification() {
+        // The same goes for a question being handed over, which that task awaits as well.
+        if ordered && self.state.on_own_worker() {
             return Err(reentrant_ordered_request());
         }
         let id = self
@@ -3399,6 +3447,15 @@ impl ClientState {
         std::ptr::from_ref(self).addr()
     }
 
+    /// Whether the caller is on the task that delivers this client's ordered answers, inside
+    /// a call that task is awaiting: a notification, or a question being handed over.
+    fn on_own_worker(&self) -> bool {
+        self.handling_own_notification()
+            || HANDING_OFF_FOR
+                .try_with(|client| *client == self.address())
+                .unwrap_or(false)
+    }
+
     /// Whether the caller is inside this client's `on_notification`, on the task that awaits it.
     fn handling_own_notification(&self) -> bool {
         HANDLING_NOTIFICATION_FOR
@@ -3473,8 +3530,8 @@ impl ClientState {
 
     /// Tells the peer that a question handed over with a [`Responder`] was let go unanswered,
     /// so it does not wait on it for good. Silent once the connection has ended. Queued
-    /// beside the queue's bounds: there is at most one of these for each question, and a
-    /// drop has nobody to tell that a full queue ended the connection.
+    /// within the queue's bounds like the answer it stands for: a handler that drops what a
+    /// peer that is not reading keeps asking fills the queue, and the connection ends there.
     fn refuse_dropped(&self, raw_id: Value) {
         if self.closed.load(Ordering::Acquire) || self.link_poisoned.load(Ordering::Acquire) {
             return;
@@ -3484,10 +3541,19 @@ impl ClientState {
             message: String::from("the request was let go without an answer"),
             data: None,
         });
+        let _ = self.enqueue_reply(reply_frame(self, raw_id, refusal));
+    }
+
+    /// Queues the answer to one of the peer's questions, within the queue's bounds. See
+    /// [`outbox::Outbox::enqueue_reply`].
+    fn enqueue_reply(&self, frame: String) -> Result<outbox::Ticket> {
+        if self.link_poisoned.load(Ordering::Acquire) {
+            return Err(self.unusable_link());
+        }
         let deadline = deadline_after(self.options.request_timeout);
-        let _ = self
-            .outbox
-            .enqueue_aside(reply_frame(self, raw_id, refusal), deadline);
+        self.outbox
+            .enqueue_reply(frame, deadline)
+            .map_err(|refusal| self.refused(refusal))
     }
 
     /// A claim for a new call, for a client that cancels what it gives up.
@@ -4054,7 +4120,7 @@ fn reentrant_ordered_request() -> Error {
     Error::HostConfiguration {
         expected: "an ordered JSON-RPC request made outside this client's notification handler",
         received: String::from(
-            "one made inside on_notification, whose return its answer would wait for",
+            "one made inside on_notification or on_request_handoff, whose return its answer would wait for",
         ),
     }
 }
@@ -4191,6 +4257,11 @@ async fn hand_off(
     raw_id: Value,
     bytes: OwnedSemaphorePermit,
 ) {
+    // A question still queued when the connection ended can no longer be answered. It is not
+    // put to a handler that could only find that out by trying.
+    if state.closed.load(Ordering::Acquire) {
+        return;
+    }
     let Ok(slot) = Arc::clone(&state.handoff_slots).try_acquire_owned() else {
         let id = RequestId::new(raw_id.clone());
         let outcome = handler
@@ -4202,7 +4273,12 @@ async fn hand_off(
         return;
     };
     let responder = Responder::new(state, raw_id, Some(slot), bytes);
-    handler.on_request_handoff(method, params, responder).await;
+    HANDING_OFF_FOR
+        .scope(
+            state.address(),
+            handler.on_request_handoff(method, params, responder),
+        )
+        .await;
 }
 
 /// The frame that answers the peer's question `raw_id` with `outcome`.
