@@ -693,3 +693,26 @@ async fn frames_replayed_before_any_turn_are_dropped_and_a_running_compaction_re
         ],
     );
 }
+
+/// A compaction's error is redacted before it is cut: a password at the bound, cut first, would
+/// leave `redis://app:hunter2` behind, where no rule reads it as a credential.
+#[tokio::test]
+async fn a_compactions_error_is_redacted_before_it_is_cut() {
+    let url = " redis://app:hunter2";
+    let limit = mango_external_agents::normalize::TextLimit::Detail.max_code_points();
+    let error = format!("{}{url}@db", "x".repeat(limit - url.len()));
+    let received = turn_story(vec![
+        compaction("c1", "in_progress"),
+        with(
+            compaction("c1", "failed"),
+            "error",
+            serde_json::json!(error),
+        ),
+    ])
+    .await;
+    assert!(
+        received.iter().all(|line| !line.contains("hunter2")),
+        "expected the compaction error redacted before it is cut | received a story of {} lines",
+        received.len()
+    );
+}

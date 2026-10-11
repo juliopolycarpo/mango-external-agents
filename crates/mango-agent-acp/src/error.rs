@@ -22,6 +22,7 @@
 
 use agent_client_protocol_schema::v1::ErrorCode as AcpErrorCode;
 use mango_external_agents::error::jsonrpc_code_is_retryable;
+use mango_external_agents::normalize::TextLimit;
 use mango_external_agents::{Error, ErrorCode, VendorError};
 
 /// The code a turn's terminal carries when the agent answered `session/prompt` with ACP's
@@ -140,7 +141,7 @@ fn message(error: &agent_client_protocol_schema::v1::Error) -> String {
         }
         _ => error.message.clone(),
     };
-    mango_external_agents::redact::stderr_text(&text)
+    mango_external_agents::redact::bounded(&text, TextLimit::ErrorMessage).text
 }
 
 /// `data` with every string under a credential-named key replaced, at any depth, and every other

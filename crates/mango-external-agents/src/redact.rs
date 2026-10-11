@@ -64,6 +64,27 @@ pub fn stderr_text(raw: &str) -> String {
     remove_boundaries(redact_url_passwords(&assignments))
 }
 
+/// Redacts `raw` and then bounds it to `limit`: the order every vendor-written diagnostic needs.
+///
+/// A bound that cuts first can leave the head of a credential where no rule recognises it, so the
+/// whole text is redacted and the result is cut. `truncated` says that the bound removed
+/// characters from the redacted text. Characters redaction itself stripped or replaced are not
+/// counted, since the text no longer holds them.
+///
+/// # Example
+///
+/// ```
+/// use mango_external_agents::normalize::TextLimit;
+/// use mango_external_agents::redact;
+///
+/// let text = redact::bounded("refused: API_KEY=sk-live-42", TextLimit::ErrorMessage);
+/// assert_eq!(text.text, "refused: API_KEY=[REDACTED]");
+/// assert!(!text.truncated);
+/// ```
+pub fn bounded(raw: &str, limit: crate::normalize::TextLimit) -> crate::normalize::BoundedText {
+    crate::normalize::bound_text(&stderr_text(raw), limit)
+}
+
 /// Whether `dropped`, the text a cut removed from the end of what came before, stops where a
 /// rule here is still waiting for a credential's value.
 ///

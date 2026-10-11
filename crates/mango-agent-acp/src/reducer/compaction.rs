@@ -242,10 +242,7 @@ impl Reducer {
             }
             MaybeUndefined::Value(error) => {
                 // Redacted before it is cut, like every other agent error text.
-                let bounded = normalize::bound_text(
-                    &mango_external_agents::redact::stderr_text(&error),
-                    TextLimit::Detail,
-                );
+                let bounded = mango_external_agents::redact::bounded(&error, TextLimit::Detail);
                 compaction.error_cut = bounded.truncated;
                 compaction.error = Some(bounded.text);
                 true

@@ -119,11 +119,14 @@ impl JsonRpcError {
     /// The failure this represents, with the peer's structure kept.
     ///
     /// The message is redacted of credential-shaped text, as a stderr tail is: a peer that fails
-    /// while describing the request it was making may print the header it sent.
+    /// while describing the request it was making may print the header it sent. It is then bounded
+    /// like the message of a terminal, since a frame may be a megabyte and redaction can grow it.
     pub fn into_vendor_error(self, code: ErrorCode, request_id: Option<String>) -> VendorError {
         let retryable = jsonrpc_code_is_retryable(self.code);
-        let mut error = VendorError::new(code, crate::redact::stderr_text(&self.message))
-            .with_vendor_code(self.code.to_string(), retryable);
+        let message =
+            crate::redact::bounded(&self.message, crate::normalize::TextLimit::ErrorMessage).text;
+        let mut error =
+            VendorError::new(code, message).with_vendor_code(self.code.to_string(), retryable);
         error.request_id = request_id;
         error
     }
@@ -5751,6 +5754,24 @@ mod tests {
                 "expected the internal-error code for {frame}"
             );
         }
+    }
+
+    /// A frame can be a megabyte and redaction can grow what it keeps, so the message of an
+    /// error the peer sent is bounded like the message of a terminal.
+    #[test]
+    fn a_peers_error_message_is_bounded_after_it_is_redacted() {
+        let bound = crate::normalize::TextLimit::ErrorMessage.max_code_points();
+        let big = JsonRpcError {
+            code: -32603,
+            message: "token=abc ".repeat(100_000),
+            data: None,
+        };
+        let vendor = big.into_vendor_error(crate::ErrorCode::from_static("peer-call-failed"), None);
+        assert!(
+            vendor.message.chars().count() <= bound && !vendor.message.contains("abc"),
+            "expected a redacted message within {bound} code points | received {} code points",
+            vendor.message.chars().count()
+        );
     }
 
     /// A malformed `error` member is stood in for by a description of its type, because quoting
