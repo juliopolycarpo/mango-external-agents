@@ -3136,8 +3136,16 @@ impl Client {
     /// let a later close finish. Parked in its wait for the handler to be told that the peer
     /// exited, the first holds the reader, and the second, which has closed the link by then,
     /// returns an [`Error::Timeout`] naming the reader when its own bound of twice
-    /// `shutdown_timeout` runs out. Two closes polled together against a handler that does not
-    /// return in time may end this way for the later one, where the earlier one returns `Ok`.
+    /// `shutdown_timeout` runs out. A first close that is polled and finishes within its bound
+    /// is no hindrance: the second then finds nothing left to wait for and returns `Ok`. The
+    /// later close can also end this way when the first is not held but simply runs out of its
+    /// own bound at the same moment, against a handler that does not return in time: the window
+    /// is the first close's expiry plus about a scheduler turn, in which it still holds the
+    /// reader while it takes it down, and a second close whose own bound runs out in that window
+    /// returns the timeout where it used to return `Ok`. The first close, polled again after the
+    /// second gave up, still completes with `Ok`. For now a host tells this timeout from the
+    /// link's only by its `operation` text, "JSON-RPC reader shutdown";
+    /// [`is_link_shutdown_timeout`] is `false` for it.
     ///
     /// # Wrapping a close
     ///
