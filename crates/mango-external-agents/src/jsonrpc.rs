@@ -1280,19 +1280,27 @@ impl UnaskedReplies {
     }
 }
 
-/// The longest string an invalid request's id may be and still be sent back, in bytes.
+/// The most an invalid request's id may take in the reply and still be sent back, in bytes
+/// as this side writes it: a string with its quotes and escapes, a number as it is printed.
 ///
 /// A reply is otherwise some seventy bytes whatever it answers, and is held beside every
 /// bound on what this side queues. An id sent back whole would make it as large as the
-/// peer's line, with nothing counting it.
+/// peer's line, with nothing counting it. With this, a reply is at most some two hundred.
 const ECHOED_ID_BYTES: usize = 128;
 
 /// The id an invalid request is answered under: the one it came with when that can name a
-/// request and is short enough to send back, and null otherwise.
+/// request and is short enough as written to send back, and null otherwise.
+///
+/// The id is written again from what was read, not copied from the peer's bytes: a number
+/// comes back as this side prints it, which for one outside what it can hold exactly is not
+/// digit for digit what the peer sent.
 fn echoed_id(id: Option<&Value>) -> Value {
     match id {
-        Some(Value::String(id)) if id.len() <= ECHOED_ID_BYTES => Value::String(id.clone()),
-        Some(id @ Value::Number(_)) => id.clone(),
+        Some(id @ (Value::String(_) | Value::Number(_)))
+            if id.to_string().len() <= ECHOED_ID_BYTES =>
+        {
+            id.clone()
+        }
         _ => Value::Null,
     }
 }

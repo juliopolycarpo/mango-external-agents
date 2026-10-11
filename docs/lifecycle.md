@@ -213,7 +213,8 @@ request with `-32600`, under a bound of its own and beside the queue's bounds in
 each reply a frame of its own. Answered under a null id: a line that is a number, a string,
 `true`, `false` or `null`; where batches are read, an empty batch and each member of a batch that
 is not an object; where they are not, a line that is an array, once. Answered under its own id
-when that is a number or a string of at most 128 bytes, and under null otherwise: an object with neither `result` nor
+when that is a string or a number of at most 128 bytes as this side writes it, and under null
+otherwise: an object with neither `result` nor
 `error` whose `method` is missing or not a string, or whose `id` is something an id cannot be.
 Never answered: an object with `result` or `error`, which is a response, this side's own replies
 among them, so two peers that answer invalid requests cannot loop; an object with no `method` and an id that

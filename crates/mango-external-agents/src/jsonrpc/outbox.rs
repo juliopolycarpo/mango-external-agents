@@ -318,12 +318,16 @@ impl WireOptions {
     /// | an object with no `result` and no `error`, whose `method` is not a string, or is missing with no `id` that is a string or a number | answered | see below |
     /// | an object with no `result` and no `error`, whose `id` is not a string, a number or null | answered, `id` null | see below |
     /// | an object with no `method`, no `result`, no `error`, and an `id` that is a string or a number, whatever else it holds | the response it always was, with no result | the same |
-    /// | an object with `result` or `error` | a response, never answered | the same |
+    /// | an object with `result` or `error` and no `method` that is a string | a response, never answered | the same |
     /// | an object with a `method` that is a string and an `id` that can be one, or none | a request or a notification, whatever its `params` or `jsonrpc` say | the same |
+    /// | an object with a `method` that is a string, and `result` or `error` as well | a request or a notification, as before: the `method` decides | the same |
     /// | a line that is not JSON | [`with_parse_error_replies`](Self::with_parse_error_replies)'s to answer | the same |
     ///
-    /// An object is answered under its own `id` when that is a number or a string of at most
-    /// 128 bytes, and under null otherwise: a reply stays small whatever it answers. So `{}`, `{"jsonrpc":"2.0"}`, `{"method":1}` and `{"id":null}` are
+    /// An object is answered under its own `id` when that is a string or a number that takes
+    /// at most 128 bytes as this side writes it, quotes and escapes included, and under null
+    /// otherwise: a reply is at most some two hundred bytes whatever it answers. The id is
+    /// written again from what was read, so a number comes back as this side prints it, not
+    /// digit for digit as it came. So `{}`, `{"jsonrpc":"2.0"}`, `{"method":1}` and `{"id":null}` are
     /// answered under null, `{"id":4,"method":5}` under `4`, and `{"method":"x","id":{}}`
     /// under null. Without this option the first four are dropped, the fifth is read as the
     /// response to call `4` with no result, and the last is put to the handler and answered

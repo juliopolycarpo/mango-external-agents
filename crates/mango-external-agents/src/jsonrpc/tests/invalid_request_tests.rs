@@ -85,6 +85,8 @@ fn invalid_objects() -> Vec<(Value, Value)> {
         (json!({ "method": "x", "id": true }), Value::Null),
         (json!({ "id": null }), Value::Null),
         (json!({ "id": [1] }), Value::Null),
+        (json!({ "id": {} }), Value::Null),
+        (json!({ "method": "x", "id": [1] }), Value::Null),
     ]
 }
 
@@ -107,8 +109,8 @@ async fn a_client_that_was_not_asked_answers_nothing_and_routes_objects_as_befor
     link.push_line(notification("after"));
 
     let handled = handler.wait_for_notifications(1).await;
-    // The two objects with a method that is a string are questions to this client.
-    sent(&link, 2).await;
+    // The three objects with a method that is a string are questions to this client.
+    sent(&link, 3).await;
     let observed = (methods_seen(&handled), up_to_a_probe(&link, &client).await);
     let expected = (
         vec!["after"],
@@ -116,6 +118,7 @@ async fn a_client_that_was_not_asked_answers_nothing_and_routes_objects_as_befor
             vec![
                 json!({ "jsonrpc": "2.0", "id": {}, "result": "yes" }),
                 json!({ "jsonrpc": "2.0", "id": true, "result": "yes" }),
+                json!({ "jsonrpc": "2.0", "id": [1], "result": "yes" }),
                 probe(),
             ],
             0,
@@ -124,7 +127,7 @@ async fn a_client_that_was_not_asked_answers_nothing_and_routes_objects_as_befor
     );
     assert_eq!(
         observed, expected,
-        "expected no invalid-request error, and the two questions answered under the ids they came with: {expected:?} | received {observed:?}"
+        "expected no invalid-request error, and the three questions answered under the ids they came with: {expected:?} | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -355,6 +358,7 @@ async fn what_is_a_response_or_a_lenient_request_is_never_answered_as_invalid() 
         .expect("expected the request written");
     // A response to nobody, a response with both members, and this side's own two replies.
     link.push_line(json!({ "result": 1 }).to_string());
+    link.push_line(json!({ "error": {} }).to_string());
     link.push_line(json!({ "id": 99, "result": 1 }).to_string());
     link.push_line(
         json!({ "id": 9, "result": 1, "error": { "code": 1, "message": "m" } }).to_string(),
@@ -710,8 +714,8 @@ async fn the_bound_on_one_batch_does_not_start_again_as_its_replies_are_written(
 /// The rest of the table, with the option on. A request whose id is null is a request, put to
 /// the handler and answered under null. A response whose result is null is a response, and so
 /// is an object with an id and no method, whatever else it holds. A number is sent back as it
-/// came, negative or fractional. A string longer than 128 bytes is not sent back: the reply is
-/// under null and stays small.
+/// came, negative or fractional. A string that takes more than 128 bytes written, its two
+/// quotes included, is not sent back: the reply is under null and stays small.
 #[tokio::test]
 async fn ids_are_read_and_sent_back_for_what_they_are() {
     let (link, handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
@@ -727,8 +731,8 @@ async fn ids_are_read_and_sent_back_for_what_they_are() {
     link.push_line(json!({ "jsonrpc": "2.0", "id": 2, "extra": true }).to_string());
     link.push_line(json!({ "method": "question", "id": null }).to_string());
     link.push_line(json!({ "id": -1.5, "method": 7 }).to_string());
-    link.push_line(json!({ "id": "s".repeat(128), "method": 7 }).to_string());
-    link.push_line(json!({ "id": "s".repeat(129), "method": 7 }).to_string());
+    link.push_line(json!({ "id": "s".repeat(126), "method": 7 }).to_string());
+    link.push_line(json!({ "id": "s".repeat(127), "method": 7 }).to_string());
     link.push_line(notification("after"));
 
     let handled = handler.wait_for_notifications(1).await;
@@ -755,7 +759,7 @@ async fn ids_are_read_and_sent_back_for_what_they_are() {
         vec![json!({ "jsonrpc": "2.0", "id": null, "result": "yes" })],
         vec![
             invalid_request(json!(-1.5)),
-            invalid_request(json!("s".repeat(128))),
+            invalid_request(json!("s".repeat(126))),
             invalid_request(Value::Null),
         ],
         0,
@@ -855,6 +859,103 @@ async fn a_batch_member_answered_as_invalid_takes_none_of_the_handlers_budget() 
     assert_eq!(
         observed, expected,
         "expected both notifications handled within a budget of two, the third member answered, and the connection open: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// The id is sent back only when it is short as this side writes it. A string of quotes and
+/// control characters is measured with its escapes: sixty-two such characters and the two
+/// quotes are 126 bytes written, and sixty-four are past the cap. A number is written again
+/// from what was read: a long numeral that is a number this side can hold comes back as it
+/// prints that number, short, and not digit for digit.
+#[tokio::test]
+async fn an_id_is_sent_back_only_when_it_is_short_as_written() {
+    let (link, _handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
+    let escaped = |count: usize| "\"".repeat(count / 2) + &"\n".repeat(count - count / 2);
+    let long_numeral = format!("0.{}", "1".repeat(400));
+    link.push_line(json!({ "id": escaped(62), "method": 7 }).to_string());
+    link.push_line(json!({ "id": escaped(64), "method": 7 }).to_string());
+    link.push_line(format!(r#"{{"id":{long_numeral},"method":7}}"#));
+
+    sent(&link, 3).await;
+    let written = link.sent();
+    let ids: Vec<Value> = frames(&link)
+        .iter()
+        .map(|frame| frame["id"].clone())
+        .collect();
+    let longest = written.iter().map(String::len).max().unwrap_or(0);
+    let numeral_written = ids[2].to_string();
+    let observed = (
+        ids[..2].to_vec(),
+        ids[2].is_number() && numeral_written.len() < 30,
+        longest <= 73 + 128,
+    );
+    let expected = (vec![json!(escaped(62)), Value::Null], true, true);
+    assert_eq!(
+        observed, expected,
+        "expected the short string sent back, the long one answered under null, the numeral sent back as a short number, and no reply longer than its 73 bytes and the 128 an id may take: {expected:?} | received {observed:?} (numeral {numeral_written}, longest {longest})"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// The rule itself, on what a reader built with exact numbers would hand it: an id is sent
+/// back when it takes at most 128 bytes as written, a string or a number alike, and anything
+/// else an id can be is answered under null.
+#[test]
+fn an_id_is_measured_as_it_would_be_written() {
+    use crate::jsonrpc::echoed_id;
+    let at_the_cap = json!("s".repeat(126));
+    let past_it = json!("s".repeat(127));
+    let escapes_past_it = json!("\u{1}".repeat(22));
+    let observed = (
+        echoed_id(Some(&at_the_cap)),
+        echoed_id(Some(&past_it)),
+        echoed_id(Some(&escapes_past_it)),
+        echoed_id(Some(&json!(-0.5))),
+        echoed_id(Some(&json!(null))),
+        echoed_id(Some(&json!([1]))),
+        echoed_id(None),
+    );
+    let expected = (
+        at_the_cap.clone(),
+        Value::Null,
+        Value::Null,
+        json!(-0.5),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected ids of at most 128 written bytes sent back and the rest answered under null: {expected:?} | received {observed:?}"
+    );
+}
+
+/// An object with a method that is a string is a request or a notification, as it always was,
+/// even when it carries `result` as well: the method decides, and it is put to the handler.
+#[tokio::test]
+async fn a_method_that_is_a_string_decides_even_beside_a_result() {
+    let (link, handler, client) = connect(WireOptions::new().with_invalid_request_replies(8));
+    link.push_line(json!({ "id": 1, "method": "asked", "result": 1 }).to_string());
+    link.push_line(json!({ "method": "told", "error": {} }).to_string());
+
+    let handled = handler.wait_for_notifications(1).await;
+    sent(&link, 1).await;
+    let observed = (methods_seen(&handled), up_to_a_probe(&link, &client).await);
+    let expected = (
+        vec!["told"],
+        (
+            vec![
+                json!({ "jsonrpc": "2.0", "id": 1, "result": "yes" }),
+                probe(),
+            ],
+            0,
+            false,
+        ),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the question answered by the handler and the notification handled, with no invalid-request error: {expected:?} | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
