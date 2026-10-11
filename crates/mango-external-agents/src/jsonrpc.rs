@@ -1020,6 +1020,9 @@ pub enum ConnectionEnd {
 /// Why a call queued with [`Client::submit_request`] has no answer.
 ///
 /// [`cause`](Self::cause) says which side failed it and how, as a type.
+/// [`peer_error_was_unreadable`](Self::peer_error_was_unreadable) says whether a failure
+/// that is the peer's is an answer this side could not read as an error, which is a peer
+/// breaking the protocol and not one refusing the request.
 /// [`into_error`](Self::into_error) is the failure as an [`Error`], for a caller that only
 /// reports it.
 ///
@@ -1029,6 +1032,9 @@ pub enum ConnectionEnd {
 ///
 /// if let Err(failure) = reply.await {
 ///     match failure.cause() {
+///         CallFailureCause::Peer(_) if failure.peer_error_was_unreadable() => {
+///             eprintln!("the peer answered with an error that is not one")
+///         }
 ///         CallFailureCause::Peer(error) => eprintln!("the peer refused with {}", error.code),
 ///         CallFailureCause::Ended(ConnectionEnd::Peer(PeerTermination::Exited)) => {
 ///             eprintln!("the peer exited")
