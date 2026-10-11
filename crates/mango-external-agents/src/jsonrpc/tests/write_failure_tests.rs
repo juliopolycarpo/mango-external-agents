@@ -1,8 +1,9 @@
 //! Completed transport failures and safe local refusals have different link consequences.
 
-use super::outbox_tests::{gated, link_held, methods, options, until, within};
+use super::outbox_tests::{gated, limits, link_held, methods, options, until, within};
 use super::*;
-use crate::jsonrpc::{ConnectionEnd, WireOptions};
+use crate::Dispatch;
+use crate::jsonrpc::{ConnectionEnd, OutboundBound, WireOptions, Written};
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 
@@ -659,5 +660,246 @@ async fn an_outbound_overflow_landing_on_a_close_leaves_what_was_queued_before_i
     assert_eq!(
         observed, expected,
         "expected the link usable and both frames queued before the close written before it went: {expected:?} | received {observed:?}"
+    );
+}
+
+/// A client whose queue is full: the writer is held on one frame with another queued behind it,
+/// under a bound of two frames, the frame being written counted.
+async fn full_queue() -> (super::outbox_tests::Gated, Written, Written) {
+    let gated = gated(options(), limits(usize::MAX, usize::MAX, 2));
+    let held = link_held(&gated).await;
+    let queued = gated
+        .client
+        .submit_notification("queued", json!({}))
+        .expect("expected a frame queued behind the held one");
+    (gated, held, queued)
+}
+
+/// What a caller whose frame found the queue full is told, by type: the bound passed, whether
+/// anything was submitted, and the limit with the count that passed it.
+fn overflow_refusal(error: &Error) -> (Option<OutboundBound>, Dispatch, Option<(usize, usize)>) {
+    let counts = match error.cause() {
+        Error::LimitExceeded {
+            limit, received, ..
+        } => Some((*limit, *received)),
+        _ => None,
+    };
+    (OutboundBound::exceeded_by(error), error.dispatch(), counts)
+}
+
+/// A real close, and a real `submit_notification` that finds a real full queue in the moment
+/// between the close's record and its seal, which is the only moment the queue both has a close on
+/// record and still measures a frame against its bounds. The close is on record first, so it owns
+/// the queue: the overflowing call is refused with the bound it passed, the link is not made
+/// unusable, the handler is told nothing, and what was queued before the close is written before
+/// the link goes.
+#[tokio::test]
+async fn a_frame_that_overflows_the_queue_after_a_close_recorded_is_refused_alone() {
+    let (gated, held, queued) = full_queue().await;
+    let landed: Arc<std::sync::Mutex<Option<(Error, bool)>>> = Arc::default();
+    {
+        let client = Arc::downgrade(&gated.client);
+        let landed = Arc::clone(&landed);
+        *gated
+            .client
+            .state
+            .before_seal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let Some(client) = client.upgrade() else {
+                return;
+            };
+            let refused = client.submit_notification("overflow", json!({}));
+            let poisoned = client
+                .state
+                .link_poisoned
+                .load(std::sync::atomic::Ordering::Acquire);
+            if let Err(error) = refused {
+                *landed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((error, poisoned));
+            }
+        }));
+    }
+    let closing = {
+        let client = Arc::clone(&gated.client);
+        tokio::spawn(async move { client.close().await })
+    };
+    until("the overflowing call to have landed", || {
+        landed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    })
+    .await;
+    gated.gate.add_permits(1);
+    let held = within("the held frame", held).await;
+    let queued = within("the queued frame", queued).await;
+    let closed = within("the close", closing)
+        .await
+        .expect("expected the close task to finish");
+
+    let (refused, poisoned) = landed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("expected the overflowing call to have been refused");
+    let observed = (
+        overflow_refusal(&refused),
+        poisoned,
+        held.is_ok(),
+        queued.is_ok(),
+        methods(&gated.link),
+        closed.is_ok(),
+        gated.handler.terminations.lock().await.len(),
+        gated.client.ended(),
+    );
+    let expected = (
+        (
+            Some(OutboundBound::QueuedFrames),
+            Dispatch::NotSubmitted,
+            Some((2, 3)),
+        ),
+        false,
+        true,
+        true,
+        vec![String::from("hold"), String::from("queued")],
+        true,
+        0,
+        Some(ConnectionEnd::Closed),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the overflowing frame refused alone with the link usable, the frames queued before the close written before it went, and the handler told nothing: {expected:?} | received {observed:?}"
+    );
+}
+
+/// The overflow that is decided before a close seals the queue and put on record after the close
+/// has marked the connection closed. The close owns the end, so the overflowing call is refused
+/// with the bound it passed and nothing else comes of it: the overflow is not put on record for
+/// the reader, the link is not made unusable, the handler is told nothing, and what was queued is
+/// written before the link goes.
+#[tokio::test]
+async fn a_frame_refused_for_room_just_before_a_close_is_refused_alone_and_ends_nothing() {
+    let (gated, held, queued) = full_queue().await;
+    {
+        let state = Arc::downgrade(&gated.client.state);
+        *gated
+            .client
+            .state
+            .before_overflow_recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            // The first two steps of a close.
+            state.ended_with(ConnectionEnd::Closed, state.closed_error());
+            state.mark_closed();
+        }));
+    }
+    let refused = gated
+        .client
+        .submit_notification("overflow", json!({}))
+        .expect_err("expected the frame that found the queue full refused");
+    let poisoned = gated
+        .client
+        .state
+        .link_poisoned
+        .load(std::sync::atomic::Ordering::Acquire);
+    let recorded_for_the_reader = gated
+        .client
+        .state
+        .outbound_overflow
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some();
+    gated.gate.add_permits(1);
+    let held = within("the held frame", held).await;
+    let queued = within("the queued frame", queued).await;
+    let closed = within("the close", gated.client.close()).await;
+
+    let observed = (
+        overflow_refusal(&refused),
+        poisoned,
+        recorded_for_the_reader,
+        held.is_ok(),
+        queued.is_ok(),
+        methods(&gated.link),
+        closed.is_ok(),
+        gated.handler.terminations.lock().await.len(),
+        gated.client.ended(),
+    );
+    let expected = (
+        (
+            Some(OutboundBound::QueuedFrames),
+            Dispatch::NotSubmitted,
+            Some((2, 3)),
+        ),
+        false,
+        false,
+        true,
+        true,
+        vec![String::from("hold"), String::from("queued")],
+        true,
+        0,
+        Some(ConnectionEnd::Closed),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the overflowing frame refused alone, nothing put on record for the reader, the link usable and the queued frames written before it went: {expected:?} | received {observed:?}"
+    );
+}
+
+/// What a caller can do after a close has begun, on a queue that is full: its frame is turned
+/// away as closed, not as an overflow, whatever the bounds say. Nothing of it is written, the link
+/// is not made unusable by it, and the handler is told nothing.
+#[tokio::test]
+async fn a_frame_submitted_after_a_close_began_is_refused_as_closed_not_as_an_overflow() {
+    let (gated, held, queued) = full_queue().await;
+    let closing = {
+        let client = Arc::clone(&gated.client);
+        tokio::spawn(async move { client.close().await })
+    };
+    until("the close to have begun", || gated.client.is_closed()).await;
+    let refused = gated
+        .client
+        .submit_notification("late", json!({}))
+        .expect_err("expected a frame submitted after the close began refused");
+    let poisoned = gated
+        .client
+        .state
+        .link_poisoned
+        .load(std::sync::atomic::Ordering::Acquire);
+    gated.gate.add_permits(1);
+    let held = within("the held frame", held).await;
+    let queued = within("the queued frame", queued).await;
+    let closed = within("the close", closing)
+        .await
+        .expect("expected the close task to finish");
+
+    let observed = (
+        matches!(refused.cause(), Error::Closed { subject: "link" }),
+        OutboundBound::exceeded_by(&refused),
+        poisoned,
+        held.is_ok(),
+        queued.is_ok(),
+        methods(&gated.link),
+        closed.is_ok(),
+        gated.handler.terminations.lock().await.len(),
+    );
+    let expected = (
+        true,
+        None,
+        false,
+        true,
+        true,
+        vec![String::from("hold"), String::from("queued")],
+        true,
+        0,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the late frame refused as closed and never written, the frames queued before the close written, and the handler told nothing: {expected:?} | received {observed:?}"
     );
 }
