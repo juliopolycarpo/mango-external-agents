@@ -138,6 +138,8 @@ impl RequestAdmission {
 pub(super) struct RequestAbandonment {
     connection: Arc<ConnectionHandle>,
     armed: bool,
+    /// Why the connection is ended when the request is given up.
+    reason: mango_external_agents::CancelReason,
 }
 
 impl RequestAbandonment {
@@ -145,6 +147,7 @@ impl RequestAbandonment {
         Self {
             connection,
             armed: true,
+            reason: mango_external_agents::CancelReason::Shutdown,
         }
     }
 
@@ -158,8 +161,25 @@ impl Drop for RequestAbandonment {
         if !self.armed {
             return;
         }
-        self.connection
-            .begin_shutdown(mango_external_agents::CancelReason::Shutdown);
+        self.connection.begin_shutdown(self.reason);
+    }
+}
+
+impl<Response> SubmittedRequest<'_, Response> {
+    /// Ends the connection for `reason` if this request is given up, where it would otherwise
+    /// end it as a shutdown.
+    ///
+    /// For the one request sent on somebody's behalf while they are already ending the
+    /// session: giving up `session/close` starts the teardown, and the first reason a teardown
+    /// is given is the one the child is stopped for.
+    ///
+    /// ```ignore
+    /// let sent = submit(&connection, CloseSessionRequest::new(id))?.abandoned_for(reason);
+    /// ```
+    #[must_use]
+    pub(crate) fn abandoned_for(mut self, reason: mango_external_agents::CancelReason) -> Self {
+        self.abandonment.reason = reason;
+        self
     }
 }
 

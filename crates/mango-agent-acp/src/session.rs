@@ -1648,15 +1648,16 @@ async fn finish_close(
     // in flight. Withdraw them before and after the bounded handshake.
     state.withdraw_pending();
     if capabilities.session_capabilities.close.is_some() {
-        let _ = tokio::time::timeout(
-            limits.shutdown_timeout,
-            client::send(
-                &connection,
-                profile.as_ref(),
-                CloseSessionRequest::new(native_session_id),
-            ),
-        )
-        .await;
+        // Given up at the deadline, this request starts the teardown itself, so it carries the
+        // reason the host closed with: the child is stopped for the first reason given.
+        if let Ok(sent) = client::submit(&connection, CloseSessionRequest::new(native_session_id)) {
+            let sent = sent.abandoned_for(reason.into());
+            let _ = tokio::time::timeout(
+                limits.shutdown_timeout,
+                client::await_sent(&connection, profile.as_ref(), sent),
+            )
+            .await;
+        }
         state.withdraw_pending();
     }
 

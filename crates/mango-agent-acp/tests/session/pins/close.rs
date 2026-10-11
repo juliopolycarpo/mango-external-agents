@@ -112,3 +112,92 @@ async fn an_agent_that_ignores_session_close_holds_the_close_for_the_shutdown_ti
     assert_first_frame_after(&launcher, "session/new", "session/close");
     assert_closed_and_reaped(session.as_ref(), &launcher);
 }
+
+/// A launcher that records the reason each child was stopped for.
+#[derive(Clone)]
+struct ReasonRecordingLauncher {
+    inner: FakeLauncher,
+    reasons: Arc<Mutex<Vec<CancelReason>>>,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for ReasonRecordingLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<ManagedProcess> {
+        let mut process = self.inner.spawn(spec).await?;
+        process.control = Arc::new(ReasonRecordingControl {
+            inner: Arc::clone(&process.control),
+            reasons: Arc::clone(&self.reasons),
+        });
+        Ok(process)
+    }
+}
+
+struct ReasonRecordingControl {
+    inner: Arc<dyn ProcessControl>,
+    reasons: Arc<Mutex<Vec<CancelReason>>>,
+}
+
+#[async_trait::async_trait]
+impl ProcessControl for ReasonRecordingControl {
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+
+    async fn wait(&self) -> mango_external_agents::Result<mango_external_agents::ExitStatus> {
+        self.inner.wait().await
+    }
+
+    async fn kill(&self, reason: CancelReason) -> mango_external_agents::Result<()> {
+        self.reasons
+            .lock()
+            .expect("expected the reasons")
+            .push(reason);
+        self.inner.kill(reason).await
+    }
+}
+
+/// A close keeps its reason when the agent never answers `session/close`. Giving that request
+/// up is what starts the teardown, and the teardown stops the child for the reason the host
+/// closed with, not for a generic shutdown.
+#[tokio::test(start_paused = true)]
+async fn a_close_whose_handshake_times_out_stops_the_child_for_the_hosts_reason() {
+    let silent_on_close = ScriptedPeer::new(|_| Vec::new())
+        .with_session_capabilities(serde_json::json!({ "close": {} }));
+    let inner = FakeLauncher::new();
+    inner.push(silent_on_close.process());
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let launcher = ReasonRecordingLauncher {
+        inner: inner.clone(),
+        reasons: Arc::clone(&reasons),
+    };
+    let host = HostContext::builder()
+        .launcher(Arc::new(launcher))
+        .cwd(std::env::temp_dir())
+        .client_info("mea-tests", "0.1.0")
+        .build()
+        .expect("expected a host");
+    let session = AcpHarness::new(profile())
+        .open_session(&host, OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+
+    session
+        .close(CloseReason::ConsentRevoked)
+        .await
+        .expect("expected the close to succeed");
+
+    let received = reasons.lock().expect("expected the reasons").clone();
+    let expected = [CancelReason::ConsentRevoked];
+    assert_eq!(
+        received, expected,
+        "expected the reasons the child was stopped for: {expected:?} | received: {received:?}"
+    );
+    assert_first_frame_after(&inner, "session/new", "session/close");
+}
