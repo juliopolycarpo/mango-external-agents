@@ -168,7 +168,7 @@ pub struct Limits {
     /// That outgoing budget bounds one ACP frame; the frames queued for an agent, the one being
     /// written included, may hold twice it, so a host's memory bound for outgoing ACP frames is
     /// twice that number, apart from the few small frames the connection queues beside its
-    /// bounds (`$/cancel_request`, `-32700`).
+    /// bounds (`$/cancel_request`, `-32700`, `-32600`).
     pub turn_channel_capacity: usize,
     /// Maximum serialized bytes queued per turn, excluding its reserved terminal.
     ///
@@ -203,6 +203,8 @@ pub struct Limits {
     /// session that is ending: a stop whose connection closes under its interrupt waits up to
     /// this long for that ending to fail the turn, and the teardown waits up to this long for a
     /// turn's ending that another task is still committing before it closes the connection.
+    /// In the Claude harness it also bounds two waits of a `close`: for a launch the host's
+    /// launcher has not returned yet, and for the removal of the session's MCP artifact.
     pub shutdown_timeout: Duration,
     /// How long a turn this side asked to stop may stay unresolved before the harness escalates to
     /// process shutdown.
@@ -239,6 +241,14 @@ pub struct Limits {
     /// [`Self::shutdown_timeout`]), and one more [`Self::shutdown_timeout`] for a turn another
     /// task is still settling. `docs/harness-acp.md` has that table.
     ///
+    /// The Claude harness has no protocol stop, so every stop is the process stop: two
+    /// [`Self::kill_grace`] and two [`Self::shutdown_timeout`], 14 seconds at the defaults. A
+    /// `cancel` writes the turn's terminal at once and returns when that stop does. `close` adds
+    /// one [`Self::shutdown_timeout`] for removing the MCP artifact, 19 seconds, and waits one
+    /// [`Self::shutdown_timeout`] for a launch the host's launcher has not returned yet. A stop
+    /// that runs out of time returns its own [`Error::Timeout`], not
+    /// [`Error::CleanupRequired`]. `docs/harness-claude.md` has that table.
+    ///
     /// For example, a host whose tools can take minutes to abort raises this without lengthening
     /// every protocol request: `Limits { cancel_settle_timeout: Duration::from_secs(300),
     /// ..Limits::default() }`.
@@ -250,6 +260,12 @@ pub struct Limits {
     /// lets a host fail a stalled handshake promptly without cutting an approval short.
     pub approval_timeout: Duration,
     /// How long a child is given to exit on its own before the launcher escalates.
+    ///
+    /// A process stop spends it twice: once on the graceful interrupt call and once waiting for
+    /// the child to exit after it. The Claude harness also uses it as the grace around a child's
+    /// exit that nobody asked for. A stream that ends without a result waits this long for the
+    /// exit status before the turn's terminal is written, and a child that exits while something
+    /// else holds its stdout open is read for this long after the exit.
     pub kill_grace: Duration,
 }
 

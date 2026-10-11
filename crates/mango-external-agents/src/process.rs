@@ -124,6 +124,11 @@ pub trait ProcessControl: Send + Sync {
     fn stderr_tail(&self) -> String;
 
     /// Waits for the child to exit.
+    ///
+    /// May be called concurrently with another `wait` and with [`kill`](Self::kill) or
+    /// [`interrupt`](Self::interrupt): a harness watches for the exit while it reads the child's
+    /// output, and a stop waits on the same control. Every waiter observes the same exit, and a
+    /// pending `wait` must not keep `kill` or `interrupt` from running.
     async fn wait(&self) -> Result<ExitStatus>;
 
     /// Requests the platform's graceful user interrupt, when supported by the host.
