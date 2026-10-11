@@ -169,6 +169,12 @@ pub struct FakeClaudeCli {
     graceful_interrupts: Arc<Mutex<usize>>,
     interrupt_supported: bool,
     slow_stop: Option<SlowStop>,
+    /// Fired each time a child is handed out, for a test waiting on one that is still spawning.
+    spawned: Notify,
+    /// Holds one permit per turn whose prompt was written and whose stdin was closed.
+    input_closed: Arc<Notify>,
+    /// Whether a turn child's stdout needs one more pass of the runtime before a line is ready.
+    output_needs_a_pass: bool,
 }
 
 impl Default for FakeClaudeCli {
@@ -198,6 +204,9 @@ impl FakeClaudeCli {
             graceful_interrupts: Arc::new(Mutex::new(0)),
             interrupt_supported: false,
             slow_stop: None,
+            spawned: Notify::new(),
+            input_closed: Arc::new(Notify::new()),
+            output_needs_a_pass: false,
         }
     }
 
@@ -253,6 +262,25 @@ impl FakeClaudeCli {
     pub fn with_slow_stop(mut self, stop: SlowStop) -> Self {
         self.slow_stop = Some(stop);
         self
+    }
+
+    /// Makes a turn child's stdout answer a read one pass of the runtime after a line is there.
+    ///
+    /// What a real pipe does: the bytes are in the kernel, and the read is ready only once the
+    /// runtime's I/O driver has reported them. The in-memory queue this fake reads is ready the
+    /// moment a line is pushed, which hides that gap unless a test asks for it.
+    #[must_use]
+    pub fn with_output_ready_a_pass_late(mut self) -> Self {
+        self.output_needs_a_pass = true;
+        self
+    }
+
+    /// Returns once a turn's prompt was written and its stdin closed.
+    ///
+    /// The pump goes from that close into its read in the same poll, so a test that resumes
+    /// after this finds the pump reading. One permit per turn, so the order of arrival is free.
+    pub async fn turn_reading(&self) {
+        self.input_closed.notified().await;
     }
 
     /// Every launch, in order.
@@ -407,8 +435,14 @@ impl FakeClaudeCli {
     /// Waits on the child's own notification rather than polling, so a test under a paused clock
     /// can read off how long the reap took.
     pub async fn turn_reaped(&self) {
-        let Some(child) = self.newest_turn(|_| true) else {
-            return;
+        // A turn whose spawn is still in flight has no child yet; wait for the launcher to hand
+        // one out before waiting on it.
+        let child = loop {
+            let spawned = self.spawned.notified();
+            if let Some(child) = self.newest_turn(|_| true) {
+                break child;
+            }
+            spawned.await;
         };
         loop {
             let changed = child.changed.notified();
@@ -530,6 +564,7 @@ impl ProcessLauncher for FakeClaudeCli {
             pending: Mutex::new(lines.into()),
             finished: Mutex::new(finished),
             output_open: Mutex::new(!finished),
+            output_needs_a_pass: is_turn && self.output_needs_a_pass,
             slow_stop: is_turn.then_some(self.slow_stop).flatten(),
             exit: Mutex::new(exit),
             stderr,
@@ -544,6 +579,7 @@ impl ProcessLauncher for FakeClaudeCli {
             stop_gate,
         });
         lock(&self.children).push(Arc::clone(&child));
+        self.spawned.notify_waiters();
 
         Ok(ManagedProcess {
             stdout: Box::new(FakeStdout {
@@ -554,6 +590,7 @@ impl ProcessLauncher for FakeClaudeCli {
                 partial: Vec::new(),
                 input_write_gate,
                 input_close_gate,
+                closed: is_turn.then(|| Arc::clone(&self.input_closed)),
             })),
             control: child,
         })
@@ -566,6 +603,7 @@ struct Child {
     /// Whether anything still holds the write end of stdout. Separate from `finished` because a
     /// pipe outlives the process that was handed it for as long as a helper keeps it open.
     output_open: Mutex<bool>,
+    output_needs_a_pass: bool,
     slow_stop: Option<SlowStop>,
     exit: Mutex<ExitStatus>,
     stderr: StderrTail,
@@ -690,6 +728,9 @@ impl ByteSource for FakeStdout {
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         loop {
             let changed = self.child.changed.notified();
+            if self.child.output_needs_a_pass && !lock(&self.child.pending).is_empty() {
+                tokio::task::yield_now().await;
+            }
             if let Some(line) = lock(&self.child.pending).pop_front() {
                 return Ok(Some(format!("{line}\n").into_bytes()));
             }
@@ -706,6 +747,8 @@ struct FakeStdin {
     partial: Vec<u8>,
     input_write_gate: Option<SpawnGate>,
     input_close_gate: Option<SpawnGate>,
+    /// Told when a turn's stdin is closed.
+    closed: Option<Arc<Notify>>,
 }
 
 #[async_trait::async_trait]
@@ -731,6 +774,9 @@ impl ByteSink for FakeStdin {
         if let Some(gate) = &self.input_close_gate {
             gate.arrived.notify_one();
             gate.release.notified().await;
+        }
+        if let Some(closed) = &self.closed {
+            closed.notify_one();
         }
         Ok(())
     }

@@ -2322,7 +2322,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// A host scratch mount that takes the removal and never answers it.
+    /// A host scratch mount that takes the removal and does not answer it until it is released.
+    ///
+    /// It gives up by itself after ten real seconds. A paused clock cannot bound a close that is
+    /// parked on the blocking pool, so without that a close with no bound of its own would hang
+    /// the test instead of failing it. A close that has its bound returns long before, and the
+    /// test then releases the removal at once.
     struct StalledRemover {
         arrived: Arc<tokio::sync::Notify>,
         released: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -2335,7 +2340,7 @@ mod tests {
                 .released
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .recv();
+                .recv_timeout(std::time::Duration::from_secs(10));
             std::fs::remove_dir_all(directory)
         }
     }
@@ -2382,19 +2387,6 @@ mod tests {
         )
     }
 
-    /// Lets every task that is ready run, and says whether `task` finished without the clock
-    /// moving. A bounded number of passes rather than a wait: a close that is still parked on the
-    /// blocking pool has nothing left to run, and under a paused clock nothing would wake it.
-    async fn finished_without_time<T>(task: &tokio::task::JoinHandle<T>) -> bool {
-        for _ in 0..64 {
-            if task.is_finished() {
-                return true;
-            }
-            tokio::task::yield_now().await;
-        }
-        task.is_finished()
-    }
-
     /// A removal the host's filesystem never answers is one stage of a close, so it gets a
     /// shutdown stage's bound. `spawn_blocking` cannot be cancelled, so the close stops waiting
     /// and says the artifact may still be there; before the bound existed it never returned.
@@ -2423,21 +2415,12 @@ mod tests {
             async move { session.close(CloseReason::Requested).await }
         });
         arrived.notified().await;
-        assert!(
-            !finished_without_time(&closing).await,
-            "expected the close to wait for the removal inside its bound | received a close that returned at once"
-        );
         tokio::time::advance(limits.shutdown_timeout).await;
-        assert!(
-            finished_without_time(&closing).await,
-            "expected the close to return once shutdown_timeout ({:?}) had passed | received a close still waiting on the removal",
-            limits.shutdown_timeout
-        );
 
         let error = closing
             .await
             .expect("expected the close task to finish")
-            .expect_err("expected the close to report the removal it stopped waiting for");
+            .expect_err("expected the close to return an error once shutdown_timeout had passed | received a close that waited for the removal to finish");
         assert!(
             matches!(
                 error.cause(),

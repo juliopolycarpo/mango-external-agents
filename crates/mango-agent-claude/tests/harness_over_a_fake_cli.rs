@@ -4167,14 +4167,9 @@ mod mcp_passthrough {
         );
 
         gate.release();
-        // No clock is involved: the guard's task only has to be polled, and this fake's kill ends
-        // the child at once. A bounded number of passes, so a child nobody reaps fails here.
-        for _ in 0..256 {
-            if launcher.kill_requests() == 1 && launcher.all_children_ended() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(60 * 60), launcher.turn_reaped())
+            .await
+            .expect("expected the abandoned start's guard to reap the late child | received a child still running after an hour");
         assert_eq!(
             (launcher.kill_requests(), launcher.all_children_ended()),
             (1, true),
@@ -5932,6 +5927,43 @@ mod deadlines {
         );
     }
 
+    /// What the grace is for: a `result` the child wrote as it left reaches the reader a moment
+    /// after the exit does, inside the grace, and still completes the turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_result_that_arrives_inside_the_grace_completes_the_turn() {
+        let limits = Limits::default();
+        let late = limits.kill_grace / 2;
+        let launcher = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let session = open_under(&launcher, limits).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        let began = tokio::time::Instant::now();
+        launcher.exit_turn_holding_its_output(0);
+        // The pipe's own behaviour: the last line surfaces half a grace after the exit.
+        let pipe = tokio::spawn({
+            let launcher = Arc::clone(&launcher);
+            async move {
+                tokio::time::sleep(late).await;
+                launcher.write_to_held_output(r#"{"type":"result","is_error":false}"#);
+            }
+        });
+        let events = terminal_of(&mut turn).await;
+        pipe.await.expect("expected the pipe task to finish");
+        assert!(
+            matches!(events.last(), Some(EventKind::Completed)),
+            "expected a result arriving inside the grace to complete the turn | received {events:?}"
+        );
+        assert_eq!(
+            began.elapsed(),
+            late,
+            "expected the turn to complete when the result arrived ({late:?}) | received {:?}",
+            began.elapsed()
+        );
+    }
+
     /// A host can set `kill_grace` to zero to mean "kill at once". That leaves no time to wait
     /// for more output after the exit, and still must not throw away a line that is already there.
     #[tokio::test(start_paused = true)]
@@ -6003,12 +6035,95 @@ mod deadlines {
             .await
             .expect("expected a turn");
 
-        reading(&inner).await;
+        inner.turn_reading().await;
         let began = tokio::time::Instant::now();
         drop(turn);
         tokio::time::timeout(NEVER, inner.turn_reaped())
             .await
             .expect("expected the kill to reach the child once the stream was dropped | received a child still running after an hour");
+        assert_eq!(
+            began.elapsed(),
+            Duration::ZERO,
+            "expected the stop to wait on nothing | received {:?}",
+            began.elapsed()
+        );
+    }
+
+    /// A `cancel` starts its stop on another task while the pump may still hold the watch. The
+    /// stop's token wakes the pump, which lets the watch go on its way out of the read, so the
+    /// kill waits on a poll and never on a timer.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_stops_a_child_whose_control_serialises_wait_and_kill() {
+        let inner = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let session = open_serialised(&inner).await;
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        inner.turn_reading().await;
+        let began = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(NEVER, session.cancel(CancelReason::Requested))
+            .await
+            .expect("expected the cancel to return | received none within an hour");
+        assert_eq!(
+            (outcome.is_ok(), began.elapsed(), inner.all_children_ended()),
+            (true, Duration::ZERO, true),
+            "expected the cancel to stop the child with no wait | received (ok, elapsed, all ended) = ({}, {:?}, {}), outcome {outcome:?}",
+            outcome.is_ok(),
+            began.elapsed(),
+            inner.all_children_ended()
+        );
+        let events = terminal_of(&mut turn).await;
+        assert!(
+            events.contains(&EventKind::Cancelled {
+                reason: CancelReason::Requested
+            }),
+            "expected the turn to end cancelled | received {events:?}"
+        );
+    }
+
+    /// The same, for a `close`.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_stops_a_child_whose_control_serialises_wait_and_kill() {
+        let inner = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let session = open_serialised(&inner).await;
+        let _turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        inner.turn_reading().await;
+        let began = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(NEVER, session.close(CloseReason::Requested))
+            .await
+            .expect("expected the close to return | received none within an hour");
+        assert_eq!(
+            (outcome.is_ok(), began.elapsed(), session.snapshot().status),
+            (true, Duration::ZERO, SessionStatus::Closed),
+            "expected the close to stop the child with no wait | received (ok, elapsed, status) = ({}, {:?}, {:?}), outcome {outcome:?}",
+            outcome.is_ok(),
+            began.elapsed(),
+            session.snapshot().status
+        );
+    }
+
+    /// The same, for a session that is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_session_stops_a_child_whose_control_serialises_wait_and_kill() {
+        let inner = Arc::new(FakeClaudeCli::new().with_turn(stalled()));
+        let session = open_serialised(&inner).await;
+        let _turn = session
+            .start_turn(TurnRequest::new("turn-1", "hold"))
+            .await
+            .expect("expected a turn");
+
+        inner.turn_reading().await;
+        let began = tokio::time::Instant::now();
+        drop(session);
+        tokio::time::timeout(NEVER, inner.turn_reaped())
+            .await
+            .expect("expected the dropped session's stop to reach the child | received a child still running after an hour");
         assert_eq!(
             began.elapsed(),
             Duration::ZERO,
@@ -6034,7 +6149,7 @@ mod deadlines {
             .await
             .expect("expected a turn");
 
-        reading(&inner).await;
+        inner.turn_reading().await;
         let began = tokio::time::Instant::now();
         host.cancel().cancel();
         let events = terminal_of(&mut turn).await;
@@ -6051,18 +6166,6 @@ mod deadlines {
             began.elapsed(),
             inner.all_children_ended()
         );
-    }
-
-    /// Returns once the pump has written the prompt, which it does in the same poll that takes
-    /// it into the read. No clock is involved, so this is a bounded number of passes.
-    async fn reading(launcher: &FakeClaudeCli) {
-        for _ in 0..64 {
-            if !launcher.written().is_empty() {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("expected the pump to write the prompt and start reading | received no prompt");
     }
 
     async fn open_serialised(inner: &Arc<FakeClaudeCli>) -> Box<dyn Session> {
