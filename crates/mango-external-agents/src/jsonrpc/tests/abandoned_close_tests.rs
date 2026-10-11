@@ -290,6 +290,81 @@ async fn a_second_close_gives_up_on_a_first_held_while_the_handler_is_being_told
     );
 }
 
+/// A client whose peer has exited, with its handler inside `on_terminated` and held there.
+async fn peer_exited_with_the_handler_held() -> (Client, Arc<ParkedTermination>) {
+    let link = ScriptedLink::new();
+    let handler = ParkedTermination::arc();
+    let client = Client::connect(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    link.end();
+    until("the handler to be told of the exit", || {
+        handler.entered.load(Ordering::Acquire) == 1
+    })
+    .await;
+    (client, handler)
+}
+
+/// The first close of the case above, polled again after the second has given up, is not left
+/// with anything wrong: its own bound has run out by then, so it takes the reader down, as a close
+/// does when the handler is not told in time, and completes with `Ok`. The handler's call, cut with
+/// the reader, never returns. A third close has nothing left to wait for.
+#[tokio::test(start_paused = true)]
+async fn a_first_close_polled_again_after_the_second_gave_up_still_completes() {
+    let (client, handler) = peer_exited_with_the_handler_held().await;
+    let mut first: Closing = Box::pin(client.close());
+    park("the first close", &mut first).await;
+    let bound = shutdown() * 2;
+    let second = tokio::time::timeout(bound * 5, client.close()).await;
+    let gave_up_on_the_reader = matches!(&second, Ok(Err(Error::Timeout { operation, .. })) if operation.contains("reader"));
+
+    let first = within("the first close, polled again", first).await;
+    let third = within("the third close", client.close()).await;
+    let observed = (
+        gave_up_on_the_reader,
+        first.is_ok(),
+        handler.returned.load(Ordering::Acquire),
+        third.is_ok(),
+    );
+    assert_eq!(
+        observed,
+        (true, true, 0, true),
+        "expected the second close to give up on the reader, the first, polled again, to complete with Ok having cut the handler's call, and a third close to finish: (true, true, 0, true) | received {observed:?} with the first {first:?}"
+    );
+}
+
+/// The ordinary race: two closes polled together on a connection that ended under this side, the
+/// first finishing within its bound because the handler returns in time. The second waits behind
+/// the first for the reader and finds nothing left to wait for: both are `Ok`, and neither takes
+/// longer than the handler did. A characterisation test; it holds with or without the bound.
+#[tokio::test(start_paused = true)]
+async fn two_closes_polled_together_both_succeed_when_the_handler_returns_in_time() {
+    let (client, handler) = peer_exited_with_the_handler_held().await;
+    let began = tokio::time::Instant::now();
+    let releasing = async {
+        tokio::time::sleep(shutdown() / 2).await;
+        handler.gate.add_permits(1);
+    };
+    let (first, second, ()) = within("both closes", async {
+        tokio::join!(client.close(), client.close(), releasing)
+    })
+    .await;
+    let observed = (
+        first.is_ok(),
+        second.is_ok(),
+        handler.returned.load(Ordering::Acquire),
+        began.elapsed() <= shutdown(),
+    );
+    assert_eq!(
+        observed,
+        (true, true, 1, true),
+        "expected both closes to succeed within shutdown_timeout ({:?}) with the handler's call returned: (true, true, 1, true) | received {observed:?} with the first {first:?} and the second {second:?}",
+        shutdown()
+    );
+}
+
 /// A sender whose `close` does not return until the test lets it.
 struct HeldClose {
     inner: Box<dyn crate::link::LinkSender>,
