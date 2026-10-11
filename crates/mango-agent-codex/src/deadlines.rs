@@ -81,6 +81,7 @@ fn total(terms: &[Duration]) -> Duration {
 /// | [`teardown`](Self::teardown)          | `kg` + `st` + 3 `st` + stop | 36 s  |
 /// | [`close`](Self::close)                | the teardown             | 36 s     |
 /// | [`overflow_to_closed`](Self::overflow_to_closed) | `st` + the teardown | 41 s |
+/// | [`connection_lost_to_closed`](Self::connection_lost_to_closed) | 2 `st` + the teardown | 46 s |
 /// | [`cancel_interrupt_accepted`](Self::cancel_interrupt_accepted) | `rt` + `rt` + `cs` + teardown | 336 s |
 /// | [`cancel_interrupt_failed`](Self::cancel_interrupt_failed) | 3 `rt` + `st` + teardown | 401 s |
 ///
@@ -241,6 +242,32 @@ impl Deadlines {
     #[must_use]
     pub fn overflow_to_closed(&self) -> Duration {
         total(&[self.limits.shutdown_timeout, self.teardown()])
+    }
+
+    /// The app-server's exit or a failed link, to the child's reap, measured from the event.
+    ///
+    /// Those ends drain the queue for up to one `shutdown_timeout`, and a stretch still held when
+    /// that runs out is waited for one more, so the client reports the connection's end within
+    /// two. The teardown starts after that report: two `shutdown_timeout` plus
+    /// [`teardown`](Self::teardown), 46 s at the defaults. A `close` called inside that window
+    /// is still bounded by [`close_worst_case`](Self::close_worst_case) from its own call.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_codex::deadlines::Deadlines;
+    /// use mango_external_agents::Limits;
+    ///
+    /// let lost = Deadlines::from_limits(&Limits::default()).connection_lost_to_closed();
+    /// assert_eq!(lost.as_secs(), 46);
+    /// ```
+    #[must_use]
+    pub fn connection_lost_to_closed(&self) -> Duration {
+        total(&[
+            self.limits.shutdown_timeout,
+            self.limits.shutdown_timeout,
+            self.teardown(),
+        ])
     }
 
     /// `Session::cancel` of a named turn whose interrupt the app-server accepted, measured from

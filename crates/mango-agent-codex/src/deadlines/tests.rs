@@ -43,6 +43,11 @@ fn every_row_matches_the_guide_at_the_defaults() {
         deadlines.overflow_to_closed(),
     );
     assert_duration(
+        "connection lost to closed",
+        secs(46),
+        deadlines.connection_lost_to_closed(),
+    );
+    assert_duration(
         "cancel, interrupt accepted",
         secs(336),
         deadlines.cancel_interrupt_accepted(),
@@ -67,6 +72,11 @@ fn every_row_reads_its_own_limit() {
         "overflow to closed",
         secs(100 + teardown),
         deadlines.overflow_to_closed(),
+    );
+    assert_duration(
+        "connection lost to closed",
+        secs(200 + teardown),
+        deadlines.connection_lost_to_closed(),
     );
     assert_duration(
         "cancel, interrupt accepted",
@@ -115,6 +125,10 @@ fn extreme_limits_saturate_instead_of_panicking() {
         ("close", deadlines.close()),
         ("close, worst case", deadlines.close_worst_case()),
         ("overflow to closed", deadlines.overflow_to_closed()),
+        (
+            "connection lost to closed",
+            deadlines.connection_lost_to_closed(),
+        ),
         (
             "cancel, interrupt accepted",
             deadlines.cancel_interrupt_accepted(),
