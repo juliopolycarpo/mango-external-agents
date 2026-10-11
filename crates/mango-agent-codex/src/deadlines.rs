@@ -4,7 +4,7 @@
 //! its own timeout around `close` or `cancel` needs the numbers, and copying a formula by hand
 //! lets it drift from the code. [`Deadlines`] is the same formula as code: every method is one
 //! row of those tables, and the teardown's terms are the very expressions the teardown enforces
-//! ([`close_backstop`] and [`interrupt_bound`] are called from `session.rs`).
+//! (`close_backstop` and `interrupt_bound` are called from `session.rs`).
 //!
 //! Each method's documentation names where its clock starts. That is half of every bound: `close`
 //! is bounded from the call to `close`, while a connection loss is bounded from the event.

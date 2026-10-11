@@ -256,7 +256,8 @@ pub struct Limits {
     /// [`Self::kill_grace`] and two [`Self::shutdown_timeout`], 14 seconds at the defaults. A
     /// `cancel` writes the turn's terminal at once and returns when that stop does. `close` adds
     /// one [`Self::shutdown_timeout`] for removing the MCP artifact, 19 seconds, and waits one
-    /// [`Self::shutdown_timeout`] for a launch the host's launcher has not returned yet. A stop
+    /// [`Self::shutdown_timeout`] for a launch the host's launcher has not returned yet, so a
+    /// close over a pending launch whose child then has to be stopped takes up to 24 seconds. A stop
     /// that runs out of time returns its own [`Error::Timeout`], not
     /// [`Error::CleanupRequired`]. `docs/harness-claude.md` has that table, and
     /// `mango_agent_claude::deadlines::Deadlines` computes its rows from a `Limits`.
