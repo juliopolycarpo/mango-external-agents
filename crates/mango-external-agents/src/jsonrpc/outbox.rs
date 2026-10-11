@@ -59,6 +59,7 @@ pub struct WireOptions {
     max_outbound_queued_bytes: usize,
     max_outbound_queued_frames: usize,
     batch_decoding: bool,
+    request_handoff: bool,
     parse_error_replies: Option<usize>,
     cancel_on_abandon: Option<String>,
 }
@@ -70,6 +71,7 @@ impl Default for WireOptions {
             max_outbound_queued_bytes: usize::MAX,
             max_outbound_queued_frames: usize::MAX,
             batch_decoding: false,
+            request_handoff: false,
             parse_error_replies: None,
             cancel_on_abandon: None,
         }
@@ -150,7 +152,10 @@ impl WireOptions {
     /// Passing it ends the connection the way
     /// [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) describes. A
     /// bound of zero is not passed by anything the peer did: it refuses every queued frame
-    /// alone, and leaves the connection to callers that wait for their own writes. The frames
+    /// alone, and leaves the connection to callers that wait for their own writes. Not so
+    /// with [`with_request_handoff`](Self::with_request_handoff), whose answers are queued
+    /// frames: a queue that takes none cannot answer the peer's first question, and the
+    /// connection ends there. The frames
     /// [`with_parse_error_replies`](Self::with_parse_error_replies) and
     /// [`with_cancel_on_abandon`](Self::with_cancel_on_abandon) send are not held to this
     /// bound, whatever it is.
@@ -207,6 +212,55 @@ impl WireOptions {
         self
     }
 
+    /// Hands each of the peer's questions to the handler in the order it was read, with a
+    /// [`Responder`](super::Responder) to answer it through, now or later.
+    ///
+    /// Off by default, where a question is answered by
+    /// [`PeerHandler::on_request`](super::PeerHandler::on_request) on a task of its own and
+    /// its answer is written by that task when its turn at the link comes. On:
+    ///
+    /// - a question reaches
+    ///   [`PeerHandler::on_request_handoff`](super::PeerHandler::on_request_handoff) on the
+    ///   task that runs the notifications, in the order the peer sent it among them, and that
+    ///   call is awaited like a notification. So a response asked for with
+    ///   [`RequestOptions::after_earlier_notifications`](super::RequestOptions::after_earlier_notifications)
+    ///   waits for the questions read before it to be handed over too;
+    /// - every answer is queued without waiting, by [`Responder::answer`](super::Responder::answer),
+    ///   in the order the answers are given among the frames queued with
+    ///   [`Client::submit_request`](super::Client::submit_request) and
+    ///   [`Client::submit_notification`](super::Client::submit_notification), and counted
+    ///   against [`with_max_outbound_queued_frames`](Self::with_max_outbound_queued_frames)
+    ///   and [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) like
+    ///   them. Answers go through the queue, so from the first one on, every write of this
+    ///   client takes its turn there;
+    /// - a question past
+    ///   [`ClientOptions::max_in_flight_requests`](super::ClientOptions::max_in_flight_requests)
+    ///   is put to
+    ///   [`PeerHandler::on_request_past_cap`](super::PeerHandler::on_request_past_cap), which
+    ///   answers it on the spot.
+    ///
+    /// Set the outbound queue's bounds along with this. An answer given on the spot, and the
+    /// answer to a question past the cap, is queued without waiting for the peer to read
+    /// anything. With no bound on the queue, a peer that asks without reading is limited only
+    /// by the write at the head of the queue running out its
+    /// [`ClientOptions::request_timeout`](super::ClientOptions::request_timeout), and the
+    /// queue grows until then. The bounds are what ends such a connection sooner; this
+    /// option does not set them.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_request_handoff();
+    /// assert!(wire.hands_requests_off());
+    /// ```
+    #[must_use]
+    pub fn with_request_handoff(mut self) -> Self {
+        self.request_handoff = true;
+        self
+    }
+
     /// Answers a line that is not JSON with a JSON-RPC parse error: code `-32700`, `id` null.
     ///
     /// Off by default, where such a line is dropped: a vendor that prints a stray diagnostic
@@ -254,7 +308,8 @@ impl WireOptions {
     /// dropped. Nothing is sent:
     ///
     /// - for a request whose frame never began to be written, since the peer never saw it;
-    /// - for a request whose caller was told the link refused its frame;
+    /// - for a request whose write has ended with the link refusing its frame whole, whether
+    ///   or not its caller has heard yet;
     /// - once a response to it has been taken for its caller, delivered yet or not;
     /// - once the connection has ended.
     ///
@@ -309,6 +364,21 @@ impl WireOptions {
     #[must_use]
     pub fn parse_error_replies(&self) -> Option<usize> {
         self.parse_error_replies
+    }
+
+    /// Whether the peer's questions are handed to the handler in order, with a
+    /// [`Responder`](super::Responder).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert!(!WireOptions::new().hands_requests_off());
+    /// ```
+    #[must_use]
+    pub fn hands_requests_off(&self) -> bool {
+        self.request_handoff
     }
 
     /// The notification sent for a request given up, or `None` when none is.
@@ -565,6 +635,9 @@ pub(super) struct Outgoing {
     call: Option<Registration>,
     /// Whether the frame has a share of the queue's bounds to give back.
     counted: bool,
+    /// Whether the frame answers one of the peer's questions. Nobody has to be waiting on
+    /// such a write for it to matter: an answer that was not written leaves the peer waiting.
+    reply: bool,
 }
 
 /// What the writer takes off the queue.
@@ -673,7 +746,18 @@ impl Outbox {
         deadline: Instant,
         call: Option<Registration>,
     ) -> std::result::Result<Ticket, Refusal> {
-        self.queue_frame(frame, deadline, call, true)
+        self.queue_frame(frame, deadline, call, true, false)
+    }
+
+    /// The same, for the answer to one of the peer's questions: a frame that must be written.
+    /// One that is not, for any reason, ends the connection, since the peer would otherwise
+    /// wait for good on a question this side believes it has answered.
+    pub(super) fn enqueue_reply(
+        &self,
+        frame: String,
+        deadline: Instant,
+    ) -> std::result::Result<Ticket, Refusal> {
+        self.queue_frame(frame, deadline, None, true, true)
     }
 
     /// Queues a frame this side sends of its own accord, beside the queue's bounds: it takes
@@ -688,7 +772,7 @@ impl Outbox {
         frame: String,
         deadline: Instant,
     ) -> std::result::Result<Ticket, Refusal> {
-        self.queue_frame(frame, deadline, None, false)
+        self.queue_frame(frame, deadline, None, false, false)
     }
 
     fn queue_frame(
@@ -697,6 +781,7 @@ impl Outbox {
         deadline: Instant,
         call: Option<Registration>,
         counted: bool,
+        reply: bool,
     ) -> std::result::Result<Ticket, Refusal> {
         let bytes = frame.len();
         let mut held = self
@@ -737,6 +822,7 @@ impl Outbox {
             deadline,
             call,
             counted,
+            reply,
         };
         if let Err(refused) = self.queue.send(Entry::Frame(queued)) {
             // The frame comes back in the error and gives its share back as it is dropped, which
@@ -985,6 +1071,12 @@ async fn frame(state: &ClientState, mut outgoing: Outgoing) {
     }
     let outcome = write(state, &mut outgoing).await;
     let ack = outgoing.ack.take();
+    if outgoing.reply
+        && let Some(Err(error)) = &outcome
+    {
+        // Whether or not anyone waits to hear: the pump is told, and ends the connection.
+        state.signal_write_failure(error);
+    }
     let unwritten = call.filter(|_| !matches!(outcome, Some(Ok(()))));
     if let Some((_, claim)) = &unwritten {
         // The write is over and the link took none of the frame, or is unusable now. Settled

@@ -15,7 +15,16 @@ pub trait LinkSender: Send {
     ///
     /// # Errors
     ///
-    /// [`Error::Link`](crate::Error::Link) when the peer is gone.
+    /// [`Error::Link`](crate::Error::Link) when the peer is gone, and for any failure after
+    /// which some of the message may have reached the peer.
+    ///
+    /// Any other error says that no byte of the message was accepted and that the link is as
+    /// usable as it was: a refusal for size, a link already closed on this side. What is built
+    /// on a link relies on that. A JSON-RPC client fails a request or a notification refused
+    /// this way and goes on writing, where a [`Error::Link`](crate::Error::Link) ends the
+    /// connection; and it tells the peer nothing about that request, since the peer never
+    /// saw it. An implementation that cannot tell whether bytes were accepted reports
+    /// [`Error::Link`](crate::Error::Link).
     async fn send(&mut self, message: String) -> Result<()>;
 
     /// Closes this side of the link. Idempotent.

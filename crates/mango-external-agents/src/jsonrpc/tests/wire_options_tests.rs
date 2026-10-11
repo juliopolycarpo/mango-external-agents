@@ -1495,15 +1495,175 @@ async fn a_cancel_keeps_its_place_ahead_of_the_retry_with_the_record_of_calls_co
     client.close().await.expect("expected a clean close");
 }
 
+/// Refuses every frame naming `ask` whole, the way a transport refuses a frame it will not
+/// carry: no byte accepted, the link as good as it was.
+struct RefuseAsks {
+    inner: Box<dyn crate::link::LinkSender>,
+}
+
+#[async_trait::async_trait]
+impl crate::link::LinkSender for RefuseAsks {
+    async fn send(&mut self, message: String) -> crate::error::Result<()> {
+        if message.contains("\"ask\"") {
+            return Err(Error::LimitExceeded {
+                subject: "local outgoing frame bytes",
+                limit: 1,
+                received: message.len(),
+            }
+            .with_dispatch(crate::Dispatch::NotSubmitted));
+        }
+        self.inner.send(message).await
+    }
+
+    async fn close(&mut self) -> crate::error::Result<()> {
+        self.inner.close().await
+    }
+}
+
+/// The one request the peer never got that is announced all the same: given up while its
+/// frame is being written, with the link then refusing the frame whole. The call is let go
+/// between the write beginning and the link's answer, which is before anyone can know.
+#[tokio::test]
+async fn a_request_given_up_mid_write_is_cancelled_even_if_the_link_then_refuses_it() {
+    let link = ScriptedLink::new();
+    let (sender, receiver) = link.clone().into_link().split();
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect_with(
+        crate::link::Link::new(Box::new(RefuseAsks { inner: sender }), receiver),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+        WireOptions::new().with_cancel_on_abandon(CANCEL),
+    );
+    let reply = Arc::new(std::sync::Mutex::new(None));
+    *client
+        .state
+        .after_write_began
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new({
+        let reply = Arc::clone(&reply);
+        move || {
+            let reply = reply
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            drop::<Option<crate::jsonrpc::Reply>>(reply);
+        }
+    }));
+    let (written, waiting) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    *reply
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waiting);
+    let refused = within("the write refused", written).await;
+    within("the next write", client.notify("after", json!({})))
+        .await
+        .expect("expected the notification written");
+
+    let observed = (refused.is_err(), methods(&link));
+    assert_eq!(
+        observed,
+        (true, vec![String::from(CANCEL), String::from("after")]),
+        "expected the refusal reported and the cancel sent for a call let go mid-write: (true, [\"$/cancel_request\", \"after\"]) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// Requests the link refuses whole, each let go once its write is over, with the record of
+/// calls kept busy from another thread so that the writer is still waiting to tell the caller.
+/// None of them reached the peer, and none is cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_refused_whole_are_never_cancelled_with_the_record_of_calls_contended() {
+    const ROUNDS: usize = 200;
+    let link = ScriptedLink::new();
+    let (sender, receiver) = link.clone().into_link().split();
+    let handler = RecordingHandler::arc(None);
+    let client = Arc::new(Client::connect_with(
+        crate::link::Link::new(Box::new(RefuseAsks { inner: sender }), receiver),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+        WireOptions::new().with_cancel_on_abandon(CANCEL),
+    ));
+    let busy = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            loop {
+                let held = client.state.pending.lock().await;
+                tokio::task::yield_now().await;
+                drop(held);
+            }
+        }
+    });
+    for _ in 0..ROUNDS {
+        let (written, reply) = client
+            .submit_request("ask", json!({}), RequestOptions::new())
+            .expect("expected the request queued")
+            .into_parts();
+        // The frame is let go as its write ends, before the writer waits for the record.
+        until("the refused frame to be let go", || {
+            written.started() && outbox_holds(&client) == (0, 0)
+        })
+        .await;
+        let dropped = tokio::task::spawn_blocking(move || drop(reply));
+        within("the reply dropped", dropped)
+            .await
+            .expect("expected the dropping thread to finish");
+        let refused = within("the write refused", written).await;
+        assert!(
+            refused.is_err(),
+            "expected every request refused by the link: Err | received {refused:?}"
+        );
+    }
+    busy.abort();
+    let _ = busy.await;
+    within("the last write", client.notify("last", json!({})))
+        .await
+        .expect("expected the notification written");
+
+    let observed = (
+        methods(&link),
+        client.state.outbox.aside(),
+        client.is_closed(),
+    );
+    assert_eq!(
+        observed,
+        (vec![String::from("last")], 0, false),
+        "expected no cancel for any request the peer never got, and the connection open: ([\"last\"], 0, false) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// Which side a round of the race below gives the head start.
+#[derive(Clone, Copy)]
+enum HeadStart {
+    /// The response is read and taken before the caller lets go.
+    Reader,
+    /// The caller has let go before the response is sent.
+    Caller,
+    /// Both at once, from two threads.
+    Nobody,
+}
+
 /// A response racing the caller that gives its call up, from two threads, request after
-/// request. Whichever wins, the call ends one way: answered with no cancel, or cancelled with
-/// the response dropped. Never an answer in the caller's hands and a cancel on the wire, never
-/// two cancels, never a cancel for a request that was not written, and nothing left behind.
+/// request, with every third round given to one side and every third to the other so that
+/// both ends are certain to occur. Each call ends exactly one way: the reader took it and no
+/// cancel was sent, or the caller let it go first and one cancel was sent. Never both, never
+/// neither, never an answer in the caller's hands beside a cancel, and nothing left behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_response_racing_a_call_given_up_ends_the_call_one_way_only() {
-    const ROUNDS: usize = 400;
-    let (link, _handler, client) =
+    const ROUNDS: usize = 300;
+    let (link, handler, client) =
         connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
+    let taken_by_reader = |key: &str| {
+        client
+            .state
+            .claimed_by_reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|taken| taken == key)
+    };
     let mut calls = Vec::new();
     for round in 0..ROUNDS {
         let request = if round % 2 == 0 {
@@ -1511,10 +1671,16 @@ async fn a_response_racing_a_call_given_up_ends_the_call_one_way_only() {
         } else {
             ordered_options()
         };
+        let head_start = match round % 3 {
+            0 => HeadStart::Reader,
+            1 => HeadStart::Caller,
+            _ => HeadStart::Nobody,
+        };
         let submitted = client
             .submit_request("ask", json!({}), request)
             .expect("expected the request queued");
         let id = submitted.id().as_json().clone();
+        let key = submitted.id().key();
         let (written, reply) = submitted.into_parts();
         within("the request written", written)
             .await
@@ -1526,16 +1692,33 @@ async fn a_response_racing_a_call_given_up_ends_the_call_one_way_only() {
                 _ = given_up => None,
             }
         });
-        // Both at once, from this thread: the reader and the caller run on two others.
-        link.push_line(json!({ "jsonrpc": "2.0", "id": id, "result": "done" }).to_string());
-        let _ = give_up.send(());
-        let answered = within("the caller", caller)
-            .await
-            .expect("expected the caller to finish")
-            .is_some();
-        calls.push((id, answered));
+        let response = json!({ "jsonrpc": "2.0", "id": id, "result": "done" }).to_string();
+        let answered = match head_start {
+            HeadStart::Reader => {
+                link.push_line(response);
+                until("the reader to take the call", || taken_by_reader(&key)).await;
+                let _ = give_up.send(());
+                within("the caller", caller).await
+            }
+            HeadStart::Caller => {
+                let _ = give_up.send(());
+                let answered = within("the caller", caller).await;
+                link.push_line(response);
+                answered
+            }
+            HeadStart::Nobody => {
+                link.push_line(response);
+                let _ = give_up.send(());
+                within("the caller", caller).await
+            }
+        }
+        .expect("expected the caller to finish")
+        .is_some();
+        calls.push((id, key, answered));
     }
-    // Every cancel there is going to be is queued by now: the callers have all let go.
+    // A marker behind the last response: once it is handled, every response has been read.
+    link.push_line(notification("read to here").to_string());
+    handler.wait_for_notifications(1).await;
     within("the last write", client.notify("last", json!({})))
         .await
         .expect("expected the notification written");
@@ -1553,8 +1736,8 @@ async fn a_response_racing_a_call_given_up_ends_the_call_one_way_only() {
     .await;
 
     let written = frames(&link);
-    let mut cancelled = 0;
-    for (id, answered) in &calls {
+    let (mut by_reader, mut by_caller) = (0, 0);
+    for (id, key, answered) in &calls {
         let asks = written
             .iter()
             .filter(|frame| frame["method"] == "ask" && frame["id"] == *id)
@@ -1563,17 +1746,22 @@ async fn a_response_racing_a_call_given_up_ends_the_call_one_way_only() {
             .iter()
             .filter(|frame| frame["method"] == CANCEL && frame["params"]["requestId"] == *id)
             .count();
-        cancelled += cancels;
-        let one_way = asks == 1 && cancels <= 1 && !(*answered && cancels == 1);
+        let taken = taken_by_reader(key);
+        by_reader += usize::from(taken);
+        by_caller += cancels;
+        let one_way = asks == 1 && usize::from(taken) + cancels == 1 && (taken || !*answered);
         assert!(
             one_way,
-            "expected request {id} written once and then answered or cancelled, not both: (1 ask, answered xor 1 cancel, or neither seen by the caller) | received ({asks} asks, answered {answered}, {cancels} cancels)"
+            "expected request {id} written once and then taken by the reader or cancelled, exactly one of the two, and answered only if taken: (1 ask, taken xor 1 cancel) | received ({asks} asks, taken {taken}, {cancels} cancels, answered {answered})"
         );
     }
-    let others = written.len() - ROUNDS - cancelled - 1;
+    let others = written.len() - ROUNDS - by_caller - 1;
+    let observed = (others, by_reader >= ROUNDS / 3, by_caller >= ROUNDS / 3);
     assert_eq!(
-        others, 0,
-        "expected no frame but the requests, their cancels and the last write: 0 | received {others} more in {written:?}"
+        observed,
+        (0, true, true),
+        "expected nothing else on the wire and both ends to have occurred at least {} times each: (0, true, true) | received {observed:?} ({by_reader} taken by the reader, {by_caller} cancelled)",
+        ROUNDS / 3
     );
     client.close().await.expect("expected a clean close");
 }
