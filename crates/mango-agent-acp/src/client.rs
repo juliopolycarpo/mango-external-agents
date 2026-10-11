@@ -1840,7 +1840,7 @@ impl ConnectionHandle {
     ///   this request alone.
     /// - On a connection that has ended, the same failure a request in flight would have had,
     ///   marked not submitted too: nothing of this request was queued.
-    /// - Anything else as the peer gave it.
+    /// - Anything else as [`not_queued`](Self::not_queued) words it.
     fn refused(&self, method: &str, error: Error) -> Error {
         if let Some(overflow) = Overflow::from_refused_frame(&error) {
             return overflow
@@ -1852,7 +1852,27 @@ impl ConnectionHandle {
                 .link_closed_under(method)
                 .with_dispatch(mango_external_agents::Dispatch::NotSubmitted);
         }
-        error
+        self.not_queued(error)
+    }
+
+    /// A refusal that queued nothing on a live connection, in this crate's own words and
+    /// marked not submitted.
+    ///
+    /// With the frame's size and the connection's end already ruled out, the one count the
+    /// peer can still refuse a request for is its reserve of places for answers awaiting
+    /// delivery. That reserve is sized from `Limits::max_pending_requests`, so it is reported
+    /// as that limit, the one a host set, and not under the peer's name for it. For example,
+    /// with 64 requests allowed: `expected at most 64 outstanding ACP requests, received 65`.
+    pub(super) fn not_queued(&self, error: Error) -> Error {
+        let reworded = match error.cause() {
+            Error::LimitExceeded { .. } => Error::LimitExceeded {
+                subject: requests::OUTSTANDING_REQUESTS,
+                limit: self.limits.max_pending_requests,
+                received: self.limits.max_pending_requests.saturating_add(1),
+            },
+            _ => error,
+        };
+        reworded.with_dispatch(mango_external_agents::Dispatch::NotSubmitted)
     }
 
     /// Ends the connection and the child. Idempotent.

@@ -63,6 +63,9 @@ agent_request! {
     PromptRequest => PromptResponse, session_prompt;
 }
 
+/// What [`RequestAdmission`] counts, as a host reads it in a refusal.
+pub(super) const OUTSTANDING_REQUESTS: &str = "outstanding ACP requests";
+
 /// Admission in front of the connection's requests that are not prompts.
 ///
 /// The JSON-RPC peer has a budget of its own for calls awaiting an answer, applied when a
@@ -91,7 +94,8 @@ impl RequestAdmission {
     /// # Errors
     ///
     /// [`Error::Closed`] once [`Self::close`] was called, and [`Error::LimitExceeded`] naming the
-    /// limit when it is reached.
+    /// limit when it is reached. Both are marked [`Dispatch::NotSubmitted`]: `send` was not
+    /// run, so nothing of the request exists anywhere.
     ///
     /// ```ignore
     /// let (permit, queued) = admission.submit(|| client.submit_request(method, params, options))?;
@@ -104,16 +108,17 @@ impl RequestAdmission {
         if *closed {
             return Err(Error::Closed {
                 subject: "ACP connection",
-            });
+            }
+            .with_dispatch(Dispatch::NotSubmitted));
         }
-        let permit = self
-            .permits
-            .try_acquire()
-            .map_err(|_| Error::LimitExceeded {
-                subject: "outstanding ACP requests",
+        let permit = self.permits.try_acquire().map_err(|_| {
+            Error::LimitExceeded {
+                subject: OUTSTANDING_REQUESTS,
                 limit: self.limit,
                 received: self.limit.saturating_add(1),
-            })?;
+            }
+            .with_dispatch(Dispatch::NotSubmitted)
+        })?;
         let sent = send();
         drop(closed);
         Ok((permit, sent))
@@ -358,7 +363,8 @@ impl PromptCall {
 ///
 /// [`Error::LimitExceeded`] with [`Dispatch::NotSubmitted`] when the frame is larger than the
 /// outgoing budget, naming the frame's size: nothing was queued and the connection stays usable.
-/// Any other refusal that queued nothing on a live connection, the same way.
+/// Any other refusal that queued nothing on a live connection, the same way, in the words of
+/// [`ConnectionHandle::not_queued`].
 ///
 /// ```ignore
 /// let prompt = submit_prompt(&connection, PromptRequest::new(session_id, blocks))?;
@@ -388,7 +394,7 @@ pub(crate) fn submit_prompt(
     if link_gone || connection.client.ended().is_some() {
         return Ok(PromptCall { reply: None });
     }
-    Err(error.with_dispatch(Dispatch::NotSubmitted))
+    Err(connection.not_queued(error))
 }
 
 /// The agent's own error frame, in the schema's type.
@@ -471,14 +477,15 @@ mod tests {
             .expect_err("expected the second request refused");
         assert!(
             matches!(
-                refused,
+                refused.cause(),
                 Error::LimitExceeded {
                     subject: "outstanding ACP requests",
                     limit: 1,
                     received: 2
                 }
-            ),
-            "expected LimitExceeded {{ outstanding ACP requests, 1, 2 }} | received: {refused:?}"
+            ) && refused.dispatch() == mango_external_agents::Dispatch::NotSubmitted,
+            "expected LimitExceeded {{ outstanding ACP requests, 1, 2 }} marked NotSubmitted | received: {refused:?} marked {:?}",
+            refused.dispatch()
         );
         drop(permit);
         assert!(
@@ -496,12 +503,13 @@ mod tests {
             .expect_err("expected a closed admission to refuse");
         assert!(
             matches!(
-                refused,
+                refused.cause(),
                 Error::Closed {
                     subject: "ACP connection"
                 }
-            ),
-            "expected Closed {{ subject: \"ACP connection\" }} | received: {refused:?}"
+            ) && refused.dispatch() == mango_external_agents::Dispatch::NotSubmitted,
+            "expected Closed {{ subject: \"ACP connection\" }} marked NotSubmitted | received: {refused:?} marked {:?}",
+            refused.dispatch()
         );
     }
 
