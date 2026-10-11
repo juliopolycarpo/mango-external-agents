@@ -83,6 +83,47 @@ async fn a_refused_frame_names_the_frame_bound() {
     gated.client.close().await.expect("expected a clean close");
 }
 
+/// A caller that waits for its own write is refused the same way, and the refusal names the
+/// same bound.
+#[tokio::test]
+async fn a_waiting_callers_refused_frame_names_the_frame_bound() {
+    let exact = r#"{"jsonrpc":"2.0","method":"fits","params":{"pad":"xxxx"}}"#;
+    let gated = gated(options(), limits(exact.len(), usize::MAX, usize::MAX));
+
+    let error = gated
+        .client
+        .notify("fits", json!({"pad": "xxxxx"}))
+        .await
+        .expect_err("expected the frame one byte over refused");
+    let observed = (told(&error), gated.client.is_closed());
+    let expected = ((Some(OutboundBound::FrameBytes), false), false);
+    assert_eq!(
+        observed, expected,
+        "expected the frame bound named for a waiting caller, the connection open: {expected:?} | received {observed:?} ({error:?})"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
+/// A queue that may hold no frame at all refuses each frame alone, and names the bound on
+/// queued frames for it: the bound is named, and nothing ends. Whether the connection ended is
+/// for `Client::ended` to say.
+#[tokio::test]
+async fn a_queue_bounded_to_no_frames_names_the_bound_and_ends_nothing() {
+    let gated = gated(options(), limits(usize::MAX, usize::MAX, 0));
+
+    let error = gated
+        .client
+        .submit_notification("queued", json!({}))
+        .expect_err("expected the frame refused");
+    let observed = (told(&error), gated.client.is_closed(), gated.client.ended());
+    let expected = ((Some(OutboundBound::QueuedFrames), false), false, None);
+    assert_eq!(
+        observed, expected,
+        "expected the bound on queued frames named and the connection untouched: {expected:?} | received {observed:?} ({error:?})"
+    );
+    gated.client.close().await.expect("expected a clean close");
+}
+
 /// A queue that holds too many frames ends the connection. The refusal the caller receives
 /// and the end the handler is told of both name the bound on queued frames.
 #[tokio::test]
@@ -184,23 +225,28 @@ async fn a_request_or_a_write_that_times_out_is_not_a_link_shutdown() {
 
     let handler = RecordingHandler::arc(None);
     let stalled = stalled_client(Arc::clone(&handler), "session/prompt");
+    // Without a deadline of its own, so that only the write can run out of time.
     let unwritten = eventually(
         "the stalled write",
-        stalled.request_with::<_, Value>("session/prompt", json!({}), RequestOptions::new()),
+        stalled.request_with::<_, Value>(
+            "session/prompt",
+            json!({}),
+            RequestOptions::new().without_deadline(),
+        ),
     )
     .await
     .expect_err("expected the write to time out");
 
     let observed = (
-        matches!(unanswered.cause(), Error::Timeout { .. }),
+        matches!(unanswered.cause(), Error::Timeout { operation, .. } if operation == "a JSON-RPC request"),
         told(&unanswered),
-        matches!(unwritten.cause(), Error::Timeout { .. }),
+        matches!(unwritten.cause(), Error::Timeout { operation, .. } if operation == "JSON-RPC frame write"),
         told(&unwritten),
     );
     let expected = (true, (None, false), true, (None, false));
     assert_eq!(
         observed, expected,
-        "expected two timeouts, neither a link shutdown and neither naming a bound: {expected:?} | received {observed:?} ({unanswered:?}, {unwritten:?})"
+        "expected a request that timed out and a write that timed out, neither a link shutdown and neither naming a bound: {expected:?} | received {observed:?} ({unanswered:?}, {unwritten:?})"
     );
 }
 
