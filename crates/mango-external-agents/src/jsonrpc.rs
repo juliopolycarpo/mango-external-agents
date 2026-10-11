@@ -282,12 +282,24 @@ pub trait PeerHandler: Send + Sync {
     /// stream of events arriving meanwhile. A handler that cannot decide should refuse rather than
     /// never return: an unanswered request blocks the vendor on a reply that never comes, which
     /// presents as a hung turn rather than as the failure it is.
+    ///
+    /// On a client made with [`WireOptions::with_request_handoff`] this is called only by the
+    /// default [`on_request_handoff`](Self::on_request_handoff): a handler that overrides
+    /// that one is never asked here and need not write this at all. The default refuses
+    /// with `-32601`, "Method not found", which is what a peer is owed by a handler that
+    /// answers no questions.
     async fn on_request(
         &self,
-        method: String,
-        params: Value,
-        id: RequestId,
-    ) -> ServerRequestOutcome;
+        _method: String,
+        _params: Value,
+        _id: RequestId,
+    ) -> ServerRequestOutcome {
+        ServerRequestOutcome::Failure(JsonRpcError {
+            code: -32601,
+            message: String::from("Method not found"),
+            data: None,
+        })
+    }
 
     /// The peer asked something, on a client made with
     /// [`WireOptions::with_request_handoff`]: the question, and the [`Responder`] that
@@ -1277,9 +1289,21 @@ impl Drop for QueuedAnswer {
 struct Registration {
     id: String,
     answer: oneshot::Sender<Answer>,
-    delivery: Delivery,
+    /// The call's place in the reserve for ordered responses, when it asked for that order.
+    place: Option<QueuedPlace>,
     counted: bool,
     claim: CallClaim,
+}
+
+/// The place an ordered call holds while its request waits in the queue, shared by the frame
+/// and the caller's [`Reply`]. A caller that gives the call up before the frame is written
+/// takes the place out and so gives it back at once: the frame may stay in the queue for as
+/// long as the link is busy, and a call nobody waits on has no use for a place meanwhile.
+type QueuedPlace = Arc<StdMutex<Option<OwnedSemaphorePermit>>>;
+
+/// Takes the place out of where a queued call keeps it, if it is still there.
+fn take_place(place: &QueuedPlace) -> Option<OwnedSemaphorePermit> {
+    place.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 
 struct ClientState {
@@ -1962,6 +1986,9 @@ pub struct Reply {
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
     label: Option<&'static str>,
     ctl: Arc<outbox::FrameCtl>,
+    /// The place the call holds while its request is queued, for a call that asked for its
+    /// answer in order. See [`QueuedPlace`].
+    place: Option<QueuedPlace>,
     /// Takes the call back out from among those awaiting an answer when this is dropped.
     pending: PendingCall,
 }
@@ -2009,7 +2036,13 @@ impl Drop for Reply {
     fn drop(&mut self) {
         // Nobody will hear the answer, so a frame the writer has not taken is not sent at all.
         // One it has taken is left alone: cutting a write off is what breaks a link.
-        self.ctl.withdraw();
+        if self.ctl.withdraw()
+            && let Some(place) = &self.place
+        {
+            // The frame stays in the queue until the writer reaches it. The place does not
+            // wait for that.
+            drop(take_place(place));
+        }
     }
 }
 
@@ -2383,17 +2416,17 @@ impl Client {
         let frame = self
             .state
             .frame(Some(Value::String(id.clone())), method, params)?;
-        let delivery = if ordered {
-            Delivery::Ordered(self.state.ordered_place()?)
+        let place = if ordered {
+            Some(Arc::new(StdMutex::new(Some(self.state.ordered_place()?))))
         } else {
-            Delivery::Immediate
+            None
         };
         let (answer, waiting) = oneshot::channel();
         let claim = self.state.call_claim();
         let registration = Registration {
             id: id.clone(),
             answer,
-            delivery,
+            place: place.clone(),
             counted: !options.outside_pending_budget,
             claim: claim.clone(),
         };
@@ -2408,6 +2441,7 @@ impl Client {
                 deadline: timeout.map(|timeout| (timeout, deadline_after(timeout))),
                 timer: None,
                 label: options.label,
+                place,
                 pending: PendingCall {
                     state: Arc::clone(&self.state),
                     id,
@@ -3292,10 +3326,16 @@ impl ClientState {
         let Registration {
             id,
             answer,
-            delivery,
+            place,
             counted,
             claim,
         } = registration;
+        // A caller that gave the call up a moment ago took the place with it: nothing will be
+        // delivered for that call, in order or otherwise.
+        let delivery = match place.as_ref().and_then(take_place) {
+            Some(place) => Delivery::Ordered(place),
+            None => Delivery::Immediate,
+        };
         let mut pending = self.pending.lock().await;
         if self.closed.load(Ordering::Acquire) {
             drop(pending);

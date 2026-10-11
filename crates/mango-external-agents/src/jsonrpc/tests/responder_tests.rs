@@ -1170,3 +1170,89 @@ async fn a_responder_dropped_with_no_way_to_say_so_ends_the_connection() {
         let _ = connected.client.close().await;
     }
 }
+
+/// Ordered calls given up, more of them than the reserve for ordered responses holds, on one
+/// connection that stays up. A call given up has no further use for its place, whether its
+/// request was written or was still waiting behind a busy link, so the next ordered call
+/// finds one.
+#[tokio::test]
+async fn ordered_calls_given_up_give_their_places_back() {
+    for written_first in [true, false] {
+        let connected = connect(options(), WireOptions::new());
+        let held = if written_first {
+            None
+        } else {
+            Some(hold_the_link(&connected).await)
+        };
+        for _ in 0..70 {
+            let submitted =
+                connected
+                    .client
+                    .submit_request("session/prompt", json!({}), ordered_options());
+            let (written, reply) = match submitted {
+                Ok(submitted) => submitted.into_parts(),
+                Err(error) => panic!(
+                    "expected every ordered call admitted after the one before it was given up (written first: {written_first}): Ok | received {error:?}"
+                ),
+            };
+            if written_first {
+                within("the request written", written)
+                    .await
+                    .expect("expected the request written");
+            }
+            drop(reply);
+        }
+        let places = connected.client.state.ordered_places.available_permits();
+        assert_eq!(
+            places, 64,
+            "expected every place back once its call was given up (written first: {written_first}): 64 | received {places}"
+        );
+        connected.gate.add_permits(1);
+        drop(held);
+        connected
+            .client
+            .close()
+            .await
+            .expect("expected a clean close");
+    }
+}
+
+/// A handler that answers no questions at all, by either path.
+struct SilentHandler;
+
+#[async_trait::async_trait]
+impl PeerHandler for SilentHandler {
+    async fn on_notification(&self, _method: String, _params: Value) {}
+}
+
+/// A handler that writes neither way of answering refuses every question as a method it does
+/// not have, whether or not the client hands questions over.
+#[tokio::test]
+async fn a_handler_that_answers_nothing_refuses_every_question_as_not_found() {
+    for wire_options in [WireOptions::new(), handoff()] {
+        let link = ScriptedLink::new();
+        let client = Client::connect_with(
+            link.clone().into_link(),
+            Arc::new(SilentHandler) as Arc<dyn PeerHandler>,
+            options(),
+            wire_options,
+        );
+        link.push_line(question(1, "anything"));
+
+        sent(&link, 1).await;
+        let written = link.sent();
+        let expected = vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32601, "message": "Method not found" },
+            })
+            .to_string(),
+        ];
+        assert_eq!(
+            written, expected,
+            "expected the question refused as a method not found: {expected:?} | received {written:?}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+}
