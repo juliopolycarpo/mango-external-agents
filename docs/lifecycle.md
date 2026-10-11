@@ -123,7 +123,9 @@ notifications and peer requests, not between them and responses: a response can 
 before the handler has seen a notification that arrived ahead of it. A request made with
 `RequestOptions::after_earlier_notifications` opts out of that for its own answer: the response
 waits in the callback queue and reaches its caller once the handler has returned from every
-notification read before it, and when the peer exits or the link fails it is still delivered (or
+notification read before it (and, on a client that hands questions over, from the hand-off of
+every question read before it; without that option a question only has to have been started),
+and when the peer exits or the link fails it is still delivered (or
 the call failed) only after that queued work has drained, within `shutdown_timeout` (twice that
 when the drain runs out inside a stretch that holds its cancellation off, below). Up to
 `max_pending_requests` such answers have places reserved in the queue apart from the callback

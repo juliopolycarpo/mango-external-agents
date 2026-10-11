@@ -755,7 +755,11 @@ impl RequestOptions {
     ///
     /// What it waits for is the handler returning from each earlier notification. A question the
     /// peer asked earlier ([`PeerHandler::on_request`]) only has to have been started: it is
-    /// answered on a task of its own and does not hold the answer back.
+    /// answered on a task of its own and does not hold the answer back. On a client made with
+    /// [`WireOptions::with_request_handoff`] it waits for more: the handler has to have
+    /// returned from [`PeerHandler::on_request_handoff`] for each earlier question as well,
+    /// though not to have answered it, since a question kept with its
+    /// [`Responder`] is answered later.
     ///
     /// The same order holds when the connection ends. A response that was read before the peer
     /// exited or the link failed still reaches its caller once the notifications ahead of it have
