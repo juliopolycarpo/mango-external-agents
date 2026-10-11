@@ -779,6 +779,9 @@ struct NotificationCall {
     /// Whether the call asked for a [`CancellationHold`]. Read by the handler's task when the
     /// call returns, so a handler that never asks pays nothing for the ones that do.
     asked_for_hold: std::cell::Cell<bool>,
+    /// How many holds this call has out, made on its first. Shared with each hold, which may be
+    /// dropped on another task.
+    holds: std::cell::OnceCell<Arc<AtomicUsize>>,
 }
 
 impl NotificationCall {
@@ -786,6 +789,7 @@ impl NotificationCall {
         Self {
             client,
             asked_for_hold: std::cell::Cell::new(false),
+            holds: std::cell::OnceCell::new(),
         }
     }
 }
@@ -1281,8 +1285,9 @@ impl Drop for WorkerStopped {
 /// Returned by [`Client::hold_cancellation`], and released when dropped.
 #[must_use = "the call may be cancelled again as soon as this is dropped"]
 pub struct CancellationHold {
-    /// `None` for a hold asked for outside a notification call, which holds nothing.
-    state: Option<Arc<ClientState>>,
+    /// The client, and the count of the holds its call has out. `None` for a hold asked for
+    /// outside a notification call, which holds nothing.
+    state: Option<(Arc<ClientState>, Arc<AtomicUsize>)>,
 }
 
 impl std::fmt::Debug for CancellationHold {
@@ -1312,7 +1317,8 @@ impl CancellationHold {
 
 impl Drop for CancellationHold {
     fn drop(&mut self) {
-        if let Some(state) = self.state.take() {
+        if let Some((state, in_call)) = self.state.take() {
+            in_call.fetch_sub(1, Ordering::SeqCst);
             state.release_hold();
         }
     }
@@ -1985,12 +1991,13 @@ impl Client {
     /// therefore either granted, and waited for, or never granted. Ask for it before the first
     /// step of the stretch, not part-way through.
     ///
-    /// Holds nest: one asked for while another is out is granted, and the wait is for the last
-    /// of them to be dropped.
+    /// Holds nest: one asked for while the same call has another out is granted, and the wait
+    /// is for the last of them to be dropped.
     ///
     /// Drop a hold in the call that asked for it. One kept past that call, moved to another
     /// task for one, still counts until it is dropped: an end of the connection waits the
-    /// grace for it while later calls, which hold nothing themselves, go on being made.
+    /// grace for it while later calls go on being made, and a later call that asks for a hold
+    /// of its own by then is refused like any other.
     ///
     /// What a hold does not do:
     ///
@@ -2010,33 +2017,36 @@ impl Client {
         let address = self.state.address();
         let in_own_call = HANDLING_NOTIFICATION_FOR
             .try_with(|call| {
-                let own = call.client == address;
-                if own {
+                (call.client == address).then(|| {
                     call.asked_for_hold.set(true);
-                }
-                own
+                    Arc::clone(call.holds.get_or_init(Arc::default))
+                })
             })
-            .unwrap_or(false);
-        if !in_own_call {
+            .ok()
+            .flatten();
+        let Some(in_call) = in_own_call else {
             return CancellationHold { state: None };
-        }
+        };
         // Counted first, read second; a cancellation raises its flag first and counts the
         // holds second. Whichever the interleaving, either the cancellation sees this hold and
         // waits for it, or this sees the cancellation and takes the hold back.
         //
-        // A hold asked for under one already out is granted whatever the flag says: the
-        // cancellation that raised it counted the earlier hold and is waiting, and refusing
-        // this one would park the very stretch it waits for.
-        let already_holding = self.state.holds.fetch_add(1, Ordering::SeqCst) > 0;
+        // A hold asked for under one this call already has out is granted whatever the flag
+        // says: the cancellation that raised it counted the earlier hold and is waiting, and
+        // refusing this one would park the very stretch it waits for. Only this call's own
+        // holds count for that; one an earlier call kept says nothing about this stretch.
+        self.state.holds.fetch_add(1, Ordering::SeqCst);
+        let already_holding = in_call.fetch_add(1, Ordering::SeqCst) > 0;
         #[cfg(test)]
         ClientState::run_hook(&self.state.after_hold_counted);
         if !already_holding && self.state.cancelling_handler.load(Ordering::SeqCst) {
+            in_call.fetch_sub(1, Ordering::SeqCst);
             self.state.release_hold();
             // The cancellation is on its way to this task. Nothing past this point runs.
             std::future::pending::<()>().await;
         }
         CancellationHold {
-            state: Some(Arc::clone(&self.state)),
+            state: Some((Arc::clone(&self.state), in_call)),
         }
     }
 

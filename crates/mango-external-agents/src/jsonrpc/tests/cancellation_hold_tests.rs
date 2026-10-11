@@ -5,7 +5,7 @@ use super::outbox_tests::{
     eventually, gated, limits, link_held, one_termination, options, until, within,
 };
 use super::*;
-use crate::jsonrpc::{HANDLING_NOTIFICATION_FOR, NotificationCall, WireOptions};
+use crate::jsonrpc::{CancellationHold, HANDLING_NOTIFICATION_FOR, NotificationCall, WireOptions};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex as StdMutex, OnceLock, PoisonError, Weak};
 
@@ -18,6 +18,8 @@ struct Script {
     hold: bool,
     /// The stretch takes a few turns of the scheduler; otherwise it waits at a gate.
     quick: bool,
+    /// The first call keeps its hold past its own end and returns at once.
+    keep_first_hold: bool,
     /// Asks for a second hold inside the stretch, as a helper it calls might.
     nested_hold: bool,
     /// Panics inside the stretch.
@@ -44,6 +46,8 @@ struct HoldingHandler {
     granted: AtomicUsize,
     committed: AtomicUsize,
     before_hold: tokio::sync::Semaphore,
+    /// Holds kept past the call that asked for them.
+    kept: StdMutex<Vec<CancellationHold>>,
     inside: tokio::sync::Semaphore,
     after: tokio::sync::Semaphore,
     /// What the calls made inside the stretch returned.
@@ -87,7 +91,7 @@ impl HoldingHandler {
 #[async_trait::async_trait]
 impl PeerHandler for HoldingHandler {
     async fn on_notification(&self, _method: String, _params: Value) {
-        self.begun.fetch_add(1, Ordering::AcqRel);
+        let first = self.begun.fetch_add(1, Ordering::AcqRel) == 0;
         // Taken for each use and let go again: a handler that kept its client across a wait
         // would keep it from ever being dropped.
         let client = || self.client.get().and_then(Weak::upgrade);
@@ -107,6 +111,13 @@ impl PeerHandler for HoldingHandler {
         } else {
             None
         };
+        if first && self.script.keep_first_hold {
+            self.kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(hold);
+            return;
+        }
         if self.script.quick {
             for _ in 0..3 {
                 tokio::task::yield_now().await;
@@ -189,6 +200,7 @@ fn connect_with(
         granted: AtomicUsize::new(0),
         committed: AtomicUsize::new(0),
         before_hold: tokio::sync::Semaphore::new(0),
+        kept: StdMutex::new(Vec::new()),
         inside: tokio::sync::Semaphore::new(0),
         after: tokio::sync::Semaphore::new(0),
         outcomes: StdMutex::new(Vec::new()),
@@ -221,6 +233,7 @@ const HOLDING: Script = Script {
     park_before_hold: false,
     hold: true,
     quick: false,
+    keep_first_hold: false,
     nested_hold: false,
     panic_inside: false,
     ask_inside: false,
@@ -255,7 +268,11 @@ async fn overflow_behind_the_stretch(
     for _ in 0..3 {
         link.push_line(UPDATE);
     }
-    until("the overflow to end the connection", || client.is_closed()).await;
+    // Closed is not yet decided: the reader raises the flag a step later.
+    until("the overflow to decide the cancellation", || {
+        client.is_closed() && client.state.cancelling_handler.load(Ordering::SeqCst)
+    })
+    .await;
 }
 
 fn spawn_close(client: &Arc<Client>) -> tokio::task::JoinHandle<crate::Result<()>> {
@@ -778,16 +795,26 @@ async fn a_close_that_overtakes_an_outbound_overflow_still_lets_the_handler_be_t
     let _ = within("the close", gated.client.close()).await;
 
     let termination = one_termination(&gated.handler).await;
+    // The reader's own branch for an overflow takes the note of it; found still there, it was
+    // the close's flag the reader answered.
+    let through_the_close = gated
+        .client
+        .state
+        .outbound_overflow
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some();
     assert!(
-        matches!(
-            termination,
-            PeerTermination::OutboundBackpressure {
-                limit: 2,
-                received: 3,
-                ..
-            }
-        ),
-        "expected the handler told the end on record: OutboundBackpressure {{ limit: 2, received: 3 }} | received {termination:?}"
+        through_the_close
+            && matches!(
+                termination,
+                PeerTermination::OutboundBackpressure {
+                    limit: 2,
+                    received: 3,
+                    ..
+                }
+            ),
+        "expected the handler told the end on record by the reader the close stopped: (true, OutboundBackpressure {{ limit: 2, received: 3 }}) | received ({through_the_close}, {termination:?})"
     );
 }
 
@@ -1230,4 +1257,59 @@ async fn a_close_given_up_while_the_handler_is_told_takes_the_reader_down() {
         returned, 0,
         "expected the reader cancelled inside on_terminated: 0 returned | received {returned}"
     );
+}
+
+/// A hold kept past its call does not make later calls look nested. A later call that asks
+/// for a hold of its own after the cancellation was decided is refused like any other, though
+/// the kept hold is still out and still waited for.
+#[tokio::test]
+async fn a_hold_kept_by_an_earlier_call_does_not_get_a_later_one_granted() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            park_before_hold: true,
+            keep_first_hold: true,
+            ..HOLDING
+        },
+    );
+    link.push_line(UPDATE);
+    handler.before_hold.add_permits(1);
+    until("the first call to return with its hold kept", || {
+        handler.progress() == (1, 1, 0)
+            && client.state.holds.load(Ordering::SeqCst) == 1
+            && handler
+                .kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                == 1
+    })
+    .await;
+    link.push_line(UPDATE);
+    until("the second call to begin", || handler.progress().0 == 2).await;
+
+    let held = client.state.cancellation_held();
+    assert!(
+        held,
+        "expected the kept hold counted when the cancellation was decided: true | received false"
+    );
+    handler.before_hold.add_permits(1);
+    until("the second call to ask for its hold", || {
+        HoldingHandler::count(&handler.asked_for_hold) == 2
+    })
+    .await;
+    client.state.stop_notifications().await;
+    let progress = handler.progress();
+    assert_eq!(
+        progress,
+        (2, 1, 0),
+        "expected the second call's hold never granted: (2, 1, 0) | received {progress:?}"
+    );
+    handler
+        .kept
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    client.close().await.expect("expected a clean close");
 }
