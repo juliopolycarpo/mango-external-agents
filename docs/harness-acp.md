@@ -233,7 +233,8 @@ quiet. Once that question is answered, withdrawn or expires, the deadline restar
 so a turn whose approval lapsed stops waiting one idle period later. At the deadline the harness
 sends [`session/cancel`](https://agentclientprotocol.com/protocol/v1/prompt-turn#cancellation)
 exactly as a host cancel would. The turn ends as `Cancelled { reason: Timeout }` when the agent
-answers with `stop_reason: cancelled`, or after `Limits::kill_grace` and a reap when it does not.
+answers, with `stop_reason: cancelled` or with an error of its own, and the session is kept; or
+after `Limits::kill_grace` and a reap when it does not answer.
 There is no floor, unlike the Claude harness's ten minutes: an ACP agent reports a running tool call
 through `tool_call_update`, so a silent one is not a working one.
 

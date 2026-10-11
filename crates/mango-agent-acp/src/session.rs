@@ -1335,9 +1335,11 @@ impl Session for AcpSession {
                     )))),
                     false,
                 )
-            } else if let Some(overflow) = match &outcome {
-                None | Some(Err(_)) => connection.overflow(),
-                Some(Ok(_)) => None,
+            } else if let Some(overflow) = match answered {
+                // An answer this side understood is reported as itself, whatever the agent
+                // did to the connection after giving it.
+                true => None,
+                false => connection.overflow(),
             } {
                 (Some(Ending::Fail(overflow_failure(overflow))), true)
             } else {

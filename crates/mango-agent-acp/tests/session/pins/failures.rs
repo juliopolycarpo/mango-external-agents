@@ -603,27 +603,6 @@ fn permission_ask(id: u32) -> String {
     .to_string()
 }
 
-/// Starts `turn_id` once the session's turn slot is free, within five seconds.
-///
-/// A turn's terminal is published just ahead of the release of its slot, so the next start can
-/// be answered `Busy` for a moment. Bounded, so a slot that is never released fails here.
-async fn start_when_free(session: &dyn Session, turn_id: &str, input: &str) -> TurnStream {
-    let begun = std::time::Instant::now();
-    loop {
-        match session.start_turn(TurnRequest::new(turn_id, input)).await {
-            Ok(turn) => return turn,
-            Err(error) if matches!(error.cause(), Error::Busy) => {
-                assert!(
-                    begun.elapsed() < Duration::from_secs(5),
-                    "expected the turn slot free for {turn_id} within 5s | received: still busy"
-                );
-                tokio::task::yield_now().await;
-            }
-            Err(error) => panic!("expected {turn_id} accepted | received refusal: {error:?}"),
-        }
-    }
-}
-
 /// An agent that refuses a prompt with an error of its own has answered: the connection is as
 /// healthy as after any answer, so the session stays usable, as it does after a `refusal` or a
 /// `max_tokens` stop. The failed turn leaves nothing behind for the next one: the question it
@@ -673,18 +652,25 @@ async fn a_session_takes_another_turn_after_an_agents_error_on_the_prompt() {
         .start_turn(TurnRequest::new("turn-1", "try"))
         .await
         .expect("expected the first turn");
-    let events = event_labels(&drain(&mut first).await);
-    let received = (
-        events
-            .iter()
-            .filter(|label| label.starts_with("ActivityCompleted"))
-            .count(),
-        events.last().map(String::as_str),
+    let events = drain(&mut first).await;
+    let closed: Vec<String> = events
+        .iter()
+        .filter_map(|kind| match kind {
+            EventKind::ActivityCompleted { call_id, result } => {
+                Some(format!("{call_id} {:?}", result.status))
+            }
+            _ => None,
+        })
+        .collect();
+    let labels = event_labels(&events);
+    let received = (closed, labels.last().map(String::as_str));
+    let expected = (
+        vec![String::from("call_1 Failed")],
+        Some("Error(acp-request-failed)"),
     );
-    let expected = (1, Some("Error(acp-request-failed)"));
     assert_eq!(
         received, expected,
-        "expected (calls closed, terminal) of the refused turn: {expected:?} | received: {received:?} in {events:?}"
+        "expected (calls closed, terminal) of the refused turn: {expected:?} | received: {received:?} in {labels:?}"
     );
     eventually("the parked question withdrawn", &launcher, || {
         wire_labels(&launcher)
@@ -716,6 +702,41 @@ async fn a_session_takes_another_turn_after_an_agents_error_on_the_prompt() {
         session.snapshot().status,
         SessionStatus::Ready,
     );
+}
+
+/// An agent that refuses a prompt and then floods the connection has still refused the prompt.
+/// The turn reports the refusal it was given, with the agent's code, and not the budget the
+/// agent went on to pass: that ends the connection, and the session with it, on its own.
+#[tokio::test]
+async fn an_agents_error_followed_by_a_flood_is_still_reported_as_the_error() {
+    let peer = ScriptedPeer::new(|frame| match frame["method"].as_str() {
+        Some("session/prompt") => {
+            let heartbeat = serde_json::json!({ "jsonrpc": "2.0", "method": "$/vendor/heartbeat" });
+            vec![
+                prompt_refusal(&frame["id"]),
+                serde_json::Value::Array(vec![heartbeat; 1_100]).to_string(),
+            ]
+        }
+        _ => Vec::new(),
+    });
+    let (session, launcher) = open_under(peer.process(), Limits::default()).await;
+    let mut lifecycle = session.subscribe();
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "try"))
+        .await
+        .expect("expected a turn");
+
+    assert_events(
+        "the refused turn",
+        &drain(&mut turn).await,
+        &["TurnStarted", "Error(acp-request-failed)"],
+    );
+    assert_status(
+        "after the flood",
+        status_once_settled(&mut lifecycle).await,
+        SessionStatus::Closed,
+    );
+    assert_no_live_children("after the flood", &launcher);
 }
 
 /// A cancel that races the agent's own error is still the host's cancel: the turn ends as
