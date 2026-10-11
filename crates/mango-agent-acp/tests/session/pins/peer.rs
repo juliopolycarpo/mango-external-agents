@@ -377,3 +377,43 @@ async fn an_unreadable_permission_request_is_refused_without_echoing_what_it_car
         "expected (error.data, the secret written back): {expected:?} | received: {received:?} in {refusals:?}"
     );
 }
+
+/// How many requests the cycling test makes behind its prompt.
+const CYCLED_REQUESTS: usize = 3_000;
+
+/// A session that allows one request at a time takes them one after another for as long as a
+/// host likes, with a prompt in flight beside them. The connection gives the place of an
+/// answered request back a moment after its caller is free to ask again, on another thread;
+/// the reserve has one place of slack for exactly that, so no request in the cycle is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_cycled_one_at_a_time_behind_a_prompt_are_all_admitted() {
+    let launcher = FakeLauncher::new();
+    launcher.push(
+        FakeAcpAgent::new()
+            .listing_sessions()
+            .with_updates(Vec::new())
+            .never_finishing_turns()
+            .process(),
+    );
+    let limits = Limits {
+        max_pending_requests: 1,
+        ..Limits::default()
+    };
+    let session = AcpHarness::new(profile())
+        .open_session(&host_with(&launcher, limits), OpenSession::new("chat-1"))
+        .await
+        .expect("expected a session");
+    let _turn = session
+        .start_turn(TurnRequest::new("turn-1", "never finish"))
+        .await
+        .expect("expected a turn");
+
+    for round in 0..CYCLED_REQUESTS {
+        let listed = session.list_sessions(Default::default()).await;
+        assert!(
+            listed.is_ok(),
+            "expected request {round} of {CYCLED_REQUESTS} admitted | received: {:?}",
+            listed.err()
+        );
+    }
+}

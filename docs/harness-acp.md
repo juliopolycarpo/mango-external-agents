@@ -52,7 +52,7 @@ per line each way, and `transport::frame` hands them back as a `Link`. The core'
 | Queued incoming bytes    | `Limits::turn_buffer_bytes`                                              | serialized bytes                    | 8 MiB (8,388,608) | ends the connection      |
 | One outgoing frame       | `HostContext::outbound_buffer_bytes()` (defaults to `turn_buffer_bytes`) | serialized bytes, excluding newline | 8 MiB (8,388,608) | refuses that frame alone |
 | Queued outgoing bytes    | twice `HostContext::outbound_buffer_bytes()`                             | serialized bytes, excluding newline | 16 MiB            | ends the connection      |
-| Queued outgoing frames   | larger of `Limits::turn_channel_capacity` and `max_pending_requests`     | frames                              | 1,024             | ends the connection      |
+| Queued outgoing frames   | the incoming message limit + 3 x `max_pending_requests` + 4              | frames                              | 1,220             | ends the connection      |
 
 Incoming messages are counted individually: a batch is charged one message per member that is a
 notification or a request, and the whole batch is counted before any of it is handled, so a batch

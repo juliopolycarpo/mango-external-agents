@@ -162,6 +162,41 @@ fn message_limit(limits: &Limits) -> usize {
         .max(1)
 }
 
+/// The most frames the outgoing queue may hold, the one being written included.
+///
+/// Sized so that what this side queues on its own account always fits, whatever the agent
+/// does, and only answers the agent itself keeps asking for can fill it. With `r` for
+/// `max_pending_requests`, this side's own frames at one moment are at most:
+///
+/// - the prompt, and the `$/cancel_request` that follows it when it is given up: 2;
+/// - the `r` requests admitted beside it, and a `$/cancel_request` for each: 2`r`;
+/// - the answers to the `r` questions that may be parked, all withdrawn at once by a cancel: `r`;
+/// - `session/cancel`, and the one repeat a cancel that beat its prompt is owed: 2.
+///
+/// That is 3`r` + 4. On top of it the queue takes [`message_limit`] answers to requests the
+/// agent makes and this side answers on the spot (`-32601`, or a question past the cap): the
+/// agent sets how many of those there are, so they are what a queue that fills is made of. For
+/// example, the default limits allow 1,024 + 3 x 64 + 4 = 1,220 frames.
+fn outgoing_frame_limit(limits: &Limits) -> usize {
+    limits
+        .max_pending_requests
+        .saturating_mul(3)
+        .saturating_add(4)
+        .saturating_add(message_limit(limits))
+}
+
+/// The places reserved for answers that wait behind earlier notifications.
+///
+/// Every request this side makes asks for one. `max_pending_requests` requests are admitted at
+/// a time, and the prompt apart from them. One more is slack: the peer gives a place back a
+/// moment after it has handed the answer over, on its own task, while the caller it woke has
+/// already returned its admission and may be asking again. The peer hands answers over one at
+/// a time, so at most one place is ever in that state. For example, the default limits reserve
+/// 66 places.
+fn ordered_places(limits: &Limits) -> usize {
+    limits.max_pending_requests.saturating_add(2)
+}
+
 /// How the connection to one ACP agent speaks and what it holds of the agent's traffic.
 ///
 /// Every bound comes from the host's [`Limits`]:
@@ -174,9 +209,8 @@ fn message_limit(limits: &Limits) -> usize {
 /// - `shutdown_timeout` bounds each stage of closing the connection.
 ///
 /// A request's answer is delivered behind the notifications that arrived before it, which
-/// takes a reserved place per request: `max_pending_requests` of them for the requests this
-/// crate admits, and one more for the prompt, which is admitted apart. The agent's own
-/// questions are answered on a task each, at most as many as could be queued and parked at once.
+/// takes a reserved place per request: [`ordered_places`] of them. The agent's own questions
+/// are handed over one at a time, at most as many out as could be queued and parked at once.
 ///
 /// For example, `client_options(host.limits()).max_pending_notifications` is 1,024 under the
 /// default limits.
@@ -187,7 +221,7 @@ pub(crate) fn client_options(limits: &Limits) -> ClientOptions {
         .with_limits(limits)
         .with_max_pending_notifications(messages)
         .with_max_in_flight_requests(messages.saturating_add(limits.max_pending_requests));
-    options.max_pending_requests = limits.max_pending_requests.saturating_add(1);
+    options.max_pending_requests = ordered_places(limits);
     options
 }
 
@@ -230,7 +264,7 @@ pub(crate) fn wire_options(limits: &Limits, outbound_buffer_bytes: usize) -> Wir
     WireOptions::new()
         .with_max_outbound_frame_bytes(outbound_buffer_bytes)
         .with_max_outbound_queued_bytes(queued_bytes_limit(outbound_buffer_bytes))
-        .with_max_outbound_queued_frames(message_limit(limits))
+        .with_max_outbound_queued_frames(outgoing_frame_limit(limits))
         .with_batch_decoding()
         .with_parse_error_replies(PARSE_ERROR_REPLIES)
         .with_cancel_on_abandon(PROTOCOL_LEVEL_METHOD_NAMES.cancel_request)
@@ -241,7 +275,8 @@ pub(crate) fn wire_options(limits: &Limits, outbound_buffer_bytes: usize) -> Wir
 mod tests {
     use super::Budget;
     use super::{
-        Overflow, client_options, message_limit, outgoing_budget, queued_bytes_limit, wire_options,
+        Overflow, client_options, message_limit, ordered_places, outgoing_budget,
+        outgoing_frame_limit, queued_bytes_limit, wire_options,
     };
     use mango_external_agents::jsonrpc::{
         Client, ClientOptions, ConnectionEnd, PeerHandler, PeerTermination, ServerRequestOutcome,
@@ -463,6 +498,45 @@ mod tests {
     }
 
     #[test]
+    fn the_frame_limit_holds_this_sides_own_frames_on_top_of_the_message_limit() {
+        // (turn_channel_capacity, max_pending_requests) -> message limit + 3 requests' worth + 4.
+        let cases = [
+            ((1, 1), 1 + 3 + 4),
+            ((2, 4), 4 + 12 + 4),
+            ((1_024, 64), 1_024 + 192 + 4),
+            ((usize::MAX, usize::MAX), usize::MAX),
+        ];
+        for ((turn_channel_capacity, max_pending_requests), expected) in cases {
+            let limits = Limits {
+                turn_channel_capacity,
+                max_pending_requests,
+                ..Limits::default()
+            };
+            let received = outgoing_frame_limit(&limits);
+            assert_eq!(
+                received, expected,
+                "expected the frame limit for ({turn_channel_capacity}, {max_pending_requests}): {expected} | received: {received}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ordered_places_are_the_requests_the_prompt_and_one_of_slack() {
+        let cases = [(1, 3), (64, 66), (usize::MAX, usize::MAX)];
+        for (max_pending_requests, expected) in cases {
+            let limits = Limits {
+                max_pending_requests,
+                ..Limits::default()
+            };
+            let received = ordered_places(&limits);
+            assert_eq!(
+                received, expected,
+                "expected the ordered places for {max_pending_requests} requests: {expected} | received: {received}"
+            );
+        }
+    }
+
+    #[test]
     fn the_client_options_take_every_bound_from_the_hosts_limits() {
         let limits = Limits {
             turn_channel_capacity: 8,
@@ -487,7 +561,7 @@ mod tests {
             "acp",
             true,
             8,
-            4,
+            5,
             11,
             4_096,
             limits.request_timeout,
@@ -515,7 +589,7 @@ mod tests {
             wire.parse_error_replies(),
             wire.cancel_on_abandon(),
         );
-        let expected = (4_096, 8_192, 8, true, Some(8), Some("$/cancel_request"));
+        let expected = (4_096, 8_192, 21, true, Some(8), Some("$/cancel_request"));
         assert_eq!(
             received, expected,
             "expected (frame bytes, queued bytes, queued frames, batches, parse replies, cancel method): {expected:?} | received: {received:?}"
