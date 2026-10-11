@@ -242,3 +242,93 @@ async fn a_close_during_the_refusal_commit_waits_for_it() {
 
     running.assert_the_refusal_was_committed("a close");
 }
+
+/// A `session/request_permission` line under `id`, offering one way to allow and one to refuse.
+fn ask_line(id: u32) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+        "params": {
+            "sessionId": "session-1",
+            "toolCall": { "toolCallId": "call-ask", "title": "Run tests" },
+            "options": [
+                { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                { "optionId": "reject", "name": "Reject", "kind": "reject_once" },
+            ],
+        }
+    })
+    .to_string()
+}
+
+/// A host that answers a question after the connection ended under it, and before the turn's
+/// owner has swept it, is not told the agent failed: the answer came too late, which is
+/// `AlreadyResolved`, and the question it was shown is closed as withdrawn so its dialog does
+/// not stay open.
+#[tokio::test]
+async fn a_host_answer_after_the_connection_ended_closes_the_question_as_withdrawn() {
+    let mut running = RunningTurn::start().await;
+    running.agent.announce(ask_line(77));
+    let question = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), running.events.recv())
+            .await
+            .expect("expected the question announced within 5s")
+            .expect("expected an open stream");
+        if let EventKind::ApprovalRequested { request } = event.kind {
+            break request;
+        }
+    };
+
+    running.agent.announce(flood());
+    running.connection.ended().cancelled().await;
+
+    let refusal = question.deny().expect("expected a refusing option");
+    let answered = running.state.answer(&refusal);
+    running
+        .turn
+        .approvals
+        .flush(&running.turn.sink)
+        .await
+        .expect("expected the resolution delivered");
+    let mut resolutions = Vec::new();
+    while let Ok(event) = running.events.try_recv() {
+        if let EventKind::ApprovalResolved { decision, .. } = event.kind {
+            resolutions.push(format!("{:?}", decision.source));
+        }
+    }
+    let received = (format!("{answered:?}"), resolutions);
+    let expected = (
+        String::from("Ok(AlreadyResolved)"),
+        vec![String::from("Cancelled")],
+    );
+    assert_eq!(
+        received, expected,
+        "expected (the answer's result, resolutions shown to the host): {expected:?} | received: {received:?}"
+    );
+}
+
+/// A request made on a connection that has already ended is refused with what ended it, and
+/// marked not submitted: none of it was queued, so a host may send it again elsewhere.
+#[tokio::test]
+async fn a_request_refused_by_an_ended_connection_is_marked_not_submitted() {
+    let running = RunningTurn::start().await;
+    running.agent.announce(flood());
+    running.connection.ended().cancelled().await;
+
+    let refused = super::submit(
+        &running.connection,
+        agent_client_protocol_schema::v1::ListSessionsRequest::new(),
+    )
+    .err()
+    .expect("expected the request refused");
+    let received = (
+        matches!(
+            refused.cause(),
+            mango_external_agents::Error::LimitExceeded { .. }
+        ),
+        refused.dispatch(),
+    );
+    let expected = (true, mango_external_agents::Dispatch::NotSubmitted);
+    assert_eq!(
+        received, expected,
+        "expected (the budget that ended the connection, dispatch): {expected:?} | received: {received:?} from {refused:?}"
+    );
+}

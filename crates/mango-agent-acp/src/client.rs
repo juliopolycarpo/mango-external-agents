@@ -186,26 +186,51 @@ impl PendingApproval {
     /// [`PermissionRequest::deny`](mango_external_agents::PermissionRequest::deny), which can only
     /// return one of them. The fallback to [`ApprovalDecision::unresolved`] is defence in depth for
     /// an id that somehow is not among them, not a path this harness's own callers can reach.
+    ///
+    /// A connection that no longer takes the answer has ended under the question. Nothing was
+    /// decided as far as the agent knows, so the host hears what a withdrawal says, when it was
+    /// ever told about the question, and the answer reads as one that came too late:
+    /// [`Answered::AlreadyResolved`]. It is not an error of the agent's, and not one a host
+    /// could act on.
     fn respond_with_resolution(
         self,
         response: RequestPermissionResponse,
         option_id: String,
         source: DecisionSource,
-    ) -> agent_client_protocol_schema::v1::Result<()> {
-        let decision = self
-            .question
+    ) -> Answered {
+        let Self {
+            reply,
+            question,
+            announced,
+            turn,
+            ..
+        } = self;
+        let decision = question
             .options
             .iter()
             .find(|option| option.id == option_id)
             .map(|option| ApprovalDecision::from_option(option, source))
             .unwrap_or_else(|| ApprovalDecision::unresolved(option_id, source));
         let event = EventKind::ApprovalResolved {
-            interaction_id: self.question.id().clone(),
+            interaction_id: question.id().clone(),
             decision,
         };
-        self.turn
+        let taken = turn
             .approvals
-            .record_response(event, || self.reply.respond(response))
+            .record_response(event, || reply.respond(response));
+        if taken.is_ok() {
+            return Answered::Sent;
+        }
+        if announced {
+            turn.approvals.push(EventKind::ApprovalResolved {
+                interaction_id: question.id().clone(),
+                decision: ApprovalDecision::unresolved(
+                    WITHDRAWN_OPTION_ID,
+                    DecisionSource::Cancelled,
+                ),
+            });
+        }
+        Answered::AlreadyResolved
     }
 }
 
@@ -915,8 +940,7 @@ impl SessionState {
                 &requested.outcome
             {
                 let option_id = outcome.option_id.to_string();
-                pending.respond_with_resolution(requested, option_id, source)?;
-                return Ok(Answered::Sent);
+                return Ok(pending.respond_with_resolution(requested, option_id, source));
             }
             pending.reply.respond(requested)?;
             return Ok(Answered::Sent);
@@ -946,7 +970,7 @@ impl SessionState {
         };
         let outcome = permission::selected(option_id);
         let option_id = option_id.clone();
-        pending.respond_with_resolution(outcome, option_id, DecisionSource::Expired)?;
+        pending.respond_with_resolution(outcome, option_id, DecisionSource::Expired);
         Ok(Answered::AlreadyResolved)
     }
 
@@ -1789,7 +1813,8 @@ impl ConnectionHandle {
     ///
     /// - A frame over the outgoing budget is that budget, marked not submitted: the refusal is of
     ///   this request alone.
-    /// - On a connection that has ended, the same failure a request in flight would have had.
+    /// - On a connection that has ended, the same failure a request in flight would have had,
+    ///   marked not submitted too: nothing of this request was queued.
     /// - Anything else as the peer gave it.
     fn refused(&self, method: &str, error: Error) -> Error {
         if let Some(overflow) = Overflow::from_refused_frame(&error) {
@@ -1798,7 +1823,9 @@ impl ConnectionHandle {
                 .with_dispatch(mango_external_agents::Dispatch::NotSubmitted);
         }
         if self.client.ended().is_some() {
-            return self.link_closed_under(method);
+            return self
+                .link_closed_under(method)
+                .with_dispatch(mango_external_agents::Dispatch::NotSubmitted);
         }
         error
     }
