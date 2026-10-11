@@ -1842,6 +1842,9 @@ pub(crate) fn overflow_failure(overflow: crate::transport::Overflow) -> VendorEr
 }
 
 #[cfg(test)]
+mod commit_hold_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
