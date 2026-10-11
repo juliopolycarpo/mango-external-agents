@@ -4,8 +4,8 @@
 //! pin what a close given up leaves behind, they were not written to fail first. Where they ask
 //! whether the link is still open they ask the sender itself, which is the child's input and
 //! bypasses the client's own refusal of writes; what a caller can do is asked of the client.
-//! The last covers a second close made while the first is held and never polled again, inside the
-//! closing of the link; it pins behaviour too.
+//! The last two cover a second close made while the first is held and never polled again. The
+//! first of those failed before the wait for the reader was bounded; the second pins behaviour.
 
 use super::outbox_tests::{gated, link_held, methods, options, until, within};
 use super::*;
@@ -196,6 +196,97 @@ async fn a_close_cut_behind_a_held_write_writes_nothing_queued_and_a_second_fini
     assert_eq!(
         observed, expected,
         "expected the close parked on the held write and cut there, the link unusable, only the held frame on the wire, the queued notification and request refused, a second close to finish and the handler told nothing: {expected:?} | received {observed:?}"
+    );
+}
+
+/// A handler whose `on_terminated` does not return until the test lets it.
+struct ParkedTermination {
+    entered: AtomicUsize,
+    returned: AtomicUsize,
+    gate: Semaphore,
+}
+
+impl ParkedTermination {
+    fn arc() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicUsize::new(0),
+            returned: AtomicUsize::new(0),
+            gate: Semaphore::new(0),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for ParkedTermination {
+    async fn on_notification(&self, _method: String, _params: Value) {}
+
+    async fn on_terminated(&self, _termination: PeerTermination) {
+        self.entered.fetch_add(1, Ordering::AcqRel);
+        self.gate
+            .acquire()
+            .await
+            .expect("expected the termination gate to stay open")
+            .forget();
+        self.returned.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// A second close made while the first is held, never to be polled again, inside its wait for the
+/// handler to be told that the peer exited. The first keeps the reader's lock, and the second gives
+/// up there within the bound a close documents, twice `shutdown_timeout`, with a `Timeout` that
+/// names the reader and is not the link's: the link was closed. It does not wait for good.
+#[tokio::test(start_paused = true)]
+async fn a_second_close_gives_up_on_a_first_held_while_the_handler_is_being_told() {
+    let link = ScriptedLink::new();
+    let handler = ParkedTermination::arc();
+    let client = Client::connect(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    link.end();
+    until("the handler to be told of the exit", || {
+        handler.entered.load(Ordering::Acquire) == 1
+    })
+    .await;
+    let mut first: Closing = Box::pin(client.close());
+    park("the first close", &mut first).await;
+    let holds_the_reader = client.pump.try_lock().is_err();
+
+    let began = tokio::time::Instant::now();
+    let bound = shutdown() * 2;
+    let second = tokio::time::timeout(bound * 5, client.close()).await;
+    let waited = began.elapsed();
+    let outcome = match &second {
+        Ok(Ok(())) => String::from("closed cleanly"),
+        Ok(Err(error)) => format!("{error:?}"),
+        Err(_) => String::from("still waiting"),
+    };
+    let observed = (
+        holds_the_reader,
+        matches!(&second, Ok(Err(Error::Timeout { operation, .. })) if operation.contains("reader")),
+        matches!(&second, Ok(Err(error)) if is_link_shutdown_timeout(error)),
+        waited <= bound,
+    );
+    assert_eq!(
+        observed,
+        (true, true, false, true),
+        "expected the first close holding the reader and the second giving up with a reader timeout, not the link's, within 2x shutdown_timeout ({bound:?}): (true, true, false, true) | received {observed:?}: the second close {outcome} after {waited:?}"
+    );
+
+    // The first is let go: the reader it holds is taken down with it, mid-call, and the handler's
+    // call never returns. A third close has nothing left to wait for.
+    drop(first);
+    let third = within("the third close", client.close()).await;
+    let told = (
+        handler.entered.load(Ordering::Acquire),
+        handler.returned.load(Ordering::Acquire),
+        third.is_ok(),
+    );
+    assert_eq!(
+        told,
+        (1, 0, true),
+        "expected the handler's call cut by the first close being dropped and a third close to finish: (1, 0, true) | received {told:?}"
     );
 }
 

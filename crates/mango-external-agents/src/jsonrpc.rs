@@ -292,6 +292,11 @@ impl OutboundBound {
 /// What a [`Client::close`] that ran out of its grace names as the call that stalled.
 const LINK_SHUTDOWN: &str = "JSON-RPC link shutdown";
 
+/// What a [`Client::close`] that ran out of its bound waiting for another close to let go of the
+/// reader names as the call that stalled. The link was dealt with by then, which is why this is
+/// not [`LINK_SHUTDOWN`].
+const READER_SHUTDOWN: &str = "JSON-RPC reader shutdown";
+
 /// Whether `error` is a [`Client::close`] that gave up: closing the link, behind whatever
 /// was still queued for it, did not finish within
 /// [`ClientOptions::shutdown_timeout`]. The link may still be open and the peer still
@@ -3101,7 +3106,11 @@ impl Client {
     /// # Errors
     ///
     /// [`Error::Link`] when closing the link itself failed, [`Error::Timeout`] when the link
-    /// could not be reached within `shutdown_timeout`.
+    /// could not be reached within `shutdown_timeout` (that one is
+    /// [`is_link_shutdown_timeout`]), and [`Error::Timeout`] naming the reader when another
+    /// close that holds it was still waiting for the handler to be told after this one's bound
+    /// of twice `shutdown_timeout` had run out. The link is closed by then. Nothing in the
+    /// second case waits for good, whether or not the other close is ever polled again.
     pub async fn close(&self) -> Result<()> {
         // Stored before the drain rather than inside it, and that order is the contract `call`
         // reads: a caller that finds the map open has, by that fact, arrived before this store,
@@ -3169,8 +3178,15 @@ impl Client {
             return closed;
         }
         // The lock is kept across the wait, so that a second close waits for the handler to be
-        // told as the first one does.
-        let mut reader = self.pump.lock().await;
+        // told as the first one does. Not for longer than a close may take: a first close that
+        // was kept and is never polled again holds it for good, and this close must still end.
+        let Ok(mut reader) = tokio::time::timeout_at(latest, self.pump.lock()).await else {
+            // The link was dealt with above, and a failure to close it is the better answer.
+            return closed.and(Err(Error::Timeout {
+                operation: String::from(READER_SHUTDOWN),
+                after: self.state.options.shutdown_timeout.saturating_mul(2),
+            }));
+        };
         if let Some(pump) = reader.take() {
             // The reader of a connection that ended under this side is on its way to telling
             // the handler so, or is telling it. It is owed that call whole, so it is waited for
