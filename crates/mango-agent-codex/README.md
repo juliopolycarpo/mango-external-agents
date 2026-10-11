@@ -5,8 +5,8 @@ OpenAI Codex harness for
 
 ```toml
 [dependencies]
-mango-external-agents = "0.5"
-mango-agent-codex = "0.5"
+mango-external-agents = "0.6"
+mango-agent-codex = "0.6"
 ```
 
 Drives the `codex` CLI the user already installed, through `codex app-server` — the interface
