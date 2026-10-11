@@ -124,7 +124,8 @@ before the handler has seen a notification that arrived ahead of it. A request m
 `RequestOptions::after_earlier_notifications` opts out of that for its own answer: the response
 waits in the callback queue and reaches its caller once the handler has returned from every
 notification read before it, and when the peer exits or the link fails it is still delivered (or
-the call failed) only after that queued work has drained, within `shutdown_timeout`. Up to
+the call failed) only after that queued work has drained, within `shutdown_timeout` (twice that
+when the drain runs out inside a stretch that holds its cancellation off, below). Up to
 `max_pending_requests` such answers have places reserved in the queue apart from the callback
 budgets, so callback pressure cannot refuse one. `Client::close` and callback queue pressure fail
 such a call at once. Request deadlines include

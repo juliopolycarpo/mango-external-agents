@@ -663,8 +663,10 @@ impl RequestOptions {
     /// The same order holds when the connection ends. A response that was read before the peer
     /// exited or the link failed still reaches its caller once the notifications ahead of it have
     /// been handled, and a request the peer never answered fails only after that drain, which
-    /// [`ClientOptions::shutdown_timeout`] bounds. [`Client::close`] and a queue overflow do not
-    /// drain: they fail the call at once.
+    /// [`ClientOptions::shutdown_timeout`] bounds, or twice that when the drain runs out inside
+    /// a stretch under a [`CancellationHold`]. [`Client::close`] and a queue overflow do not
+    /// drain: they fail the call at once, or, for an answer already queued behind such a
+    /// stretch, when the stretch is over.
     ///
     /// A request [`without_deadline`](Self::without_deadline) waits in that queue for as long
     /// as the handler takes: an `on_notification` that never returns holds its answer back
@@ -874,6 +876,9 @@ impl NotificationCall {
 pub struct Client {
     state: Arc<ClientState>,
     pump: Mutex<Option<JoinHandle<()>>>,
+    /// The reader's task, so that a close can tell it is being made from that task without
+    /// taking the lock a close that waits for the reader holds.
+    reader: tokio::task::Id,
 }
 
 /// How a connection came to its end.
@@ -1717,6 +1722,7 @@ impl Client {
         let pump = tokio::spawn(pump(Arc::clone(&state), receiver, handler, notifications));
         Self {
             state,
+            reader: pump.id(),
             pump: Mutex::new(Some(pump)),
         }
     }
@@ -2231,20 +2237,18 @@ impl Client {
         giving_up.reached_the_link = closed.is_ok();
         drop(giving_up);
         let closed = closed.and_then(std::convert::identity);
-        let pump = {
-            let mut pump = self.pump.lock().await;
-            // A handler that closes its client from `on_terminated` is on the reader's own
-            // task, in the last thing that task does. The reader is left where it is, to
-            // return from that call: taking it down here would cut the call short, and
-            // waiting for it would be waiting for this.
-            let on_the_reader = pump
-                .as_ref()
-                .is_some_and(|pump| tokio::task::try_id() == Some(pump.id()));
-            if on_the_reader { None } else { pump.take() }
-            // The lock is let go before anything is waited for: a close made from
-            // `on_terminated` while this one waits for that call must not queue up behind it.
-        };
-        if let Some(pump) = pump {
+        // A handler that closes its client from `on_terminated` is on the reader's own task, in
+        // the last thing that task does. The reader is left where it is, to return from that
+        // call: taking it down here would cut the call short, and waiting for it would be
+        // waiting for this. Decided without the lock, which a close that is waiting for that
+        // very call holds.
+        if tokio::task::try_id() == Some(self.reader) {
+            return closed;
+        }
+        // The lock is kept across the wait, so that a second close waits for the handler to be
+        // told as the first one does.
+        let mut reader = self.pump.lock().await;
+        if let Some(pump) = reader.take() {
             // The reader of a connection that ended under this side is on its way to telling
             // the handler so, or is telling it. It is owed that call whole, so it is waited for
             // with what is left of the time this close may take.
@@ -2602,8 +2606,13 @@ impl ClientState {
         {
             // The queue had its time. A stretch held at this moment is given the same bounded
             // wait as on the ends that do not drain, and no hold is granted from here on.
+            //
+            // The shutdown flag goes up first and the answers still owed to the peer are
+            // written meanwhile, as on those ends, so the two waits overlap and the handler
+            // is told within two graces of the end, held or not.
             if self.cancellation_held() {
-                self.wait_for_holds().await;
+                self.shutdown.cancel();
+                tokio::join!(self.wait_for_holds(), self.drain_in_flight());
             }
             handle.abort();
             let _ = handle.await;

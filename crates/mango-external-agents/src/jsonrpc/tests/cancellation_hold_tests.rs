@@ -59,6 +59,7 @@ struct HoldingHandler {
     terminated: Notify,
     termination_gate: tokio::sync::Semaphore,
     terminations_returned: AtomicUsize,
+    termination_returned: Notify,
 }
 
 impl HoldingHandler {
@@ -187,6 +188,7 @@ impl PeerHandler for HoldingHandler {
             let _ = client.close().await;
         }
         self.terminations_returned.fetch_add(1, Ordering::AcqRel);
+        self.termination_returned.notify_one();
     }
 }
 
@@ -215,6 +217,7 @@ fn connect_with(
         terminated: Notify::new(),
         termination_gate: tokio::sync::Semaphore::new(0),
         terminations_returned: AtomicUsize::new(0),
+        termination_returned: Notify::new(),
     });
     let client = Arc::new(Client::connect_with(
         link.clone().into_link(),
@@ -1261,9 +1264,10 @@ async fn a_close_made_from_on_terminated_lets_that_call_return() {
     );
     let began = tokio::time::Instant::now();
     link.end();
-    until("on_terminated to return", || {
-        HoldingHandler::count(&handler.terminations_returned) == 1 || began.elapsed() > GRACE
-    })
+    eventually(
+        "on_terminated to return",
+        handler.termination_returned.notified(),
+    )
     .await;
     let observed = (
         began.elapsed(),
@@ -1568,4 +1572,77 @@ async fn the_drain_deadline_is_one_grace_for_a_call_and_two_for_a_held_stretch()
         );
         client.close().await.expect("expected a clean close");
     }
+}
+
+/// Two closes from the host while the handler is being told: both wait for it. The second does
+/// not return early for finding the reader already taken by the first.
+#[tokio::test(start_paused = true)]
+async fn two_closes_at_once_both_wait_for_the_handler_to_be_told() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            park_termination: true,
+            ..NOT_HOLDING
+        },
+    );
+    link.end();
+    eventually("the termination to begin", handler.terminated.notified()).await;
+    let began = tokio::time::Instant::now();
+    let first = spawn_close(&client);
+    let second = spawn_close(&client);
+    tokio::time::sleep(GRACE / 4).await;
+    let waiting = (first.is_finished(), second.is_finished());
+    assert_eq!(
+        waiting,
+        (false, false),
+        "expected both closes waiting while the handler is being told: (false, false) | received {waiting:?}"
+    );
+
+    handler.termination_gate.add_permits(1);
+    for closing in [first, second] {
+        eventually("the close", closing)
+            .await
+            .expect("expected the close task to finish")
+            .expect("expected a clean close");
+    }
+    let observed = (
+        began.elapsed(),
+        HoldingHandler::count(&handler.terminations_returned),
+    );
+    assert_eq!(
+        observed,
+        (GRACE / 4, 1),
+        "expected both closes over when the handler had been told: (50ms, 1) | received {observed:?}"
+    );
+}
+
+/// The drain's deadline overlaps its wait for a held stretch with the one for the answers
+/// still owed to the peer: a stretch and a question that both never finish cost the end of
+/// the connection two graces, not three.
+#[tokio::test(start_paused = true)]
+async fn the_drain_deadline_waits_for_a_held_stretch_and_the_answers_owed_at_once() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(&link, HOLDING);
+    inside_the_stretch(&link, &handler).await;
+    let began = tokio::time::Instant::now();
+    link.end();
+    tokio::time::sleep(GRACE + GRACE / 2).await;
+    let observed = (
+        client.state.shutdown.is_cancelled(),
+        handler.terminations().len(),
+    );
+    assert_eq!(
+        observed,
+        (true, 0),
+        "expected the shutdown flag up while the stretch is waited for past the drain: (true, 0) | received {observed:?}"
+    );
+    eventually("the termination", handler.terminated.notified()).await;
+    let waited = began.elapsed();
+    assert_eq!(
+        waited,
+        GRACE * 2,
+        "expected the handler told two graces after the end: 400ms | received {waited:?}"
+    );
+    client.close().await.expect("expected a clean close");
 }
