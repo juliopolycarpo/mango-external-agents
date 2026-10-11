@@ -970,7 +970,10 @@ impl AcpHarness {
             // Fallback: a fresh conversation, and the host is told why rather than left to notice
             // that its history disappeared.
             Err(error) if resume_failure_is_conclusive(&error) => {
-                let reason = resume_fallback_reason("session/load", &error);
+                let reason = resume_fallback_reason(
+                    agent_client_protocol_schema::v1::AGENT_METHOD_NAMES.session_load,
+                    &error,
+                );
                 connection_state.abandon_native_session();
                 let mut opened = self
                     .new_session(connection, connection_state, cwd, mcp_servers)
@@ -1071,7 +1074,7 @@ fn resume_failure_is_conclusive(error: &Error) -> bool {
     matches!(
         error.cause(),
         Error::Vendor(vendor)
-            if vendor.request_id.as_deref() == Some("session/load")
+            if vendor.request_id.as_deref() == Some(agent_client_protocol_schema::v1::AGENT_METHOD_NAMES.session_load)
                 && vendor.vendor_code.as_deref() == Some("-32002")
     )
 }

@@ -1597,7 +1597,7 @@ fn prompt_ending(
         // with its code, and not a link that closed: the same failure a refused
         // `session/new` is reported as.
         return Some(Ending::Fail(crate::error::vendor_error(
-            "session/prompt",
+            <PromptRequest as client::AgentRequest>::METHOD,
             refusal,
         )));
     }

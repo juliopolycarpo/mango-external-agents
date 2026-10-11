@@ -1102,7 +1102,12 @@ impl SessionState {
         };
         let answered = self
             .respond_pending(response.interaction_id.as_str(), outcome, response.source)
-            .map_err(|error| Error::Vendor(vendor_error("session/request_permission", &error)))?;
+            .map_err(|error| {
+                Error::Vendor(vendor_error(
+                    CLIENT_METHOD_NAMES.session_request_permission,
+                    &error,
+                ))
+            })?;
         match alive {
             true => Ok(answered),
             false => Ok(Answered::AlreadyResolved),
