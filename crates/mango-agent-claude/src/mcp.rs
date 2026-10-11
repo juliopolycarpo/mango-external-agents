@@ -351,6 +351,20 @@ pub(crate) fn release_lease(file: Option<std::sync::Arc<ConfigFile>>) {
     }
 }
 
+/// Releases a start's lease once the stop of the child it launched has an outcome.
+///
+/// A stop that reaped the child leaves nothing that can read the file, so the lease goes the way
+/// every lease does. A stop that failed leaves a child that may still read it, and this lease can
+/// be the last reference when a close already gave its own up. The file is then marked to stay on
+/// disk before the reference is dropped, exactly as a close does for a stop that failed under it.
+pub(crate) async fn release_after_stop(file: Option<std::sync::Arc<ConfigFile>>, reaped: bool) {
+    if let Some(file) = file.as_ref().filter(|_| !reaped) {
+        file.preserve
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    release_off_worker(file).await;
+}
+
 /// Keeps an MCP artifact on disk after native cleanup failed.
 ///
 /// A still-running Claude child may read this file after a bounded process stop reports failure.
@@ -983,6 +997,62 @@ mod tests {
         assert!(
             !directory.exists(),
             "expected the artifact to be gone, received {directory:?}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A reference a close gives up touches no filesystem while another holder remains, and
+    /// removes the artifact when it turns out to be the last one.
+    #[test]
+    fn a_lease_given_up_removes_the_artifact_only_when_it_is_the_last() {
+        use std::sync::Arc;
+
+        let scratch = tempdir();
+        let file = Arc::new(
+            ConfigFile::write_with(&servers(), &scratch, &super::PrivateFileWriter)
+                .expect("expected a file")
+                .expect("expected servers to produce one"),
+        );
+        let directory = file
+            .path()
+            .parent()
+            .expect("a file sits in a directory")
+            .to_path_buf();
+
+        super::release_lease(Some(Arc::clone(&file)));
+        assert!(
+            directory.exists(),
+            "expected the artifact to stay while another lease holds it | received {directory:?} gone"
+        );
+        // No runtime on this thread, so the last reference is dropped where it stands.
+        super::release_lease(Some(file));
+        assert!(
+            !directory.exists(),
+            "expected the last lease to remove the artifact | received {directory:?} still on disk"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A lease released after a stop that failed leaves the file for the host, even as the last.
+    #[tokio::test]
+    async fn a_lease_released_after_a_failed_stop_keeps_the_artifact() {
+        use std::sync::Arc;
+
+        let scratch = tempdir();
+        let file = ConfigFile::write(&servers(), &scratch)
+            .await
+            .expect("expected a file")
+            .expect("expected servers to produce one");
+        let directory = file
+            .path()
+            .parent()
+            .expect("a file sits in a directory")
+            .to_path_buf();
+
+        super::release_after_stop(Some(Arc::new(file)), false).await;
+        assert!(
+            directory.exists(),
+            "expected a failed stop to keep the artifact | received {directory:?} gone"
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }

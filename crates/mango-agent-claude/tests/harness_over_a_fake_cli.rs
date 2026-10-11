@@ -4055,6 +4055,74 @@ mod mcp_passthrough {
         );
     }
 
+    /// The late child's stop can fail too, and the close that would have kept the artifact for
+    /// that case has already returned. The start is then the last holder of the file, and a child
+    /// it could not reap may still read it, so the file stays for the host to reclaim.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_child_whose_stop_fails_keeps_its_mcp_artifact() {
+        let launcher = Arc::new(
+            FakeClaudeCli::new()
+                .with_help(HELP_2_1_270)
+                .with_turn(Run::stalling::<[String; 0], String>([]))
+                .with_slow_stop(support::SlowStop {
+                    interrupt: None,
+                    kill: Duration::from_secs(24 * 60 * 60),
+                    kill_ends_child: false,
+                }),
+        );
+        let gate = launcher.gate_turn_spawns();
+        let session: Arc<dyn Session> = Arc::from(open_with_servers(&launcher).await);
+
+        let starting = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .start_turn(TurnRequest::new("turn-1", "start something long"))
+                    .await
+                    .map(drop)
+            }
+        });
+        gate.wait_for_spawn().await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(60 * 60),
+            session.close(CloseReason::Requested),
+        )
+        .await
+        .expect("expected the close to stop waiting for the launch | received a close still pending after an hour")
+        .expect_err("expected the close to report the launch it stopped waiting for");
+        assert!(
+            matches!(error.cause(), Error::Timeout { operation, .. } if operation == "a pending Claude launch"),
+            "expected Error::Timeout naming a pending Claude launch | received {error:?}"
+        );
+
+        gate.release();
+        let outcome = tokio::time::timeout(Duration::from_secs(60 * 60), starting)
+            .await
+            .expect("expected the start to return once its stop ran out of time | received a start still pending after an hour")
+            .expect("expected the start task to finish");
+        assert!(
+            matches!(outcome, Err(ref error) if matches!(error.cause(), Error::Timeout { operation, .. } if operation == "process-tree termination")),
+            "expected the start to report the stop that failed | received {outcome:?}"
+        );
+        let argv = launcher.turn_argvs().pop().expect("expected a turn launch");
+        let path = std::path::PathBuf::from(
+            value_after(&argv, "--mcp-config").expect("expected the config argument"),
+        );
+        assert_eq!(
+            (launcher.a_child_is_running(), path.exists()),
+            (true, true),
+            "expected an unreaped child to keep its MCP artifact | received (child running, artifact on disk) = ({}, {})",
+            launcher.a_child_is_running(),
+            path.exists()
+        );
+
+        launcher.end_turns_for_host_cleanup();
+        let _ = std::fs::remove_dir_all(
+            path.parent()
+                .expect("expected the config file to have a private directory"),
+        );
+    }
+
     /// The same close, over a start whose caller already went away. Nobody is left to poll that
     /// start, so the guard it left behind is what reaps the child once the launcher returns it.
     #[tokio::test(start_paused = true)]
@@ -4080,10 +4148,13 @@ mod mcp_passthrough {
         starting.abort();
         let _ = starting.await;
 
-        let error = session
-            .close(CloseReason::Requested)
-            .await
-            .expect_err("expected the close to report the launch it stopped waiting for");
+        let error = tokio::time::timeout(
+            Duration::from_secs(60 * 60),
+            session.close(CloseReason::Requested),
+        )
+        .await
+        .expect("expected the close to stop waiting for the launch | received a close still pending after an hour")
+        .expect_err("expected the close to report the launch it stopped waiting for");
         assert!(
             matches!(error.cause(), Error::Timeout { operation, .. } if operation == "a pending Claude launch"),
             "expected Error::Timeout naming a pending Claude launch | received {error:?}"

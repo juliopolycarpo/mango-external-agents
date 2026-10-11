@@ -577,9 +577,10 @@ async fn run_close_teardown(
     let Some(native) = native else {
         // The launcher has not handed back a child, so there is nothing here to stop and no
         // proof that nothing will start. The session stays `Closing`. The start that owns the
-        // launch reaps the child if one arrives, and it holds its own lease on the artifact until
-        // it has, so this reference is given up rather than preserved: preserving would keep the
-        // file after the last process that could read it is gone.
+        // launch stops the child if one arrives and holds its own lease on the artifact until
+        // that stop has an outcome: it removes the file after a reap and keeps it after a stop
+        // that failed. So this reference is given up rather than preserved here, which would
+        // keep the file after the last process that could read it is gone.
         crate::mcp::release_lease(mcp_config.take());
         close.finish(Err(Error::Timeout {
             operation: String::from(PENDING_LAUNCH_OPERATION),
@@ -801,8 +802,7 @@ impl Drop for AbandonedStart {
                 true,
             )
             .await;
-            crate::mcp::release_off_worker(lease).await;
-            let _ = outcome;
+            crate::mcp::release_after_stop(lease, outcome.is_ok()).await;
         });
     }
 }
@@ -1144,9 +1144,10 @@ impl mango_external_agents::Session for ClaudeSession {
             .await;
             // After the kill, never before: the child read `--mcp-config` at startup. And off the
             // worker, because a close that won the race left this lease holding the last
-            // reference, so this is where the `remove_dir_all` happens.
-            crate::mcp::release_off_worker(mcp_lease.take()).await;
-            crate::mcp::release_off_worker(abandoned.mcp_lease.take()).await;
+            // reference, so this is where the `remove_dir_all` happens. A stop that failed left a
+            // child that may still read the file, so that outcome keeps it on disk instead.
+            crate::mcp::release_after_stop(mcp_lease.take(), outcome.is_ok()).await;
+            crate::mcp::release_after_stop(abandoned.mcp_lease.take(), outcome.is_ok()).await;
             outcome.map_err(|error| error.with_dispatch(Dispatch::Accepted))?;
             abandoned.disarm();
             return Err((if self.shared.lifecycle.is_closed() {
