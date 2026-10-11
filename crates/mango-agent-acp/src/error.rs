@@ -11,11 +11,33 @@
 //! command as text — the library does not send `authenticate`, does not open a browser and does not
 //! read a credential, so the only useful thing it can do is say what a person should run.
 //!
-//! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/initialization>
+//! The same code answered to `session/prompt`, mid-session, is a turn's failure and not a setup
+//! error: a turn's terminal is a [`VendorError`], which has no login-hint field. It ends as
+//! [`AUTH_REQUIRED_CODE`] instead of `acp-request-failed`, with the profile's login command in
+//! its message and none of the agent's own text.
+//!
+//! ACP v1 reference: <https://agentclientprotocol.com/protocol/v1/authentication>, whose "Active
+//! Sessions" passage lets an agent "return `auth_required` errors for future session activity". The
+//! number `-32000` is the schema crate's `ErrorCode::AuthRequired`.
 
 use agent_client_protocol_schema::v1::ErrorCode as AcpErrorCode;
 use mango_external_agents::error::jsonrpc_code_is_retryable;
 use mango_external_agents::{Error, ErrorCode, VendorError};
+
+/// The code a turn's terminal carries when the agent answered `session/prompt` with ACP's
+/// authentication-required error (`-32000`).
+///
+/// Stable. A host branches on it the way it branches on [`Error::AuthRequired`] from
+/// `open_session`: the person has to sign in again before the next prompt can work.
+///
+/// # Example
+///
+/// ```
+/// use mango_agent_acp::error::AUTH_REQUIRED_CODE;
+///
+/// assert_eq!(AUTH_REQUIRED_CODE, "acp-auth-required");
+/// ```
+pub const AUTH_REQUIRED_CODE: &str = "acp-auth-required";
 
 /// One ACP failure as a vendor failure, correlated to the method that produced it.
 ///
@@ -69,6 +91,35 @@ pub fn request_error(
     Error::Vendor(vendor_error(method, error))
 }
 
+/// One ACP failure that answered `session/prompt`, as the failure a turn's terminal carries.
+///
+/// Any code but authentication-required is [`vendor_error`]. That one becomes
+/// [`AUTH_REQUIRED_CODE`], keeping the request and the agent's code, with a message made of the
+/// profile's `login_hint` and nothing the agent wrote: the hint is host-owned text a person can
+/// act on, while the agent's message and `data` are whatever it held when its token failed. The
+/// core bounds the message like any other. The library never signs in; the text only says how.
+///
+/// ```ignore
+/// let failure = prompt_failure("session/prompt", &AcpError::auth_required(), "opencode auth login");
+/// assert_eq!(failure.code.as_str(), "acp-auth-required");
+/// ```
+pub(crate) fn prompt_failure(
+    method: &str,
+    error: &agent_client_protocol_schema::v1::Error,
+    login_hint: &str,
+) -> VendorError {
+    if error.code != AcpErrorCode::AuthRequired {
+        return vendor_error(method, error);
+    }
+    let code = i32::from(error.code);
+    VendorError::new(
+        ErrorCode::from_static(AUTH_REQUIRED_CODE),
+        format!("authentication required; to sign in: {login_hint}"),
+    )
+    .with_request_id(method)
+    .with_vendor_code(code.to_string(), false)
+}
+
 /// The agent's message, with whatever it put in `data` appended.
 ///
 /// `data` is where an agent explains itself — which file, which command, which limit — and dropping
@@ -87,7 +138,7 @@ fn message(error: &agent_client_protocol_schema::v1::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{request_error, vendor_error};
+    use super::{AUTH_REQUIRED_CODE, prompt_failure, request_error, vendor_error};
     use agent_client_protocol_schema::v1::Error as AcpError;
     use mango_external_agents::Error;
 
@@ -176,6 +227,42 @@ mod tests {
         assert!(
             matches!(error, Error::Vendor(_)),
             "expected a vendor failure, received {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_authentication_refusal_of_a_prompt_carries_the_hint_and_none_of_the_agents_text() {
+        let refusal =
+            AcpError::auth_required().data(serde_json::json!({ "token": "sk-agent-secret" }));
+        let failure = prompt_failure("session/prompt", &refusal, "agent login");
+        let received = (
+            failure.code.as_str().to_owned(),
+            failure.request_id.clone(),
+            failure.vendor_code.clone(),
+            failure.retryable,
+            failure.message.clone(),
+        );
+        let expected = (
+            String::from(AUTH_REQUIRED_CODE),
+            Some(String::from("session/prompt")),
+            Some(String::from("-32000")),
+            false,
+            String::from("authentication required; to sign in: agent login"),
+        );
+        assert_eq!(
+            received, expected,
+            "expected (code, request, vendor code, retryable, message): {expected:?} | received: {received:?}"
+        );
+    }
+
+    #[test]
+    fn any_other_refusal_of_a_prompt_is_the_plain_vendor_failure() {
+        let refusal = AcpError::new(-31_000, "model busy");
+        let failure = prompt_failure("session/prompt", &refusal, "agent login");
+        assert_eq!(
+            failure,
+            vendor_error("session/prompt", &refusal),
+            "expected the unchanged vendor failure for a non-authentication code"
         );
     }
 }

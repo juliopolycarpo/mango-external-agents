@@ -67,6 +67,8 @@ pub struct FakeAcpAgent {
     load_session_error: Option<(i32, String)>,
     /// `session/load` answers with `"result": null` instead of a result object.
     load_session_null: bool,
+    /// `session/prompt` answers with this error code instead of a stop reason.
+    prompt_error: Option<(i32, String)>,
     /// Streams a turn's updates and never answers its `session/prompt`.
     never_finishes: bool,
     /// Holds each turn open after its updates and after any permission answer, ending it only
@@ -128,6 +130,7 @@ impl FakeAcpAgent {
             new_session_error: None,
             load_session_error: None,
             load_session_null: false,
+            prompt_error: None,
             never_finishes: false,
             stays_silent: false,
             asks_when_closing: false,
@@ -321,6 +324,25 @@ impl FakeAcpAgent {
     #[must_use]
     pub fn refusing_new_session(mut self, code: i32, message: impl Into<String>) -> Self {
         self.new_session_error = Some((code, message.into()));
+        self
+    }
+
+    /// Answers every `session/prompt` with this JSON-RPC error and no updates before it.
+    ///
+    /// What an agent does when a token expires mid-session: `-32000` is ACP's "authentication
+    /// required".
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_agent_acp::testing::FakeAcpAgent;
+    ///
+    /// let agent = FakeAcpAgent::new().refusing_prompt(-32_000, "token expired");
+    /// let _process = agent.process();
+    /// ```
+    #[must_use]
+    pub fn refusing_prompt(mut self, code: i32, message: impl Into<String>) -> Self {
+        self.prompt_error = Some((code, message.into()));
         self
     }
 
@@ -752,6 +774,9 @@ impl FakeAcpAgent {
 
     /// The updates for one turn, then either a permission request or the turn's end.
     fn prompt(&self, id: serde_json::Value, pending: &Arc<Mutex<PendingTurn>>) -> Vec<String> {
+        if let Some((code, message)) = &self.prompt_error {
+            return vec![error(id, *code, message)];
+        }
         if let Some(lines) = self.batched_turn(&id) {
             return lines;
         }
@@ -1085,6 +1110,36 @@ mod tests {
                 _ => "other",
             })
             .collect()
+    }
+
+    #[test]
+    fn refusing_the_prompt_ends_the_turns_lines_with_the_error_instead_of_a_stop_reason() {
+        let pending = std::sync::Arc::default();
+        let lines = FakeAcpAgent::new()
+            .refusing_prompt(-32_000, "token expired")
+            .prompt(serde_json::json!(7), &pending);
+        let last: serde_json::Value = lines
+            .last()
+            .and_then(|line| serde_json::from_str(line).ok())
+            .unwrap_or_default();
+        let received = (
+            lines.len(),
+            last["id"].clone(),
+            last["error"]["code"].clone(),
+            last["error"]["message"].clone(),
+            last.get("result").is_some(),
+        );
+        let expected = (
+            1,
+            serde_json::json!(7),
+            serde_json::json!(-32_000),
+            serde_json::json!("token expired"),
+            false,
+        );
+        assert_eq!(
+            received, expected,
+            "expected (line count, id, code, message, has result): {expected:?} | received: {received:?}"
+        );
     }
 
     #[test]

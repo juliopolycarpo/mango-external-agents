@@ -1337,6 +1337,7 @@ impl Session for AcpSession {
                 recorded,
                 connection_state,
                 &agent,
+                &profile.login_text(),
                 control.as_ref(),
             );
             let _ = turn.approvals.flush(&turn.sink).await;
@@ -1558,13 +1559,16 @@ struct ConnectionRecord {
 /// - otherwise [`prompt_ending`] decides.
 ///
 /// ```ignore
-/// let (ending, release) = turn_ending(outcome, recorded, connection, "opencode", control);
+/// let (ending, release) = turn_ending(
+///     outcome, recorded, connection, "opencode", "opencode auth login", control,
+/// );
 /// ```
 fn turn_ending(
     outcome: Option<std::result::Result<PromptResponse, PromptFailure>>,
     recorded: TurnRecord,
     connection: ConnectionRecord,
     agent: &str,
+    login_hint: &str,
     control: &dyn ProcessControl,
 ) -> (Option<Ending>, bool) {
     if let Some(error) = connection.cleanup_error {
@@ -1576,7 +1580,10 @@ fn turn_ending(
     {
         return (Some(Ending::Fail(overflow_failure(overflow))), true);
     }
-    (prompt_ending(outcome, recorded, agent, control), true)
+    (
+        prompt_ending(outcome, recorded, agent, login_hint, control),
+        true,
+    )
 }
 
 /// What a session recorded about a turn by the time its prompt wait ended.
@@ -1600,7 +1607,8 @@ struct TurnRecord {
 ///
 /// - a stop reason from the agent ends the turn as the agent said, and the agent's own error
 ///   fails it unless a stop was recorded, as `acp-request-failed` naming `session/prompt`
-///   and carrying the agent's code;
+///   and carrying the agent's code, or as `acp-auth-required` carrying the profile's
+///   `login_hint` and none of the agent's text when that code is authentication required;
 /// - a stop somebody asked for, recorded before this is decided, ends it as `Cancelled` with
 ///   that reason, including when the agent died instead of answering the stop;
 /// - a connection that went away with no stop recorded is the closed link, carrying the agent's
@@ -1612,12 +1620,13 @@ struct TurnRecord {
 /// failed, where the recorded reason is reported.
 ///
 /// ```ignore
-/// let ending = prompt_ending(None, recorded, "opencode", control.as_ref());
+/// let ending = prompt_ending(None, recorded, "opencode", "opencode auth login", control.as_ref());
 /// ```
 fn prompt_ending(
     outcome: Option<std::result::Result<PromptResponse, PromptFailure>>,
     recorded: TurnRecord,
     agent: &str,
+    login_hint: &str,
     control: &dyn ProcessControl,
 ) -> Option<Ending> {
     let TurnRecord {
@@ -1647,10 +1656,12 @@ fn prompt_ending(
     if let Some(refusal) = error.as_ref().and_then(PromptFailure::answered_with) {
         // The agent answered, with an error of its own or with a result this side could not
         // read. Either is a failed request with a code, and not a link that closed: the same
-        // failure a refused `session/new` is reported as.
-        return Some(Ending::Fail(crate::error::vendor_error(
+        // failure a refused `session/new` is reported as, except that authentication required
+        // carries the hint in the turn's message because a terminal has no typed form for it.
+        return Some(Ending::Fail(crate::error::prompt_failure(
             <PromptRequest as client::AgentRequest>::METHOD,
             refusal,
+            login_hint,
         )));
     }
     // The link is closed either way. When this side closed it because another request on it
@@ -1845,6 +1856,9 @@ mod tests {
     use mango_external_agents::{ApprovalRouting, Error, PermissionLevel};
     use mango_external_agents::{ExitStatus, ProcessControl};
 
+    /// The sign-in command the endings below are decided under.
+    const LOGIN_HINT: &str = "fake login";
+
     /// ACP has no vendor-side "put it back": neither the mode a session opens under nor the local
     /// routing decision can be un-set, so a reset is refused the same way everywhere it is asked.
     #[test]
@@ -2029,8 +2043,14 @@ mod tests {
             ),
         ];
         for (what, outcome, connection, expected, release) in cases {
-            let (ending, released) =
-                super::turn_ending(outcome, untouched(), connection, "fake", &DeadAgent);
+            let (ending, released) = super::turn_ending(
+                outcome,
+                untouched(),
+                connection,
+                "fake",
+                LOGIN_HINT,
+                &DeadAgent,
+            );
             let received = (shown(ending.as_ref()), released);
             assert_eq!(
                 received,
@@ -2046,7 +2066,8 @@ mod tests {
             timed_out: Some(String::from("session/list got no answer within 5s")),
             ..untouched()
         };
-        let received = shown(prompt_ending(None, recorded, "fake", &DeadAgent).as_ref());
+        let received =
+            shown(prompt_ending(None, recorded, "fake", LOGIN_HINT, &DeadAgent).as_ref());
         let expected = "Fail(acp-link-closed, \"fake: a transport that closed under session/prompt after session/list got no answer within 5s\")";
         assert!(
             received.starts_with(expected.trim_end_matches("\")")),
@@ -2086,7 +2107,7 @@ mod tests {
     fn a_dead_link_nobody_cancelled_ends_the_turn_as_a_closed_link_however_it_was_seen() {
         let expected = "Fail(acp-link-closed, \"fake: a transport that closed under session/prompt; the agent's stderr: panicked at src/main.rs:7\\nAuthorization: Bearer [REDACTED]\")";
         for (seen, outcome) in ways_to_see_a_dead_link() {
-            let ending = prompt_ending(outcome, untouched(), "fake", &DeadAgent);
+            let ending = prompt_ending(outcome, untouched(), "fake", LOGIN_HINT, &DeadAgent);
             let received = shown(ending.as_ref());
             assert_eq!(
                 received, expected,
@@ -2109,7 +2130,7 @@ mod tests {
                     cancel_reason: Some(reason),
                     ..untouched()
                 };
-                let ending = prompt_ending(outcome, recorded, "fake", &DeadAgent);
+                let ending = prompt_ending(outcome, recorded, "fake", LOGIN_HINT, &DeadAgent);
                 assert!(
                     matches!(&ending, Some(Ending::Cancel(received)) if *received == reason),
                     "expected the ending when {seen}: Cancel({reason:?}) | received: {}",
@@ -2128,7 +2149,7 @@ mod tests {
             cancel_failure: Some(String::from("ACP session/cancel could not be queued")),
             ..untouched()
         };
-        let ending = prompt_ending(None, recorded, "fake", &DeadAgent);
+        let ending = prompt_ending(None, recorded, "fake", LOGIN_HINT, &DeadAgent);
         let received = shown(ending.as_ref());
         let expected = "Fail(acp-link-closed, \"ACP session/cancel could not be queued\")";
         assert_eq!(
@@ -2144,11 +2165,55 @@ mod tests {
             already_terminal: true,
             ..untouched()
         };
-        let ending = prompt_ending(None, recorded, "fake", &DeadAgent);
+        let ending = prompt_ending(None, recorded, "fake", LOGIN_HINT, &DeadAgent);
         assert!(
             ending.is_none(),
             "expected no further ending | received: {}",
             shown(ending.as_ref())
+        );
+    }
+
+    /// An authentication-required answer to the prompt ends the turn with the profile's hint and
+    /// not the agent's text.
+    #[test]
+    fn an_authentication_refusal_of_the_prompt_ends_the_turn_with_the_login_hint() {
+        let refusal = agent_client_protocol_schema::v1::Error::auth_required();
+        let ending = prompt_ending(
+            Some(Err(PromptFailure::Agent(refusal))),
+            untouched(),
+            "fake",
+            LOGIN_HINT,
+            &DeadAgent,
+        );
+        let received = shown(ending.as_ref());
+        let expected =
+            "Fail(acp-auth-required, \"authentication required; to sign in: fake login\")";
+        assert_eq!(
+            received, expected,
+            "expected the ending {expected} | received: {received}"
+        );
+    }
+
+    /// A stop somebody asked for outranks the agent's authentication error: the turn is
+    /// `Cancelled` with that reason, as for any other error answered to a requested stop.
+    #[test]
+    fn an_authentication_refusal_under_a_requested_stop_is_still_a_cancellation() {
+        let recorded = TurnRecord {
+            cancel_reason: Some(CancelReason::Requested),
+            ..untouched()
+        };
+        let refusal = agent_client_protocol_schema::v1::Error::auth_required();
+        let ending = prompt_ending(
+            Some(Err(PromptFailure::Agent(refusal))),
+            recorded,
+            "fake",
+            LOGIN_HINT,
+            &DeadAgent,
+        );
+        let received = shown(ending.as_ref());
+        assert_eq!(
+            received, "Some(Cancel(Requested))",
+            "expected the requested stop to decide the ending | received: {received}"
         );
     }
 
@@ -2163,8 +2228,9 @@ mod tests {
                 agent_client_protocol_schema::v1::Error::new(-31_000, "model busy"),
             ))),
         ];
-        let received = answers
-            .map(|answer| shown(prompt_ending(answer, untouched(), "fake", &DeadAgent).as_ref()));
+        let received = answers.map(|answer| {
+            shown(prompt_ending(answer, untouched(), "fake", LOGIN_HINT, &DeadAgent).as_ref())
+        });
         let expected = [
             "Some(Complete)",
             "Some(Cancel(Requested))",
