@@ -254,8 +254,19 @@ async fn a_line_that_is_not_json_is_answered_with_a_parse_error() {
         link.push_line(notification("after").to_string());
 
         handler.wait_for_notifications(1).await;
-        sent(&link, 1).await;
-        let written = frames(&link);
+        // A frame of this side's own, written behind every answer the lines set off.
+        let after = client
+            .submit_notification("after", json!({}))
+            .expect("expected the notification queued");
+        within("the notification written", after)
+            .await
+            .expect("expected the notification written");
+        let mut written = frames(&link);
+        let last = written.pop().expect("expected this side's own frame");
+        assert_eq!(
+            last["method"], "after",
+            "expected this side's own frame written last: \"after\" | received {last}"
+        );
         let mut expected = json!({
             "id": null,
             "error": { "code": -32700, "message": "Parse error" },
@@ -304,7 +315,7 @@ async fn parse_error_replies_are_bounded_by_how_many_wait_to_be_written() {
     assert_eq!(
         written,
         vec!["hold", "?", "?", "?"],
-        "expected a line that is not JSON answered again once the earlier answers were written | received {written:?}"
+        "expected a line that is not JSON answered again once the earlier answers were written: [\"hold\", \"?\", \"?\", \"?\"] | received {written:?}"
     );
     gated.client.close().await.expect("expected a clean close");
 }
@@ -342,7 +353,7 @@ async fn parse_errors_take_none_of_the_room_the_queue_leaves_the_host() {
     assert_eq!(
         written,
         vec!["hold", "?", "?", "mine"],
-        "expected both answers and the host's frame written in the order they were queued | received {written:?}"
+        "expected both answers and the host's frame written in the order they were queued: [\"hold\", \"?\", \"?\", \"mine\"] | received {written:?}"
     );
     gated.client.close().await.expect("expected a clean close");
 }
@@ -565,7 +576,7 @@ async fn a_reply_dropped_after_the_connection_ended_sends_no_cancel() {
     client.close().await.expect("expected a clean close");
     drop(reply);
 
-    let observed = (methods(&link), outbox_holds(&client).0);
+    let observed = (methods(&link), client.state.outbox.aside());
     assert_eq!(
         observed,
         (vec![String::from("ask")], 0),
@@ -592,11 +603,15 @@ async fn a_cancel_is_queued_beside_a_full_queue_and_the_connection_stays() {
     let _held = link_held(&gated).await;
     drop(reply);
 
-    let observed = (outbox_holds(&gated.client).0, gated.client.is_closed());
+    let observed = (
+        outbox_holds(&gated.client).0,
+        gated.client.state.outbox.aside(),
+        gated.client.is_closed(),
+    );
     assert_eq!(
         observed,
-        (1, false),
-        "expected only the held frame counted and the connection open: (1, false) | received {observed:?}"
+        (1, 1, false),
+        "expected the held frame counted, the cancel beside it, the connection open: (1, 1, false) | received {observed:?}"
     );
     assert_ended(&gated.client, None);
     gated.gate.add_permits(1);
@@ -605,7 +620,7 @@ async fn a_cancel_is_queued_beside_a_full_queue_and_the_connection_stays() {
     assert_eq!(
         written,
         vec!["ask", "hold", CANCEL],
-        "expected the cancel written once the link took writes again | received {written:?}"
+        "expected the cancel written once the link took writes again: [\"ask\", \"hold\", \"$/cancel_request\"] | received {written:?}"
     );
     gated.client.close().await.expect("expected a clean close");
 }
@@ -777,4 +792,33 @@ fn a_batch_member_is_work_for_the_handler_only_with_a_string_method() {
             "expected {member} to be work for the handler: {expected} | received {work}"
         );
     }
+}
+
+/// A cancel is in the queue from the moment the request is given up, though it takes none of
+/// the queue's bounds. A caller that writes for itself straight afterwards waits its turn
+/// behind it: the retry does not reach the peer before the cancel of what it replaces.
+#[tokio::test(start_paused = true)]
+async fn a_write_made_straight_after_a_request_is_given_up_follows_its_cancel() {
+    let (link, _handler, client) = connect(
+        options().with_request_timeout(Duration::from_millis(50)),
+        WireOptions::new().with_cancel_on_abandon(CANCEL),
+    );
+    let outcome = client.request::<_, Value>("ask", json!({})).await;
+    assert!(
+        matches!(outcome, Err(Error::Timeout { .. })),
+        "expected the request to time out: Err(Timeout) | received {outcome:?}"
+    );
+    // Nothing has been awaited since the cancel was queued: the writer has not run.
+    client
+        .notify("second", json!({}))
+        .await
+        .expect("expected the notification written");
+
+    let written = methods(&link);
+    assert_eq!(
+        written,
+        vec!["ask", CANCEL, "second"],
+        "expected the cancel ahead of the next write: [\"ask\", \"$/cancel_request\", \"second\"] | received {written:?}"
+    );
+    client.close().await.expect("expected a clean close");
 }

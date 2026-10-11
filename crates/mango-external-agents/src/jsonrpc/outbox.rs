@@ -150,7 +150,10 @@ impl WireOptions {
     /// Passing it ends the connection the way
     /// [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) describes. A
     /// bound of zero is not passed by anything the peer did: it refuses every queued frame
-    /// alone, and leaves the connection to callers that wait for their own writes.
+    /// alone, and leaves the connection to callers that wait for their own writes. The frames
+    /// [`with_parse_error_replies`](Self::with_parse_error_replies) and
+    /// [`with_cancel_on_abandon`](Self::with_cancel_on_abandon) send are not held to this
+    /// bound, whatever it is.
     ///
     /// # Example
     ///
@@ -379,6 +382,9 @@ pub(super) enum Refusal {
 struct Held {
     frames: usize,
     bytes: usize,
+    /// Frames queued beside the bounds: in the queue, and in nobody's count of it. Counted
+    /// here so that a queue holding only these is still not taken for an empty one.
+    aside: usize,
     /// Turns queued for callers that write for themselves. Not bounded here: each is a caller
     /// waiting, and holds no frame of its own in the queue.
     turns: usize,
@@ -405,6 +411,11 @@ impl Budget {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         held.frames = held.frames.saturating_sub(1);
         held.bytes = held.bytes.saturating_sub(bytes);
+    }
+
+    fn release_aside(&self) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.aside = held.aside.saturating_sub(1);
     }
 }
 
@@ -560,6 +571,8 @@ impl Drop for Outgoing {
         self.ctl.settle();
         if self.counted {
             self.budget.release(self.ctl.bytes);
+        } else {
+            self.budget.release_aside();
         }
     }
 }
@@ -699,6 +712,8 @@ impl Outbox {
         if counted {
             held.frames += 1;
             held.bytes = held.bytes.saturating_add(bytes);
+        } else {
+            held.aside += 1;
         }
         let queued = Outgoing {
             frame,
@@ -753,6 +768,7 @@ impl Outbox {
             });
         }
         if held.frames == 0
+            && held.aside == 0
             && held.turns == 0
             && let Ok(sender) = Arc::clone(sender).try_lock_owned()
         {
@@ -876,6 +892,16 @@ impl Outbox {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .turns
+    }
+
+    /// How many frames are queued beside the bounds.
+    #[cfg(test)]
+    pub(super) fn aside(&self) -> usize {
+        self.budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .aside
     }
 
     #[cfg(test)]
