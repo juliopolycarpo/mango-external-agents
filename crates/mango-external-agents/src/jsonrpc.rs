@@ -562,7 +562,11 @@ pub trait PeerHandler: Send + Sync {
     /// callback is never made for [`Client::close`], whose caller already owns that shutdown.
     /// Nor is it made for a peer's exit, a failed link or a budget passed that a close
     /// overtook: the end on record first owns the connection's end, and [`Client::ended`]
-    /// reports it as the close.
+    /// reports it as the close. A close given up after it recorded its end (its future dropped,
+    /// a timeout of the caller's own, or made from inside the handler's own call, which the
+    /// close cuts short) still owns the end, whatever the reader had read: this is not made, the
+    /// reader fails no pending call, and the link stays open until a second [`Client::close`],
+    /// or dropping the client, finishes the teardown.
     ///
     /// Made once, after the handler's task has stopped. A [`Client::close`] that arrives while
     /// the connection is ending this way waits for this call to return, within the time a close
@@ -3076,6 +3080,11 @@ impl Client {
     /// peer never reads, and when the future returned here is dropped before it finishes,
     /// unless another call to `close` is still in progress, which then answers for the link.
     ///
+    /// A close given up still owns the end it recorded. The handler is told of no end the
+    /// reader had read, the reader fails no pending call, and the child's input stays open.
+    /// Calling `close` again finishes the teardown from where the first one stopped: it fails
+    /// the calls still pending, stops the handler's task and closes the link.
+    ///
     /// # Errors
     ///
     /// [`Error::Link`] when closing the link itself failed, [`Error::Timeout`] when the link
@@ -4489,9 +4498,10 @@ async fn link_failed(
 /// that records between the reader's look and its record is found all the same. It holds for
 /// every end the reader records, whatever the cause: a link's write or read failing, this side
 /// passing its outbound budget, the peer passing an inbound budget, the peer's exit (which a
-/// close brings about itself by closing the link). The close fails the calls and stops the
-/// handler's task itself, and the handler is not told of an end its host caused, under a client
-/// whose host says so through `Client::ended`.
+/// poll of the reader already under way across the close can still read: a fresh poll finds the
+/// shutdown flag first). The close fails the calls and stops the handler's task itself, and
+/// the handler is not told of an end its host caused, under a client whose host says so
+/// through `Client::ended`. A close given up after it recorded its end keeps that ownership.
 fn owned_by_a_close(state: &ClientState, failure: &Failed) -> bool {
     if !matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
         return false;
@@ -4973,6 +4983,7 @@ fn oversized_frame(error: &Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod abandoned_close_tests;
     mod cancellation_hold_tests;
     mod handoff_hold_tests;
     mod handoff_queue_tests;

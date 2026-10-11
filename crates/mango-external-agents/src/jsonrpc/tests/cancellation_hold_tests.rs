@@ -2173,3 +2173,48 @@ async fn deciding_the_end_through_the_seam_says_when_a_stretch_is_held() {
     );
     client.close().await.expect("expected a clean close");
 }
+
+/// A close made from inside the handler's own call is cut short by its own abort of that call,
+/// before it reaches the link. A second close, from outside, finishes it.
+#[tokio::test(start_paused = true)]
+async fn a_close_made_from_inside_a_call_is_finished_by_a_second_from_outside() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(
+        &link,
+        Script {
+            close_inside: true,
+            ..HOLDING
+        },
+    );
+    inside_the_stretch(&link, &handler).await;
+    handler.inside.add_permits(1);
+    eventually(
+        "the handler's task to stop",
+        client.state.worker_stopped.cancelled(),
+    )
+    .await;
+    let open = client
+        .state
+        .sender
+        .lock()
+        .await
+        .send(String::from("probe"))
+        .await
+        .is_ok();
+
+    let second = client.close().await;
+    let closed = client
+        .state
+        .sender
+        .lock()
+        .await
+        .send(String::from("probe"))
+        .await
+        .is_err();
+    let observed = (open, second.is_ok(), closed, handler.terminations().len());
+    assert_eq!(
+        observed,
+        (true, true, true, 0),
+        "expected the link open after the close cut short, then a second close to finish it and the handler told nothing: (true, true, true, 0) | received {observed:?}"
+    );
+}

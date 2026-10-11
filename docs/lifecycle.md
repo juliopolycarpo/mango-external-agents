@@ -200,7 +200,10 @@ forgotten stops counting when the call is over.
 `on_terminated` is made once, after the handler's task has stopped, and not at all for an end a
 close put on record first: when the peer's exit, a failed link or a budget passed on either side
 is found with a close already on record, `Client::ended` reports `Closed` and the handler is told
-nothing. A `Client::close` that arrives
+nothing. A close given up after it recorded its end (its future dropped, a timeout of the caller's
+own, or made from inside the handler's own call, which it cuts short) still owns the end: the
+handler is told nothing, the reader fails no pending call and the link stays open, and calling
+`close` again, or dropping the client, finishes the teardown. A `Client::close` that arrives
 while a connection is ending under this side waits for that call to return, within the bound of a
 close, where it used to take the reader down under it. Dropping the `Client` cannot wait: the
 call in progress is cancelled whatever it holds, and `on_terminated` may not be made at all.
