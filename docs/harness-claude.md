@@ -275,8 +275,9 @@ behind, holds the read open after the Claude process is gone. The pump watches
 `ProcessControl::wait` beside the read. When the exit arrives it keeps reading for one
 `Limits::kill_grace`, counted from the exit, because what the child wrote before it left is still
 in the pipe and can be the `result`. Then the turn ends as it does at end of stream, with the exit
-status in its error, and the stop that follows ends the helper. A host control that fails to report
-an exit leaves the read to the idle timer.
+status in its error, and the stop that follows ends the helper. A line that is already there is
+always read, so a `kill_grace` of zero still takes what the pipe holds and waits for nothing more.
+A host control that fails to report an exit leaves the read to the idle timer.
 
 ### Deadlines
 
@@ -304,29 +305,33 @@ error.
 
 The stages add up. With `st` for `shutdown_timeout` and `kg` for `kill_grace`, the worst cases are
 below. The first value column holds for any launcher on any platform. The other two are what the
-core `TokioLauncher` can reach when it was built `with_limits` from the same `Limits`. Its kill
-sends SIGTERM, waits `kg`, sends SIGKILL and waits `kg` again, so the kill stage ends at the smaller
-of 2 `kg` and `st`. On Windows it reports no graceful interrupt, and its kill gives the Job 2 `kg`
-to empty.
+core `TokioLauncher` comes to when it was built `with_limits` from the same `Limits`, and they are
+smaller for two reasons. Its interrupt call returns at once. Its kill answers only when the whole
+tree is gone, so the reap that follows has nothing left to wait for. On Unix that leaves `kg` for
+the SIGINT, then a kill that sends SIGTERM, waits `kg`, sends SIGKILL and waits `kg` again. On
+Windows it reports no graceful interrupt, and its kill gives the Job 2 `kg` to empty. Either kill
+is cut at `st` if that is the smaller.
 
 | Path                                         | Worst case                 | At the defaults | `TokioLauncher`, Unix | `TokioLauncher`, Windows |
 | -------------------------------------------- | -------------------------- | --------------- | --------------------- | ------------------------ |
-| Stop `S`                                     | `kg` + `kg` + `st` + `st`  | 14 s            | 11 s                  | 9 s                      |
+| Stop `S`                                     | `kg` + `kg` + `st` + `st`  | 14 s            | 6 s                   | 4 s                      |
 | `cancel`, to the turn's terminal             | none                       | at once         | at once               | at once                  |
-| `cancel`, to its return                      | `S`                        | 14 s            | 11 s                  | 9 s                      |
+| `cancel`, to its return                      | `S`                        | 14 s            | 6 s                   | 4 s                      |
 | `cancel` while the launch is pending         | none                       | at once         | at once               | at once                  |
 | `close`, no turn                             | `st`                       | 5 s             | 5 s                   | 5 s                      |
-| `close` with a turn active                   | `S` + `st`                 | 19 s            | 16 s                  | 14 s                     |
-| `close` while the launch is pending          | `st`, or `st` + `S` + `st` | 5 s, or 24 s    | 5 s, or 21 s          | 5 s, or 19 s             |
+| `close` with a turn active                   | `S` + `st`                 | 19 s            | 11 s                  | 9 s                      |
+| `close` while the launch is pending          | `st`, or `st` + `S` + `st` | 5 s, or 24 s    | 5 s, or 16 s          | 5 s, or 14 s             |
 | Child exit or end of stream, to the terminal | `kg`                       | 2 s             | 2 s                   | 2 s                      |
-| Child exit or end of stream, to reaped       | `kg` + `S`                 | 16 s            | 13 s                  | 11 s                     |
+| Child exit or end of stream, to reaped       | `kg` + `S`                 | 16 s            | 8 s                   | 6 s                      |
 | Silent stream, to the terminal               | idle floor + `kg`          | 602 s           | 602 s                 | 602 s                    |
-| Host shutdown token, to the terminal         | `S`                        | 14 s            | 11 s                  | 9 s                      |
-| Session dropped mid-turn, to reaped          | `S`                        | 14 s            | 11 s                  | 9 s                      |
+| Host shutdown token, to the terminal         | `S`                        | 14 s            | 6 s                   | 4 s                      |
+| Session dropped mid-turn, to reaped          | `S`                        | 14 s            | 6 s                   | 4 s                      |
 
-The first value column is pinned by tests on a paused clock against a fake launcher, and those run
-on CI's Linux, macOS and Windows lanes. The two `TokioLauncher` columns come from reading the
-launcher and are not asserted as sums anywhere.
+Tests on a paused clock against a fake launcher assert the stages these sums are made of: the
+14 s stop, the stop with no graceful interrupt, the `kg` waits around an exit, the 602 s, and the
+`st` a close gives a pending launch and the artifact removal. They run on CI's Linux, macOS and
+Windows lanes. The sums themselves are not asserted, and the two `TokioLauncher` columns come from
+reading the launcher: nothing measures them, on Windows or anywhere else.
 
 What each path does, and what a host sees when a bound runs out:
 
@@ -341,10 +346,12 @@ What each path does, and what a host sees when a bound runs out:
   the background and the artifact goes when the host's mount answers.
 - **`close` while the launch is pending.** The close waits one `shutdown_timeout` for the launcher.
   If the child arrives in that time the close waits for its stop and removes the artifact. If it
-  does not, the close fails and the session stays `Closing`. The start that owns the launch still
-  stops the child when it arrives, and removes the artifact once it has. That holds whether the
-  `start_turn` caller is still waiting or dropped its call. A `start_turn` future that is kept
-  alive and never polled again stops nothing until it is polled or dropped.
+  does not, the close fails and the session stays `Closing`, even after the child is later reaped,
+  and a second `close` returns the same error. The start that owns the launch still stops the
+  child when it arrives. It removes the artifact after a reap and leaves it on disk after a stop
+  that failed. That holds whether the `start_turn` caller is still waiting or dropped its call. A
+  `start_turn` future that is kept alive and never polled again stops nothing until it is polled
+  or dropped.
 - **Child exit or end of stream.** The terminal is an `Error` event with code `claude-no-result`,
   `claude-terminated` for exit 143, or `claude-stream-broken` when the link itself failed. The
   stop runs after it. Nobody is waiting on that stop, so
@@ -355,8 +362,9 @@ What each path does, and what a host sees when a bound runs out:
 - **Session dropped mid-turn.** `Drop` cannot wait, so the stop runs detached on the runtime that
   opened the session and its result goes nowhere. If that runtime has shut down, no stop is sent.
   The session still releases the host's `ProcessControl`, and the child's fate is that control's
-  own `Drop`. The core `TokioLauncher`'s control kills the tree there, with SIGKILL on Unix and by
-  closing the Job on Windows. A host control with no such `Drop` leaves the child running.
+  own `Drop`. The core `TokioLauncher`'s control sends SIGKILL to the process group there on Unix.
+  On Windows the launcher's reaper task owns the Job, and the Job closes, ending its members, when
+  that task goes with its runtime. A host control with no such `Drop` leaves the child running.
 
 A stop that runs out of time returns the stop's own error: `Error::Timeout` from the stage that
 expired, or whatever the host's `ProcessControl` returned. It is not wrapped in
