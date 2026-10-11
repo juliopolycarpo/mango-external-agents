@@ -90,6 +90,16 @@ Unset preserves existing default and custom `Limits::turn_buffer_bytes` behavior
   frame budget can still be followed by its `session/cancel`. A frame that would pass it, or the
   frame count, means the agent has stopped reading: the connection ends.
 
+The frame count is sized so that what this side queues by itself always fits. With `r` for
+`max_pending_requests` that is at most 3`r` + 4 frames at one moment: the prompt and the
+`$/cancel_request` that follows it when it is given up, the `r` requests beside it and theirs,
+the answers to `r` parked questions withdrawn at once by a cancel, and `session/cancel` with its
+one repeat. The incoming message limit is added on top for answers the agent asks for and this
+side gives on the spot (`-32601`, a question past the cap). Only those can fill the queue, so
+an outgoing overflow is always an agent that keeps asking and reads nothing, and it is reported
+as `acp-transport-overflow` even when the host had asked for the turn to stop: the session is
+gone, and that is why. A host's own `cancel` or `close` never overflows it.
+
 So the outgoing ACP frames a host holds for one session are bounded by twice
 `outbound_buffer_bytes`, 16 MiB at the defaults, not by that number itself. String allocation
 capacity, parsed messages, attachments and host-supplied sinks are outside that accounting, so
@@ -142,6 +152,11 @@ What the handler does with the agent's traffic:
 - Any other request is answered `-32601` (`Method not found`), and one whose `session/request_permission`
   parameters cannot be read `-32602`, with no `data`: nothing the agent sent is echoed back.
 - Any other notification is dropped without an answer.
+- A `session/update` this build cannot read is dropped too, and the turn is told once: the first
+  one in a turn becomes a warning `EventKind::Notice` ("The agent sent an update this client
+  could not read") in this library's own words, with nothing of the frame in it. It is not
+  progress, so it does not restart the idle deadline, and it does not fail the turn. A tool
+  call whose first frame was lost this way is opened by its next `tool_call_update`.
 
 One stretch on the notification call must run whole: a `session/update` whose event the core
 refuses to publish fails the turn there, taking the turn's reducer and questions and then
@@ -213,6 +228,11 @@ answers with `stop_reason: cancelled`, or after `Limits::kill_grace` and a reap 
 There is no floor, unlike the Claude harness's ten minutes: an ACP agent reports a running tool call
 through `tool_call_update`, so a silent one is not a working one.
 
+An agent that answers `session/prompt` with a JSON-RPC error has refused the prompt: the turn
+ends with one `EventKind::Error` coded `acp-request-failed`, with `request_id` `session/prompt`,
+the agent's code as `vendor_code` and its message. The connection is ended after it, as after
+any prompt that did not complete.
+
 A turn ends as `Cancelled` in two cases. The agent answered its prompt with
 `stop_reason: cancelled`, which is believed and reported as `Requested` when no reason was
 recorded. Or a stop was recorded for the turn: a host `cancel`, a dropped stream or session, the
@@ -227,6 +247,11 @@ of the connection is observed first. When both a stop and the agent's death appl
 wins if it was recorded before the turn's terminal was decided: the turn ends as `Cancelled` with
 that reason, without the stderr tail. A `session/cancel` that could not be written can instead
 end the turn with `acp-link-closed` naming that write.
+
+A request the session refuses before queueing anything is marked `Dispatch::NotSubmitted`: one
+made after teardown began (`Error::Closed`), one past `max_pending_requests`
+(`expected at most N outstanding ACP requests, received N + 1`), one whose frame is too large,
+and one made on a connection that had already ended.
 
 A request other than the prompt that was still waiting when the connection went away fails the
 same way, as `acp-link-closed` with `a transport that closed under <method>` and the stderr tail,
