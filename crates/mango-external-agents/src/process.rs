@@ -136,8 +136,9 @@ pub trait ByteSink: Send {
     /// this sink fails the request or notification it was writing with that error and goes on
     /// writing, where an [`Error::Link`] ends the connection, since half a frame may be on the
     /// wire. An answer to one of the peer's questions that the sink refuses cannot be said
-    /// again, and ends the connection whatever the error, unless it was refused for its size,
-    /// which is replaced by a smaller refusal first. An implementation that cannot tell
+    /// again, and ends the connection whatever the error the sink gives. The one exception is
+    /// an answer the client refused itself for passing its own frame limit, before the sink was
+    /// touched: that is replaced by a smaller refusal. An implementation that cannot tell
     /// whether bytes were accepted reports [`Error::Link`].
     ///
     /// A write that is abandoned while it is in progress, by a deadline or a dropped caller,

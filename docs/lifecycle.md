@@ -275,8 +275,8 @@ takes the write: awaited for up to `shutdown_timeout`, before the link is closed
 `on_terminated` for an end that is not a close. A close and an inbound overflow raise the flag at
 once; the peer's exit, a failed link and an outbound overflow first give the notifications
 already read up to `shutdown_timeout` to reach the handler, and a call that returns in that time
-answers the peer itself. A link whose write failed, or that the peer's exit has closed to
-writes, takes no refusal. Dropping the `Client` aborts the call without waiting for it; a refusal
+answers the peer itself. A link whose write failed, that this side's outbound budget made
+unusable, or that the peer's exit has closed to writes, takes no refusal. Dropping the `Client` aborts the call without waiting for it; a refusal
 another thread had begun to write may still go out.
 
 ACP sets those bounds from `Limits`: queued JSON-RPC messages by the larger of
