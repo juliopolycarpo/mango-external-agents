@@ -223,7 +223,7 @@ pub(crate) struct Shared {
     /// Held by a test to park [`Shared::finish_for`] or [`Shared::poison`] after it claimed the
     /// turn's terminal and before it commits it.
     #[cfg(test)]
-    terminal_claimed: Arc<Mutex<()>>,
+    handler_commit_parked: Arc<Mutex<()>>,
     /// Wakes the session-owned process reaper after an unexpected link termination.
     terminated: mango_external_agents::CancelToken,
     /// Wakes an abandonment watcher after its owned native turn reaches a terminal outcome, and a
@@ -277,7 +277,7 @@ impl Shared {
             #[cfg(test)]
             termination_claimed: Mutex::new(()),
             #[cfg(test)]
-            terminal_claimed: Arc::new(Mutex::new(())),
+            handler_commit_parked: Arc::new(Mutex::new(())),
             terminated: mango_external_agents::CancelToken::new(),
             turn_finished: Notify::new(),
             idle_changes,
@@ -1808,7 +1808,7 @@ impl Shared {
         )
         .await;
         #[cfg(test)]
-        drop(self.terminal_claimed.lock().await);
+        drop(self.handler_commit_parked.lock().await);
         self.commit_terminal(claim, events, cancelled, failure)
             .await;
         drop(hold);
@@ -1905,7 +1905,7 @@ impl Shared {
         let hold = self.hold_terminal_commit().await;
         if let Some(mut claim) = self.claim_terminal(None).await {
             #[cfg(test)]
-            drop(self.terminal_claimed.lock().await);
+            drop(self.handler_commit_parked.lock().await);
             claim.close_open(ActivityStatus::Failed).await;
             let _ = claim.sink.fail(failure).await;
             self.release_terminal(&claim.owner).await;
@@ -8321,7 +8321,7 @@ mod tests {
                 link: &ScriptedLink,
                 terminal: String,
             ) -> OwnedMutexGuard<()> {
-                let parked = Arc::clone(&shared.terminal_claimed).lock_owned().await;
+                let parked = Arc::clone(&shared.handler_commit_parked).lock_owned().await;
                 link.push_line(terminal);
                 until("the handler: holding the turn's claimed terminal", || {
                     terminal_is_claimed(shared)
@@ -8548,7 +8548,7 @@ mod tests {
                     running_session_with(shared, options, |control| control).await;
                 let client = client_of(&shared);
 
-                let parked = Arc::clone(&shared.terminal_claimed).lock_owned().await;
+                let parked = Arc::clone(&shared.handler_commit_parked).lock_owned().await;
                 link.push_line(unroutable_terminal());
                 // The poison interrupts the turn before it fails it, and waits for the answer.
                 link.wait_for_sent(1).await;
