@@ -1466,16 +1466,19 @@ async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
         r#"{"message":"m"}"#,
         r#"{"code":1,"message":2}"#,
     ];
-    // Each with the text it is written again as, which for `-0` is not what was sent.
-    let minus_zero = (
-        r#"{"code":-0,"message":"m"}"#,
-        r#"{"code":-0.0,"message":"m"}"#,
-    );
-    let shapes = shapes
-        .into_iter()
-        .map(|shape| (shape, shape))
-        .chain([minus_zero]);
-    for (shape, text) in shapes {
+    // `-0` is a code this side cannot hold either, so it is told the same way.
+    let shapes = shapes.into_iter().chain([r#"{"code":-0,"message":"m"}"#]);
+    for shape in shapes {
+        // The stand-in describes the member's JSON type and quotes none of it.
+        let type_name = match shape.as_bytes()[0] {
+            b'n' => "null",
+            b't' => "boolean",
+            b'"' => "string",
+            b'[' => "array",
+            b'{' => "object",
+            _ => "number",
+        };
+        let text = format!("an error member that is a JSON {type_name}, not an error object");
         for ordered in [false, true] {
             let asking = match ordered {
                 true => ordered_options(),
@@ -1483,13 +1486,13 @@ async fn an_error_member_that_is_not_an_error_object_is_told_as_unreadable() {
             };
             let failure = answered_with_error(&gated, asking, shape).await;
             let observed = peer_error(&failure);
-            let expected = (true, Some((-32603, String::from(text), None)));
+            let expected = (true, Some((-32603, text.clone(), None)));
             assert_eq!(
                 observed, expected,
                 "expected the error member {shape} told as unreadable, with the stand-in for it (ordered: {ordered}): {expected:?} | received {observed:?}"
             );
             let observed = vendor_error(failure);
-            let expected = Some((Some(String::from("-32603")), String::from(text)));
+            let expected = Some((Some(String::from("-32603")), text.clone()));
             assert_eq!(
                 observed, expected,
                 "expected the failure to turn into a vendor error with the stand-in's code and text for {shape}: {expected:?} | received {observed:?}"
