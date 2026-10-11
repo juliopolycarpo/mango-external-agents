@@ -8,7 +8,7 @@
 //! The check exists because the transport enforces the same budget on every outgoing frame, and
 //! a prompt refused only there would be refused too late: the turn has already started, the
 //! connection fails, the session closes and the host is left with `AcceptanceUnknown`. These
-//! tests drive the real outbound path (the SDK's own serialisation and the bounded transport's
+//! tests drive the real outbound path (the connection's own serialisation and its
 //! own check), so the boundary they pin is the one a host meets.
 
 use super::*;
@@ -462,5 +462,160 @@ async fn two_images_at_the_attachment_cap_still_fit_under_default_limits() {
     assert!(
         lengths.len() == 1 && lengths[0] < budget,
         "expected one prompt frame under {budget} bytes | received {lengths:?}"
+    );
+}
+
+/// Starts a turn of `input` once the session's slot is free, cancels it without waiting for
+/// anything, and returns how the cancel was answered and the turn's events as short labels.
+async fn cancelled_at_once(
+    session: &dyn Session,
+    turn_id: &str,
+    input: &str,
+) -> (Option<String>, Vec<String>) {
+    let begun = std::time::Instant::now();
+    let mut turn = loop {
+        match session.start_turn(TurnRequest::new(turn_id, input)).await {
+            Ok(turn) => break turn,
+            // The previous turn's terminal is published just ahead of the release of its slot.
+            // Bounded, so a slot that is never released fails here instead of spinning.
+            Err(error) if matches!(error.cause(), Error::Busy) => {
+                assert!(
+                    begun.elapsed() < std::time::Duration::from_secs(5),
+                    "expected the turn slot free for {turn_id} within 5s | received: still busy"
+                );
+                tokio::task::yield_now().await;
+            }
+            Err(error) => panic!("expected {turn_id} accepted | received refusal: {error}"),
+        }
+    };
+    let cancel_refused = session
+        .cancel(CancelReason::Requested)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let events = drain(&mut turn)
+        .await
+        .iter()
+        .map(|kind| match kind {
+            EventKind::Error { error } => {
+                format!("Error({}: {})", error.code.as_str(), error.message)
+            }
+            other => format!("{other:?}").chars().take(40).collect(),
+        })
+        .collect();
+    (cancel_refused, events)
+}
+
+/// The frame budget is for one frame, and the queue has room behind it. A prompt that fills the
+/// frame budget exactly is still followed by its `session/cancel`: both are queued in the same
+/// instant, the prompt not yet written, and the cancel stops the turn. It does not end the
+/// connection for a queue that one more small frame overfilled.
+#[tokio::test]
+async fn a_cancel_queued_behind_a_prompt_that_fills_the_frame_budget_stops_the_turn() {
+    let silent = FakeAcpAgent::new()
+        .with_updates(Vec::new())
+        .staying_silent();
+    let (session, launcher) = open_with(silent, small_budget()).await;
+    let cancelled = (
+        None,
+        vec![
+            String::from("TurnStarted"),
+            String::from("Cancelled { reason: Requested }"),
+            String::from("Completed"),
+        ],
+    );
+
+    let calibrating = cancelled_at_once(session.as_ref(), "turn-empty", "").await;
+    assert_eq!(
+        calibrating, cancelled,
+        "expected the empty turn (cancel refusal, events): {cancelled:?} | received: {calibrating:?}"
+    );
+    let base = prompt_frame_lengths(&launcher)[0];
+
+    let filling = "a".repeat(SMALL_BUDGET - base);
+    let received = cancelled_at_once(session.as_ref(), "turn-full", &filling).await;
+    assert_eq!(
+        received, cancelled,
+        "expected the turn that fills the frame budget (cancel refusal, events): {cancelled:?} | received: {received:?}"
+    );
+    assert_eq!(
+        prompt_frame_lengths(&launcher).last().copied(),
+        Some(SMALL_BUDGET),
+        "expected the filling prompt written as one {SMALL_BUDGET}-byte frame"
+    );
+    assert_eq!(
+        session.snapshot().status,
+        SessionStatus::Ready,
+        "expected the session to stay usable"
+    );
+}
+
+/// The frame budget is exact whatever the width of the request id. The check ahead of the turn
+/// measures with the shortest id there is, so with a two-digit id it lets through a prompt one
+/// byte too long, and the connection, which measures the frame it really queues, refuses that
+/// one. A host cannot tell the two refusals apart: the same error, the same numbers, nothing
+/// written, and a session that takes the next turn.
+#[tokio::test]
+async fn the_frame_budget_is_exact_for_a_one_digit_and_a_two_digit_request_id() {
+    let (session, launcher) =
+        open_with(FakeAcpAgent::new().listing_sessions(), small_budget()).await;
+
+    assert_completes(session.as_ref(), TurnRequest::new("turn-empty", "")).await;
+    let base = prompt_frame_lengths(&launcher)[0];
+
+    // `initialize`, `session/new` and the empty prompt took ids 1 to 3; listings take the rest
+    // of the single digits, so the next prompt goes out under a two-digit id.
+    let mut written = 1;
+    for (width, extra) in [(1_usize, 0_usize), (2, 1)] {
+        if width == 2 {
+            for _ in 0..8 {
+                session
+                    .list_sessions(Default::default())
+                    .await
+                    .expect("expected a listing");
+            }
+        }
+        let fitting = SMALL_BUDGET - base - extra;
+        let label = format!("with a {width}-digit id");
+        assert_completes(
+            session.as_ref(),
+            TurnRequest::new(format!("fits-{width}"), "a".repeat(fitting)),
+        )
+        .await;
+        written += 1;
+        assert_eq!(
+            prompt_frame_lengths(&launcher).last().copied(),
+            Some(SMALL_BUDGET),
+            "expected the largest fitting prompt {label} written as one {SMALL_BUDGET}-byte frame"
+        );
+
+        let refused = assert_refused_before_submission(
+            session.as_ref(),
+            TurnRequest::new(format!("over-{width}"), "a".repeat(fitting + 1)),
+        )
+        .await;
+        assert_eq!(
+            refused,
+            (SMALL_BUDGET, SMALL_BUDGET + 1),
+            "expected (limit, received) {label}: ({SMALL_BUDGET}, {}) | received: {refused:?}",
+            SMALL_BUDGET + 1
+        );
+        assert_eq!(
+            prompt_frame_lengths(&launcher).len(),
+            written,
+            "expected the refused prompt {label} to reach no frame | received: {:?}",
+            prompt_frame_lengths(&launcher)
+        );
+    }
+
+    assert_completes(
+        session.as_ref(),
+        TurnRequest::new("turn-after", "still here"),
+    )
+    .await;
+    assert_eq!(
+        session.snapshot().status,
+        SessionStatus::Ready,
+        "expected the session to stay usable after both refusals"
     );
 }

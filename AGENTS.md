@@ -32,7 +32,7 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
 | `crates/mango-external-agents/` | Core: `Harness`/`Session` traits, events, normalisation, permission matrix, host ports, transports, testing             |
 | `crates/mango-agent-claude/`    | Claude Code harness: stream-json dialect, reducer, auth probe, models, permissions                                      |
 | `crates/mango-agent-codex/`     | Codex harness: app-server dialect, reducer, approvals, rate limits; vendored protocol types under `vendor/`             |
-| `crates/mango-agent-acp/`       | Generic ACP harness over the official crate, per-agent profiles, `acp` transport                                        |
+| `crates/mango-agent-acp/`       | Generic ACP harness over the core JSON-RPC peer and the official schema crate, per-agent profiles, `acp` transport      |
 | `examples/mea/`                 | Unpublished CLI: discover, turn, capture, doctor, digests (the smoke and drift tool)                                    |
 | `examples/hub-host/`            | Unpublished reference host: the retry, reconciliation and stream-ownership loop over an injected Hub port               |
 | `fixtures/<vendor>/`            | Captured contracts and transcripts, replayed by the fakes                                                               |
@@ -54,9 +54,10 @@ It is a library, not a daemon: no listener, no service, no telemetry, no login h
   credential-shaped text.
 - **No dependency on `mango-protocol` or on mangostudio.** The runtime binary is where they meet.
 - **TLS is `ring` everywhere.** `deny.toml` bans `aws-lc-rs` and `openssl`; `scripts/check-tls.sh`
-  proves the tree is clean. `agent-client-protocol` stays inside `mango-agent-acp` with every
-  feature off; `deny.toml` bans `async-io`, `async-process` and `blocking`, which its `process`
-  and `stdio` features would bring back.
+  proves the tree is clean. ACP runs on the core JSON-RPC peer: `agent-client-protocol-schema`
+  stays inside `mango-agent-acp`, pinned exactly, with every feature off, and `deny.toml` bans the
+  SDK (`agent-client-protocol`), `futures-concurrency`, which only it needed, and the executors
+  it brought (`async-io`, `async-process`, `blocking`).
 - **Vendor fixtures are captured by `mea capture`, never hand-edited.** In a capture directory that
   carries a `manifest.json`, that rule is enforced: the manifest holds a SHA-256 digest per file
   beside it and `mea`'s test suite recomputes them, so an edited file there fails `scripts/check.sh`.

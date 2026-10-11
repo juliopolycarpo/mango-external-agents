@@ -137,7 +137,7 @@ fn assert_turn_died_as_a_closed_link(what: &str, events: &[EventKind], before: &
 /// The same death on a multi-thread runtime, repeated so every order the prompt task can observe
 /// it in shows up in one run.
 ///
-/// The prompt task waits on the prompt's own failure and on the end of the dispatch loop. The
+/// The prompt task waits on the prompt's own failure and on the end of the connection. The
 /// lifecycle watcher can wind the loop down before that task is polled, so either may be seen
 /// first. Nobody asked for a cancel, so both orders end the turn as the closed link, with the
 /// agent's stderr: a host is never told it stopped a turn whose agent died.
@@ -154,7 +154,7 @@ async fn an_agent_death_mid_prompt_is_never_reported_as_a_cancellation() {
 }
 
 /// An agent that dies the moment it reads the prompt, before it reports anything, ends the turn
-/// the same way: the dispatch loop can be over before the prompt task first looks at it.
+/// the same way: the connection can be over before the prompt task first looks at it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_death_under_the_prompt_it_just_read_is_never_reported_as_a_cancellation() {
     for round in 0..DEATH_ROUNDS {
@@ -170,6 +170,92 @@ async fn an_agent_death_under_the_prompt_it_just_read_is_never_reported_as_a_can
             &format!("the turn in round {round}"),
             &drain(&mut turn).await,
             &["TurnStarted"],
+        );
+    }
+}
+
+/// A launcher whose child closes its stdout right behind the first line containing `after`:
+/// that line is read whole, and the next read is the end of the stream.
+///
+/// Models an agent that writes its last answer and exits, with the answer still in the pipe.
+#[derive(Clone)]
+struct LeavingLauncher {
+    inner: FakeLauncher,
+    after: &'static str,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for LeavingLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<ManagedProcess> {
+        let mut process = self.inner.spawn(spec).await?;
+        process.stdout = Box::new(LeavingStdout {
+            inner: process.stdout,
+            after: self.after,
+            left: false,
+        });
+        Ok(process)
+    }
+}
+
+struct LeavingStdout {
+    inner: Box<dyn mango_external_agents::process::ByteSource>,
+    after: &'static str,
+    left: bool,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::process::ByteSource for LeavingStdout {
+    async fn next_chunk(&mut self) -> mango_external_agents::Result<Option<Vec<u8>>> {
+        if self.left {
+            return Ok(None);
+        }
+        let chunk = self.inner.next_chunk().await?;
+        self.left = chunk
+            .as_deref()
+            .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains(self.after));
+        Ok(chunk)
+    }
+}
+
+/// An agent that answers its prompt and exits at once leaves the prompt task two things to see
+/// at the same moment: the answer and the end of the connection. Whichever it looks at first,
+/// the agent did answer, so the turn completes; it is not reported as a link that closed under
+/// the prompt. Repeated on a multi-thread runtime, where both orders show up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_that_answers_and_exits_at_once_completes_the_turn() {
+    for round in 0..DEATH_ROUNDS {
+        let fake = FakeLauncher::new();
+        fake.push(FakeAcpAgent::new().with_updates(Vec::new()).process());
+        let launcher = LeavingLauncher {
+            inner: fake,
+            after: "stopReason",
+        };
+        let host = HostContext::builder()
+            .launcher(Arc::new(launcher))
+            .cwd(std::env::temp_dir())
+            .client_info("mea-tests", "0.1.0")
+            .build()
+            .expect("expected a host");
+        let session = AcpHarness::new(profile())
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_configuration(permissive()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("expected a session | received: {error:?}"));
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "say nothing"))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("expected a turn in round {round} | received: {error:?}")
+            });
+        assert_events(
+            &format!("the turn in round {round}"),
+            &drain(&mut turn).await,
+            &["TurnStarted", "Completed"],
         );
     }
 }
@@ -193,7 +279,7 @@ async fn an_agent_death_under_a_request_is_never_reported_as_the_agents_refusal(
 }
 
 /// A request still waiting when the connection is wound down under it loses its reply with the
-/// dispatch loop rather than at EOF. The agent refused nothing, so that is the closed link naming
+/// connection rather than at EOF. The agent refused nothing, so that is the closed link naming
 /// the request too, and never `acp-request-failed`. Here the connection ends because the host
 /// dropped another request it had sent.
 #[tokio::test(start_paused = true)]
@@ -441,9 +527,53 @@ async fn a_request_past_its_deadline_times_out_and_ends_the_connection() {
     assert_first_frame_after(&launcher, "session/new", "session/list");
 }
 
+/// An agent that answers `session/prompt` with an error of its own has refused the prompt. The
+/// turn fails as that refusal: `acp-request-failed`, naming the request, with the agent's code
+/// and message. It is not reported as a link that closed, which is what a host is told when
+/// the agent went away.
+#[tokio::test]
+async fn an_agents_own_error_on_the_prompt_fails_the_turn_as_its_refusal() {
+    let refusing = ScriptedPeer::new(|frame| match frame["method"].as_str() {
+        Some("session/prompt") => vec![
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": frame["id"],
+                "error": { "code": -31_000, "message": "model busy" }
+            })
+            .to_string(),
+        ],
+        _ => Vec::new(),
+    });
+    let (session, _launcher) = open_under(refusing.process(), Limits::default()).await;
+    let mut turn = session
+        .start_turn(TurnRequest::new("turn-1", "try"))
+        .await
+        .expect("expected a turn");
+
+    let events = drain(&mut turn).await;
+    assert_events(
+        "the refused turn",
+        &events,
+        &["TurnStarted", "Error(acp-request-failed)"],
+    );
+    let Some(EventKind::Error { error }) = events.last() else {
+        unreachable!("the events above end in an error");
+    };
+    let received = (
+        error.request_id.as_deref(),
+        error.vendor_code.as_deref(),
+        error.message.as_str(),
+    );
+    let expected = (Some("session/prompt"), Some("-31000"), "model busy");
+    assert_eq!(
+        received, expected,
+        "expected (request, the agent's code, message): {expected:?} | received: {received:?}"
+    );
+}
+
 /// A request that passed its deadline ends the connection under a turn that was still running.
 /// Nobody asked to stop that turn, so it ends as the closed link and not as a cancellation the
-/// host never requested.
+/// host never requested. The message says which request's deadline closed the link, so the
+/// turn does not fail for no visible reason.
 #[tokio::test(start_paused = true)]
 async fn a_request_past_its_deadline_fails_the_turn_in_flight_as_a_closed_link() {
     let deadline = Duration::from_secs(5);
@@ -479,7 +609,7 @@ async fn a_request_past_its_deadline_fails_the_turn_in_flight_as_a_closed_link()
     let Some(EventKind::Error { error }) = events.last() else {
         unreachable!("the events above end in an error");
     };
-    let expected = "fake: a transport that closed under session/prompt";
+    let expected = "fake: a transport that closed under session/prompt after session/list got no answer within 5s";
     assert_eq!(
         error.message, expected,
         "expected the failure message: {expected:?} | received: {:?}",

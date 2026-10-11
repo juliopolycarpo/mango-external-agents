@@ -287,8 +287,8 @@ and nothing implying an official or endorsed integration.
 
 ## Agent Client Protocol agents (`mango-agent-acp`)
 
-**Surface used:** ACP v1 over the official `agent-client-protocol` crate, `unstable_protocol_v2` and
-every other draft feature off. Every method driven is listed with its specification page in
+**Surface used:** ACP v1, with the wire types of the official `agent-client-protocol-schema` crate
+(every `unstable_*` feature off) carried by this library's own JSON-RPC 2.0 peer. Every method driven is listed with its specification page in
 [harness-acp.md](harness-acp.md#the-surface-driven). Profile facts were read on 2026-09-13.
 
 The client advertises three session capabilities, all of which only let an agent report more:

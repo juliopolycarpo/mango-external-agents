@@ -93,7 +93,6 @@ jobs:
             echo '### Protocol crates in this run'
             echo
             echo '```'
-            cargo tree -i agent-client-protocol -e normal --depth 0 --locked
             cargo tree -i agent-client-protocol-schema -e normal --depth 0 --locked
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

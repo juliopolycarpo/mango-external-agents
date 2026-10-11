@@ -7,12 +7,16 @@
 
 use super::*;
 
+#[path = "pins/bounds.rs"]
+mod bounds;
 #[path = "pins/budgets.rs"]
 mod budgets;
 #[path = "pins/close.rs"]
 mod close;
 #[path = "pins/failures.rs"]
 mod failures;
+#[path = "pins/peer.rs"]
+mod peer;
 #[path = "pins/wire.rs"]
 mod wire;
 
