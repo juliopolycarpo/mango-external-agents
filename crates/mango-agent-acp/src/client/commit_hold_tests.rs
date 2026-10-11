@@ -28,6 +28,8 @@ const MESSAGE_BUDGET: usize = 4;
 
 /// One running turn on a live connection to a fake agent the test speaks through.
 struct RunningTurn {
+    launcher: FakeLauncher,
+    host: HostContext,
     state: Arc<SessionState>,
     connection: Arc<ConnectionHandle>,
     agent: Announcer,
@@ -131,6 +133,8 @@ impl RunningTurn {
             .begin_turn(sink, None)
             .expect("expected the turn to be admitted");
         Self {
+            launcher,
+            host,
             state,
             connection,
             agent,
@@ -376,5 +380,152 @@ async fn a_request_refused_by_an_ended_connection_is_marked_not_submitted() {
     assert_eq!(
         received, expected,
         "expected (the budget that ended the connection, dispatch): {expected:?} | received: {received:?} from {refused:?}"
+    );
+}
+
+/// A `session/request_permission` line under `id` that offers no way to refuse.
+fn ask_without_a_refusal(id: u32) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+        "params": {
+            "sessionId": "session-1",
+            "toolCall": { "toolCallId": "call-ask", "title": "Run tests" },
+            "options": [{ "optionId": "allow", "name": "Allow", "kind": "allow_once" }],
+        }
+    })
+    .to_string()
+}
+
+impl RunningTurn {
+    /// Has the agent ask a question it cannot be refused, and returns it once the host has
+    /// been shown it.
+    async fn asked_without_a_refusal(
+        &mut self,
+        id: u32,
+    ) -> mango_external_agents::PermissionRequest {
+        self.agent.announce(ask_without_a_refusal(id));
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), self.events.recv())
+                .await
+                .expect("expected the question announced within 5s")
+                .expect("expected an open stream");
+            if let EventKind::ApprovalRequested { request } = event.kind {
+                return request;
+            }
+        }
+    }
+
+    /// Makes the parked question `id` one whose time has run out.
+    fn expire(&self, id: &str) {
+        let now = std::time::SystemTime::now();
+        self.state
+            .lock_pending()
+            .get_mut(id)
+            .expect("expected the question parked")
+            .deadline = mango_external_agents::approval::ApprovalDeadline::new(now, now)
+            .expect("expected an elapsed deadline");
+    }
+}
+
+/// A question that runs out of time with no refusing option stops the turn. When the
+/// connection has ended and cannot carry `session/cancel`, that is not the agent's error and
+/// not the caller's: the question was withdrawn, so the answer reads as too late, and the
+/// failed cancel is recorded on the turn for its owner to report, as a host's own is.
+#[tokio::test]
+async fn an_expiry_cancel_the_connection_cannot_carry_is_recorded_on_the_turn() {
+    let mut running = RunningTurn::start().await;
+    let question = running.asked_without_a_refusal(81).await;
+    running.agent.announce(flood());
+    running.connection.ended().cancelled().await;
+    running.expire(question.id().as_str());
+
+    let answered = running.state.respond_pending(
+        question.id().as_str(),
+        crate::permission::cancelled(),
+        mango_external_agents::DecisionSource::Expired,
+    );
+    let recorded = running
+        .turn
+        .cancel_failure
+        .lock()
+        .expect("expected the failure slot")
+        .clone();
+    let received = (
+        format!("{answered:?}"),
+        recorded,
+        running.turn.cancellation.is_cancelled(),
+    );
+    let expected = (
+        String::from("Ok(AlreadyResolved)"),
+        Some(String::from("ACP session/cancel could not be queued")),
+        true,
+    );
+    assert_eq!(
+        received, expected,
+        "expected (the result, the failure recorded on the turn, the turn told to stop): {expected:?} | received: {received:?}"
+    );
+}
+
+/// The expiry's `session/cancel` belongs to the turn the question was asked in. When that turn
+/// has ended and another runs by the time the cancel would be sent, nothing is sent and the
+/// running turn is left alone: its questions stay parked and it is not told to stop.
+#[tokio::test]
+async fn an_expiry_cancel_is_not_sent_once_another_turn_is_running() {
+    let mut running = RunningTurn::start().await;
+    let question = running.asked_without_a_refusal(82).await;
+    let expired = running
+        .state
+        .lock_pending()
+        .remove(question.id().as_str())
+        .expect("expected the question parked");
+
+    running.state.release_turn_matching(&running.turn);
+    let (sink, mut events) = EventSink::new(
+        SessionId::new("session-1"),
+        TurnId::new("turn-2"),
+        AttemptId::default(),
+        Arc::clone(running.host.clock()),
+        16,
+    );
+    let next = running
+        .state
+        .begin_turn(sink, None)
+        .expect("expected the next turn admitted");
+    running.agent.announce(ask_line(83));
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("expected the next turn's question announced within 5s")
+            .expect("expected an open stream");
+        if matches!(event.kind, EventKind::ApprovalRequested { .. }) {
+            break;
+        }
+    }
+
+    running.state.cancel_expired(expired);
+
+    // A marker queued after the call: whatever the call queued is written ahead of it.
+    running
+        .connection
+        .client
+        .submit_notification("x/marker", serde_json::json!({}))
+        .expect("expected the marker queued")
+        .await
+        .expect("expected the marker written");
+    let cancels = running
+        .launcher
+        .written()
+        .iter()
+        .filter(|line| line.contains("session/cancel"))
+        .count();
+    let received = (
+        cancels,
+        next.cancellation.is_cancelled(),
+        running.state.pending_count(),
+    );
+    let expected = (0, false, 1);
+    assert_eq!(
+        received, expected,
+        "expected (session/cancel frames written, the running turn told to stop, its questions parked): {expected:?} | received: {received:?}"
     );
 }

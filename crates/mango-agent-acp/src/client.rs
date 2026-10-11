@@ -977,25 +977,50 @@ impl SessionState {
             // `begin_cancellation`, take this same lock. The reason is already recorded, so a
             // late request or answer sees a cancelling turn whether or not the guard is held.
             drop(cancelling);
-            let notification = pending.cancel.clone();
-            let cancellation = pending.turn.cancellation.clone();
-            // Every resolution is queued before anything reaches the agent that could end its
-            // prompt: an agent that honours `session/cancel` on the spot can finish on another
-            // worker, and a resolution registered after the terminal is dropped. Nothing is chosen
-            // for the agent; it hears ACP's own `Cancelled` outcome. The siblings are swept here
-            // too, ahead of the only `?`, so a dead connection cannot strand one.
-            pending.withdraw();
-            self.withdraw_pending();
-            // The agent may ignore `session/cancel`; this starts the kill-grace fallback that
-            // reaps it, the same as a host `cancel` does.
-            cancellation.cancel();
-            self.notify_cancel(notification)?;
+            self.cancel_expired(pending);
             return Ok(Answered::AlreadyResolved);
         };
         let outcome = permission::selected(option_id);
         let option_id = option_id.clone();
         pending.respond_with_resolution(outcome, option_id, DecisionSource::Expired);
         Ok(Answered::AlreadyResolved)
+    }
+
+    /// Stops the turn whose question ran out of time with no way to refuse it.
+    ///
+    /// The question is withdrawn, its siblings with it, and the agent is sent `session/cancel`,
+    /// under the gate a turn starts under. That gate is what ties the cancel to this turn: the
+    /// caller let go of the cancel-reason lock before coming here, so the turn can have ended
+    /// and another begun in between, and a `session/cancel` sent then would stop a turn nobody
+    /// timed out. A question whose turn is no longer the running one is only withdrawn.
+    ///
+    /// A `session/cancel` the connection does not take is recorded on the turn, as a host's own
+    /// cancel records it, so the turn's owner reports it and tears the connection down instead
+    /// of waiting out the kill grace. It is not an error of the caller's: the question was
+    /// withdrawn either way.
+    ///
+    /// ```ignore
+    /// state.cancel_expired(pending);
+    /// ```
+    fn cancel_expired(&self, pending: PendingApproval) {
+        let turn = pending.turn.clone();
+        let notification = pending.cancel.clone();
+        let _starting = self.lock_turn_start();
+        // Every resolution is queued before anything reaches the agent that could end its
+        // prompt: an agent that honours `session/cancel` on the spot can finish on another
+        // worker, and a resolution registered after the terminal is dropped. Nothing is chosen
+        // for the agent; it hears ACP's own `Cancelled` outcome.
+        pending.withdraw();
+        if !self.can_submit_prompt(&turn) {
+            return;
+        }
+        self.withdraw_pending();
+        // The agent may ignore `session/cancel`; this starts the kill-grace fallback that
+        // reaps it, the same as a host `cancel` does.
+        turn.cancellation.cancel();
+        if self.notify_cancel(notification).is_err() {
+            self.record_cancel_failure(&turn, "ACP session/cancel could not be queued");
+        }
     }
 
     /// Withdraws one pending request when its turn cannot continue.
