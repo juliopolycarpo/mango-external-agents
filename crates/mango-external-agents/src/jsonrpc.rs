@@ -784,9 +784,6 @@ tokio::task_local! {
 struct NotificationCall {
     /// The client's state, by address.
     client: usize,
-    /// Whether the call asked for a [`CancellationHold`]. Read by the handler's task when the
-    /// call returns, so a handler that never asks pays nothing for the ones that do.
-    asked_for_hold: std::cell::Cell<bool>,
     /// The holds this call has out, made on its first. Shared with each hold, which may be
     /// dropped on another task.
     holds: std::cell::OnceCell<Arc<CallHolds>>,
@@ -872,7 +869,6 @@ impl NotificationCall {
     fn of(client: usize) -> Self {
         Self {
             client,
-            asked_for_hold: std::cell::Cell::new(false),
             holds: std::cell::OnceCell::new(),
         }
     }
@@ -2109,7 +2105,6 @@ impl Client {
         let in_own_call = HANDLING_NOTIFICATION_FOR
             .try_with(|call| {
                 (call.client == address).then(|| {
-                    call.asked_for_hold.set(true);
                     Arc::clone(
                         call.holds
                             .get_or_init(|| Arc::new(CallHolds::of(&self.state.holds))),
@@ -3537,14 +3532,16 @@ async fn peer_work_pump(
     handler: Arc<dyn PeerHandler>,
 ) {
     while let Some(queued) = notifications.recv().await {
+        // An end that does not drain has been noticed, and nothing still queued is to be begun
+        // or delivered: either this task is about to be stopped, or the end was waiting for a
+        // stretch the last call held and is over now that it is let go. A queued answer fails
+        // with what ended the connection, as it and the rest of the queue are let go. One load,
+        // for each thing taken from the queue, of a word written once in a connection's life.
+        if state.cancelling_handler.load(Ordering::SeqCst) {
+            break;
+        }
         let (work, _permit) = match queued {
             QueuedWork::Response(answer) => {
-                // An end that does not drain has been noticed and is on its way to stopping
-                // this task. An answer still queued then is not delivered: it fails with what
-                // ended the connection, as it and the rest of the queue are let go.
-                if state.cancelling_handler.load(Ordering::SeqCst) {
-                    break;
-                }
                 // Everything read before this response has been handed to the handler and, for a
                 // notification, awaited.
                 answer.deliver();
@@ -3554,18 +3551,12 @@ async fn peer_work_pump(
         };
         match work {
             PeerWork::Notification { method, params } => {
-                let asked_for_hold = HANDLING_NOTIFICATION_FOR
-                    .scope(NotificationCall::of(state.address()), async {
-                        handler.on_notification(method, params).await;
-                        HANDLING_NOTIFICATION_FOR.with(|call| call.asked_for_hold.get())
-                    })
+                HANDLING_NOTIFICATION_FOR
+                    .scope(
+                        NotificationCall::of(state.address()),
+                        handler.on_notification(method, params),
+                    )
                     .await;
-                // A cancellation that waited for this call's hold is over the moment the hold
-                // is dropped, and whatever is queued behind the call is not to be begun. Only a
-                // call that asked for a hold can have been waited for, so only it looks.
-                if asked_for_hold && state.cancelling_handler.load(Ordering::SeqCst) {
-                    break;
-                }
             }
             PeerWork::Request { method, params, id } => {
                 // A question that waits for a person must not stop later events after it has

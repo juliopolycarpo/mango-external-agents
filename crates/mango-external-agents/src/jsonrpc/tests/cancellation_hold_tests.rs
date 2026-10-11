@@ -51,6 +51,12 @@ struct HoldingHandler {
     script: Script,
     client: OnceLock<Weak<Client>>,
     begun: AtomicUsize,
+    /// Questions from the peer put to the handler.
+    asked: AtomicUsize,
+    /// Calls whose future is gone, returned or dropped part-way.
+    ended: AtomicUsize,
+    /// How many calls had ended when the handler was told the connection did.
+    ended_at_termination: AtomicUsize,
     asked_for_hold: AtomicUsize,
     granted: AtomicUsize,
     committed: AtomicUsize,
@@ -102,6 +108,7 @@ impl HoldingHandler {
 impl PeerHandler for HoldingHandler {
     async fn on_notification(&self, _method: String, _params: Value) {
         let first = self.begun.fetch_add(1, Ordering::AcqRel) == 0;
+        let _ended = CountOnDrop(&self.ended);
         // Taken for each use and let go again: a handler that kept its client across a wait
         // would keep it from ever being dropped.
         let client = || self.client.get().and_then(Weak::upgrade);
@@ -191,10 +198,13 @@ impl PeerHandler for HoldingHandler {
         _params: Value,
         _id: RequestId,
     ) -> ServerRequestOutcome {
+        self.asked.fetch_add(1, Ordering::AcqRel);
         ServerRequestOutcome::Answer(Value::Null)
     }
 
     async fn on_terminated(&self, termination: PeerTermination) {
+        self.ended_at_termination
+            .store(Self::count(&self.ended), Ordering::Release);
         let committed = Self::count(&self.committed);
         self.terminations
             .lock()
@@ -214,6 +224,15 @@ impl PeerHandler for HoldingHandler {
     }
 }
 
+/// Counts a call as ended when its future goes, however it goes.
+struct CountOnDrop<'a>(&'a AtomicUsize);
+
+impl Drop for CountOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 const GRACE: Duration = Duration::from_millis(200);
 const UPDATE: &str = r#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#;
 
@@ -227,6 +246,9 @@ fn connect_with(
         script,
         client: OnceLock::new(),
         begun: AtomicUsize::new(0),
+        asked: AtomicUsize::new(0),
+        ended: AtomicUsize::new(0),
+        ended_at_termination: AtomicUsize::new(usize::MAX),
         asked_for_hold: AtomicUsize::new(0),
         granted: AtomicUsize::new(0),
         committed: AtomicUsize::new(0),
@@ -1938,4 +1960,130 @@ async fn an_answer_reached_after_the_end_was_decided_is_failed_not_delivered() {
         failed.cause()
     );
     client.close().await.expect("expected a clean close");
+}
+
+/// With nothing held, there is a moment between an end deciding to stop the handler's task and
+/// the task being stopped. A call that returns in that moment is the last: what is queued
+/// behind it, a notification or a question from the peer, is not begun.
+#[tokio::test(start_paused = true)]
+async fn work_reached_after_the_end_was_decided_is_not_begun() {
+    const QUESTION: &str =
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{}}"#;
+    for queued in [UPDATE, QUESTION] {
+        let link = ScriptedLink::new();
+        let (handler, client) = connect(&link, NOT_HOLDING);
+        inside_the_stretch(&link, &handler).await;
+        link.push_line(queued);
+        until("the next frame to be queued behind the call", || {
+            client.state.peer_bytes.available_permits()
+                <= client.state.options.max_pending_bytes - UPDATE.len() - queued.len()
+        })
+        .await;
+
+        // What a close does up to the moment before it stops the task, and no further.
+        let _ = client.state.ended_with(
+            crate::jsonrpc::ConnectionEnd::Closed,
+            client.state.closed_error(),
+        );
+        client.state.mark_closed();
+        let held = client.state.cancellation_held();
+        assert!(
+            !held,
+            "expected nothing held when the end was decided: false | received true"
+        );
+        // The task gets on before it is stopped: its call returns, with more queued behind.
+        handler.inside.add_permits(8);
+        eventually(
+            "the handler's task to stop",
+            client.state.worker_stopped.cancelled(),
+        )
+        .await;
+        let observed = (handler.progress(), HoldingHandler::count(&handler.asked));
+        assert_eq!(
+            observed,
+            ((1, 0, 1), 0),
+            "expected the call in progress returned and nothing queued begun: ((1, 0, 1), 0) | received {observed:?}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
+}
+
+/// After an inbound overflow with nothing held, the handler is told the connection ended only
+/// once its task has stopped, also when a close took the task's handle first. Asking a task
+/// to stop does not stop it there and then: it is gone the next time the scheduler comes to
+/// it, and the reader waits for that.
+#[tokio::test(start_paused = true)]
+async fn an_overflow_tells_the_handler_after_its_task_stopped_when_a_close_holds_the_task() {
+    let link = ScriptedLink::new();
+    let (handler, client) = connect(&link, NOT_HOLDING);
+    inside_the_stretch(&link, &handler).await;
+    // What a close does first to stop the task, stopped short of stopping it.
+    let taken = client
+        .state
+        .notifications
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .expect("expected the handler's task to be on record");
+    for _ in 0..3 {
+        link.push_line(UPDATE);
+    }
+    eventually("the termination", handler.terminated.notified()).await;
+    let ended = HoldingHandler::count(&handler.ended_at_termination);
+    assert_eq!(
+        ended, 1,
+        "expected the call in progress gone by the time the handler was told: 1 call ended | received {ended}"
+    );
+    taken.abort();
+    client.close().await.expect("expected a clean close");
+}
+
+/// A call's end and a drop of its hold on another thread, at once, over and over. Whichever
+/// gets there first, the hold is counted off once: the count is back at zero after every call
+/// and never below it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_calls_end_racing_a_hold_dropped_on_another_thread_counts_it_off_once() {
+    let link = ScriptedLink::new();
+    let mut roomy = ClientOptions::new("ACP agent");
+    roomy.shutdown_timeout = Duration::from_secs(30);
+    let (handler, client) = connect_with(
+        &link,
+        Script {
+            hold_elsewhere: true,
+            quick: true,
+            ..HOLDING
+        },
+        roomy,
+        WireOptions::new(),
+    );
+    for round in 1..=500 {
+        link.push_line(UPDATE);
+        // The call hands its hold over and runs on to its end, three turns of the scheduler
+        // away; this thread drops the hold as soon as it finds it.
+        let elsewhere = loop {
+            let found = handler
+                .kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop();
+            if let Some(hold) = found {
+                break hold;
+            }
+            std::hint::spin_loop();
+        };
+        drop(elsewhere);
+        until("the call to return", || handler.progress().2 == round).await;
+        until("the call's record to be let go", || {
+            HoldingHandler::count(&handler.ended) == round
+        })
+        .await;
+        let left = client.state.holds.out.load(Ordering::SeqCst);
+        assert_eq!(
+            left, 0,
+            "expected the hold counted off exactly once (round {round}): 0 | received {left}"
+        );
+    }
+    within("the close", client.close())
+        .await
+        .expect("expected a clean close");
 }
