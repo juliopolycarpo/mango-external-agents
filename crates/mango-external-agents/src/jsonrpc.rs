@@ -2979,6 +2979,33 @@ impl Client {
         }
     }
 
+    /// Decides, for a test, that the handler's task is to be cancelled, as [`Client::close`]
+    /// and the peer passing an inbound budget decide it first, and does nothing else.
+    ///
+    /// Only under the `testing` feature. A harness that takes a [`hold`](Self::hold_cancellation)
+    /// around a stretch can test the order it asks in, which no other way reaches: a hold asked
+    /// for after the cancellation was decided never returns, the call parking where it asked,
+    /// so the stretch behind it is never begun. Decide the end while the handler is parked
+    /// before its hold, let it go on, and see what it did and did not get to.
+    ///
+    /// The connection stays up and nothing is cancelled here, but the worker begins no more
+    /// work, and a call that asks for a hold parks at the ask. The client is then fit only to
+    /// be closed, which cancels the parked call. Returns whether a hold is out that an end
+    /// would wait for: `false` when the call that is asking holds nothing, or is the caller.
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
+    /// // Before the handler's call asks for its hold: its next hold request is refused.
+    /// let held = client.decide_cancellation();
+    /// assert!(!held, "no stretch is being held yet");
+    /// client.close().await.expect("expected a clean close");
+    /// # }
+    /// ```
+    #[cfg(any(test, feature = "testing"))]
+    pub fn decide_cancellation(&self) -> bool {
+        self.state.cancellation_held()
+    }
+
     /// Stops the pump, fails every call still waiting, and closes this side of the link.
     ///
     /// The process or socket underneath is the caller's to reap: this client did not open it.
