@@ -222,8 +222,10 @@ pub struct Limits {
     ///
     /// A `cancel` call waits only when the turn is already named: then it covers the interrupt,
     /// this deadline and any shutdown. Before that it returns as soon as the stop is recorded.
-    /// `close` skips the protocol stop and stays within [`Self::kill_grace`] and
-    /// [`Self::shutdown_timeout`].
+    /// `close` skips the protocol stop and this deadline. In the Codex harness it goes straight
+    /// to the teardown. Each stage of that teardown is bounded by [`Self::kill_grace`] or
+    /// [`Self::shutdown_timeout`], and together they add up to the teardown row of the same
+    /// table: 36 seconds at the defaults.
     ///
     /// For example, a host whose tools can take minutes to abort raises this without lengthening
     /// every protocol request: `Limits { cancel_settle_timeout: Duration::from_secs(300),
