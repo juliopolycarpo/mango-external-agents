@@ -3,7 +3,9 @@
 A session admits one native turn at a time. A concurrent start returns `Error::Busy` with
 `Dispatch::NotSubmitted`; it never replaces, queues or steers the current turn. A stopping attempt
 continues to own admission until native work can no longer conflict and its terminal is committed.
-The host does not have to drain the old transcript before starting another turn.
+The host does not have to drain the old transcript before starting another turn. In the ACP
+harness the slot is released a moment after the terminal is published, so a start made the
+instant the terminal is read can still be answered `Error::Busy`, and is simply made again.
 
 Every callback belongs to an attempt. The harness compares that owner before publishing session
 state, resolving interactions or clearing admission. Reusing a host turn ID does not give an older
@@ -194,7 +196,7 @@ while a connection is ending under this side waits for that call to return, with
 close, where it used to take the reader down under it. Dropping the `Client` cannot wait: the
 call in progress is cancelled whatever it holds, and `on_terminated` may not be made at all.
 
-Three things a client does on the wire only when its `WireOptions` ask for them, each off by
+Things a client does on the wire only when its `WireOptions` ask for them, each off by
 default. `with_batch_decoding` reads a line that is a JSON array as a batch: its members are
 routed in order, each notification and question counted against `max_pending_notifications` on its
 own and the whole batch counted before any of it is queued, the line's bytes taken from
@@ -208,7 +210,22 @@ would have gone on reading. What is answered is a line the transport handed over
 which includes a stdio line whose bytes were not UTF-8, since the line reader replaces those bytes
 and hands the line on. What the transport cannot hand over is not answered, because the read fails
 and the connection ends: a line or websocket message past `max_line_bytes`, and a websocket text
-frame that is not UTF-8. `with_cancel_on_abandon(method)` queues a notification
+frame that is not UTF-8. `with_invalid_request_replies(max_queued)` answers JSON that is not a
+request with `-32600`, under a bound of its own and beside the queue's bounds in the same way,
+each reply a frame of its own. Answered under a null id: a line that is a number, a string,
+`true`, `false` or `null`; where batches are read, an empty batch and each member of a batch that
+is not an object; where they are not, a line that is an array, once. Answered under its own id
+when that is a string or a number of at most 128 bytes as this side writes it, and under null
+otherwise: an object with neither `result` nor
+`error` whose `method` is missing or not a string, or whose `id` is something an id cannot be.
+Never answered: an object with `result` or `error`, which is a response, this side's own replies
+among them, so two peers that answer invalid requests cannot loop; an object with no `method` and an id that
+could name a call, which is read as that call's response as before; and a request or notification
+with a `method` that is a string, whatever its `params` or `jsonrpc` say. One batch is answered
+for at most `max_queued` of its members, and a batch refused whole is answered for none. A bound of nothing answers nothing and reroutes nothing. Without
+the option every object is routed exactly as before: `{"id":4,"method":5}` is the response to
+call `4`, and `{"method":"x","id":{}}` is put to the handler.
+`with_cancel_on_abandon(method)` queues a notification
 `method` with `{"requestId": id}` when a request that was written is given up, by its future or
 `Reply` being dropped or its deadline running out; not for a request that never began to be
 written or whose write has ended with the link refusing its frame whole, not once a response to

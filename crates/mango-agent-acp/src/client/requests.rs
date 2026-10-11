@@ -333,10 +333,40 @@ where
 /// Why a `session/prompt` has no answer.
 #[derive(Debug)]
 pub(crate) enum PromptFailure {
-    /// The agent answered with an error of its own, or with a result that is not a prompt's.
+    /// The agent answered with a JSON-RPC error of its own: it refused the prompt.
+    ///
+    /// The connection is as healthy as after any answer, so the session stays usable.
     Agent(AcpError),
+    /// The agent answered with a result this client could not read as a prompt's.
+    ///
+    /// The agent believes the turn ended some way this side cannot tell, so what state it
+    /// holds the session in is unknown, and the connection is not used again. Carried as the
+    /// internal error (`-32603`) the turn reports.
+    Unreadable(AcpError),
     /// The connection went away, or the prompt never reached it.
     LinkClosed,
+}
+
+impl PromptFailure {
+    /// Whether the connection can carry another turn after this failure.
+    ///
+    /// Only after the agent's own refusal: it answered, in a shape this side understood. For
+    /// example, `PromptFailure::LinkClosed.leaves_the_connection_usable()` is `false`.
+    pub(crate) fn leaves_the_connection_usable(&self) -> bool {
+        matches!(self, Self::Agent(_))
+    }
+
+    /// The error a turn reports for an answer that was not a prompt's result, or `None` when
+    /// there was no answer at all.
+    ///
+    /// For example, an agent's `-31000 model busy` comes back as that error, and a result
+    /// with a number where a stop reason belongs as an internal error naming the mismatch.
+    pub(crate) fn answered_with(&self) -> Option<&AcpError> {
+        match self {
+            Self::Agent(error) | Self::Unreadable(error) => Some(error),
+            Self::LinkClosed => None,
+        }
+    }
 }
 
 /// A `session/prompt` in flight.
@@ -363,7 +393,7 @@ impl PromptCall {
                 return decode(PromptRequest::METHOD, result).map_err(|error| {
                     let mut unreadable = AcpError::internal_error();
                     unreadable.message = error.to_string();
-                    PromptFailure::Agent(unreadable)
+                    PromptFailure::Unreadable(unreadable)
                 });
             }
             Err(failure) => failure,
@@ -464,6 +494,33 @@ mod tests {
     };
     use mango_external_agents::Error;
     use mango_external_agents::jsonrpc::JsonRpcError;
+
+    #[test]
+    fn only_the_agents_own_refusal_leaves_the_connection_usable() {
+        use super::{AcpError, PromptFailure};
+
+        let refusal = || AcpError::new(-31_000, "model busy");
+        let cases = [
+            (PromptFailure::Agent(refusal()), true, Some(-31_000)),
+            (
+                PromptFailure::Unreadable(AcpError::internal_error()),
+                false,
+                Some(-32_603),
+            ),
+            (PromptFailure::LinkClosed, false, None),
+        ];
+        for (failure, usable, code) in cases {
+            let received = (
+                failure.leaves_the_connection_usable(),
+                failure.answered_with().map(|error| i32::from(error.code)),
+            );
+            assert_eq!(
+                received,
+                (usable, code),
+                "expected (connection usable, code reported) for {failure:?}: ({usable}, {code:?}) | received: {received:?}"
+            );
+        }
+    }
 
     #[test]
     fn every_request_goes_out_under_its_acp_method() {

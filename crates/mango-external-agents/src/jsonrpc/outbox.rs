@@ -61,6 +61,7 @@ pub struct WireOptions {
     batch_decoding: bool,
     request_handoff: bool,
     parse_error_replies: Option<usize>,
+    invalid_request_replies: Option<usize>,
     cancel_on_abandon: Option<String>,
 }
 
@@ -73,6 +74,7 @@ impl Default for WireOptions {
             batch_decoding: false,
             request_handoff: false,
             parse_error_replies: None,
+            invalid_request_replies: None,
             cancel_on_abandon: None,
         }
     }
@@ -156,7 +158,8 @@ impl WireOptions {
     /// with [`with_request_handoff`](Self::with_request_handoff), whose answers are queued
     /// frames: a queue that takes none cannot answer the peer's first question, and the
     /// connection ends there. The frames
-    /// [`with_parse_error_replies`](Self::with_parse_error_replies) and
+    /// [`with_parse_error_replies`](Self::with_parse_error_replies),
+    /// [`with_invalid_request_replies`](Self::with_invalid_request_replies) and
     /// [`with_cancel_on_abandon`](Self::with_cancel_on_abandon) send are not held to this
     /// bound, whatever it is.
     ///
@@ -194,7 +197,9 @@ impl WireOptions {
     ///   line of its own takes none.
     /// - A response in a batch reaches its caller as one on a line of its own does, ordered
     ///   answers behind the notifications before them in the batch.
-    /// - A member that is not an object, and an empty array, are dropped.
+    /// - A member that is not an object, and an empty array, are dropped, unless
+    ///   [`with_invalid_request_replies`](Self::with_invalid_request_replies) has them
+    ///   answered.
     ///
     /// The answers to a batch's questions go out as frames of their own, not as one array.
     ///
@@ -282,7 +287,9 @@ impl WireOptions {
     ///
     /// The reply does not quote the line. A line that is empty or only whitespace gets none,
     /// and neither does a line that is JSON and not a frame (a number, a string, an array
-    /// without [`with_batch_decoding`](Self::with_batch_decoding)).
+    /// without [`with_batch_decoding`](Self::with_batch_decoding)): that is not a parse error.
+    /// [`with_invalid_request_replies`](Self::with_invalid_request_replies) answers the ones
+    /// that are owed an answer.
     ///
     /// # Example
     ///
@@ -295,6 +302,72 @@ impl WireOptions {
     #[must_use]
     pub fn with_parse_error_replies(mut self, max_queued: usize) -> Self {
         self.parse_error_replies = Some(max_queued);
+        self
+    }
+
+    /// Answers JSON that is not a request with a JSON-RPC invalid-request error: code
+    /// `-32600`, "Invalid Request".
+    ///
+    /// Off by default. What each input comes to, with this on and without it:
+    ///
+    /// | Input | With this on | Without it |
+    /// | --- | --- | --- |
+    /// | a number, a string, `true`, `false`, `null` | answered, `id` null | dropped |
+    /// | `[]`, with [`with_batch_decoding`](Self::with_batch_decoding) | answered once, `id` null | dropped |
+    /// | a member of a batch that is not an object | answered, `id` null; the other members are handled | passed over |
+    /// | an array, without [`with_batch_decoding`](Self::with_batch_decoding) | answered once, `id` null | dropped |
+    /// | an object with no `result` and no `error`, whose `method` is not a string, or is missing with no `id` that is a string or a number | answered | see below |
+    /// | an object with no `result` and no `error`, whose `id` is not a string, a number or null | answered, `id` null | see below |
+    /// | an object with no `method`, no `result`, no `error`, and an `id` that is a string or a number, whatever else it holds | the response it always was, with no result | the same |
+    /// | an object with `result` or `error` and no `method` that is a string | a response, never answered | the same |
+    /// | an object with a `method` that is a string and an `id` that can be one, or none | a request or a notification, whatever its `params` or `jsonrpc` say | the same |
+    /// | an object with a `method` that is a string, and `result` or `error` as well | a request or a notification, as before: the `method` decides | the same |
+    /// | a line that is not JSON | [`with_parse_error_replies`](Self::with_parse_error_replies)'s to answer | the same |
+    ///
+    /// An object is answered under its own `id` when that is a string or a number that takes
+    /// at most 128 bytes as this side writes it, quotes and escapes included, and under null
+    /// otherwise: a reply is at most some two hundred bytes whatever it answers. The id is
+    /// written again from what was read, so a number comes back as this side prints it, not
+    /// digit for digit as it came. So `{}`, `{"jsonrpc":"2.0"}`, `{"method":1}` and `{"id":null}` are
+    /// answered under null, `{"id":4,"method":5}` under `4`, and `{"method":"x","id":{}}`
+    /// under null. Without this option the first four are dropped, the fifth is read as the
+    /// response to call `4` with no result, and the last is put to the handler and answered
+    /// under `{}` as it came: a client that does not ask for these replies routes every
+    /// object exactly as it did before there were any.
+    ///
+    /// Every reply carries `error`, and an object with `error` is never answered: two peers
+    /// that both answer invalid requests cannot answer each other for ever.
+    ///
+    /// Each reply is a frame of its own, for the members of a batch as well: they are not
+    /// gathered into one array. Apart from such an id, the reply quotes nothing of what it
+    /// answers.
+    ///
+    /// At most `max_queued` such replies wait to be written at a time, and input that would
+    /// be answered while that many wait is dropped. `0` answers none and is the same as not
+    /// asking: every object is routed as it is without this. One batch is answered for at
+    /// most `max_queued` of its members, however fast the replies are written, and a batch
+    /// refused whole for passing the handoff budget is answered for none. A member of a batch
+    /// that is answered this way is not counted against that budget and holds no share of the
+    /// byte budget. Its bytes are still part of the line: a batch with anything for the
+    /// handler takes the whole line's bytes, as
+    /// [`with_batch_decoding`](Self::with_batch_decoding) says, and the members handled hold
+    /// them between them. The bound is
+    /// this option's own, apart from the one on parse-error replies. The replies are held
+    /// beside the bounds of the outbound queue and go through the queue, and a reply is a
+    /// write, with what [`with_parse_error_replies`](Self::with_parse_error_replies) says
+    /// that costs with a peer that does not read.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_invalid_request_replies(8);
+    /// assert_eq!(wire.invalid_request_replies(), Some(8));
+    /// ```
+    #[must_use]
+    pub fn with_invalid_request_replies(mut self, max_queued: usize) -> Self {
+        self.invalid_request_replies = Some(max_queued);
         self
     }
 
@@ -364,6 +437,20 @@ impl WireOptions {
     #[must_use]
     pub fn parse_error_replies(&self) -> Option<usize> {
         self.parse_error_replies
+    }
+
+    /// How many invalid-request replies may wait to be written, or `None` when none are sent.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert_eq!(WireOptions::new().invalid_request_replies(), None);
+    /// ```
+    #[must_use]
+    pub fn invalid_request_replies(&self) -> Option<usize> {
+        self.invalid_request_replies
     }
 
     /// Whether the peer's questions are handed to the handler in order, with a
