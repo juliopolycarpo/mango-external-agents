@@ -108,7 +108,7 @@ async fn unsupported_session_messages_are_consumed_without_sdk_retry_storage() {
 struct StalledDriver;
 
 impl StalledDriver {
-    fn start() -> tokio::task::JoinHandle<agent_client_protocol::Result<()>> {
+    fn start() -> tokio::task::JoinHandle<agent_client_protocol_schema::v1::Result<()>> {
         tokio::spawn(std::future::pending())
     }
 }
@@ -184,8 +184,8 @@ async fn a_request_in_flight_when_an_incoming_budget_overflows_returns_limit_exc
             &profile,
             Duration::from_secs(5),
             "initialize",
-            agent_client_protocol::schema::v1::InitializeRequest::new(
-                agent_client_protocol::schema::ProtocolVersion::V1,
+            agent_client_protocol_schema::v1::InitializeRequest::new(
+                agent_client_protocol_schema::ProtocolVersion::V1,
             ),
         ),
     )
@@ -248,8 +248,8 @@ async fn an_agent_refusal_is_kept_even_when_the_connection_has_overflowed() {
         &profile,
         Duration::from_secs(5),
         "initialize",
-        agent_client_protocol::schema::v1::InitializeRequest::new(
-            agent_client_protocol::schema::ProtocolVersion::V1,
+        agent_client_protocol_schema::v1::InitializeRequest::new(
+            agent_client_protocol_schema::ProtocolVersion::V1,
         ),
     )
     .await
@@ -291,8 +291,8 @@ async fn an_agent_error_with_null_data_reads_as_one_without_data() {
         &profile,
         Duration::from_secs(5),
         "initialize",
-        agent_client_protocol::schema::v1::InitializeRequest::new(
-            agent_client_protocol::schema::ProtocolVersion::V1,
+        agent_client_protocol_schema::v1::InitializeRequest::new(
+            agent_client_protocol_schema::ProtocolVersion::V1,
         ),
     )
     .await
@@ -336,7 +336,7 @@ async fn a_null_result_reads_as_an_empty_response_where_the_schema_allows_it() {
         &profile,
         Duration::from_secs(5),
         "session/set_mode",
-        agent_client_protocol::schema::v1::SetSessionModeRequest::new("native-1", "plan"),
+        agent_client_protocol_schema::v1::SetSessionModeRequest::new("native-1", "plan"),
     )
     .await;
     let received = answered
@@ -354,14 +354,14 @@ async fn a_null_result_reads_as_an_empty_response_where_the_schema_allows_it() {
 
 #[test]
 fn only_the_sdk_link_closure_shapes_count_as_link_closure() {
-    let mut closed = agent_client_protocol::Error::internal_error();
+    let mut closed = agent_client_protocol_schema::v1::Error::internal_error();
     closed.data = Some(
         serde_json::json!({"reason": agent_client_protocol::INCOMING_TRANSPORT_CLOSED_REASON}),
     );
     let dropped = agent_client_protocol::util::internal_error(
         "response to `initialize` never received: oneshot canceled",
     );
-    let refused = agent_client_protocol::Error::new(-32000, "refused by the agent");
+    let refused = agent_client_protocol_schema::v1::Error::new(-32000, "refused by the agent");
     let plain = agent_client_protocol::util::internal_error("agent crashed");
     let seen = [
         is_link_closure(&closed),

@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol_schema::v1::{
     AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, ContentChunk, Diff, Plan, PlanEntry,
     PlanEntryPriority, PlanEntryStatus, SessionConfigOption, SessionUpdate, StopReason, ToolCall,
     ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
@@ -381,7 +381,7 @@ impl Reducer {
     /// # Example
     ///
     /// ```
-    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use agent_client_protocol_schema::v1::SessionUpdate;
     /// use mango_agent_acp::reducer::Reducer;
     /// use mango_external_agents::EventKind;
     ///
@@ -411,7 +411,7 @@ impl Reducer {
     /// ```
     /// use std::time::Instant;
     ///
-    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use agent_client_protocol_schema::v1::SessionUpdate;
     /// use mango_agent_acp::reducer::Reducer;
     ///
     /// let update: SessionUpdate = serde_json::from_value(serde_json::json!({
@@ -452,7 +452,7 @@ impl Reducer {
     /// # Example
     ///
     /// ```
-    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use agent_client_protocol_schema::v1::SessionUpdate;
     /// use mango_agent_acp::reducer::{Reducer, SessionFact};
     ///
     /// let announced: SessionUpdate = serde_json::from_value(serde_json::json!({
@@ -512,7 +512,7 @@ impl Reducer {
     /// # Example
     ///
     /// ```
-    /// use agent_client_protocol::schema::v1::SessionUpdate;
+    /// use agent_client_protocol_schema::v1::SessionUpdate;
     /// use mango_agent_acp::reducer::Reducer;
     /// use mango_external_agents::event::{ActivityStatus, EventKind};
     ///
@@ -1248,7 +1248,7 @@ pub const TURN_INCOMPLETE_CODE: &str = "vendor-turn-incomplete";
 /// # Example
 ///
 /// ```
-/// use agent_client_protocol::schema::v1::StopReason;
+/// use agent_client_protocol_schema::v1::StopReason;
 /// use mango_agent_acp::reducer::stop_failure;
 ///
 /// let failure = stop_failure(StopReason::MaxTokens).expect("a truncated turn is a failure");
@@ -1284,7 +1284,7 @@ mod tests {
         UNTITLED_TOOL_CALL, activity_kind, content_detail, names_a_tool, stop_failure,
         tool_call_content, tool_name, was_cancelled,
     };
-    use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, ToolCallContent, ToolKind};
+    use agent_client_protocol_schema::v1::{SessionUpdate, StopReason, ToolCallContent, ToolKind};
     use mango_external_agents::event::{
         ActivityKind, ActivityStatus, ActivityUpdate, Command, EventKind, ThreadUsage, Usage,
     };

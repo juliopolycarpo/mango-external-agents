@@ -5,7 +5,7 @@
 //!
 //! Protocol: <https://agentclientprotocol.com/rfds/session-notices>, stable in v1 from schema 1.11.
 
-use agent_client_protocol::schema::v1::{Notice, NoticeSeverity as WireSeverity};
+use agent_client_protocol_schema::v1::{Notice, NoticeSeverity as WireSeverity};
 use mango_external_agents::NoticeSeverity;
 use mango_external_agents::event::EventKind;
 

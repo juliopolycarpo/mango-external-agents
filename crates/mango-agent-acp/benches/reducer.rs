@@ -13,7 +13,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use agent_client_protocol::schema::v1::SessionUpdate;
+use agent_client_protocol_schema::v1::SessionUpdate;
 use mango_agent_acp::reducer::Reducer;
 use mango_external_agents::ActivityContent;
 use mango_external_agents::event::EventKind;

@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol_schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, ListSessionsRequest, PromptRequest,
     PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigSelectOptions, SessionId as AcpSessionId,
@@ -50,7 +50,7 @@ pub struct AcpSession {
     connection: Arc<ConnectionHandle>,
     native_session_id: AcpSessionId,
     agent_capabilities: AgentCapabilities,
-    modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
+    modes: Option<agent_client_protocol_schema::v1::SessionModeState>,
     configuration_gate: tokio::sync::Mutex<()>,
     lifecycle: Arc<SessionLifecycle>,
     /// The close owner records one result independently of the `close` future that started it.
@@ -178,7 +178,7 @@ impl AcpSession {
         connection: Arc<ConnectionHandle>,
         native_session_id: AcpSessionId,
         agent_capabilities: AgentCapabilities,
-        modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
+        modes: Option<agent_client_protocol_schema::v1::SessionModeState>,
     ) -> Self {
         Self {
             profile,
@@ -897,7 +897,7 @@ fn configuration_option(option: SessionConfigOption) -> ConfigurationOption {
 /// Flattens grouped selectors without changing the order within each group.
 fn select_values(
     options: SessionConfigSelectOptions,
-) -> Vec<agent_client_protocol::schema::v1::SessionConfigSelectOption> {
+) -> Vec<agent_client_protocol_schema::v1::SessionConfigSelectOption> {
     match options {
         SessionConfigSelectOptions::Ungrouped(values) => values,
         SessionConfigSelectOptions::Grouped(groups) => {
@@ -1564,7 +1564,7 @@ struct TurnRecord {
 /// let ending = prompt_ending(None, recorded, "opencode", control.as_ref());
 /// ```
 fn prompt_ending(
-    outcome: Option<std::result::Result<PromptResponse, agent_client_protocol::Error>>,
+    outcome: Option<std::result::Result<PromptResponse, agent_client_protocol_schema::v1::Error>>,
     recorded: TurnRecord,
     agent: &str,
     control: &dyn ProcessControl,
@@ -1771,7 +1771,7 @@ impl AcpSession {
 #[cfg(test)]
 mod tests {
     use super::{Ending, TurnRecord, accepted_axes, prompt_ending, refuse_unsupported_reset};
-    use agent_client_protocol::schema::v1::{PromptResponse, StopReason};
+    use agent_client_protocol_schema::v1::{PromptResponse, StopReason};
     use mango_external_agents::configuration::{
         Configuration, ConfigurationChange, ConfigurationPatch,
     };
@@ -1853,8 +1853,8 @@ mod tests {
     }
 
     /// The SDK's error for a request whose incoming transport reached EOF.
-    fn transport_closed() -> agent_client_protocol::Error {
-        let mut error = agent_client_protocol::Error::internal_error();
+    fn transport_closed() -> agent_client_protocol_schema::v1::Error {
+        let mut error = agent_client_protocol_schema::v1::Error::internal_error();
         error.message = String::from("Incoming transport closed");
         error.data(serde_json::json!({
             "reason": agent_client_protocol::INCOMING_TRANSPORT_CLOSED_REASON,
@@ -1863,7 +1863,7 @@ mod tests {
     }
 
     /// The SDK's error for a request whose reply channel was dropped with the dispatch loop.
-    fn reply_dropped() -> agent_client_protocol::Error {
+    fn reply_dropped() -> agent_client_protocol_schema::v1::Error {
         agent_client_protocol::util::internal_error(
             "response to `session/prompt` never received: oneshot canceled",
         )
@@ -1880,7 +1880,8 @@ mod tests {
     }
 
     /// How a prompt wait can end.
-    type Waited = Option<std::result::Result<PromptResponse, agent_client_protocol::Error>>;
+    type Waited =
+        Option<std::result::Result<PromptResponse, agent_client_protocol_schema::v1::Error>>;
 
     /// The three ways a prompt task can learn the connection is gone: the dispatch loop ended
     /// first, the SDK failed the prompt at EOF, or the reply was dropped with the loop.
@@ -1972,7 +1973,7 @@ mod tests {
         let answers: [Waited; 3] = [
             Some(Ok(PromptResponse::new(StopReason::EndTurn))),
             Some(Ok(PromptResponse::new(StopReason::Cancelled))),
-            Some(Err(agent_client_protocol::Error::new(
+            Some(Err(agent_client_protocol_schema::v1::Error::new(
                 -31_000,
                 "model busy",
             ))),
