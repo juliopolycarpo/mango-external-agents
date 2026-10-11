@@ -232,7 +232,8 @@ comes back with its responder, the connection untouched. A responder dropped una
 peer with `-32603` and gives back what the question held. An answer is a frame that has to be
 written: one that was queued and then could not be, because the link refused it or its deadline
 ran out in the queue, ends the connection whether or not anyone awaits its write, and so does a
-question no reply to fits a frame. Answers are queued without waiting, so the outbound bounds are
+question nothing can be said for: one no reply to fits a frame, or one let go on a queue bounded
+at nothing. Answers are queued without waiting, so the outbound bounds are
 what limits them when a peer asks faster than it reads. A question still queued when the
 connection ends is not handed over. Once the connection has ended a
 responder still out answers nothing and says nothing: a handler that parks questions settles them

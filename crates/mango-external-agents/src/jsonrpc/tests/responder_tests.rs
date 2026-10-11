@@ -137,8 +137,12 @@ impl PeerHandler for ParkingHandler {
                     .request_with::<_, Value>("back", json!({}), ordered_options())
                     .await;
                 let holding = client.hold_cancellation().await.is_holding();
-                let refusal = match &asked {
-                    Err(Error::HostConfiguration { received, .. }) => received.clone(),
+                let queued = client.submit_request("back", json!({}), ordered_options());
+                let refusal = match (&asked, queued.as_ref().map(|_| ())) {
+                    (
+                        Err(Error::HostConfiguration { received, .. }),
+                        Err(Error::HostConfiguration { .. }),
+                    ) => received.clone(),
                     other => format!("{other:?}"),
                 };
                 self.asked_back
@@ -865,7 +869,11 @@ async fn a_question_no_reply_to_fits_ends_the_connection() {
 /// progress goes on, and its answer is refused as closed.
 #[tokio::test]
 async fn a_question_still_queued_when_the_connection_ended_is_not_handed_over() {
-    let connected = connect(options(), handoff());
+    // The drain that follows the peer's exit waits this long for the call in progress, which
+    // has to outlast a slow machine getting from the end to the gate below.
+    let mut patient = options();
+    patient.shutdown_timeout = Duration::from_secs(5);
+    let connected = connect(patient, handoff());
     connected.link.push_line(question(1, WAIT_THEN_PARK));
     connected.link.push_line(question(2, PARK));
     until("the first hand-off to begin", || {
@@ -1096,4 +1104,69 @@ async fn a_cap_of_zero_hands_nothing_over() {
         .close()
         .await
         .expect("expected a clean close");
+}
+
+/// A responder dropped unanswered is a frame in the outbound queue like the answer it stands
+/// for. With the peer not reading and the queue full, the drop ends the connection with the
+/// outbound budget instead of queueing beside it.
+#[tokio::test]
+async fn a_responder_dropped_into_a_full_queue_ends_the_connection() {
+    let connected = connect(
+        options(),
+        limits(usize::MAX, usize::MAX, 1).with_request_handoff(),
+    );
+    let _held = hold_the_link(&connected).await;
+    connected.link.push_line(question(1, LET_GO));
+
+    let termination = termination_of(&connected.handler).await;
+    let observed = (
+        matches!(
+            termination,
+            PeerTermination::OutboundBackpressure {
+                limit: 1,
+                received: 2,
+                ..
+            }
+        ),
+        connected.client.state.outbox.aside(),
+    );
+    assert_eq!(
+        observed,
+        (true, 0),
+        "expected the drop's refusal counted against a queue of one, and nothing queued beside it: (true, 0) | received {observed:?} ({termination:?})"
+    );
+    connected.gate.add_permits(1);
+    let _ = connected.client.close().await;
+}
+
+/// A responder dropped when nothing can be said for its question ends the connection, so the
+/// peer is not left waiting on one that looks well: an id as large as a frame may be, which no
+/// reply fits, and a queue bounded at nothing, which takes no reply.
+#[tokio::test]
+async fn a_responder_dropped_with_no_way_to_say_so_ends_the_connection() {
+    for (wire_options, id, named) in [
+        (
+            limits(120, usize::MAX, usize::MAX),
+            json!("i".repeat(200)),
+            "bytes of one outgoing JSON-RPC frame",
+        ),
+        (
+            limits(usize::MAX, usize::MAX, 0),
+            json!(1),
+            "outgoing JSON-RPC frames awaiting their write",
+        ),
+    ] {
+        let connected = connect(options(), wire_options.with_request_handoff());
+        connected.link.push_line(
+            json!({ "jsonrpc": "2.0", "id": id, "method": LET_GO, "params": {} }).to_string(),
+        );
+
+        let termination = termination_of(&connected.handler).await;
+        let observed = (&termination, connected.link.sent().len());
+        assert!(
+            matches!(&observed, (PeerTermination::LinkFailed(cause), 0) if cause.contains(named)),
+            "expected the connection ended naming what took no reply: (LinkFailed naming {named:?}, 0) | received {observed:?}"
+        );
+        let _ = connected.client.close().await;
+    }
 }

@@ -301,7 +301,9 @@ pub trait PeerHandler: Send + Sync {
     /// is kept, not awaited here.
     ///
     /// Like a notification call, this one is cancelled at an await when the connection ends
-    /// without draining. [`Client::hold_cancellation`] has nothing to hold here.
+    /// without draining. [`Client::hold_cancellation`] has nothing to hold here, and a
+    /// [`Client::close`] awaited from inside the call ends the call at that await, as it
+    /// does inside a notification.
     ///
     /// The default asks [`on_request`](Self::on_request) and answers with what it returns,
     /// one question at a time. That suits an `on_request` that returns promptly. It is not
@@ -1544,7 +1546,9 @@ impl Drop for CancellationHold {
 ///
 /// Dropped unanswered, it tells the peer so: an error `-32603`, "the request was let go
 /// without an answer", queued as it is dropped, so the peer does not wait on the question
-/// for good. Nothing is sent once the connection has ended.
+/// for good. Nothing is sent once the connection has ended. Where not even that fits, a
+/// question whose id is as large as a frame may be or a queue bounded at nothing, the
+/// connection ends as a failed link instead.
 ///
 /// An answer is a frame that has to be written. One that was queued and then could not be
 /// written, because the link refused it or its deadline ran out in the queue, ends the
@@ -1640,7 +1644,8 @@ impl Responder {
     ///   answer can be given through the responder that came back;
     /// - [`Error::LimitExceeded`] for a queue that is full, which ends the connection as
     ///   it does for [`Client::submit_notification`], and for a queue whose bound is zero,
-    ///   which takes no answer at all and leaves the connection as it was;
+    ///   which takes no answer at all: the connection is as it was until the responder is
+    ///   dropped, and ends then;
     /// - [`Error::Closed`] or [`Error::Link`] once the connection has ended.
     ///
     /// ```no_run
@@ -3541,7 +3546,15 @@ impl ClientState {
             message: String::from("the request was let go without an answer"),
             data: None,
         });
-        let _ = self.enqueue_reply(reply_frame(self, raw_id, refusal));
+        let Err(error) = self.enqueue_reply(reply_frame(self, raw_id, refusal)) else {
+            return;
+        };
+        // Refused for its size, or by a queue that takes nothing: the question cannot be
+        // answered in any form, and the peer is not left waiting on a connection that looks
+        // well. A full queue has already ended it, and a closed one has nobody to tell.
+        if matches!(error.cause(), Error::LimitExceeded { .. }) {
+            self.signal_write_failure(&error);
+        }
     }
 
     /// Queues the answer to one of the peer's questions, within the queue's bounds. See
