@@ -3,9 +3,11 @@
 //! The deadlines table in `docs/harness-claude.md` derives the launcher's stop time from the code:
 //! on Unix one `kill_grace` for the exit after a delivered SIGINT, then SIGTERM and a second
 //! `kill_grace`, then SIGKILL; on Windows no graceful interrupt and a Job that empties on request.
-//! Each test runs `stop_process_with_limits` over a child that behaves one way and asserts a lower
-//! bound that proves a stage was waited out, which a loaded machine cannot break because a stage
-//! takes at least its grace, and an upper bound with slack for a loaded runner.
+//! Each test runs `stop_process_with_limits` over a child that behaves one way. Where a stage must
+//! have been waited out, the test asserts a lower bound for it, which a loaded machine cannot break
+//! because a stage takes at least its grace. The upper bounds carry slack for a loaded runner and
+//! only catch a gross regression: the launcher's own error, returned when its last wait expires,
+//! is what enforces the ceiling, and `timed_stop` fails on it.
 
 use super::*;
 use crate::Limits;
@@ -56,8 +58,9 @@ mod on_unix {
 
     /// Whether the operating system still knows the child's process group.
     ///
-    /// The group and not the leader, because the launcher signals the group. A zombie nobody
-    /// reaped is still a member, so `ESRCH` also proves the reap.
+    /// The group and not the leader, because the launcher signals the group. On Linux a zombie
+    /// nobody reaped is still a member, so `ESRCH` also proves the reap there; elsewhere the
+    /// leader's reap is proven by `status_of`.
     fn group_exists(leader: u32) -> bool {
         !matches!(
             killpg(super::super::super::group_of(leader), None),
@@ -79,7 +82,7 @@ mod on_unix {
     /// Blocked rather than ignored: installing a handler or `SIG_IGN` needs `unsafe`, which this
     /// crate forbids. The mask is set on the calling thread around the spawn so the child's
     /// runtime inherits it before it creates a thread, and it is restored before this returns.
-    async fn spawn_ready(mode: &str, blocked: &[Signal]) -> Running {
+    async fn spawn_ready(mode: &str, blocked: &[Signal], grace: Duration) -> Running {
         let original = SigSet::thread_get_mask().expect("signal mask");
         let mut mask = original;
         for signal in blocked {
@@ -87,7 +90,7 @@ mod on_unix {
         }
         mask.thread_set_mask().expect("block signals before spawn");
         let spawned = TokioLauncher::new()
-            .with_kill_grace(GRACE)
+            .with_kill_grace(grace)
             .spawn(fixture(mode))
             .await;
         original
@@ -125,7 +128,12 @@ mod on_unix {
     /// and reaped.
     #[tokio::test]
     async fn a_group_that_ignores_sigint_and_sigterm_is_killed_after_two_graces() {
-        let child = spawn_ready("ready-with-helper", &[Signal::SIGINT, Signal::SIGTERM]).await;
+        let child = spawn_ready(
+            "ready-with-helper",
+            &[Signal::SIGINT, Signal::SIGTERM],
+            GRACE,
+        )
+        .await;
         let pid = child.pid;
         assert!(
             group_exists(pid),
@@ -161,13 +169,14 @@ mod on_unix {
     }
 
     /// A child that dies on SIGINT is reaped inside the first stage: the stop reports
-    /// `Interrupted` and does not spend the grace. The grace is the default two seconds here, so
-    /// finishing under it cannot be the machine being fast.
+    /// `Interrupted` and does not spend the grace. The launcher and the limits share the default
+    /// two-second grace, as the table assumes, so finishing under it cannot be the machine being
+    /// fast.
     #[tokio::test]
     async fn a_child_that_exits_on_sigint_is_interrupted_without_waiting_out_the_grace() {
-        let child = spawn_ready("interrupt-ready", &[]).await;
-        let pid = child.pid;
         let limits = Limits::default();
+        let child = spawn_ready("interrupt-ready", &[], limits.kill_grace).await;
+        let pid = child.pid;
 
         let (elapsed, outcome) = timed_stop(child.control.as_ref(), &limits).await;
 
@@ -196,7 +205,7 @@ mod on_unix {
     /// second: SIGTERM, not SIGKILL, ends it.
     #[tokio::test]
     async fn a_child_that_ignores_sigint_but_dies_on_sigterm_ends_in_the_second_stage() {
-        let child = spawn_ready("interrupt-ready", &[Signal::SIGINT]).await;
+        let child = spawn_ready("interrupt-ready", &[Signal::SIGINT], GRACE).await;
         let pid = child.pid;
 
         let (elapsed, outcome) = timed_stop(child.control.as_ref(), &limits_with(GRACE)).await;
@@ -268,10 +277,7 @@ mod on_windows {
             elapsed < grace,
             "expected the stop to spend no grace stage (< {grace:?}) | received: {elapsed:?}"
         );
-        assert!(
-            !windows_process_is_running(pid),
-            "expected process {pid} gone | received: still running"
-        );
+        await_windows_process_exit(pid).await;
     }
 
     /// The Job takes the leader and the helper it started, inside the documented two graces.

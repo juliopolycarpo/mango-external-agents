@@ -1033,12 +1033,15 @@ mod tests {
                 use std::io::Write as _;
                 let executable =
                     std::env::current_exe().expect("expected the test binary's own path");
-                let _ = std::process::Command::new(executable)
+                let helper = std::process::Command::new(executable)
                     .args(["launcher_fixture_child", "--nocapture", "--test-threads=1"])
                     .env(FIXTURE_MODE, "forever")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
-                    .spawn();
+                    .spawn()
+                    .expect("expected the helper to start");
+                // Never waited on: the launcher's stop ends the group, and this leader is killed with it.
+                std::mem::forget(helper);
                 println!("MEA-READY");
                 std::io::stdout().flush().expect("flush ready marker");
                 loop {

@@ -354,16 +354,16 @@ Tests on a paused clock against a fake launcher assert the stages these sums are
 14 s stop, the stop with no graceful interrupt, the `kg` waits around an exit, the 602 s, and the
 `st` a close gives a pending launch and the artifact removal. They run on CI's Linux, macOS and
 Windows lanes. The sums themselves are not asserted. The two `TokioLauncher` columns are pinned by
-real-process tests on the real clock, at a `kill_grace` of 500 ms on Unix and 1 s on Windows, in
-`crates/mango-external-agents/src/launcher/tokio_launcher/tests/stop_bound.rs`, each with a lower
-bound that proves a stage was waited out and an upper bound with slack for a loaded runner. On
-Unix, a child and a helper in its group that ignore SIGINT and SIGTERM take at least 2 `kg`, at most
-the table's 3 `kg` plus slack, end by SIGKILL and leave no process group; a child that ignores only
-SIGINT takes at least 1 `kg` and ends by SIGTERM; a child that exits on SIGINT reports
-`Interrupted` inside one default `kg`. On Linux those measured 1.02 s, 523 ms and 1.1 ms. On
-Windows, a stop spends no `kg` stage, and a Job holding a leader and a helper is gone, both
-processes with it, inside 2 `kg` plus slack; that test runs on CI's Windows lane only. The
-upper bounds carry slack, so they pin the ceilings in the table and not the exact sums.
+real-process tests on the real clock, at a `kill_grace` of 500 ms on Unix and 1 s or 4 s on
+Windows, in `crates/mango-external-agents/src/launcher/tokio_launcher/tests/stop_bound.rs`. Where a
+stage must have been waited out the test asserts a lower bound for it, which a loaded runner cannot
+break. The upper bounds carry slack and only catch a gross regression: the launcher's own error,
+returned when its last wait expires, enforces the ceiling. On Unix, a child and a helper in its
+group that ignore SIGINT and SIGTERM take at least 2 `kg`, end by SIGKILL and leave no process
+group; a child that ignores only SIGINT takes at least 1 `kg` and ends by SIGTERM; a child that
+exits on SIGINT reports `Interrupted` inside one `kg`. On Linux those measured 1.02 s, 523 ms and
+1.1 ms. On Windows, a stop spends no `kg` stage, and a Job holding a leader and a helper is gone,
+both processes with it, within 2 `kg`; that test runs on CI's Windows lane only.
 
 What each path does, and what a host sees when a bound runs out:
 
