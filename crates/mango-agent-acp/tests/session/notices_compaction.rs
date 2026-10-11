@@ -303,6 +303,29 @@ async fn a_compaction_that_fails_carries_the_agents_error_as_its_detail() {
     );
 }
 
+/// The error is agent text beside a failure, so credential-shaped text in it is redacted like an
+/// error's message, and the words around it stay.
+#[tokio::test]
+async fn a_compactions_error_is_redacted_of_credential_shaped_text() {
+    let received = turn_story(vec![
+        compaction("c1", "in_progress"),
+        with(
+            compaction("c1", "failed"),
+            "error",
+            serde_json::json!("summariser refused: API_KEY=another-secret"),
+        ),
+    ])
+    .await;
+    assert_story(
+        &received,
+        &[
+            STARTED_C1,
+            "completed acp:compaction:c1 Failed detail=summariser refused: API_KEY=[REDACTED] content=-",
+            "turn completed",
+        ],
+    );
+}
+
 #[tokio::test]
 async fn a_cancelled_compaction_ends_as_cancelled() {
     let received = turn_story(vec![chunk("c1", "half"), compaction("c1", "cancelled")]).await;
