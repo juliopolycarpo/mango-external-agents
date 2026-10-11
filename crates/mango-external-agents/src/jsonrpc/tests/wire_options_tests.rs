@@ -5,6 +5,7 @@ use super::outbox_tests::{
     assert_ended, gated, limits, link_held, methods, one_termination, options, ordered_options,
     outbox_holds, sent, until, within,
 };
+use super::write_failure_tests::RefuseFirstSend;
 use super::*;
 use crate::jsonrpc::{WireOptions, is_peer_work};
 
@@ -464,10 +465,132 @@ async fn a_request_given_up_before_its_write_began_sends_no_cancel() {
     gated.client.close().await.expect("expected a clean close");
 }
 
-/// A response that has been read disarms the cancel, whether or not its caller has looked at
-/// it: the reader took the call off the record, so giving the reply up finds nothing to cancel.
+/// Where in the reader's handling of a response a test has the caller give the call up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GivenUp {
+    /// The call is off the record and the reader has not yet claimed it.
+    BeforeTheReaderClaims,
+    /// The reader has claimed it and not yet handed the response on.
+    AfterTheReaderClaimed,
+}
+
+/// Writes one request, has its reply dropped at `when` inside the reader's handling of the
+/// response, and returns what was written and whether the reader went on to hand the response
+/// on after the point where it takes the claim.
+async fn give_up_as_the_response_is_read(
+    when: GivenUp,
+    request: RequestOptions,
+) -> (Vec<String>, bool, usize) {
+    let (link, _handler, client) =
+        connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
+    let (written, reply) = client
+        .submit_request("ask", json!({}), request)
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    let reply = Arc::new(std::sync::Mutex::new(Some(reply)));
+    let handed_on = Arc::new(AtomicBool::new(false));
+    let give_up = {
+        let reply = Arc::clone(&reply);
+        move || {
+            let reply = reply
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            drop(reply);
+        }
+    };
+    let state = &client.state;
+    match when {
+        GivenUp::BeforeTheReaderClaims => {
+            *state
+                .after_response_matched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(give_up));
+            let handed_on = Arc::clone(&handed_on);
+            *state
+                .after_response_claimed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Box::new(move || handed_on.store(true, Ordering::Release)));
+        }
+        GivenUp::AfterTheReaderClaimed => {
+            let handed_on = Arc::clone(&handed_on);
+            *state
+                .after_response_claimed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+                handed_on.store(true, Ordering::Release);
+                give_up();
+            }));
+        }
+    }
+    link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"done"}"#);
+    until("the reply to be given up", || {
+        reply
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    })
+    .await;
+    within("the next write", client.notify("after", json!({})))
+        .await
+        .expect("expected the notification written");
+    until("the response to be out of the handoff queue", || {
+        client.state.queued_answers.load(Ordering::Acquire) == 0
+    })
+    .await;
+    let places = client.state.ordered_places.available_permits();
+    let observed = (methods(&link), handed_on.load(Ordering::Acquire), places);
+    client.close().await.expect("expected a clean close");
+    observed
+}
+
+/// A caller that gives a call up as its response is being read, before the reader has claimed
+/// the call, has the last word: the cancel goes out, once, and the reader drops the response
+/// as a late one instead of handing it on. Whichever way the response was to be delivered.
 #[tokio::test]
-async fn a_response_already_read_disarms_the_cancel() {
+async fn a_call_given_up_before_the_reader_claims_it_is_cancelled_and_its_response_dropped() {
+    for request in [RequestOptions::new(), ordered_options()] {
+        let observed =
+            give_up_as_the_response_is_read(GivenUp::BeforeTheReaderClaims, request).await;
+        let expected = (
+            vec![
+                String::from("ask"),
+                String::from(CANCEL),
+                String::from("after"),
+            ],
+            false,
+            64,
+        );
+        assert_eq!(
+            observed, expected,
+            "expected one cancel, the response not handed on, every ordered place back: {expected:?} | received {observed:?}"
+        );
+    }
+}
+
+/// A response the reader has claimed disarms the cancel, whether or not its caller has looked
+/// at it: giving the reply up from then on tells the peer nothing.
+#[tokio::test]
+async fn a_call_given_up_after_the_reader_claimed_it_sends_no_cancel() {
+    for request in [RequestOptions::new(), ordered_options()] {
+        let observed =
+            give_up_as_the_response_is_read(GivenUp::AfterTheReaderClaimed, request).await;
+        let expected = (vec![String::from("ask"), String::from("after")], true, 64);
+        assert_eq!(
+            observed, expected,
+            "expected no cancel for a call that was answered, every ordered place back: {expected:?} | received {observed:?}"
+        );
+    }
+}
+
+/// A response that was delivered disarms the cancel too: a caller that has its answer and lets
+/// the call go tells the peer nothing.
+#[tokio::test]
+async fn a_call_that_was_answered_sends_no_cancel() {
     for request in [RequestOptions::new(), ordered_options()] {
         let (link, _handler, client) =
             connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
@@ -479,30 +602,68 @@ async fn a_response_already_read_disarms_the_cancel() {
             .await
             .expect("expected the request written");
         link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"done"}"#);
-        until("the response to be read", || {
-            client
-                .state
-                .pending
-                .try_lock()
-                .is_ok_and(|pending| pending.is_empty())
-        })
-        .await;
-        drop(reply);
-        let after = client
-            .submit_notification("after", json!({}))
-            .expect("expected the notification queued");
-        within("the notification written", after)
+        let answer = within("the answer", reply).await;
+        within("the next write", client.notify("after", json!({})))
             .await
             .expect("expected the notification written");
 
-        let written = methods(&link);
+        let observed = (answer.ok(), methods(&link));
+        let expected = (
+            Some(json!("done")),
+            vec![String::from("ask"), String::from("after")],
+        );
         assert_eq!(
-            written,
-            vec!["ask", "after"],
-            "expected no cancel for a request that was answered | received {written:?}"
+            observed, expected,
+            "expected the answer and no cancel behind it: {expected:?} | received {observed:?}"
         );
         client.close().await.expect("expected a clean close");
     }
+}
+
+/// A request the link refused whole never reached the peer: its frame's write began and the
+/// link took none of it. The caller hears that, lets the call go, and nothing is cancelled.
+#[tokio::test]
+async fn a_request_the_link_refused_whole_sends_no_cancel() {
+    let link = ScriptedLink::new();
+    let (sender, receiver) = link.clone().into_link().split();
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect_with(
+        crate::link::Link::new(
+            Box::new(RefuseFirstSend {
+                inner: sender,
+                first: true,
+            }),
+            receiver,
+        ),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+        WireOptions::new().with_cancel_on_abandon(CANCEL),
+    );
+    let (written, reply) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    let refused = within("the write refused", written).await;
+    assert!(
+        matches!(&refused, Err(error) if matches!(error.cause(), Error::LimitExceeded { .. })),
+        "expected the link's refusal of the frame: Err(LimitExceeded) | received {refused:?}"
+    );
+    let answer = within("the reply", reply).await;
+    assert!(
+        answer.is_err(),
+        "expected the call failed with its frame unwritten: Err | received {answer:?}"
+    );
+    within("the next write", client.notify("after", json!({})))
+        .await
+        .expect("expected the notification written");
+
+    let observed = (methods(&link), client.state.outbox.aside());
+    assert_eq!(
+        observed,
+        (vec![String::from("after")], 0),
+        "expected no cancel for a request the peer never got: ([\"after\"], 0) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
 }
 
 /// A call whose deadline runs out is given up like any other: the caller gets its timeout and
@@ -532,6 +693,9 @@ async fn a_request_that_times_out_sends_the_cancel() {
 /// The cancel is decided and queued as the reply is dropped, whatever the record of calls is
 /// doing at that moment. With the record held by someone else, the cancel is in the queue
 /// before the drop returns, and a write this caller makes next goes out behind it.
+///
+/// The record of calls is no longer on the path of the decision. Holding it here is what shows
+/// that: a drop that went back to waiting for it would leave nothing queued when it returned.
 #[tokio::test]
 async fn a_cancel_does_not_wait_for_the_record_of_calls() {
     let (link, _handler, client) =
@@ -1142,11 +1306,48 @@ async fn writes_made_after_a_parse_error_was_queued_follow_it() {
     gated.client.close().await.expect("expected a clean close");
 }
 
+/// The same on a link nobody holds, where a caller that writes for itself would otherwise go
+/// straight to it: with only the parse error waiting, queued and not yet picked up, the host's
+/// notification takes its turn behind it.
+#[tokio::test]
+async fn a_write_made_on_an_idle_link_follows_a_parse_error_still_queued() {
+    let (link, _handler, client) =
+        connect(options(), WireOptions::new().with_parse_error_replies(4));
+    // Queued from here, so nothing has run between this and the write that follows.
+    client.state.answer_unparseable();
+    let waiting = (client.state.outbox.aside(), outbox_holds(&client));
+    assert_eq!(
+        waiting,
+        (1, (0, 0)),
+        "expected the parse error alone in the queue, beside its bounds: (1, (0, 0)) | received {waiting:?}"
+    );
+    within("the host's notification", client.notify("mine", json!({})))
+        .await
+        .expect("expected the notification written");
+
+    let written: Vec<String> = frames(&link)
+        .iter()
+        .map(|frame| {
+            frame["method"]
+                .as_str()
+                .map_or_else(|| frame["error"]["code"].to_string(), str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        written,
+        vec!["-32700", "mine"],
+        "expected the parse error ahead of the host's notification: [\"-32700\", \"mine\"] | received {written:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
 /// Requests given up and retried from four threads, with the record of calls kept busy the
-/// whole time. For every request that reached the wire, its cancel is there too, after it and
-/// ahead of the retry its caller made next.
+/// whole time. Every request is on the wire before it is given up, so every one has exactly
+/// one cancel naming it, after it and ahead of the retry its caller made next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_keeps_its_place_ahead_of_the_retry_with_the_record_of_calls_contended() {
+    const CALLERS: usize = 4;
+    const ROUNDS: usize = 50;
     let (link, _handler, client) =
         connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
     let busy = tokio::spawn({
@@ -1159,61 +1360,154 @@ async fn a_cancel_keeps_its_place_ahead_of_the_retry_with_the_record_of_calls_co
             }
         }
     });
-    let callers: Vec<_> = (0..4)
+    let callers: Vec<_> = (0..CALLERS)
         .map(|caller| {
             let client = Arc::clone(&client);
             tokio::spawn(async move {
-                for round in 0..50 {
+                let mut asked = Vec::new();
+                for round in 0..ROUNDS {
                     let tag = json!({ "caller": caller, "round": round });
-                    // Nobody answers, so the wait ends by being given up.
-                    let asking = client.request::<_, Value>("ask", tag.clone());
-                    let _ = tokio::time::timeout(Duration::from_millis(2), asking).await;
+                    let submitted = client
+                        .submit_request("ask", tag.clone(), RequestOptions::new())
+                        .expect("expected the request queued");
+                    asked.push((submitted.id().as_json().clone(), tag.clone()));
+                    let (written, reply) = submitted.into_parts();
+                    within("the request written", written)
+                        .await
+                        .expect("expected the request written");
+                    // Nobody answers. Given up with the request on the wire.
+                    drop(reply);
                     client
                         .notify("retry", tag)
                         .await
                         .expect("expected the retry written");
                 }
+                asked
             })
         })
         .collect();
+    let mut asked = Vec::new();
     for caller in callers {
-        within("a caller", caller)
-            .await
-            .expect("expected the caller to finish");
+        asked.extend(
+            within("a caller", caller)
+                .await
+                .expect("expected the caller to finish"),
+        );
     }
     busy.abort();
     let _ = busy.await;
-    until("every cancel to be written", || {
-        client.state.outbox.aside() == 0
+    sent(&link, CALLERS * ROUNDS * 3).await;
+
+    let written = frames(&link);
+    let places = |wanted: &dyn Fn(&Value) -> bool| -> Vec<usize> {
+        written
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| wanted(frame))
+            .map(|(at, _)| at)
+            .collect()
+    };
+    for (id, tag) in &asked {
+        let asked_at = places(&|frame| frame["method"] == "ask" && frame["id"] == *id);
+        let cancel_at =
+            places(&|frame| frame["method"] == CANCEL && frame["params"]["requestId"] == *id);
+        let retry_at = places(&|frame| frame["method"] == "retry" && frame["params"] == *tag);
+        let in_order = matches!(
+            (&asked_at[..], &cancel_at[..], &retry_at[..]),
+            ([asked_at], [cancel_at], [retry_at]) if asked_at < cancel_at && cancel_at < retry_at
+        );
+        assert!(
+            in_order,
+            "expected request {id} once, then its one cancel, then its retry: [ask] < [cancel] < [retry] | received ask at {asked_at:?}, cancel at {cancel_at:?}, retry at {retry_at:?}"
+        );
+    }
+    let observed = (asked.len(), written.len());
+    let expected = (CALLERS * ROUNDS, CALLERS * ROUNDS * 3);
+    assert_eq!(
+        observed, expected,
+        "expected every request written, cancelled and retried, and nothing else on the wire: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A response racing the caller that gives its call up, from two threads, request after
+/// request. Whichever wins, the call ends one way: answered with no cancel, or cancelled with
+/// the response dropped. Never an answer in the caller's hands and a cancel on the wire, never
+/// two cancels, never a cancel for a request that was not written, and nothing left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_response_racing_a_call_given_up_ends_the_call_one_way_only() {
+    const ROUNDS: usize = 400;
+    let (link, _handler, client) =
+        connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
+    let mut calls = Vec::new();
+    for round in 0..ROUNDS {
+        let request = if round % 2 == 0 {
+            RequestOptions::new()
+        } else {
+            ordered_options()
+        };
+        let submitted = client
+            .submit_request("ask", json!({}), request)
+            .expect("expected the request queued");
+        let id = submitted.id().as_json().clone();
+        let (written, reply) = submitted.into_parts();
+        within("the request written", written)
+            .await
+            .expect("expected the request written");
+        let (give_up, given_up) = tokio::sync::oneshot::channel::<()>();
+        let caller = tokio::spawn(async move {
+            tokio::select! {
+                answer = reply => answer.ok(),
+                _ = given_up => None,
+            }
+        });
+        // Both at once, from this thread: the reader and the caller run on two others.
+        link.push_line(json!({ "jsonrpc": "2.0", "id": id, "result": "done" }).to_string());
+        let _ = give_up.send(());
+        let answered = within("the caller", caller)
+            .await
+            .expect("expected the caller to finish")
+            .is_some();
+        calls.push((id, answered));
+    }
+    // Every cancel there is going to be is queued by now: the callers have all let go.
+    within("the last write", client.notify("last", json!({})))
+        .await
+        .expect("expected the notification written");
+    until("every response to be out of the handoff queue", || {
+        client.state.queued_answers.load(Ordering::Acquire) == 0
     })
     .await;
 
     let written = frames(&link);
-    let place = |wanted: &dyn Fn(&Value) -> bool| written.iter().position(wanted);
-    let mut checked = 0;
-    for (asked_at, ask) in written
-        .iter()
-        .enumerate()
-        .filter(|(_, frame)| frame["method"] == "ask")
-    {
-        let cancel_at =
-            place(&|frame| frame["method"] == CANCEL && frame["params"]["requestId"] == ask["id"]);
-        let retry_at =
-            place(&|frame| frame["method"] == "retry" && frame["params"] == ask["params"]);
-        let in_order = matches!(
-            (cancel_at, retry_at),
-            (Some(cancel_at), Some(retry_at)) if asked_at < cancel_at && cancel_at < retry_at
-        );
+    let mut cancelled = 0;
+    for (id, answered) in &calls {
+        let asks = written
+            .iter()
+            .filter(|frame| frame["method"] == "ask" && frame["id"] == *id)
+            .count();
+        let cancels = written
+            .iter()
+            .filter(|frame| frame["method"] == CANCEL && frame["params"]["requestId"] == *id)
+            .count();
+        cancelled += cancels;
+        let one_way = asks == 1 && cancels <= 1 && !(*answered && cancels == 1);
         assert!(
-            in_order,
-            "expected request {}, its cancel and its retry in that order: {asked_at} < cancel < retry | received cancel at {cancel_at:?}, retry at {retry_at:?}",
-            ask["params"]
+            one_way,
+            "expected request {id} written once and then answered or cancelled, not both: (1 ask, answered xor 1 cancel, or neither seen by the caller) | received ({asks} asks, answered {answered}, {cancels} cancels)"
         );
-        checked += 1;
     }
-    assert!(
-        checked > 100,
-        "expected most of the 200 requests to have reached the wire before they were given up: > 100 | received {checked}"
+    let others = written.len() - ROUNDS - cancelled - 1;
+    let left = (
+        others,
+        client.state.outbox.aside(),
+        client.state.pending.lock().await.len(),
+        client.state.ordered_places.available_permits(),
+    );
+    assert_eq!(
+        left,
+        (0, 0, 0, 64),
+        "expected no frame but the requests, their cancels and the last write, and nothing held: (0, 0, 0, 64) | received {left:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -1269,5 +1563,183 @@ async fn a_parse_error_the_peer_never_reads_ends_the_connection_at_the_write_dea
         "expected the connection ended by the stalled write at its deadline, not before: (50ms or just after, LinkFailed) | received {observed:?}"
     );
     // The link is unusable by now; what the close makes of that is not this test's subject.
+    let _ = client.close().await;
+}
+
+/// A peer's question inside a batch waits for the notifications before it, like one on a line
+/// of its own: nothing is answered while the handler is inside the first member, and once it
+/// is let through the question is answered and the member after it is handled.
+#[tokio::test]
+async fn a_question_in_a_batch_waits_for_the_members_before_it() {
+    let (link, handler, client) =
+        GatedHandler::connect(options(), WireOptions::new().with_batch_decoding());
+    link.push_line(
+        json!([
+            notification("one"),
+            { "jsonrpc": "2.0", "id": 7, "method": "ask", "params": {} },
+            notification("two"),
+        ])
+        .to_string(),
+    );
+    until("the handler to be inside the first member", || {
+        GatedHandler::list(&handler.begun) == ["one"]
+    })
+    .await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let early = (GatedHandler::list(&handler.begun), link.sent().len());
+    assert_eq!(
+        early,
+        (vec![String::from("one")], 0),
+        "expected the question unanswered while the member before it is handled: ([\"one\"], 0) | received {early:?}"
+    );
+
+    handler.gate.add_permits(2);
+    sent(&link, 1).await;
+    until("the last member to be handled", || {
+        GatedHandler::list(&handler.finished).len() == 2
+    })
+    .await;
+    let observed = (GatedHandler::list(&handler.finished), frames(&link));
+    let expected = (
+        vec![String::from("one"), String::from("two")],
+        vec![json!({ "jsonrpc": "2.0", "id": 7, "result": "yes" })],
+    );
+    assert_eq!(
+        observed, expected,
+        "expected both members handled in order and the question answered once: {expected:?} | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// The bytes a child wrote, as the stdio transport reads them: through the line reader, with
+/// its caps and its repair of bytes that are not UTF-8.
+struct ChildOutput {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl crate::process::ByteSource for ChildOutput {
+    async fn next_chunk(&mut self) -> crate::error::Result<Option<Vec<u8>>> {
+        match self.chunks.pop_front() {
+            Some(chunk) => Ok(Some(chunk)),
+            // The child is still there: it has only stopped writing.
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// A link's reading half over the line reader, as the stdio transport's is.
+struct LinesFromBytes {
+    lines: crate::process::LineStream,
+}
+
+#[async_trait::async_trait]
+impl crate::link::LinkReceiver for LinesFromBytes {
+    async fn recv(&mut self) -> crate::error::Result<Option<String>> {
+        self.lines.next_line().await
+    }
+}
+
+/// A link's reading half that fails the way the websocket transport does for a text frame that
+/// is not UTF-8.
+struct BadTextFrame;
+
+#[async_trait::async_trait]
+impl crate::link::LinkReceiver for BadTextFrame {
+    async fn recv(&mut self) -> crate::error::Result<Option<String>> {
+        Err(Error::Link {
+            peer: String::from("ws://peer"),
+            message: String::from("a text frame that is not UTF-8"),
+        })
+    }
+}
+
+/// A client that answers parse errors, reading from `receiver`.
+fn answering_from(
+    receiver: Box<dyn crate::link::LinkReceiver>,
+) -> (ScriptedLink, Arc<RecordingHandler>, Client) {
+    let link = ScriptedLink::new();
+    let (sender, _unused) = link.clone().into_link().split();
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect_with(
+        crate::link::Link::new(sender, receiver),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+        WireOptions::new().with_parse_error_replies(4),
+    );
+    (link, handler, client)
+}
+
+fn child_output(bytes: &[u8], max_line_bytes: usize) -> Box<dyn crate::link::LinkReceiver> {
+    let limits = crate::process::LineLimits {
+        max_line_bytes,
+        max_buffered_bytes: 4096,
+    };
+    let source = ChildOutput {
+        chunks: std::collections::VecDeque::from([bytes.to_vec()]),
+    };
+    Box::new(LinesFromBytes {
+        lines: crate::process::LineStream::new(Box::new(source), limits),
+    })
+}
+
+/// Bytes on a child's output that are not UTF-8 are repaired by the line reader and arrive as
+/// a line. When what is left is not JSON, a client asked to answer parse errors answers it,
+/// and the connection goes on.
+#[tokio::test]
+async fn a_stdio_line_that_is_not_utf8_is_answered_as_a_parse_error() {
+    let mut bytes = vec![0xff, 0xfe, b'\n'];
+    bytes.extend_from_slice(notification("after").to_string().as_bytes());
+    bytes.push(b'\n');
+    let (link, handler, client) = answering_from(child_output(&bytes, 1024));
+
+    let handled = handler.wait_for_notifications(1).await;
+    sent(&link, 1).await;
+    let observed = (
+        frames(&link)[0]["error"]["code"].clone(),
+        seen(&handled),
+        client.is_closed(),
+    );
+    assert_eq!(
+        observed,
+        (json!(-32700), vec!["after"], false),
+        "expected the repaired line answered and the next one handled: (-32700, [\"after\"], false) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A line longer than the transport's cap never becomes a line: the read fails, which ends the
+/// connection. It is not JSON either, but it is not answered: there is no line to answer.
+#[tokio::test]
+async fn a_stdio_line_past_the_cap_ends_the_connection_and_is_not_answered() {
+    let mut bytes = vec![b'x'; 65];
+    bytes.push(b'\n');
+    let (link, handler, client) = answering_from(child_output(&bytes, 64));
+
+    let termination = one_termination(&handler).await;
+    let observed = (&termination, link.sent().len());
+    assert!(
+        matches!(&observed, (PeerTermination::LinkFailed(cause), 0)
+            if cause.contains("bytes of one vendor output line")),
+        "expected the read's refusal to end the connection with nothing written: (LinkFailed naming the line cap, 0) | received {observed:?}"
+    );
+    let _ = client.close().await;
+}
+
+/// A websocket text frame that is not UTF-8 fails the read in the same way: the connection
+/// ends and nothing is answered.
+#[tokio::test]
+async fn a_read_that_fails_on_a_bad_text_frame_ends_the_connection_and_is_not_answered() {
+    let (link, handler, client) = answering_from(Box::new(BadTextFrame));
+
+    let termination = one_termination(&handler).await;
+    let observed = (&termination, link.sent().len());
+    assert!(
+        matches!(&observed, (PeerTermination::LinkFailed(cause), 0)
+            if cause.contains("a text frame that is not UTF-8")),
+        "expected the failed read to end the connection with nothing written: (LinkFailed naming the frame, 0) | received {observed:?}"
+    );
     let _ = client.close().await;
 }

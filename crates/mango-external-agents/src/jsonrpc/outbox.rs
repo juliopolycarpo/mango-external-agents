@@ -254,8 +254,15 @@ impl WireOptions {
     /// dropped. Nothing is sent:
     ///
     /// - for a request whose frame never began to be written, since the peer never saw it;
-    /// - once any response to it has been read, delivered yet or not;
+    /// - for a request whose caller was told the link refused its frame;
+    /// - once a response to it has been taken for its caller, delivered yet or not;
     /// - once the connection has ended.
+    ///
+    /// A response that is read at the very moment its caller lets go ends one way or the
+    /// other, never both: either it is taken for the caller and nothing is sent, or the
+    /// request is given up first, this is sent, and the response is dropped as a late one. A
+    /// request given up while its frame is being written is announced, since some of it may
+    /// have reached the peer, even if the link then refuses the frame.
     ///
     /// There is at most one for each request the peer was sent, and they are held beside the
     /// bounds of the outbound queue, not within them: a caller letting go of requests takes

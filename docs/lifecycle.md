@@ -202,10 +202,17 @@ JSON with `-32700` and a null id, at most `max_queued` of them waiting to be wri
 held beside the bounds of the outbound queue. A reply is a write: a peer that sends such lines and
 does not read what it is sent leaves one waiting, and when that write's `request_timeout` runs out
 the connection ends as after any write that could not finish, where a client that answers nothing
-would have gone on reading. `with_cancel_on_abandon(method)` queues a notification
+would have gone on reading. What is answered is a line the transport handed over that is not JSON,
+which includes a stdio line whose bytes were not UTF-8, since the line reader replaces those bytes
+and hands the line on. What the transport cannot hand over is not answered, because the read fails
+and the connection ends: a line or websocket message past `max_line_bytes`, and a websocket text
+frame that is not UTF-8. `with_cancel_on_abandon(method)` queues a notification
 `method` with `{"requestId": id}` when a request that was written is given up, by its future or
 `Reply` being dropped or its deadline running out; not for a request that never began to be
-written, not once a response to it has been read, and not after the connection has ended.
+written or whose caller was told the link refused its frame, not once a response to it has been
+taken for its caller, and not after the connection has ended. A response read at the moment its
+caller lets go ends one way only: taken for the caller with nothing sent, or the cancel sent and
+the response dropped as a late one.
 
 ACP also bounds its SDK frame boundary by queued JSON-RPC messages, the larger of
 `turn_channel_capacity` and `max_pending_requests` (1,024 by default, batch members counted

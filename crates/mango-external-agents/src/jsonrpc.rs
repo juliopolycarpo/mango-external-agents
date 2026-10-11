@@ -1112,8 +1112,10 @@ struct PendingAnswer {
 /// The last word on a call, shared by the record of calls and the caller, for a client that
 /// tells the peer when it gives a request up: `None` for one that does not.
 ///
-/// The reader takes it for a response that came, the caller for a call it gives up, and only
-/// the first to take it acts on it. So a call is never both answered and cancelled, and
+/// Whoever settles the call takes it first: the reader for a response that came, the writer
+/// for a frame the link refused, the caller for a call it gives up. Only the first to take it
+/// acts on it. A reader that finds it taken drops the response as a late one, and a caller
+/// that finds it taken sends no cancel. So a call is answered or cancelled, never both, and
 /// neither side has to wait for the record of calls to find out which it is.
 type CallClaim = Option<Arc<AtomicBool>>;
 
@@ -1122,6 +1124,12 @@ fn take_claim(claim: &CallClaim) -> bool {
     claim
         .as_ref()
         .is_some_and(|claim| !claim.swap(true, Ordering::SeqCst))
+}
+
+/// Takes the last word on a call for the side that settles it, and says whether the caller had
+/// already given the call up. Never, for a client that does not cancel: it has no claim.
+fn given_up(claim: &CallClaim) -> bool {
+    claim.is_some() && !take_claim(claim)
 }
 
 /// Drops the entries nobody waits on any more and counts those that hold a place in the budget.
@@ -1267,6 +1275,14 @@ struct ClientState {
     /// the worker's dequeue exactly there.
     #[cfg(test)]
     after_queue_length_read: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in [`ClientState::deliver`] between taking a call off the record and taking
+    /// its claim, so a test can have the caller give the call up exactly there.
+    #[cfg(test)]
+    after_response_matched: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in [`ClientState::deliver`] between taking a call's claim and handing the
+    /// response on, so a test can have the caller give the call up exactly there.
+    #[cfg(test)]
+    after_response_claimed: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     peer_bytes: Arc<Semaphore>,
     /// How many notifications and peer questions may wait in the handoff queue. The channel is
     /// larger than this by the reserve below, so the reader counts what is in it.
@@ -1451,8 +1467,9 @@ impl PendingCall {
 impl Drop for PendingCall {
     fn drop(&mut self) {
         // Decided here and now, whatever the record of calls is doing: a cancel that waited
-        // for it would let this caller's next write out ahead of it. The peer has seen the
-        // request, and no response to it has been read.
+        // for it would let this caller's next write out ahead of it. The peer may have seen
+        // the request, and nobody has settled the call first: no response was taken for it,
+        // and its caller was not told the link refused its frame.
         if self.began() && take_claim(&self.claim) {
             self.state.cancel_abandoned(&self.id);
         }
@@ -1736,6 +1753,10 @@ impl Client {
             after_hold_counted: StdMutex::new(None),
             #[cfg(test)]
             after_queue_length_read: StdMutex::new(None),
+            #[cfg(test)]
+            after_response_matched: StdMutex::new(None),
+            #[cfg(test)]
+            after_response_claimed: StdMutex::new(None),
             peer_bytes,
             notification_capacity,
             queued_answers: AtomicUsize::new(0),
@@ -2985,6 +3006,9 @@ impl ClientState {
         let Some(waiting) = self.pending.lock().await.remove(id) else {
             return;
         };
+        // Before its caller hears: the link took none of the frame, so a caller that lets go
+        // on this news has nothing to cancel.
+        take_claim(&waiting.claim);
         let failure = self
             .ended
             .lock()
@@ -3310,9 +3334,17 @@ impl ClientState {
         else {
             return Ok(());
         };
-        // A response has been read: from here the call is answered, not given up, whatever
-        // its caller does next.
-        take_claim(&claim);
+        #[cfg(test)]
+        Self::run_hook(&state.after_response_matched);
+        // The claim decides between this response and a caller giving the call up at this
+        // very moment, which takes no lock to do it. Taken here, the call is answered and no
+        // cancel follows, whatever its caller does next. Found taken, the cancel is already on
+        // its way: the response is a late one and is dropped, its place with it.
+        if given_up(&claim) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        Self::run_hook(&state.after_response_claimed);
         let place = match delivery {
             Delivery::Immediate => {
                 let _ = answer.send(outcome);
