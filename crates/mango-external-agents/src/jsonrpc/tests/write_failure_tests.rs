@@ -1,6 +1,8 @@
 //! Completed transport failures and safe local refusals have different link consequences.
 
+use super::outbox_tests::{options, within};
 use super::*;
+use crate::jsonrpc::ConnectionEnd;
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 
@@ -235,4 +237,69 @@ async fn a_request_that_times_out_while_queued_does_not_poison_the_healthy_sende
     assert!(!client.is_closed());
     assert!(handler.terminations.lock().await.is_empty());
     client.close().await.expect("expected bounded close");
+}
+
+/// A handler that says, on a channel the test awaits, what it was told.
+struct SayingHandler {
+    said: tokio::sync::mpsc::UnboundedSender<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for SayingHandler {
+    async fn on_notification(&self, _method: String, _params: Value) {}
+
+    async fn on_terminated(&self, _termination: PeerTermination) {
+        let _ = self.said.send("told of a termination");
+    }
+}
+
+/// A link that fails in the moment after the reader has looked for a close on record and
+/// before it records the failure, and a close puts its own end on record exactly there. The
+/// close owns that end: the reader lets the failure go, the handler is told of no termination,
+/// and the client reports the close it was given, as for a failure that lands a moment later.
+#[tokio::test]
+async fn a_link_failure_that_a_close_overtakes_while_it_is_recorded_is_not_reported() {
+    let link = ScriptedLink::new();
+    let (say, mut said) = tokio::sync::mpsc::unbounded_channel();
+    let client = Client::connect(
+        link.into_link(),
+        Arc::new(SayingHandler { said: say.clone() }) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    *client
+        .state
+        .after_write_failure_ignored
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let _ = say.send("let go by the reader");
+    }));
+    {
+        let state = Arc::clone(&client.state);
+        *client
+            .state
+            .before_link_failure_recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            // What the first step of a close does.
+            state.ended_with(ConnectionEnd::Closed, state.closed_error());
+        }));
+    }
+
+    client
+        .state
+        .signal_write_failure(&client.state.write_timeout());
+    let first = within("what the reader did with the failure", said.recv()).await;
+    client.close().await.expect("expected a clean close");
+    let later = said.try_recv().ok();
+
+    let observed = (first, later, client.ended());
+    let expected = (
+        Some("let go by the reader"),
+        None,
+        Some(ConnectionEnd::Closed),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the reader to let the failure go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
+    );
 }

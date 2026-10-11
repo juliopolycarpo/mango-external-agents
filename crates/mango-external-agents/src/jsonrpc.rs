@@ -1714,10 +1714,14 @@ struct ClientState {
     /// test can have the writer's work done exactly there.
     #[cfg(test)]
     after_batch_member_answered: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Runs once when the reader lets a write failure go because a close is on record, so a
+    /// Runs once when the reader lets a link failure go because a close is on record, so a
     /// test can tell that from the reader never having heard of the failure.
     #[cfg(test)]
     after_write_failure_ignored: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in [`link_failed`] before the failure is put on record, so a test can have a
+    /// close put its own end on record exactly there.
+    #[cfg(test)]
+    before_link_failure_recorded: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The calls whose claim the reader took, for a test that has to know which side won.
     #[cfg(test)]
     claimed_by_reader: StdMutex<Vec<String>>,
@@ -2497,6 +2501,8 @@ impl Client {
             after_batch_member_answered: StdMutex::new(None),
             #[cfg(test)]
             after_write_failure_ignored: StdMutex::new(None),
+            #[cfg(test)]
+            before_link_failure_recorded: StdMutex::new(None),
             #[cfg(test)]
             claimed_by_reader: StdMutex::new(Vec::new()),
             peer_bytes,
@@ -4373,6 +4379,8 @@ async fn link_failed(
     notifications: mpsc::Sender<QueuedWork>,
     cause: String,
 ) {
+    #[cfg(test)]
+    ClientState::run_hook(&state.before_link_failure_recorded);
     let termination = PeerTermination::LinkFailed(cause.clone());
     let failure = state.ended_with(
         ConnectionEnd::Peer(termination.clone()),
@@ -4382,6 +4390,15 @@ async fn link_failed(
             data: None,
         },
     );
+    // Decided on the record, not on a look taken before it: a close that put its own end on
+    // record first owns this one. It fails the calls and stops the handler's task itself, and
+    // the handler is not told of an end its host caused, so a failure that lands here a moment
+    // after the look the reader took, but before this record, is let go the same way.
+    if matches!(failure.cause, FailedCause::Ended(ConnectionEnd::Closed)) {
+        #[cfg(test)]
+        ClientState::run_hook(&state.after_write_failure_ignored);
+        return;
+    }
     let termination = failure.termination(termination);
     connection_failed(state, handler, notifications, termination, failure).await;
 }
