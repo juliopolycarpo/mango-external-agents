@@ -6,7 +6,7 @@ use super::outbox_tests::{
     outbox_holds, sent, until, within,
 };
 use super::*;
-use crate::jsonrpc::WireOptions;
+use crate::jsonrpc::{WireOptions, is_peer_work};
 
 const CANCEL: &str = "$/cancel_request";
 
@@ -93,8 +93,8 @@ async fn a_batch_reaches_the_handler_member_by_member_in_order() {
     client.close().await.expect("expected a clean close");
 }
 
-/// A response in a batch reaches the call that waits for it, and an ordered one does so behind
-/// the notification that comes before it in the same batch.
+/// A response in a batch reaches the call that waits for it, ordered or not, and the
+/// notification beside it reaches the handler.
 #[tokio::test]
 async fn a_response_in_a_batch_reaches_its_caller() {
     for request in [RequestOptions::new(), ordered_options()] {
@@ -140,7 +140,7 @@ async fn a_batch_past_the_notification_budget_ends_the_connection_counted_whole(
     assert_eq!(
         seen(&handled),
         vec!["one", "two"],
-        "expected a batch that fits handled whole | received {handled:?}"
+        "expected a batch that fits handled whole: [\"one\", \"two\"] | received {handled:?}"
     );
 
     link.push_line(
@@ -190,7 +190,7 @@ async fn a_batch_takes_its_bytes_once_and_gives_them_back() {
     assert_eq!(
         seen(&handled),
         vec!["one", "two", "three"],
-        "expected a batch exactly as long as the budget admitted | received {handled:?}"
+        "expected a batch exactly as long as the budget admitted, in order: [\"one\", \"two\", \"three\"] | received {handled:?}"
     );
 
     let longer = json!([
@@ -220,39 +220,56 @@ async fn a_line_that_is_not_json_is_dropped_by_a_client_that_was_not_asked_to_an
     let (link, handler, client) = connect(options(), WireOptions::new());
     link.push_line("{oops");
     link.push_line(notification("after").to_string());
-
     handler.wait_for_notifications(1).await;
-    let written = link.sent();
-    assert!(
-        written.is_empty(),
-        "expected nothing written for a line that is not JSON: [] | received {written:?}"
+    // A frame of this side's own, written behind anything the line could have set off.
+    let after = client
+        .submit_notification("after", json!({}))
+        .expect("expected the notification queued");
+    within("the notification written", after)
+        .await
+        .expect("expected the notification written");
+
+    let written = methods(&link);
+    assert_eq!(
+        written,
+        vec!["after"],
+        "expected nothing written for a line that is not JSON: [\"after\"] | received {written:?}"
     );
     client.close().await.expect("expected a clean close");
 }
 
 /// Asked to, a client answers a line that is not JSON with a parse error for no request. A
-/// line that is JSON and not a frame is not a parse error, and gets none.
+/// blank line is not answered, and neither is a line that is JSON and not a frame.
 #[tokio::test]
 async fn a_line_that_is_not_json_is_answered_with_a_parse_error() {
-    let (link, handler, client) =
-        connect(options(), WireOptions::new().with_parse_error_replies(4));
-    link.push_line("{oops");
-    link.push_line("42");
-    link.push_line(notification("after").to_string());
+    for versioned in [true, false] {
+        let mut speaking = options();
+        speaking.include_version_header = versioned;
+        let (link, handler, client) =
+            connect(speaking, WireOptions::new().with_parse_error_replies(4));
+        link.push_line("");
+        link.push_line("   ");
+        link.push_line("{oops");
+        link.push_line("42");
+        link.push_line(notification("after").to_string());
 
-    handler.wait_for_notifications(1).await;
-    sent(&link, 1).await;
-    let written = frames(&link);
-    let expected = vec![json!({
-        "jsonrpc": "2.0",
-        "id": null,
-        "error": { "code": -32700, "message": "Parse error" },
-    })];
-    assert_eq!(
-        written, expected,
-        "expected one parse error, for the line that was not JSON: {expected:?} | received {written:?}"
-    );
-    client.close().await.expect("expected a clean close");
+        handler.wait_for_notifications(1).await;
+        sent(&link, 1).await;
+        let written = frames(&link);
+        let mut expected = json!({
+            "id": null,
+            "error": { "code": -32700, "message": "Parse error" },
+        });
+        if versioned {
+            expected["jsonrpc"] = json!("2.0");
+        }
+        assert_eq!(
+            written,
+            vec![expected.clone()],
+            "expected one parse error, for the line that was not JSON: [{expected}] | received {written:?}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
 }
 
 /// The answers are bounded by how many of them wait to be written. With the link not taking
@@ -267,10 +284,16 @@ async fn parse_error_replies_are_bounded_by_how_many_wait_to_be_written() {
     }
     gated.link.push_line(notification("after").to_string());
     gated.handler.wait_for_notifications(1).await;
-    let holding = outbox_holds(&gated.client).0;
+    let waiting = gated
+        .client
+        .state
+        .parse_error_replies
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
     assert_eq!(
-        holding, 3,
-        "expected the held frame and two parse errors queued, the other three dropped: 3 frames | received {holding}"
+        waiting, 2,
+        "expected two parse errors waiting to be written, the other three dropped: 2 | received {waiting}"
     );
 
     gated.gate.add_permits(1);
@@ -286,13 +309,14 @@ async fn parse_error_replies_are_bounded_by_how_many_wait_to_be_written() {
     gated.client.close().await.expect("expected a clean close");
 }
 
-/// A parse error the outbound queue has no room for is dropped. The peer's noise meeting this
-/// side's bounds does not end the connection.
+/// The answers are held beside the bounds of the outbound queue. With the queue one frame
+/// short of full, the peer's noise takes none of the room that is left: the host's next frame
+/// is queued, where it would have ended the connection had an answer taken its place.
 #[tokio::test]
-async fn a_parse_error_the_queue_has_no_room_for_is_dropped_and_the_connection_stays() {
+async fn parse_errors_take_none_of_the_room_the_queue_leaves_the_host() {
     let gated = gated(
         options(),
-        limits(usize::MAX, usize::MAX, 1).with_parse_error_replies(4),
+        limits(usize::MAX, usize::MAX, 2).with_parse_error_replies(4),
     );
     let _held = link_held(&gated).await;
     gated.link.push_line("{oops");
@@ -300,14 +324,26 @@ async fn a_parse_error_the_queue_has_no_room_for_is_dropped_and_the_connection_s
     gated.link.push_line(notification("after").to_string());
     gated.handler.wait_for_notifications(1).await;
 
-    let observed = (outbox_holds(&gated.client).0, gated.client.is_closed());
+    let mine = gated.client.submit_notification("mine", json!({}));
+    let observed = (
+        mine.is_ok(),
+        outbox_holds(&gated.client).0,
+        gated.client.is_closed(),
+    );
     assert_eq!(
         observed,
-        (1, false),
-        "expected only the held frame queued and the connection open: (1, false) | received {observed:?}"
+        (true, 2, false),
+        "expected the host's frame queued in the room that was left: (true, 2, false) | received {observed:?}"
     );
     assert_ended(&gated.client, None);
     gated.gate.add_permits(1);
+    sent(&gated.link, 4).await;
+    let written = methods(&gated.link);
+    assert_eq!(
+        written,
+        vec!["hold", "?", "?", "mine"],
+        "expected both answers and the host's frame written in the order they were queued | received {written:?}"
+    );
     gated.client.close().await.expect("expected a clean close");
 }
 
@@ -340,32 +376,51 @@ async fn a_request_given_up_is_not_announced_by_a_client_that_was_not_asked_to()
 }
 
 /// Asked to, a client tells the peer when a request it has written is given up: a notification
-/// naming the request by the id it was sent with, and no id of its own.
+/// naming the request by the id it was sent with, and no id of its own. Whether the reply is
+/// dropped or the whole submission, and a response that comes afterwards finds nobody waiting.
 #[tokio::test]
-async fn a_reply_dropped_after_its_request_was_written_sends_the_cancel() {
-    let (link, _handler, client) =
-        connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
-    let (written, reply) = client
-        .submit_request("ask", json!({}), RequestOptions::new())
-        .expect("expected the request queued")
-        .into_parts();
-    within("the request written", written)
-        .await
-        .expect("expected the request written");
-    drop(reply);
+async fn a_request_given_up_after_it_was_written_sends_the_cancel() {
+    for whole in [false, true] {
+        let (link, handler, client) =
+            connect(options(), WireOptions::new().with_cancel_on_abandon(CANCEL));
+        let submitted = client
+            .submit_request("ask", json!({}), RequestOptions::new())
+            .expect("expected the request queued");
+        if whole {
+            sent(&link, 1).await;
+            until("the write to be over", || outbox_holds(&client) == (0, 0)).await;
+            drop(submitted);
+        } else {
+            let (written, reply) = submitted.into_parts();
+            within("the request written", written)
+                .await
+                .expect("expected the request written");
+            drop(reply);
+        }
 
-    sent(&link, 2).await;
-    let cancel = frames(&link).pop().expect("expected a second frame");
-    let expected = json!({
-        "jsonrpc": "2.0",
-        "method": CANCEL,
-        "params": { "requestId": "1" },
-    });
-    assert_eq!(
-        cancel, expected,
-        "expected the cancel for the request given up: {expected} | received {cancel}"
-    );
-    client.close().await.expect("expected a clean close");
+        sent(&link, 2).await;
+        let cancel = frames(&link).pop().expect("expected a second frame");
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "method": CANCEL,
+            "params": { "requestId": "1" },
+        });
+        assert_eq!(
+            cancel, expected,
+            "expected the cancel for the request given up (whole: {whole}): {expected} | received {cancel}"
+        );
+        // The peer answers all the same. Nobody waits, and nothing comes of it.
+        link.push_line(r#"{"jsonrpc":"2.0","id":"1","result":"late"}"#);
+        link.push_line(notification("after").to_string());
+        handler.wait_for_notifications(1).await;
+        let observed = (link.sent().len(), client.is_closed());
+        assert_eq!(
+            observed,
+            (2, false),
+            "expected the late response dropped and the connection open: (2, false) | received {observed:?}"
+        );
+        client.close().await.expect("expected a clean close");
+    }
 }
 
 /// A request given up while it is still queued is taken out of the queue. The peer never saw
@@ -495,7 +550,7 @@ async fn a_cancel_decided_after_waiting_for_the_record_of_calls_is_still_sent() 
 }
 
 /// Once the connection has ended there is nobody to tell: a reply dropped after a close sends
-/// nothing.
+/// nothing. The drop decides it on the spot, so there is nothing to wait for.
 #[tokio::test]
 async fn a_reply_dropped_after_the_connection_ended_sends_no_cancel() {
     let (link, _handler, client) =
@@ -509,22 +564,19 @@ async fn a_reply_dropped_after_the_connection_ended_sends_no_cancel() {
         .expect("expected the request written");
     client.close().await.expect("expected a clean close");
     drop(reply);
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
 
-    let written = methods(&link);
+    let observed = (methods(&link), outbox_holds(&client).0);
     assert_eq!(
-        written,
-        vec!["ask"],
-        "expected nothing written after the close | received {written:?}"
+        observed,
+        (vec![String::from("ask")], 0),
+        "expected nothing written or queued after the close: ([\"ask\"], 0) | received {observed:?}"
     );
 }
 
-/// A cancel the outbound queue has no room for is dropped. A caller letting go of a request
-/// does not end the connection.
+/// Cancels are held beside the bounds of the outbound queue. With the queue full, a caller
+/// letting go of a request does not end the connection, and the cancel is written all the same.
 #[tokio::test]
-async fn a_cancel_the_queue_has_no_room_for_is_dropped_and_the_connection_stays() {
+async fn a_cancel_is_queued_beside_a_full_queue_and_the_connection_stays() {
     let gated = gated(
         options(),
         limits(usize::MAX, usize::MAX, 1).with_cancel_on_abandon(CANCEL),
@@ -544,10 +596,17 @@ async fn a_cancel_the_queue_has_no_room_for_is_dropped_and_the_connection_stays(
     assert_eq!(
         observed,
         (1, false),
-        "expected only the held frame queued and the connection open: (1, false) | received {observed:?}"
+        "expected only the held frame counted and the connection open: (1, false) | received {observed:?}"
     );
     assert_ended(&gated.client, None);
     gated.gate.add_permits(1);
+    sent(&gated.link, 3).await;
+    let written = methods(&gated.link);
+    assert_eq!(
+        written,
+        vec!["ask", "hold", CANCEL],
+        "expected the cancel written once the link took writes again | received {written:?}"
+    );
     gated.client.close().await.expect("expected a clean close");
 }
 
@@ -632,4 +691,90 @@ async fn a_request_given_up_while_it_waits_for_the_link_sends_no_cancel() {
         "expected neither the request nor a cancel for it on the wire | received {written:?}"
     );
     gated.client.close().await.expect("expected a clean close");
+}
+
+/// A batch of responses alone takes nothing of the byte budget, as a response on a line of
+/// its own takes nothing. One for a call nobody waits for is dropped.
+#[tokio::test]
+async fn a_batch_of_responses_alone_takes_none_of_the_byte_budget() {
+    let mut narrow = options();
+    narrow.max_pending_bytes = 8;
+    let (link, _handler, client) = connect(narrow, WireOptions::new().with_batch_decoding());
+    let (written, reply) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    within("the request written", written)
+        .await
+        .expect("expected the request written");
+    link.push_line(
+        json!([
+            { "jsonrpc": "2.0", "id": "nobody", "result": "stray" },
+            { "jsonrpc": "2.0", "id": "1", "result": "done" },
+        ])
+        .to_string(),
+    );
+
+    let answer = within("the reply", reply).await;
+    let observed = (answer.as_ref().ok(), client.is_closed());
+    assert_eq!(
+        observed,
+        (Some(&json!("done")), false),
+        "expected the answer delivered and the connection open: (Some(\"done\"), false) | received ({answer:?}, {})",
+        client.is_closed()
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// A batch with a response and notifications is charged its whole line, shared among the
+/// notifications in shares that need not be equal, and gives every byte back.
+#[tokio::test]
+async fn a_mixed_batch_gives_back_every_byte_it_took() {
+    let batch = json!([
+        { "jsonrpc": "2.0", "id": "nobody", "result": "a response of some length." },
+        notification("one"),
+        notification("two"),
+        notification("three"),
+    ])
+    .to_string();
+    assert!(
+        !batch.len().is_multiple_of(3),
+        "expected a line whose bytes do not share out evenly among three: remainder 1 or 2 | received {}",
+        batch.len() % 3
+    );
+    let mut exact = options();
+    exact.max_pending_bytes = batch.len();
+    let (link, handler, client) = connect(exact, WireOptions::new().with_batch_decoding());
+    link.push_line(batch.clone());
+    let handled = handler.wait_for_notifications(3).await;
+    until("the batch's bytes to be given back", || {
+        client.state.peer_bytes.available_permits() == batch.len()
+    })
+    .await;
+    assert_eq!(
+        seen(&handled),
+        vec!["one", "two", "three"],
+        "expected the notifications handled in order: [\"one\", \"two\", \"three\"] | received {handled:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
+/// What makes a batch member something for the handler: an object with a method that is a
+/// string. Anything else is a response, or nothing.
+#[test]
+fn a_batch_member_is_work_for_the_handler_only_with_a_string_method() {
+    for (member, expected) in [
+        (json!({ "method": "session/update" }), true),
+        (json!({ "id": 1, "method": "ask" }), true),
+        (json!({ "id": 1, "result": {} }), false),
+        (json!({ "method": 5 }), false),
+        (json!("method"), false),
+        (json!(["method"]), false),
+    ] {
+        let work = is_peer_work(&member);
+        assert_eq!(
+            work, expected,
+            "expected {member} to be work for the handler: {expected} | received {work}"
+        );
+    }
 }

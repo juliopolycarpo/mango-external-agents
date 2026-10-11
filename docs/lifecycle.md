@@ -199,7 +199,7 @@ own and the whole batch counted before any of it is queued, the line's bytes tak
 `max_pending_bytes` once and shared out among those members; the answers to a batch's questions
 go out as frames of their own. `with_parse_error_replies(max_queued)` answers a line that is not
 JSON with `-32700` and a null id, at most `max_queued` of them waiting to be written at a time,
-and never ends the connection over one. `with_cancel_on_abandon(method)` queues a notification
+held beside the bounds of the outbound queue. `with_cancel_on_abandon(method)` queues a notification
 `method` with `{"requestId": id}` when a request that was written is given up, by its future or
 `Reply` being dropped or its deadline running out; not for a request that never began to be
 written, not once a response to it has been read, and not after the connection has ended.

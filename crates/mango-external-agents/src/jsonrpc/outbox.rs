@@ -179,9 +179,11 @@ impl WireOptions {
     ///   does not fit ends the connection with nothing of it handled, and the
     ///   [`PeerTermination::NotificationBackpressure`](super::PeerTermination::NotificationBackpressure)
     ///   reports what the queue held plus every such member as `received`.
-    /// - The line's bytes count against
-    ///   [`ClientOptions::max_pending_bytes`](super::ClientOptions::max_pending_bytes) once,
-    ///   shared out evenly among those members and given back as each is handled.
+    /// - The line's bytes, all of them, count against
+    ///   [`ClientOptions::max_pending_bytes`](super::ClientOptions::max_pending_bytes) once
+    ///   when the batch has any such member, shared out evenly among those members and given
+    ///   back as each is handled. A batch of responses alone takes none, as a response on a
+    ///   line of its own takes none.
     /// - A response in a batch reaches its caller as one on a line of its own does, ordered
     ///   answers behind the notifications before them in the batch.
     /// - A member that is not an object, and an empty array, are dropped.
@@ -207,12 +209,16 @@ impl WireOptions {
     /// Off by default, where such a line is dropped: a vendor that prints a stray diagnostic
     /// on its output is not told about it. On, at most `max_queued` such replies wait to be
     /// written at a time, and a line that is not JSON while that many wait is dropped as
-    /// before. The peer's own noise therefore cannot fill the outbound queue: a reply that
-    /// the bounds of the queue have no room for is dropped too, and never ends the connection.
+    /// before; `0` answers none. The replies are held beside the bounds of the outbound queue,
+    /// not within them: the peer's noise takes none of the room those bounds leave this side's
+    /// own frames, and cannot bring the queue to the bound that ends a connection. A reply is
+    /// still a write: one that fails ends the connection as any failed write does. The replies
+    /// go through the queue, so from the first one on, every write of this client takes its
+    /// turn there.
     ///
-    /// The reply does not quote the line. A line that is JSON and not a frame (a number, a
-    /// string, an array without [`with_batch_decoding`](Self::with_batch_decoding)) is not a
-    /// parse error and is dropped.
+    /// The reply does not quote the line. A line that is empty or only whitespace gets none,
+    /// and neither does a line that is JSON and not a frame (a number, a string, an array
+    /// without [`with_batch_decoding`](Self::with_batch_decoding)).
     ///
     /// # Example
     ///
@@ -232,16 +238,19 @@ impl WireOptions {
     /// `{"requestId": <the request's id>}` for its parameters, queued behind the request.
     ///
     /// Off by default. A request is given up when its future or its
-    /// [`Reply`](super::Reply) is dropped before an answer came, which is also what a deadline
-    /// running out does. Nothing is sent:
+    /// [`Reply`](super::Reply) is dropped before an answer came. A deadline that runs out
+    /// drops the future of [`Client::request`](super::Client::request) and so sends it at
+    /// once; a [`Reply`](super::Reply) that resolved with a timeout sends it when it is
+    /// dropped. Nothing is sent:
     ///
     /// - for a request whose frame never began to be written, since the peer never saw it;
     /// - once any response to it has been read, delivered yet or not;
     /// - once the connection has ended.
     ///
-    /// The notification is sent on a best effort: one the outbound queue has no room for is
-    /// dropped and does not end the connection. It goes through the queue, so from the first
-    /// one on, every write of this client takes its turn there.
+    /// There is at most one for each request the peer was sent, and they are held beside the
+    /// bounds of the outbound queue, not within them: a caller letting go of requests takes
+    /// none of the room those bounds leave other frames. It goes through the queue, so from
+    /// the first one on, every write of this client takes its turn there.
     ///
     /// # Example
     ///
@@ -529,6 +538,8 @@ pub(super) struct Outgoing {
     /// answer by the writer, just before the frame goes out: no answer can come sooner, and the
     /// caller that queued it could not wait for that map.
     call: Option<Registration>,
+    /// Whether the frame has a share of the queue's bounds to give back.
+    counted: bool,
 }
 
 /// What the writer takes off the queue.
@@ -547,7 +558,9 @@ impl Drop for Outgoing {
         // it, written or not. Also the path of a frame still queued when the writer is taken
         // down, where the dropped acknowledgement tells whoever waits.
         self.ctl.settle();
-        self.budget.release(self.ctl.bytes);
+        if self.counted {
+            self.budget.release(self.ctl.bytes);
+        }
     }
 }
 
@@ -633,6 +646,31 @@ impl Outbox {
         deadline: Instant,
         call: Option<Registration>,
     ) -> std::result::Result<Ticket, Refusal> {
+        self.queue_frame(frame, deadline, call, true)
+    }
+
+    /// Queues a frame this side sends of its own accord, beside the queue's bounds: it takes
+    /// none of the room the bounds leave the host's frames, and is not refused for want of it.
+    ///
+    /// For frames that are bounded where they are made (a parse error, a cancel for a request
+    /// given up), so that neither the peer's noise nor a caller letting go of a request can
+    /// bring the queue to the bound that ends a connection. A frame larger than any frame may
+    /// be is still refused.
+    pub(super) fn enqueue_aside(
+        &self,
+        frame: String,
+        deadline: Instant,
+    ) -> std::result::Result<Ticket, Refusal> {
+        self.queue_frame(frame, deadline, None, false)
+    }
+
+    fn queue_frame(
+        &self,
+        frame: String,
+        deadline: Instant,
+        call: Option<Registration>,
+        counted: bool,
+    ) -> std::result::Result<Ticket, Refusal> {
         let bytes = frame.len();
         let mut held = self
             .budget
@@ -643,7 +681,14 @@ impl Outbox {
         if held.sealed {
             return Err(Refusal::Sealed);
         }
-        admission(&self.limits, held.frames, held.bytes, bytes)?;
+        if counted {
+            admission(&self.limits, held.frames, held.bytes, bytes)?;
+        } else if bytes > self.limits.max_outbound_frame_bytes {
+            return Err(Refusal::FrameTooLarge {
+                limit: self.limits.max_outbound_frame_bytes,
+                received: bytes,
+            });
+        }
         // From the first queued frame on, every write takes its turn here.
         held.queueing = true;
         let ctl = Arc::new(FrameCtl {
@@ -651,8 +696,10 @@ impl Outbox {
             bytes,
         });
         let (ack, acknowledged) = oneshot::channel();
-        held.frames += 1;
-        held.bytes = held.bytes.saturating_add(bytes);
+        if counted {
+            held.frames += 1;
+            held.bytes = held.bytes.saturating_add(bytes);
+        }
         let queued = Outgoing {
             frame,
             ctl: Arc::clone(&ctl),
@@ -660,6 +707,7 @@ impl Outbox {
             ack: Some(ack),
             deadline,
             call,
+            counted,
         };
         if let Err(refused) = self.queue.send(Entry::Frame(queued)) {
             // The frame comes back in the error and gives its share back as it is dropped, which

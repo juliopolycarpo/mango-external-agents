@@ -3120,9 +3120,9 @@ impl ClientState {
     }
 
     /// Tells the peer that a request it may have seen was given up, if this client was asked
-    /// to. On a best effort: silent once the connection has ended, and a notification the
-    /// queue has no room for is dropped, since a caller letting go of a request is not what
-    /// ends a connection.
+    /// to. Silent once the connection has ended. Queued beside the queue's bounds: there is at
+    /// most one of these for each request written, and a caller letting go of a request is
+    /// not what brings a queue to the bound that ends a connection.
     fn cancel_abandoned(&self, id: &str) {
         let Some(method) = self.outbox.wire().cancel_on_abandon() else {
             return;
@@ -3134,7 +3134,7 @@ impl ClientState {
             return;
         };
         let deadline = deadline_after(self.options.request_timeout);
-        let _ = self.outbox.enqueue(frame, deadline, None);
+        let _ = self.outbox.enqueue_aside(frame, deadline);
     }
 
     /// Answers a line that was not JSON with a parse error, if this client was asked to and
@@ -3164,11 +3164,11 @@ impl ClientState {
             json!({ "code": -32700, "message": "Parse error" }),
         );
         let deadline = deadline_after(self.options.request_timeout);
-        // Straight to the queue: a refusal for want of room is the peer's noise meeting this
-        // side's bounds, and is not allowed to end the connection.
+        // Beside the queue's bounds, being bounded here: the peer's noise takes none of the
+        // room they leave this side's own frames.
         if let Ok(ticket) = self
             .outbox
-            .enqueue(Value::Object(frame).to_string(), deadline, None)
+            .enqueue_aside(Value::Object(frame).to_string(), deadline)
         {
             waiting.push(ticket.ctl);
         }
@@ -3507,7 +3507,10 @@ async fn dispatch(
         }
         Ok(_) => return Ok(()),
         Err(_) => {
-            state.answer_unparseable();
+            // A blank line is nothing a peer could be told about.
+            if !message.trim().is_empty() {
+                state.answer_unparseable();
+            }
             return Ok(());
         }
     };
@@ -3578,7 +3581,7 @@ async fn dispatch_batch(
         } else {
             None
         };
-        // A response takes nothing of the byte budget, in a batch as on a line of its own.
+        // A response holds nothing of the byte budget.
         let bytes = mine.map_or(PeerBytes::Line(0), PeerBytes::Share);
         dispatch_frame(state, notifications, frame, bytes).await?;
     }
@@ -3599,14 +3602,20 @@ async fn dispatch_frame(
     if let Some(Value::String(method)) = frame.remove("method") {
         let params = frame.remove("params").unwrap_or(Value::Null);
         let permit = match bytes {
-            PeerBytes::Line(bytes) => take_peer_bytes(state, bytes)?,
+            PeerBytes::Line(bytes) => {
+                let permit = take_peer_bytes(state, bytes)?;
+                // The channel also has room reserved for ordered responses, so its own
+                // capacity no longer says when the peer's share is spent.
+                if state.peer_work_queued(notifications) >= state.notification_capacity {
+                    return Err(state.queue_full());
+                }
+                permit
+            }
+            // A batch was counted whole before any of it was queued, and is not counted
+            // again member by member: a second count could come out one higher while the
+            // handler's task lets an answer go, and refuse a batch half-way through.
             PeerBytes::Share(permit) => permit,
         };
-        // The channel also has room reserved for ordered responses, so its own capacity no
-        // longer says when the peer's share is spent.
-        if state.peer_work_queued(notifications) >= state.notification_capacity {
-            return Err(state.queue_full());
-        }
         let work = match id {
             Some(id) => PeerWork::Request { method, params, id },
             None => PeerWork::Notification { method, params },
