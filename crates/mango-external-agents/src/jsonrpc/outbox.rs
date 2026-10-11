@@ -58,6 +58,9 @@ pub struct WireOptions {
     max_outbound_frame_bytes: usize,
     max_outbound_queued_bytes: usize,
     max_outbound_queued_frames: usize,
+    batch_decoding: bool,
+    parse_error_replies: Option<usize>,
+    cancel_on_abandon: Option<String>,
 }
 
 impl Default for WireOptions {
@@ -66,6 +69,9 @@ impl Default for WireOptions {
             max_outbound_frame_bytes: usize::MAX,
             max_outbound_queued_bytes: usize::MAX,
             max_outbound_queued_frames: usize::MAX,
+            batch_decoding: false,
+            parse_error_replies: None,
+            cancel_on_abandon: None,
         }
     }
 }
@@ -158,6 +164,139 @@ impl WireOptions {
     pub fn with_max_outbound_queued_frames(mut self, frames: usize) -> Self {
         self.max_outbound_queued_frames = frames;
         self
+    }
+
+    /// Reads a line that is a JSON array as a JSON-RPC batch: each member that is an object is
+    /// taken as a frame, in the order the array gives them.
+    ///
+    /// Off by default, where such a line is dropped like any other line that is not a frame.
+    ///
+    /// What a batch is held to:
+    ///
+    /// - Each notification and each question in it counts against
+    ///   [`ClientOptions::max_pending_notifications`](super::ClientOptions::max_pending_notifications)
+    ///   on its own. The whole batch is counted before any of it is queued, so a batch that
+    ///   does not fit ends the connection with nothing of it handled, and the
+    ///   [`PeerTermination::NotificationBackpressure`](super::PeerTermination::NotificationBackpressure)
+    ///   reports what the queue held plus every such member as `received`.
+    /// - The line's bytes count against
+    ///   [`ClientOptions::max_pending_bytes`](super::ClientOptions::max_pending_bytes) once,
+    ///   shared out evenly among those members and given back as each is handled.
+    /// - A response in a batch reaches its caller as one on a line of its own does, ordered
+    ///   answers behind the notifications before them in the batch.
+    /// - A member that is not an object, and an empty array, are dropped.
+    ///
+    /// The answers to a batch's questions go out as frames of their own, not as one array.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_batch_decoding();
+    /// assert!(wire.decodes_batches());
+    /// ```
+    #[must_use]
+    pub fn with_batch_decoding(mut self) -> Self {
+        self.batch_decoding = true;
+        self
+    }
+
+    /// Answers a line that is not JSON with a JSON-RPC parse error: code `-32700`, `id` null.
+    ///
+    /// Off by default, where such a line is dropped: a vendor that prints a stray diagnostic
+    /// on its output is not told about it. On, at most `max_queued` such replies wait to be
+    /// written at a time, and a line that is not JSON while that many wait is dropped as
+    /// before. The peer's own noise therefore cannot fill the outbound queue: a reply that
+    /// the bounds of the queue have no room for is dropped too, and never ends the connection.
+    ///
+    /// The reply does not quote the line. A line that is JSON and not a frame (a number, a
+    /// string, an array without [`with_batch_decoding`](Self::with_batch_decoding)) is not a
+    /// parse error and is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_parse_error_replies(8);
+    /// assert_eq!(wire.parse_error_replies(), Some(8));
+    /// ```
+    #[must_use]
+    pub fn with_parse_error_replies(mut self, max_queued: usize) -> Self {
+        self.parse_error_replies = Some(max_queued);
+        self
+    }
+
+    /// Tells the peer when this side gives a request up: a notification named `method`, with
+    /// `{"requestId": <the request's id>}` for its parameters, queued behind the request.
+    ///
+    /// Off by default. A request is given up when its future or its
+    /// [`Reply`](super::Reply) is dropped before an answer came, which is also what a deadline
+    /// running out does. Nothing is sent:
+    ///
+    /// - for a request whose frame never began to be written, since the peer never saw it;
+    /// - once any response to it has been read, delivered yet or not;
+    /// - once the connection has ended.
+    ///
+    /// The notification is sent on a best effort: one the outbound queue has no room for is
+    /// dropped and does not end the connection. It goes through the queue, so from the first
+    /// one on, every write of this client takes its turn there.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_cancel_on_abandon("$/cancel_request");
+    /// assert_eq!(wire.cancel_on_abandon(), Some("$/cancel_request"));
+    /// ```
+    #[must_use]
+    pub fn with_cancel_on_abandon(mut self, method: impl Into<String>) -> Self {
+        self.cancel_on_abandon = Some(method.into());
+        self
+    }
+
+    /// Whether a line that is a JSON array is read as a batch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert!(!WireOptions::new().decodes_batches());
+    /// ```
+    #[must_use]
+    pub fn decodes_batches(&self) -> bool {
+        self.batch_decoding
+    }
+
+    /// How many parse-error replies may wait to be written, or `None` when none are sent.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert_eq!(WireOptions::new().parse_error_replies(), None);
+    /// ```
+    #[must_use]
+    pub fn parse_error_replies(&self) -> Option<usize> {
+        self.parse_error_replies
+    }
+
+    /// The notification sent for a request given up, or `None` when none is.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert_eq!(WireOptions::new().cancel_on_abandon(), None);
+    /// ```
+    #[must_use]
+    pub fn cancel_on_abandon(&self) -> Option<&str> {
+        self.cancel_on_abandon.as_deref()
     }
 
     /// The largest single frame this client sends.
@@ -350,7 +489,7 @@ impl FrameCtl {
     }
 
     /// Whether the frame is still waiting for the writer.
-    fn queued(&self) -> bool {
+    pub(super) fn queued(&self) -> bool {
         self.phase.load(Ordering::Acquire) == QUEUED
     }
 
@@ -477,6 +616,11 @@ impl Outbox {
             },
             frames,
         )
+    }
+
+    /// The options this queue was made with.
+    pub(super) fn wire(&self) -> &WireOptions {
+        &self.limits
     }
 
     /// Admits one frame and queues it, as one step.
