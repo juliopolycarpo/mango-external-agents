@@ -1,7 +1,9 @@
 //! Which outbound bound an error or an end names, and which timeout is a close giving up, told
 //! by type from the values the client really produces.
 
-use super::outbox_tests::{eventually, gated, limits, link_held, one_termination, options, within};
+use super::outbox_tests::{
+    eventually, gated, limits, link_held, methods, one_termination, options, within,
+};
 use super::*;
 use crate::Dispatch;
 use crate::jsonrpc::{OutboundBound, WireOptions, is_link_shutdown_timeout};
@@ -115,11 +117,30 @@ async fn a_queue_bounded_to_no_frames_names_the_bound_and_ends_nothing() {
         .client
         .submit_notification("queued", json!({}))
         .expect_err("expected the frame refused");
-    let observed = (told(&error), gated.client.is_closed(), gated.client.ended());
-    let expected = ((Some(OutboundBound::QueuedFrames), false), false, None);
+    let refused = told(&error);
+    // A direct write goes past the queue's bound, so the connection is still carrying frames.
+    gated
+        .client
+        .notify("later", json!({}))
+        .await
+        .expect("expected a direct write, which no queue bound refuses, written");
+    let observed = (
+        refused,
+        gated.client.is_closed(),
+        gated.client.ended(),
+        gated.handler.terminations.lock().await.is_empty(),
+        methods(&gated.link),
+    );
+    let expected = (
+        (Some(OutboundBound::QueuedFrames), false),
+        false,
+        None,
+        true,
+        vec![String::from("later")],
+    );
     assert_eq!(
         observed, expected,
-        "expected the bound on queued frames named and the connection untouched: {expected:?} | received {observed:?} ({error:?})"
+        "expected the bound on queued frames named, nothing ended and a direct write carried: {expected:?} | received {observed:?} ({error:?})"
     );
     gated.client.close().await.expect("expected a clean close");
 }

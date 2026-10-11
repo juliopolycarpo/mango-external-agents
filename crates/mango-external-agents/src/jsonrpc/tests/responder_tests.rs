@@ -571,12 +571,13 @@ async fn an_answer_too_large_hands_the_responder_back_for_a_smaller_one() {
 }
 
 /// The error of an answer that is too large names the bound on one frame's bytes by type, as
-/// the error of a frame refused where it is submitted does.
+/// the error of a frame refused where it is submitted does, and so when it is the queue's byte
+/// bound that the answer passes, with the bound on one frame left unset.
 #[tokio::test]
 async fn an_answer_too_large_names_the_frame_bound() {
     let connected = connect(
         options(),
-        limits(200, usize::MAX, usize::MAX).with_request_handoff(),
+        limits(usize::MAX, 200, usize::MAX).with_request_handoff(),
     );
     connected.link.push_line(question(5, LARGE));
 
@@ -1257,6 +1258,52 @@ async fn a_responder_dropped_with_no_way_to_say_so_ends_the_connection() {
         );
         let _ = connected.client.close().await;
     }
+}
+
+/// Under a queue bound of nothing no answer can be queued, and the error of the answer names the
+/// bound on queued frames. That does not end anything by itself, but the responder cannot say
+/// anything for its question either, so the connection ends as a failed link when it is dropped.
+#[tokio::test]
+async fn an_answer_under_a_queue_bound_of_nothing_names_the_bound_and_the_connection_ends() {
+    let connected = connect(
+        options(),
+        limits(usize::MAX, usize::MAX, 0).with_request_handoff(),
+    );
+    connected.link.push_line(question(5, LARGE));
+
+    let termination = termination_of(&connected.handler).await;
+    let refused = connected
+        .handler
+        .too_large
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(too_large, _)| *too_large)
+        .collect::<Vec<_>>();
+    let bounds = connected
+        .handler
+        .too_large_bound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let observed = (
+        bounds,
+        refused,
+        matches!(&termination, PeerTermination::LinkFailed(cause)
+            if cause.contains("outgoing JSON-RPC frames awaiting their write")),
+        connected.link.sent().len(),
+    );
+    let expected = (
+        vec![Some(OutboundBound::QueuedFrames)],
+        vec![false],
+        true,
+        0,
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the bound on queued frames named for an answer that was not too large, and the connection ended as a failed link naming it with nothing written: {expected:?} | received {observed:?} ({termination:?})"
+    );
+    let _ = connected.client.close().await;
 }
 
 /// Ordered calls given up, more of them than the reserve for ordered responses holds, on one

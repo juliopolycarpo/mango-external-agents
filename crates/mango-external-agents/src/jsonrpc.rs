@@ -198,8 +198,10 @@ pub enum PeerTermination {
 /// [`PeerTermination::OutboundBackpressure`]. Both are told as an [`Error::LimitExceeded`]
 /// whose `subject` is text; this says which bound that text names, so that nothing has to
 /// read it. It does not say whether the connection ended: a queue bound of nothing refuses
-/// each frame alone and ends nothing, and [`Client::ended`] is what says whether the
-/// connection did. More bounds may be added, so a `match` on this needs a wildcard arm.
+/// each frame queued with `submit_*` alone and ends nothing, while an answer that cannot be
+/// queued under it ends the connection as a failed link when its [`Responder`] is dropped.
+/// [`Client::ended`] says whether the connection has ended, and after a failed link it may
+/// take a moment to. More bounds may be added, so a `match` on this needs a wildcard arm.
 ///
 /// ```
 /// use mango_external_agents::jsonrpc::OutboundBound;
@@ -227,7 +229,9 @@ pub enum OutboundBound {
     /// How many frames wait to be written:
     /// [`with_max_outbound_queued_frames`](WireOptions::with_max_outbound_queued_frames).
     /// Passing it with frames waiting ends the connection. A bound of nothing refuses each
-    /// frame alone with this bound named, and ends nothing.
+    /// frame queued with `submit_*` alone, with this bound named, and ends nothing. An answer
+    /// given through a [`Responder`] cannot be queued under it, and the connection ends as a
+    /// failed link when the responder is dropped.
     QueuedFrames,
 }
 
@@ -252,7 +256,7 @@ impl OutboundBound {
     /// if let Err(error) = submitted {
     ///     match OutboundBound::exceeded_by(&error) {
     ///         Some(OutboundBound::FrameBytes) => eprintln!("the prompt is too large to send"),
-    ///         Some(bound) => eprintln!("the queue is full ({bound:?}); ended: {:?}", client.ended()),
+    ///         Some(bound) => eprintln!("refused at {bound:?}; ended so far: {:?}", client.ended()),
     ///         None => eprintln!("{error}"),
     ///     }
     /// }
@@ -295,7 +299,8 @@ const LINK_SHUTDOWN: &str = "JSON-RPC link shutdown";
 ///
 /// It is `false` for every other timeout, a request left unanswered and a frame left
 /// unwritten among them. It reads through what [`Error::cause`] reads through, a
-/// [`Dispatch`] annotation among it.
+/// [`Dispatch`] annotation among it. A close that gave up is known by the operation text this
+/// client names it by, so another layer's `Timeout` that carries that very text reads as one.
 ///
 /// ```no_run
 /// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
