@@ -262,7 +262,7 @@ impl WireOptions {
     /// other, never both: either it is taken for the caller and nothing is sent, or the
     /// request is given up first, this is sent, and the response is dropped as a late one. A
     /// request given up while its frame is being written is announced, since some of it may
-    /// have reached the peer, even if the link then refuses the frame.
+    /// have reached the peer, even if the link then refuses the frame whole and stays usable.
     ///
     /// There is at most one for each request the peer was sent, and they are held beside the
     /// bounds of the outbound queue, not within them: a caller letting go of requests takes
@@ -970,8 +970,9 @@ async fn frame(state: &ClientState, mut outgoing: Outgoing) {
         if !outgoing.ctl.queued() {
             return;
         }
+        let claim = registration.claim.clone();
         match state.register(registration).await {
-            Ok(id) => call = Some(id),
+            Ok(id) => call = Some((id, claim)),
             Err(refused) => {
                 let ack = outgoing.ack.take();
                 drop(outgoing);
@@ -984,12 +985,17 @@ async fn frame(state: &ClientState, mut outgoing: Outgoing) {
     }
     let outcome = write(state, &mut outgoing).await;
     let ack = outgoing.ack.take();
+    let unwritten = call.filter(|_| !matches!(outcome, Some(Ok(()))));
+    if let Some((_, claim)) = &unwritten {
+        // The write is over and the link took none of the frame, or is unusable now. Settled
+        // here, before anything is waited for: a caller that lets go from now on has nothing
+        // to cancel, whether or not it has heard yet.
+        super::take_claim(claim);
+    }
     // Its share of the budget goes back before its caller hears: a caller that queues the next
     // frame on that news must find the room.
     drop(outgoing);
-    if let Some(id) = call
-        && !matches!(outcome, Some(Ok(())))
-    {
+    if let Some((id, _)) = unwritten {
         state.fail_unwritten(&id).await;
     }
     if let (Some(ack), Some(outcome)) = (ack, outcome) {

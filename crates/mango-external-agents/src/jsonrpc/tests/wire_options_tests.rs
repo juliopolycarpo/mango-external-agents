@@ -666,6 +666,63 @@ async fn a_request_the_link_refused_whole_sends_no_cancel() {
     client.close().await.expect("expected a clean close");
 }
 
+/// The same for a caller that lets go before it has heard: once the link has refused the
+/// frame the call is settled, even while the writer still waits for the record of calls to
+/// say so.
+#[tokio::test]
+async fn a_request_refused_whole_and_given_up_before_its_caller_heard_sends_no_cancel() {
+    let link = ScriptedLink::new();
+    let (sender, receiver) = link.clone().into_link().split();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler = RecordingHandler::arc(None);
+    let client = Client::connect_with(
+        crate::link::Link::new(
+            Box::new(GatedSender {
+                inner: Box::new(RefuseFirstSend {
+                    inner: sender,
+                    first: true,
+                }),
+                method: "ask",
+                gate: Arc::clone(&gate),
+            }),
+            receiver,
+        ),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        options(),
+        WireOptions::new().with_cancel_on_abandon(CANCEL),
+    );
+    let (written, reply) = client
+        .submit_request("ask", json!({}), RequestOptions::new())
+        .expect("expected the request queued")
+        .into_parts();
+    until("the write to begin", || written.started()).await;
+    let in_the_way = client.state.pending.lock().await;
+    gate.add_permits(1);
+    until("the refused frame to be let go", || {
+        outbox_holds(&client) == (0, 0)
+    })
+    .await;
+    drop(reply);
+    let queued = client.state.outbox.aside();
+    assert_eq!(
+        queued, 0,
+        "expected no cancel queued for a frame the link had refused, its caller not yet told: 0 | received {queued}"
+    );
+    drop(in_the_way);
+    let refused = within("the write refused", written).await;
+    within("the next write", client.notify("after", json!({})))
+        .await
+        .expect("expected the notification written");
+
+    let observed = (refused.is_err(), methods(&link));
+    assert_eq!(
+        observed,
+        (true, vec![String::from("after")]),
+        "expected the refusal reported and nothing but the next write on the wire: (true, [\"after\"]) | received {observed:?}"
+    );
+    client.close().await.expect("expected a clean close");
+}
+
 /// A call whose deadline runs out is given up like any other: the caller gets its timeout and
 /// the peer is told. This is the path of a caller that writes for itself.
 #[tokio::test(start_paused = true)]
@@ -997,6 +1054,8 @@ struct GatedHandler {
     begun: std::sync::Mutex<Vec<String>>,
     finished: std::sync::Mutex<Vec<String>>,
     gate: tokio::sync::Semaphore,
+    /// What had been handled to the end each time a question arrived.
+    finished_when_asked: std::sync::Mutex<Vec<Vec<String>>>,
     terminations: std::sync::Mutex<Vec<PeerTermination>>,
 }
 
@@ -1010,6 +1069,7 @@ impl GatedHandler {
             begun: std::sync::Mutex::new(Vec::new()),
             finished: std::sync::Mutex::new(Vec::new()),
             gate: tokio::sync::Semaphore::new(0),
+            finished_when_asked: std::sync::Mutex::new(Vec::new()),
             terminations: std::sync::Mutex::new(Vec::new()),
         });
         let client = Arc::new(Client::connect_with(
@@ -1057,6 +1117,11 @@ impl PeerHandler for GatedHandler {
         _params: Value,
         _id: RequestId,
     ) -> ServerRequestOutcome {
+        let finished = Self::list(&self.finished);
+        self.finished_when_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(finished);
         ServerRequestOutcome::Answer(json!("yes"))
     }
 
@@ -1474,8 +1539,16 @@ async fn a_response_racing_a_call_given_up_ends_the_call_one_way_only() {
     within("the last write", client.notify("last", json!({})))
         .await
         .expect("expected the notification written");
-    until("every response to be out of the handoff queue", || {
+    // Given back by whoever let go last, on its own thread: waited for, then asserted.
+    until("everything held for the calls to be given back", || {
         client.state.queued_answers.load(Ordering::Acquire) == 0
+            && client.state.outbox.aside() == 0
+            && client.state.ordered_places.available_permits() == 64
+            && client
+                .state
+                .pending
+                .try_lock()
+                .is_ok_and(|pending| pending.is_empty())
     })
     .await;
 
@@ -1498,16 +1571,9 @@ async fn a_response_racing_a_call_given_up_ends_the_call_one_way_only() {
         );
     }
     let others = written.len() - ROUNDS - cancelled - 1;
-    let left = (
-        others,
-        client.state.outbox.aside(),
-        client.state.pending.lock().await.len(),
-        client.state.ordered_places.available_permits(),
-    );
     assert_eq!(
-        left,
-        (0, 0, 0, 64),
-        "expected no frame but the requests, their cancels and the last write, and nothing held: (0, 0, 0, 64) | received {left:?}"
+        others, 0,
+        "expected no frame but the requests, their cancels and the last write: 0 | received {others} more in {written:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -1567,8 +1633,8 @@ async fn a_parse_error_the_peer_never_reads_ends_the_connection_at_the_write_dea
 }
 
 /// A peer's question inside a batch waits for the notifications before it, like one on a line
-/// of its own: nothing is answered while the handler is inside the first member, and once it
-/// is let through the question is answered and the member after it is handled.
+/// of its own: the handler is asked only once it has returned from the first member, however
+/// long that takes, and then the question is answered and the member after it is handled.
 #[tokio::test]
 async fn a_question_in_a_batch_waits_for_the_members_before_it() {
     let (link, handler, client) =
@@ -1585,30 +1651,32 @@ async fn a_question_in_a_batch_waits_for_the_members_before_it() {
         GatedHandler::list(&handler.begun) == ["one"]
     })
     .await;
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    let early = (GatedHandler::list(&handler.begun), link.sent().len());
-    assert_eq!(
-        early,
-        (vec![String::from("one")], 0),
-        "expected the question unanswered while the member before it is handled: ([\"one\"], 0) | received {early:?}"
-    );
-
     handler.gate.add_permits(2);
     sent(&link, 1).await;
     until("the last member to be handled", || {
         GatedHandler::list(&handler.finished).len() == 2
     })
     .await;
-    let observed = (GatedHandler::list(&handler.finished), frames(&link));
+    let asked_after: Vec<bool> = handler
+        .finished_when_asked
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|finished| finished.first().is_some_and(|first| first == "one"))
+        .collect();
+    let observed = (
+        GatedHandler::list(&handler.finished),
+        asked_after,
+        frames(&link),
+    );
     let expected = (
         vec![String::from("one"), String::from("two")],
+        vec![true],
         vec![json!({ "jsonrpc": "2.0", "id": 7, "result": "yes" })],
     );
     assert_eq!(
         observed, expected,
-        "expected both members handled in order and the question answered once: {expected:?} | received {observed:?}"
+        "expected both members handled in order, the question asked once and after the first, and answered once: {expected:?} | received {observed:?}"
     );
     client.close().await.expect("expected a clean close");
 }
@@ -1719,27 +1787,28 @@ async fn a_stdio_line_past_the_cap_ends_the_connection_and_is_not_answered() {
     let (link, handler, client) = answering_from(child_output(&bytes, 64));
 
     let termination = one_termination(&handler).await;
-    let observed = (&termination, link.sent().len());
-    assert!(
-        matches!(&observed, (PeerTermination::LinkFailed(cause), 0)
-            if cause.contains("bytes of one vendor output line")),
-        "expected the read's refusal to end the connection with nothing written: (LinkFailed naming the line cap, 0) | received {observed:?}"
-    );
     let _ = client.close().await;
+    let observed = (&termination, link.sent().len(), client.state.outbox.aside());
+    assert!(
+        matches!(&observed, (PeerTermination::LinkFailed(cause), 0, 0)
+            if cause.contains("bytes of one vendor output line")),
+        "expected the read's refusal to end the connection with nothing written or waiting: (LinkFailed naming the line cap, 0, 0) | received {observed:?}"
+    );
 }
 
-/// A websocket text frame that is not UTF-8 fails the read in the same way: the connection
-/// ends and nothing is answered.
+/// A read that fails is not a line either. This is the shape the websocket transport gives a
+/// text frame that is not UTF-8, returned here by a fake: the connection ends and nothing is
+/// answered. That the transport reports such a frame this way is the transport's to pin.
 #[tokio::test]
 async fn a_read_that_fails_on_a_bad_text_frame_ends_the_connection_and_is_not_answered() {
     let (link, handler, client) = answering_from(Box::new(BadTextFrame));
 
     let termination = one_termination(&handler).await;
-    let observed = (&termination, link.sent().len());
-    assert!(
-        matches!(&observed, (PeerTermination::LinkFailed(cause), 0)
-            if cause.contains("a text frame that is not UTF-8")),
-        "expected the failed read to end the connection with nothing written: (LinkFailed naming the frame, 0) | received {observed:?}"
-    );
     let _ = client.close().await;
+    let observed = (&termination, link.sent().len(), client.state.outbox.aside());
+    assert!(
+        matches!(&observed, (PeerTermination::LinkFailed(cause), 0, 0)
+            if cause.contains("a text frame that is not UTF-8")),
+        "expected the failed read to end the connection with nothing written or waiting: (LinkFailed naming the frame, 0, 0) | received {observed:?}"
+    );
 }

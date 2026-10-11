@@ -3006,9 +3006,6 @@ impl ClientState {
         let Some(waiting) = self.pending.lock().await.remove(id) else {
             return;
         };
-        // Before its caller hears: the link took none of the frame, so a caller that lets go
-        // on this news has nothing to cancel.
-        take_claim(&waiting.claim);
         let failure = self
             .ended
             .lock()
