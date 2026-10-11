@@ -234,7 +234,7 @@ written: one that was queued and then could not be, because the link refused it 
 ran out in the queue, ends the connection whether or not anyone awaits its write, and so does a
 question nothing can be said for: one no reply to fits a frame, or one let go on a queue bounded
 at nothing. Answers are queued without waiting, so the outbound bounds are
-what limits them when a peer asks faster than it reads: set them with the option. A write that
+what limits them when a peer asks faster than it reads: the option does not set them, so set them beside it. A write that
 fails in the moment a close is on record is the close's, and the handler is told of no
 termination for it. A question still queued when the
 connection ends is not handed over. Once the connection has ended a

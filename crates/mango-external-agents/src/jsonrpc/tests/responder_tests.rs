@@ -1316,14 +1316,15 @@ impl PeerHandler for RacingHandler {
 
     async fn on_request_handoff(&self, _method: String, _params: Value, responder: Responder) {
         let id = responder.id().as_json().as_u64().unwrap_or(u64::MAX);
-        self.handed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(id);
+        // Parked before it is noted: a test that has seen the question finds its responder.
         self.parked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(responder);
+        self.handed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id);
     }
 
     fn on_request_past_cap(
@@ -1342,7 +1343,13 @@ impl PeerHandler for RacingHandler {
 
 /// Answers the question when the peer gave it an even number, and lets it go otherwise.
 fn settle(responder: Responder) {
-    if responder.id().as_json().as_u64().unwrap_or(0) % 2 == 0 {
+    if responder
+        .id()
+        .as_json()
+        .as_u64()
+        .unwrap_or(0)
+        .is_multiple_of(2)
+    {
         let _ = responder.answer(ServerRequestOutcome::Answer(json!("answered")));
     }
 }
@@ -1561,6 +1568,16 @@ async fn an_answer_whose_deadline_runs_out_in_the_queue_ends_the_connection() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     drop(link_taken);
 
+    // By the machine's clock: the runtime's is paused and does not move while this yields.
+    until("the handler to be told", || {
+        !connected
+            .handler
+            .terminations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    })
+    .await;
     let termination = termination_of(&connected.handler).await;
     let observed = (&termination, connected.link.sent().len());
     assert!(
@@ -1784,5 +1801,45 @@ async fn a_write_failure_that_lands_on_a_close_is_not_reported_as_a_termination(
         observed,
         (Some("let go by the reader"), Some(ConnectionEnd::Closed)),
         "expected the reader to let the failure go under the close on record: (Some(\"let go by the reader\"), Some(Closed)) | received {observed:?}"
+    );
+}
+
+/// A refused answer is an error that can be returned as one: it says the answer was not
+/// queued and why, gives the reason as its source, and can cross threads.
+#[tokio::test]
+async fn a_refused_answer_is_an_error_naming_its_reason() {
+    fn crosses_threads<T: std::error::Error + Send + Sync + 'static>(_: &T) {}
+
+    let connected = connect(options(), handoff());
+    connected.link.push_line(question(1, PARK));
+    until("the question to be parked", || {
+        connected.handler.parked() == 1
+    })
+    .await;
+    let responder = connected.handler.take();
+    connected
+        .client
+        .close()
+        .await
+        .expect("expected a clean close");
+    let unanswered = responder
+        .answer(ServerRequestOutcome::Answer(json!("late")))
+        .expect_err("expected the answer refused after the close");
+    crosses_threads(&unanswered);
+
+    let source = std::error::Error::source(&unanswered)
+        .and_then(|source| source.downcast_ref::<Error>())
+        .map(ToString::to_string);
+    let observed = (unanswered.to_string(), source);
+    let expected = (
+        format!(
+            "the answer to a peer's question was not queued: {}",
+            unanswered.error()
+        ),
+        Some(unanswered.error().to_string()),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the refusal worded with its reason, and the reason as its source: {expected:?} | received {observed:?}"
     );
 }

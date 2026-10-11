@@ -329,7 +329,9 @@ pub trait PeerHandler: Send + Sync {
     ///
     /// On a client made without the option this is never called. A handler that overrides
     /// only this one, on such a client, answers every question through the default
-    /// [`on_request`](Self::on_request), which is `-32601`.
+    /// [`on_request`](Self::on_request), which is `-32601`, except a question past
+    /// [`ClientOptions::max_in_flight_requests`], which that client refuses with `-32000`
+    /// itself.
     ///
     /// ```no_run
     /// # use mango_external_agents::jsonrpc::{JsonRpcError, Responder, ServerRequestOutcome};
@@ -1771,6 +1773,10 @@ impl Drop for Responder {
 
 /// An answer [`Responder::answer`] could not queue, with the responder it was given through.
 ///
+/// It is an error like any other and can be returned as one. The question stays open for as
+/// long as this value is kept, since the responder is inside it: the peer is told nothing
+/// until it is dropped.
+///
 /// ```no_run
 /// # use mango_external_agents::jsonrpc::Unanswered;
 /// # fn example(unanswered: Unanswered) {
@@ -1786,7 +1792,7 @@ pub struct Unanswered {
 }
 
 impl std::fmt::Display for Unanswered {
-    /// The reason, as [`Unanswered::error`] words it.
+    /// That the answer was not queued, and the reason as [`Unanswered::error`] words it.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
