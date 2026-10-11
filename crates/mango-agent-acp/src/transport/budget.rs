@@ -10,11 +10,15 @@ use agent_client_protocol_schema::v1::PROTOCOL_LEVEL_METHOD_NAMES;
 use mango_external_agents::Limits;
 use mango_external_agents::jsonrpc::{ClientOptions, PeerTermination, WireOptions};
 
-/// How many `-32700` replies may wait to be written at once.
+/// How many replies of one kind to input that named no request may wait to be written at once:
+/// `-32700` for a line that is not JSON, and `-32600` for JSON that is not a frame.
 ///
-/// One reply answers one line that was not JSON. An agent that prints a burst of them while it is
-/// not reading gets this many replies and no more; the rest of the burst is dropped unanswered.
-const PARSE_ERROR_REPLIES: usize = 8;
+/// One reply answers one such line, or one such member of a batch. An agent that prints a burst
+/// of them while it is not reading gets this many replies of each kind and no more; the rest of
+/// the burst is dropped unanswered. Both kinds take the same bound because they are the same
+/// thing to this side: noise the agent is owed an error for, held beside the outgoing queue's
+/// bounds, where a small fixed number is what keeps it from growing.
+const UNASKED_ERROR_REPLIES: usize = 8;
 
 /// Which budget a queue passed, and by how much, as
 /// [`Error::LimitExceeded`](mango_external_agents::Error::LimitExceeded) fields.
@@ -174,8 +178,8 @@ fn message_limit(limits: &Limits) -> usize {
 /// - the answers to the `r` questions that may be parked, all withdrawn at once by a cancel: `r`;
 /// - `session/cancel`, and the one repeat a cancel that beat its prompt is owed: 2.
 ///
-/// That is 2`r` + 3. A `$/cancel_request` for a request given up, and a `-32700`, are not in
-/// it: the peer queues those beside its bounds. On top of it the queue takes [`message_limit`]
+/// That is 2`r` + 3. A `$/cancel_request` for a request given up, a `-32700` and a `-32600`
+/// are not in it: the peer queues those beside its bounds. On top of it the queue takes [`message_limit`]
 /// answers to requests the agent makes and this side answers on the spot (`-32601`, or a
 /// question past the cap): the agent sets how many of those there are, so they are what a
 /// frame count that fills is made of. For example, the default limits allow
@@ -259,7 +263,8 @@ fn queued_bytes_limit(outbound_buffer_bytes: usize) -> usize {
 /// "frames queued for the ACP agent".
 ///
 /// ACP is JSON-RPC 2.0, so a batch is read member by member, a line that is not JSON is
-/// answered with `-32700`, and a request this side gives up is followed by `$/cancel_request`.
+/// answered with `-32700`, JSON that is not a frame with `-32600`, and a request this side
+/// gives up is followed by `$/cancel_request`.
 /// The agent's own requests are handed over in wire order with a responder, so their answers
 /// are queued, in order and against the same bounds, with everything else this side writes.
 ///
@@ -270,7 +275,8 @@ pub(crate) fn wire_options(limits: &Limits, outbound_buffer_bytes: usize) -> Wir
         .with_max_outbound_queued_bytes(queued_bytes_limit(outbound_buffer_bytes))
         .with_max_outbound_queued_frames(outgoing_frame_limit(limits))
         .with_batch_decoding()
-        .with_parse_error_replies(PARSE_ERROR_REPLIES)
+        .with_parse_error_replies(UNASKED_ERROR_REPLIES)
+        .with_invalid_request_replies(UNASKED_ERROR_REPLIES)
         .with_cancel_on_abandon(PROTOCOL_LEVEL_METHOD_NAMES.cancel_request)
         .with_request_handoff()
 }
@@ -591,12 +597,21 @@ mod tests {
             wire.max_outbound_queued_frames(),
             wire.decodes_batches(),
             wire.parse_error_replies(),
+            wire.invalid_request_replies(),
             wire.cancel_on_abandon(),
         );
-        let expected = (4_096, 8_192, 17, true, Some(8), Some("$/cancel_request"));
+        let expected = (
+            4_096,
+            8_192,
+            17,
+            true,
+            Some(8),
+            Some(8),
+            Some("$/cancel_request"),
+        );
         assert_eq!(
             received, expected,
-            "expected (frame bytes, queued bytes, queued frames, batches, parse replies, cancel method): {expected:?} | received: {received:?}"
+            "expected (frame bytes, queued bytes, queued frames, batches, parse replies, invalid-request replies, cancel method): {expected:?} | received: {received:?}"
         );
     }
 }
