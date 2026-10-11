@@ -126,6 +126,60 @@ async fn a_non_json_line_mid_turn_is_answered_with_a_parse_error_and_costs_the_t
     );
 }
 
+/// JSON that is not a JSON-RPC frame is owed an answer too: JSON-RPC 2.0 has a server reply
+/// `-32600`, "Invalid Request". An agent that writes a bare number, an empty batch, an empty
+/// object or an object whose `method` is not a string between two updates gets that reply for
+/// each one, under the id the object carried when it carried a usable one and under a null id
+/// otherwise. The line costs the turn nothing: the update after it arrives, the turn completes
+/// and the session takes another.
+#[tokio::test]
+async fn json_that_is_not_a_frame_mid_turn_is_answered_as_an_invalid_request() {
+    let null = serde_json::Value::Null;
+    let cases = [
+        ("a bare number", "42", null.clone()),
+        ("an empty batch", "[]", null.clone()),
+        ("an empty object", "{}", null),
+        (
+            "an object with an id and a method that is not a string",
+            r#"{"id":4,"method":5}"#,
+            serde_json::json!(4),
+        ),
+    ];
+    for (what, line, id) in cases {
+        let (session, launcher) = open(
+            FakeAcpAgent::new()
+                .with_updates(vec![text_chunk("before"), text_chunk("after")])
+                .writing_mid_turn(1, line),
+            permissive(),
+        )
+        .await;
+
+        assert_turn_streams_around_the_stray_line(session.as_ref(), "turn-1").await;
+        let status = session.snapshot().status;
+        assert_eq!(
+            status,
+            SessionStatus::Ready,
+            "expected session status after {what}: Ready | received: {status:?}"
+        );
+        // The fake writes the line on every turn: one reply per line, not one per connection.
+        assert_turn_streams_around_the_stray_line(session.as_ref(), "turn-2").await;
+
+        let replies = replies_reaching_the_agent(&launcher, id.clone(), 2).await;
+        let received: Vec<serde_json::Value> =
+            replies.iter().map(|reply| reply["error"].clone()).collect();
+        let expected = vec![serde_json::json!({ "code": -32600, "message": "Invalid Request" }); 2];
+        assert_eq!(
+            received, expected,
+            "expected the replies to {what} under id {id}, one per line: {expected:?} | received: {replies:?}"
+        );
+
+        session
+            .close(CloseReason::Requested)
+            .await
+            .expect("expected a clean close");
+    }
+}
+
 /// The client advertises neither file access nor terminals (`fs.readTextFile: false`,
 /// `terminal: false`), so an agent that asks anyway is refused with JSON-RPC `-32601` on the id it
 /// used, and the turn it asked during carries on to its end.
