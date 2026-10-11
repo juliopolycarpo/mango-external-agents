@@ -968,21 +968,17 @@ async fn an_agent_that_exits_while_idle_after_its_error_closes_the_session() {
     );
 }
 
-/// What happens today when the `error` member of the answer to a prompt is not an error
-/// object: the connection reads it as the agent's internal error (`-32603`), which this
-/// harness cannot tell from one the agent really sent, so the turn fails as the agent's
-/// refusal and the session is kept.
-///
-/// A known limit, pinned so it changes on purpose: such an answer is not one this side
-/// understood, and the session should end as it does for a result that cannot be read. That
-/// needs the connection to say the body was malformed.
+/// An answer to a prompt whose `error` member is not an error object is not the agent's
+/// refusal: there is no code and no message in it, so it is no more an answer this side
+/// understood than a result that cannot be read. The turn fails with `-32603` and the session
+/// ends: `Closed`, the child reaped, the next turn refused.
 #[tokio::test]
-async fn a_malformed_error_body_on_the_prompt_is_read_as_the_agents_internal_error_and_keeps_the_session()
- {
+async fn a_malformed_error_body_on_the_prompt_ends_the_session() {
     let bodies = [
         serde_json::Value::Null,
         serde_json::json!("boom"),
         serde_json::json!({ "code": "x" }),
+        serde_json::json!([-32000, "no"]),
     ];
     for body in bodies {
         let malformed = body.clone();
@@ -994,6 +990,7 @@ async fn a_malformed_error_body_on_the_prompt_is_read_as_the_agents_internal_err
             _ => Vec::new(),
         });
         let (session, launcher) = open_under(peer.process(), Limits::default()).await;
+        let mut lifecycle = session.subscribe();
         let mut turn = session
             .start_turn(TurnRequest::new("turn-1", "try"))
             .await
@@ -1010,13 +1007,22 @@ async fn a_malformed_error_body_on_the_prompt_is_read_as_the_agents_internal_err
         };
         let received = (
             error.vendor_code.as_deref(),
-            session.snapshot().status,
+            status_once_settled(&mut lifecycle).await,
             launcher.live_children(),
         );
-        let expected = (Some("-32603"), SessionStatus::Ready, 1);
+        let expected = (Some("-32603"), SessionStatus::Closed, 0);
         assert_eq!(
             received, expected,
             "expected (code, session status, children) after error {body}: {expected:?} | received: {received:?}"
+        );
+        let next = refusal(
+            session
+                .start_turn(TurnRequest::new("turn-2", "again"))
+                .await,
+        );
+        assert!(
+            matches!(next.cause(), Error::Closed { subject: "session" }),
+            "expected the next turn after error {body}: Closed {{ subject: \"session\" }} | received: {next:?}"
         );
     }
 }
