@@ -174,6 +174,92 @@ async fn an_agent_death_under_the_prompt_it_just_read_is_never_reported_as_a_can
     }
 }
 
+/// A launcher whose child closes its stdout right behind the first line containing `after`:
+/// that line is read whole, and the next read is the end of the stream.
+///
+/// Models an agent that writes its last answer and exits, with the answer still in the pipe.
+#[derive(Clone)]
+struct LeavingLauncher {
+    inner: FakeLauncher,
+    after: &'static str,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncher for LeavingLauncher {
+    async fn spawn(
+        &self,
+        spec: mango_external_agents::LaunchSpec,
+    ) -> mango_external_agents::Result<ManagedProcess> {
+        let mut process = self.inner.spawn(spec).await?;
+        process.stdout = Box::new(LeavingStdout {
+            inner: process.stdout,
+            after: self.after,
+            left: false,
+        });
+        Ok(process)
+    }
+}
+
+struct LeavingStdout {
+    inner: Box<dyn mango_external_agents::process::ByteSource>,
+    after: &'static str,
+    left: bool,
+}
+
+#[async_trait::async_trait]
+impl mango_external_agents::process::ByteSource for LeavingStdout {
+    async fn next_chunk(&mut self) -> mango_external_agents::Result<Option<Vec<u8>>> {
+        if self.left {
+            return Ok(None);
+        }
+        let chunk = self.inner.next_chunk().await?;
+        self.left = chunk
+            .as_deref()
+            .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains(self.after));
+        Ok(chunk)
+    }
+}
+
+/// An agent that answers its prompt and exits at once leaves the prompt task two things to see
+/// at the same moment: the answer and the end of the connection. Whichever it looks at first,
+/// the agent did answer, so the turn completes; it is not reported as a link that closed under
+/// the prompt. Repeated on a multi-thread runtime, where both orders show up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_that_answers_and_exits_at_once_completes_the_turn() {
+    for round in 0..DEATH_ROUNDS {
+        let fake = FakeLauncher::new();
+        fake.push(FakeAcpAgent::new().with_updates(Vec::new()).process());
+        let launcher = LeavingLauncher {
+            inner: fake,
+            after: "stopReason",
+        };
+        let host = HostContext::builder()
+            .launcher(Arc::new(launcher))
+            .cwd(std::env::temp_dir())
+            .client_info("mea-tests", "0.1.0")
+            .build()
+            .expect("expected a host");
+        let session = AcpHarness::new(profile())
+            .open_session(
+                &host,
+                OpenSession::new("chat-1").with_configuration(permissive()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("expected a session | received: {error:?}"));
+        let mut turn = session
+            .start_turn(TurnRequest::new("turn-1", "say nothing"))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("expected a turn in round {round} | received: {error:?}")
+            });
+        assert_events(
+            &format!("the turn in round {round}"),
+            &drain(&mut turn).await,
+            &["TurnStarted", "Completed"],
+        );
+    }
+}
+
 /// A request that is not a prompt waits on its own reply alone, with nothing racing it, so an
 /// agent that died under `session/list` fails the call as a closed link naming that request, with
 /// the agent's stderr, and never as the agent's own refusal. The reply is failed at EOF before

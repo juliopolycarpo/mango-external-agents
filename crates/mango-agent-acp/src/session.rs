@@ -1281,7 +1281,13 @@ impl Session for AcpSession {
                         None
                     }
                 },
-                () = connection_ended.cancelled() => None,
+                // The connection reports its end only after it has settled every reply, and
+                // this `select!` picks among ready arms at random: an agent that answers and
+                // exits at once has both ready. The answer is looked at once more, so a prompt
+                // the agent did answer is never reported as a closed link.
+                () = connection_ended.cancelled() => {
+                    tokio::time::timeout(std::time::Duration::ZERO, &mut prompt).await.ok()
+                },
             };
             let cleanup_error = if outcome.is_none() || matches!(outcome, Some(Err(_))) {
                 connection.begin_shutdown(CancelReason::Shutdown);
