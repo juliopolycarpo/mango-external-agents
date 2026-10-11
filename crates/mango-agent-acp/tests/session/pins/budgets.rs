@@ -316,14 +316,15 @@ async fn replies_queued_behind_a_stalled_agent_fail_the_turn_with_the_outgoing_b
     let Some(EventKind::Error { error }) = events.last() else {
         unreachable!("the events above end in an error");
     };
-    let prefix = format!("expected at most {OUTBOUND} bytes queued for the ACP agent, received ");
+    let queued = 2 * OUTBOUND;
+    let prefix = format!("expected at most {queued} bytes queued for the ACP agent, received ");
     let received: Option<usize> = error
         .message
         .strip_prefix(&prefix)
         .and_then(|count| count.parse().ok());
     assert!(
-        received.is_some_and(|count| count > OUTBOUND),
-        "expected a message {prefix:?} followed by a count over {OUTBOUND} | received: {:?}",
+        received.is_some_and(|count| count > queued),
+        "expected a message {prefix:?} followed by a count over {queued} | received: {:?}",
         error.message
     );
 
