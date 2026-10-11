@@ -975,6 +975,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    mod stop_bound;
+
     /// Selects what the re-executed test binary does when it stands in for a vendor CLI.
     const FIXTURE_MODE: &str = "MEA_LAUNCHER_FIXTURE";
 
@@ -1017,6 +1019,29 @@ mod tests {
             },
             "interrupt-ready" => {
                 use std::io::Write as _;
+                println!("MEA-READY");
+                std::io::stdout().flush().expect("flush ready marker");
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            // A leader and a helper in one process group, both running until something ends them.
+            // The helper inherits the leader's signal mask, so the stop-bound tests give both the
+            // same disposition. Ready only once the helper has been started.
+            #[cfg(unix)]
+            "ready-with-helper" => {
+                use std::io::Write as _;
+                let executable =
+                    std::env::current_exe().expect("expected the test binary's own path");
+                let helper = std::process::Command::new(executable)
+                    .args(["launcher_fixture_child", "--nocapture", "--test-threads=1"])
+                    .env(FIXTURE_MODE, "forever")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("expected the helper to start");
+                // Never waited on: the launcher's stop ends the group, and this leader is killed with it.
+                std::mem::forget(helper);
                 println!("MEA-READY");
                 std::io::stdout().flush().expect("flush ready marker");
                 loop {
@@ -1685,7 +1710,15 @@ mod tests {
     /// Builds the leader-and-helper shape after its Job has been created by the launcher.
     #[cfg(windows)]
     async fn windows_helper_child() -> (crate::process::ManagedProcess, WindowsHelperFixture) {
-        let launcher = TokioLauncher::new().with_kill_grace(Duration::from_millis(300));
+        windows_helper_child_under(Duration::from_millis(300)).await
+    }
+
+    /// The same shape under a launcher whose `kill_grace` is `grace`.
+    #[cfg(windows)]
+    async fn windows_helper_child_under(
+        grace: Duration,
+    ) -> (crate::process::ManagedProcess, WindowsHelperFixture) {
+        let launcher = TokioLauncher::new().with_kill_grace(grace);
         let mut fixture_files = WindowsHelperFixture::new();
         let mut spec = fixture("leaves-a-helper");
         fixture_files.add_to(&mut spec);
