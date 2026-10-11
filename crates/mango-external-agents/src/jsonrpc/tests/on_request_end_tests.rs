@@ -13,6 +13,10 @@ use std::sync::{Mutex as StdMutex, PoisonError};
 /// named `block` parks too, to fill the queue behind it.
 struct WaitingHandler {
     asked: AtomicUsize,
+    /// How many `block` notifications the handler is inside.
+    blocked: AtomicUsize,
+    /// Holds the answer of a question until a test lets it go.
+    answer_gate: tokio::sync::Semaphore,
     dropped: AtomicUsize,
     terminations: StdMutex<Vec<PeerTermination>>,
     terminated: Notify,
@@ -30,6 +34,7 @@ impl Drop for CountOnDrop<'_> {
 impl PeerHandler for WaitingHandler {
     async fn on_notification(&self, method: String, _params: Value) {
         if method == "block" {
+            self.blocked.fetch_add(1, Ordering::AcqRel);
             std::future::pending::<()>().await;
         }
     }
@@ -42,8 +47,12 @@ impl PeerHandler for WaitingHandler {
     ) -> ServerRequestOutcome {
         let _dropped = CountOnDrop(&self.dropped);
         self.asked.fetch_add(1, Ordering::AcqRel);
-        std::future::pending::<()>().await;
-        ServerRequestOutcome::Answer(Value::Null)
+        self.answer_gate
+            .acquire()
+            .await
+            .expect("expected the answer gate to stay open for the whole test")
+            .forget();
+        ServerRequestOutcome::Answer(json!("real"))
     }
 
     async fn on_terminated(&self, termination: PeerTermination) {
@@ -55,11 +64,12 @@ impl PeerHandler for WaitingHandler {
     }
 }
 
-/// A receiver that reports the peer's output closed when told to, while the link behind it
-/// goes on taking writes: a peer that exited and a pipe that has not yet noticed.
+/// A receiver that reports the peer's output closed, or failed, when told to, while the link
+/// behind it goes on taking writes: a peer that exited and a pipe that has not yet noticed.
 struct ExitableReceiver {
     inner: Box<dyn crate::link::LinkReceiver>,
     exit: Arc<Notify>,
+    fail: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -67,6 +77,10 @@ impl crate::link::LinkReceiver for ExitableReceiver {
     async fn recv(&mut self) -> crate::Result<Option<String>> {
         tokio::select! {
             () = self.exit.notified() => Ok(None),
+            () = self.fail.notified() => Err(Error::Link {
+                peer: String::from("fake agent"),
+                message: String::from("the pipe broke"),
+            }),
             message = self.inner.recv() => message,
         }
     }
@@ -77,6 +91,7 @@ impl crate::link::LinkReceiver for ExitableReceiver {
 struct Asked {
     link: ScriptedLink,
     exit: Arc<Notify>,
+    fail: Arc<Notify>,
     gate: Arc<tokio::sync::Semaphore>,
     handler: Arc<WaitingHandler>,
     client: Arc<Client>,
@@ -86,13 +101,17 @@ async fn asked(options: ClientOptions, wire: WireOptions) -> Asked {
     let link = ScriptedLink::new();
     let (sender, receiver) = link.clone().into_link().split();
     let exit = Arc::new(Notify::new());
+    let fail = Arc::new(Notify::new());
     let receiver = Box::new(ExitableReceiver {
         inner: receiver,
         exit: Arc::clone(&exit),
+        fail: Arc::clone(&fail),
     });
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let handler = Arc::new(WaitingHandler {
         asked: AtomicUsize::new(0),
+        blocked: AtomicUsize::new(0),
+        answer_gate: tokio::sync::Semaphore::new(0),
         dropped: AtomicUsize::new(0),
         terminations: StdMutex::new(Vec::new()),
         terminated: Notify::new(),
@@ -118,6 +137,7 @@ async fn asked(options: ClientOptions, wire: WireOptions) -> Asked {
     Asked {
         link,
         exit,
+        fail,
         gate,
         handler,
         client,
@@ -252,10 +272,11 @@ async fn an_inbound_overflow_drops_the_call_and_the_peer_is_refused() {
     asked.client.close().await.expect("expected a clean close");
 }
 
-/// This side passing its outbound budget drops the call, and the refusal is not written: the
-/// link is unusable from that moment.
+/// This side passing its outbound budget with the writer held behind a write the peer never
+/// reads drops the call, and the refusal waits behind that write for the whole grace and is cut:
+/// nothing is written for it.
 #[tokio::test]
-async fn an_outbound_overflow_drops_the_call_and_nothing_is_written_for_it() {
+async fn an_outbound_overflow_behind_a_held_writer_cuts_the_refusal_at_the_grace() {
     let asked = asked(options(), limits(usize::MAX, usize::MAX, 2)).await;
     let held = asked
         .client
@@ -307,4 +328,92 @@ async fn dropping_the_client_drops_the_call_and_writes_nothing() {
         "expected nothing written and the handler told nothing: (0, 0) | received {observed:?}"
     );
     drop(gate);
+}
+
+/// A read that fails drops the call, and the refusal goes out over a link whose write is as
+/// good as it was. The handler is told the link failed.
+#[tokio::test]
+async fn a_failed_read_drops_the_call_and_the_peer_is_refused_while_the_link_takes_the_write() {
+    let asked = asked(options(), WireOptions::new()).await;
+
+    asked.fail.notify_one();
+    within("the end", asked.handler.terminated.notified()).await;
+    let observed = asked.after_the_end().await;
+    let failed = matches!(
+        asked
+            .handler
+            .terminations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first(),
+        Some(PeerTermination::LinkFailed(_))
+    );
+    assert_eq!(
+        (observed.clone(), failed),
+        ((1, refused_as_closed(), 1), true),
+        "expected the call dropped, the peer refused with -32000 and the handler told once that the link failed: ((1, {:?}, 1), true) | received ({observed:?}, {failed})",
+        refused_as_closed()
+    );
+    asked.client.close().await.expect("expected a clean close");
+}
+
+/// A call that returns while the notifications already read are being drained, before the flag
+/// rises, answers the peer with what it returned, and the refusal is not sent over it.
+#[tokio::test(start_paused = true)]
+async fn a_call_that_returns_while_the_notifications_are_drained_answers_the_peer_itself() {
+    let asked = asked(options(), WireOptions::new()).await;
+    asked
+        .link
+        .push_line(r#"{"jsonrpc":"2.0","method":"block","params":{}}"#);
+    until("the worker to be inside the notification", || {
+        asked.handler.blocked.load(Ordering::Acquire) == 1
+    })
+    .await;
+
+    // The drain waits on the blocked notification for the grace; the question is answered in it.
+    asked.exit.notify_one();
+    asked.handler.answer_gate.add_permits(1);
+    within("the end", asked.handler.terminated.notified()).await;
+    let observed = asked.after_the_end().await;
+    assert_eq!(
+        observed,
+        (1, vec![String::from("\"1\":null")], 1),
+        "expected the call to have returned and the peer answered with a result, not refused: (1, [\"1\":null], 1) | received {observed:?}"
+    );
+    asked.client.close().await.expect("expected a clean close");
+}
+
+/// This side passing its outbound budget makes the link unusable from that moment, so the
+/// refusal is not written even when the writer is free to write it: the held frame goes out
+/// and the refusal does not follow.
+#[tokio::test]
+async fn an_outbound_overflow_makes_the_link_unusable_so_the_refusal_is_not_written() {
+    let asked = asked(options(), limits(usize::MAX, usize::MAX, 2)).await;
+    let held = asked
+        .client
+        .submit_notification("hold", json!({}))
+        .expect("expected the held frame queued");
+    until("the writer to take the held frame", || held.started()).await;
+    let _queued = asked
+        .client
+        .submit_notification("queued", json!({}))
+        .expect("expected the second frame queued");
+    let refused = asked.client.submit_notification("one-too-many", json!({}));
+    // The writer is free from here, and whatever it writes next is judged by the link.
+    asked.gate.add_permits(1);
+
+    within("the end", asked.handler.terminated.notified()).await;
+    let (dropped, wire, told) = asked.after_the_end().await;
+    let observed = (
+        refused.is_err(),
+        dropped,
+        wire.contains(&refused_as_closed()[0]),
+        told,
+    );
+    assert_eq!(
+        observed,
+        (true, 1, false, 1),
+        "expected the third frame refused, the call dropped, no refusal written for the question and the handler told once: (true, 1, false, 1) | received {observed:?} with {wire:?}"
+    );
+    asked.client.close().await.expect("expected a clean close");
 }

@@ -439,21 +439,28 @@ pub trait PeerHandler: Send + Sync {
     /// # When the connection ends
     ///
     /// Without that option, at most [`ClientOptions::max_in_flight_requests`] calls are out at
-    /// once, each on a task of its own, and every end of the connection drops the call at the
-    /// await it is parked at. None is run to its end or waited for, and
-    /// [`Client::hold_cancellation`] holds nothing in one. The peer is refused with `-32000`,
-    /// "the connection was closed", over the link, so long as the link takes the write:
+    /// once, each on a task of its own. An end of the connection raises the shutdown flag, and
+    /// from then on the call is dropped at the await it is parked at: it is not run to its end
+    /// or waited for, and [`Client::hold_cancellation`] holds nothing in one. The peer is
+    /// refused with `-32000`, a message that the connection was closed, over the link, so long
+    /// as the link takes the write. The ends differ in when the flag rises, and in the link:
     ///
-    /// - [`Client::close`], the peer's exit, a failed link, the peer passing an inbound budget
-    ///   and this side passing its outbound budget raise the shutdown flag first. The call is
-    ///   dropped, and the refusal is waited for, for up to [`ClientOptions::shutdown_timeout`],
-    ///   before the link is closed and, for an end that is not a close, before
+    /// - [`Client::close`] and the peer passing an inbound budget raise it at once.
+    /// - The peer's exit, a failed link and this side passing its outbound budget first let the
+    ///   notifications already read reach the handler, for up to
+    ///   [`ClientOptions::shutdown_timeout`], and raise it then. A call that returns before
+    ///   that answers the peer with what it returned.
+    /// - Once it is raised, the refusal is waited for, for up to `shutdown_timeout`, before the
+    ///   link is closed and, for an end that is not a close, before
     ///   [`on_terminated`](Self::on_terminated) is made. A task still writing when that runs
     ///   out is cut.
-    /// - A link that failed, one the peer's exit has closed to writes, and one the outbound
-    ///   budget has made unusable take no refusal, and none is written. One whose writer is
-    ///   held behind a write the peer never reads outlasts the grace, and the task is cut.
-    /// - Dropping the [`Client`] cuts the call at once and writes nothing.
+    /// - A link whose write failed, one the peer's exit has closed to writes, and one the
+    ///   outbound budget has made unusable take no refusal, and none is written. A link whose
+    ///   read failed is still written to, and takes it. One whose writer is held behind a
+    ///   write the peer never reads outlasts the grace, and the task is cut.
+    /// - Dropping the [`Client`] aborts the calls without waiting for them, and writes no
+    ///   refusal of its own. One that another thread had already begun to write may still go
+    ///   out.
     async fn on_request(
         &self,
         _method: String,
@@ -2990,14 +2997,17 @@ impl Client {
     /// so the stretch behind it is never begun. Decide the end while the handler is parked
     /// before its hold, let it go on, and see what it did and did not get to.
     ///
-    /// The connection stays up and nothing is cancelled here, but the worker begins no more
-    /// work, and a call that asks for a hold parks at the ask. The client is then fit only to
-    /// be closed, which cancels the parked call. Returns whether a hold is out that an end
-    /// would wait for: `false` when the call that is asking holds nothing, or is the caller.
+    /// The connection is not ended and nothing is cancelled here, but the worker has been told
+    /// to begin no more work: it stops at the next item it takes from its queue, and a frame
+    /// the peer sends after that ends the connection as inbound backpressure. A call that
+    /// asks for a hold parks at the ask and never returns. So decide it when the test is about
+    /// to be over, and close the client to clean up, which cancels the parked call. Returns
+    /// whether a hold is out that an end would wait for: `false` when nothing is held, and
+    /// when the caller is the call that holds it.
     ///
     /// ```no_run
     /// # async fn example(client: &mango_external_agents::jsonrpc::Client) {
-    /// // Before the handler's call asks for its hold: its next hold request is refused.
+    /// // Before the handler's call asks for its hold: that request will never return.
     /// let held = client.decide_cancellation();
     /// assert!(!held, "no stretch is being held yet");
     /// client.close().await.expect("expected a clean close");

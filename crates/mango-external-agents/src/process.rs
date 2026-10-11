@@ -133,9 +133,12 @@ pub trait ByteSink: Send {
     ///
     /// Any other error says that no byte was accepted and that the sink is as usable as it
     /// was: a sink already closed on this side, a refusal for size. A JSON-RPC client over
-    /// this sink fails the frame it was writing with that error and goes on writing, where an
-    /// [`Error::Link`] ends the connection, since half a frame may be on the wire. An
-    /// implementation that cannot tell whether bytes were accepted reports [`Error::Link`].
+    /// this sink fails the request or notification it was writing with that error and goes on
+    /// writing, where an [`Error::Link`] ends the connection, since half a frame may be on the
+    /// wire. An answer to one of the peer's questions that the sink refuses cannot be said
+    /// again, and ends the connection whatever the error, unless it was refused for its size,
+    /// which is replaced by a smaller refusal first. An implementation that cannot tell
+    /// whether bytes were accepted reports [`Error::Link`].
     ///
     /// A write that is abandoned while it is in progress, by a deadline or a dropped caller,
     /// is not an error this method returns. The client treats the sink as unusable from then

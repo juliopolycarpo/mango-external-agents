@@ -2,7 +2,7 @@
 //! peer asked: the ends of a connection that cancel the call wait for the hold as they do for a
 //! notification call's.
 
-use super::outbox_tests::{eventually, until, within};
+use super::outbox_tests::{eventually, until};
 use super::*;
 use crate::jsonrpc::{CancellationHold, Responder, WireOptions};
 use std::sync::atomic::AtomicUsize;
@@ -383,12 +383,6 @@ async fn a_hold_kept_past_its_hand_off_holds_nothing_once_the_call_has_returned(
         },
     );
     link.push_line(ask());
-    within("the answer written", async {
-        while client.state.holds.out.load(Ordering::SeqCst) == 0 && link.sent().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
     until("the call to have returned and answered", || {
         !link.sent().is_empty()
     })
@@ -437,11 +431,110 @@ async fn a_close_made_from_inside_a_held_hand_off_does_not_wait_for_it() {
         .await
         .expect("expected a clean close");
 
-    let observed = (began.elapsed() < GRACE, handler.progress().0);
+    let observed = (began.elapsed() < GRACE, handler.progress());
     assert_eq!(
         observed,
-        (true, 1),
-        "expected a close made from inside the hand-off to take less than the grace: (true, 1) | received {observed:?} after {:?}",
+        (true, (1, 1, 0)),
+        "expected a close made from inside the hand-off to take less than the grace, and to end the call at its await before the stretch was committed: (true, (1, 1, 0)) | received {observed:?} after {:?}",
         began.elapsed()
+    );
+}
+
+/// A handler that only knows `on_request`, which the default `on_request_handoff` asks inline,
+/// on the task that runs the notifications.
+struct OnRequestHolder {
+    client: OnceLock<Weak<Client>>,
+    holding: StdMutex<Vec<bool>>,
+    inside: tokio::sync::Semaphore,
+    committed: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl PeerHandler for OnRequestHolder {
+    async fn on_notification(&self, _method: String, _params: Value) {}
+
+    async fn on_request(
+        &self,
+        _method: String,
+        _params: Value,
+        _id: RequestId,
+    ) -> ServerRequestOutcome {
+        let client = self
+            .client
+            .get()
+            .and_then(Weak::upgrade)
+            .expect("expected the client to outlive the call's first step");
+        let hold = client.hold_cancellation().await;
+        drop(client);
+        self.holding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(hold.is_holding());
+        HandOffHolder::at_gate(&self.inside).await;
+        self.committed.fetch_add(1, Ordering::AcqRel);
+        drop(hold);
+        ServerRequestOutcome::Answer(Value::Null)
+    }
+}
+
+/// The `on_request` that the default hand-off asks is part of the hand-off call, so a hold
+/// asked for in it is a hold: a close waits for the stretch.
+#[tokio::test(start_paused = true)]
+async fn a_hold_asked_for_in_the_on_request_the_default_hand_off_asks_is_a_hold() {
+    let link = ScriptedLink::new();
+    let handler = Arc::new(OnRequestHolder {
+        client: OnceLock::new(),
+        holding: StdMutex::new(Vec::new()),
+        inside: tokio::sync::Semaphore::new(0),
+        committed: AtomicUsize::new(0),
+    });
+    let client = Arc::new(Client::connect_with(
+        link.clone().into_link(),
+        Arc::clone(&handler) as Arc<dyn PeerHandler>,
+        ClientOptions::new("ACP agent"),
+        WireOptions::new().with_request_handoff(),
+    ));
+    let _ = handler.client.set(Arc::downgrade(&client));
+    link.push_line(ask());
+    until("the handler to be inside its stretch", || {
+        !handler
+            .holding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    })
+    .await;
+
+    let began = tokio::time::Instant::now();
+    let closing = spawn_close(&client);
+    tokio::time::sleep(GRACE / 2).await;
+    let waiting = (
+        closing.is_finished(),
+        HandOffHolder::count(&handler.committed),
+    );
+    assert_eq!(
+        waiting,
+        (false, 0),
+        "expected the close waiting on the stretch asked inside on_request: (false, 0) | received {waiting:?}"
+    );
+    handler.inside.add_permits(1);
+    eventually("the close", closing)
+        .await
+        .expect("expected the close task to finish")
+        .expect("expected a clean close");
+    let holding = handler
+        .holding
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let observed = (
+        began.elapsed(),
+        holding,
+        HandOffHolder::count(&handler.committed),
+    );
+    assert_eq!(
+        observed,
+        (GRACE / 2, vec![true], 1),
+        "expected the close over when the stretch was committed, the hold granted: (100ms, [true], 1) | received {observed:?}"
     );
 }

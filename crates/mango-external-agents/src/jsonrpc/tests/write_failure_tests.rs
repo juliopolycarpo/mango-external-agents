@@ -351,3 +351,72 @@ async fn an_outbound_overflow_that_lands_on_a_close_is_not_reported_as_a_termina
         "expected the overflow refused, the reader to let it go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
     );
 }
+
+/// A receiver whose read fails when told to.
+struct FailingReceiver {
+    fail: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::link::LinkReceiver for FailingReceiver {
+    async fn recv(&mut self) -> crate::Result<Option<String>> {
+        self.fail.notified().await;
+        Err(Error::Link {
+            peer: String::from("fake agent"),
+            message: String::from("the pipe broke"),
+        })
+    }
+}
+
+/// The same for a read that fails: it ends through the same function, and a close that
+/// overtakes it while it is recorded owns the end.
+#[tokio::test]
+async fn a_read_failure_that_a_close_overtakes_while_it_is_recorded_is_not_reported() {
+    let (say, mut said) = tokio::sync::mpsc::unbounded_channel();
+    let fail = Arc::new(tokio::sync::Notify::new());
+    let (sender, _unused) = ScriptedLink::new().into_link().split();
+    let client = Client::connect(
+        crate::link::Link::new(
+            sender,
+            Box::new(FailingReceiver {
+                fail: Arc::clone(&fail),
+            }),
+        ),
+        Arc::new(SayingHandler { said: say.clone() }) as Arc<dyn PeerHandler>,
+        options(),
+    );
+    *client
+        .state
+        .after_write_failure_ignored
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let _ = say.send("let go by the reader");
+    }));
+    {
+        let state = Arc::clone(&client.state);
+        *client
+            .state
+            .before_link_failure_recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            // What the first step of a close does.
+            state.ended_with(ConnectionEnd::Closed, state.closed_error());
+        }));
+    }
+
+    fail.notify_one();
+    let first = within("what the reader did with the failure", said.recv()).await;
+    client.close().await.expect("expected a clean close");
+    let later = said.try_recv().ok();
+
+    let observed = (first, later, client.ended());
+    let expected = (
+        Some("let go by the reader"),
+        None,
+        Some(ConnectionEnd::Closed),
+    );
+    assert_eq!(
+        observed, expected,
+        "expected the reader to let the read failure go under the close on record, and the handler told nothing: {expected:?} | received {observed:?}"
+    );
+}
