@@ -152,7 +152,9 @@ a failed link. A frame queued with `submit_*` is refused alone in the same way w
 than the queue could hold even when empty, which is every such frame under a queue bound of zero.
 Passing the bounds on queued frames or queued bytes with what the queue already holds, which
 counts the frame being written, means the peer stopped reading: the connection ends with `PeerTermination::OutboundBackpressure` and the call
-receives the same `LimitExceeded`. Which of the three bounds was passed is read by type, not from
+receives the same `LimitExceeded`. When a close is already on record the close owns the end
+instead: the call alone receives the `LimitExceeded`, the link is not made unusable, the handler
+is told nothing, and what was queued before the close is still written before the link goes. Which of the three bounds was passed is read by type, not from
 the error's text: `OutboundBound::exceeded_by(&error)` for the refusal a caller receives and
 `PeerTermination::outbound_bound()` for the end the handler is told of, each `None` for anything
 else; `is_link_shutdown_timeout(&error)` says whether a `Timeout` is `Client::close` giving up.
@@ -202,11 +204,31 @@ close put on record first: when the peer's exit, a failed link or a budget passe
 is found with a close already on record, `Client::ended` reports `Closed` and the handler is told
 nothing. A close given up after it recorded its end (its future dropped, a timeout of the caller's
 own, or made from inside the handler's own call, which it cuts short) still owns the end: the
-handler is told nothing, the reader fails no pending call and the link stays open, and calling
-`close` again, or dropping the client, finishes the teardown. A `Client::close` that arrives
-while a connection is ending under this side waits for that call to return, within the bound of a
-close, where it used to take the reader down under it. Dropping the `Client` cannot wait: the
-call in progress is cancelled whatever it holds, and `on_terminated` may not be made at all.
+handler is told nothing and the reader fails no pending call, and calling `close` again, or
+dropping the client, finishes the teardown. What the cut leaves of the link depends on where it
+came. Before the link was closed (the close was failing the pending calls, stopping the handler's
+task, waiting for the answers it owes the peer, or waiting for the queue and the link) the link is
+still open; after it, while the close waited for the reader, the link is closed. Either way a
+caller can write nothing afterwards: `submit_*` is refused, `request` returns `Error::Closed` and
+`notify` returns `Ok(())` having written nothing. The link is made unusable by a cut that came
+before it was closed (unless another close is still in progress), which is what keeps a frame
+already queued behind a write that did not finish from being written. A `Client::close` that
+arrives while a connection is ending under this side waits for that call to return, within the
+bound of a close, where it used to take the reader down under it. Dropping the `Client` cannot
+wait: the call in progress is cancelled whatever it holds, and `on_terminated` may not be made at
+all.
+
+A second `close` made while the first is still held, kept and never polled again, ends within its
+own bound all the same. If the first is parked inside the closing of the link it holds the sender,
+and the second returns the link's `Timeout` after `shutdown_timeout` without having closed it;
+dropping the first lets a later close finish. If it is parked in its wait for `on_terminated` it
+holds the reader, and the second, which has closed the link by then, returns a `Timeout` that names
+the reader (not `is_link_shutdown_timeout`) when its own bound of twice `shutdown_timeout` runs
+out. Dropping the held first close takes the reader down mid-call, so `on_terminated` does not
+return. The same holds for a caller that wraps `close` in a timeout shorter than twice
+`shutdown_timeout` on a connection that ended under this side: such a caller can cut
+`on_terminated` and should wrap `close` in nothing shorter than that bound if it relies on the
+call finishing.
 
 Things a client does on the wire only when its `WireOptions` ask for them, each off by
 default. `with_batch_decoding` reads a line that is a JSON array as a batch: its members are
