@@ -35,6 +35,10 @@ required-features = ["testing"]
 # ACP v1 only: `unstable_protocol_v2` and the other draft features stay off, so the wire this
 # crate speaks is the one agentclientprotocol.com documents as stable.
 agent-client-protocol = { version = "3.3.0", default-features = false }
+# The ACP wire types, named directly rather than through the SDK's re-export, at the exact version
+# the SDK pins. Nothing beyond the bare types is needed here: no `schemars`, no `unstable_*`. The
+# SDK still turns the schema's `tracing` feature on for the whole graph until it is removed.
+agent-client-protocol-schema = { version = "=1.11.0", default-features = false }
 async-trait = "0.1.92"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }

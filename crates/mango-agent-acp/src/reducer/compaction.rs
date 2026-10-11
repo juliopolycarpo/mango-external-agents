@@ -38,8 +38,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Instant;
 
-use agent_client_protocol::schema::MaybeUndefined;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol_schema::MaybeUndefined;
+use agent_client_protocol_schema::v1::{
     CompactionId, CompactionStatus, CompactionSummaryChunk, CompactionUpdate, ContentBlock,
 };
 use mango_external_agents::ActivityContent;
@@ -74,7 +74,7 @@ pub const COMPACTION_TITLE: &str = "Compacting the conversation";
 /// # Example
 ///
 /// ```
-/// use agent_client_protocol::schema::v1::CompactionId;
+/// use agent_client_protocol_schema::v1::CompactionId;
 /// use mango_agent_acp::reducer::compaction_call_id;
 ///
 /// assert_eq!(compaction_call_id(&CompactionId::new("c1")), "acp:compaction:c1");

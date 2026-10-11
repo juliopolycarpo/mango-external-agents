@@ -9,7 +9,7 @@
 
 use std::time::SystemTime;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol_schema::v1::{
     PermissionOption as AcpPermissionOption, PermissionOptionKind as AcpPermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, ToolCallUpdate,
@@ -141,7 +141,7 @@ pub fn cancelled() -> RequestPermissionResponse {
 #[cfg(test)]
 mod tests {
     use super::{cancelled, effect, request_from, scope, selected};
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol_schema::v1::{
         PermissionOptionKind as AcpPermissionOptionKind, RequestPermissionOutcome,
         RequestPermissionRequest,
     };

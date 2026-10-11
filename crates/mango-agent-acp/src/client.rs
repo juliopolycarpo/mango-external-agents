@@ -31,11 +31,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
+use agent_client_protocol_schema::v1::{
     CancelNotification, RequestPermissionRequest, RequestPermissionResponse, SessionNotification,
     SessionUpdate,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use mango_external_agents::approval::ApprovalDeadline;
 use mango_external_agents::configuration::{
     Configuration, ConfigurationCatalog, ConfigurationState,
@@ -160,8 +160,8 @@ pub(crate) struct TurnHandle {
 /// The ACP session a connection is bound to, and the one a failed load abandoned.
 #[derive(Debug, Default)]
 struct NativeBinding {
-    bound: Option<agent_client_protocol::schema::v1::SessionId>,
-    abandoned: Option<agent_client_protocol::schema::v1::SessionId>,
+    bound: Option<agent_client_protocol_schema::v1::SessionId>,
+    abandoned: Option<agent_client_protocol_schema::v1::SessionId>,
 }
 
 /// The option id a withdrawal reports, for a decision nobody chose.
@@ -245,7 +245,7 @@ impl PendingApproval {
         response: RequestPermissionResponse,
         option_id: String,
         source: DecisionSource,
-    ) -> agent_client_protocol::Result<()> {
+    ) -> agent_client_protocol_schema::v1::Result<()> {
         let decision = self
             .question
             .options
@@ -386,7 +386,7 @@ impl SessionState {
     }
 
     /// Binds this connection to one ACP session: the one being loaded, or the one opened.
-    pub(crate) fn bind_native_session(&self, id: agent_client_protocol::schema::v1::SessionId) {
+    pub(crate) fn bind_native_session(&self, id: agent_client_protocol_schema::v1::SessionId) {
         self.lock_native_session().bound = Some(id);
     }
 
@@ -432,7 +432,7 @@ impl SessionState {
     /// `session/new` is still in flight. Dropping them would lose that session state. Nothing
     /// before the bind can reach a turn or a host: no turn exists yet, so an update produces only
     /// session facts and a permission request is answered `Cancelled`.
-    fn serves(&self, id: &agent_client_protocol::schema::v1::SessionId) -> bool {
+    fn serves(&self, id: &agent_client_protocol_schema::v1::SessionId) -> bool {
         let binding = self.lock_native_session();
         match &binding.bound {
             Some(bound) => bound == id,
@@ -847,7 +847,7 @@ impl SessionState {
         &self,
         id: String,
         pending: PendingApproval,
-    ) -> agent_client_protocol::Result<bool> {
+    ) -> agent_client_protocol_schema::v1::Result<bool> {
         let cancelling = self.lock_cancel_reason();
         if cancelling.is_some() {
             drop(cancelling);
@@ -890,7 +890,7 @@ impl SessionState {
         id: &str,
         requested: RequestPermissionResponse,
         source: DecisionSource,
-    ) -> agent_client_protocol::Result<Answered> {
+    ) -> agent_client_protocol_schema::v1::Result<Answered> {
         let mut cancelling = self.lock_cancel_reason();
         let pending = self.lock_pending().remove(id);
         let Some(mut pending) = pending else {
@@ -902,7 +902,7 @@ impl SessionState {
             return Ok(Answered::AlreadyResolved);
         }
         if !pending.deadline.is_elapsed() {
-            if let agent_client_protocol::schema::v1::RequestPermissionOutcome::Selected(outcome) =
+            if let agent_client_protocol_schema::v1::RequestPermissionOutcome::Selected(outcome) =
                 &requested.outcome
             {
                 let option_id = outcome.option_id.to_string();
@@ -945,7 +945,10 @@ impl SessionState {
     /// Withdraws one pending request when its turn cannot continue.
     ///
     /// Sibling of [`SessionState::withdraw_pending`], for one request instead of the whole map.
-    pub(crate) fn withdraw_pending_by_id(&self, id: &str) -> agent_client_protocol::Result<()> {
+    pub(crate) fn withdraw_pending_by_id(
+        &self,
+        id: &str,
+    ) -> agent_client_protocol_schema::v1::Result<()> {
         let pending = self.lock_pending().remove(id);
         match pending {
             Some(pending) => {
@@ -1190,7 +1193,7 @@ async fn on_request_permission(
     request: RequestPermissionRequest,
     responder: Responder<RequestPermissionResponse>,
     connection: ConnectionTo<Agent>,
-) -> agent_client_protocol::Result<()> {
+) -> agent_client_protocol_schema::v1::Result<()> {
     if !state.serves(&request.session_id) {
         // Another session's question. Refused rather than shown: this host's answer would grant
         // work in a conversation it never opened.
@@ -1361,7 +1364,7 @@ pub(crate) struct ConnectionHandle {
     /// The one owner shared with lifecycle watchers that may also need to reap the child.
     child_reaper: ChildReaper,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>>,
+    driver: Mutex<Option<tokio::task::JoinHandle<agent_client_protocol_schema::v1::Result<()>>>>,
     /// Host-owned bounds for tearing down the dispatch loop and child process.
     limits: mango_external_agents::Limits,
     /// Fires once the dispatch loop is over, whichever way it ended.
@@ -1699,7 +1702,9 @@ pub(crate) async fn drive(
         .on_receive_dispatch(
             async |message: agent_client_protocol::Dispatch, _cx| match message {
                 agent_client_protocol::Dispatch::Request(_, responder) => {
-                    responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+                    responder.respond_with_error(
+                        agent_client_protocol_schema::v1::Error::method_not_found(),
+                    )
                 }
                 agent_client_protocol::Dispatch::Notification(_) => Ok(()),
                 agent_client_protocol::Dispatch::Response(result, router) => {
@@ -1989,14 +1994,14 @@ where
 /// when the connection's reply channel was dropped with the request pending. Only these may be
 /// explained by a connection-wide transport budget; an agent's own refusal is kept as it came.
 /// For example, a `set_config_option` refusal stays a vendor error even after a later overflow.
-pub(crate) fn is_link_closure(error: &agent_client_protocol::Error) -> bool {
+pub(crate) fn is_link_closure(error: &agent_client_protocol_schema::v1::Error) -> bool {
     if agent_client_protocol::is_incoming_transport_closed(error) {
         return true;
     }
     let Some(detail) = error.data.as_ref().and_then(serde_json::Value::as_str) else {
         return false;
     };
-    error.code == agent_client_protocol::ErrorCode::InternalError
+    error.code == agent_client_protocol_schema::v1::ErrorCode::InternalError
         && detail.starts_with("response to `")
         && detail.contains("` never received: ")
 }
@@ -2732,8 +2737,8 @@ mod tests {
         let dropped = std::thread::scope(|scope| {
             let submitted = super::submit(
                 &connection,
-                agent_client_protocol::schema::v1::CloseSessionRequest::new(
-                    agent_client_protocol::schema::v1::SessionId::new("sess_abandoned"),
+                agent_client_protocol_schema::v1::CloseSessionRequest::new(
+                    agent_client_protocol_schema::v1::SessionId::new("sess_abandoned"),
                 ),
             )
             .expect("expected the request to be admitted");
@@ -2775,7 +2780,7 @@ mod tests {
     /// session names itself — and once that one binds, only it is.
     #[test]
     fn a_fallback_refuses_the_abandoned_session_until_and_after_the_new_one_binds() {
-        use agent_client_protocol::schema::v1::SessionId as AcpSessionId;
+        use agent_client_protocol_schema::v1::SessionId as AcpSessionId;
         let (state, _host) = state();
         let loading = AcpSessionId::new("sess_loading");
         let fresh = AcpSessionId::new("sess_fresh");
@@ -2876,7 +2881,7 @@ mod tests {
         /// One `session/update` notification for `session-1`, composed as the agent's JSON.
         pub(super) fn notification(
             update: serde_json::Value,
-        ) -> agent_client_protocol::schema::v1::SessionNotification {
+        ) -> agent_client_protocol_schema::v1::SessionNotification {
             serde_json::from_value(serde_json::json!({
                 "sessionId": "session-1",
                 "update": update,
@@ -2886,7 +2891,7 @@ mod tests {
 
         pub(super) fn running_call(
             index: usize,
-        ) -> agent_client_protocol::schema::v1::SessionNotification {
+        ) -> agent_client_protocol_schema::v1::SessionNotification {
             notification(serde_json::json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": format!("call-{index}"),
@@ -3021,7 +3026,7 @@ mod tests {
         use super::replay::{notification, running_call};
         use super::{SessionId, SessionState, state};
 
-        fn call_named(id: &str) -> agent_client_protocol::schema::v1::SessionNotification {
+        fn call_named(id: &str) -> agent_client_protocol_schema::v1::SessionNotification {
             notification(serde_json::json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": id,

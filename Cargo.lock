@@ -822,6 +822,7 @@ name = "mango-agent-acp"
 version = "0.5.0"
 dependencies = [
  "agent-client-protocol",
+ "agent-client-protocol-schema",
  "async-trait",
  "base64 0.22.1",
  "chrono",
