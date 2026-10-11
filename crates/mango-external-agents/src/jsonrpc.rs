@@ -1104,6 +1104,32 @@ struct PendingAnswer {
     delivery: Delivery,
     /// Whether it holds a place among `max_pending_requests`.
     counted: bool,
+    /// Who has had the last word on the call, for a client that cancels what it gives up. See
+    /// [`CallClaim`].
+    claim: CallClaim,
+}
+
+/// The last word on a call, shared by the record of calls and the caller, for a client that
+/// tells the peer when it gives a request up: `None` for one that does not.
+///
+/// Whoever settles the call takes it first: the reader for a response that came, the writer
+/// for a frame the link refused, the caller for a call it gives up. Only the first to take it
+/// acts on it. A reader that finds it taken drops the response as a late one, and a caller
+/// that finds it taken sends no cancel. So a call is answered or cancelled, never both, and
+/// neither side has to wait for the record of calls to find out which it is.
+type CallClaim = Option<Arc<AtomicBool>>;
+
+/// Takes the last word on a call, and says whether it was still there to take.
+fn take_claim(claim: &CallClaim) -> bool {
+    claim
+        .as_ref()
+        .is_some_and(|claim| !claim.swap(true, Ordering::SeqCst))
+}
+
+/// Takes the last word on a call for the side that settles it, and says whether the caller had
+/// already given the call up. Never, for a client that does not cancel: it has no claim.
+fn given_up(claim: &CallClaim) -> bool {
+    claim.is_some() && !take_claim(claim)
 }
 
 /// Drops the entries nobody waits on any more and counts those that hold a place in the budget.
@@ -1168,6 +1194,7 @@ struct Registration {
     answer: oneshot::Sender<Answer>,
     delivery: Delivery,
     counted: bool,
+    claim: CallClaim,
 }
 
 struct ClientState {
@@ -1220,6 +1247,8 @@ struct ClientState {
     /// mid-frame send, so a queued writer refuses instead of using the broken physical link.
     /// The pump ends the connection later, on its own task.
     link_poisoned: AtomicBool,
+    /// The parse-error replies still waiting to be written, for the bound on them.
+    parse_error_replies: StdMutex<Vec<Arc<outbox::FrameCtl>>>,
     /// The peer's questions currently being answered, so they can be counted and taken down.
     in_flight: StdMutex<JoinSet<()>>,
     notifications: StdMutex<Option<JoinHandle<()>>>,
@@ -1246,6 +1275,14 @@ struct ClientState {
     /// the worker's dequeue exactly there.
     #[cfg(test)]
     after_queue_length_read: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in [`ClientState::deliver`] between taking a call off the record and taking
+    /// its claim, so a test can have the caller give the call up exactly there.
+    #[cfg(test)]
+    after_response_matched: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in [`ClientState::deliver`] between taking a call's claim and handing the
+    /// response on, so a test can have the caller give the call up exactly there.
+    #[cfg(test)]
+    after_response_claimed: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     peer_bytes: Arc<Semaphore>,
     /// How many notifications and peer questions may wait in the handoff queue. The channel is
     /// larger than this by the reserve below, so the reader counts what is in it.
@@ -1413,10 +1450,29 @@ impl Drop for CancellationHold {
 struct PendingCall {
     state: Arc<ClientState>,
     id: String,
+    /// The request's frame in the queue, for a request that was queued.
+    ctl: Option<Arc<outbox::FrameCtl>>,
+    /// Set once a caller that writes for itself has written the frame whole.
+    wrote: bool,
+    claim: CallClaim,
+}
+
+impl PendingCall {
+    /// Whether any byte of the request may have reached the peer.
+    fn began(&self) -> bool {
+        self.wrote || self.ctl.as_ref().is_some_and(|ctl| ctl.began())
+    }
 }
 
 impl Drop for PendingCall {
     fn drop(&mut self) {
+        // Decided here and now, whatever the record of calls is doing: a cancel that waited
+        // for it would let this caller's next write out ahead of it. The peer may have seen
+        // the request, and nobody has settled the call first: no response was taken for it,
+        // and its caller was not told the link refused its frame.
+        if self.began() && take_claim(&self.claim) {
+            self.state.cancel_abandoned(&self.id);
+        }
         if let Ok(mut pending) = self.state.pending.try_lock() {
             pending.remove(&self.id);
             return;
@@ -1684,6 +1740,7 @@ impl Client {
             write_failed: Notify::new(),
             ended: StdMutex::new(None),
             link_poisoned: AtomicBool::new(false),
+            parse_error_replies: StdMutex::new(Vec::new()),
             in_flight: StdMutex::new(JoinSet::new()),
             notifications: StdMutex::new(None),
             worker_abort: OnceLock::new(),
@@ -1696,6 +1753,10 @@ impl Client {
             after_hold_counted: StdMutex::new(None),
             #[cfg(test)]
             after_queue_length_read: StdMutex::new(None),
+            #[cfg(test)]
+            after_response_matched: StdMutex::new(None),
+            #[cfg(test)]
+            after_response_claimed: StdMutex::new(None),
             peer_bytes,
             notification_capacity,
             queued_answers: AtomicUsize::new(0),
@@ -1980,11 +2041,13 @@ impl Client {
             Delivery::Immediate
         };
         let (answer, waiting) = oneshot::channel();
+        let claim = self.state.call_claim();
         let registration = Registration {
             id: id.clone(),
             answer,
             delivery,
             counted: !options.outside_pending_budget,
+            claim: claim.clone(),
         };
         let ticket = self.state.enqueue(frame, Some(registration))?;
         let ctl = Arc::clone(&ticket.ctl);
@@ -1997,11 +2060,14 @@ impl Client {
                 deadline: timeout.map(|timeout| (timeout, deadline_after(timeout))),
                 timer: None,
                 label: options.label,
-                ctl,
                 pending: PendingCall {
                     state: Arc::clone(&self.state),
                     id,
+                    ctl: Some(Arc::clone(&ctl)),
+                    wrote: false,
+                    claim,
                 },
+                ctl,
             },
         })
     }
@@ -2366,6 +2432,7 @@ impl Client {
             .frame(Some(Value::String(id.clone())), method, params)?;
 
         let (answer, waiting) = oneshot::channel();
+        let claim = self.state.call_claim();
         {
             let mut pending = self.state.pending.lock().await;
             // Read again, holding the map, because the check above is not the same instant as this
@@ -2397,12 +2464,16 @@ impl Client {
                     answer,
                     delivery,
                     counted,
+                    claim: claim.clone(),
                 },
             );
         }
-        let _pending = PendingCall {
+        let mut pending = PendingCall {
             state: Arc::clone(&self.state),
             id: id.clone(),
+            ctl: None,
+            wrote: false,
+            claim,
         };
 
         if let Err(error) = self.state.write_marking(frame, write_started).await {
@@ -2412,9 +2483,11 @@ impl Client {
             self.state.pending.lock().await.remove(&id);
             return Err(error);
         }
+        // From here the peer has the request, and giving it up is worth telling it.
+        pending.wrote = true;
 
         // A caller that stops waiting, by its deadline or by being dropped, takes its entry
-        // back out as `_pending` goes.
+        // back out as `pending` goes.
         self.state.answered(waiting.await, &id)
     }
 }
@@ -2872,6 +2945,7 @@ impl ClientState {
             answer,
             delivery,
             counted,
+            claim,
         } = registration;
         let mut pending = self.pending.lock().await;
         if self.closed.load(Ordering::Acquire) {
@@ -2897,6 +2971,7 @@ impl ClientState {
                 answer,
                 delivery,
                 counted,
+                claim,
             },
         );
         Ok(id)
@@ -3077,9 +3152,78 @@ impl ClientState {
     /// The termination a peer earns by sending more than the handoff queue may hold.
     fn queue_full(&self) -> PeerTermination {
         let limit = self.options.max_pending_notifications.max(1);
+        self.queue_overrun(limit.saturating_add(1))
+    }
+
+    /// The same, for a peer that brought the queue to `received` in one go.
+    fn queue_overrun(&self, received: usize) -> PeerTermination {
         PeerTermination::NotificationBackpressure {
-            limit,
-            received: limit.saturating_add(1),
+            limit: self.options.max_pending_notifications.max(1),
+            received,
+        }
+    }
+
+    /// A claim for a new call, for a client that cancels what it gives up.
+    fn call_claim(&self) -> CallClaim {
+        self.outbox
+            .wire()
+            .cancel_on_abandon()
+            .is_some()
+            .then(|| Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Tells the peer that a request it may have seen was given up, if this client was asked
+    /// to. Silent once the connection has ended. Queued beside the queue's bounds: there is at
+    /// most one of these for each request written, and a caller letting go of a request is
+    /// not what brings a queue to the bound that ends a connection.
+    fn cancel_abandoned(&self, id: &str) {
+        let Some(method) = self.outbox.wire().cancel_on_abandon() else {
+            return;
+        };
+        if self.closed.load(Ordering::Acquire) || self.link_poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(frame) = self.frame(None, method, json!({ "requestId": id })) else {
+            return;
+        };
+        let deadline = deadline_after(self.options.request_timeout);
+        let _ = self.outbox.enqueue_aside(frame, deadline);
+    }
+
+    /// Answers a line that was not JSON with a parse error, if this client was asked to and
+    /// fewer such answers than its bound are still waiting to be written.
+    fn answer_unparseable(&self) {
+        let Some(limit) = self.outbox.wire().parse_error_replies() else {
+            return;
+        };
+        if self.closed.load(Ordering::Acquire) || self.link_poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        let mut waiting = self
+            .parse_error_replies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        waiting.retain(|reply| reply.queued());
+        if waiting.len() >= limit {
+            return;
+        }
+        let mut frame = Map::new();
+        if self.options.include_version_header {
+            frame.insert(String::from("jsonrpc"), json!("2.0"));
+        }
+        frame.insert(String::from("id"), Value::Null);
+        frame.insert(
+            String::from("error"),
+            json!({ "code": -32700, "message": "Parse error" }),
+        );
+        let deadline = deadline_after(self.options.request_timeout);
+        // Beside the queue's bounds, being bounded here: the peer's noise takes none of the
+        // room they leave this side's own frames.
+        if let Ok(ticket) = self
+            .outbox
+            .enqueue_aside(Value::Object(frame).to_string(), deadline)
+        {
+            waiting.push(ticket.ctl);
         }
     }
 
@@ -3179,11 +3323,25 @@ impl ClientState {
         // A response nobody is waiting for is dropped: the call timed out or was abandoned, or
         // this is a second response to a request whose first is already delivered or queued.
         let Some(PendingAnswer {
-            answer, delivery, ..
+            answer,
+            delivery,
+            claim,
+            ..
         }) = state.pending.lock().await.remove(&id)
         else {
             return Ok(());
         };
+        #[cfg(test)]
+        Self::run_hook(&state.after_response_matched);
+        // The claim decides between this response and a caller giving the call up at this
+        // very moment, which takes no lock to do it. Taken here, the call is answered and no
+        // cancel follows, whatever its caller does next. Found taken, the cancel is already on
+        // its way: the response is a late one and is dropped, its place with it.
+        if given_up(&claim) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        Self::run_hook(&state.after_response_claimed);
         let place = match delivery {
             Delivery::Immediate => {
                 let _ = answer.send(outcome);
@@ -3409,28 +3567,122 @@ async fn dispatch(
 ) -> std::result::Result<(), PeerTermination> {
     // Not every line on a peer's output is a frame. Dropping an unparseable one keeps a stray
     // diagnostic from killing a live turn.
-    let Ok(Value::Object(mut frame)) = serde_json::from_str::<Value>(&message) else {
-        return Ok(());
+    let frame = match serde_json::from_str::<Value>(&message) {
+        Ok(Value::Object(frame)) => frame,
+        Ok(Value::Array(members)) if state.outbox.wire().decodes_batches() => {
+            return dispatch_batch(state, notifications, members, message.len()).await;
+        }
+        Ok(_) => return Ok(()),
+        Err(_) => {
+            // A blank line is nothing a peer could be told about.
+            if !message.trim().is_empty() {
+                state.answer_unparseable();
+            }
+            return Ok(());
+        }
     };
+    dispatch_frame(state, notifications, frame, PeerBytes::Line(message.len())).await
+}
 
+/// What a notification or a question holds of the peer's byte budget while it is queued.
+enum PeerBytes {
+    /// A frame on a line of its own, that many bytes long, still to be counted.
+    Line(usize),
+    /// A member of a batch, with its share of the batch's bytes already taken.
+    Share(tokio::sync::OwnedSemaphorePermit),
+}
+
+/// Takes `bytes` of the peer's byte budget, or says the peer passed it.
+fn take_peer_bytes(
+    state: &Arc<ClientState>,
+    bytes: usize,
+) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, PeerTermination> {
+    let over_bytes = || PeerTermination::NotificationByteBackpressure {
+        limit: state.options.max_pending_bytes,
+        received: bytes,
+    };
+    let permits = u32::try_from(bytes).map_err(|_| over_bytes())?;
+    Arc::clone(&state.peer_bytes)
+        .try_acquire_many_owned(permits)
+        .map_err(|_| over_bytes())
+}
+
+/// Whether a batch member is something for the handler: a notification or a question.
+fn is_peer_work(member: &Value) -> bool {
+    member.get("method").is_some_and(Value::is_string)
+}
+
+/// Routes the members of one batch, in order.
+///
+/// The batch is admitted as a whole before any of it is queued: its notifications and
+/// questions against the handoff queue, counted one by one, and its bytes against the byte
+/// budget, once. The bytes are then shared out evenly among those members, the last taking
+/// what is left over, so that all of them are back when the last member has been handled.
+async fn dispatch_batch(
+    state: &Arc<ClientState>,
+    notifications: &mpsc::Sender<QueuedWork>,
+    members: Vec<Value>,
+    bytes: usize,
+) -> std::result::Result<(), PeerTermination> {
+    let mut work = members.iter().filter(|member| is_peer_work(member)).count();
+    let mut held = None;
+    if work > 0 {
+        let queued = state.peer_work_queued(notifications);
+        let received = queued.saturating_add(work);
+        if received > state.notification_capacity {
+            return Err(state.queue_overrun(received));
+        }
+        held = Some(take_peer_bytes(state, bytes)?);
+    }
+    let share = bytes.checked_div(work).unwrap_or(0);
+    for member in members {
+        let Value::Object(frame) = member else {
+            continue;
+        };
+        let mine = if frame.get("method").is_some_and(Value::is_string) {
+            work -= 1;
+            match work {
+                0 => held.take(),
+                _ => held.as_mut().and_then(|held| held.split(share)),
+            }
+        } else {
+            None
+        };
+        // A response holds nothing of the byte budget.
+        let bytes = mine.map_or(PeerBytes::Line(0), PeerBytes::Share);
+        dispatch_frame(state, notifications, frame, bytes).await?;
+    }
+    Ok(())
+}
+
+/// Routes one frame: a notification or a question to the handler's queue, a response to the
+/// call that waits for it.
+async fn dispatch_frame(
+    state: &Arc<ClientState>,
+    notifications: &mpsc::Sender<QueuedWork>,
+    mut frame: Map<String, Value>,
+    bytes: PeerBytes,
+) -> std::result::Result<(), PeerTermination> {
     // The frame is owned and read once, so every member is taken out of it rather than cloned: a
     // large diff notification would otherwise exist twice until the clone is dropped.
     let id = frame.remove("id");
     if let Some(Value::String(method)) = frame.remove("method") {
         let params = frame.remove("params").unwrap_or(Value::Null);
-        let over_bytes = || PeerTermination::NotificationByteBackpressure {
-            limit: state.options.max_pending_bytes,
-            received: message.len(),
+        let permit = match bytes {
+            PeerBytes::Line(bytes) => {
+                let permit = take_peer_bytes(state, bytes)?;
+                // The channel also has room reserved for ordered responses, so its own
+                // capacity no longer says when the peer's share is spent.
+                if state.peer_work_queued(notifications) >= state.notification_capacity {
+                    return Err(state.queue_full());
+                }
+                permit
+            }
+            // A batch was counted whole before any of it was queued, and is not counted
+            // again member by member: a second count could come out one higher while the
+            // handler's task lets an answer go, and refuse a batch half-way through.
+            PeerBytes::Share(permit) => permit,
         };
-        let bytes = u32::try_from(message.len()).map_err(|_| over_bytes())?;
-        let permit = Arc::clone(&state.peer_bytes)
-            .try_acquire_many_owned(bytes)
-            .map_err(|_| over_bytes())?;
-        // The channel also has room reserved for ordered responses, so its own capacity no
-        // longer says when the peer's share is spent.
-        if state.peer_work_queued(notifications) >= state.notification_capacity {
-            return Err(state.queue_full());
-        }
         let work = match id {
             Some(id) => PeerWork::Request { method, params, id },
             None => PeerWork::Notification { method, params },
@@ -3667,6 +3919,7 @@ mod tests {
     mod ordered_response_tests;
     mod outbox_tests;
     mod request_lifecycle_tests;
+    mod wire_options_tests;
     mod write_failure_tests;
 
     use super::{

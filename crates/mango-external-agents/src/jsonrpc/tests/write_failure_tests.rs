@@ -31,9 +31,9 @@ impl crate::link::LinkSender for HeldFirstSend {
 }
 
 /// A local transport admission refusal does not put bytes on the wire or damage the sender.
-struct RefuseFirstSend {
-    inner: Box<dyn crate::link::LinkSender>,
-    first: bool,
+pub(super) struct RefuseFirstSend {
+    pub(super) inner: Box<dyn crate::link::LinkSender>,
+    pub(super) first: bool,
 }
 
 #[async_trait::async_trait]

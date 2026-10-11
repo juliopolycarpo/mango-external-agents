@@ -58,6 +58,9 @@ pub struct WireOptions {
     max_outbound_frame_bytes: usize,
     max_outbound_queued_bytes: usize,
     max_outbound_queued_frames: usize,
+    batch_decoding: bool,
+    parse_error_replies: Option<usize>,
+    cancel_on_abandon: Option<String>,
 }
 
 impl Default for WireOptions {
@@ -66,6 +69,9 @@ impl Default for WireOptions {
             max_outbound_frame_bytes: usize::MAX,
             max_outbound_queued_bytes: usize::MAX,
             max_outbound_queued_frames: usize::MAX,
+            batch_decoding: false,
+            parse_error_replies: None,
+            cancel_on_abandon: None,
         }
     }
 }
@@ -144,7 +150,10 @@ impl WireOptions {
     /// Passing it ends the connection the way
     /// [`with_max_outbound_queued_bytes`](Self::with_max_outbound_queued_bytes) describes. A
     /// bound of zero is not passed by anything the peer did: it refuses every queued frame
-    /// alone, and leaves the connection to callers that wait for their own writes.
+    /// alone, and leaves the connection to callers that wait for their own writes. The frames
+    /// [`with_parse_error_replies`](Self::with_parse_error_replies) and
+    /// [`with_cancel_on_abandon`](Self::with_cancel_on_abandon) send are not held to this
+    /// bound, whatever it is.
     ///
     /// # Example
     ///
@@ -158,6 +167,162 @@ impl WireOptions {
     pub fn with_max_outbound_queued_frames(mut self, frames: usize) -> Self {
         self.max_outbound_queued_frames = frames;
         self
+    }
+
+    /// Reads a line that is a JSON array as a JSON-RPC batch: each member that is an object is
+    /// taken as a frame, in the order the array gives them.
+    ///
+    /// Off by default, where such a line is dropped like any other line that is not a frame.
+    ///
+    /// What a batch is held to:
+    ///
+    /// - Each notification and each question in it counts against
+    ///   [`ClientOptions::max_pending_notifications`](super::ClientOptions::max_pending_notifications)
+    ///   on its own. The whole batch is counted before any of it is queued, so a batch that
+    ///   does not fit ends the connection with nothing of it handled, and the
+    ///   [`PeerTermination::NotificationBackpressure`](super::PeerTermination::NotificationBackpressure)
+    ///   reports what the queue held plus every such member as `received`.
+    /// - The line's bytes, all of them, count against
+    ///   [`ClientOptions::max_pending_bytes`](super::ClientOptions::max_pending_bytes) once
+    ///   when the batch has any such member, shared out evenly among those members and given
+    ///   back as each is handled. A batch of responses alone takes none, as a response on a
+    ///   line of its own takes none.
+    /// - A response in a batch reaches its caller as one on a line of its own does, ordered
+    ///   answers behind the notifications before them in the batch.
+    /// - A member that is not an object, and an empty array, are dropped.
+    ///
+    /// The answers to a batch's questions go out as frames of their own, not as one array.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_batch_decoding();
+    /// assert!(wire.decodes_batches());
+    /// ```
+    #[must_use]
+    pub fn with_batch_decoding(mut self) -> Self {
+        self.batch_decoding = true;
+        self
+    }
+
+    /// Answers a line that is not JSON with a JSON-RPC parse error: code `-32700`, `id` null.
+    ///
+    /// Off by default, where such a line is dropped: a vendor that prints a stray diagnostic
+    /// on its output is not told about it. On, at most `max_queued` such replies wait to be
+    /// written at a time, and a line that is not JSON while that many wait is dropped as
+    /// before; `0` answers none. The replies are held beside the bounds of the outbound queue,
+    /// not within them: the peer's noise takes none of the room those bounds leave this side's
+    /// own frames, and cannot bring the queue to the bound that ends a connection. The replies
+    /// go through the queue, so from the first one on, every write of this client takes its
+    /// turn there.
+    ///
+    /// What turning this on costs: a reply is a write. A peer that sends lines that are not
+    /// JSON and does not read what it is sent leaves a reply waiting to be written, and when
+    /// that write's deadline ([`ClientOptions::request_timeout`](super::ClientOptions::request_timeout))
+    /// runs out the connection ends, as after any write that could not finish: a line may be
+    /// half written by then. With this off, such a peer is read for as long as it writes. A
+    /// peer that reads what it is sent pays nothing for a line that is not JSON beyond the
+    /// reply.
+    ///
+    /// The reply does not quote the line. A line that is empty or only whitespace gets none,
+    /// and neither does a line that is JSON and not a frame (a number, a string, an array
+    /// without [`with_batch_decoding`](Self::with_batch_decoding)).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_parse_error_replies(8);
+    /// assert_eq!(wire.parse_error_replies(), Some(8));
+    /// ```
+    #[must_use]
+    pub fn with_parse_error_replies(mut self, max_queued: usize) -> Self {
+        self.parse_error_replies = Some(max_queued);
+        self
+    }
+
+    /// Tells the peer when this side gives a request up: a notification named `method`, with
+    /// `{"requestId": <the request's id>}` for its parameters, queued behind the request.
+    ///
+    /// Off by default. A request is given up when its future or its
+    /// [`Reply`](super::Reply) is dropped before an answer came. A deadline that runs out
+    /// drops the future of [`Client::request`](super::Client::request) and so sends it at
+    /// once; a [`Reply`](super::Reply) that resolved with a timeout sends it when it is
+    /// dropped. Nothing is sent:
+    ///
+    /// - for a request whose frame never began to be written, since the peer never saw it;
+    /// - for a request whose caller was told the link refused its frame;
+    /// - once a response to it has been taken for its caller, delivered yet or not;
+    /// - once the connection has ended.
+    ///
+    /// A response that is read at the very moment its caller lets go ends one way or the
+    /// other, never both: either it is taken for the caller and nothing is sent, or the
+    /// request is given up first, this is sent, and the response is dropped as a late one. A
+    /// request given up while its frame is being written is announced, since some of it may
+    /// have reached the peer, even if the link then refuses the frame whole and stays usable.
+    ///
+    /// There is at most one for each request the peer was sent, and they are held beside the
+    /// bounds of the outbound queue, not within them: a caller letting go of requests takes
+    /// none of the room those bounds leave other frames. It goes through the queue, so from
+    /// the first one on, every write of this client takes its turn there.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// let wire = WireOptions::new().with_cancel_on_abandon("$/cancel_request");
+    /// assert_eq!(wire.cancel_on_abandon(), Some("$/cancel_request"));
+    /// ```
+    #[must_use]
+    pub fn with_cancel_on_abandon(mut self, method: impl Into<String>) -> Self {
+        self.cancel_on_abandon = Some(method.into());
+        self
+    }
+
+    /// Whether a line that is a JSON array is read as a batch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert!(!WireOptions::new().decodes_batches());
+    /// ```
+    #[must_use]
+    pub fn decodes_batches(&self) -> bool {
+        self.batch_decoding
+    }
+
+    /// How many parse-error replies may wait to be written, or `None` when none are sent.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert_eq!(WireOptions::new().parse_error_replies(), None);
+    /// ```
+    #[must_use]
+    pub fn parse_error_replies(&self) -> Option<usize> {
+        self.parse_error_replies
+    }
+
+    /// The notification sent for a request given up, or `None` when none is.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mango_external_agents::jsonrpc::WireOptions;
+    ///
+    /// assert_eq!(WireOptions::new().cancel_on_abandon(), None);
+    /// ```
+    #[must_use]
+    pub fn cancel_on_abandon(&self) -> Option<&str> {
+        self.cancel_on_abandon.as_deref()
     }
 
     /// The largest single frame this client sends.
@@ -231,6 +396,9 @@ pub(super) enum Refusal {
 struct Held {
     frames: usize,
     bytes: usize,
+    /// Frames queued beside the bounds: in the queue, and in nobody's count of it. Counted
+    /// here so that a queue holding only these is still not taken for an empty one.
+    aside: usize,
     /// Turns queued for callers that write for themselves. Not bounded here: each is a caller
     /// waiting, and holds no frame of its own in the queue.
     turns: usize,
@@ -257,6 +425,11 @@ impl Budget {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         held.frames = held.frames.saturating_sub(1);
         held.bytes = held.bytes.saturating_sub(bytes);
+    }
+
+    fn release_aside(&self) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.aside = held.aside.saturating_sub(1);
     }
 }
 
@@ -350,7 +523,7 @@ impl FrameCtl {
     }
 
     /// Whether the frame is still waiting for the writer.
-    fn queued(&self) -> bool {
+    pub(super) fn queued(&self) -> bool {
         self.phase.load(Ordering::Acquire) == QUEUED
     }
 
@@ -390,6 +563,8 @@ pub(super) struct Outgoing {
     /// answer by the writer, just before the frame goes out: no answer can come sooner, and the
     /// caller that queued it could not wait for that map.
     call: Option<Registration>,
+    /// Whether the frame has a share of the queue's bounds to give back.
+    counted: bool,
 }
 
 /// What the writer takes off the queue.
@@ -408,7 +583,11 @@ impl Drop for Outgoing {
         // it, written or not. Also the path of a frame still queued when the writer is taken
         // down, where the dropped acknowledgement tells whoever waits.
         self.ctl.settle();
-        self.budget.release(self.ctl.bytes);
+        if self.counted {
+            self.budget.release(self.ctl.bytes);
+        } else {
+            self.budget.release_aside();
+        }
     }
 }
 
@@ -479,6 +658,11 @@ impl Outbox {
         )
     }
 
+    /// The options this queue was made with.
+    pub(super) fn wire(&self) -> &WireOptions {
+        &self.limits
+    }
+
     /// Admits one frame and queues it, as one step.
     ///
     /// The count and the push happen under one lock, so two callers cannot be admitted in one
@@ -488,6 +672,31 @@ impl Outbox {
         frame: String,
         deadline: Instant,
         call: Option<Registration>,
+    ) -> std::result::Result<Ticket, Refusal> {
+        self.queue_frame(frame, deadline, call, true)
+    }
+
+    /// Queues a frame this side sends of its own accord, beside the queue's bounds: it takes
+    /// none of the room the bounds leave the host's frames, and is not refused for want of it.
+    ///
+    /// For frames that are bounded where they are made (a parse error, a cancel for a request
+    /// given up), so that neither the peer's noise nor a caller letting go of a request can
+    /// bring the queue to the bound that ends a connection. A frame larger than any frame may
+    /// be is still refused.
+    pub(super) fn enqueue_aside(
+        &self,
+        frame: String,
+        deadline: Instant,
+    ) -> std::result::Result<Ticket, Refusal> {
+        self.queue_frame(frame, deadline, None, false)
+    }
+
+    fn queue_frame(
+        &self,
+        frame: String,
+        deadline: Instant,
+        call: Option<Registration>,
+        counted: bool,
     ) -> std::result::Result<Ticket, Refusal> {
         let bytes = frame.len();
         let mut held = self
@@ -499,7 +708,14 @@ impl Outbox {
         if held.sealed {
             return Err(Refusal::Sealed);
         }
-        admission(&self.limits, held.frames, held.bytes, bytes)?;
+        if counted {
+            admission(&self.limits, held.frames, held.bytes, bytes)?;
+        } else if bytes > self.limits.max_outbound_frame_bytes {
+            return Err(Refusal::FrameTooLarge {
+                limit: self.limits.max_outbound_frame_bytes,
+                received: bytes,
+            });
+        }
         // From the first queued frame on, every write takes its turn here.
         held.queueing = true;
         let ctl = Arc::new(FrameCtl {
@@ -507,8 +723,12 @@ impl Outbox {
             bytes,
         });
         let (ack, acknowledged) = oneshot::channel();
-        held.frames += 1;
-        held.bytes = held.bytes.saturating_add(bytes);
+        if counted {
+            held.frames += 1;
+            held.bytes = held.bytes.saturating_add(bytes);
+        } else {
+            held.aside += 1;
+        }
         let queued = Outgoing {
             frame,
             ctl: Arc::clone(&ctl),
@@ -516,6 +736,7 @@ impl Outbox {
             ack: Some(ack),
             deadline,
             call,
+            counted,
         };
         if let Err(refused) = self.queue.send(Entry::Frame(queued)) {
             // The frame comes back in the error and gives its share back as it is dropped, which
@@ -561,6 +782,7 @@ impl Outbox {
             });
         }
         if held.frames == 0
+            && held.aside == 0
             && held.turns == 0
             && let Ok(sender) = Arc::clone(sender).try_lock_owned()
         {
@@ -686,6 +908,16 @@ impl Outbox {
             .turns
     }
 
+    /// How many frames are queued beside the bounds.
+    #[cfg(test)]
+    pub(super) fn aside(&self) -> usize {
+        self.budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .aside
+    }
+
     #[cfg(test)]
     pub(super) fn held(&self) -> (usize, usize) {
         let held = self
@@ -738,8 +970,9 @@ async fn frame(state: &ClientState, mut outgoing: Outgoing) {
         if !outgoing.ctl.queued() {
             return;
         }
+        let claim = registration.claim.clone();
         match state.register(registration).await {
-            Ok(id) => call = Some(id),
+            Ok(id) => call = Some((id, claim)),
             Err(refused) => {
                 let ack = outgoing.ack.take();
                 drop(outgoing);
@@ -752,12 +985,17 @@ async fn frame(state: &ClientState, mut outgoing: Outgoing) {
     }
     let outcome = write(state, &mut outgoing).await;
     let ack = outgoing.ack.take();
+    let unwritten = call.filter(|_| !matches!(outcome, Some(Ok(()))));
+    if let Some((_, claim)) = &unwritten {
+        // The write is over and the link took none of the frame, or is unusable now. Settled
+        // here, before anything is waited for: a caller that lets go from now on has nothing
+        // to cancel, whether or not it has heard yet.
+        super::take_claim(claim);
+    }
     // Its share of the budget goes back before its caller hears: a caller that queues the next
     // frame on that news must find the room.
     drop(outgoing);
-    if let Some(id) = call
-        && !matches!(outcome, Some(Ok(())))
-    {
+    if let Some((id, _)) = unwritten {
         state.fail_unwritten(&id).await;
     }
     if let (Some(ack), Some(outcome)) = (ack, outcome) {
