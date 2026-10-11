@@ -292,6 +292,11 @@ impl OutboundBound {
 /// What a [`Client::close`] that ran out of its grace names as the call that stalled.
 const LINK_SHUTDOWN: &str = "JSON-RPC link shutdown";
 
+/// What a [`Client::close`] that ran out of its bound waiting for another close to let go of the
+/// reader names as the call that stalled. The link was dealt with by then, which is why this is
+/// not [`LINK_SHUTDOWN`].
+const READER_SHUTDOWN: &str = "JSON-RPC reader shutdown";
+
 /// Whether `error` is a [`Client::close`] that gave up: closing the link, behind whatever
 /// was still queued for it, did not finish within
 /// [`ClientOptions::shutdown_timeout`]. The link may still be open and the peer still
@@ -564,9 +569,10 @@ pub trait PeerHandler: Send + Sync {
     /// overtook: the end on record first owns the connection's end, and [`Client::ended`]
     /// reports it as the close. A close given up after it recorded its end (its future dropped,
     /// a timeout of the caller's own, or made from inside the handler's own call, which the
-    /// close cuts short) still owns the end, whatever the reader had read: this is not made, the
-    /// reader fails no pending call, and the link stays open until a second [`Client::close`],
-    /// or dropping the client, finishes the teardown.
+    /// close cuts short) still owns the end, whatever the reader had read: this is not made and
+    /// the reader fails no pending call. A second [`Client::close`], or dropping the client,
+    /// finishes the teardown; what the cut leaves of the link is in the documentation of
+    /// [`Client::close`].
     ///
     /// Made once, after the handler's task has stopped. A [`Client::close`] that arrives while
     /// the connection is ending this way waits for this call to return, within the time a close
@@ -1679,6 +1685,15 @@ struct ClientState {
     /// can queue a frame exactly there.
     #[cfg(test)]
     after_seal: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once as an end of the connection begins to mark it closed, before the queue is
+    /// sealed, so a test can queue a frame at the moment a close is on record and the queue
+    /// still takes frames.
+    #[cfg(test)]
+    before_seal: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once when a frame has been refused for want of room in the queue, before the
+    /// overflow is put on record, so a test can have a close land exactly there.
+    #[cfg(test)]
+    before_overflow_recorded: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The connection's runtime also owns cleanup when a request is dropped on another thread.
     runtime: tokio::runtime::Handle,
     options: ClientOptions,
@@ -2520,6 +2535,10 @@ impl Client {
             after_turn_decided: StdMutex::new(None),
             #[cfg(test)]
             after_seal: StdMutex::new(None),
+            #[cfg(test)]
+            before_seal: StdMutex::new(None),
+            #[cfg(test)]
+            before_overflow_recorded: StdMutex::new(None),
             runtime: tokio::runtime::Handle::current(),
             options,
             next_id: AtomicU64::new(1),
@@ -2773,8 +2792,9 @@ impl Client {
     /// when the frame is larger than [`WireOptions::with_max_outbound_frame_bytes`] allows or
     /// than the queue could hold even when empty (any frame, under a queue bound of zero), which
     /// refuses this call alone, or when the queue's bounds are passed by what it already holds,
-    /// which also ends the connection; and [`Error::Link`] when an earlier write left the link
-    /// unusable.
+    /// which also ends the connection, unless a [`Client::close`] has put its own end on record
+    /// first: that close owns the end, and the overflow refuses only this frame; and
+    /// [`Error::Link`] when an earlier write left the link unusable.
     ///
     /// [`ClientOptions::max_pending_requests`] is applied when the frame's turn to be written
     /// comes, not here: a request past it is not written, its [`Written`] resolves to that
@@ -3056,8 +3076,10 @@ impl Client {
     /// [`hold`](Self::hold_cancellation), during the first wait, and, on a connection that had
     /// already ended under this side, the handler's
     /// [`on_terminated`](PeerHandler::on_terminated), with whatever is left of the bound. A caller that wants
-    /// a tighter bound puts its own timeout around this future or drops it: that is safe at any
-    /// point, and leaves the link as the last paragraph below describes.
+    /// a tighter bound puts its own timeout around this future or drops it: that is sound at any
+    /// point, and leaves the link as "A close given up" below describes. A bound shorter than
+    /// twice `shutdown_timeout` can cut [`on_terminated`](PeerHandler::on_terminated) short, as
+    /// "Wrapping a close" below says.
     ///
     /// # What becomes of queued frames
     ///
@@ -3067,6 +3089,12 @@ impl Client {
     /// left unusable), and nothing of it is queued or written. One that raced the close
     /// either got into the queue ahead of it, and is then a frame queued before the close, or
     /// was refused the same way.
+    ///
+    /// A frame admitted between the close's record and the sealing of the queue lands ahead of
+    /// the close's barrier like any frame queued before the close, and is written before the
+    /// link goes. If the queue is full at that moment the frame is refused alone, with the
+    /// [`OutboundBound`] it passed: the close owns the end, so that overflow neither ends the
+    /// connection nor makes the link unusable, and the handler is told nothing.
     ///
     /// Of the frames queued before the close, notifications are written before the link
     /// goes. Requests whose turn to be written has not come are not: a request is entered among
@@ -3080,15 +3108,62 @@ impl Client {
     /// peer never reads, and when the future returned here is dropped before it finishes,
     /// unless another call to `close` is still in progress, which then answers for the link.
     ///
+    /// # A close given up
+    ///
     /// A close given up still owns the end it recorded. The handler is told of no end the
-    /// reader had read, the reader fails no pending call, and the child's input stays open.
-    /// Calling `close` again finishes the teardown from where the first one stopped: it fails
-    /// the calls still pending, stops the handler's task and closes the link.
+    /// reader had read and the reader fails no pending call. Calling `close` again finishes the
+    /// teardown from where the first one stopped: it fails the calls still pending, stops the
+    /// handler's task and closes the link.
+    ///
+    /// What the cut leaves of the link depends on where it came. Before the link was closed,
+    /// whether the close was failing the pending calls, stopping the handler's task, waiting
+    /// for the answers owed to the peer or waiting for the queue and the link, the link is still
+    /// open (a cut inside the link's own close leaves what that close leaves). After it, while
+    /// the close waited for the reader, the link is closed. Either way a caller can write nothing
+    /// afterwards: [`Client::submit_request`] and [`Client::submit_notification`] are refused,
+    /// [`Client::request`] returns [`Error::Closed`] and [`Client::notify`] returns `Ok(())`
+    /// having written nothing. The link being made unusable, as above, is what keeps a frame
+    /// already queued behind a write that did not finish from being written; it is not made
+    /// unusable by a cut that came after the link was closed.
+    ///
+    /// # A second close
+    ///
+    /// A second `close` while the first has not finished waits behind it for the same things.
+    /// A first close that is kept and never polled again, which dropping it is not, can hold
+    /// what the second needs; the second still ends within its own bound. Parked inside the
+    /// closing of the link, the first holds the sender, and the second returns the link's
+    /// [`Error::Timeout`] after `shutdown_timeout` without having closed it; drop the first to
+    /// let a later close finish. Parked in its wait for the handler to be told that the peer
+    /// exited, the first holds the reader, and the second, which has closed the link by then,
+    /// returns an [`Error::Timeout`] naming the reader when its own bound of twice
+    /// `shutdown_timeout` runs out. A first close that is polled and finishes within its bound
+    /// is no hindrance: the second then finds nothing left to wait for and returns `Ok`. The
+    /// later close can also end this way when the first is not held but simply runs out of its
+    /// own bound at the same moment, against a handler that does not return in time: the window
+    /// is the first close's expiry plus about a scheduler turn, in which it still holds the
+    /// reader while it takes it down, and a second close whose own bound runs out in that window
+    /// returns the timeout where it used to return `Ok`. The first close, polled again after the
+    /// second gave up, still completes with `Ok`. For now a host tells this timeout from the
+    /// link's only by its `operation` text, "JSON-RPC reader shutdown";
+    /// [`is_link_shutdown_timeout`] is `false` for it.
+    ///
+    /// # Wrapping a close
+    ///
+    /// A caller that puts its own timeout around `close` takes the close's bound, twice
+    /// `shutdown_timeout`, as the least it may allow if it relies on
+    /// [`on_terminated`](PeerHandler::on_terminated) finishing for a connection that ended under
+    /// this side. A close cut inside its wait for the reader takes the reader down, and the
+    /// handler's call is cancelled at the await it had reached, with no further call to tell the
+    /// handler of the end. A caller that wants a tighter bound accepts that.
     ///
     /// # Errors
     ///
     /// [`Error::Link`] when closing the link itself failed, [`Error::Timeout`] when the link
-    /// could not be reached within `shutdown_timeout`.
+    /// could not be reached within `shutdown_timeout` (that one is
+    /// [`is_link_shutdown_timeout`]), and [`Error::Timeout`] naming the reader when another
+    /// close that holds it was still waiting for the handler to be told after this one's bound
+    /// of twice `shutdown_timeout` had run out. The link is closed by then. Nothing in the
+    /// second case waits for good, whether or not the other close is ever polled again.
     pub async fn close(&self) -> Result<()> {
         // Stored before the drain rather than inside it, and that order is the contract `call`
         // reads: a caller that finds the map open has, by that fact, arrived before this store,
@@ -3156,8 +3231,15 @@ impl Client {
             return closed;
         }
         // The lock is kept across the wait, so that a second close waits for the handler to be
-        // told as the first one does.
-        let mut reader = self.pump.lock().await;
+        // told as the first one does. Not for longer than a close may take: a first close that
+        // was kept and is never polled again holds it for good, and this close must still end.
+        let Ok(mut reader) = tokio::time::timeout_at(latest, self.pump.lock()).await else {
+            // The link was dealt with above, and a failure to close it is the better answer.
+            return closed.and(Err(Error::Timeout {
+                operation: String::from(READER_SHUTDOWN),
+                after: self.state.options.shutdown_timeout.saturating_mul(2),
+            }));
+        };
         if let Some(pump) = reader.take() {
             // The reader of a connection that ended under this side is on its way to telling
             // the handler so, or is telling it. It is owed that call whole, so it is waited for
@@ -3718,18 +3800,26 @@ impl ClientState {
     /// measured against the queue's bounds, and one that found the queue full would be taken
     /// for a peer that stopped reading and end a connection that is only closing.
     fn mark_closed(&self) {
+        #[cfg(test)]
+        Self::run_hook(&self.before_seal);
         self.outbox.seal();
         #[cfg(test)]
         Self::run_hook(&self.after_seal);
         self.closed.store(true, Ordering::Release);
     }
 
-    /// Ends the connection because this side holds more for the peer than it may.
+    /// Ends the connection because this side holds more for the peer than it may, unless a close
+    /// is on record first.
     ///
     /// Callable from synchronous code, so it only records and signals: the cause every waiting
     /// call is failed with, the typed reason the handler is told, and a link no later frame may
-    /// use. The pump does the ending, as for any failed write.
+    /// use. The pump does the ending, as for any failed write. A close on record first owns the
+    /// end and the queue: nothing is made unusable, the handler is told nothing, what was queued
+    /// before the close is still written before the link goes, and only the frame that found the
+    /// queue full is refused, by the error this returns.
     fn outbound_overflow(&self, subject: &'static str, limit: usize, received: usize) -> Error {
+        #[cfg(test)]
+        Self::run_hook(&self.before_overflow_recorded);
         let termination = PeerTermination::OutboundBackpressure {
             subject,
             limit,
