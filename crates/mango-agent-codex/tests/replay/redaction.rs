@@ -120,3 +120,43 @@ async fn a_refused_requests_message_is_redacted_before_the_host_sees_it() {
     };
     assert_redacted("a refused request's message", &error.message);
 }
+
+/// The app-server's missing-rollout answer is recognised by its exact text, and a thread id that is
+/// itself credential-shaped is redacted out of that text on its way to the harness, so the
+/// comparison is made against the text in the form that arrives.
+#[tokio::test]
+async fn a_credential_shaped_thread_id_still_falls_back_to_a_fresh_thread() {
+    let launcher = Arc::new(FakeLauncher::new());
+    let missing = "api_key=0123456789abcdef";
+    launcher.push(
+        ResumeErrorServer {
+            message: format!("no rollout found for thread id {missing}"),
+        }
+        .process(),
+    );
+    let (host, launcher) = with_launcher(launcher, None);
+
+    let session = CodexHarness::new()
+        .open_session(
+            &host,
+            OpenSession::new("chat-1")
+                .resuming(missing, mango_external_agents::ResumeMode::Fallback),
+        )
+        .await
+        .expect("expected a conclusive missing rollout to start a new thread");
+
+    assert!(
+        !session.snapshot().resumed && session.snapshot().fallback_reason.is_some(),
+        "expected a fresh thread with a fallback reason | received: resumed {} reason {:?}",
+        session.snapshot().resumed,
+        session.snapshot().fallback_reason
+    );
+    assert!(
+        launcher
+            .written()
+            .iter()
+            .any(|line| line.contains("thread/start")),
+        "expected thread/start after the missing rollout | received: {:?}",
+        launcher.written()
+    );
+}
